@@ -146,6 +146,49 @@ fn malformed_counts_pending_answers_and_wrong_job_kinds_are_refused() {
 }
 
 #[test]
+fn retries_are_unsettled_until_final_and_minimum_does_not_hide_failed_items() {
+    event("retry-minimum");
+    let mut running = progress(vec![waiting(json!(0)), completed(json!(1), "peer")]);
+    let payload = &mut running["result"]["details"]["partialResult"]["details"];
+    payload["retries"] = json!(1);
+    payload["minOk"] = json!(1);
+    payload["meetsMinimum"] = json!(true);
+    payload["judgments"] = receipts(3);
+    let first = parsed_reply(&running, json!({"jobId":"fixture"}));
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["items"][0]["index"], 1);
+    assert_eq!(first["complete"], false);
+    let mut final_output = final_result(vec![
+        json!({"key":0,"ok":false,"error":"PI_JUDGE_RESPONSE"}),
+        json!({"key":1,"ok":true,"verdict":verdict("peer")}),
+    ]);
+    final_output.is_error = false;
+    let details = final_output.details.as_mut().unwrap();
+    details["result"]["retries"] = json!(1);
+    details["result"]["minOk"] = json!(1);
+    details["result"]["meetsMinimum"] = json!(true);
+    details["judgments"] = receipts(3);
+    let terminal = job(Some(final_output), "exited");
+    let input = json!({"jobId":"fixture","cursor":first["cursor"]});
+    let last = parsed_reply(&terminal, input.clone());
+    assert_eq!(last["jobFailed"], false);
+    assert_eq!(last["complete"], true);
+    assert_eq!(last["items"][0]["ok"], false);
+    assert_eq!(last["cursor"]["seen"], json!([0, 1]));
+    let request = Request::parse(&input).unwrap();
+    for (pointer, replacement) in [
+        ("/result/details/result/meetsMinimum", json!(false)),
+        ("/result/details/result/allOk", json!(true)),
+        ("/result/details/result/retries", json!(0)),
+        ("/result/details/result/minOk", json!(2)),
+    ] {
+        let mut invalid = terminal.clone();
+        *invalid.pointer_mut(pointer).unwrap() = replacement;
+        assert!(Observation::parse(&invalid, &request).is_err(), "{pointer}");
+    }
+}
+
+#[test]
 fn interrupted_and_withheld_evidence_do_not_fabricate_item_failures() {
     event("interruption");
     let first = progress(vec![completed(json!(0),"one"),waiting(json!(1))]);

@@ -993,6 +993,17 @@ def _model_protocol():
     return ToolBridgeError("EVAL_MODEL_PROTOCOL: invalid native model job response")
 
 
+def _model_batch_policy(payload):
+    if not any(name in payload for name in ("retries", "minOk", "meetsMinimum")):
+        return {"retries": 0, "minOk": payload["total"],
+                "meetsMinimum": payload["succeeded"] == payload["total"]}
+    if (type(payload.get("retries")) is not int or not 0 <= payload["retries"] <= 3
+            or type(payload.get("minOk")) is not int or not 0 <= payload["minOk"] <= payload["total"]
+            or payload.get("meetsMinimum") is not (payload["succeeded"] >= payload["minOk"])):
+        raise _model_protocol()
+    return {name: payload[name] for name in ("retries", "minOk", "meetsMinimum")}
+
+
 def _model_payload(operation, payload):
     if type(payload) is not dict:
         raise _model_protocol()
@@ -1008,7 +1019,7 @@ def _model_payload(operation, payload):
     else:
         if (payload.get("schema") != "pi.eval.judgment-batch.v1" or type(payload.get("items")) is not list
                 or type(payload.get("total")) is not int or payload["total"] != len(payload["items"])
-                or payload["total"] < 1
+                or not 1 <= payload["total"] <= 16
                 or type(payload.get("succeeded")) is not int or payload["succeeded"] < 0
                 or type(payload.get("failed")) is not int or payload["failed"] < 0
                 or payload["succeeded"] + payload["failed"] != payload["total"]
@@ -1027,6 +1038,7 @@ def _model_payload(operation, payload):
                 raise _model_protocol()
         if succeeded != payload["succeeded"]:
             raise _model_protocol()
+        _model_batch_policy(payload)
     return payload
 
 
@@ -1051,8 +1063,11 @@ def _model_check_progress(job, result, wrapper_schema):
             or type(progress.get("judgments")) is not dict
             or progress["judgments"].get("schema") != "pi.eval.judgments.v1"
             or type(progress["judgments"].get("attempts")) is not list
-            or len(progress["judgments"]["attempts"]) != progress["total"]
+            or not progress["total"] <= len(progress["judgments"]["attempts"]) <= 16
             or any(type(receipt) is not dict for receipt in progress["judgments"]["attempts"])):
+        raise _model_protocol()
+    policy = _model_batch_policy(progress)
+    if len(progress["judgments"]["attempts"]) > progress["total"] * (policy["retries"] + 1):
         raise _model_protocol()
     counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0}
     seen = set()
@@ -1094,6 +1109,7 @@ def _model_progress_view(job, snapshot):
     return {"schema": "pi.eval.model-job.progress.v1", "operation": job.operation, "complete": True,
             "jobStatus": snapshot["status"], "total": batch["total"], "completed": batch["total"],
             "succeeded": batch["succeeded"], "failed": batch["failed"], "queued": 0, "running": 0,
+            **_model_batch_policy(batch),
             "items": [{"key": item["key"], "status": "completed", "verdict": item["verdict"]} if item["ok"]
                       else {"key": item["key"], "status": "failed", "error": item["error"]} for item in batch["items"]],
             "judgments": details["judgments"]}
@@ -1136,8 +1152,14 @@ def _model_check_job(job, snapshot):
                 raise _model_protocol()
         else:
             payload = _model_payload(job.operation, details["result"])
-            if job.operation == "judgment_batch" and result.get("isError", False) is not (not payload["allOk"]):
-                raise _model_protocol()
+            if job.operation == "judgment_batch":
+                policy = _model_batch_policy(payload)
+                attempts = details["judgments"]["attempts"]
+                if (result.get("isError", False) is not (not policy["meetsMinimum"])
+                        or not payload["total"] <= len(attempts) <= 16
+                        or len(attempts) > payload["total"] * (policy["retries"] + 1)
+                        or any(type(receipt) is not dict for receipt in attempts)):
+                    raise _model_protocol()
             if job.operation != "judgment_batch" and result.get("isError", False):
                 raise _model_protocol()
         if snapshot["status"] != "exited" and not result.get("isError", False):
@@ -1339,6 +1361,10 @@ def _model_options(options, allowed):
             raise ValueError("EVAL_MODEL_INPUT: max_tokens must be an integer from 1 to 4096")
         if name == "concurrency" and (type(value) is not int or not 1 <= value <= 8):
             raise ValueError("EVAL_MODEL_INPUT: concurrency must be an integer from 1 to 8")
+        if name == "retries" and (type(value) is not int or not 0 <= value <= 3):
+            raise ValueError("EVAL_MODEL_INPUT: retries must be an integer from 0 to 3")
+        if name == "min_ok" and (type(value) is not int or not 0 <= value <= 16):
+            raise ValueError("EVAL_MODEL_INPUT: min_ok must be an integer from 0 through item count")
         arguments[allowed[name]] = value
     return arguments
 
@@ -1379,9 +1405,11 @@ async def _judge(state, questions, **options):
 async def _judge_batch(states, questions, **options):
     if type(states) not in (list, dict) or not states or type(questions) is not dict or not questions:
         raise TypeError("EVAL_MODEL_INPUT: judge_batch requires nonempty states and questions")
-    return await _model_launch("judgment_batch", {"states": states, "questions": questions,
-                              **_model_options(options, {"model": "model", "images": "images", "concurrency": "concurrency",
-                                                        "timeout_seconds": "timeout_secs"})})
+    arguments = _model_options(options, {"model": "model", "images": "images", "concurrency": "concurrency",
+                                        "timeout_seconds": "timeout_secs", "retries": "retries", "min_ok": "min_ok"})
+    if "min_ok" in arguments and arguments["min_ok"] > len(states):
+        raise ValueError("EVAL_MODEL_INPUT: min_ok exceeds item count")
+    return await _model_launch("judgment_batch", {"states": states, "questions": questions, **arguments})
 
 
 def _model_attachment(operation):

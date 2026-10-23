@@ -132,6 +132,15 @@
         && !/[\s\x00-\x1f\x7f]/.test(id);
     const modelRecord = value => value !== null && typeof value === 'object' && !isArray(value);
     const modelProtocol = () => new ErrorType('EVAL_MODEL_PROTOCOL: invalid native model job response');
+    const modelBatchPolicy = payload => {
+        if (!['retries','minOk','meetsMinimum'].some(name => hasOwn(payload,name))) {
+            return {retries:0,minOk:payload.total,meetsMinimum:payload.succeeded === payload.total};
+        }
+        if (!integer(payload.retries) || payload.retries < 0 || payload.retries > 3
+            || !integer(payload.minOk) || payload.minOk < 0 || payload.minOk > payload.total
+            || payload.meetsMinimum !== (payload.succeeded >= payload.minOk)) throw modelProtocol();
+        return {retries:payload.retries,minOk:payload.minOk,meetsMinimum:payload.meetsMinimum};
+    };
     const modelPayload = (operation, payload) => {
         if (!modelRecord(payload)) throw modelProtocol();
         if (operation === 'completion') {
@@ -145,7 +154,7 @@
                 || keys(payload.answers).length === 0) throw modelProtocol();
         } else {
             if (payload.schema !== 'pi.eval.judgment-batch.v1' || !isArray(payload.items)
-                || !integer(payload.total) || payload.total !== payload.items.length || payload.total < 1
+                || !integer(payload.total) || payload.total !== payload.items.length || payload.total < 1 || payload.total > 16
                 || !integer(payload.succeeded) || payload.succeeded < 0
                 || !integer(payload.failed) || payload.failed < 0
                 || payload.succeeded + payload.failed !== payload.total
@@ -159,6 +168,7 @@
                 else if (typeof item.error !== 'string' || !item.error) throw modelProtocol();
             }
             if (succeeded !== payload.succeeded) throw modelProtocol();
+            modelBatchPolicy(payload);
         }
         return payload;
     };
@@ -179,8 +189,11 @@
             || progress.completed !== progress.succeeded + progress.failed
             || progress.total !== progress.completed + progress.queued + progress.running
             || !modelRecord(progress.judgments) || progress.judgments.schema !== 'pi.eval.judgments.v1'
-            || !isArray(progress.judgments.attempts) || progress.judgments.attempts.length !== progress.total
+            || !isArray(progress.judgments.attempts) || progress.judgments.attempts.length < progress.total
+            || progress.judgments.attempts.length > 16
             || progress.judgments.attempts.some(receipt => !modelRecord(receipt))) throw modelProtocol();
+        const policy = modelBatchPolicy(progress);
+        if (progress.judgments.attempts.length > progress.total * (policy.retries + 1)) throw modelProtocol();
         const counts = {queued:0,running:0,completed:0,failed:0};
         const seen = [];
         for (const item of progress.items) {
@@ -210,6 +223,7 @@
         const batch = details.result;
         return {schema:'pi.eval.model-job.progress.v1',operation:job.operation,complete:true,jobStatus:snapshot.status,
             total:batch.total,completed:batch.total,succeeded:batch.succeeded,failed:batch.failed,queued:0,running:0,
+            ...modelBatchPolicy(batch),
             items:batch.items.map(item => item.ok ? {key:item.key,status:'completed',verdict:item.verdict}
                 : {key:item.key,status:'failed',error:item.error}),judgments:details.judgments};
     };
@@ -246,7 +260,14 @@
                 if (!result.isError || typeof details.error !== 'string' || !details.error) throw modelProtocol();
             } else {
                 const payload = modelPayload(job.operation,details.result);
-                if (job.operation === 'judgment_batch' && (result.isError === true) !== !payload.allOk) throw modelProtocol();
+                if (job.operation === 'judgment_batch') {
+                    const policy = modelBatchPolicy(payload);
+                    if ((result.isError === true) !== !policy.meetsMinimum
+                        || details.judgments.attempts.length < payload.total
+                        || details.judgments.attempts.length > 16
+                        || details.judgments.attempts.length > payload.total * (policy.retries + 1)
+                        || details.judgments.attempts.some(receipt => !modelRecord(receipt))) throw modelProtocol();
+                }
                 if (job.operation !== 'judgment_batch' && result.isError) throw modelProtocol();
             }
             if (snapshot.status !== 'exited' && !result.isError) throw modelProtocol();
@@ -421,6 +442,12 @@
             if (key === 'concurrency' && (!integer(value) || value < 1 || value > 8)) {
                 throw new RangeErrorType('EVAL_MODEL_INPUT: concurrency must be an integer from 1 to 8');
             }
+            if (key === 'retries' && (!integer(value) || value < 0 || value > 3)) {
+                throw new RangeErrorType('EVAL_MODEL_INPUT: retries must be an integer from 0 to 3');
+            }
+            if (key === 'minOk' && (!integer(value) || value < 0 || value > 16)) {
+                throw new RangeErrorType('EVAL_MODEL_INPUT: minOk must be an integer from 0 through item count');
+            }
             args[allowed[key]] = value;
         }
         return args;
@@ -459,8 +486,12 @@
             || !modelRecord(questions) || keys(questions).length === 0) {
             throw new TypeErrorType('EVAL_MODEL_INPUT: judgeBatch requires nonempty states and questions');
         }
-        return launchModel('judgment_batch',{states,questions,
-            ...modelOptions(options,{model:'model',images:'images',concurrency:'concurrency',timeoutSeconds:'timeout_secs'})});
+        const args = modelOptions(options,{model:'model',images:'images',concurrency:'concurrency',
+            timeoutSeconds:'timeout_secs',retries:'retries',minOk:'min_ok'});
+        if (hasOwn(args,'min_ok') && args.min_ok > keys(states).length) {
+            throw new RangeErrorType('EVAL_MODEL_INPUT: minOk exceeds item count');
+        }
+        return launchModel('judgment_batch',{states,questions,...args});
     };
     completion.attach = id => attachModel('completion',id);
     judge.attach = id => attachModel('judgment',id);

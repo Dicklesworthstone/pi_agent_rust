@@ -151,19 +151,51 @@ display({'paths': paths, 'items': judgments['items']})
 |---|---|---|
 | `completion(prompt, options)` / `completion(prompt, **options)` | `model` role, `system`, `schema`, `images`, `maxTokens` / `max_tokens`, `timeoutSeconds` / `timeout_seconds` | Text, or validated `data` when a schema was requested |
 | `judge(state, questions, options)` / `judge(state, questions, **options)` | `model` role, `images`, task timeout | The typed `answers` object |
-| `judgeBatch(states, questions, options)` / `judge_batch(states, questions, **options)` | `model` role, `images`, `concurrency`, task timeout | The complete ordered `pi.eval.judgment-batch.v1` aggregate |
+| `judgeBatch(states, questions, options)` / `judge_batch(states, questions, **options)` | `model` role, `images`, `concurrency`, `retries`, `minOk` / `min_ok`, task timeout | The complete ordered `pi.eval.judgment-batch.v1` aggregate |
 
 The factories are asynchronous: **await the factory to get a handle**. Options
 use an object in JavaScript and keyword arguments in Python. Unknown options,
-including retries, `minOk`/`min_ok` and `intent`, are rejected. Requests use the
+including `intent`, are rejected. Requests use the
 launching cell's native binding unless they explicitly select a configured
-model role as described below, with no retry or fallback. Completion and
+model role as described below, with no model fallback. Single completions and
+judgments make one attempt; retained batches can explicitly enable bounded retries.
+Completion and
 judgment images use the existing path or embedded-image
 format; batch images map literal state keys or canonical array indices to
 attachment lists. Image reads finish through the current Agent's enabled `read`
 tool before background provider admission. The selected model must declare
 image support, including when a completion also supplies a JSON Schema. Text
 privacy screening does not redact pixels or perform OCR.
+
+### Retained batch retries and minimum successful items
+
+`retries` accepts an integer from 0 through 3, defaulting to **0**. `minOk` in
+JavaScript and `min_ok` in Python accept an integer from 0 through the number
+of items, defaulting to **all items**. These preserve Pi's existing cost and
+failure behavior; OMP v18.12.6 defaults to one retry and one successful item.
+For example, Python `await judge_batch(states, questions, retries=1, min_ok=2)`
+allows one extra attempt per failed item and requires two successful items.
+
+Admission reserves `item_count * (retries + 1)` of the launching eval cell's
+shared 16 model attempts before any host call, image read or provider request.
+An over-budget batch is rejected in full. Unused reservations cannot be spent
+by later calls in that cell. Retries use the same screened evidence, selected
+model, credentials, privacy snapshot and original native job deadline.
+
+Only malformed typed answers and classified transient provider failures can
+retry. Classification happens before diagnostics are sanitized. Authentication,
+access, policy, invalid-request, cancellation and timeout failures do not retry.
+Retries queue behind untouched peers; successful items never rerun. Every
+attempt retains its own receipt with `item`, `itemAttempt` and, once settled,
+`retryScheduled`; provider diagnostic bodies remain withheld.
+
+`minOk` is a success threshold, not early termination: every original item still
+settles. The aggregate includes `minOk`, `retries` and `meetsMinimum`.
+`allOk` continues to mean every item succeeded, so a batch can have
+`meetsMinimum: true`, `allOk: false` and real failed items. Ordinary `wait()`
+returns that aggregate when the threshold is met; falling short raises with
+the native result attached. A threshold of zero explicitly accepts all-failed
+batches, but cannot turn cancellation or timeout into successful completion.
 
 ### Per-request model roles
 
@@ -212,7 +244,7 @@ native job captures that concrete provider, credentials, thinking level and
 privacy snapshot; later cells and settings changes do not retarget accepted
 work. The launch receipt records `selectedModel`, and successful results retain
 the actual `provider` and `modelId`. All roles share the existing 16-attempt
-cell limit, including every item in a batch. A helper role alone does not
+cell limit, including every possible retained batch attempt. A helper role alone does not
 authorize networking: every cell launching model work still needs its own
 explicit `judge_model` or a host-bound Judge. Reading an existing job does not
 need a new model selection.
@@ -238,7 +270,8 @@ optional `model` role field under these rules.
 Ordinary `wait()` raises on a failed, cancelled or timed-out native job. The
 error retains its native output as `error.result`; JavaScript also exposes
 `error.jobId` and Python `error.job_id`. For a mixed-success batch, use
-`output()` or the non-raising wait to inspect both successful and failed items.
+`output()` or the non-raising wait to inspect both successful and failed items
+when the requested `minOk` threshold was not met.
 A wait that expires while the job is still running raises `TimeoutError` and
 leaves the job running. Repeated waits observe the same job and do not repeat
 provider work. Global `wait()` preserves input order, accepts these handles
@@ -248,7 +281,10 @@ For a retained batch, `await review.progress()` observes all original items in
 input order. Each item has its original `key` and a `status` of `queued`,
 `running`, `completed` or `failed`. Only completed items carry a typed `verdict`;
 failed items carry a sanitized `error`. The view includes `total`, `completed`,
-`succeeded`, `failed`, `queued`, `running` and native `judgments` receipts.
+`succeeded`, `failed`, `queued`, `running`, `retries`, `minOk`, `meetsMinimum`
+and native `judgments` receipts. A failed attempt that will retry leaves the
+item queued or running: it is not counted as settled or delivered by `drain()`.
+Receipt count can exceed item count while staying within the reserved attempt budget.
 Observations do not consume items and can be repeated after attaching by job ID.
 
 The view's `jobStatus` comes from the same native snapshot as its evidence.

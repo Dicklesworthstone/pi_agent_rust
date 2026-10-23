@@ -79,6 +79,7 @@ struct Fixture {
     gate: Arc<Gate>,
     gates: Mutex<VecDeque<Arc<Gate>>>,
     replies: Mutex<VecDeque<String>>,
+    errors: Mutex<VecDeque<Error>>,
     calls: AtomicUsize,
     contents: Mutex<Vec<UserContent>>,
 }
@@ -91,6 +92,7 @@ impl Fixture {
             gate,
             gates: Mutex::new(VecDeque::new()),
             replies: Mutex::new(replies.iter().map(|text| (*text).to_owned()).collect()),
+            errors: Mutex::new(VecDeque::new()),
             calls: AtomicUsize::new(0),
             contents: Mutex::new(Vec::new()),
         })
@@ -139,6 +141,14 @@ impl Provider for Fixture {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(user.content.clone());
         self.calls.fetch_add(1, Ordering::AcqRel);
+        if let Some(error) = self
+            .errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+        {
+            return Err(error);
+        }
         let text = self
             .replies
             .lock()
@@ -1315,6 +1325,181 @@ fn mixed_batch_failure_keeps_ordered_peer_results_and_receipts() -> Result<()> {
         ); // ubs:ignore -- Later successful provider usage remains visible.
         assert!(!details.to_string().contains("invalid model result")); // ubs:ignore -- Provider diagnostics cannot leak through public errors.
         assert_eq!(harness.provider.calls.load(Ordering::Acquire), 3); // ubs:ignore -- No failed judgment may be retried implicitly.
+        Ok(())
+    })
+}
+
+#[test]
+fn retries_run_after_untouched_peers_and_keep_every_attempt_receipt() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(&["invalid answer", r#"{"q":0.2}"#, r#"{"q":0.8}"#], true)?;
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = harness.invocation(&factory)?;
+        let ack = acknowledgment(invocation.start_background(&harness.tool, Operation::Batch,
+            json!({"states":["first","second"],"questions":questions(),"concurrency":1,"retries":1}))
+            .await.map_err(bridge_error)?)?;
+        assert_eq!(invocation.receipts.len(), 4); // ubs:ignore -- Reserve the worst case before detaching, even if fewer calls are made.
+        let done = harness.settle(&ack).await?;
+        assert_eq!(done.status, "exited"); // ubs:ignore -- A recovered typed answer makes this complete batch successful.
+        let details = done.result.and_then(|result| result.details).ok_or_else(stopped)?;
+        assert_eq!(details["result"]["allOk"], true); // ubs:ignore -- Every original item has a real successful verdict.
+        assert_eq!(details["result"]["items"][0]["verdict"]["answers"]["q"]["bool"], 0.8); // ubs:ignore -- The third response belongs to the retry of the first item.
+        assert_eq!(details["result"]["items"][1]["verdict"]["answers"]["q"]["bool"], 0.2); // ubs:ignore -- The untouched peer dispatches before the retry and is never repeated.
+        let attempts = details["judgments"]["attempts"].as_array().ok_or_else(stopped)?;
+        assert_eq!(attempts.len(), 3); // ubs:ignore -- Unused reservation slots are not fabricated provider attempts.
+        assert_eq!(attempts[0]["status"], "failed"); // ubs:ignore -- Recovery does not erase the initial failure.
+        assert_eq!(attempts[0]["retryScheduled"], true); // ubs:ignore -- Failed receipts explain why the item stayed unsettled.
+        assert_eq!(attempts[2]["item"], 0); // ubs:ignore -- Retry receipts retain the original item identity.
+        assert_eq!(attempts[2]["itemAttempt"], 2); // ubs:ignore -- Each actual attempt has its own ordinal.
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 3); // ubs:ignore -- The successful peer must never run again.
+        Ok(())
+    })
+}
+
+#[test]
+fn minimum_success_is_separate_from_all_items_succeeding() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    for (minimum, expected) in [(0, "exited"), (1, "exited"), (2, "failed")] {
+        let harness = Harness::new(&[r#"{"q":0.7}"#, "invalid answer"], true)?;
+        runtime().block_on(async {
+            let factory = privacy;
+            let mut invocation = harness.invocation(&factory)?;
+            let ack = acknowledgment(invocation.start_background(&harness.tool, Operation::Batch,
+                json!({"states":["first","second"],"questions":questions(),"concurrency":1,"min_ok":minimum}))
+                .await.map_err(bridge_error)?)?;
+            let done = harness.settle(&ack).await?;
+            assert_eq!(done.status, expected); // ubs:ignore -- Only the explicitly requested threshold changes aggregate success.
+            let details = done.result.and_then(|result| result.details).ok_or_else(stopped)?;
+            assert_eq!(details["result"]["allOk"], false); // ubs:ignore -- Meeting a threshold cannot turn a failed item into success.
+            assert_eq!(details["result"]["meetsMinimum"], minimum <= 1); // ubs:ignore -- The threshold is truthful and independent of allOk.
+            assert_eq!(details["result"]["failed"], 1); // ubs:ignore -- Threshold success preserves failed evidence.
+            assert_eq!(harness.provider.calls.load(Ordering::Acquire), 2); // ubs:ignore -- Reaching minOk never skips remaining original items.
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn retry_reservation_and_option_validation_precede_all_host_work() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    for (name, value) in [
+        ("retries", json!(4)),
+        ("retries", json!(-1)),
+        ("retries", json!(true)),
+        ("retries", json!(1.5)),
+        ("min_ok", json!(2)),
+        ("min_ok", json!(-1)),
+        ("min_ok", json!(false)),
+    ] {
+        let mut input = json!({"states":["first"],"questions":questions()});
+        input[name] = value;
+        assert!(Request::parse(Operation::Batch, input).is_err()); // ubs:ignore -- Retry controls are bounded integers, never coerced.
+    }
+    let harness = Harness::new(&[], true)?;
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = harness.invocation(&factory)?;
+        let result = invocation
+            .start_background(
+                &harness.tool,
+                Operation::Batch,
+                json!({"states":vec!["state"; 9],"questions":questions(),"retries":1}),
+            )
+            .await;
+        assert!(result.is_err_and(|error| error.contains("PI_MODEL_JOB_LIMIT"))); // ubs:ignore -- All 18 possible attempts must fit before admission.
+        assert!(invocation.receipts.is_empty() && invocation.tool_receipts.is_empty()); // ubs:ignore -- Rejected reservation performs neither reads nor jobs admission.
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 0); // ubs:ignore -- An over-budget batch never reaches a provider.
+        Ok(())
+    })
+}
+
+#[test]
+fn provider_retries_use_typed_failure_before_public_sanitization() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    for (error, retry) in [
+        (Error::api("HTTP 503: unavailable PRIVATE-DIAGNOSTIC"), true),
+        (Error::api("connection reset PRIVATE-DIAGNOSTIC"), true),
+        (
+            Error::Auth("503 overloaded PRIVATE-DIAGNOSTIC".into()),
+            false,
+        ),
+        (
+            Error::tool("policy", "503 overloaded PRIVATE-DIAGNOSTIC"),
+            false,
+        ),
+        (Error::api("HTTP 403: rate limit PRIVATE-DIAGNOSTIC"), false),
+        (
+            Error::api("HTTP 400: usage limit field invalid PRIVATE-DIAGNOSTIC"),
+            false,
+        ),
+        (Error::api("HTTP 504: overloaded PRIVATE-DIAGNOSTIC"), false),
+        (
+            Error::api("policy denied: 503 overloaded PRIVATE-DIAGNOSTIC"),
+            false,
+        ),
+        (
+            Error::api("request cancelled: 503 PRIVATE-DIAGNOSTIC"),
+            false,
+        ),
+        (Error::Aborted, false),
+    ] {
+        let harness = Harness::new(&[], true)?;
+        harness
+            .provider
+            .errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(error);
+        runtime().block_on(async {
+            let factory = privacy;
+            let mut invocation = harness.invocation(&factory)?;
+            let ack = acknowledgment(
+                invocation
+                    .start_background(
+                        &harness.tool,
+                        Operation::Batch,
+                        json!({"states":["first"],"questions":questions(),"retries":1}),
+                    )
+                    .await
+                    .map_err(bridge_error)?,
+            )?;
+            let done = harness.settle(&ack).await?;
+            assert_eq!(done.status, if retry { "exited" } else { "failed" }); // ubs:ignore -- Terminal errors stay terminal despite retry-looking words.
+            assert_eq!(
+                harness.provider.calls.load(Ordering::Acquire),
+                if retry { 2 } else { 1 }
+            ); // ubs:ignore -- Only classified provider transients spend another reserved attempt.
+            assert!(!serde_json::to_string(&done)?.contains("PRIVATE-DIAGNOSTIC")); // ubs:ignore -- Classifying a raw error must not expose its contents.
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cancelling_a_retry_keeps_the_item_unsettled_and_drops_the_stream() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(&["invalid answer", r#"{"q":0.2}"#, r#"{"q":0.8}"#], false)?;
+    let gates = harness.provider.queue_gates(&[true, true, false]);
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = harness.invocation(&factory)?;
+        let ack = acknowledgment(invocation.start_background(&harness.tool, Operation::Batch,
+            json!({"states":["first","second"],"questions":questions(),"concurrency":1,"retries":2}))
+            .await.map_err(bridge_error)?)?;
+        started(&harness, 3).await?;
+        let running = batch_observation(&harness, &ack, 1, 1).await?;
+        let partial = partial_details(&running)?;
+        assert_eq!(partial["failed"], 0); // ubs:ignore -- An intermediate failed attempt is not a settled failed item.
+        assert_eq!(partial["items"][0]["status"], "running"); // ubs:ignore -- The retried item remains unavailable to drains.
+        assert_eq!(partial["judgments"]["attempts"][0]["status"], "failed"); // ubs:ignore -- The failed attempt remains inspectable even while its item is running.
+        let cancelled = crate::jobs::cancel_async(&harness.host.owner, ack["jobId"].as_str().ok_or_else(stopped)?).await?;
+        assert_eq!(cancelled.status, "killed"); // ubs:ignore -- The owner cancels the original job including every retry.
+        assert_eq!(partial_details(&cancelled)?, partial); // ubs:ignore -- Cancellation preserves exactly the last screened incomplete observation.
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 3); // ubs:ignore -- Cancellation cannot dispatch the unused final retry.
+        assert_eq!(gates[2].dropped.load(Ordering::Acquire), 1); // ubs:ignore -- Native cancellation retires the retried stream before returning.
         Ok(())
     })
 }

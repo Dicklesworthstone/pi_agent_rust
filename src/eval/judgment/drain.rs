@@ -185,8 +185,26 @@ impl<'a> Observation<'a> {
         let total = count(payload, "total")?;
         let items = payload.get("items").and_then(Value::as_array)
             .filter(|items| total > 0 && items.len() == total).ok_or(PROTOCOL)?;
+        let (retries, min_ok) = if ["retries", "minOk", "meetsMinimum"]
+            .iter()
+            .any(|name| payload.get(name).is_some())
+        {
+            let retries = count(payload, "retries")?;
+            let min_ok = count(payload, "minOk")?;
+            if retries > 3
+                || min_ok > total
+                || payload["meetsMinimum"].as_bool() != Some(count(payload, "succeeded")? >= min_ok)
+            {
+                return Err(PROTOCOL.into());
+            }
+            (retries, min_ok)
+        } else {
+            (0, total)
+        };
         if receipts["schema"] != "pi.eval.judgments.v1"
-            || !receipts["attempts"].as_array().is_some_and(|items| items.len() == total && items.iter().all(Value::is_object))
+            || !receipts["attempts"].as_array().is_some_and(|items|
+                (total..=16.min(total * (retries + 1))).contains(&items.len())
+                    && items.iter().all(Value::is_object))
         { return Err(PROTOCOL.into()); }
         let mut mask = 0_u16;
         let mut counts = [0_usize; 4]; // queued, running, completed, failed
@@ -232,7 +250,7 @@ impl<'a> Observation<'a> {
             if count(payload, "queued")? != counts[0] || count(payload, "running")? != counts[1]
                 || count(payload, "completed")? != counts[2] + counts[3]
             { return Err(PROTOCOL.into()); }
-        } else if payload["allOk"].as_bool() != Some(counts[3] == 0) || failed != (counts[3] > 0) {
+        } else if payload["allOk"].as_bool() != Some(counts[3] == 0) || failed != (counts[2] < min_ok) {
             return Err(PROTOCOL.into());
         }
         // Identical literal keys and order are required across observations,

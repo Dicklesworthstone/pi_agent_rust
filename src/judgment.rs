@@ -101,10 +101,61 @@ pub struct Judge {
 /// Fully screened, owned evidence and rubric. Preparation performs no provider
 /// I/O and retains neither the caller's privacy callback nor any tool authority.
 /// The private fields keep background callers on the ordinary validation path.
+#[derive(Clone)]
 pub(crate) struct PreparedJudgment {
     system: String,
     content: UserContent,
     rubric: JudgmentRequest,
+}
+
+/// Retry eligibility is captured before sanitizing provider diagnostics. Only
+/// retained batches consume it; an ordinary judgment still makes one attempt.
+pub(crate) struct JudgmentFailure {
+    pub(crate) error: Error,
+    pub(crate) retryable: bool,
+}
+
+impl From<Error> for JudgmentFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            retryable: false,
+        }
+    }
+}
+
+impl JudgmentFailure {
+    fn provider(error: Error, diagnostic: &str) -> Self {
+        // Classify the actual error body, never a provider's display name or
+        // the sanitized public message. Explicit stops outrank retry wording.
+        let error = match error {
+            Error::Provider { message, .. } => Error::api(message),
+            error => error,
+        };
+        let lower = error.to_string().to_ascii_lowercase();
+        let terminal = [
+            "timeout",
+            "timed out",
+            "cancel",
+            "abort",
+            "policy",
+            "access denied",
+            "permission",
+            "forbidden",
+            "unauthorized",
+            "authentication",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        let timeout = crate::error::ProviderErrorSummary::from_error_text(None, &lower).kind
+            == crate::error::ProviderErrorKind::Timeout
+            || matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut);
+        let retryable = !terminal && !timeout && crate::failover::call_error_is_retryable(&error);
+        Self {
+            error: failure(diagnostic),
+            retryable,
+        }
+    }
 }
 
 impl Judge {
@@ -186,13 +237,24 @@ impl Judge {
 
     /// Execute already admitted evidence with the same tool-free collector,
     /// cancellation checks and response validation as foreground judgments.
-    pub(crate) async fn run_prepared_judgment(
+    pub(crate) async fn run_prepared_judgment(&self, prepared: PreparedJudgment) -> Result<Value> {
+        self.run_prepared_judgment_attempt(prepared)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn run_prepared_judgment_attempt(
         &self,
         prepared: PreparedJudgment,
-    ) -> Result<Value> {
+    ) -> std::result::Result<Value, JudgmentFailure> {
         let PreparedJudgment { system, content, rubric } = prepared;
-        let (answer, usage) = self.request_content(system, content, None).await?;
-        let answers = rubric.answers(&answer)?;
+        let (answer, usage) = self.request_content_attempt(system, content, None).await?;
+        // The typed rubric was already validated during admission. A failure
+        // here means a malformed model answer, not invalid caller input.
+        let answers = rubric.answers(&answer).map_err(|error| JudgmentFailure {
+            error,
+            retryable: true,
+        })?;
         Ok(self.reply("pi.judgment.v1", "answers", answers, usage))
     }
 
@@ -239,10 +301,21 @@ impl Judge {
         content: UserContent,
         requested_tokens: Option<u32>,
     ) -> Result<(String, Option<Usage>)> {
+        self.request_content_attempt(system, content, requested_tokens)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn request_content_attempt(
+        &self,
+        system: String,
+        content: UserContent,
+        requested_tokens: Option<u32>,
+    ) -> std::result::Result<(String, Option<Usage>), JudgmentFailure> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
         if !owner.capabilities().io || !owner.capabilities().time {
-            return Err(failure("PI_JUDGE_PERMISSION: I/O and timer capabilities required"));
+            return Err(failure("PI_JUDGE_PERMISSION: I/O and timer capabilities required").into());
         }
         let context = Context::owned(
             Some(system),
@@ -264,7 +337,7 @@ impl Judge {
             let _permit = AUXILIARY_MODEL_GATE.acquire(&owner).await?;
             owner.checkpoint().map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
             let stream = self.provider.stream(&context, &options).await
-                .map_err(|_| failure("PI_JUDGE_PROVIDER: request failed; no verdict"))?;
+                .map_err(|error| JudgmentFailure::provider(error, "PI_JUDGE_PROVIDER: request failed; no verdict"))?;
             let stream = stream.map(|event| {
                 if let Ok(StreamEvent::Done { message, .. }) = &event {
                     usage = Some(message.usage.clone());
@@ -272,7 +345,7 @@ impl Judge {
                 event
             });
             collect_text(stream, MAX_ANSWER_BYTES).await
-                .map_err(|_| failure("PI_JUDGE_PROVIDER: incomplete, failed, oversized or tool-bearing response; no verdict"))
+                .map_err(|error| JudgmentFailure::provider(error, "PI_JUDGE_PROVIDER: incomplete, failed, oversized or tool-bearing response; no verdict"))
         }).await.map_err(|stop| match stop {
             RequestStop::TimedOut => failure("PI_JUDGE_TIMEOUT: no verdict"),
             RequestStop::Cancelled => failure("PI_JUDGE_CANCELLED: no verdict"),

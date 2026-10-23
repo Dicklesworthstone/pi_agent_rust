@@ -54,7 +54,8 @@ def model_result(operation, result, *, failed=False, error=None):
             "details": {"schema": "pi.eval.model-job.result.v1", "operation": operation,
                         "result": result, "error": error,
                         "judgments": {"schema": "pi.eval.judgments.v1", "attempts": [
-                            {"attempt": 1, "status": "failed" if failed else "completed"}]}},
+                            {"attempt": index + 1, "status": "failed" if failed else "completed"}
+                            for index in range(result.get("total", 1) if operation == "judgment_batch" and result else 1)]}},
             **({"isError": True} if failed else {})}
 
 
@@ -437,6 +438,51 @@ captured
     def launch_batch(self):
         self.launch_model("judge_batch([1,2], {'safe':{'type':'bool','instructions':'safe?'}})", "judgment_batch")
 
+    def test_batch_retry_controls_and_minimum_preserve_truthful_all_ok(self):
+        request = self.launch_model("judge_batch(['a','b'], {'safe':{'type':'bool','instructions':'safe?'}}, "
+                                    "retries=1, min_ok=1)", "judgment_batch")
+        self.assertEqual((request["retries"], request["min_ok"]), (1, 1))
+        payload = {"schema": "pi.eval.judgment-batch.v1", "total": 2, "succeeded": 1, "failed": 1,
+                   "allOk": False, "retries": 1, "minOk": 1, "meetsMinimum": True,
+                   "items": [{"key": 0, "ok": True, "verdict": judgment_value(1)},
+                             {"key": 1, "ok": False, "error": "PI_JUDGE_RESPONSE"}]}
+        native = model_result("judgment_batch", payload)
+        native["details"]["judgments"]["attempts"].append({"attempt": 3, "item": 1, "itemAttempt": 2, "status": "failed"})
+        snapshot = model_snapshot("judgment_batch", native)
+        self.assertEqual(self.value(self.kernel.cell("await model.wait()", self.reply_with(envelope(snapshot)))), payload)
+        progress = self.value(self.kernel.cell("await model.progress()", self.reply_with(envelope(snapshot))))
+        self.assertTrue(progress["meetsMinimum"])
+        self.assertEqual((progress["minOk"], progress["failed"], len(progress["judgments"]["attempts"])), (1, 1, 3))
+        for change in ({"meetsMinimum": False}, {"allOk": True}, {"minOk": 3}, {"retries": 0}, {"retries": 4}):
+            invalid = json.loads(json.dumps(snapshot))
+            invalid["result"]["details"]["result"].update(change)
+            response = self.kernel.cell("await model.status()", self.reply_with(envelope(invalid)))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_MODEL_PROTOCOL", response["error"])
+
+    def test_batch_retry_progress_keeps_failed_attempts_without_settling_the_item(self):
+        self.launch_batch()
+        native = batch_progress_result()
+        partial = native["details"]["partialResult"]["details"]
+        partial.update(retries=1, minOk=1, meetsMinimum=True, completed=1, failed=0, queued=2)
+        partial["items"][1] = {"key": "bad", "status": "queued"}
+        partial["judgments"]["attempts"].append({"attempt": 5, "item": 1, "itemAttempt": 2, "status": "queued"})
+        progress = self.value(self.kernel.cell("await model.progress()",
+            self.reply_with(envelope(batch_progress_snapshot(native)))))
+        self.assertEqual(progress["completed"], 1)
+        self.assertEqual(progress["items"][1]["status"], "queued")
+        self.assertEqual(progress["judgments"]["attempts"][1]["status"], "failed")
+        self.assertEqual(len(progress["judgments"]["attempts"]), 5)
+        self.assertFalse(progress["complete"])
+
+    def test_batch_retry_controls_are_bounded_before_dispatch(self):
+        for options in ("retries=-1", "retries=4", "retries=0.5", "retries=True", "retries=None",
+                        "min_ok=-1", "min_ok=3", "min_ok=0.5", "min_ok=False", "min_ok=None"):
+            response = self.kernel.cell(f"await judge_batch(['a','b'], {{'q':{{}}}}, {options})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_MODEL_INPUT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 0)
+
     def test_batch_drain_uses_one_native_waiter_call_and_preserves_full_page(self):
         self.launch_batch()
         page = batch_drain_page()
@@ -753,6 +799,7 @@ captured
                     "schema": "pi.eval.model-job.progress.v1", "operation": "judgment_batch", "complete": True,
                     "jobStatus": status, "total": 2, "completed": 2, "succeeded": payload["succeeded"],
                     "failed": payload["failed"], "queued": 0, "running": 0,
+                    "retries": 0, "minOk": 2, "meetsMinimum": not failed,
                     "items": [{"key": "first", "status": "completed", "verdict": judgment_value(1)},
                               {"key": "second", "status": "failed", "error": "PI_JUDGE_PROVIDER"} if failed
                               else {"key": "second", "status": "completed", "verdict": judgment_value(0)}],
@@ -860,7 +907,7 @@ captured
                            "judge_batch(['state'], {'q':{}}, model=1)", "completion('work', api_key='secret')",
                            "completion('work', max_tokens=0)", "completion('work', timeout_seconds=601)",
                            "completion('work', timeout_seconds=True)", "judge('state', {'q':{}}, retries=1)",
-                           "judge('state', {'q':{}}, operation='other')", "judge_batch(['state'], {'q':{}}, min_ok=1)",
+                           "judge('state', {'q':{}}, operation='other')", "judge_batch(['state'], {'q':{}}, min_ok=2)",
                            "judge_batch(['state'], {'q':{}}, intent='custom')",
                            "judge_batch(['state'], {'q':{}}, concurrency=9)", "judge_batch([], {'q':{}})",
                            "completion.attach('invalid id')"):

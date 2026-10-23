@@ -744,7 +744,13 @@ impl Tool for EvalTool {
          Each selected role resolves once per cell from trusted settings, with \
          its configured thinking level; missing/disabled roles fail without \
          fallback. Omission uses the cell binding. SDK host-bound Judges cannot \
-         be overridden. No helper retries or minOk. The native \
+         be overridden. Retained batches accept retries (0-3, default 0) and \
+         minOk in JS / min_ok in Python (0 through item count, default all). \
+         Every possible retry reserves one of the launching cell's 16 attempts. \
+         Only malformed answers or transient provider failures retry, after untouched peers; \
+         successful peers never rerun. Retries retain the original job deadline. \
+         Batch allOk remains true only when every item succeeded; meetsMinimum \
+         separately controls aggregate success without skipping remaining items. The native \
          bridge for explicitly retained work is available through tool.call: \
          call __pi_model_complete_start, __pi_judge_start or __pi_judge_batch_start with \
          the same fields and optional timeout_secs (1-600; default 60 for single \

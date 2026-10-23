@@ -56,8 +56,16 @@ batch `drain({cursor, timeout})` and Python `drain(cursor=..., timeout=...)`
 expose [native cursor-based result pages](eval-background-completions.md#collect-batch-results-as-they-finish).
 Callers acknowledge pages explicitly after processing; both helpers preserve
 partial failures and current host access checks without implicit cursor state
-or guest polling. The raw `__pi_judge_batch_drain` bridge remains available. Retries and automatic
-backgrounding of arbitrary eval code remain separate work; unknown helper
+or guest polling. The raw `__pi_judge_batch_drain` bridge remains available.
+Retained `judgeBatch` / `judge_batch` accepts `retries` (0–3) and `minOk` /
+`min_ok` (0 through item count). Defaults stay at zero retries and all items
+required, intentionally preserving native behavior rather than OMP v18.12.6's
+defaults of one retry and one required success. The full worst-case attempt
+budget is reserved before admission; retries retain the original deadline,
+never rerun successful peers, and only retry malformed answers or classified
+transient provider failures. `meetsMinimum` reports the threshold separately
+from truthful `allOk`, with all settled items and per-attempt receipts retained.
+Automatic backgrounding of arbitrary eval code remains separate work; unknown helper
 options fail explicitly.
 The typed `completion()` helper uses the uniform model-job bridge
 `__pi_model_complete_start`. The existing raw `__pi_complete_start` contract

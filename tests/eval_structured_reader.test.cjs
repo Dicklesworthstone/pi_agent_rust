@@ -145,7 +145,8 @@ const judgmentValue = value => ({schema:'pi.judgment.v1',answers:{safe:{type:'bo
 const modelResult = (operation, result, failed = false, error = null) => ({
     content:[{type:'text',text:failed ? 'model request failed' : 'model request completed'}],
     details:{schema:'pi.eval.model-job.result.v1',operation,result,error,
-        judgments:{schema:'pi.eval.judgments.v1',attempts:[{attempt:1,status:failed ? 'failed' : 'completed'}]}},
+        judgments:{schema:'pi.eval.judgments.v1',attempts:Array.from({length:operation === 'judgment_batch' ? result?.total ?? 1 : 1},
+            (_,index)=>({attempt:index + 1,status:failed ? 'failed' : 'completed'}))}},
     ...(failed ? {isError:true} : {}),
 });
 const modelSnapshot = (id, operation, result, status = 'exited') =>
@@ -239,6 +240,60 @@ test('mixed judgment batch failures retain ordered successful verdicts and error
     answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native,'failed'));
     assert.deepEqual(JSON.parse(JSON.stringify(await pending)),native);
 });
+test('retained batches pass bounded retry controls and preserve minimum success independently of allOk', async () => {
+    const h = host();
+    const request = await launchModel(h,
+        "judgeBatch(['good','bad'],{safe:{type:'bool',instructions:'safe?'}},{retries:1,minOk:1})",'judgment_batch');
+    assert.equal(request.args.retries,1);
+    assert.equal(request.args.min_ok,1);
+    const payload = {schema:'pi.eval.judgment-batch.v1',total:2,succeeded:1,failed:1,allOk:false,
+        retries:1,minOk:1,meetsMinimum:true,
+        items:[{key:0,ok:true,verdict:judgmentValue(1)},{key:1,ok:false,error:'PI_JUDGE_RESPONSE'}]};
+    const native = modelResult('judgment_batch',payload);
+    native.details.judgments.attempts.push({attempt:3,item:1,itemAttempt:2,status:'failed'});
+    let pending = vm.runInContext('model.wait()',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native));
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)),payload);
+    pending = vm.runInContext('model.progress()',h.context);
+    answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',native));
+    const progress = await pending;
+    assert.equal(progress.meetsMinimum,true);
+    assert.equal(progress.minOk,1);
+    assert.equal(progress.failed,1);
+    assert.equal(progress.judgments.attempts.length,3);
+    for (const change of [{meetsMinimum:false},{allOk:true},{minOk:3},{retries:0},{retries:4}]) {
+        const invalid = JSON.parse(JSON.stringify(native));
+        Object.assign(invalid.details.result,change);
+        pending = vm.runInContext('model.status()',h.context);
+        answer(h,h.requests.at(-1),modelSnapshot('model-native','judgment_batch',invalid));
+        await assert.rejects(pending,/EVAL_MODEL_PROTOCOL/);
+    }
+});
+test('retry progress counts original items while retaining extra failed attempt receipts', async () => {
+    const h = host();
+    await startProgressBatch(h);
+    const native = batchProgressResult();
+    const partial = native.details.partialResult.details;
+    Object.assign(partial,{retries:1,minOk:1,meetsMinimum:true,completed:1,failed:0,queued:2});
+    partial.items[1] = {key:'bad',status:'queued'};
+    partial.judgments.attempts.push({attempt:5,item:1,itemAttempt:2,status:'queued'});
+    const pending = vm.runInContext('model.progress()',h.context);
+    answer(h,h.requests.at(-1),batchProgressSnapshot(native));
+    const progress = await pending;
+    assert.equal(progress.completed,1);
+    assert.equal(progress.items[1].status,'queued');
+    assert.equal(progress.judgments.attempts[1].status,'failed');
+    assert.equal(progress.judgments.attempts.length,5);
+    assert.equal(progress.complete,false);
+});
+test('invalid batch retry and minimum controls never dispatch a bridge request', async () => {
+    for (const options of ['{retries:-1}','{retries:4}','{retries:0.5}','{retries:true}',
+        '{retries:null}','{minOk:-1}','{minOk:3}','{minOk:0.5}','{minOk:false}','{minOk:null}']) {
+        const h = host();
+        await assert.rejects(vm.runInContext(`judgeBatch(['a','b'],{q:{}},${options})`,h.context),/EVAL_MODEL_INPUT/);
+        assert.equal(h.requests.length,0);
+    }
+});
 test('batch drains preserve complete failed evidence independently of interruption status', async () => {
     const h = host();
     await launchModel(h,"judgeBatch(['good','bad'],{safe:{type:'bool',instructions:'safe?'}})",'judgment_batch');
@@ -324,6 +379,7 @@ test('settled batch progress derives complete counts and ordered items from the 
         const progress = JSON.parse(JSON.stringify(await pending));
         assert.deepEqual(progress,{schema:'pi.eval.model-job.progress.v1',operation:'judgment_batch',
             complete:true,jobStatus:status,total:2,completed:2,succeeded:payload.succeeded,failed:payload.failed,
+            retries:0,minOk:2,meetsMinimum:!failed,
             queued:0,running:0,items:[{key:'first',status:'completed',verdict:judgmentValue(1)},failed
                 ? {key:'second',status:'failed',error:'PI_JUDGE_PROVIDER'}
                 : {key:'second',status:'completed',verdict:judgmentValue(0)}],judgments:native.details.judgments});
@@ -425,7 +481,7 @@ test('model helpers reject invalid role, retry, threshold and authority options 
         "completion('work',{api_key:'secret'})",
         "completion('work',{maxTokens:0})","completion('work',{timeoutSeconds:601})",
         "judge('state',{q:{}},{retries:1})","judge('state',{q:{}},{operation:'other'})",
-        "judgeBatch(['state'],{q:{}},{minOk:1})","judgeBatch(['state'],{q:{}},{intent:'custom'})",
+        "judgeBatch(['state'],{q:{}},{minOk:2})","judgeBatch(['state'],{q:{}},{intent:'custom'})",
         "judgeBatch(['state'],{q:{}},{concurrency:9})","judgeBatch([],{q:{}})",
         "completion.attach('invalid id')","completion('work',JSON.parse('{\"__proto__\":{}}'))"]) {
         const h = host(); await assert.rejects(vm.runInContext(expression,h.context),/EVAL_MODEL_INPUT/);
