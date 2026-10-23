@@ -5,6 +5,22 @@ use futures::Stream;
 use std::pin::Pin;
 use std::sync::Mutex;
 
+
+#[test]
+fn process_wide_auxiliary_gate_caps_and_releases_slots() {
+    let gate = AuxiliaryModelGate::new(2);
+    let first = gate.try_acquire().expect("first auxiliary slot");
+    let second = gate.try_acquire().expect("second auxiliary slot");
+    assert!(gate.try_acquire().is_none());
+    assert_eq!(gate.active.load(Ordering::Acquire), 2);
+    drop(first);
+    let replacement = gate.try_acquire().expect("released auxiliary slot");
+    assert_eq!(gate.active.load(Ordering::Acquire), 2);
+    drop(second);
+    drop(replacement);
+    assert_eq!(gate.active.load(Ordering::Acquire), 0);
+}
+
 fn request() -> JudgmentRequest {
     JudgmentRequest::parse(json!({
         "state":{"change":"adds a regression test"},

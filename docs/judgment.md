@@ -567,6 +567,14 @@ uses one ordinary native job slot. The process-wide limit of eight live jobs
 is shared with shell jobs, subagents and workpools; a capacity or shutdown
 rejection starts no provider work.
 
+All auxiliary provider requests also share a **process-wide 32-request gate**.
+This covers foreground completions and judgments, every batch item, and retained
+model jobs because they converge on the same terminal request collector. Waiting
+for a slot stays inside the request's existing 60-second ceiling and inherited
+cancellation; it does not grant a fresh deadline, retry a request, or reserve a
+provider call before a slot exists. A permit is released when stream collection
+finishes, fails, times out, or is cancelled.
+
 ### Results, errors and retention
 
 The ordinary `pi.host_job.v1` snapshot contains the final native `ToolOutput`
