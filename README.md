@@ -355,8 +355,18 @@ Each standalone CLI invocation starts a new process, so its in-memory cache is
 fresh. The five-minute cache only avoids repeat discovery calls made within one
 long-lived process by SDK/library users; `--refresh-models` bypasses that cache.
 
+Discovery also reads usable `supported_reasoning_levels` advertisements, including
+`metadata.supported_reasoning_levels` and entries shaped as `{"effort":"high"}`.
+Nested metadata takes precedence. Pi preserves the advertised tiers through the
+cache and persisted catalog, constrains the model's thinking choices to those
+tiers, and sends the selected effort through the provider's request format.
+The recognized tiers are `off` (also advertised as `none`), `minimal`, `low`,
+`medium`, `high`, `xhigh`, and `max`. Missing, empty, or unusable advertisements
+leave existing model capabilities intact. Your configured thinking level remains
+authoritative; discovery does not select a server-advertised default effort.
+
 Persistence is opt-in. The v2 `~/.pi/agent/models.fetched.json` schema stores
-provider/model IDs, the fetch timestamp, and a non-secret SHA-256 identity
+provider/model IDs, optional bounded reasoning tiers, the fetch timestamp, and a non-secret SHA-256 identity
 binding membership to the provider, API, query-free endpoint, auth-header
 mode, recognized credential-query ordered name/presence shape, and
 request-header name/presence shape that produced it. Pi never persists a static fallback, API

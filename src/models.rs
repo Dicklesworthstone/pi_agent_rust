@@ -619,6 +619,12 @@ pub(crate) struct PersistedFetchedProvider {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedFetchedModel {
     pub(crate) id: String,
+    #[serde(
+        default,
+        rename = "reasoningLevels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) reasoning_levels: Option<Vec<crate::model::ThinkingLevel>>,
 }
 
 fn deserialize_fetched_providers<'de, D>(
@@ -3382,6 +3388,17 @@ fn apply_fetched_models(
             )
         })
         .collect::<HashMap<_, _>>();
+    let advertised = config
+        .providers
+        .iter()
+        .flat_map(|(provider, config)| {
+            config
+                .models
+                .iter()
+                .flatten()
+                .map(move |model| (fetched_model_key(provider, &model.id), model))
+        })
+        .collect::<HashMap<_, _>>();
 
     apply_custom_models(auth, models, &config, base_dir);
 
@@ -3389,10 +3406,19 @@ fn apply_fetched_models(
         .iter_mut()
         .filter(|entry| fetched_providers.contains(&canonical_provider_key(&entry.model.provider)))
     {
-        if let Some(existing) =
-            preserved.get(&fetched_model_key(&entry.model.provider, &entry.model.id))
-        {
+        let key = fetched_model_key(&entry.model.provider, &entry.model.id);
+        if let Some(existing) = preserved.get(&key) {
             entry.clone_from(existing);
+        }
+        if let Some(discovered) = advertised.get(&key) {
+            if let Some(reasoning) = discovered.reasoning {
+                entry.model.reasoning = reasoning;
+            }
+            if let Some(levels) = &discovered.thinking_level_map {
+                let compat = entry.compat.get_or_insert_with(CompatConfig::default);
+                compat.thinking_level_map = Some(levels.clone());
+                compat.supports_reasoning_effort = Some(true);
+            }
         }
     }
 }
@@ -4779,6 +4805,15 @@ fn load_fetched_models_config(
             .models
             .into_iter()
             .map(|model| ModelConfig {
+                reasoning: model.reasoning_levels.as_ref().map(|levels| {
+                    levels
+                        .iter()
+                        .any(|level| *level != crate::model::ThinkingLevel::Off)
+                }),
+                thinking_level_map: model
+                    .reasoning_levels
+                    .as_deref()
+                    .map(fetched_thinking_level_map),
                 id: model.id,
                 ..ModelConfig::default()
             })
@@ -4793,6 +4828,34 @@ fn load_fetched_models_config(
     })
     .collect();
     Ok((ModelsConfig { providers }, binding_errors))
+}
+
+fn fetched_thinking_level_map(
+    levels: &[crate::model::ThinkingLevel],
+) -> HashMap<String, Option<String>> {
+    use crate::model::ThinkingLevel;
+    [
+        ThinkingLevel::Off,
+        ThinkingLevel::Minimal,
+        ThinkingLevel::Low,
+        ThinkingLevel::Medium,
+        ThinkingLevel::High,
+        ThinkingLevel::XHigh,
+        ThinkingLevel::Max,
+    ]
+    .into_iter()
+    .map(|level| {
+        let key = level.to_string();
+        let value = levels.contains(&level).then(|| {
+            if level == ThinkingLevel::Off {
+                "none".to_string()
+            } else {
+                key.clone()
+            }
+        });
+        (key, value)
+    })
+    .collect()
 }
 
 pub(crate) fn parse_persisted_fetched_catalog(
@@ -4868,6 +4931,22 @@ pub(crate) fn validate_persisted_fetched_catalog(
             )));
         }
         for model in &fetched.models {
+            if let Some(levels) = &model.reasoning_levels {
+                if levels.is_empty() || levels.len() > 7 {
+                    return Err(Error::config(
+                        "Generated model reasoning levels must contain one to seven tiers",
+                    ));
+                }
+                if levels
+                    .iter()
+                    .enumerate()
+                    .any(|(index, level)| levels[..index].contains(level))
+                {
+                    return Err(Error::config(
+                        "Generated model reasoning levels contain duplicate tiers",
+                    ));
+                }
+            }
             if !is_safe_model_catalog_identifier(&model.id, MAX_FETCHED_MODEL_ID_BYTES) {
                 return Err(Error::config(format!(
                     "Generated model catalog contains an invalid model ID for provider {provider:?}"
@@ -7786,6 +7865,66 @@ mod tests {
     }
 
     #[test]
+    fn generated_reasoning_capabilities_are_bounded_and_cannot_supply_config() {
+        let catalog = |row: serde_json::Value| {
+            serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA,
+                "providers": {"openai": {
+                    "routeFingerprint": format!("sha256:{}", "0".repeat(64)),
+                    "fetchedAtUnixMs": 1,
+                    "models": [row]
+                }}
+            })
+            .to_string()
+        };
+        for levels in [
+            serde_json::json!([]),
+            serde_json::json!(["high", "high"]),
+            serde_json::json!([
+                "off", "minimal", "low", "medium", "high", "xhigh", "max", "low"
+            ]),
+            serde_json::json!(["unknown"]),
+            serde_json::json!([{"effort": "high"}]),
+            serde_json::json!("high"),
+        ] {
+            assert!(
+                parse_persisted_fetched_catalog(&catalog(serde_json::json!({
+                    "id": "new-model", "reasoningLevels": levels
+                })))
+                .is_err(),
+                "invalid persisted tiers: {levels}"
+            );
+        }
+        for (field, value) in [
+            ("baseUrl", serde_json::json!("https://untrusted.example/v1")),
+            ("headers", serde_json::json!({"Authorization": "secret"})),
+            (
+                "compat",
+                serde_json::json!({"supportsReasoningEffort": true}),
+            ),
+            ("thinkingLevelMap", serde_json::json!({"high": "arbitrary"})),
+            ("reasoning", serde_json::json!(true)),
+        ] {
+            let mut row = serde_json::json!({"id": "new-model", "reasoningLevels": ["high"]});
+            row[field] = value;
+            assert!(
+                parse_persisted_fetched_catalog(&catalog(row)).is_err(),
+                "unauthorized field: {field}"
+            );
+        }
+        let valid = parse_persisted_fetched_catalog(&catalog(serde_json::json!({
+            "id": "new-model", "reasoningLevels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }))).expect("all seven canonical tiers are allowed");
+        assert_eq!(
+            valid.providers["openai"].models[0]
+                .reasoning_levels
+                .as_ref()
+                .map(Vec::len),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn model_catalog_discovery_rejects_custom_provider_without_explicit_endpoint() {
         let dir = tempdir().expect("tempdir");
         let models_path = dir.path().join("models.json");
@@ -8175,6 +8314,54 @@ mod tests {
             registry.find("openai", "gpt-4o").is_none(),
             "models absent from the live membership must not be reintroduced"
         );
+    }
+
+    #[test]
+    fn fetched_reasoning_overlays_preserved_metadata_and_can_disable_reasoning() {
+        use crate::model::ThinkingLevel;
+
+        let (dir, auth) = test_auth_storage();
+        let baseline = ModelRegistry::load(&auth, None);
+        let models_path = dir.path().join("models.json");
+        let route = resolve_model_catalog_provider_config("openai", &models_path)
+            .expect("resolve OpenAI route")
+            .expect("built-in OpenAI route");
+        let mut provider = fetched_provider_json("openai", &route, &["gpt-4o", "gpt-5.6"]);
+        provider["models"][0]["reasoningLevels"] = serde_json::json!(["xhigh"]);
+        provider["models"][1]["reasoningLevels"] = serde_json::json!(["off"]);
+        std::fs::write(
+            fetched_models_path(&models_path),
+            serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA, "providers": {"openai": provider}
+            })
+            .to_string(),
+        )
+        .expect("write advertised reasoning");
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        assert!(registry.error().is_none(), "{:?}", registry.error());
+        for (id, reasoning, levels) in [
+            ("gpt-4o", true, vec![ThinkingLevel::XHigh]),
+            ("gpt-5.6", false, vec![ThinkingLevel::Off]),
+        ] {
+            let mut expected = baseline.find("openai", id).expect("baseline model").model;
+            expected.reasoning = reasoning;
+            let discovered = registry.find("openai", id).expect("discovered known model");
+            assert_eq!(
+                serde_json::to_value(&discovered.model).expect("discovered metadata"),
+                serde_json::to_value(expected).expect("baseline metadata"),
+                "all other model metadata must survive the capability overlay"
+            );
+            assert_eq!(discovered.available_thinking_levels(), levels);
+            let compat = discovered
+                .compat
+                .as_ref()
+                .expect("advertised compatibility");
+            assert_eq!(compat.supports_reasoning_effort, Some(true));
+            assert_eq!(
+                compat.thinking_level_map.as_ref().map(HashMap::len),
+                Some(7)
+            );
+        }
     }
 
     #[test]

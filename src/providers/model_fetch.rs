@@ -61,6 +61,7 @@ use tempfile::NamedTempFile;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::http::client::{Client, effective_default_request_timeout};
+use crate::model::ThinkingLevel;
 #[cfg(test)]
 use crate::models::FETCHED_MODELS_SCHEMA;
 use crate::models::{
@@ -82,6 +83,24 @@ use crate::providers::normalize_openai_base;
 pub const MODEL_CACHE_TTL: Duration = Duration::from_mins(5);
 const MODEL_CACHE_MAX_ENTRIES: usize = 16;
 const MODEL_CACHE_MAX_MODEL_ID_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ADVERTISED_REASONING_LEVELS: usize = 32;
+
+type ReasoningCatalog = HashMap<String, Vec<ThinkingLevel>>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DiscoveredModels {
+    models: Vec<String>,
+    reasoning_levels: ReasoningCatalog,
+}
+
+impl From<Vec<String>> for DiscoveredModels {
+    fn from(models: Vec<String>) -> Self {
+        Self {
+            models,
+            reasoning_levels: ReasoningCatalog::new(),
+        }
+    }
+}
 
 /// Environment variable that disables the cache entirely.  Useful for
 /// debugging and for ad-hoc verification of provider catalog changes without
@@ -91,6 +110,7 @@ pub const DISABLE_CACHE_ENV: &str = "PI_DISABLE_MODEL_CACHE";
 #[derive(Debug, Clone)]
 struct CacheEntry {
     models: Vec<String>,
+    reasoning_levels: ReasoningCatalog,
     fetched_at_unix_ms: u64,
     inserted: Instant,
 }
@@ -111,6 +131,7 @@ pub enum ModelCatalogSource {
 pub struct ProviderModelCatalog {
     provider: String,
     models: Vec<String>,
+    reasoning_levels: ReasoningCatalog,
     source: ModelCatalogSource,
     route_fingerprint: Option<String>,
     route_persistable: bool,
@@ -126,6 +147,13 @@ impl ProviderModelCatalog {
     /// Model IDs in the discovered catalog.
     pub fn models(&self) -> &[String] {
         &self.models
+    }
+
+    /// The usable reasoning tiers advertised for this model, if any. An absent
+    /// advertisement leaves the model's existing capabilities unchanged.
+    pub fn reasoning_levels(&self, model_id: &str) -> Option<&[ThinkingLevel]> {
+        let (_, model_id) = normalized_registry_key(&self.provider, model_id);
+        self.reasoning_levels.get(&model_id).map(Vec::as_slice)
     }
 
     /// Whether the catalog came from a live response, its verified cache, or
@@ -319,7 +347,7 @@ fn normalize_model_ids(
     Ok(model_ids)
 }
 
-fn cache_lookup(key: &str) -> Option<(Vec<String>, u64)> {
+fn cache_lookup(key: &str) -> Option<(DiscoveredModels, u64)> {
     let mut guard = cache().lock().ok()?;
     let now = Instant::now();
     if guard.get(key).is_some_and(|entry| {
@@ -329,9 +357,15 @@ fn cache_lookup(key: &str) -> Option<(Vec<String>, u64)> {
         guard.remove(key);
         return None;
     }
-    guard
-        .get(key)
-        .map(|entry| (entry.models.clone(), entry.fetched_at_unix_ms))
+    guard.get(key).map(|entry| {
+        (
+            DiscoveredModels {
+                models: entry.models.clone(),
+                reasoning_levels: entry.reasoning_levels.clone(),
+            },
+            entry.fetched_at_unix_ms,
+        )
+    })
 }
 
 fn model_id_bytes(models: &[String]) -> usize {
@@ -340,8 +374,24 @@ fn model_id_bytes(models: &[String]) -> usize {
         .fold(0usize, |total, model| total.saturating_add(model.len()))
 }
 
-fn cache_store(key: String, models: Vec<String>, fetched_at_unix_ms: u64) {
-    let incoming_bytes = model_id_bytes(&models);
+fn catalog_bytes(models: &[String], reasoning_levels: &ReasoningCatalog) -> usize {
+    reasoning_levels
+        .iter()
+        .fold(model_id_bytes(models), |total, (id, levels)| {
+            total.saturating_add(id.len()).saturating_add(
+                levels
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ThinkingLevel>()),
+            )
+        })
+}
+
+fn cache_store(key: String, catalog: impl Into<DiscoveredModels>, fetched_at_unix_ms: u64) {
+    let DiscoveredModels {
+        models,
+        reasoning_levels,
+    } = catalog.into();
+    let incoming_bytes = catalog_bytes(&models, &reasoning_levels);
     if incoming_bytes > MODEL_CACHE_MAX_MODEL_ID_BYTES {
         return;
     }
@@ -354,7 +404,7 @@ fn cache_store(key: String, models: Vec<String>, fetched_at_unix_ms: u64) {
         guard.remove(&key);
         while guard.len() >= MODEL_CACHE_MAX_ENTRIES
             || guard.values().fold(incoming_bytes, |total, entry| {
-                total.saturating_add(model_id_bytes(&entry.models))
+                total.saturating_add(catalog_bytes(&entry.models, &entry.reasoning_levels))
             }) > MODEL_CACHE_MAX_MODEL_ID_BYTES
         {
             let Some(oldest_key) = guard
@@ -374,6 +424,7 @@ fn cache_store(key: String, models: Vec<String>, fetched_at_unix_ms: u64) {
             key,
             CacheEntry {
                 models,
+                reasoning_levels,
                 fetched_at_unix_ms,
                 inserted: now,
             },
@@ -485,12 +536,13 @@ async fn fetch_provider_model_catalog_with_route(
     {
         tracing::debug!(
             provider = %canonical_provider_key(provider),
-            count = cached.len(),
+            count = cached.models.len(),
             "model cache hit"
         );
         return Ok(ProviderModelCatalog {
             provider: canonical_provider,
-            models: cached,
+            models: cached.models,
+            reasoning_levels: cached.reasoning_levels,
             source: ModelCatalogSource::Cache,
             route_fingerprint,
             route_persistable,
@@ -540,7 +592,7 @@ async fn refresh_provider_model_catalog_with_route(
     let route_fingerprint = model_catalog_route_fingerprint(provider, &route);
     let route_persistable = model_catalog_route_is_persistable(&route);
     let live = fetch_live_models(provider, &effective_api_key, &route).await?;
-    if live.is_empty() {
+    if live.models.is_empty() {
         return Err(Error::api(format!(
             "live model fetch for {provider:?} returned an empty catalog"
         )));
@@ -551,7 +603,8 @@ async fn refresh_provider_model_catalog_with_route(
     }
     Ok(ProviderModelCatalog {
         provider: canonical_provider_key(provider),
-        models: live,
+        models: live.models,
+        reasoning_levels: live.reasoning_levels,
         source: ModelCatalogSource::Live,
         route_fingerprint: Some(route_fingerprint),
         route_persistable,
@@ -579,7 +632,7 @@ async fn fetch_and_cache(
         ))),
     };
     match live_result {
-        Ok(live) if !live.is_empty() => {
+        Ok(live) if !live.models.is_empty() => {
             let fetched_at_unix_ms = current_unix_timestamp_ms()?;
             if !cache_disabled()
                 && let Some(key) = key
@@ -588,7 +641,8 @@ async fn fetch_and_cache(
             }
             Ok(ProviderModelCatalog {
                 provider: canonical_provider,
-                models: live,
+                models: live.models,
+                reasoning_levels: live.reasoning_levels,
                 source: ModelCatalogSource::Live,
                 route_fingerprint: route_fingerprint.map(ToString::to_string),
                 route_persistable: route.is_some_and(model_catalog_route_is_persistable),
@@ -603,6 +657,7 @@ async fn fetch_and_cache(
             Ok(ProviderModelCatalog {
                 provider: canonical_provider,
                 models: static_registry_models(provider)?,
+                reasoning_levels: ReasoningCatalog::new(),
                 source: ModelCatalogSource::StaticFallback,
                 route_fingerprint: None,
                 route_persistable: false,
@@ -618,6 +673,7 @@ async fn fetch_and_cache(
             Ok(ProviderModelCatalog {
                 provider: canonical_provider,
                 models: static_registry_models(provider)?,
+                reasoning_levels: ReasoningCatalog::new(),
                 source: ModelCatalogSource::StaticFallback,
                 route_fingerprint: None,
                 route_persistable: false,
@@ -705,8 +761,7 @@ pub fn persist_provider_model_catalog(
     })?;
     persist_provider_model_catalog_rows(
         models_path,
-        &catalog.provider,
-        &catalog.models,
+        catalog,
         route_fingerprint,
         fetched_at_unix_ms,
     )
@@ -714,15 +769,13 @@ pub fn persist_provider_model_catalog(
 
 fn persist_provider_model_catalog_rows(
     models_path: &Path,
-    provider: &str,
-    models: &[String],
+    catalog: &ProviderModelCatalog,
     route_fingerprint: &str,
     fetched_at_unix_ms: u64,
 ) -> Result<PathBuf> {
     persist_provider_model_catalog_rows_with_hook(
         models_path,
-        provider,
-        models,
+        catalog,
         route_fingerprint,
         fetched_at_unix_ms,
         |_| Ok(()),
@@ -731,8 +784,7 @@ fn persist_provider_model_catalog_rows(
 
 fn persist_provider_model_catalog_rows_with_hook<F>(
     models_path: &Path,
-    provider: &str,
-    models: &[String],
+    catalog: &ProviderModelCatalog,
     route_fingerprint: &str,
     fetched_at_unix_ms: u64,
     before_replace: F,
@@ -742,8 +794,7 @@ where
 {
     persist_provider_model_catalog_rows_with_hooks(
         models_path,
-        provider,
-        models,
+        catalog,
         route_fingerprint,
         fetched_at_unix_ms,
         before_replace,
@@ -753,8 +804,7 @@ where
 
 fn persist_provider_model_catalog_rows_with_hooks<F, G>(
     models_path: &Path,
-    provider: &str,
-    models: &[String],
+    catalog: &ProviderModelCatalog,
     route_fingerprint: &str,
     fetched_at_unix_ms: u64,
     before_replace: F,
@@ -764,9 +814,9 @@ where
     F: FnOnce(&Path) -> std::io::Result<()>,
     G: FnOnce(&Path) -> std::io::Result<()>,
 {
-    let provider = validate_provider_id(provider)?;
+    let provider = validate_provider_id(&catalog.provider)?;
 
-    let model_ids = normalize_model_ids(provider, models.iter().cloned())?;
+    let model_ids = normalize_model_ids(provider, catalog.models.iter().cloned())?;
     if model_ids.is_empty() {
         return Err(Error::validation(
             "refusing to persist an empty fetched model catalog",
@@ -787,6 +837,7 @@ where
         parent,
         provider,
         model_ids,
+        reasoning_levels: &catalog.reasoning_levels,
         route_fingerprint,
         fetched_at_unix_ms,
     };
@@ -799,6 +850,7 @@ struct CatalogPersistenceRequest<'a> {
     parent: &'a Path,
     provider: &'a str,
     model_ids: Vec<String>,
+    reasoning_levels: &'a ReasoningCatalog,
     route_fingerprint: &'a str,
     fetched_at_unix_ms: u64,
 }
@@ -807,6 +859,7 @@ fn merge_provider_catalog(
     mut catalog: PersistedFetchedCatalog,
     provider: &str,
     model_ids: Vec<String>,
+    reasoning_levels: &ReasoningCatalog,
     route_fingerprint: &str,
     fetched_at_unix_ms: u64,
 ) -> Result<PersistedFetchedCatalog> {
@@ -815,13 +868,18 @@ fn merge_provider_catalog(
         .providers
         .retain(|existing, _| canonical_provider_key(existing) != provider);
     catalog.providers.insert(
-        provider,
+        provider.clone(),
         PersistedFetchedProvider {
             route_fingerprint: route_fingerprint.to_string(),
             fetched_at_unix_ms,
             models: model_ids
                 .into_iter()
-                .map(|id| PersistedFetchedModel { id })
+                .map(|id| PersistedFetchedModel {
+                    reasoning_levels: reasoning_levels
+                        .get(&normalized_registry_key(&provider, &id).1)
+                        .cloned(),
+                    id,
+                })
                 .collect(),
         },
     );
@@ -1480,6 +1538,7 @@ where
         parent,
         provider,
         model_ids,
+        reasoning_levels,
         route_fingerprint,
         fetched_at_unix_ms,
     } = request;
@@ -1517,6 +1576,7 @@ where
         catalog,
         provider,
         model_ids,
+        reasoning_levels,
         route_fingerprint,
         fetched_at_unix_ms,
     )?;
@@ -1832,6 +1892,7 @@ where
         path,
         provider,
         model_ids,
+        reasoning_levels,
         route_fingerprint,
         fetched_at_unix_ms,
         ..
@@ -1882,6 +1943,7 @@ where
         catalog,
         provider,
         model_ids,
+        reasoning_levels,
         route_fingerprint,
         fetched_at_unix_ms,
     )?;
@@ -1951,6 +2013,7 @@ where
         parent,
         provider,
         model_ids,
+        reasoning_levels,
         route_fingerprint,
         fetched_at_unix_ms,
     } = request;
@@ -1986,6 +2049,7 @@ where
         load_persisted_catalog(path)?,
         provider,
         model_ids,
+        reasoning_levels,
         route_fingerprint,
         fetched_at_unix_ms,
     )?;
@@ -2046,6 +2110,45 @@ struct OpenAiModelsResponse {
 struct OpenAiModelRow {
     #[serde(deserialize_with = "deserialize_live_model_id")]
     id: String,
+    #[serde(default)]
+    supported_reasoning_levels: serde_json::Value,
+    #[serde(default)]
+    metadata: serde_json::Value,
+}
+
+impl OpenAiModelRow {
+    fn reasoning_levels(&self) -> Option<Vec<ThinkingLevel>> {
+        let advertised = self
+            .metadata
+            .get("supported_reasoning_levels")
+            .filter(|value| !value.is_null())
+            .unwrap_or(&self.supported_reasoning_levels)
+            .as_array()?;
+        if advertised.len() > MAX_ADVERTISED_REASONING_LEVELS {
+            return None;
+        }
+        let mut levels = Vec::new();
+        for value in advertised {
+            let effort = value
+                .as_str()
+                .or_else(|| value.get("effort").and_then(serde_json::Value::as_str));
+            let level = match effort {
+                Some("off" | "none") => ThinkingLevel::Off,
+                Some("minimal") => ThinkingLevel::Minimal,
+                Some("low") => ThinkingLevel::Low,
+                Some("medium") => ThinkingLevel::Medium,
+                Some("high") => ThinkingLevel::High,
+                Some("xhigh") => ThinkingLevel::XHigh,
+                Some("max") => ThinkingLevel::Max,
+                _ => continue,
+            };
+            if !levels.contains(&level) {
+                levels.push(level);
+            }
+        }
+        levels.sort_unstable_by_key(|level| level.default_budget());
+        (!levels.is_empty()).then_some(levels)
+    }
 }
 
 fn deserialize_live_model_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
@@ -2114,7 +2217,7 @@ async fn fetch_live_models(
     provider: &str,
     api_key: &str,
     route: &ModelCatalogProviderConfig,
-) -> Result<Vec<String>> {
+) -> Result<DiscoveredModels> {
     let provider = validate_provider_id(provider)?;
     validate_route_headers(route)?;
     let custom_authorization = custom_authorization_header(route);
@@ -2181,10 +2284,10 @@ async fn fetch_live_models(
         )));
     }
 
-    parse_openai_model_ids(provider, body)
+    parse_openai_model_catalog(provider, body)
 }
 
-fn parse_openai_model_ids(provider: &str, body: &str) -> Result<Vec<String>> {
+fn parse_openai_model_catalog(provider: &str, body: &str) -> Result<DiscoveredModels> {
     let mut deserializer = serde_json::Deserializer::from_str(body);
     let parsed = OpenAiModelsResponse::deserialize(&mut deserializer).map_err(|err| {
         Error::api(format!(
@@ -2197,10 +2300,35 @@ fn parse_openai_model_ids(provider: &str, body: &str) -> Result<Vec<String>> {
         ))
     })?;
 
-    normalize_model_ids(provider, parsed.data.into_iter().map(|row| row.id)).map_err(|error| {
-        Error::api(format!(
-            "invalid /v1/models catalog for {provider:?}: {error}"
-        ))
+    let models = normalize_model_ids(provider, parsed.data.iter().map(|row| row.id.clone()))
+        .map_err(|error| {
+            Error::api(format!(
+                "invalid /v1/models catalog for {provider:?}: {error}"
+            ))
+        })?;
+    let mut reasoning_levels = ReasoningCatalog::new();
+    let mut conflicting_ids = HashSet::new();
+    for row in parsed.data {
+        let Some(levels) = row.reasoning_levels() else {
+            continue;
+        };
+        let (_, id) = normalized_registry_key(provider, &row.id);
+        if conflicting_ids.contains(&id) {
+            continue;
+        }
+        if reasoning_levels
+            .get(&id)
+            .is_some_and(|existing| existing != &levels)
+        {
+            reasoning_levels.remove(&id);
+            conflicting_ids.insert(id);
+        } else {
+            reasoning_levels.insert(id, levels);
+        }
+    }
+    Ok(DiscoveredModels {
+        models,
+        reasoning_levels,
     })
 }
 
@@ -2354,6 +2482,7 @@ mod tests {
         ProviderModelCatalog {
             provider: canonical_provider_key(provider),
             models,
+            reasoning_levels: ReasoningCatalog::new(),
             source: ModelCatalogSource::Live,
             route_fingerprint: Some(model_catalog_route_fingerprint(provider, route)),
             route_persistable: model_catalog_route_is_persistable(route),
@@ -2364,6 +2493,193 @@ mod tests {
     fn verified_catalog(provider: &str, models: Vec<String>) -> ProviderModelCatalog {
         let route = built_in_route(provider);
         verified_catalog_for_route(provider, &route, models)
+    }
+
+    fn serve_model_catalog(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog fixture");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("fixture address")
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("bounded fixture accept");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "catalog fixture accept timed out"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    // ubs:ignore an unexpected fixture socket error is an assertion failure
+                    Err(error) => panic!("catalog fixture accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("bounded fixture read");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                assert!(
+                    Instant::now() < deadline,
+                    "catalog fixture headers timed out"
+                );
+                match stream.read(&mut buffer) {
+                    Ok(0) => panic!("catalog fixture request ended before headers"),
+                    Ok(count) => request.extend_from_slice(&buffer[..count]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    // ubs:ignore an unexpected fixture socket error is an assertion failure
+                    Err(error) => panic!("catalog fixture read: {error}"),
+                }
+            }
+            assert!(request.starts_with(b"GET /v1/models "));
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("write catalog fixture response");
+        });
+        (base_url, server)
+    }
+
+    fn reasoning_request(
+        entry: &crate::models::ModelEntry,
+        level: ThinkingLevel,
+    ) -> serde_json::Value {
+        let provider = crate::providers::openai::OpenAIProvider::new(&entry.model.id)
+            .with_provider_name(&entry.model.provider)
+            .with_base_url(&entry.model.base_url)
+            .with_reasoning(entry.model.reasoning)
+            .with_compat(entry.compat.clone());
+        serde_json::to_value(provider.build_request(
+            &crate::provider::Context::default(),
+            &crate::provider::StreamOptions {
+                thinking_level: Some(level),
+                ..crate::provider::StreamOptions::default()
+            },
+        ))
+        .expect("serialize actual provider request")
+    }
+
+    #[test]
+    fn advertised_reasoning_survives_network_cache_persistence_and_provider_requests() {
+        let _guard = cache_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_model_cache();
+        let (base_url, server) = serve_model_catalog(
+            r#"{"data":[{
+            "id":"future-reasoner",
+            "supported_reasoning_levels":["low"],
+            "metadata":{"supported_reasoning_levels":[{"effort":"xhigh"}],"default_reasoning_level":"low"}
+        }]}"#,
+        );
+        let route = test_catalog_route(&base_url);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let live = runtime
+            .block_on(refresh_provider_model_catalog_with_route(
+                "catalog-test",
+                "",
+                route.clone(),
+            ))
+            .expect("live catalog");
+        server.join().expect("catalog server");
+        assert_eq!(live.source(), ModelCatalogSource::Live);
+        assert_eq!(
+            live.reasoning_levels("FUTURE-REASONER"),
+            Some([ThinkingLevel::XHigh].as_slice())
+        );
+        let cached = runtime
+            .block_on(fetch_provider_model_catalog_with_route(
+                "catalog-test",
+                "",
+                Some(route),
+            ))
+            .expect("cached catalog");
+        assert_eq!(cached.source(), ModelCatalogSource::Cache);
+        assert_eq!(
+            cached.reasoning_levels("future-reasoner"),
+            live.reasoning_levels("future-reasoner")
+        );
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let models_path = directory.path().join("models.json");
+        let manual = serde_json::json!({"providers":{"catalog-test":{
+            "api":"openai-completions", "baseUrl":base_url, "authHeader":false
+        }}});
+        std::fs::write(&models_path, manual.to_string()).expect("write manual route");
+        let persisted_path = persist_provider_model_catalog(&models_path, &cached)
+            .expect("persist cached reasoning");
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(persisted_path).expect("read persisted catalog"))
+                .expect("decode persisted catalog");
+        assert_eq!(
+            persisted["providers"]["catalog-test"]["models"][0],
+            serde_json::json!({"id":"future-reasoner", "reasoningLevels":["xhigh"]})
+        );
+        clear_model_cache();
+        let registry =
+            ModelRegistry::load_with_credential_resolver(Some(models_path.clone()), |_| None);
+        assert!(registry.error().is_none(), "{:?}", registry.error());
+        let entry = registry
+            .find("catalog-test", "future-reasoner")
+            .expect("restored model");
+        assert!(entry.model.reasoning);
+        assert_eq!(
+            entry.available_thinking_levels(),
+            vec![ThinkingLevel::XHigh]
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Off),
+            ThinkingLevel::XHigh
+        );
+        let selected = entry.clamp_thinking_level(ThinkingLevel::Max);
+        assert_eq!(selected, ThinkingLevel::XHigh);
+        assert_eq!(
+            reasoning_request(&entry, selected)["reasoning_effort"],
+            "xhigh"
+        );
+        assert_manual_reasoning_overrides(&models_path, &manual);
+    }
+
+    fn assert_manual_reasoning_overrides(models_path: &Path, manual_route: &serde_json::Value) {
+        for provider_patch in [
+            serde_json::json!({"modelOverrides":{"future-reasoner":{"reasoning":false}}}),
+            serde_json::json!({"modelOverrides":{"future-reasoner":{"compat":{"supportsReasoningEffort":false}}}}),
+            serde_json::json!({"modelOverrides":{"future-reasoner":{"thinkingLevelMap":{"xhigh":null}}}}),
+            serde_json::json!({"compat":{"supportsReasoningEffort":false}}),
+        ] {
+            let mut manual = manual_route.clone();
+            manual["providers"]["catalog-test"]
+                .as_object_mut()
+                .expect("manual provider")
+                .extend(provider_patch.as_object().expect("provider patch").clone());
+            std::fs::write(models_path, manual.to_string()).expect("write manual model override");
+            let registry = ModelRegistry::load_with_credential_resolver(
+                Some(models_path.to_path_buf()),
+                |_| None,
+            );
+            assert!(registry.error().is_none(), "{:?}", registry.error());
+            let entry = registry
+                .find("catalog-test", "future-reasoner")
+                .expect("overridden model");
+            assert!(
+                reasoning_request(&entry, ThinkingLevel::XHigh)
+                    .get("reasoning_effort")
+                    .is_none(),
+                "manual overrides must remain authoritative: {provider_patch}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2656,7 +2972,10 @@ mod tests {
         assert!(cache_lookup(&key).is_none(), "starts empty");
         cache_store(key.clone(), vec!["m-1".to_string(), "m-2".to_string()], 123);
         let hit = cache_lookup(&key).expect("fresh entry");
-        assert_eq!(hit, (vec!["m-1".to_string(), "m-2".to_string()], 123));
+        assert_eq!(
+            hit,
+            (vec!["m-1".to_string(), "m-2".to_string()].into(), 123)
+        );
         clear_model_cache();
         assert!(cache_lookup(&key).is_none(), "cleared");
     }
@@ -2704,6 +3023,7 @@ mod tests {
                     key.to_string(),
                     CacheEntry {
                         models: vec!["stale-model".to_string()],
+                        reasoning_levels: ReasoningCatalog::new(),
                         fetched_at_unix_ms: 1,
                         inserted: expired_at,
                     },
@@ -2768,7 +3088,13 @@ mod tests {
         for index in 0..10 {
             cache_store(
                 format!("byte-budget-{index:02}"),
-                vec![one_mebibyte.clone()],
+                DiscoveredModels {
+                    models: vec![one_mebibyte.clone()],
+                    reasoning_levels: ReasoningCatalog::from([(
+                        one_mebibyte.clone(),
+                        vec![ThinkingLevel::High],
+                    )]),
+                },
                 4,
             );
         }
@@ -2777,9 +3103,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let retained_bytes = guard
             .values()
-            .map(|entry| model_id_bytes(&entry.models))
+            .map(|entry| catalog_bytes(&entry.models, &entry.reasoning_levels))
             .sum::<usize>();
         assert!(retained_bytes <= MODEL_CACHE_MAX_MODEL_ID_BYTES);
+        assert_eq!(
+            guard.len(),
+            3,
+            "reasoning metadata must count against the byte budget"
+        );
         assert!(guard.contains_key("byte-budget-09"));
         drop(guard);
         clear_model_cache();
@@ -2817,7 +3148,7 @@ mod tests {
         assert!(error.to_string().contains("api_key"), "{error}");
         assert_eq!(
             cache_lookup(&key),
-            Some((vec!["stale-cache".to_string()], 5)),
+            Some((vec!["stale-cache".to_string()].into(), 5)),
             "failed refresh must not replace or disguise the previous cache"
         );
         clear_model_cache();
@@ -3016,7 +3347,8 @@ mod tests {
         assert_eq!(
             runtime
                 .block_on(fetch_live_models("openai", "", &route))
-                .expect("custom Authorization is sufficient"),
+                .expect("custom Authorization is sufficient")
+                .models,
             vec!["configured-model"]
         );
         let request = server.join().expect("catalog fixture thread");
@@ -3066,12 +3398,94 @@ mod tests {
 
     #[test]
     fn live_model_catalog_rejects_duplicate_json_keys() {
-        let error = parse_openai_model_ids(
+        let error = parse_openai_model_catalog(
             "openai",
             r#"{"data":[{"id":"first"}],"data":[{"id":"second"}]}"#,
         )
         .expect_err("duplicate response keys must not select an attacker-controlled value");
         assert!(error.to_string().contains("duplicate field"), "{error}");
+    }
+
+    #[test]
+    fn live_reasoning_metadata_normalizes_tiers_and_ignores_unusable_advertisements() {
+        let parsed = parse_openai_model_catalog("openai", r#"{"data":[
+            {"id":"all", "supported_reasoning_levels":["max","high","none","off",{"effort":"low"},"minimal","xhigh","medium","unknown",42]},
+            {"id":"nested", "supported_reasoning_levels":["low"],"metadata":{"supported_reasoning_levels":[{"effort":"high"}]}},
+            {"id":"null-metadata", "supported_reasoning_levels":["minimal"],"metadata":{"supported_reasoning_levels":null}},
+            {"id":"off-only", "supported_reasoning_levels":["none"]},
+            {"id":"missing"}
+        ]}"#).expect("parse reasoning metadata");
+        assert_eq!(
+            parsed.reasoning_levels["all"],
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+                ThinkingLevel::Max
+            ]
+        );
+        assert_eq!(parsed.reasoning_levels["nested"], vec![ThinkingLevel::High]);
+        assert_eq!(
+            parsed.reasoning_levels["null-metadata"],
+            vec![ThinkingLevel::Minimal]
+        );
+        assert_eq!(
+            parsed.reasoning_levels["off-only"],
+            vec![ThinkingLevel::Off]
+        );
+        assert!(!parsed.reasoning_levels.contains_key("missing"));
+
+        for unusable in [
+            serde_json::json!([]),
+            serde_json::json!(["future-tier", false, {"effort":9}]),
+            serde_json::json!("high"),
+            serde_json::json!({"effort":"high"}),
+            serde_json::json!(vec!["high"; MAX_ADVERTISED_REASONING_LEVELS + 1]),
+        ] {
+            let body = serde_json::json!({"data":[
+                {"id":"top", "supported_reasoning_levels":unusable},
+                {"id":"nested", "supported_reasoning_levels":["high"],"metadata":{"supported_reasoning_levels":unusable}}
+            ]});
+            let parsed = parse_openai_model_catalog("openai", &body.to_string())
+                .expect("unusable metadata does not remove membership");
+            assert_eq!(parsed.models.len(), 2);
+            assert!(
+                parsed.reasoning_levels.is_empty(),
+                "unusable advertisement: {unusable}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_duplicate_model_reasoning_is_omitted_in_every_order() {
+        let rows = [
+            serde_json::json!({"id":"MODEL", "supported_reasoning_levels":["high"]}),
+            serde_json::json!({"id":"model", "supported_reasoning_levels":["low"]}),
+            serde_json::json!({"id":"Model", "supported_reasoning_levels":["high"]}),
+        ];
+        for order in [[0, 1, 2], [2, 1, 0], [0, 2, 1], [1, 0, 2]] {
+            let body = serde_json::json!({"data":order.map(|index| &rows[index])});
+            let parsed = parse_openai_model_catalog("openai", &body.to_string())
+                .expect("normalized duplicates remain a valid catalog");
+            assert_eq!(parsed.models.len(), 1);
+            assert!(parsed.reasoning_levels.is_empty());
+        }
+        let compatible = parse_openai_model_catalog(
+            "openai",
+            r#"{"data":[
+            {"id":"model", "supported_reasoning_levels":["high", "low"]},
+            {"id":"MODEL", "supported_reasoning_levels":[{"effort":"low"}, "high", "low"]},
+            {"id":"Model"}
+        ]}"#,
+        )
+        .expect("equivalent duplicates");
+        assert_eq!(
+            compatible.reasoning_levels["model"],
+            vec![ThinkingLevel::Low, ThinkingLevel::High]
+        );
     }
 
     #[test]
@@ -3081,7 +3495,7 @@ mod tests {
             .collect::<Vec<_>>();
         let body = serde_json::to_string(&serde_json::json!({"data": rows}))
             .expect("serialize oversized raw catalog");
-        let error = parse_openai_model_ids("openai", &body)
+        let error = parse_openai_model_catalog("openai", &body)
             .expect_err("raw rows must be bounded even when every ID is a duplicate");
         assert!(error.to_string().contains("raw model rows"), "{error}");
     }
@@ -3288,6 +3702,7 @@ mod tests {
         let fallback = ProviderModelCatalog {
             provider: "openai".to_string(),
             models: vec!["fallback-model".to_string()],
+            reasoning_levels: ReasoningCatalog::new(),
             source: ModelCatalogSource::StaticFallback,
             route_fingerprint: None,
             route_persistable: false,
@@ -3557,8 +3972,7 @@ mod tests {
         let replacement = verified_catalog("groq", vec!["must-not-persist".to_string()]);
         let error = persist_provider_model_catalog_rows_with_hook(
             &models_path,
-            replacement.provider(),
-            replacement.models(),
+            &replacement,
             replacement
                 .route_fingerprint
                 .as_deref()
@@ -3611,8 +4025,7 @@ mod tests {
         let replacement = verified_catalog("groq", vec!["committed-model".to_string()]);
         let error = persist_provider_model_catalog_rows_with_hooks(
             &models_path,
-            replacement.provider(),
-            replacement.models(),
+            &replacement,
             replacement
                 .route_fingerprint
                 .as_deref()
@@ -3669,8 +4082,7 @@ mod tests {
         let replacement = verified_catalog("groq", vec!["must-not-persist".to_string()]);
         let error = persist_provider_model_catalog_rows_with_hook(
             &models_path,
-            replacement.provider(),
-            replacement.models(),
+            &replacement,
             replacement
                 .route_fingerprint
                 .as_deref()

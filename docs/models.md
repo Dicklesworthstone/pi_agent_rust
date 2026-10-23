@@ -7,7 +7,7 @@ Pi loads available models from a built-in registry and an optional user-defined 
 | Path | Description |
 |------|-------------|
 | `~/.pi/agent/models.json` | User-defined model overrides and custom providers |
-| `~/.pi/agent/models.fetched.json` | Generated v2 live-catalog membership; managed only by `--persist-models` |
+| `~/.pi/agent/models.fetched.json` | Generated v2 live-catalog membership and advertised reasoning tiers; managed only by `--persist-models` |
 
 Do not hand-edit `models.fetched.json`. Its provider/model IDs are bound to the
 fetching endpoint and transport shape by a non-secret fingerprint and timestamp. The
@@ -25,6 +25,23 @@ invalidate saved membership automatically; rerun
 Inference requests still resolve the current account's credential, while only
 the opt-in saved model list can remain stale. Hand-authored `models.json` remains
 authoritative.
+
+Each generated model row contains its `id` and may contain `reasoningLevels`, a
+non-empty list of at most seven distinct canonical thinking tiers. Discovery
+reads `supported_reasoning_levels` from the model row or its `metadata` object
+(metadata takes precedence), accepting tier strings or objects with an `effort`
+string. `none` becomes `off`; unknown values are ignored. Empty, malformed,
+unknown-only, or oversized advertisements leave existing capabilities unchanged.
+Conflicting advertisements for the same normalized model ID are also ignored.
+
+Usable tiers update thinking choices and request encoding while preserving
+bundled context limits, pricing, input types, and other model metadata. Unsupported
+tiers are explicitly disabled so sparse ladders such as only `xhigh` clamp
+correctly. The selected effort still comes from your configuration; a provider's
+`default_reasoning_level` does not change it. Manual provider and model overrides
+load last, including explicit `reasoning: false`, `supportsReasoningEffort: false`,
+and null `thinkingLevelMap` entries. Generated rows cannot supply endpoints,
+credentials, headers, or arbitrary compatibility settings.
 
 Legacy `pi.models.fetched.v1` files lack the endpoint and transport provenance
 required by v2 and are preserved rather than overwritten automatically. Move
