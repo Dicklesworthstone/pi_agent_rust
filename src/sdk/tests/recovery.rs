@@ -1345,6 +1345,8 @@ fn saving_handle_after_failover(dir: &Path) -> (AgentSessionHandle, Arc<AtomicUs
         handle.with_retry(Some(crate::failover::RetryPolicy {
             max_retries: 0,
             max_failovers_per_turn: 1,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 0,
             max_delay_ms: 0,
         })),
@@ -1785,6 +1787,8 @@ fn http_chain_handle(url: &str, cap: u32) -> (AgentSessionHandle, Arc<AtomicUsiz
         .with_retry(Some(crate::failover::RetryPolicy {
             max_retries: 0,
             max_failovers_per_turn: cap,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 0,
             max_delay_ms: 0,
         }))
@@ -1805,6 +1809,66 @@ fn http_chain_handle(url: &str, cap: u32) -> (AgentSessionHandle, Arc<AtomicUsiz
             cooldown_secs: 300,
         }));
     (handle, calls)
+}
+
+#[test]
+fn configured_fallback_controls_preserve_retries_and_gate_actual_provider_requests() {
+    for (model_fallback, filter, expected_swap) in [
+        (false, "any", false),
+        (true, "usage-limit", false),
+        (true, "except-usage-limit", true),
+        (true, "any", true),
+    ] {
+        let mut server = RecoveryHttpFixture::new(vec![completion_response()]);
+        let (mut handle, calls) = http_chain_handle(&server.url, 1);
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "retry": {
+                "enabled": true,
+                "maxRetries": 1,
+                "baseDelayMs": 0,
+                "maxDelayMs": 0,
+                "modelFallback": model_fallback,
+                "fallbackOn": filter,
+            }
+        }))
+        .expect("fallback policy");
+        handle.set_retry_policy(crate::failover::RetryPolicy::from_config(&config));
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt("recover once", move |event| callback(event)))
+            .expect("provider returns a completed or errored message");
+        server.finish();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "same-model retry is retained");
+        assert_eq!(
+            result.stop_reason,
+            if expected_swap { StopReason::Stop } else { StopReason::Error }
+        );
+        assert_eq!(
+            handle.model().1,
+            if expected_swap { "fallback-a" } else { "claude-x" }
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), if expected_swap { 1 } else { 0 });
+        if expected_swap {
+            assert_eq!(requests[0]["model"], "fallback-a");
+        }
+        drop(requests);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "failover_start")
+                .count(),
+            if expected_swap { 1 } else { 0 },
+        );
+        drop(events);
+        let messages = run_async(handle.messages()).expect("transcript");
+        assert_eq!(
+            messages.iter().filter(|message| matches!(message, Message::User(_))).count(),
+            1,
+            "recovery must not duplicate the user turn"
+        );
+    }
 }
 
 #[test]

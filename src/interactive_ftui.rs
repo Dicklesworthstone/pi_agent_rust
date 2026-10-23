@@ -9531,7 +9531,12 @@ pub fn run(
                                 match settings_controller.apply(&mut handle, key, &value) {
                                     Ok(snapshot) => {
                                         auto_resize_images = snapshot.auto_resize_images;
-                                        if key == SettingsKey::AutoRetry {
+                                        if matches!(
+                                            key,
+                                            SettingsKey::AutoRetry
+                                                | SettingsKey::ModelFallback
+                                                | SettingsKey::FallbackOn
+                                        ) {
                                             resume_template.retry = handle.retry_policy();
                                         }
                                         if key == SettingsKey::AutoCompaction
@@ -11535,6 +11540,8 @@ mod tests {
         SettingsSnapshot {
             path: std::path::PathBuf::from("/workspace/.pi/settings.json"),
             auto_retry: true,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             auto_compaction: true,
             steering: crate::agent::QueueMode::OneAtATime,
             follow_up: crate::agent::QueueMode::OneAtATime,

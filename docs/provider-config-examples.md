@@ -486,6 +486,8 @@ a configured fallback chain.
     // Every value below is shown at its default, so this block reproduces
     // stock behaviour except for the chain, which has no default.
     "enabled": true,           // false disables retry AND failover
+    "modelFallback": true,     // false keeps same-model retries without model swaps
+    "fallbackOn": "any",       // any | usage-limit | except-usage-limit
     "maxRetries": 3,           // same-model attempts before the chain is consulted
     "baseDelayMs": 2000,       // exponential backoff starts here
     "maxDelayMs": 60000,
@@ -503,6 +505,15 @@ a configured fallback chain.
   }
 }
 ```
+
+Set `modelFallback: false` when the selected model must remain fixed during
+automatic recovery. Use `fallbackOn: "usage-limit"` to change models only when
+account credits or subscription usage are exhausted, or `"except-usage-limit"`
+to reserve fallback for other transient provider failures. Explicit RPM/TPM
+and concurrency throttles remain transient rate limits. These choices retain
+the same-model retry policy and never admit authentication, context-overflow,
+cancellation, or durability failures. The default interactive `/settings`
+panel exposes both preferences.
 
 A retry RESUMES the turn rather than replaying it: only the failed request's
 incomplete output is stripped, so completed tool calls are neither re-run nor

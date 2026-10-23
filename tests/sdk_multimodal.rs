@@ -285,6 +285,8 @@ const fn retry_policy(retries: u32, failovers: u32) -> RetryPolicy {
     RetryPolicy {
         max_retries: retries,
         max_failovers_per_turn: failovers,
+        model_fallback: true,
+        fallback_on: pi::failover::FallbackOn::Any,
         base_delay_ms: 1,
         max_delay_ms: 1,
     }

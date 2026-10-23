@@ -405,6 +405,12 @@ pub struct BranchSummarySettings {
 #[serde(default)]
 pub struct RetrySettings {
     pub enabled: Option<bool>,
+    /// Allow recovery to switch models after an eligible provider failure.
+    #[serde(alias = "modelFallback")]
+    pub model_fallback: Option<bool>,
+    /// Restrict the provider failures that may advance the fallback chain.
+    #[serde(alias = "fallbackOn")]
+    pub fallback_on: Option<crate::failover::FallbackOn>,
     #[serde(alias = "maxRetries")]
     pub max_retries: Option<u32>,
     #[serde(alias = "baseDelayMs")]
@@ -1194,6 +1200,22 @@ impl Config {
         self.retry.as_ref().and_then(|r| r.enabled).unwrap_or(true)
     }
 
+    /// Whether automatic recovery may change models (default: true).
+    pub fn model_fallback_enabled(&self) -> bool {
+        self.retry
+            .as_ref()
+            .and_then(|retry| retry.model_fallback)
+            .unwrap_or(true)
+    }
+
+    /// Provider failure filter for model fallback (default: any).
+    pub fn retry_fallback_on(&self) -> crate::failover::FallbackOn {
+        self.retry
+            .as_ref()
+            .and_then(|retry| retry.fallback_on)
+            .unwrap_or_default()
+    }
+
     pub fn retry_max_retries(&self) -> u32 {
         self.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3)
     }
@@ -1923,6 +1945,8 @@ fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Opt
     match (base, other) {
         (Some(base), Some(other)) => Some(RetrySettings {
             enabled: other.enabled.or(base.enabled),
+            model_fallback: other.model_fallback.or(base.model_fallback),
+            fallback_on: other.fallback_on.or(base.fallback_on),
             max_retries: other.max_retries.or(base.max_retries),
             base_delay_ms: other.base_delay_ms.or(base.base_delay_ms),
             max_delay_ms: other.max_delay_ms.or(base.max_delay_ms),
@@ -2688,6 +2712,8 @@ mod tests {
             "retry": {
                 "enabled": true,
                 "maxRetries": 2,
+                "modelFallback": false,
+                "fallbackOn": "usage-limit",
                 "fallbackChains": {
                     "default": ["openai/gpt-5-mini", "google/gemini-3-pro"],
                     "anthropic/claude-opus-4-7": ["openai/gpt-5.5"]
@@ -2714,6 +2740,11 @@ mod tests {
         assert_eq!(retry.max_failovers_per_turn, Some(3));
         assert_eq!(config.failover_cooldown_secs(), 120);
         assert_eq!(config.max_failovers_per_turn(), 3);
+        assert!(!config.model_fallback_enabled());
+        assert_eq!(
+            config.retry_fallback_on(),
+            crate::failover::FallbackOn::UsageLimit
+        );
     }
 
     #[test]
@@ -2721,6 +2752,8 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.failover_cooldown_secs(), 300);
         assert_eq!(config.max_failovers_per_turn(), 8);
+        assert!(config.model_fallback_enabled());
+        assert_eq!(config.retry_fallback_on(), crate::failover::FallbackOn::Any);
         assert!(config.disabled_providers.is_none());
         assert!(config.model_scope_overrides.is_none());
     }
@@ -2759,6 +2792,8 @@ mod tests {
     #[test]
     fn failover_chains_merge_field_wise() {
         let base = RetrySettings {
+            model_fallback: Some(false),
+            fallback_on: Some(crate::failover::FallbackOn::UsageLimit),
             fallback_chains: Some(HashMap::from([(
                 "default".to_string(),
                 vec!["openai/gpt-5-mini".to_string()],
@@ -2768,12 +2803,39 @@ mod tests {
         };
         let other = RetrySettings {
             max_retries: Some(5),
+            fallback_on: Some(crate::failover::FallbackOn::ExceptUsageLimit),
             ..Default::default()
         };
         let merged = merge_retry(Some(base), Some(other)).expect("merged");
         assert!(merged.fallback_chains.is_some(), "base chains preserved");
         assert_eq!(merged.failover_cooldown_secs, Some(60));
         assert_eq!(merged.max_retries, Some(5));
+        assert_eq!(merged.model_fallback, Some(false));
+        assert_eq!(
+            merged.fallback_on,
+            Some(crate::failover::FallbackOn::ExceptUsageLimit)
+        );
+    }
+
+    #[test]
+    fn fallback_filters_round_trip_and_reject_unknown_modes() {
+        for mode in ["any", "usage-limit", "except-usage-limit"] {
+            let config: Config = serde_json::from_value(json!({
+                "retry": {"model_fallback": false, "fallback_on": mode}
+            }))
+            .expect("valid fallback policy");
+            assert!(!config.model_fallback_enabled());
+            assert_eq!(config.retry_fallback_on().as_str(), mode);
+            let encoded = serde_json::to_value(config).expect("serialize");
+            assert_eq!(encoded["retry"]["model_fallback"], false);
+            assert_eq!(encoded["retry"]["fallback_on"], mode);
+        }
+        assert!(
+            serde_json::from_value::<Config>(json!({
+                "retry": {"fallbackOn": "sometimes"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

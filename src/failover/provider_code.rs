@@ -139,6 +139,8 @@ mod tests {
         RetryPolicy {
             max_retries: 2,
             max_failovers_per_turn: 1,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 500,
             max_delay_ms: 2_000,
         }

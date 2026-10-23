@@ -10017,6 +10017,8 @@ fn print_mode_retry_policy(config: &Config, max_retries: u32) -> pi::failover::R
     pi::failover::RetryPolicy {
         max_retries,
         max_failovers_per_turn: config.max_failovers_per_turn(),
+        model_fallback: config.model_fallback_enabled(),
+        fallback_on: config.retry_fallback_on(),
         base_delay_ms: config.retry_base_delay_ms(),
         max_delay_ms: config.retry_max_delay_ms(),
     }
@@ -10236,6 +10238,9 @@ async fn try_print_failover(
     let Some(error_text) = error_text else {
         return Ok(None);
     };
+    if !config.model_fallback_enabled() || !config.retry_fallback_on().allows(error_text) {
+        return Ok(None);
+    }
     let Some(class) = pi::failover::classify_failover(error_text) else {
         return Ok(None);
     };

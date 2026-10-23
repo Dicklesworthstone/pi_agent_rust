@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::agent::QueueMode;
 use crate::config::{Config, MarkdownSpacing, SettingsScope};
 use crate::error::{Error, Result};
-use crate::failover::RetryPolicy;
+use crate::failover::{FallbackOn, RetryPolicy};
 use crate::sdk::AgentSessionHandle;
 
 use super::DoubleEscapeAction;
@@ -34,6 +34,8 @@ pub(super) fn settings_destination(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsKey {
     AutoRetry,
+    ModelFallback,
+    FallbackOn,
     AutoCompaction,
     SteeringMode,
     FollowUpMode,
@@ -45,8 +47,10 @@ pub enum SettingsKey {
 }
 
 impl SettingsKey {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::AutoRetry,
+        Self::ModelFallback,
+        Self::FallbackOn,
         Self::AutoCompaction,
         Self::SteeringMode,
         Self::FollowUpMode,
@@ -60,6 +64,8 @@ impl SettingsKey {
     pub const fn id(self) -> &'static str {
         match self {
             Self::AutoRetry => "retry",
+            Self::ModelFallback => "model-fallback",
+            Self::FallbackOn => "fallback-on",
             Self::AutoCompaction => "compaction",
             Self::SteeringMode => "steering",
             Self::FollowUpMode => "follow-up",
@@ -78,6 +84,8 @@ impl SettingsKey {
     pub const fn label(self) -> &'static str {
         match self {
             Self::AutoRetry => "Automatic retry and provider fallback",
+            Self::ModelFallback => "Allow recovery to switch models",
+            Self::FallbackOn => "Provider fallback trigger",
             Self::AutoCompaction => "Automatic context compaction",
             Self::SteeringMode => "Steering message delivery",
             Self::FollowUpMode => "Follow-up message delivery",
@@ -92,9 +100,15 @@ impl SettingsKey {
     pub const fn choices(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::AutoRetry
+            | Self::ModelFallback
             | Self::AutoCompaction
             | Self::AutoResizeImages
             | Self::HideThinking => &[("on", "On"), ("off", "Off")],
+            Self::FallbackOn => &[
+                ("any", "Any recoverable provider failure"),
+                ("usage-limit", "Account usage limits only"),
+                ("except-usage-limit", "Failures other than account usage limits"),
+            ],
             Self::SteeringMode | Self::FollowUpMode => &[
                 ("one-at-a-time", "One message at a time"),
                 ("all", "All queued messages together"),
@@ -131,6 +145,12 @@ impl SettingsKey {
         // the next startup fail. Unrelated fields stay untouched.
         Ok(match self {
             Self::AutoRetry => serde_json::json!({"retry": {"enabled": enabled}}),
+            Self::ModelFallback => serde_json::json!({
+                "retry": {"model_fallback": enabled, "modelFallback": null},
+            }),
+            Self::FallbackOn => serde_json::json!({
+                "retry": {"fallback_on": value, "fallbackOn": null},
+            }),
             Self::AutoCompaction => serde_json::json!({"compaction": {"enabled": enabled}}),
             Self::SteeringMode => serde_json::json!({
                 "steering_mode": value, "steeringMode": null, "queueMode": null,
@@ -161,6 +181,12 @@ impl SettingsKey {
         let enabled = value == "on";
         match self {
             Self::AutoRetry => config.retry.get_or_insert_default().enabled = Some(enabled),
+            Self::ModelFallback => {
+                config.retry.get_or_insert_default().model_fallback = Some(enabled);
+            }
+            Self::FallbackOn => {
+                config.retry.get_or_insert_default().fallback_on = Some(fallback_on(value));
+            }
             Self::AutoCompaction => {
                 config.compaction.get_or_insert_default().enabled = Some(enabled);
             }
@@ -190,6 +216,8 @@ impl SettingsKey {
 pub struct SettingsSnapshot {
     pub path: PathBuf,
     pub auto_retry: bool,
+    pub model_fallback: bool,
+    pub fallback_on: FallbackOn,
     pub auto_compaction: bool,
     pub steering: QueueMode,
     pub follow_up: QueueMode,
@@ -204,6 +232,8 @@ impl SettingsSnapshot {
     pub fn value(&self, key: SettingsKey) -> String {
         match key {
             SettingsKey::AutoRetry => on_off(self.auto_retry),
+            SettingsKey::ModelFallback => on_off(self.model_fallback),
+            SettingsKey::FallbackOn => self.fallback_on.as_str(),
             SettingsKey::AutoCompaction => on_off(self.auto_compaction),
             SettingsKey::SteeringMode => self.steering.as_str(),
             SettingsKey::FollowUpMode => self.follow_up.as_str(),
@@ -229,6 +259,15 @@ const fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+/// Values are validated against `SettingsKey::choices` before applying.
+fn fallback_on(value: &str) -> FallbackOn {
+    match value {
+        "usage-limit" => FallbackOn::UsageLimit,
+        "except-usage-limit" => FallbackOn::ExceptUsageLimit,
+        _ => FallbackOn::Any,
+    }
+}
+
 pub(super) struct SettingsController {
     config: Config,
     path: PathBuf,
@@ -242,6 +281,8 @@ impl SettingsController {
         let retry_policy = handle.retry_policy().unwrap_or_else(|| RetryPolicy {
             max_retries: config.retry_max_retries(),
             max_failovers_per_turn: config.max_failovers_per_turn(),
+            model_fallback: config.model_fallback_enabled(),
+            fallback_on: config.retry_fallback_on(),
             base_delay_ms: config.retry_base_delay_ms(),
             max_delay_ms: config.retry_max_delay_ms(),
         });
@@ -254,9 +295,12 @@ impl SettingsController {
 
     pub(super) fn snapshot(&self, handle: &AgentSessionHandle) -> SettingsSnapshot {
         let (steering, follow_up) = handle.session().agent.queue_modes();
+        let policy = handle.retry_policy().unwrap_or(self.retry_policy);
         SettingsSnapshot {
             path: self.path.clone(),
             auto_retry: handle.retry_policy().is_some(),
+            model_fallback: policy.model_fallback,
+            fallback_on: policy.fallback_on,
             auto_compaction: handle.compaction_settings().enabled,
             steering,
             follow_up,
@@ -289,6 +333,19 @@ impl SettingsController {
                     self.retry_policy = policy;
                 }
                 handle.set_retry_policy((value == "on").then_some(self.retry_policy));
+            }
+            SettingsKey::ModelFallback | SettingsKey::FallbackOn => {
+                let active = handle.retry_policy();
+                self.retry_policy = active.unwrap_or(self.retry_policy);
+                if key == SettingsKey::ModelFallback {
+                    self.retry_policy.model_fallback = value == "on";
+                } else {
+                    self.retry_policy.fallback_on = fallback_on(value);
+                }
+                // Editing fallback preferences must not enable recovery.
+                if active.is_some() {
+                    handle.set_retry_policy(Some(self.retry_policy));
+                }
             }
             SettingsKey::AutoCompaction => {
                 handle.session_mut().set_auto_compaction(value == "on");
@@ -352,6 +409,8 @@ mod tests {
         .with_retry(Some(RetryPolicy {
             max_retries: 7,
             max_failovers_per_turn: 2,
+            model_fallback: true,
+            fallback_on: FallbackOn::Any,
             base_delay_ms: 17,
             max_delay_ms: 333,
         }))
@@ -408,6 +467,47 @@ mod tests {
         assert!(loaded.compaction_enabled());
         assert_eq!(loaded.steering_queue_mode(), QueueMode::All);
         assert_eq!(loaded.follow_up_queue_mode(), QueueMode::All);
+    }
+
+    #[test]
+    fn fallback_preferences_apply_live_and_stay_disabled_until_recovery_is_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let mut handle = handle();
+        let mut settings = SettingsController::new(Config::default(), path.clone(), &handle);
+        settings
+            .apply(&mut handle, SettingsKey::ModelFallback, "off")
+            .expect("disable model switching");
+        let policy = handle.retry_policy().expect("same-model retries remain enabled");
+        assert!(!policy.model_fallback);
+        assert_eq!(policy.max_retries, 7);
+
+        settings
+            .apply(&mut handle, SettingsKey::AutoRetry, "off")
+            .expect("disable automatic recovery");
+        let snapshot = settings
+            .apply(&mut handle, SettingsKey::FallbackOn, "usage-limit")
+            .expect("retain usage filter");
+        assert!(!snapshot.auto_retry);
+        assert!(!snapshot.model_fallback);
+        assert_eq!(snapshot.fallback_on, FallbackOn::UsageLimit);
+        assert!(handle.retry_policy().is_none());
+
+        settings
+            .apply(&mut handle, SettingsKey::AutoRetry, "on")
+            .expect("enable recovery");
+        let policy = handle.retry_policy().expect("restored recovery");
+        assert!(!policy.model_fallback);
+        assert_eq!(policy.fallback_on, FallbackOn::UsageLimit);
+        assert_eq!((policy.max_retries, policy.max_failovers_per_turn), (7, 2));
+        assert_eq!((policy.base_delay_ms, policy.max_delay_ms), (17, 333));
+
+        let loaded: Config =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("saved settings"))
+                .expect("reload preferences");
+        assert!(loaded.retry_enabled());
+        assert!(!loaded.model_fallback_enabled());
+        assert_eq!(loaded.retry_fallback_on(), FallbackOn::UsageLimit);
     }
 
     #[test]
@@ -566,6 +666,7 @@ mod tests {
                 "markdown": {"spacing": "comfortable", "codeBlockIndent": 3},
                 "retry": {
                     "enabled": true, "maxRetries": 9,
+                    "modelFallback": true, "fallbackOn": "any",
                     "fallbackChains": {"default": ["other/model"]},
                 },
                 "compaction": {"enabled": true, "reserveTokens": 3210},
@@ -580,6 +681,8 @@ mod tests {
         let mut settings = SettingsController::new(config, path.clone(), &handle);
         for (key, value) in [
             (SettingsKey::AutoRetry, "off"),
+            (SettingsKey::ModelFallback, "off"),
+            (SettingsKey::FallbackOn, "except-usage-limit"),
             (SettingsKey::AutoCompaction, "off"),
             (SettingsKey::SteeringMode, "all"),
             (SettingsKey::FollowUpMode, "all"),
@@ -598,6 +701,10 @@ mod tests {
         let loaded: Config = serde_json::from_value(raw.clone()).expect("no duplicate aliases");
         assert!(!loaded.retry_enabled() && !loaded.compaction_enabled());
         assert_eq!(loaded.retry_max_retries(), 9);
+        assert!(!loaded.model_fallback_enabled());
+        assert_eq!(loaded.retry_fallback_on(), FallbackOn::ExceptUsageLimit);
+        assert!(raw["retry"].get("modelFallback").is_none());
+        assert!(raw["retry"].get("fallbackOn").is_none());
         assert_eq!(loaded.compaction_reserve_tokens(), 3210);
         assert_eq!(raw["retry"]["fallbackChains"]["default"][0], "other/model");
         assert_eq!(raw["pluginOptions"]["custom"], "keep me");

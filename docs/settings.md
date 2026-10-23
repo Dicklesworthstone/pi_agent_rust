@@ -285,7 +285,10 @@ Accessor defaults:
 ### Retry (defaults)
 
 Accessor defaults:
-- `retry.enabled`: `true`
+
+- `retry.enabled`: `true` (master switch for automatic recovery)
+- `retry.model_fallback`: `true` (allow recovery to switch models)
+- `retry.fallback_on`: `"any"` (which eligible failures may switch models)
 - `retry.max_retries`: `3`
 - `retry.base_delay_ms`: `2000`
 - `retry.max_delay_ms`: `60000`
@@ -294,12 +297,36 @@ Accessor defaults:
 {
   "retry": {
     "enabled": true,
+    "model_fallback": true,
+    "fallback_on": "any",
     "max_retries": 3,
     "base_delay_ms": 2000,
     "max_delay_ms": 60000
   }
 }
 ```
+
+Set `model_fallback` to `false` to retain same-model retries while preventing
+automatic model changes. A configured `fallbackChains` entry is still required
+before any model can be selected as a fallback.
+
+`fallback_on` accepts three values:
+
+| Value | Eligible failures that may switch models |
+|---|---|
+| `any` | All failures admitted by the recovery classifier |
+| `usage-limit` | Account quota, subscription window, or credit exhaustion |
+| `except-usage-limit` | Transient failures other than account usage exhaustion |
+
+Explicit per-minute, per-second, and concurrency throttles are distinguished
+from account exhaustion. A bare HTTP 402 or 429 without finer diagnostic
+evidence is treated as a usage limit. These filters do not permit recovery from
+authentication failures, context overflow, cancellation, or session-persistence
+failures, and they do not change the same-model retry budget.
+
+Camel-case aliases `modelFallback` and `fallbackOn` are accepted. The default
+interactive `/settings` panel can change both preferences live and persist them.
+Editing them while automatic recovery is off keeps recovery off.
 
 ### Search
 

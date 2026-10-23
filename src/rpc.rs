@@ -6361,6 +6361,14 @@ async fn run_prompt_with_retry_owned(
     }
 
     let max_retries = options.config.retry_max_retries();
+    let recovery_policy = crate::failover::RetryPolicy {
+        max_retries,
+        max_failovers_per_turn: options.config.max_failovers_per_turn(),
+        model_fallback: options.config.model_fallback_enabled(),
+        fallback_on: options.config.retry_fallback_on(),
+        base_delay_ms: options.config.retry_base_delay_ms(),
+        max_delay_ms: options.config.retry_max_delay_ms(),
+    };
     let mut retry_count: u32 = 0;
     let mut failovers_this_turn: u32 = 0;
     let mut failover_open = false;
@@ -6605,6 +6613,12 @@ async fn run_prompt_with_retry_owned(
             Ok(message) if message.stop_reason == StopReason::Error
         );
         let mut quota_credential: Option<(String, String)> = None;
+        let progress = crate::failover::TurnProgress {
+            retry_count,
+            failovers_this_turn,
+            stream_can_retry: true,
+        };
+        let recovery_decision;
 
         match result {
             Ok(message) => {
@@ -6625,37 +6639,31 @@ async fn run_prompt_with_retry_owned(
                     if message.stop_reason == StopReason::Aborted {
                         break;
                     }
-                    // Check if this error is retryable. Context overflow and
-                    // auth failures should NOT be retried.
-                    if let Some(ref err_msg) = final_error {
-                        let context_window = if let Ok(guard) =
-                            OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
-                        {
-                            let runtime_provider = guard.agent.provider().name().to_string();
-                            let runtime_model_id = guard.agent.provider().model_id().to_string();
-                            let session_store = Arc::clone(&guard.session);
-                            let inner_session =
-                                OwnedMutexGuard::lock(session_store, &cx).await.ok();
-                            inner_session.and_then(|inner| {
-                                current_or_runtime_model_entry(
-                                    &inner,
-                                    &runtime_provider,
-                                    &runtime_model_id,
-                                    rpc_model_catalog(&guard, &options),
-                                )
-                                .map(|e| e.model.context_window)
-                            })
-                        } else {
-                            None
-                        };
-                        if !crate::error::is_retryable_error(
-                            err_msg,
-                            Some(message.usage.input),
-                            context_window,
-                        ) {
-                            break;
-                        }
-                    }
+                    let context_window = if let Ok(guard) =
+                        OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
+                    {
+                        let runtime_provider = guard.agent.provider().name().to_string();
+                        let runtime_model_id = guard.agent.provider().model_id().to_string();
+                        let session_store = Arc::clone(&guard.session);
+                        let inner_session = OwnedMutexGuard::lock(session_store, &cx).await.ok();
+                        inner_session.and_then(|inner| {
+                            current_or_runtime_model_entry(
+                                &inner,
+                                &runtime_provider,
+                                &runtime_model_id,
+                                rpc_model_catalog(&guard, &options),
+                            )
+                            .map(|e| e.model.context_window)
+                        })
+                    } else {
+                        None
+                    };
+                    recovery_decision = crate::failover::decide(
+                        crate::failover::TurnOutcome::Completed(&message),
+                        &progress,
+                        &recovery_policy,
+                        context_window,
+                    );
                 } else {
                     let internally_staged_follow_up =
                         match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
@@ -6704,19 +6712,21 @@ async fn run_prompt_with_retry_owned(
             }
             Err(err) => {
                 let err_str = err.to_string();
-                // `call_error_is_retryable` refuses a session-persistence
-                // failure first (bd-8188r), then classifies from the TYPED
-                // error before its flattened prose (pi_agent_rust#118). Print
-                // mode inlined the same two checks until bd-u2qv4.
-                if !crate::failover::call_error_is_retryable(&err) {
-                    final_error = Some(err_str);
-                    final_error_hints = Some(error_hints_value(&err));
-                    break;
-                }
+                // Keep typed provider errors and terminal refusals in the
+                // same policy as SDK/print. Account exhaustion may permit a
+                // different model even when retrying this one cannot help.
+                recovery_decision = crate::failover::decide(
+                    crate::failover::TurnOutcome::Failed(&err),
+                    &progress,
+                    &recovery_policy,
+                    None,
+                );
                 final_error = Some(err_str.clone());
                 final_error_hints = Some(error_hints_value(&err));
-                if crate::failover::classify_failover(&err_str)
-                    == Some(crate::failover::FailoverClass::Quota)
+                if (crate::failover::call_error_is_retryable(&err)
+                    || recovery_decision == crate::failover::TurnDecision::FailOver)
+                    && crate::failover::classify_failover(&err_str)
+                        == Some(crate::failover::FailoverClass::Quota)
                 {
                     let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                         Ok(guard) => guard,
@@ -6741,11 +6751,22 @@ async fn run_prompt_with_retry_owned(
         let retry_enabled = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
             .await
             .is_ok_and(|state| state.auto_retry_enabled);
-        if !retry_enabled || retry_count >= max_retries {
-            // Failover (bd-cv653.3.2): the same-model retry budget is spent.
-            // If the error class is failover-eligible and a chain entry
-            // remains, swap providers and continue the turn there. The
-            // per-turn cap bounds total failover cost.
+        if !retry_enabled
+            || matches!(
+                recovery_decision,
+                crate::failover::TurnDecision::Finish { .. }
+                    | crate::failover::TurnDecision::Terminal(_)
+            )
+        {
+            if let Some((provider_name, key)) = quota_credential.as_ref() {
+                crate::auth::report_provider_rate_limit(provider_name, key);
+            }
+            break;
+        }
+        if recovery_decision == crate::failover::TurnDecision::FailOver {
+            // The shared policy has exhausted same-model retry or recognized
+            // an account limit that only another model could recover from.
+            // The chain walk still owns credential and transition admission.
             let failover_result = if failovers_this_turn < options.config.max_failovers_per_turn() {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
@@ -7199,6 +7220,11 @@ async fn try_failover_to_next_chain_entry(
     let Some(error_text) = error_text else {
         return Ok(false);
     };
+    if !options.config.model_fallback_enabled()
+        || !options.config.retry_fallback_on().allows(error_text)
+    {
+        return Ok(false);
+    }
     let Some(class) = crate::failover::classify_failover(error_text) else {
         return Ok(false); // auth/loud errors never fail over
     };
@@ -9124,6 +9150,118 @@ mod retry_tests {
 
             Ok(Box::pin(stream::iter(events)))
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rpc_recovery_controls_block_fallback_before_model_or_transcript_changes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            for transport_error in [false, true] {
+                for (enabled, model_fallback, filter) in [
+                    (false, true, crate::failover::FallbackOn::Any),
+                    (true, false, crate::failover::FallbackOn::Any),
+                    (true, true, crate::failover::FallbackOn::UsageLimit),
+                ] {
+                    let provider = Arc::new(FlakyProvider {
+                        transport_error,
+                        ..FlakyProvider::new()
+                    });
+                    let agent = Agent::new(
+                        Arc::clone(&provider) as Arc<dyn Provider>,
+                        ToolRegistry::new(&[], Path::new("."), None),
+                        AgentConfig::default(),
+                    );
+                    let store = Arc::new(Mutex::new(Session::in_memory()));
+                    let session = Arc::new(Mutex::new(AgentSession::new(
+                        agent,
+                        Arc::clone(&store),
+                        false,
+                        crate::compaction::ResolvedCompactionSettings::default(),
+                    )));
+                    let config = Config {
+                        retry: Some(crate::config::RetrySettings {
+                            enabled: Some(enabled),
+                            model_fallback: Some(model_fallback),
+                            fallback_on: Some(filter),
+                            max_retries: Some(0),
+                            base_delay_ms: Some(0),
+                            max_delay_ms: Some(0),
+                            fallback_chains: Some(HashMap::from([(
+                                "default".to_string(),
+                                vec!["openai/blocked-fallback".to_string()],
+                            )])),
+                            ..Default::default()
+                        }),
+                        ..Config::default()
+                    };
+                    let mut shared = RpcSharedState::new(&config);
+                    shared.auto_compaction_enabled = false;
+                    let shared = Arc::new(Mutex::new(shared));
+                    let mut fallback = dummy_entry("blocked-fallback", false);
+                    fallback.model.provider = "openai".to_string();
+                    fallback.model.api = "openai-completions".to_string();
+                    fallback.model.base_url = "http://127.0.0.1:0/v1".to_string();
+                    fallback.api_key = Some("fixture-key".to_string());
+                    let options = RpcOptions {
+                        config,
+                        working_directory: None,
+                        resources: ResourceLoader::empty(false),
+                        available_models: vec![fallback],
+                        scoped_models: Vec::new(),
+                        cli_api_key: Some("fixture-key".to_string()),
+                        auth: AuthStorage::empty_at(PathBuf::from("unused-rpc-filter-auth.json")),
+                        runtime_handle: runtime_handle.clone(),
+                        ask_tool: None,
+                    };
+                    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                    run_prompt_with_retry(
+                        Arc::clone(&session),
+                        Arc::clone(&shared),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(std::sync::Mutex::new(())),
+                        Arc::new(Mutex::new(None)),
+                        out_tx,
+                        Arc::new(AtomicBool::new(false)),
+                        options,
+                        "keep the selected model".to_string(),
+                        None,
+                        Vec::new(),
+                        AgentCx::for_request(),
+                    )
+                    .await;
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    let events: Vec<Value> = out_rx
+                        .try_iter()
+                        .map(|line| serde_json::from_str(&line).expect("event"))
+                        .collect();
+                    assert!(!events.iter().any(|event| {
+                        matches!(
+                            event["type"].as_str(),
+                            Some("failover_start" | "auto_retry_start")
+                        )
+                    }));
+                    let cx = AgentCx::for_request();
+                    let guard = session.lock(&cx).await.expect("session");
+                    assert_eq!(guard.agent.provider().model_id(), "test-model");
+                    drop(guard);
+                    let state = shared.lock(&cx).await.expect("state");
+                    assert!(state.failover_primary.is_none());
+                    assert!(state.active_failover_model.is_none());
+                    drop(state);
+                    let stored = store.lock(cx.cx()).await.expect("stored session");
+                    assert!(!stored.entries.iter().any(|entry| matches!(
+                        entry,
+                        SessionEntry::ModelChange(change) if change.role.as_deref() == Some("failover")
+                    )));
+                }
+            }
+        });
     }
 
     #[test]

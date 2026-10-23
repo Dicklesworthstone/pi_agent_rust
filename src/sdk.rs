@@ -5089,6 +5089,8 @@ mod tests {
             handle.with_retry(Some(crate::failover::RetryPolicy {
                 max_retries: 1,
                 max_failovers_per_turn: 1,
+                model_fallback: true,
+                fallback_on: crate::failover::FallbackOn::Any,
                 base_delay_ms: 1,
                 max_delay_ms: 1,
             })),
@@ -5130,6 +5132,8 @@ mod tests {
         crate::failover::RetryPolicy {
             max_retries,
             max_failovers_per_turn: 0,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 1,
             max_delay_ms: 1,
         }
@@ -5254,6 +5258,8 @@ mod tests {
             handle.with_retry(Some(crate::failover::RetryPolicy {
                 max_retries: 1,
                 max_failovers_per_turn: 1,
+                model_fallback: true,
+                fallback_on: crate::failover::FallbackOn::Any,
                 base_delay_ms: 1,
                 max_delay_ms: 1,
             })),
