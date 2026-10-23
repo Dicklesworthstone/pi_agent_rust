@@ -186,6 +186,7 @@ fn configured(root: &Path, mode: &str) -> (ConfiguredServer, Option<PeerChild>) 
         command: (!is_http).then(|| "python3".to_string()),
         args: if is_http { Vec::new() } else { args },
         env: Vec::new(), url, headers: Vec::new(),
+        oauth: None,
         transport_hint: Some(if is_http { "http" } else { "stdio" }.to_string()),
         enabled: true,
         cwd: None,

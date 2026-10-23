@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use sha2::Digest as _;
 use url::Url;
 
+use super::config::McpOAuthConfig;
 use crate::agent_cx::AgentCx;
 use crate::auth::{AuthCredential, AuthStorage};
 use crate::error::{Error, Result};
@@ -373,7 +374,7 @@ impl AuthBinding {
 
     pub(crate) async fn reauthenticate(
         &self,
-        client_id: Option<String>,
+        configuration: McpOAuthConfig,
         on_url: Arc<dyn Fn(&str) + Send + Sync>,
         check: Admission,
     ) -> Result<()> {
@@ -388,29 +389,27 @@ impl AuthBinding {
             }
             check()
         });
-        bounded(self.login(client_id, on_url, checked, owner), FLOW_TIMEOUT).await
+        bounded(self.login(configuration, on_url, checked, owner), FLOW_TIMEOUT).await
     }
 
     async fn login(
         &self,
-        supplied_client_id: Option<String>,
+        configuration: McpOAuthConfig,
         on_url: Arc<dyn Fn(&str) + Send + Sync>,
         check: Admission,
         owner: AgentCx,
     ) -> Result<()> {
         check_owner(&owner)?;
         checked_url(&self.resource)?;
+        configuration.validate_resolved()
+            .map_err(|_| error("CONFIG", "configured OAuth client or loopback callback settings are invalid"))?;
         check()?;
         let old = self.read().await?;
         let expected_epoch = old.as_ref().map(|record| record.epoch.clone());
         let metadata = discover(&self.resource, &check).await?;
         check()?;
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|_| error("CALLBACK", "cannot bind the OAuth loopback callback"))?;
-        listener.set_nonblocking(true).map_err(|_| error("CALLBACK", "cannot configure the OAuth loopback callback"))?;
-        let address = listener.local_addr().map_err(|_| error("CALLBACK", "cannot read the OAuth callback address"))?;
-        let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", address.port());
-        let mut credentials = register_client(&metadata, supplied_client_id, &redirect_uri, &check).await?;
+        let (listener, redirect_uri) = bind_callback(&configuration)?;
+        let mut credentials = register_client(&metadata, &configuration, &redirect_uri, &check).await?;
         let verifier = nonce();
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(sha2::Sha256::digest(verifier.as_bytes()));
@@ -419,7 +418,7 @@ impl AuthBinding {
         if authorization.query_pairs().any(|(name, _)| matches!(
             name.as_ref(),
             "response_type" | "client_id" | "redirect_uri" | "code_challenge"
-                | "code_challenge_method" | "state" | "resource" | "scope"
+                | "code_challenge_method" | "state" | "resource" | "scope" | "prompt"
         )) {
             return Err(error("METADATA", "authorization endpoint contains conflicting OAuth parameters"));
         }
@@ -433,6 +432,9 @@ impl AuthBinding {
             .append_pair("resource", &self.resource);
         if let Some(scope) = &credentials.scope {
             authorization.query_pairs_mut().append_pair("scope", scope);
+        }
+        if let Some(prompt) = authorization_prompt(&configuration, credentials.scope.as_deref()) {
+            authorization.query_pairs_mut().append_pair("prompt", prompt);
         }
         check()?;
         on_url(authorization.as_str());
@@ -770,32 +772,98 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
     Err(error("DISCOVERY", "no advertised authorization server supplied usable OAuth metadata"))
 }
 
+/// An explicit scope, including an empty one, takes precedence over discovery.
+fn configured_scope(configuration: &McpOAuthConfig, metadata: &Metadata) -> Result<Option<String>> {
+    match configuration.scope.as_deref() {
+        Some(scope) => scope_string(scope),
+        None => Ok(metadata.scope.clone()),
+    }
+}
+
+fn authorization_prompt<'a>(configuration: &'a McpOAuthConfig, scope: Option<&str>) -> Option<&'a str> {
+    match configuration.prompt.as_deref() {
+        Some("") => None,
+        Some(prompt) => Some(prompt),
+        None if scope.is_some_and(|scope| scope.split_whitespace().any(|token| token == "offline_access")) => Some("consent"),
+        None => None,
+    }
+}
+
+/// Bind only a loopback address. A registered redirect remains byte-for-byte
+/// unchanged, and a fixed port never falls back to an unregistered random port.
+fn bind_callback(configuration: &McpOAuthConfig) -> Result<(TcpListener, String)> {
+    configuration.validate_resolved()
+        .map_err(|_| error("CONFIG", "configured OAuth client or loopback callback settings are invalid"))?;
+    let configured_redirect = configuration.redirect_uri.as_deref()
+        .map(Url::parse).transpose()
+        .map_err(|_| error("CONFIG", "configured OAuth callback is invalid"))?;
+    let address = match configured_redirect.as_ref().and_then(Url::host) {
+        Some(url::Host::Ipv4(address)) => IpAddr::V4(address),
+        Some(url::Host::Ipv6(address)) => IpAddr::V6(address),
+        // Pin localhost to a numeric loopback address rather than consulting
+        // a resolver or allowing a host-file mapping to change the bind target.
+        Some(url::Host::Domain("localhost")) | None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        _ => return Err(error("CONFIG", "configured OAuth callback must use a loopback host")),
+    };
+    let port = configured_redirect.as_ref()
+        .and_then(Url::port_or_known_default)
+        .or(configuration.callback_port)
+        .unwrap_or(0);
+    let listener = TcpListener::bind(SocketAddr::new(address, port))
+        .map_err(|_| error("CALLBACK", "cannot bind the configured OAuth loopback callback; a fixed port may already be in use"))?;
+    listener.set_nonblocking(true)
+        .map_err(|_| error("CALLBACK", "cannot configure the OAuth loopback callback"))?;
+    let redirect_uri = match &configuration.redirect_uri {
+        Some(redirect) => redirect.clone(),
+        None => {
+            let address = listener.local_addr()
+                .map_err(|_| error("CALLBACK", "cannot read the OAuth callback address"))?;
+            let path = configuration.callback_path.as_deref().unwrap_or("/oauth/callback");
+            format!("http://127.0.0.1:{}{path}", address.port())
+        }
+    };
+    Ok((listener, redirect_uri))
+}
+
 async fn register_client(
     metadata: &Metadata,
-    supplied: Option<String>,
+    configuration: &McpOAuthConfig,
     redirect_uri: &str,
     check: &Admission,
 ) -> Result<Credentials> {
-    let (client_id, client_secret, auth_method) = if let Some(client_id) = supplied {
-        validate_string(&client_id, 4096)?;
-        (client_id, None, "none".to_string())
+    let scope = configured_scope(configuration, metadata)?;
+    let (client_id, client_secret, auth_method) = if let Some(client_id) = &configuration.client_id {
+        validate_string(client_id, 4096)?;
+        let auth_method = if let Some(secret) = &configuration.client_secret {
+            validate_string(secret, 16 * 1024)?;
+            ["client_secret_post", "client_secret_basic"].into_iter()
+                .find(|method| metadata.auth_methods.iter().any(|advertised| advertised == method))
+                .ok_or_else(|| error("CLIENT_AUTH", "the server offers no supported authentication method for the configured client secret"))?
+        } else {
+            "none"
+        };
+        (client_id.clone(), configuration.client_secret.clone(), auth_method.to_string())
     } else {
         let endpoint = metadata.registration_endpoint.as_deref()
-            .ok_or_else(|| error("CLIENT_ID_REQUIRED", "this server has no dynamic client registration; supply a public client ID"))?;
+            .ok_or_else(|| error("CLIENT_ID_REQUIRED", "this server has no dynamic client registration; configure oauth.clientId or supply a public client ID"))?;
         let auth_method = ["none", "client_secret_basic", "client_secret_post"].into_iter()
             .find(|method| metadata.auth_methods.iter().any(|advertised| advertised == method))
             .ok_or_else(|| error("CLIENT_AUTH", "the server offers no supported native-client authentication method"))?;
+        let mut registration = json!({
+            "client_name": "Pi Rust",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": auth_method,
+        });
+        if let Some(scope) = &scope {
+            registration["scope"] = Value::String(scope.clone());
+        }
         check()?;
         let value = bounded(async {
             let client = crate::http::client::Client::new();
             let response = client.post(endpoint).header("Accept", "application/json")
-                .json(&json!({
-                    "client_name": "Pi Rust",
-                    "redirect_uris": [redirect_uri],
-                    "grant_types": ["authorization_code", "refresh_token"],
-                    "response_types": ["code"],
-                    "token_endpoint_auth_method": auth_method,
-                })).map_err(|_| error("REGISTRATION", "cannot encode OAuth client registration"))?
+                .json(&registration).map_err(|_| error("REGISTRATION", "cannot encode OAuth client registration"))?
                 .timeout(HTTP_TIMEOUT).send().await
                 .map_err(|_| error("REGISTRATION", "OAuth client registration failed"))?;
             if !matches!(response.status(), 200 | 201) {
@@ -819,7 +887,7 @@ async fn register_client(
     };
     Ok(Credentials {
         issuer: metadata.issuer.clone(), token_endpoint: metadata.token_endpoint.clone(),
-        client_id, client_secret, auth_method, scope: metadata.scope.clone(),
+        client_id, client_secret, auth_method, scope,
         access_token: String::new(), refresh_token: None, expires_at_ms: None,
     })
 }
@@ -926,11 +994,17 @@ fn parse_callback(request: &[u8], redirect_uri: &str, state: &str, issuer: &str,
     if url.origin() != redirect.origin() || url.path() != redirect.path() {
         return Callback::Ignore;
     }
-    let expected_host = format!("127.0.0.1:{}", redirect.port().unwrap_or(80));
+    let expected_host = &redirect[url::Position::BeforeHost..url::Position::AfterPort];
     let mut hosts = lines.filter_map(|line| line.split_once(':'))
         .filter(|(name, _)| name.eq_ignore_ascii_case("host"));
     let Some((_, host)) = hosts.next() else { return Callback::Ignore; };
-    if host.trim() != expected_host || hosts.next().is_some() { return Callback::Ignore; }
+    let host = host.trim();
+    let default_port_host = format!("{expected_host}:80");
+    let matches_host = host.eq_ignore_ascii_case(expected_host)
+        || (redirect.port().is_none()
+            && redirect.port_or_known_default() == Some(80)
+            && host.eq_ignore_ascii_case(&default_port_host));
+    if !matches_host || hosts.next().is_some() { return Callback::Ignore; }
     let mut parameters = HashMap::new();
     for (name, value) in url.query_pairs() {
         if parameters.insert(name.into_owned(), value.into_owned()).is_some() {
@@ -1021,6 +1095,699 @@ async fn await_callback(
             }
             Callback::Ignore => reply_callback(&mut stream, false),
         }
+    }
+}
+
+#[cfg(test)]
+mod configured_tests {
+    use super::*;
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    #[derive(Clone)]
+    struct CapturedRequest {
+        method: String,
+        target: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    impl CapturedRequest {
+        fn form(&self) -> HashMap<String, String> {
+            url::form_urlencoded::parse(&self.body)
+                .into_owned()
+                .collect()
+        }
+    }
+
+    struct OAuthFixture {
+        origin: String,
+        methods: Vec<String>,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        failures: Arc<Mutex<Vec<String>>>,
+        stopping: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl OAuthFixture {
+        fn start(methods: &[&str]) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("OAuth fixture listener");
+            listener.set_nonblocking(true).expect("nonblocking fixture");
+            let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
+            let methods: Vec<String> = methods.iter().map(|value| (*value).to_string()).collect();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let failures = Arc::new(Mutex::new(Vec::new()));
+            let stopping = Arc::new(AtomicBool::new(false));
+            let captured = Arc::clone(&requests);
+            let failed = Arc::clone(&failures);
+            let stopped = Arc::clone(&stopping);
+            let base = origin.clone();
+            let advertised = methods.clone();
+            let thread = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            match read_fixture_request(&mut stream, &stopped) {
+                                Ok(request) => {
+                                    let response = fixture_response(&base, &advertised, &request);
+                                    captured.lock().expect("request capture").push(request);
+                                    if let Err(err) = stream.write_all(response.as_bytes()) {
+                                        failed.lock().expect("failure capture").push(err.to_string());
+                                    }
+                                }
+                                Err(err) if !stopped.load(Ordering::Acquire) => {
+                                    failed.lock().expect("failure capture").push(err);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => {
+                            failed.lock().expect("failure capture").push(err.to_string());
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                origin,
+                methods,
+                requests,
+                failures,
+                stopping,
+                thread: Some(thread),
+            }
+        }
+
+        fn resource(&self) -> String {
+            format!("{}/mcp", self.origin)
+        }
+
+        fn metadata(&self) -> Metadata {
+            Metadata {
+                issuer: format!("{}/", self.origin),
+                authorization_endpoint: format!("{}/authorize", self.origin),
+                token_endpoint: format!("{}/token", self.origin),
+                registration_endpoint: Some(format!("{}/register", self.origin)),
+                auth_methods: self.methods.clone(),
+                scope: Some("metadata.read offline_access".to_string()),
+                require_iss: true,
+            }
+        }
+
+        fn captured(&self) -> Vec<CapturedRequest> {
+            let failures = self.failures.lock().expect("failure capture");
+            assert!(failures.is_empty(), "fixture failures: {failures:?}");
+            self.requests.lock().expect("request capture").clone()
+        }
+    }
+
+    impl Drop for OAuthFixture {
+        fn drop(&mut self) {
+            self.stopping.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn read_fixture_request(
+        stream: &mut TcpStream,
+        stopping: &AtomicBool,
+    ) -> std::result::Result<CapturedRequest, String> {
+        stream
+            .set_nonblocking(false)
+            .map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .map_err(|err| err.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 2048];
+        while !stopping.load(Ordering::Acquire) && Instant::now() < deadline {
+            match stream.read(&mut chunk) {
+                Ok(0) => return Err("fixture request ended early".to_string()),
+                Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+            if bytes.len() > BODY_LIMIT {
+                return Err("fixture request exceeded its limit".to_string());
+            }
+            let Some(head_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = std::str::from_utf8(&bytes[..head_end])
+                .map_err(|_| "fixture request headers are not UTF-8".to_string())?;
+            let mut lines = head.lines();
+            let first = lines.next().ok_or_else(|| "missing request line".to_string())?;
+            let words: Vec<_> = first.split_whitespace().collect();
+            if words.len() != 3 {
+                return Err("invalid fixture request line".to_string());
+            }
+            let headers: HashMap<String, String> = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+                .collect();
+            let length = headers
+                .get("content-length")
+                .map_or(Ok(0), |value| value.parse::<usize>())
+                .map_err(|_| "invalid fixture content length".to_string())?;
+            if length > BODY_LIMIT {
+                return Err("fixture request body exceeded its limit".to_string());
+            }
+            let body_start = head_end + 4;
+            if bytes.len() < body_start + length {
+                continue;
+            }
+            return Ok(CapturedRequest {
+                method: words[0].to_string(),
+                target: words[1].to_string(),
+                headers,
+                body: bytes[body_start..body_start + length].to_vec(),
+            });
+        }
+        Err("fixture request deadline elapsed or fixture stopped".to_string())
+    }
+
+    fn fixture_response(origin: &str, methods: &[String], request: &CapturedRequest) -> String {
+        let (status, extra, body) = match (request.method.as_str(), request.target.as_str()) {
+            ("GET", "/mcp") => (
+                "401 Unauthorized",
+                format!(
+                    "WWW-Authenticate: Bearer resource_metadata=\"{origin}/resource\", scope=\"metadata.read offline_access\"\r\n"
+                ),
+                json!({"error": "login_required"}),
+            ),
+            ("GET", "/resource") => (
+                "200 OK",
+                String::new(),
+                json!({
+                    "resource": format!("{origin}/mcp"),
+                    "authorization_servers": [format!("{origin}/")]
+                }),
+            ),
+            ("GET", "/.well-known/oauth-authorization-server") => (
+                "200 OK",
+                String::new(),
+                json!({
+                    "issuer": format!("{origin}/"),
+                    "authorization_endpoint": format!("{origin}/authorize"),
+                    "token_endpoint": format!("{origin}/token"),
+                    "registration_endpoint": format!("{origin}/register"),
+                    "token_endpoint_auth_methods_supported": methods,
+                    "code_challenge_methods_supported": ["S256"],
+                    "response_types_supported": ["code"],
+                    "authorization_response_iss_parameter_supported": true
+                }),
+            ),
+            ("POST", "/register") => (
+                "201 Created",
+                String::new(),
+                json!({
+                    "client_id": "dynamically-registered-client",
+                    "token_endpoint_auth_method": "none"
+                }),
+            ),
+            ("POST", "/token") => {
+                if request.form().get("grant_type").map(String::as_str) == Some("refresh_token") {
+                    (
+                        "200 OK",
+                        String::new(),
+                        json!({
+                            "access_token": "refreshed-access",
+                            "token_type": "Bearer",
+                            "refresh_token": "rotated-refresh",
+                            "expires_in": 3600
+                        }),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        String::new(),
+                        json!({
+                            "access_token": "first-access",
+                            "token_type": "Bearer",
+                            "refresh_token": "first-refresh",
+                            "expires_in": 1
+                        }),
+                    )
+                }
+            }
+            _ => ("404 Not Found", String::new(), json!({"error": "unexpected_request"})),
+        };
+        let body = body.to_string();
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
+            body.len(),
+        )
+    }
+
+    fn run<T>(operation: impl Future<Output = Result<T>>) -> Result<T> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("OAuth test runtime");
+        let owner = AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(owner.with_current(bounded(operation, Duration::from_secs(15))))
+    }
+
+    fn admit() -> Admission {
+        Arc::new(|| Ok(()))
+    }
+
+    fn browser_callback(
+        captured: Arc<Mutex<Vec<Url>>>,
+        issuer: String,
+    ) -> Arc<dyn Fn(&str) + Send + Sync> {
+        Arc::new(move |authorization| {
+            let authorization = Url::parse(authorization).expect("authorization URL");
+            let parameters: HashMap<String, String> =
+                authorization.query_pairs().into_owned().collect();
+            let mut callback = Url::parse(
+                parameters.get("redirect_uri").expect("registered redirect"),
+            )
+            .expect("callback URL");
+            callback
+                .query_pairs_mut()
+                .append_pair("code", "fixture-code")
+                .append_pair("state", parameters.get("state").expect("state"))
+                .append_pair("iss", &issuer);
+            let address = match callback.host().expect("callback host") {
+                url::Host::Ipv4(address) => IpAddr::V4(address),
+                url::Host::Ipv6(address) => IpAddr::V6(address),
+                url::Host::Domain("localhost") => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                _ => panic!("callback must remain loopback"),
+            };
+            let address = SocketAddr::new(
+                address,
+                callback.port_or_known_default().expect("callback port"),
+            );
+            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+                .expect("connect browser callback");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("bounded browser callback");
+            let host = &callback[url::Position::BeforeHost..url::Position::AfterPort];
+            let target = &callback[url::Position::BeforePath..];
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            );
+            captured.lock().expect("browser capture").push(authorization);
+            // The login future begins accepting after this synchronous callback
+            // returns. Write the request without waiting here for its response.
+            stream.write_all(request.as_bytes()).expect("browser request");
+        })
+    }
+
+    #[test]
+    fn configured_client_login_bypasses_registration_and_refreshes_with_its_secret() {
+        let fixture = OAuthFixture::start(&["client_secret_basic", "client_secret_post"]);
+        let temp = tempfile::tempdir().expect("credential directory");
+        let binding = AuthBinding::new(temp.path(), "configured", &fixture.resource())
+            .expect("configured auth binding");
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("callback port reservation");
+        let port = reservation.local_addr().expect("reserved address").port();
+        drop(reservation);
+        let redirect = format!("http://localhost:{port}/registered%20callback");
+        let options = McpOAuthConfig {
+            client_id: Some("configured-client".to_string()),
+            client_secret: Some("secret:+/& with space".to_string()),
+            scope: Some("configured.write offline_access".to_string()),
+            redirect_uri: Some(redirect.clone()),
+            callback_port: Some(port),
+            callback_path: Some("/registered%20callback".to_string()),
+            prompt: Some("select_account".to_string()),
+        };
+        let browser = Arc::new(Mutex::new(Vec::new()));
+        let callback = browser_callback(Arc::clone(&browser), fixture.metadata().issuer);
+        let before = run(async {
+            binding.reauthenticate(options, callback, admit()).await?;
+            let before = binding.read().await?.expect("persisted login");
+            let credentials = before.credentials.as_ref().expect("configured credentials");
+            assert_eq!(credentials.access_token, "first-access");
+            assert_eq!(credentials.client_id, "configured-client");
+            assert_eq!(credentials.client_secret.as_deref(), Some("secret:+/& with space"));
+            assert_eq!(credentials.auth_method, "client_secret_post");
+            assert_eq!(
+                binding.authorization_header(true).await?.as_deref(),
+                Some("Bearer refreshed-access")
+            );
+            Ok(before)
+        })
+        .expect("configured login and refresh");
+        let browser = browser.lock().expect("browser capture");
+        assert_eq!(browser.len(), 1);
+        let authorization = &browser[0];
+        assert_eq!(authorization.path(), "/authorize");
+        let parameters: HashMap<String, String> =
+            authorization.query_pairs().into_owned().collect();
+        assert_eq!(parameters.get("client_id").map(String::as_str), Some("configured-client"));
+        assert_eq!(parameters.get("redirect_uri"), Some(&redirect));
+        assert_eq!(
+            parameters.get("scope").map(String::as_str),
+            Some("configured.write offline_access")
+        );
+        assert_eq!(parameters.get("prompt").map(String::as_str), Some("select_account"));
+        assert_eq!(parameters.get("resource"), Some(&fixture.resource()));
+        assert_eq!(parameters.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert!(!parameters.contains_key("client_secret"));
+        assert!(!parameters.values().any(|value| value == "secret:+/& with space"));
+
+        let requests = fixture.captured();
+        assert!(!requests.iter().any(|request| request.target == "/register"));
+        let tokens: Vec<_> = requests.iter().filter(|request| request.target == "/token").collect();
+        assert_eq!(tokens.len(), 2);
+        let exchanged = tokens[0].form();
+        assert_eq!(exchanged.get("grant_type").map(String::as_str), Some("authorization_code"));
+        assert_eq!(exchanged.get("code").map(String::as_str), Some("fixture-code"));
+        assert_eq!(exchanged.get("redirect_uri"), Some(&redirect));
+        assert_eq!(exchanged.get("client_id").map(String::as_str), Some("configured-client"));
+        assert_eq!(
+            exchanged.get("client_secret").map(String::as_str),
+            Some("secret:+/& with space")
+        );
+        assert!(!tokens[0].headers.contains_key("authorization"));
+        let verifier = exchanged.get("code_verifier").expect("PKCE verifier");
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()));
+        assert_eq!(parameters.get("code_challenge"), Some(&challenge));
+        let refreshed = tokens[1].form();
+        assert_eq!(refreshed.get("grant_type").map(String::as_str), Some("refresh_token"));
+        assert_eq!(refreshed.get("refresh_token").map(String::as_str), Some("first-refresh"));
+        assert_eq!(
+            refreshed.get("client_secret").map(String::as_str),
+            Some("secret:+/& with space")
+        );
+        assert_eq!(refreshed.get("client_id"), exchanged.get("client_id"));
+        assert!(!tokens[1].headers.contains_key("authorization"));
+        let after = binding.read_sync().expect("credential store").expect("refreshed login");
+        assert_eq!(after.epoch, before.epoch);
+        assert_ne!(after.revision, before.revision);
+        let credentials = after.credentials.expect("refreshed credentials");
+        assert_eq!(credentials.client_secret.as_deref(), Some("secret:+/& with space"));
+        assert_eq!(credentials.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(credentials.auth_method, "client_secret_post");
+    }
+
+    #[test]
+    fn authorization_url_honors_scope_and_prompt_omission_and_defaults() {
+        for (scope, prompt, expected_scope, expected_prompt) in [
+            (
+                Some("configured.read offline_access"),
+                None,
+                Some("configured.read offline_access"),
+                Some("consent"),
+            ),
+            (
+                Some("configured.read offline_access"),
+                Some(""),
+                Some("configured.read offline_access"),
+                None,
+            ),
+            (Some(""), None, None, None),
+            (None, None, Some("metadata.read offline_access"), Some("consent")),
+        ] {
+            let fixture = OAuthFixture::start(&["none"]);
+            let temp = tempfile::tempdir().expect("credential directory");
+            let binding = AuthBinding::new(temp.path(), "prompt-options", &fixture.resource())
+                .expect("public client binding");
+            let browser = Arc::new(Mutex::new(Vec::new()));
+            let callback = browser_callback(Arc::clone(&browser), fixture.metadata().issuer);
+            let options = McpOAuthConfig {
+                client_id: Some("public-configured-client".to_string()),
+                scope: scope.map(str::to_string),
+                prompt: prompt.map(str::to_string),
+                callback_path: Some("/selected-callback".to_string()),
+                ..McpOAuthConfig::default()
+            };
+            run(binding.reauthenticate(options, callback, admit())).expect("public login");
+            let browser = browser.lock().expect("browser capture");
+            assert_eq!(browser.len(), 1);
+            let parameters: HashMap<String, String> =
+                browser[0].query_pairs().into_owned().collect();
+            assert_eq!(parameters.get("scope").map(String::as_str), expected_scope);
+            assert_eq!(parameters.get("prompt").map(String::as_str), expected_prompt);
+            assert_eq!(
+                Url::parse(parameters.get("redirect_uri").expect("redirect"))
+                    .expect("callback URL")
+                    .path(),
+                "/selected-callback"
+            );
+            let requests = fixture.captured();
+            assert!(!requests.iter().any(|request| request.target == "/register"));
+            let token = requests.iter().find(|request| request.target == "/token")
+                .expect("code exchange");
+            assert!(!token.form().contains_key("client_secret"));
+            assert!(!token.headers.contains_key("authorization"));
+        }
+    }
+
+    #[test]
+    fn dynamic_registration_receives_configured_scope_and_explicit_omission() {
+        let fixture = OAuthFixture::start(&["none"]);
+        let metadata = fixture.metadata();
+        let check = admit();
+        for (scope, expected) in [
+            (Some("registered.read offline_access"), Some("registered.read offline_access")),
+            (Some(""), None),
+            (None, Some("metadata.read offline_access")),
+        ] {
+            let options = McpOAuthConfig {
+                scope: scope.map(str::to_string),
+                ..McpOAuthConfig::default()
+            };
+            let credentials = run(register_client(
+                &metadata,
+                &options,
+                "http://127.0.0.1:43121/registered",
+                &check,
+            ))
+            .expect("dynamic registration");
+            assert_eq!(credentials.client_id, "dynamically-registered-client");
+            assert_eq!(credentials.scope.as_deref(), expected);
+            assert!(credentials.client_secret.is_none());
+        }
+        let requests = fixture.captured();
+        assert_eq!(requests.len(), 3);
+        for (request, expected) in requests.iter().zip([
+            Some("registered.read offline_access"),
+            None,
+            Some("metadata.read offline_access"),
+        ]) {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/register");
+            let body: Value = serde_json::from_slice(&request.body).expect("registration JSON");
+            assert_eq!(body.get("scope").and_then(Value::as_str), expected);
+            assert_eq!(
+                body["redirect_uris"],
+                json!(["http://127.0.0.1:43121/registered"])
+            );
+            assert_eq!(body["token_endpoint_auth_method"], "none");
+            assert!(body.get("client_secret").is_none());
+        }
+    }
+
+    #[test]
+    fn configured_secret_uses_basic_when_post_is_not_advertised() {
+        let fixture = OAuthFixture::start(&["client_secret_basic"]);
+        let metadata = fixture.metadata();
+        let options = McpOAuthConfig {
+            client_id: Some("client:with space".to_string()),
+            client_secret: Some("secret:+/ with space".to_string()),
+            ..McpOAuthConfig::default()
+        };
+        let check = admit();
+        let credentials = run(register_client(
+            &metadata,
+            &options,
+            "http://127.0.0.1:43121/callback",
+            &check,
+        ))
+        .expect("configured Basic client");
+        assert_eq!(credentials.auth_method, "client_secret_basic");
+        assert!(fixture.captured().is_empty(), "configured clients bypass DCR");
+        let mut fields = vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("refresh_token".to_string(), "basic-refresh".to_string()),
+            ("resource".to_string(), fixture.resource()),
+        ];
+        run(token_request(&credentials, &mut fields)).expect("Basic-authenticated token grant");
+        let requests = fixture.captured();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target, "/token");
+        let form = requests[0].form();
+        assert_eq!(form.get("client_id").map(String::as_str), Some("client:with space"));
+        assert!(!form.contains_key("client_secret"));
+        let authorization = requests[0].headers.get("authorization").expect("Basic header");
+        let encoded = authorization.strip_prefix("Basic ").expect("Basic scheme");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64 client authentication");
+        assert_eq!(
+            String::from_utf8(decoded).expect("form-encoded Basic credentials"),
+            "client%3Awith+space:secret%3A%2B%2F+with+space"
+        );
+    }
+
+    #[test]
+    fn unsupported_configured_and_dynamic_client_authentication_fails_before_network() {
+        let fixture = OAuthFixture::start(&["private_key_jwt"]);
+        let options = McpOAuthConfig {
+            client_id: Some("configured-client".to_string()),
+            client_secret: Some("configured-secret".to_string()),
+            ..McpOAuthConfig::default()
+        };
+        let check = admit();
+        for methods in [vec!["private_key_jwt"], vec!["none"], Vec::new()] {
+            let mut metadata = fixture.metadata();
+            metadata.auth_methods = methods.into_iter().map(str::to_string).collect();
+            let error = run(register_client(
+                &metadata,
+                &options,
+                "http://127.0.0.1:43121/callback",
+                &check,
+            ))
+            .err()
+            .expect("unsupported configured authentication");
+            assert!(error.to_string().contains("MCP_AUTH_CLIENT_AUTH"));
+            assert!(!error.to_string().contains("configured-secret"));
+        }
+        let metadata = fixture.metadata();
+        let error = run(register_client(
+            &metadata,
+            &McpOAuthConfig::default(),
+            "http://127.0.0.1:43121/callback",
+            &check,
+        ))
+        .err()
+        .expect("unsupported dynamic authentication");
+        assert!(error.to_string().contains("MCP_AUTH_CLIENT_AUTH"));
+        assert!(fixture.captured().is_empty());
+    }
+
+    #[test]
+    fn callback_host_checks_cover_localhost_ipv6_and_default_http_port() {
+        for (redirect, host) in [
+            ("http://localhost:43121/callback", "LOCALHOST:43121"),
+            ("http://[::1]:43121/callback", "[::1]:43121"),
+            ("http://localhost/callback", "localhost"),
+            ("http://localhost/callback", "localhost:80"),
+            ("http://localhost:80/callback", "localhost"),
+            ("http://localhost:80/callback", "localhost:80"),
+            ("http://[::1]/callback", "[::1]"),
+            ("http://[::1]:80/callback", "[::1]:80"),
+            ("http://127.0.0.1:80/callback", "127.0.0.1"),
+            ("http://127.0.0.1/callback", "127.0.0.1:80"),
+        ] {
+            let request = format!(
+                "GET /callback?code=approved&state=random HTTP/1.1\r\nHost: {host}\r\n\r\n"
+            );
+            assert!(
+                matches!(
+                    parse_callback(
+                        request.as_bytes(),
+                        redirect,
+                        "random",
+                        "https://issuer.example/",
+                        false,
+                    ),
+                    Callback::Code(code) if code == "approved"
+                ),
+                "{redirect} with Host {host}"
+            );
+            let duplicate = request.replace("\r\n\r\n", "\r\nHost: attacker.example\r\n\r\n");
+            assert!(matches!(
+                parse_callback(
+                    duplicate.as_bytes(),
+                    redirect,
+                    "random",
+                    "https://issuer.example/",
+                    false,
+                ),
+                Callback::Ignore
+            ));
+        }
+        for (redirect, host) in [
+            ("http://localhost:43121/callback", "127.0.0.1:43121"),
+            ("http://[::1]:43121/callback", "::1:43121"),
+            ("http://localhost:43121/callback", "localhost:43122"),
+            ("http://localhost:80/callback", "localhost:81"),
+            ("http://localhost/callback", "localhost.attacker.example"),
+        ] {
+            let request = format!(
+                "GET /callback?code=approved&state=random HTTP/1.1\r\nHost: {host}\r\n\r\n"
+            );
+            assert!(matches!(
+                parse_callback(
+                    request.as_bytes(),
+                    redirect,
+                    "random",
+                    "https://issuer.example/",
+                    false,
+                ),
+                Callback::Ignore
+            ));
+        }
+    }
+
+    #[test]
+    fn occupied_callback_port_never_falls_back_to_an_unregistered_port() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("occupied callback port");
+        let port = occupied.local_addr().expect("occupied address").port();
+        let redirect = format!("http://localhost:{port}/registered%20callback");
+        for options in [
+            McpOAuthConfig {
+                callback_port: Some(port),
+                callback_path: Some("/registered%20callback".to_string()),
+                ..McpOAuthConfig::default()
+            },
+            McpOAuthConfig {
+                redirect_uri: Some(redirect.clone()),
+                ..McpOAuthConfig::default()
+            },
+        ] {
+            let error = bind_callback(&options).expect_err("fixed port must remain fixed");
+            assert!(error.to_string().contains("MCP_AUTH_CALLBACK"));
+        }
+        drop(occupied);
+        let options = McpOAuthConfig {
+            redirect_uri: Some(redirect.clone()),
+            ..McpOAuthConfig::default()
+        };
+        let (listener, registered) = bind_callback(&options).expect("released registered port");
+        assert_eq!(registered, redirect);
+        assert_eq!(
+            listener.local_addr().expect("bound registered callback"),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        );
+        drop(listener);
+        let options = McpOAuthConfig {
+            callback_path: Some("/custom-callback".to_string()),
+            ..McpOAuthConfig::default()
+        };
+        let (listener, generated) = bind_callback(&options).expect("ephemeral callback");
+        assert_eq!(
+            generated,
+            format!(
+                "http://127.0.0.1:{}/custom-callback",
+                listener.local_addr().expect("ephemeral address").port()
+            )
+        );
     }
 }
 

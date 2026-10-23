@@ -151,6 +151,180 @@ impl Provenance {
     }
 }
 
+/// OAuth client and loopback callback settings imported from OMP.
+///
+/// Values remain authored templates until the server has been trusted. In
+/// particular, discovery and trust fingerprinting never resolve client secrets.
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpOAuthConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub scope: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub callback_port: Option<u16>,
+    pub callback_path: Option<String>,
+    /// An empty string explicitly suppresses the authorization prompt.
+    pub prompt: Option<String>,
+}
+
+impl std::fmt::Debug for McpOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("scope", &self.scope)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("callback_port", &self.callback_port)
+            .field("callback_path", &self.callback_path)
+            .field("prompt", &self.prompt)
+            .finish()
+    }
+}
+
+impl McpOAuthConfig {
+    /// Validate authored settings without reading variables or running helpers.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid fields or literal callback targets. Callback templates
+    /// receive full URL validation after trusted variable expansion.
+    pub fn validate_raw(&self) -> Result<(), String> {
+        self.validate_fields()?;
+        self.validate_callbacks(true)
+    }
+
+    /// Validate trusted, resolved settings before binding a callback listener.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid fields, non-loopback callbacks, or conflicting explicit
+    /// redirect URI and callback port/path settings. Errors never echo values.
+    pub fn validate_resolved(&self) -> Result<(), String> {
+        self.validate_fields()?;
+        self.validate_callbacks(false)
+    }
+
+    fn validate_fields(&self) -> Result<(), String> {
+        for (name, value, limit, allow_empty) in [
+            ("clientId", self.client_id.as_deref(), 4096, false),
+            ("clientSecret", self.client_secret.as_deref(), 16 * 1024, false),
+            ("scope", self.scope.as_deref(), 4096, true),
+            ("redirectUri", self.redirect_uri.as_deref(), 4096, false),
+            ("callbackPath", self.callback_path.as_deref(), 4096, false),
+            ("prompt", self.prompt.as_deref(), 4096, true),
+        ] {
+            if let Some(value) = value
+                && (value.len() > limit
+                    || (!allow_empty && value.trim().is_empty())
+                    || value.chars().any(is_terminal_control))
+            {
+                return Err(format!(
+                    "oauth.{name} has an invalid length or contains control characters"
+                ));
+            }
+        }
+        if self.client_secret.is_some() && self.client_id.is_none() {
+            return Err("oauth.clientSecret requires oauth.clientId".to_string());
+        }
+        if self.callback_port == Some(0) {
+            return Err("oauth.callbackPort must be an integer from 1 to 65535".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_callbacks(&self, allow_templates: bool) -> Result<(), String> {
+        let callback_path = self
+            .callback_path
+            .as_deref()
+            .filter(|value| !(allow_templates && value.contains("${")));
+        if let Some(path) = callback_path {
+            validate_oauth_callback_path(path)?;
+        }
+        let Some(redirect_uri) = self.redirect_uri.as_deref() else {
+            return Ok(());
+        };
+        if allow_templates && redirect_uri.contains("${") {
+            return Ok(());
+        }
+        let redirect = url::Url::parse(redirect_uri)
+            .map_err(|_| "oauth.redirectUri must be an absolute HTTP loopback URL".to_string())?;
+        let loopback = match redirect.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            Some(url::Host::Domain("localhost")) => true,
+            _ => false,
+        };
+        if redirect.scheme() != "http"
+            || !loopback
+            || redirect_uri.chars().any(char::is_whitespace)
+            || redirect_uri.contains('\\')
+            || !redirect_uri
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+            || !redirect.username().is_empty()
+            || redirect.password().is_some()
+            || redirect.query().is_some()
+            || redirect.fragment().is_some()
+            || redirect.port_or_known_default() == Some(0)
+        {
+            return Err(
+                "oauth.redirectUri must be an HTTP loopback URL without credentials, query, or fragment"
+                    .to_string(),
+            );
+        }
+        // Browser URL parsing must not change the registered callback path.
+        // An omitted HTTP path is the ordinary root path used on the wire.
+        let authority_and_path = redirect_uri
+            .get(7..)
+            .ok_or_else(|| "oauth.redirectUri must be an absolute HTTP loopback URL".to_string())?;
+        let (authority, raw_path) = authority_and_path
+            .find('/')
+            .map_or((authority_and_path, "/"), |start| {
+                authority_and_path.split_at(start)
+            });
+        if authority.contains('@') || raw_path != redirect.path() {
+            return Err(
+                "oauth.redirectUri must not contain credentials or a path requiring normalization"
+                    .to_string(),
+            );
+        }
+        validate_oauth_callback_path(redirect.path())?;
+        if self
+            .callback_port
+            .is_some_and(|port| Some(port) != redirect.port_or_known_default())
+        {
+            return Err("oauth.callbackPort conflicts with oauth.redirectUri".to_string());
+        }
+        if callback_path.is_some_and(|path| path != redirect.path()) {
+            return Err("oauth.callbackPath conflicts with oauth.redirectUri".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn validate_oauth_callback_path(path: &str) -> Result<(), String> {
+    let invalid = || {
+        "oauth.callbackPath must be an absolute URL path without query, fragment, or normalization"
+            .to_string()
+    };
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains(['?', '#', '\\'])
+    {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(&format!("http://127.0.0.1{path}"))
+        .map_err(|_| invalid())?;
+    if url.path() != path {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// One server definition after merging.
 #[derive(Debug, Clone)]
 pub struct ConfiguredServer {
@@ -166,6 +340,8 @@ pub struct ConfiguredServer {
     pub url: Option<String>,
     /// Extra HTTP headers (values may use `$ENV:`/`$CMD:`).
     pub headers: Vec<(String, String)>,
+    /// Authored OAuth settings; secret references resolve only after trust.
+    pub oauth: Option<McpOAuthConfig>,
     /// Explicit transport hint (`"stdio"` / `"http"` / `"sse"`).
     pub transport_hint: Option<String>,
     /// Explicit configuration disablement is independent of operator trust.
@@ -223,6 +399,23 @@ impl ConfiguredServer {
         hash_definitions(&mut hasher, "env", &self.env, false);
         hash_optional(&mut hasher, "url", self.url.as_deref());
         hash_definitions(&mut hasher, "headers", &self.headers, true);
+        if let Some(oauth) = &self.oauth {
+            // Retain the existing digest for definitions without OAuth, while
+            // binding every authored option (including raw secret references).
+            hash_part(&mut hasher, "oauth.state", b"present");
+            for (label, value) in [
+                ("oauth.client_id", oauth.client_id.as_deref()),
+                ("oauth.client_secret", oauth.client_secret.as_deref()),
+                ("oauth.scope", oauth.scope.as_deref()),
+                ("oauth.redirect_uri", oauth.redirect_uri.as_deref()),
+                ("oauth.callback_path", oauth.callback_path.as_deref()),
+                ("oauth.prompt", oauth.prompt.as_deref()),
+            ] {
+                hash_optional(&mut hasher, label, value);
+            }
+            let port = oauth.callback_port.map(|value| value.to_string());
+            hash_optional(&mut hasher, "oauth.callback_port", port.as_deref());
+        }
         hash_optional(
             &mut hasher,
             "transport_hint",
@@ -418,6 +611,9 @@ pub(super) fn validate_transport_shape(
     config: &ConfiguredServer,
 ) -> std::result::Result<(), String> {
     validate_timeout(config.timeout_ms)?;
+    if let Some(oauth) = &config.oauth {
+        oauth.validate_raw()?;
+    }
     if let Some(cwd) = &config.cwd
         && (cwd.as_os_str().is_empty() || cwd.to_string_lossy().chars().any(is_terminal_control))
     {
@@ -444,6 +640,9 @@ pub(super) fn validate_transport_shape(
             }
             if !config.headers.is_empty() {
                 return Err("stdio transport must not define HTTP headers".to_string());
+            }
+            if config.oauth.is_some() {
+                return Err("stdio transport must not define OAuth settings".to_string());
             }
             Ok(())
         }
@@ -718,6 +917,8 @@ struct RawServer {
     url: Option<String>,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    oauth: Option<McpOAuthConfig>,
     #[serde(default, rename = "type")]
     transport: Option<String>,
     #[serde(default)]
@@ -730,6 +931,47 @@ struct RawServer {
     timeout_ms: Option<u64>,
 }
 
+/// Reject malformed OAuth values before serde can echo a credential in an error.
+fn validate_oauth_shape(value: &Value) -> Result<(), String> {
+    let fields = value
+        .as_object()
+        .ok_or_else(|| "oauth must be an object".to_string())?;
+    for (name, value) in fields {
+        match name.as_str() {
+            "clientId" | "clientSecret" | "scope" | "redirectUri" | "callbackPath" | "prompt" => {
+                if !value.is_string() {
+                    return Err(format!("oauth.{name} must be a string"));
+                }
+            }
+            "callbackPort" => {
+                if !value
+                    .as_u64()
+                    .is_some_and(|port| (1..=65535).contains(&port))
+                {
+                    return Err(
+                        "oauth.callbackPort must be an integer from 1 to 65535".to_string(),
+                    );
+                }
+            }
+            _ => return Err("oauth contains an unknown field".to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Parse OAuth settings without resolving authored secret or variable references.
+///
+/// # Errors
+///
+/// Rejects malformed settings using diagnostics that never include field values.
+pub(crate) fn parse_oauth_config(value: &Value) -> Result<McpOAuthConfig, String> {
+    validate_oauth_shape(value)?;
+    let oauth: McpOAuthConfig = serde_json::from_value(value.clone())
+        .map_err(|_| "oauth settings are malformed".to_string())?;
+    oauth.validate_raw()?;
+    Ok(oauth)
+}
+
 /// Parse one server entry; `Err` carries the skip reason.
 fn parse_server(name: &str, raw: &Value) -> std::result::Result<RawServer, String> {
     for key in [
@@ -739,10 +981,14 @@ fn parse_server(name: &str, raw: &Value) -> std::result::Result<RawServer, Strin
         "timeout",
         "timeoutMs",
         "timeout_ms",
+        "oauth",
     ] {
         if raw.get(key).is_some_and(Value::is_null) {
             return Err(format!("entry {name:?}: field {key:?} must not be null"));
         }
+    }
+    if let Some(oauth) = raw.get("oauth") {
+        parse_oauth_config(oauth).map_err(|reason| format!("entry {name:?}: {reason}"))?;
     }
     let server: RawServer =
         serde_json::from_value(raw.clone()).map_err(|err| format!("entry {name:?}: {err}"))?;
@@ -1233,6 +1479,7 @@ pub fn discover(
                 env: Vec::new(),
                 url: raw.url,
                 headers: Vec::new(),
+                oauth: raw.oauth,
                 transport_hint: raw.transport,
                 enabled: false,
                 cwd: None,
@@ -1320,6 +1567,7 @@ pub fn discover(
             env,
             url,
             headers,
+            oauth: raw.oauth,
             transport_hint: raw.transport,
             enabled,
             cwd: server_cwd,
@@ -1348,6 +1596,7 @@ pub fn discover(
                 env: Vec::new(),
                 url: None,
                 headers: Vec::new(),
+                oauth: None,
                 transport_hint: None,
                 enabled: false,
                 cwd: None,
@@ -1998,6 +2247,7 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: None,
             enabled: true,
             cwd: None,
@@ -2177,6 +2427,7 @@ mod tests {
             env: Vec::new(),
             url: Some("https://example.invalid/mcp".to_string()),
             headers: Vec::new(),
+            oauth: None,
             transport_hint: None,
             enabled: true,
             cwd: None,
@@ -2558,6 +2809,246 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn omp_oauth_settings_survive_discovery_without_resolving_secrets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let options = serde_json::json!({
+            "clientId": "${PI_MCP_CONFIGURED_CLIENT}",
+            "clientSecret": "$CMD:exit 97",
+            "scope": "${PI_MCP_CONFIGURED_SCOPE}",
+            "redirectUri": "${PI_MCP_CONFIGURED_REDIRECT}",
+            "callbackPort": 43121,
+            "callbackPath": "${PI_MCP_CONFIGURED_CALLBACK}",
+            "prompt": ""
+        });
+        write(
+            &temp.path().join(".omp/mcp.json"),
+            &serde_json::json!({"mcpServers": {
+                "protected": {"url": "https://mcp.example.test", "oauth": options},
+                "disabled": {
+                    "url": "https://mcp.example.test", "enabled": false, "oauth": options
+                }
+            }})
+            .to_string(),
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        assert_eq!(discovery.servers.len(), 2);
+        let server = discovery
+            .servers
+            .iter()
+            .find(|server| server.name == "protected")
+            .expect("protected server");
+        let oauth = server.oauth.as_ref().expect("OAuth settings");
+        assert_eq!(server.provenance, Provenance::Foreign);
+        assert_eq!(oauth.client_id.as_deref(), Some("${PI_MCP_CONFIGURED_CLIENT}"));
+        assert_eq!(oauth.client_secret.as_deref(), Some("$CMD:exit 97"));
+        assert_eq!(oauth.scope.as_deref(), Some("${PI_MCP_CONFIGURED_SCOPE}"));
+        assert_eq!(oauth.redirect_uri.as_deref(), Some("${PI_MCP_CONFIGURED_REDIRECT}"));
+        assert_eq!(oauth.callback_port, Some(43121));
+        assert_eq!(oauth.callback_path.as_deref(), Some("${PI_MCP_CONFIGURED_CALLBACK}"));
+        assert_eq!(oauth.prompt.as_deref(), Some(""));
+        let disabled = discovery
+            .servers
+            .iter()
+            .find(|server| server.name == "disabled")
+            .expect("disabled server");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.oauth.as_ref(), Some(oauth));
+        let debug = format!("{server:?}");
+        assert!(!debug.contains("$CMD:exit 97"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn malformed_oauth_blocks_lower_precedence_without_echoing_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"remote":{"url":"https://fallback.example.test"}}}"#,
+        );
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("DO_NOT_ECHO_CREDENTIAL"),
+            serde_json::json!({"clientSecret": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"clientId": "client", "clientSecret": null}),
+            serde_json::json!({"clientId": "client", "clientSecret": ["DO_NOT_ECHO_CREDENTIAL"]}),
+            serde_json::json!({"clientId": "", "clientSecret": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"clientId": "client", "clientSecret": "DO_NOT_ECHO_CREDENTIAL\n"}),
+            serde_json::json!({"callbackPort": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"callbackPort": 0}),
+            serde_json::json!({"callbackPort": -1}),
+            serde_json::json!({"callbackPort": 65536}),
+            serde_json::json!({"callbackPort": 1.5}),
+            serde_json::json!({"prompt": null}),
+            serde_json::json!({"unknown": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"redirectUri": "https://127.0.0.1:43121/callback"}),
+            serde_json::json!({"redirectUri": "http://remote.example.test:43121/callback"}),
+            serde_json::json!({
+                "redirectUri": "http://127.0.0.1:43121/callback", "callbackPort": 43122
+            }),
+            serde_json::json!({
+                "redirectUri": "http://127.0.0.1:43121/callback", "callbackPath": "/other"
+            }),
+        ] {
+            write(
+                &temp.path().join(".pi/mcp.json"),
+                &serde_json::json!({"mcpServers": {"remote": {
+                    "url": "https://mcp.example.test", "oauth": invalid
+                }}})
+                .to_string(),
+            );
+            let discovery = discover(temp.path(), &global, &[], true);
+            assert!(discovery.servers.is_empty(), "{invalid}");
+            assert_eq!(discovery.warnings.len(), 1, "{invalid}");
+            assert!(!format!("{:?}", discovery.warnings).contains("DO_NOT_ECHO_CREDENTIAL"));
+        }
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{"remote":{"command":"server","oauth":{"clientId":"client"}}}}"#,
+        );
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.servers.is_empty());
+        assert!(discovery.warnings[0].reason.contains("stdio transport"));
+    }
+
+    #[test]
+    fn oauth_callback_validation_accepts_loopback_without_rewriting_registered_uri() {
+        for redirect in [
+            "http://127.0.0.1:43121/callback",
+            "http://127.0.0.2:43121/callback",
+            "http://[::1]:43121/callback",
+            "http://localhost:43121/callback",
+            "http://127.0.0.1:80/callback",
+            "http://127.0.0.1:43121/callback%20path",
+        ] {
+            let options = McpOAuthConfig {
+                redirect_uri: Some(redirect.to_string()),
+                prompt: Some(String::new()),
+                ..McpOAuthConfig::default()
+            };
+            options.validate_raw().expect("raw loopback callback");
+            options.validate_resolved().expect("resolved loopback callback");
+            assert_eq!(options.redirect_uri.as_deref(), Some(redirect));
+        }
+        let options = McpOAuthConfig {
+            redirect_uri: Some("http://localhost/callback".to_string()),
+            callback_port: Some(80),
+            callback_path: Some("/callback".to_string()),
+            ..McpOAuthConfig::default()
+        };
+        options.validate_resolved().expect("matching default HTTP port");
+        for redirect in [
+            "http://0.0.0.0:43121/callback",
+            "http://[::]:43121/callback",
+            "http://localhost.example:43121/callback",
+            "http://127.0.0.1:0/callback",
+            "http://user:secret@127.0.0.1:43121/callback",
+            "http://127.0.0.1:43121/callback?state=fixed",
+            "http://127.0.0.1:43121/callback#fragment",
+            "http://127.0.0.1:43121/call back",
+            "http://127.0.0.1:43121/a/../callback",
+            "http://127.0.0.1:43121/%2e%2e/callback",
+            "http://@127.0.0.1:43121/callback",
+            " http://127.0.0.1:43121/callback",
+            "http://127.0.0.1:43121\\callback",
+            "http:127.0.0.1:43121/callback",
+        ] {
+            let options = McpOAuthConfig {
+                redirect_uri: Some(redirect.to_string()),
+                ..McpOAuthConfig::default()
+            };
+            assert!(options.validate_resolved().is_err(), "{redirect}");
+        }
+        for path in ["", "callback", "//other/callback", "/a/../callback", "/a b", "/cb?x", "/cb#x"] {
+            let options = McpOAuthConfig {
+                callback_path: Some(path.to_string()),
+                ..McpOAuthConfig::default()
+            };
+            assert!(options.validate_resolved().is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn oauth_callback_templates_are_checked_after_trusted_expansion() {
+        let mut options = McpOAuthConfig {
+            redirect_uri: Some("${CALLBACK}".to_string()),
+            callback_path: Some("${CALLBACK_PATH}".to_string()),
+            callback_port: Some(43121),
+            ..McpOAuthConfig::default()
+        };
+        options.validate_raw().expect("retain callback templates");
+        assert!(options.validate_resolved().is_err());
+        options.redirect_uri = Some(
+            expand_config_value_with(
+                options.redirect_uri.as_deref().unwrap(),
+                Path::new("."),
+                |_| Some("http://127.0.0.1:43121/login".to_string()),
+            )
+            .expect("expand redirect"),
+        );
+        options.callback_path = Some(
+            expand_config_value_with(
+                options.callback_path.as_deref().unwrap(),
+                Path::new("."),
+                |_| Some("/login".to_string()),
+            )
+            .expect("expand path"),
+        );
+        options.validate_resolved().expect("resolved matching callback");
+        options.callback_path = Some("/different".to_string());
+        assert!(options.validate_resolved().is_err());
+    }
+
+    #[test]
+    fn oauth_trust_fingerprint_binds_every_authored_option_and_secret_reference() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{"remote":{
+                "url":"https://mcp.example.test",
+                "oauth":{
+                    "clientId":"client",
+                    "clientSecret":"$ENV:SECRET_A",
+                    "scope":"read offline_access",
+                    "redirectUri":"http://127.0.0.1:43121/callback",
+                    "callbackPort":43121,
+                    "callbackPath":"/callback",
+                    "prompt":""
+                }
+            }}}"#,
+        );
+        let server = discover(temp.path(), &temp.path().join("global"), &[], true)
+            .servers
+            .remove(0);
+        let fingerprint = server.fingerprint(temp.path());
+        let changes: [fn(&mut McpOAuthConfig); 7] = [
+            |oauth| oauth.client_id = Some("other-client".to_string()),
+            |oauth| oauth.client_secret = Some("$ENV:SECRET_B".to_string()),
+            |oauth| oauth.scope = Some("write offline_access".to_string()),
+            |oauth| oauth.redirect_uri = Some("http://localhost:43121/callback".to_string()),
+            |oauth| oauth.callback_port = Some(43122),
+            |oauth| oauth.callback_path = Some("/other".to_string()),
+            |oauth| oauth.prompt = None,
+        ];
+        for change in changes {
+            let mut changed = server.clone();
+            change(changed.oauth.as_mut().expect("OAuth settings"));
+            assert_ne!(fingerprint, changed.fingerprint(temp.path()));
+        }
+        let mut absent = server.clone();
+        absent.oauth = None;
+        assert_ne!(fingerprint, absent.fingerprint(temp.path()));
+        let absent_fingerprint = absent.fingerprint(temp.path());
+        absent.oauth = Some(McpOAuthConfig::default());
+        assert_ne!(absent_fingerprint, absent.fingerprint(temp.path()));
+        assert_eq!(
+            server.oauth.as_ref().unwrap().client_secret.as_deref(),
+            Some("$ENV:SECRET_A")
+        );
     }
 
     #[test]

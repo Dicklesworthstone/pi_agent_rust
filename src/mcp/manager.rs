@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{ConfiguredServer, McpDiscovery, Provenance};
+use super::config::{ConfiguredServer, McpDiscovery, McpOAuthConfig, Provenance};
 use super::transport::{DEFAULT_MCP_TIMEOUT, MCP_PROTOCOL_VERSION, McpTransport};
 use super::trust::{TrustDecision, TrustStore, TrustWriteGuard};
 use crate::error::{Error, Result};
@@ -651,7 +651,8 @@ impl McpManager {
     /// Cancelling the browser wait does not clear an existing login. Once new
     /// credentials are saved, reconnect failure or cancellation cannot undo them.
     /// Authentication never grants trust or rewrites a server's source config.
-    /// A public client ID may be supplied for servers without registration.
+    /// Configured OAuth settings apply to every operator surface. Supplying a
+    /// public client ID overrides the configured client and discards its secret.
     ///
     /// # Errors
     /// Returns admission, discovery, authorization, persistence, or reconnect
@@ -687,7 +688,8 @@ impl McpManager {
             async {
                 // Do not hold the connection lane during browser interaction:
                 // unauth/deny/shutdown must be able to revoke a pending flow.
-                binding.reauthenticate(client_id, on_url, check).await?;
+                let configuration = self.resolve_authentication_configuration(&entry, client_id).await?;
+                binding.reauthenticate(configuration, on_url, check).await?;
                 let _lane = asupersync::sync::OwnedMutexGuard::lock(
                     Arc::clone(&entry.connect_lane),
                     owner.cx(),
@@ -717,6 +719,60 @@ impl McpManager {
             Duration::from_secs(300),
         )
         .await?
+    }
+
+    /// Resolve authored credentials under the same trust lock used by transport
+    /// construction. Cancellation can withdraw queued blocking work before a
+    /// credential helper executes, and no lock spans browser interaction.
+    async fn resolve_authentication_configuration(
+        &self,
+        entry: &Arc<ServerEntry>,
+        public_client_id: Option<String>,
+    ) -> Result<McpOAuthConfig> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        catalog::check_request_owner(&owner)?;
+        self.check_authentication_entry(entry)?;
+        let config = entry.config.clone();
+        let cwd = entry.effective_cwd(&self.inner.cwd);
+        let workspace = self.inner.cwd.clone();
+        let trust_path = self.inner.trust_path.clone();
+        let manager = Self { inner: Arc::clone(&self.inner) };
+        let entry = Arc::clone(entry);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandoned_worker = Arc::clone(&abandoned);
+        let mut attempt = TransportConstructionAttempt::new(abandoned);
+        let result = asupersync::runtime::spawn_blocking(move || {
+            let _owner_guard = owner.cx().clone().set_current_restricted();
+            let ensure_active = || {
+                catalog::check_request_owner(&owner)?;
+                manager.check_running()?;
+                if abandoned_worker.load(Ordering::Acquire) {
+                    return Err(tool_err("MCP_CANCELLED", "MCP credential resolution was cancelled"));
+                }
+                if !Arc::ptr_eq(&manager.entry(&config.name)?, &entry) {
+                    return Err(tool_err(
+                        "MCP_AUTH_SUPERSEDED",
+                        "the MCP server definition changed while resolving credentials",
+                    ));
+                }
+                Ok(())
+            };
+            ensure_active()?;
+            let _trust_execution_guard =
+                Self::lock_trust_for_execution(&config, &cwd, &workspace, &trust_path)?;
+            ensure_active()?;
+            resolve_oauth_settings(
+                &config,
+                public_client_id,
+                &cwd,
+                &workspace,
+                owner.capabilities().spawn,
+                &ensure_active,
+            )
+        })
+        .await;
+        attempt.disarm();
+        result
     }
 
     /// Remove managed credentials and retire the live connection and catalog.
@@ -1910,6 +1966,7 @@ impl McpManager {
                 env: optional_string_map(spec, "env")?,
                 url: optional_string(spec, "url")?,
                 headers: optional_string_map(spec, "headers")?,
+                oauth: spec.get("oauth").map(super::config::parse_oauth_config).transpose()?,
                 transport_hint,
                 enabled: super::config::configured_enabled(spec)?,
                 cwd: None,
@@ -2035,6 +2092,82 @@ fn is_indeterminate_call_delivery(err: &Error) -> bool {
                     .iter()
                     .any(|prefix| message.starts_with(prefix))
     )
+}
+
+/// Keep authored OAuth definitions intact and resolve only the selected client.
+/// The caller holds the trust-execution guard for the entire resolution.
+fn resolve_oauth_settings(
+    config: &ConfiguredServer,
+    public_client_id: Option<String>,
+    cwd: &Path,
+    workspace: &Path,
+    allow_commands: bool,
+    check: &impl Fn() -> Result<()>,
+) -> Result<McpOAuthConfig> {
+    let mut oauth = config.oauth.clone().unwrap_or_default();
+    let public_override = public_client_id.is_some();
+    if let Some(client_id) = public_client_id {
+        // RPC's override denotes a public client. Neither configured helper
+        // may run, and a secret must never be paired with another client ID.
+        oauth.client_id = Some(client_id);
+        oauth.client_secret = None;
+    }
+    oauth.validate_raw().map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
+    check()?;
+    if !public_override {
+        for (name, field) in [
+            ("clientId", &mut oauth.client_id),
+            ("clientSecret", &mut oauth.client_secret),
+        ] {
+            let Some(raw) = field.as_ref() else { continue; };
+            check()?;
+            if config.provenance != Provenance::Acp
+                && raw.trim().starts_with("$CMD:")
+                && !allow_commands
+            {
+                return Err(tool_err(
+                    "MCP_CAPABILITY_DENIED",
+                    "configured OAuth credential helpers require the owner's process-spawn capability",
+                ));
+            }
+            let mut resolved = resolve_server_secrets(
+                &[(name.to_string(), raw.clone())],
+                config.provenance,
+                super::config::validate_env_value,
+                cwd,
+                workspace,
+            )
+            .map_err(|_| tool_err(
+                "MCP_SECRET_UNRESOLVED",
+                format!("cannot resolve oauth.{name}; credential values and helper output are redacted"),
+            ))?;
+            let (_, value) = resolved.pop().ok_or_else(|| tool_err(
+                "MCP_SECRET_UNRESOLVED",
+                format!("oauth.{name} did not resolve to a value"),
+            ))?;
+            *field = Some(value);
+        }
+    }
+    for (name, field) in [
+        ("scope", &mut oauth.scope),
+        ("redirectUri", &mut oauth.redirect_uri),
+        ("callbackPath", &mut oauth.callback_path),
+        ("prompt", &mut oauth.prompt),
+    ] {
+        check()?;
+        if let Some(raw) = field.as_ref()
+            && config.provenance != Provenance::Acp
+        {
+            // Ordinary OAuth options support variable interpolation only.
+            // Expanded values never acquire command-execution semantics.
+            *field = Some(super::config::expand_config_value(raw, workspace).map_err(|_| {
+                tool_err("MCP_CONFIG_INVALID", format!("cannot expand oauth.{name}"))
+            })?);
+        }
+    }
+    oauth.validate_resolved().map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
+    check()?;
+    Ok(oauth)
 }
 
 /// ACP values are already literal values, not pi's configuration language.
@@ -2579,6 +2712,7 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
             enabled: true,
             cwd: None,
@@ -2615,6 +2749,7 @@ mod tests {
                 env: Vec::new(),
                 url: None,
                 headers: Vec::new(),
+                oauth: None,
                 transport_hint: Some("stdio".to_string()),
                 enabled: true,
                 cwd: None,
@@ -2816,6 +2951,7 @@ mod tests {
             env: Vec::new(),
             url: Some("https://fixture.invalid/mcp".to_string()),
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("http".to_string()),
             enabled: true,
             cwd: None,
@@ -3073,6 +3209,7 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
             enabled: true,
             cwd: None,
@@ -3134,6 +3271,7 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
             enabled: true,
             cwd: None,
@@ -3374,6 +3512,7 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
             enabled: true,
             cwd: None,
@@ -3489,6 +3628,7 @@ mod tests {
             env: Vec::new(),
             url: Some("http://127.0.0.1:1/mcp".to_string()),
             headers: vec![("Authorization".to_string(), command)],
+            oauth: None,
             transport_hint: Some("http".to_string()),
             enabled: true,
             cwd: None,
@@ -3610,6 +3750,7 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
             enabled: true,
             cwd: None,
@@ -3731,6 +3872,7 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
             enabled: true,
             cwd: None,

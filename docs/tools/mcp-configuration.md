@@ -251,17 +251,79 @@ it. The browser
 wait does not hold the session mutex and does not emit a model turn or append
 conversation entries. A failed URL delivery ends the login attempt.
 
-By default, browser sign-in uses the authorization server's dynamic client
-registration endpoint. If the server requires a previously registered public
-client, provide its identifier through RPC:
+Every operator surface uses the server's configured OAuth settings. With no
+configured client, browser sign-in uses the authorization server's dynamic
+client registration endpoint. A public client can also be selected explicitly
+through RPC:
 
 ```json
 {"id":"login-docs","type":"mcp_reauth","server":"docs","clientId":"registered-public-client"}
 ```
 
-The manager API also accepts this optional client ID. Terminal, print, and ACP
-commands use dynamic registration by default. Custom callback ports, scopes, and OMP
-OAuth configuration fields are not imported by this native flow.
+The manager API accepts the same override. It selects a public client and
+discards the configured client secret; neither configured client credential
+helper runs for that override.
+
+### Configured OAuth clients and callbacks
+
+OMP's `oauth` block is imported from file definitions and supported in extension
+registrations. It works with terminal, print, ACP operator commands, and RPC:
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "oauth": {
+        "clientId": "${MCP_CLIENT_ID}",
+        "clientSecret": "$ENV:MCP_CLIENT_SECRET",
+        "scope": "read offline_access",
+        "redirectUri": "http://127.0.0.1:34567/oauth/callback",
+        "callbackPort": 34567,
+        "callbackPath": "/oauth/callback",
+        "prompt": ""
+      }
+    }
+  }
+}
+```
+
+Only include the fields your server requires:
+
+- `clientId` selects a previously registered client. Without it, Pi uses dynamic
+  registration when the authorization server supports it.
+- `clientSecret` requires `clientId`. Pi prefers advertised
+  `client_secret_post`, falls back to advertised `client_secret_basic`, and uses
+  the same method when refreshing tokens.
+- `scope` explicitly selects the requested scopes, overriding discovered
+  scopes. An empty string suppresses discovered scopes. When absent, Pi uses
+  discovery. The selected scopes also accompany dynamic client registration.
+- `redirectUri` preserves the exact registered HTTP loopback URI in both the
+  authorization request and code exchange. Supported hosts are IPv4 loopback,
+  `[::1]`, and `localhost`; localhost binds a numeric IPv4 loopback listener.
+  HTTPS callbacks, remote callbacks, credentials, query strings, fragments,
+  whitespace, and paths requiring URL normalization are rejected.
+- `callbackPort` selects a fixed port from 1 through 65535. `callbackPath`
+  selects an absolute URL path. If also specified with `redirectUri`, they must
+  agree with it. A busy fixed port fails explicitly instead of silently using
+  another port. Without a redirect or port, Pi allocates an available loopback
+  port; the default path is `/oauth/callback`.
+- `prompt` is sent when nonempty. An explicitly empty string omits it. When
+  absent, Pi requests `consent` if the effective scopes include `offline_access`.
+
+Client IDs and secrets support the existing bounded `$ENV:`/`$CMD:` credential
+references and variable templates. Resolution occurs only after trust approval,
+under the server's execution trust lock and request capabilities. Scope,
+redirect, path, and prompt support variable templates without executing commands.
+The source configuration retains its authored references. Diagnostics redact
+secret values and helper output.
+
+All authored OAuth fields participate in the server's trust and credential
+identity. Changing the client, secret reference, callback, scope, or prompt
+requires a new trust acknowledgment and a corresponding login. Disabled or
+untrusted servers do not resolve credentials or start OAuth discovery. OAuth
+configuration is rejected for stdio definitions.
 
 ## Request timeouts
 

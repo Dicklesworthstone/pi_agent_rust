@@ -180,6 +180,7 @@ pub fn parse_acp_servers(
             url: wire.url,
             headers: normalize_http_headers(pairs(wire.headers))
                 .map_err(|_| format!("Invalid HTTP headers at mcpServers[{index}]"))?,
+            oauth: None,
             transport_hint: Some(kind.to_string()),
             enabled: true,
             cwd: None,

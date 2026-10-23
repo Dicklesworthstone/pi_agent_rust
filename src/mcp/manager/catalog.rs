@@ -552,6 +552,7 @@ mod tests {
             env: Vec::new(),
             url: Some("https://catalog.invalid/mcp".to_string()),
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("http".to_string()),
             enabled: true,
             cwd: None,

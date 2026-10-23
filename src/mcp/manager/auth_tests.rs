@@ -215,6 +215,7 @@ fn fixture(
                 env: Vec::new(),
                 url: Some(url),
                 headers,
+                oauth: None,
                 transport_hint: Some("http".to_string()),
                 enabled: true,
                 cwd: None,
@@ -368,4 +369,186 @@ fn operator_authentication_requires_trust_and_cannot_replace_static_authorizatio
             manager.shutdown_all().await;
         });
     }
+}
+
+
+fn configured_oauth_fixture(
+    temporary: &tempfile::TempDir,
+    spec: &Value,
+    trusted: bool,
+) -> (McpManager, Arc<ServerEntry>) {
+    let global = temporary.path().join("oauth-global");
+    std::fs::create_dir_all(&global).expect("OAuth fixture global directory");
+    let manager = McpManager::new(
+        temporary.path(),
+        &global,
+        McpDiscovery { servers: Vec::new(), warnings: Vec::new() },
+    );
+    manager.register_extension_server("configured", spec);
+    let entry = manager.entry("configured").expect("configured extension server");
+    if trusted {
+        TrustStore::load(&manager.inner.trust_path)
+            .expect("load trust store")
+            .acknowledge("configured", &manager.trust_fingerprint_for(&entry), "operator")
+            .expect("acknowledge configured OAuth fixture");
+    }
+    (manager, entry)
+}
+
+#[test]
+fn public_client_override_skips_both_configured_helpers_and_preserves_authored_settings() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (manager, entry) = configured_oauth_fixture(
+        &temporary,
+        &json!({
+            "url": "http://127.0.0.1:1/mcp",
+            "oauth": {
+                "clientId": "$CMD:exit 97",
+                "clientSecret": "$CMD:exit 98",
+                "scope": "read offline_access",
+                "prompt": ""
+            }
+        }),
+        true,
+    );
+    let resolved = runtime().block_on(
+        manager.resolve_authentication_configuration(&entry, Some("public-client".to_string())),
+    ).expect("public override must not run either unused helper");
+    assert_eq!(resolved.client_id.as_deref(), Some("public-client"));
+    assert!(resolved.client_secret.is_none());
+    assert_eq!(resolved.scope.as_deref(), Some("read offline_access"));
+    assert_eq!(resolved.prompt.as_deref(), Some(""));
+    let authored = entry.config.oauth.as_ref().expect("authored options");
+    assert_eq!(authored.client_id.as_deref(), Some("$CMD:exit 97"));
+    assert_eq!(authored.client_secret.as_deref(), Some("$CMD:exit 98"));
+
+    // An RPC client ID is a literal identifier, not another configuration
+    // reference. It is also valid without the process-spawn capability.
+    let literal = resolve_oauth_settings(
+        &entry.config,
+        Some("$CMD:literal-client-identifier".to_string()),
+        temporary.path(),
+        temporary.path(),
+        false,
+        &|| Ok(()),
+    ).expect("literal public identifier");
+    assert_eq!(literal.client_id.as_deref(), Some("$CMD:literal-client-identifier"));
+    assert!(literal.client_secret.is_none());
+    let error = resolve_oauth_settings(
+        &entry.config, None, temporary.path(), temporary.path(), false, &|| Ok(()),
+    ).expect_err("selected helper requires process capability");
+    assert!(error.to_string().contains("MCP_CAPABILITY_DENIED"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_oauth_helpers_and_network_wait_for_trust_and_enabled_admission() {
+    for (enabled, trusted, denied, expected) in [
+        (true, false, false, "MCP_TRUST_PENDING"),
+        (false, true, false, "MCP_SERVER_DISABLED"),
+        (true, true, true, "MCP_TRUST_DENIED"),
+    ] {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let server = AuthHttpServer::start(None, 401, 405);
+        let (manager, _) = configured_oauth_fixture(
+            &temporary,
+            &json!({
+                "url": server.url(),
+                "enabled": enabled,
+                "oauth": {
+                    "clientId": "registered",
+                    "clientSecret": "$CMD:printf ran > oauth-helper-marker; printf private-secret"
+                }
+            }),
+            trusted,
+        );
+        runtime().block_on(async {
+            if denied {
+                manager.deny("configured").await.expect("deny configured server");
+            }
+            let error = manager.reauthenticate(
+                "configured",
+                None,
+                Arc::new(|_| panic!("rejected admission must not emit a sign-in URL")),
+            ).await.expect_err("OAuth admission must reject this server");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!temporary.path().join("oauth-helper-marker").exists());
+            assert_eq!(server.count(), 0, "admission must precede discovery");
+        });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_oauth_resolution_uses_server_cwd_and_session_workspace_without_persisting_secrets() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let helper_directory = temporary.path().join("helper");
+    std::fs::create_dir_all(&helper_directory).expect("helper directory");
+    std::fs::write(helper_directory.join("client-secret.txt"), "registered-secret")
+        .expect("helper secret fixture");
+    let (manager, entry) = configured_oauth_fixture(
+        &temporary,
+        &json!({
+            "url": "http://127.0.0.1:1/mcp",
+            "cwd": "helper",
+            "oauth": {
+                "clientId": "client-${workspaceFolder}",
+                "clientSecret": "$CMD:cat client-secret.txt",
+                "scope": "read offline_access",
+                "prompt": ""
+            }
+        }),
+        true,
+    );
+    let resolved = runtime().block_on(
+        manager.resolve_authentication_configuration(&entry, None),
+    ).expect("resolve trusted configured OAuth");
+    assert_eq!(resolved.client_id, Some(format!("client-{}", manager.inner.cwd.display())));
+    assert_eq!(resolved.client_secret.as_deref(), Some("registered-secret"));
+    let authored = entry.config.oauth.as_ref().expect("authored configuration");
+    assert_eq!(authored.client_id.as_deref(), Some("client-${workspaceFolder}"));
+    assert_eq!(authored.client_secret.as_deref(), Some("$CMD:cat client-secret.txt"));
+    assert!(!format!("{resolved:?}").contains("registered-secret"));
+}
+
+#[test]
+fn changing_oauth_configuration_requires_a_new_trust_acknowledgment() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let spec = json!({
+        "url": "http://127.0.0.1:1/mcp",
+        "oauth": {"clientId": "original", "clientSecret": "$CMD:exit 97"}
+    });
+    let (original, entry) = configured_oauth_fixture(&temporary, &spec, true);
+    let original_fingerprint = original.trust_fingerprint_for(&entry);
+    let mut changed_spec = spec;
+    changed_spec["oauth"]["clientId"] = Value::String("replacement".to_string());
+    let (changed, changed_entry) = configured_oauth_fixture(&temporary, &changed_spec, false);
+    assert_ne!(original_fingerprint, changed.trust_fingerprint_for(&changed_entry));
+    let error = runtime().block_on(
+        changed.resolve_authentication_configuration(&changed_entry, None),
+    ).expect_err("changed client must not reuse prior trust or run its helper");
+    assert!(error.to_string().contains("MCP_TRUST_PENDING"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn oauth_helper_diagnostics_never_expose_command_output_or_secret_values() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (manager, entry) = configured_oauth_fixture(
+        &temporary,
+        &json!({
+            "url": "http://127.0.0.1:1/mcp",
+            "oauth": {
+                "clientId": "registered",
+                "clientSecret": "$CMD:printf DO_NOT_ECHO_OAUTH_SECRET >&2; exit 23"
+            }
+        }),
+        true,
+    );
+    let error = runtime().block_on(
+        manager.resolve_authentication_configuration(&entry, None),
+    ).expect_err("failed credential helper");
+    assert!(error.to_string().contains("oauth.clientSecret"), "{error}");
+    assert!(!error.to_string().contains("DO_NOT_ECHO_OAUTH_SECRET"));
+    assert!(!error.to_string().contains("exit 23"));
 }
