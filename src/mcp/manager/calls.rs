@@ -609,6 +609,16 @@ impl McpManager {
             }
             return Err(error);
         }
+        if let Err(error) = &result
+            && super::is_authentication_error(error)
+        {
+            // An explicit auth rejection is not uncertain delivery and must
+            // never enter the automatic connection-recovery path. Retire this
+            // generation without spending the server-crash restart budget.
+            guard.armed = false;
+            Self::fail_transport_generation(entry, transport, error);
+            return result;
+        }
         let result = match result {
             Err(error)
                 if is_indeterminate_call_delivery(&error)

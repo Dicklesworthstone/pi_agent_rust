@@ -15,6 +15,8 @@ use super::transport::{DEFAULT_MCP_TIMEOUT, MCP_PROTOCOL_VERSION, McpTransport};
 use super::trust::{TrustDecision, TrustStore, TrustWriteGuard};
 use crate::error::{Error, Result};
 
+#[cfg(test)]
+mod auth_tests;
 mod calls;
 mod catalog;
 #[cfg(test)]
@@ -211,6 +213,8 @@ pub enum ServerHealth {
     NotStarted,
     /// Connected and tool list cached.
     Ready { tools: usize },
+    /// Credentials are missing, expired, rejected, or explicitly removed.
+    AuthenticationRequired { reason: String },
     /// Crashed; will retry after the backoff elapses.
     Unhealthy { reason: String, retries: u32 },
     /// Exceeded restart budget; manual `/mcp test` revives.
@@ -222,6 +226,9 @@ impl ServerHealth {
         match self {
             Self::NotStarted => "not started".to_string(),
             Self::Ready { tools } => format!("ready ({tools} tools)"),
+            Self::AuthenticationRequired { reason } => {
+                format!("authentication required: {reason}")
+            }
             Self::Unhealthy { reason, retries } => {
                 format!("unhealthy (retry {retries}/{MAX_RESTARTS}): {reason}")
             }
@@ -360,6 +367,7 @@ pub struct McpManager {
 
 struct McpManagerInner {
     cwd: PathBuf,
+    global_dir: PathBuf,
     servers: Mutex<HashMap<String, Arc<ServerEntry>>>,
     trust_path: PathBuf,
     trust_lock: Mutex<()>,
@@ -394,6 +402,7 @@ impl McpManager {
         Self {
             inner: Arc::new(McpManagerInner {
                 cwd: super::config::canonical_cwd(cwd),
+                global_dir: global_dir.to_path_buf(),
                 servers: Mutex::new(servers),
                 trust_path: global_dir.join("mcp-trust.json"),
                 trust_lock: Mutex::new(()),
@@ -593,6 +602,175 @@ impl McpManager {
         *Self::lock(&entry.health) = ServerHealth::NotStarted;
         Self::lock(&entry.tools_cache).take();
         Ok(())
+    }
+
+    fn authentication_binding(&self, entry: &Arc<ServerEntry>) -> Result<super::auth::AuthBinding> {
+        if !entry.config.is_http() {
+            return Err(tool_err(
+                "MCP_AUTH_UNSUPPORTED",
+                "OAuth authentication is available for HTTP MCP servers only",
+            ));
+        }
+        if entry
+            .config
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(tool_err(
+                "MCP_AUTH_STATIC_HEADER",
+                "this server has an explicit Authorization header; remove it from the source configuration before using managed OAuth",
+            ));
+        }
+        let url =
+            entry.config.url.as_deref().ok_or_else(|| {
+                tool_err("MCP_CONFIG_INVALID", "HTTP MCP server has no endpoint URL")
+            })?;
+        super::auth::AuthBinding::new(
+            &self.inner.global_dir,
+            &self.trust_fingerprint_for(entry),
+            url,
+        )
+    }
+
+    fn check_authentication_entry(&self, entry: &Arc<ServerEntry>) -> Result<()> {
+        self.check_running()?;
+        if !Arc::ptr_eq(&self.entry(&entry.config.name)?, entry) {
+            return Err(tool_err(
+                "MCP_AUTH_SUPERSEDED",
+                "the MCP server definition changed while authentication was pending",
+            ));
+        }
+        self.check_trust(entry)
+    }
+
+    /// Sign in to a trusted HTTP server using discovery, PKCE, and a loopback
+    /// callback, then replace its live connection and refresh the tool catalog.
+    /// The URL observer is operator output; it must not invoke a model or tool.
+    ///
+    /// Cancelling the browser wait does not clear an existing login. Once new
+    /// credentials are saved, reconnect failure or cancellation cannot undo them.
+    /// Authentication never grants trust or rewrites a server's source config.
+    /// A public client ID may be supplied for servers without registration.
+    ///
+    /// # Errors
+    /// Returns admission, discovery, authorization, persistence, or reconnect
+    /// failures. A reconnect failure explicitly identifies already-saved login.
+    pub async fn reauthenticate(
+        &self,
+        name: &str,
+        client_id: Option<String>,
+        on_url: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Result<()> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        catalog::check_request_owner(&owner)?;
+        let entry = self.entry(name)?;
+        self.check_authentication_entry(&entry)?;
+        let binding = self.authentication_binding(&entry)?;
+        if entry.config.headers.len() > 95 {
+            return Err(tool_err(
+                "MCP_CONFIG_INVALID",
+                "managed OAuth requires room for its Authorization header; at most 95 custom headers are supported",
+            ));
+        }
+        let check_manager = Self {
+            inner: Arc::clone(&self.inner),
+        };
+        let check_entry = Arc::clone(&entry);
+        let check_owner = owner.clone();
+        let check: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
+            catalog::check_request_owner(&check_owner)?;
+            check_manager.check_authentication_entry(&check_entry)
+        });
+        catalog::operation_with_owner(
+            &owner,
+            async {
+                // Do not hold the connection lane during browser interaction:
+                // unauth/deny/shutdown must be able to revoke a pending flow.
+                binding.reauthenticate(client_id, on_url, check).await?;
+                let _lane = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&entry.connect_lane),
+                    owner.cx(),
+                )
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled after saving MCP login"))?;
+                self.check_authentication_entry(&entry)?;
+                Self::retire_authenticated_connection(&entry);
+                self.ensure_ready_in_lane(&entry).await.map_err(|error| {
+                    tool_err(
+                        "MCP_AUTH_RECONNECT_FAILED",
+                        format!("login saved, but the MCP server is still disconnected: {error}"),
+                    )
+                })?;
+                self.list_and_cache_tools_in_lane(&entry)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        tool_err(
+                            "MCP_AUTH_RECONNECT_FAILED",
+                            format!(
+                                "login saved, but the MCP tool catalog could not be loaded: {error}"
+                            ),
+                        )
+                    })
+            },
+            Duration::from_secs(300),
+        )
+        .await?
+    }
+
+    /// Remove managed credentials and retire the live connection and catalog.
+    /// Trust is unchanged. This local operation also works after a server has
+    /// been denied or disabled, and never sends a request using removed tokens.
+    ///
+    /// # Errors
+    /// Returns unknown-server, static-header, cancellation, or storage errors.
+    pub async fn unauthenticate(&self, name: &str) -> Result<()> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        catalog::check_request_owner(&owner)?;
+        let entry = self.entry(name)?;
+        let binding = self.authentication_binding(&entry)?;
+        catalog::operation_with_owner(
+            &owner,
+            async {
+                // Persist the tombstone before waiting for a connection lane.
+                // Refresh and browser callbacks cannot resurrect this login.
+                binding.forget().await?;
+                Self::retire_authenticated_connection(&entry);
+                let _lane = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&entry.connect_lane),
+                    owner.cx(),
+                )
+                .await
+                .map_err(|_| {
+                    tool_err(
+                        "MCP_CANCELLED",
+                        "login removed; connection retirement was cancelled",
+                    )
+                })?;
+                // A constructor already inside the lane can only have used a
+                // pre-removal generation. Retire any publication it completed.
+                Self::retire_authenticated_connection(&entry);
+                *Self::lock(&entry.health) = ServerHealth::AuthenticationRequired {
+                    reason: "managed login removed; use /mcp reauth to sign in".to_string(),
+                };
+                Ok(())
+            },
+            entry.timeout(),
+        )
+        .await?
+    }
+
+    fn retire_authenticated_connection(entry: &Arc<ServerEntry>) {
+        let mut current = Self::lock(&entry.transport);
+        if let Some(transport) = current.take() {
+            // The old session belongs to the old login. Never send a DELETE
+            // with newly replaced or revoked credentials for that session.
+            transport.abort();
+        }
+        Self::lock(&entry.tools_cache).take();
+        *Self::lock(&entry.restarts) = RestartState::default();
+        *Self::lock(&entry.health) = ServerHealth::NotStarted;
     }
 
     /// bd-vjfol: tear down every live transport and await child exit.
@@ -824,7 +1002,11 @@ impl McpManager {
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
             {
                 let removed = current.take();
-                Self::record_failure(entry, failure);
+                if transport.authentication_required() {
+                    Self::record_failure(entry, &authentication_transport_error());
+                } else {
+                    Self::record_failure(entry, failure);
+                }
                 removed
             } else {
                 None
@@ -1022,13 +1204,17 @@ impl McpManager {
             return Ok(());
         }
         if let Some(dead) = existing {
-            let failure = tool_err(
-                "MCP_TRANSPORT_CLOSED",
-                format!(
-                    "server {:?} exited before the next request",
-                    entry.config.name
-                ),
-            );
+            let failure = if dead.authentication_required() {
+                authentication_transport_error()
+            } else {
+                tool_err(
+                    "MCP_TRANSPORT_CLOSED",
+                    format!(
+                        "server {:?} exited before the next request",
+                        entry.config.name
+                    ),
+                )
+            };
             Self::detach_failed_call_transport(entry, &dead, &failure);
         }
         Self::check_restart_budget(entry)?;
@@ -1107,13 +1293,17 @@ impl McpManager {
             return Err(err);
         }
         if !transport.is_alive() {
-            let err = tool_err(
-                "MCP_TRANSPORT_CLOSED",
-                format!(
-                    "server {:?} failed while activating its receive channel",
-                    entry.config.name
-                ),
-            );
+            let err = if transport.authentication_required() {
+                authentication_transport_error()
+            } else {
+                tool_err(
+                    "MCP_TRANSPORT_CLOSED",
+                    format!(
+                        "server {:?} failed while activating its receive channel",
+                        entry.config.name
+                    ),
+                )
+            };
             transport.close().await;
             Self::record_failure(entry, &err);
             return Err(err);
@@ -1169,6 +1359,12 @@ impl McpManager {
     /// exponential backoff.
     fn record_failure(entry: &Arc<ServerEntry>, err: &Error) {
         Self::lock(&entry.tools_cache).take();
+        if is_authentication_error(err) {
+            *Self::lock(&entry.health) = ServerHealth::AuthenticationRequired {
+                reason: err.to_string(),
+            };
+            return;
+        }
         let mut restarts = Self::lock(&entry.restarts);
         restarts.count = restarts.count.saturating_add(1);
         let backoff = Duration::from_secs(1 << restarts.count.min(3));
@@ -1192,6 +1388,7 @@ impl McpManager {
         let cwd = entry.effective_cwd(&self.inner.cwd);
         let workspace = self.inner.cwd.clone();
         let trust_path = self.inner.trust_path.clone();
+        let global_dir = self.inner.global_dir.clone();
         #[cfg(test)]
         let factory = Self::lock(&self.inner.transport_factory).clone();
         let abandoned = Arc::new(AtomicBool::new(false));
@@ -1251,7 +1448,18 @@ impl McpManager {
                     &workspace,
                 )?;
                 ensure_active()?;
-                let transport = super::transport::HttpTransport::new(&url, headers)?;
+                let has_static_auth = headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+                let mut transport = super::transport::HttpTransport::new(&url, headers)?;
+                if !has_static_auth {
+                    let binding = super::auth::AuthBinding::new(
+                        &global_dir,
+                        &config.fingerprint_for_workspace(&cwd, &workspace),
+                        &url,
+                    )?;
+                    transport = transport.with_authentication(binding)?;
+                }
                 transport.configure_workspace_root(&workspace)?;
                 return Ok(Box::new(transport) as Box<dyn McpTransport>);
             }
@@ -1331,7 +1539,11 @@ impl McpManager {
                 // generation-checked critical section. Otherwise a replacement
                 // could publish between `take` and `mark_unhealthy` and then be
                 // poisoned by the stale failure.
-                Self::mark_unhealthy(entry, failure);
+                if failed_transport.authentication_required() {
+                    Self::mark_unhealthy(entry, &authentication_transport_error());
+                } else {
+                    Self::mark_unhealthy(entry, failure);
+                }
                 removed
             } else {
                 None
@@ -1375,6 +1587,12 @@ impl McpManager {
     /// successful tool call arms backoff and consumes the remaining budget.
     fn mark_unhealthy(entry: &Arc<ServerEntry>, err: &Error) {
         Self::lock(&entry.tools_cache).take();
+        if is_authentication_error(err) {
+            *Self::lock(&entry.health) = ServerHealth::AuthenticationRequired {
+                reason: err.to_string(),
+            };
+            return;
+        }
         let mut restarts = Self::lock(&entry.restarts);
         restarts.count = restarts.count.saturating_add(1);
         // Preserve one immediate recovery for an isolated runtime crash. A
@@ -1785,6 +2003,20 @@ impl McpManager {
             .entry(name.to_string())
             .or_insert(entry);
     }
+}
+
+/// Only native typed auth errors qualify; server text is nested under the
+/// server-error code and cannot impersonate this classification.
+pub(super) fn is_authentication_error(err: &Error) -> bool {
+    matches!(err, Error::Tool { tool, message }
+        if tool == "mcp" && message.starts_with("[MCP_AUTH_"))
+}
+
+fn authentication_transport_error() -> Error {
+    tool_err(
+        "MCP_AUTH_REQUIRED",
+        "the HTTP connection requires authentication; use /mcp reauth for managed OAuth or update the configured Authorization header",
+    )
 }
 
 /// Whether a `tools/call` failure happened after request delivery may have

@@ -217,6 +217,11 @@ pub trait McpTransport: Send + Sync {
     async fn notify(&self, method: &str, params: Value) -> Result<()>;
     /// Whether the transport is still usable.
     fn is_alive(&self) -> bool;
+    /// Whether a native authentication failure retired this generation.
+    /// Background HTTP receive failures retain this cause for the manager.
+    fn authentication_required(&self) -> bool {
+        false
+    }
     /// Synchronously abort in-flight work. This is the cancellation-safe
     /// teardown path used when a connection future is dropped at a deadline.
     fn abort(&self);
@@ -1575,7 +1580,9 @@ pub struct HttpTransport {
     client: crate::http::client::Client,
     url: String,
     headers: Vec<(String, String)>,
+    authentication: Option<super::auth::AuthBinding>,
     session: Mutex<HttpSessionState>,
+    authentication_failed: AtomicBool,
     progress: std::sync::Arc<ProgressRegistry>,
     roots: ClientRoots,
     tools_list_changed_generation: AtomicU64,
@@ -1606,12 +1613,22 @@ struct HttpCancellationDispatch {
     client: crate::http::client::Client,
     url: String,
     headers: Vec<(String, String)>,
+    authentication: Option<super::auth::AuthBinding>,
     wire_state: HttpWireState,
     request_id: u64,
 }
 
 impl HttpCancellationDispatch {
     async fn send(self) -> Result<()> {
+        HttpTransport::run_with_deadline(
+            self.send_inner(),
+            HTTP_CANCEL_TIMEOUT,
+            "HTTP cancellation",
+        )
+        .await
+    }
+
+    async fn send_inner(self) -> Result<()> {
         let frame = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
@@ -1634,6 +1651,11 @@ impl HttpCancellationDispatch {
         if let Some(protocol_version) = self.wire_state.protocol_version {
             request = request.header("Mcp-Protocol-Version", protocol_version);
         }
+        if let Some(authentication) = &self.authentication
+            && let Some(value) = authentication.authorization_header(false).await?
+        {
+            request = request.try_header("Authorization", value)?;
+        }
         let response = request
             .json(&frame)
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("encode cancellation: {err}")))?
@@ -1642,6 +1664,7 @@ impl HttpCancellationDispatch {
             .await
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("send cancellation: {err}")))?;
         let status = response.status();
+        reject_authentication_status(status)?;
         if status != 202 {
             return Err(tool_err(
                 "MCP_PROTOCOL",
@@ -1669,6 +1692,7 @@ struct HttpSessionDeleteDispatch {
     client: crate::http::client::Client,
     url: String,
     headers: Vec<(String, String)>,
+    authentication: Option<super::auth::AuthBinding>,
     wire_state: HttpWireState,
 }
 
@@ -1693,10 +1717,16 @@ impl HttpSessionDeleteDispatch {
         request = request.header("Mcp-Protocol-Version", protocol_version);
         HttpTransport::run_with_deadline(
             async move {
+                if let Some(authentication) = &self.authentication
+                    && let Some(value) = authentication.authorization_header(false).await?
+                {
+                    request = request.try_header("Authorization", value)?;
+                }
                 let response = request.no_timeout().send().await.map_err(|err| {
                     tool_err("MCP_TRANSPORT_IO", format!("terminate HTTP session: {err}"))
                 })?;
                 let status = response.status();
+                reject_authentication_status(status)?;
                 if (200..300).contains(&status) || status == 405 {
                     // Session teardown is complete once the status arrives.
                     // The body is non-semantic and must not extend close time.
@@ -1902,7 +1932,9 @@ impl HttpTransport {
             client: crate::http::client::Client::new(),
             url: url.to_string(),
             headers,
+            authentication: None,
             session: Mutex::new(HttpSessionState::default()),
+            authentication_failed: AtomicBool::new(false),
             progress: std::sync::Arc::new(ProgressRegistry::default()),
             roots: ClientRoots::default(),
             tools_list_changed_generation: AtomicU64::new(0),
@@ -1913,6 +1945,42 @@ impl HttpTransport {
             abort_notify: asupersync::sync::Notify::new(),
             lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
         })
+    }
+
+    /// Keep explicit configured headers authoritative. Fallible OAuth header
+    /// insertion follows protocol headers, so header limits fail before send.
+    pub(crate) fn with_authentication(mut self, binding: super::auth::AuthBinding) -> Result<Self> {
+        if self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(tool_err(
+                "MCP_AUTH_STATIC_HEADER",
+                "managed OAuth cannot replace an explicit Authorization header",
+            ));
+        }
+        self.authentication = Some(binding);
+        Ok(self)
+    }
+
+    async fn current_authorization_header(&self) -> Result<Option<String>> {
+        let result = match &self.authentication {
+            Some(binding) => binding.authorization_header(true).await,
+            None => Ok(None),
+        };
+        if result.as_ref().is_err_and(super::manager::is_authentication_error) {
+            self.authentication_failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn check_authentication_status(&self, status: u16) -> Result<()> {
+        let result = reject_authentication_status(status);
+        if result.is_err() {
+            self.authentication_failed.store(true, Ordering::Release);
+        }
+        result
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1945,6 +2013,7 @@ impl HttpTransport {
             client: self.client.clone(),
             url: self.url.clone(),
             headers: self.headers.clone(),
+            authentication: self.authentication.clone(),
             wire_state,
         }
     }
@@ -1992,6 +2061,7 @@ impl HttpTransport {
             client: self.client.clone(),
             url: self.url.clone(),
             headers: self.headers.clone(),
+            authentication: self.authentication.clone(),
             wire_state: self.wire_state(),
             request_id,
         }
@@ -2212,6 +2282,9 @@ impl HttpTransport {
             // ubs:ignore validated at initialize-state capture below
             request = request.header("Mcp-Protocol-Version", protocol_version.to_string());
         }
+        if let Some(value) = self.current_authorization_header().await? {
+            request = request.try_header("Authorization", value)?;
+        }
         let response = request
             .json(frame)
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("encode: {err}")))?
@@ -2221,6 +2294,9 @@ impl HttpTransport {
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("send: {err}")))?;
 
         let status = response.status();
+        // Authentication rejection is definitive. Do not read an untrusted
+        // error body, replay the request, or spend a server-crash retry.
+        self.check_authentication_status(status)?;
         let candidate_session_id = response
             .headers()
             .iter()
@@ -2497,9 +2573,11 @@ impl HttpTransport {
         ))
         .await;
         match result {
-            Err(error) if is_session_expired(&error) => Err(tool_err(
+            Err(error)
+                if is_session_expired(&error)
+                    || super::manager::is_authentication_error(&error) => Err(tool_err(
                 "MCP_DELIVERY_INDETERMINATE",
-                "server rejected the client response inside an already-accepted SSE request; refusing to replay the originating request",
+                "server rejected the client response inside an already-accepted SSE request; the original request may have completed and was not replayed",
             )),
             result => result.map(|_| ()),
         }
@@ -2537,6 +2615,11 @@ impl HttpTransport {
         let header_timeout = timeout.unwrap_or(DEFAULT_MCP_TIMEOUT);
         Self::run_with_deadline(
             async move {
+                // Include refresh in the GET's existing deadline, including
+                // event-stream reconnection and resume requests.
+                if let Some(value) = self.current_authorization_header().await? {
+                    request = request.try_header("Authorization", value)?;
+                }
                 let response = request.no_timeout().send().await.map_err(|err| {
                     tool_err(
                         "MCP_TRANSPORT_IO",
@@ -2544,6 +2627,7 @@ impl HttpTransport {
                     )
                 })?;
                 let status = response.status();
+                self.check_authentication_status(status)?;
                 if status == 405 {
                     // GET is optional. Do not let a hostile or broken server
                     // hold activation open by drip-feeding an ignored body.
@@ -2780,7 +2864,17 @@ impl HttpTransport {
         };
         let resumed = match self
             .open_event_stream(wire_state, Some(&last_event_id), Some(timeout))
-            .await?
+            .await
+            .map_err(|error| {
+                if super::manager::is_authentication_error(&error) {
+                    tool_err(
+                        "MCP_DELIVERY_INDETERMINATE",
+                        "authentication failed while resuming an already-accepted SSE request; the original request may have completed and was not replayed",
+                    )
+                } else {
+                    error
+                }
+            })?
         {
             HttpEventStreamOpen::Stream(response) => response,
             HttpEventStreamOpen::Unsupported => {
@@ -3012,6 +3106,19 @@ fn classify_http_response_media_type(content_type: &str) -> Result<HttpResponseM
     }
 }
 
+fn reject_authentication_status(status: u16) -> Result<()> {
+    if matches!(status, 401 | 403) {
+        Err(tool_err(
+            "MCP_AUTH_REQUIRED",
+            format!(
+                "HTTP {status}: the MCP server rejected authorization; use /mcp reauth for managed OAuth or update its configured Authorization header"
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_session_expired(error: &Error) -> bool {
     matches!(
         error,
@@ -3169,6 +3276,10 @@ fn parse_sse_responses(body: &str, expected_id: u64) -> Result<Value> {
 
 #[async_trait]
 impl McpTransport for HttpTransport {
+    fn authentication_required(&self) -> bool {
+        self.authentication_failed.load(Ordering::Acquire)
+    }
+
     fn configure_workspace_root(&self, workspace: &Path) -> Result<()> {
         self.roots.configure(workspace)
     }

@@ -7,6 +7,7 @@
 //! specs — with one trust gate, one spawn path, and one `/mcp` view showing
 //! all three provenances.
 
+mod auth;
 pub mod config;
 mod content;
 pub mod manager;
