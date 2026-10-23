@@ -1652,6 +1652,176 @@ async fn resolve_cli_session_workdir(
     Ok(Some(saved))
 }
 
+/// Native operator commands supplied directly on the print command line.
+#[derive(Debug, PartialEq, Eq)]
+enum PrintMcpCommand {
+    List,
+    Inspect(String),
+    Trust(String),
+    Deny(String),
+    Test(String),
+    Refresh(Option<String>),
+}
+
+impl PrintMcpCommand {
+    const fn rpc_name(&self) -> &'static str {
+        match self {
+            Self::List => "mcp_list",
+            Self::Inspect(_) => "mcp_inspect",
+            Self::Trust(_) => "mcp_trust",
+            Self::Deny(_) => "mcp_deny",
+            Self::Test(_) => "mcp_test",
+            Self::Refresh(_) => "mcp_refresh",
+        }
+    }
+}
+
+/// Read original argv before files or prompt resources can supply text. One
+/// quoted argument preserves exact names, including internal whitespace.
+fn print_mcp_command(
+    cli: &cli::Cli,
+    piped_stdin: Option<&str>,
+) -> Result<Option<PrintMcpCommand>> {
+    let print_mode = cli
+        .mode
+        .as_deref()
+        .map_or(cli.print, |mode| matches!(mode, "text" | "json"));
+    if !print_mode || cli.acp || cli.export.is_some() || cli.list_models.is_some() {
+        return Ok(None);
+    }
+    let messages = cli.message_args();
+    let candidate = messages.iter().find_map(|text| {
+        let rest = text.trim().strip_prefix("/mcp")?;
+        (rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .then_some((rest.trim(), *text))
+    });
+    let Some((rest, original)) = candidate else {
+        return Ok(None);
+    };
+    if messages.len() != 1 || !cli.file_args().is_empty() || piped_stdin.is_some() {
+        bail!(
+            "MCP operator commands require one standalone quoted argument, without piped input or file attachments"
+        );
+    }
+    if original.contains(['\r', '\n']) {
+        bail!("An MCP operator command must be on one line");
+    }
+    let (verb, name) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, None), |(verb, name)| {
+            (verb, Some(name.trim()).filter(|name| !name.is_empty()))
+        });
+    let command = match (verb, name) {
+        ("" | "list", None) => PrintMcpCommand::List,
+        ("inspect", Some(name)) => PrintMcpCommand::Inspect(name.to_string()),
+        ("trust", Some(name)) => PrintMcpCommand::Trust(name.to_string()),
+        ("deny", Some(name)) => PrintMcpCommand::Deny(name.to_string()),
+        ("test", Some(name)) => PrintMcpCommand::Test(name.to_string()),
+        ("refresh", name) => PrintMcpCommand::Refresh(name.map(str::to_string)),
+        _ => bail!(
+            "Usage: /mcp list | inspect NAME | trust NAME | deny NAME | test NAME | refresh [NAME]"
+        ),
+    };
+    Ok(Some(command))
+}
+
+async fn execute_print_mcp_command(
+    manager: &pi::mcp::McpManager,
+    command: &PrintMcpCommand,
+) -> pi::error::Result<Value> {
+    match command {
+        PrintMcpCommand::List => Ok(json!({"servers": manager.list()})),
+        PrintMcpCommand::Inspect(name) => {
+            let server = manager
+                .list()
+                .into_iter()
+                .find(|server| server.name == *name)
+                .ok_or_else(|| {
+                    pi::error::Error::tool(
+                        "mcp",
+                        format!("[MCP_UNKNOWN_SERVER] unknown server {name:?}; use /mcp list"),
+                    )
+                })?;
+            Ok(json!({"server": server}))
+        }
+        PrintMcpCommand::Trust(name) => {
+            let tools = manager.trust(name).await?;
+            Ok(json!({"server": name, "trusted": true, "tools": tools.len()}))
+        }
+        PrintMcpCommand::Deny(name) => {
+            manager.deny(name).await?;
+            Ok(json!({"server": name, "trusted": false}))
+        }
+        PrintMcpCommand::Test(name) => {
+            let tools = manager.test(name).await?;
+            Ok(json!({"server": name, "tools": tools.len()}))
+        }
+        PrintMcpCommand::Refresh(Some(name)) => {
+            let tools = manager.refresh_tools(name).await?;
+            Ok(json!({"server": name, "tools": tools.len()}))
+        }
+        PrintMcpCommand::Refresh(None) => {
+            manager.connect_trusted().await;
+            Ok(json!({"servers": manager.list()}))
+        }
+    }
+}
+
+/// Run before resources, extensions, or provider credentials load. The startup
+/// path still verifies a selected session's workspace before invoking MCP.
+/// Native MCP setup must work even when no LLM account has been configured.
+async fn run_print_mcp_command(
+    command: PrintMcpCommand,
+    cli: &cli::Cli,
+    cwd: &Path,
+    global_dir: &Path,
+    project_trusted: bool,
+) -> Result<()> {
+    let json_mode = cli.mode.as_deref() == Some("json");
+    let action = command.rpc_name();
+    let outcome: Result<Value> = async {
+        if cli.no_mcp {
+            bail!("MCP is disabled by --no-mcp");
+        }
+        let manager = pi::mcp::McpManager::bootstrap(
+            cwd,
+            global_dir,
+            &cli.mcp_config,
+            project_trusted,
+        )?;
+        let result = Box::pin(execute_print_mcp_command(&manager, &command)).await;
+        // This invocation owns its processes and receive tasks, including
+        // partial connections left by a failed trust/test attempt.
+        manager.shutdown_all().await;
+        result.map_err(anyhow::Error::from)
+    }
+    .await;
+    match outcome {
+        Ok(data) => {
+            let output = if json_mode {
+                json!({"type": "mcp_result", "command": action, "success": true, "data": data})
+                    .to_string()
+            } else {
+                serde_json::to_string_pretty(&data)?
+            };
+            emit_text_delta(&format!("{output}\n"))?;
+            Ok(())
+        }
+        Err(error) => {
+            if json_mode {
+                let output = json!({
+                    "type": "mcp_result",
+                    "command": action,
+                    "success": false,
+                    "error": error.to_string(),
+                });
+                emit_text_delta(&format!("{output}\n"))?;
+            }
+            Err(error)
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::future_not_send,
@@ -1875,6 +2045,20 @@ async fn run(
     } else {
         None
     };
+
+    // Verify any selected session's workspace above before MCP can act on it.
+    // Only original operator argv enters this route, before prompt/resource
+    // expansion, extension prewarm, or provider credential/model selection.
+    if let Some(command) = print_mcp_command(&cli, piped_stdin.as_deref())? {
+        return Box::pin(run_print_mcp_command(
+            command,
+            &cli,
+            &cwd,
+            &Config::global_dir(),
+            workspace_trusted,
+        ))
+        .await;
+    }
 
     let startup_mode = cli.mode.clone().unwrap_or_else(|| {
         if !cli.print && cli.export.is_none() {
@@ -10997,6 +11181,71 @@ mod tests {
     use clap::Parser as _;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn print_mcp_commands_preserve_exact_server_names() {
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp trust docs  europe"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Trust("docs  europe".into()))
+        );
+        let cli = cli::Cli::parse_from(["pi", "--mode", "json", "/mcp refresh docs"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Refresh(Some("docs".into())))
+        );
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp"]);
+        assert_eq!(print_mcp_command(&cli, None).unwrap(), Some(PrintMcpCommand::List));
+    }
+
+    #[test]
+    fn print_mcp_commands_reject_mixed_input_before_expansion() {
+        for args in [
+            vec!["pi", "-p", "/mcp trust docs", "@instructions.md"],
+            vec!["pi", "-p", "/mcp deny docs", "another prompt"],
+            vec!["pi", "-p", "/mcp trust docs\nanother line"],
+            vec!["pi", "-p", "/mcp trust"],
+            vec!["pi", "-p", "/mcp", "trust", "docs"],
+            vec!["pi", "-p", "/mcp list unexpected-name"],
+            vec!["pi", "-p", "/mcp unknown-command"],
+        ] {
+            let cli = cli::Cli::parse_from(args);
+            assert!(print_mcp_command(&cli, None).is_err());
+        }
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp trust docs"]);
+        assert!(print_mcp_command(&cli, Some("untrusted input")).is_err());
+    }
+
+    #[test]
+    fn print_mcp_commands_do_not_promote_piped_or_attached_text() {
+        let cli = cli::Cli::parse_from(["pi", "-p"]);
+        assert!(
+            print_mcp_command(&cli, Some("/mcp trust docs"))
+                .unwrap()
+                .is_none()
+        );
+        let cli = cli::Cli::parse_from(["pi", "-p", "@mcp-instructions.txt"]);
+        assert!(print_mcp_command(&cli, None).unwrap().is_none());
+        for text in [
+            "Explain /mcp trust docs",
+            "/mcpish trust docs",
+            "/template-that-expands-to-an-operator-command",
+        ] {
+            let cli = cli::Cli::parse_from(["pi", "-p", text]);
+            assert!(print_mcp_command(&cli, None).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn print_mcp_commands_do_not_intercept_other_host_modes() {
+        for args in [
+            vec!["pi", "--mode", "rpc", "/mcp trust docs"],
+            vec!["pi", "--acp", "/mcp deny docs"],
+        ] {
+            let cli = cli::Cli::parse_from(args);
+            assert!(print_mcp_command(&cli, None).unwrap().is_none());
+        }
+    }
 
     fn run_cli_workdir_test<T>(future: impl std::future::Future<Output = T>) -> T {
         let runtime = RuntimeBuilder::current_thread()

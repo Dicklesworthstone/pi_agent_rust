@@ -39,6 +39,43 @@ file definition from silently becoming active. A whole-file failure in a native
 or explicit CLI file stops discovery of lower-priority files. Warnings identify
 the file and entry that need attention.
 
+## One-shot operator commands
+
+MCP setup and inspection can run without loading an LLM provider or creating an
+agent session:
+
+```bash
+pi -p "/mcp list"
+pi -p "/mcp inspect docs"
+pi -p "/mcp trust docs"
+pi -p "/mcp test docs"
+pi -p "/mcp refresh docs"
+pi -p "/mcp deny docs"
+pi --mode json "/mcp refresh"
+```
+
+Use one quoted command argument; server names retain their exact internal
+whitespace. `/mcp` is an alias for list. Refresh with a name reloads that server's
+catalog; refresh without a name connects acknowledged servers within the shared
+startup budget and reports all server health states. Inspect reports the
+registry's provenance, trust, health, and source location without exposing raw
+configuration credentials.
+
+Workspace trust still controls project-file discovery. A server-specific trust
+command acknowledges that exact definition and attempts to connect. If the
+connection fails, an already-persisted trust decision remains in effect. Test
+and refresh do not grant trust. Every one-shot command shuts down its temporary
+connections before exiting.
+
+Only standalone text from the original command-line arguments can invoke these
+commands. A command mixed with another prompt, piped input, or file attachments
+is rejected. File contents and expanded prompt templates cannot gain operator
+authority.
+
+JSON mode emits a `mcp_result` record with `command`, `success`, and either
+`data` or `error`. Command failures return a nonzero process status.
+For a refresh of all servers, inspect each returned server's health.
+
 ## Server settings
 
 This OMP-compatible project configuration starts `./serve` in the workspace's
