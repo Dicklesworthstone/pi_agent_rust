@@ -90,9 +90,6 @@ fn is_usage_limit(error_text: &str) -> bool {
         || [
             "usage_limit",
             "usage limit",
-            "quota exhausted",
-            "quota_exhausted",
-            "quota will reset",
             "daily limit",
             "weekly limit",
             "monthly limit",
@@ -100,7 +97,6 @@ fn is_usage_limit(error_text: &str) -> bool {
             "weekly quota",
             "monthly quota",
             "subscription limit",
-            "exhausted your capacity",
         ]
         .iter()
         .any(|pattern| lower.contains(pattern))
@@ -191,6 +187,10 @@ fn is_quota_exhaustion(lower: &str) -> bool {
         "quota exceeded",
         "quota_exceeded",
         "quota has been exceeded",
+        "quota exhausted",
+        "quota_exhausted",
+        "quota will reset",
+        "exhausted your capacity",
         "billing hard limit",
         "billing_not_active",
         "not enough credits",
@@ -328,10 +328,16 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     if let Some(class) = provider_code::connect_recovery(error_text) {
         return class;
     }
-    if is_quota_exhaustion(&text) || is_usage_limit(&text) {
+    // Broad usage-limit labels can describe invalid request fields. Only
+    // concrete exhaustion evidence may override a permanent client response.
+    let status = recovery_http_status(&text);
+    let usage_label_is_eligible = status.is_none_or(|status| {
+        !(400..=499).contains(&status) || matches!(status, 402 | 408 | 429)
+    });
+    if is_quota_exhaustion(&text) || (usage_label_is_eligible && is_usage_limit(&text)) {
         return Some(FailoverClass::Quota);
     }
-    if let Some(status) = recovery_http_status(&text) {
+    if let Some(status) = status {
         match status {
             408 | 504 => return Some(FailoverClass::Transient),
             429 => return Some(FailoverClass::Quota),
@@ -2465,7 +2471,10 @@ mod tests {
     fn fallback_filters_distinguish_account_exhaustion_from_transient_throttles() {
         let cases = [
             ("HTTP 429: insufficient_quota", true),
+            ("HTTP 400: usage_limit_reached", true),
+            ("HTTP 400: quota exhausted", true),
             ("HTTP 402: credit balance is too low", true),
+            ("HTTP 402", true),
             ("usage_limit_reached: your weekly limit is exhausted", true),
             ("HTTP 429: quota will reset tomorrow", true),
             ("HTTP 429", true),
@@ -2501,6 +2510,42 @@ mod tests {
                         },
                         "{filter:?}: {text}",
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usage_limit_labels_cannot_override_invalid_request_responses() {
+        for text in [
+            "HTTP 400: invalid request parameter usage_limit",
+            "HTTP 400: invalid daily limit parameter",
+            "HTTP 404: model usage_limit does not exist",
+            "HTTP 422: unsupported subscription limit argument",
+        ] {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            assert_eq!(classify_failover(text), None, "{text}");
+            for filter in [
+                FallbackOn::Any,
+                FallbackOn::UsageLimit,
+                FallbackOn::ExceptUsageLimit,
+            ] {
+                let policy = RetryPolicy {
+                    fallback_on: filter,
+                    ..policy()
+                };
+                for state in [progress(0, 0), progress(2, 0)] {
+                    for outcome in [
+                        TurnOutcome::Completed(&message),
+                        TurnOutcome::Failed(&error),
+                    ] {
+                        assert_eq!(
+                            decide(outcome, &state, &policy, None),
+                            TurnDecision::Finish { success: false },
+                            "{filter:?}: {text}",
+                        );
+                    }
                 }
             }
         }
@@ -3272,7 +3317,13 @@ mod tests {
             "HTTP 400: credit balance is too low",
             "HTTP 402: not enough credits",
             "HTTP 400: insufficient_quota",
+            "HTTP 400: usage_limit_reached",
+            "HTTP 400: quota exhausted",
+            "HTTP 400: quota_exhausted",
+            "HTTP 400: quota will reset tomorrow",
+            "HTTP 400: exhausted your capacity",
             "HTTP 402: billing_not_active",
+            "HTTP 402",
         ] {
             assert_eq!(classify_failover(text), Some(FailoverClass::Quota));
             let message = errored_message(Some(text), 0);
