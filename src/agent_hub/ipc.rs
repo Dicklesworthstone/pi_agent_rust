@@ -94,6 +94,25 @@ struct WireRequest {
     request: Request,
 }
 
+/// A wait lease cannot send a message or choose an unauthenticated waiter.
+/// Closing its socket releases it without a second request.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WaitRequest {
+    peer: Option<String>,
+    cursor: u64,
+    claimed_from: Option<String>,
+    wait_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireWaitRequest {
+    version: u8,
+    token: String,
+    wait: WaitRequest,
+}
+
 // Separate envelopes keep the established messaging API unchanged. A frame
 // cannot combine a messaging operation with a result read (both deny unknown
 // fields); result reads carry no caller-supplied sender or filesystem path.
@@ -102,6 +121,7 @@ struct WireRequest {
 enum Incoming {
     Message(WireRequest),
     Result(results::WireRequest),
+    Wait(WireWaitRequest),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -255,6 +275,10 @@ async fn wait_for_cancellation(owner: &AgentCx) -> Error {
 }
 
 async fn exchange(address: SocketAddr, frame: Vec<u8>) -> Result<Reply> {
+    exchange_open(address, frame).await.map(|(reply, _)| reply)
+}
+
+async fn exchange_open(address: SocketAddr, frame: Vec<u8>) -> Result<(Reply, AsyncTcpStream)> {
     // SocketAddr is validated before this function; no name resolution or
     // ambient proxy configuration participates in this local transport.
     let mut socket = AsyncTcpStream::connect(address)
@@ -304,11 +328,83 @@ async fn exchange(address: SocketAddr, frame: Vec<u8>) -> Result<Reply> {
             let response: WireResponse = serde_json::from_slice(&response[..end])
                 .map_err(|_| ipc_error("PROTOCOL", "parent returned an invalid response"))?;
             return match response {
-                WireResponse::Ok(reply) => Ok(reply),
+                WireResponse::Ok(reply) => Ok((reply, socket)),
                 WireResponse::Error(message) => Err(Error::tool("hub", message)),
             };
         }
     }
+}
+
+/// Hold one authenticated dependency lease while the returned socket lives.
+/// Opening the lease shares the original wait budget and cancellation owner.
+pub(super) async fn open_wait_channel(
+    owner: &AgentCx,
+    peer: Option<&str>,
+    cursor: u64,
+    claimed_from: Option<&str>,
+    remaining: Duration,
+) -> Result<(super::InboxWaitResult, AsyncTcpStream)> {
+    let (address, token) = inherited_endpoint()?
+        .ok_or_else(|| ipc_error("CONFIG", "parent wait channel is unavailable"))?;
+    if !owner.capabilities().io || !owner.capabilities().time {
+        return Err(ipc_error(
+            "PERMISSION",
+            "reply wait requires I/O and timer authority",
+        ));
+    }
+    owner
+        .checkpoint()
+        .map_err(|_| ipc_error("CANCELLED", "reply wait was cancelled"))?;
+    let now = owner
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+    let inherited = owner.budget().deadline.map_or(EXCHANGE_TIMEOUT, |deadline| {
+        Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+    });
+    let timeout = remaining.min(EXCHANGE_TIMEOUT).min(inherited);
+    if timeout.is_zero() {
+        return Err(ipc_error("TIMEOUT", "reply wait expired before acquiring its lease"));
+    }
+    // Round the wire lease up; the client still observes the precise budget.
+    let wait_ms = u64::try_from(remaining.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(60_000)
+        .min(60_000);
+    let mut frame = serde_json::to_vec(&WireWaitRequest {
+        version: VERSION,
+        token,
+        wait: WaitRequest {
+            peer: peer.map(str::to_string),
+            cursor,
+            claimed_from: claimed_from.map(str::to_string),
+            wait_ms,
+        },
+    })?;
+    frame.push(b'\n');
+    if frame.len() > MAX_REQUEST_BYTES {
+        return Err(ipc_error("LIMIT", "wait request exceeds the frame limit"));
+    }
+    let exchange = async {
+        match select(
+            Box::pin(exchange_open(address, frame)),
+            Box::pin(wait_for_cancellation(owner)),
+        )
+        .await
+        {
+            Either::Left((reply, _)) => reply,
+            Either::Right((error, _)) => Err(error),
+        }
+    };
+    let (reply, socket) = owner
+        .with_current(asupersync::time::timeout(now, timeout, exchange))
+        .await
+        .map_err(|_| ipc_error("TIMEOUT", "parent wait lease timed out"))??;
+    let Reply::Wait { result } = reply else {
+        return Err(ipc_error("PROTOCOL", "parent returned a different wait lease reply"));
+    };
+    if result.peer.as_deref() != peer || result.next_cursor < cursor {
+        return Err(ipc_error("PROTOCOL", "parent returned an inconsistent wait lease"));
+    }
+    Ok((result, socket))
 }
 
 /// Owned by the same guard as the native process, never by the global registry.
@@ -418,6 +514,7 @@ struct Connection {
     written: usize,
     deadline: Instant,
     result_stream: Option<results::Transfer>,
+    wait_hold: Option<std::sync::Arc<super::wait::DependencyHold>>,
 }
 
 impl Connection {
@@ -429,6 +526,7 @@ impl Connection {
             written: 0,
             deadline: Instant::now() + EXCHANGE_TIMEOUT,
             result_stream: None,
+            wait_hold: None,
         }
     }
 
@@ -474,6 +572,14 @@ impl Connection {
         if self.result_stream.as_ref().is_some_and(|stream| stream.check_reader().is_err()) {
             return false;
         }
+        if let Some(hold) = &self.wait_hold {
+            if !hold.active() {
+                return false;
+            }
+            if self.output.as_ref().is_some_and(|output| self.written == output.len()) {
+                return true;
+            }
+        }
         if self.output.is_none() {
             for _ in 0..IO_CHUNKS_PER_POLL {
                 let mut chunk = [0_u8; 4096];
@@ -515,6 +621,16 @@ impl Connection {
                                         Err(error) => WireResponse::Error(error.to_string()),
                                     });
                                 }
+                                Ok(Incoming::Wait(request)) => {
+                                    match acquire_wait_hold(sender, token, request, owner, &self.socket) {
+                                        Ok((hold, result, duration)) => {
+                                            self.wait_hold = Some(hold);
+                                            self.deadline = Instant::now() + duration;
+                                            self.set_response(&WireResponse::Ok(Reply::Wait { result }));
+                                        }
+                                        Err(error) => self.set_response(&WireResponse::Error(error.to_string())),
+                                    }
+                                }
                                 Err(_) => self.refuse("PROTOCOL", "invalid request frame"),
                             }
                             break;
@@ -540,6 +656,7 @@ impl Connection {
                     Ok(count) => {
                         self.written += count;
                         if self.written == total {
+                            if self.wait_hold.is_some() { return true; }
                             if self.advance_result() { continue; }
                             let _ = self.socket.shutdown(Shutdown::Both);
                             return false;
@@ -553,6 +670,57 @@ impl Connection {
         }
         true
     }
+}
+
+fn acquire_wait_hold(
+    sender: &str,
+    token: &str,
+    request: WireWaitRequest,
+    owner: &AgentCx,
+    socket: &TcpStream,
+) -> Result<(std::sync::Arc<super::wait::DependencyHold>, super::InboxWaitResult, Duration)> {
+    if request.version != VERSION || !matches_token(token, &request.token) {
+        return Err(ipc_error("AUTH", "invalid parent wait credential or protocol version"));
+    }
+    let request = request.wait;
+    if request.claimed_from.as_deref().is_some_and(|claimed| claimed != sender) {
+        return Err(ipc_error("SENDER", "waiter does not match the authenticated child"));
+    }
+    if !(1..=60_000).contains(&request.wait_ms) {
+        return Err(ipc_error("INPUT", "wait lease must be between 1 and 60000 milliseconds"));
+    }
+    owner
+        .checkpoint()
+        .map_err(|_| ipc_error("CANCELLED", "parent wait owner is cancelled"))?;
+    let channel = socket
+        .try_clone()
+        .map_err(|_| ipc_error("UNAVAILABLE", "could not retain wait channel"))?;
+    let mut hub = registry().try_lock().map_err(|error| match error {
+        std::sync::TryLockError::WouldBlock => ipc_error("BUSY", "parent agent registry is busy"),
+        std::sync::TryLockError::Poisoned(_) => {
+            ipc_error("UNAVAILABLE", "parent agent registry is unavailable")
+        }
+    })?;
+    acquire_wait_in_registry(&mut hub, sender, &request, channel)
+}
+
+fn acquire_wait_in_registry(
+    hub: &mut AgentHubRegistry,
+    sender: &str,
+    request: &WaitRequest,
+    channel: TcpStream,
+) -> Result<(std::sync::Arc<super::wait::DependencyHold>, super::InboxWaitResult, Duration)> {
+    if hub.control_pid(sender).is_none()
+        || hub.get(sender).is_none_or(|entry| entry.status != ChildStatus::Running)
+    {
+        return Err(ipc_error("REVOKED", "the waiter no longer owns a live process"));
+    }
+    let duration = Duration::from_millis(request.wait_ms);
+    let hold = hub.begin_reply_wait(
+        sender, request.peer.as_deref(), request.cursor, duration, Some(channel),
+    )?;
+    let result = hub.wait_snapshot(sender, request.peer.as_deref(), request.cursor)?;
+    Ok((hold, result, duration))
 }
 
 fn matches_token(expected: &str, supplied: &str) -> bool {
@@ -703,6 +871,21 @@ mod tests {
         frame
     }
 
+    fn wait_wire(token: &str, claimed_from: Option<&str>, wait_ms: u64) -> Vec<u8> {
+        let mut frame = serde_json::to_vec(&WireWaitRequest {
+            version: VERSION,
+            token: token.to_string(),
+            wait: WaitRequest {
+                peer: Some("parent".to_string()),
+                cursor: 0,
+                claimed_from: claimed_from.map(str::to_string),
+                wait_ms,
+            },
+        }).expect("encode wait lease");
+        frame.push(b'\n');
+        frame
+    }
+
     fn channel() -> (AgentCx, ChildChannel) {
         let owner = AgentCx::for_testing_with_io();
         let channel = ChildChannel::bind(
@@ -827,6 +1010,114 @@ mod tests {
         );
         assert!(channel.listener.is_some());
         assert!(channel.connections.is_empty());
+    }
+
+    #[test]
+    fn wait_socket_rejects_spoofing_invalid_budgets_and_revoked_owners() {
+        let (_owner, mut channel) = channel();
+        let token = channel.token.clone();
+        let wrong = if token.starts_with('a') { "b".repeat(64) } else { "a".repeat(64) };
+        for (credential, claimed, wait_ms, code) in [
+            (wrong.as_str(), None, 1000, "PI_HUB_IPC_AUTH"),
+            (token.as_str(), Some("parent"), 1000, "PI_HUB_IPC_SENDER"),
+            (token.as_str(), None, 0, "PI_HUB_IPC_INPUT"),
+            (token.as_str(), None, 60_001, "PI_HUB_IPC_INPUT"),
+        ] {
+            let frame = wait_wire(credential, claimed, wait_ms);
+            let error = refusal(&round_trip(&mut channel, &frame));
+            assert!(error.contains(code), "{error}");
+            assert!(!error.contains(&token));
+            assert!(channel.connections.is_empty());
+        }
+        let frame = wait_wire(&token, None, 1000);
+        let error = refusal(&round_trip(&mut channel, &frame));
+        assert!(
+            error.contains("PI_HUB_IPC_REVOKED") || error.contains("PI_HUB_IPC_BUSY"),
+            "{error}"
+        );
+        assert!(channel.connections.is_empty());
+        assert!(channel.listener.is_some());
+    }
+
+    #[test]
+    fn wait_envelope_cannot_be_combined_with_a_message_operation() {
+        let (_owner, mut channel) = channel();
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &wait_wire(&channel.token, None, 1000),
+        ).unwrap();
+        value["request"] = serde_json::json!({"action":"send","name":"parent","text":"not sent"});
+        let mut frame = serde_json::to_vec(&value).unwrap();
+        frame.push(b'\n');
+        assert!(refusal(&round_trip(&mut channel, &frame)).contains("PI_HUB_IPC_PROTOCOL"));
+        assert!(channel.connections.is_empty());
+    }
+
+    #[test]
+    fn accepted_wait_lease_keeps_socket_open_and_cancellation_releases_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut hub = AgentHubRegistry::default();
+        hub.set_dir_for_tests(temp.path().to_path_buf());
+        let sender = hub.register("lease-sender", "wait for peer").unwrap();
+        let peer = hub.register("lease-peer", "answer sender").unwrap();
+        hub.mark_running(&sender.id, 10);
+        hub.mark_running(&peer.id, 20);
+        hub.bus_send("parent", &peer.id, "private parent report").unwrap();
+        let owner = AgentCx::for_testing_with_io();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut connection = Connection::new(server);
+        let (hold, result, duration) = acquire_wait_in_registry(
+            &mut hub,
+            &sender.id,
+            &WaitRequest {
+                peer: Some(peer.id.clone()),
+                cursor: 0,
+                claimed_from: None,
+                wait_ms: 60_000,
+            },
+            connection.socket.try_clone().unwrap(),
+        ).unwrap();
+        assert_eq!(result.id, sender.id);
+        assert!(result.messages.is_empty());
+        connection.wait_hold = Some(hold);
+        connection.deadline = Instant::now() + duration;
+        connection.set_response(&WireResponse::Ok(Reply::Wait { result }));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut response = Vec::new();
+        while !response.ends_with(b"\n") {
+            assert!(Instant::now() < deadline, "wait acknowledgement did not arrive");
+            assert!(connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
+            let mut bytes = [0_u8; 4096];
+            match client.read(&mut bytes) {
+                Ok(0) => panic!("acknowledged lease closed early"),
+                Ok(count) => response.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("lease read failed: {error}"),
+            }
+        }
+        assert!(matches!(
+            serde_json::from_slice::<WireResponse>(&response).unwrap(),
+            WireResponse::Ok(Reply::Wait { .. })
+        ));
+        assert!(connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
+        assert_eq!(
+            hub.wait_snapshot(&peer.id, Some(&sender.id), 0).unwrap().status,
+            super::super::InboxWaitStatus::PeerBlocked
+        );
+        owner.set_cancel_requested(true);
+        assert!(!connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
+        drop(connection);
+        assert_eq!(
+            hub.wait_snapshot(&peer.id, Some(&sender.id), 0).unwrap().status,
+            super::super::InboxWaitStatus::Pending
+        );
+        assert_eq!(hub.control_pid(&sender.id), Some(10));
+        assert_eq!(hub.inbox("parent")[0].body, "private parent report");
     }
 
     #[test]

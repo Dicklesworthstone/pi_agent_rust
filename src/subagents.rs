@@ -378,6 +378,7 @@ impl SubagentTool {
             crate::agent_hub::ChildKind::Tan,
             deadline,
         )
+        .into_background()
         .with_parent_model(self.capture_parent_model())
         .run_one(&agents, request, None, None)
         .await;

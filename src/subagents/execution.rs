@@ -62,6 +62,7 @@ pub(super) struct ChildRunner {
     revival: Option<(String, RevivalSpec)>,
     public_task: Option<String>,
     launch_admission: Option<LaunchAdmission>,
+    foreground: bool,
 }
 
 impl ChildRunner {
@@ -84,7 +85,13 @@ impl ChildRunner {
             revival: None,
             public_task: None,
             launch_admission: None,
+            foreground: true,
         }
+    }
+
+    pub(super) const fn into_background(mut self) -> Self {
+        self.foreground = false;
+        self
     }
 
     pub(super) fn with_public_task(mut self, task: Option<String>) -> Self {
@@ -484,6 +491,23 @@ impl ChildRunner {
             }
         };
         attempt.result.hub_id = Some(hub_entry.id.clone());
+        if self.foreground {
+            let hold = crate::agent_hub::registry()
+                .lock()
+                .map_err(|_| crate::error::Error::tool(
+                    "subagent", "PI_SUBAGENT_HUB: registry is poisoned",
+                ))
+                .and_then(|mut hub| {
+                    hub.hold_child_result(&hub_entry.id, self.deadline.remaining())
+                });
+            match hold {
+                Ok(hold) => attempt.parent_wait = Some(hold),
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
+            }
+        }
         emit_progress(update, &attempt.result);
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
@@ -783,6 +807,7 @@ struct Attempt {
     isolation: Option<(IsoHandle, IsoApplyMode)>,
     hub: HubLease,
     deadline: Deadline,
+    parent_wait: Option<Arc<crate::agent_hub::DependencyHold>>,
 }
 
 impl Attempt {
@@ -792,6 +817,7 @@ impl Attempt {
             isolation: None,
             hub: HubLease::empty(),
             deadline,
+            parent_wait: None,
         }
     }
 
@@ -886,6 +912,7 @@ impl Attempt {
             self.result.iso = Some(outcome);
         }
         self.hub.settle(&self.result);
+        drop(self.parent_wait.take());
         emit_progress(update, &self.result);
         self.result
     }

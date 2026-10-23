@@ -9842,7 +9842,7 @@ impl Tool for HubTool {
          nextCursor). Omit name to await any reply to your outstanding sends; \
          automatic waits use the previous inbox/wait cursor, or omit it initially. \
          unrelated running agents do not keep this wait open. It returns on \
-         messages, peer exit, no pending replies, retention loss, or waitMs \
+         messages, peer exit, a dependency cycle, no pending replies, retention loss, or waitMs \
          (default 30000, range 1..60000). It does not send or consume messages. \
          Include hub in a child's declared tools to enable messaging."
     }
@@ -10093,6 +10093,10 @@ impl HubTool {
                 "{} finished without a newer reply. Read its result or continue without the answer.",
                 result.peer.as_deref().unwrap_or("All messaged agents")
             ),
+            InboxWaitStatus::PeerBlocked => format!(
+                "{} cannot reply before you finish: the wait depends on your result. Continue without the answer to break the dependency cycle.",
+                result.blocked_peers.join(", ")
+            ),
             InboxWaitStatus::HistoryLost => format!(
                 "{}: inbox or pending-reply history after the requested cursor was evicted; inspect the reported gaps before continuing.",
                 result.id
@@ -10125,7 +10129,9 @@ impl HubTool {
                 "\n{}: sent at sequence {}, {}.",
                 reply.peer,
                 reply.sent_cursor,
-                if reply.can_reply {
+                if reply.blocked_on_caller {
+                    "waiting on your result"
+                } else if reply.can_reply {
                     "reply still pending"
                 } else {
                     "cannot reply in this run"
@@ -24950,6 +24956,38 @@ mod tests {
             let content = std::fs::read_to_string(&file).unwrap();
             assert_eq!(content, "line1\nchanged\n");
         });
+    }
+
+    #[test]
+    fn hub_wait_dependency_result_explains_the_cycle_and_preserves_details() {
+        let result: crate::agent_hub::InboxWaitResult = serde_json::from_value(
+            serde_json::json!({
+                "id": "worker-1",
+                "status": "peerBlocked",
+                "messages": [],
+                "nextCursor": 17,
+                "hasMore": false,
+                "oldestCursor": 0,
+                "droppedThroughCursor": 0,
+                "peerStatus": null,
+                "pendingReplies": [{
+                    "peer": "parent",
+                    "sentCursor": 17,
+                    "peerStatus": null,
+                    "canReply": false,
+                    "blockedOnCaller": true
+                }],
+                "blockedPeers": ["parent"]
+            }),
+        ).unwrap();
+        let (text, details) = HubTool::format_wait_reply(&result);
+        assert!(text.contains("dependency cycle"));
+        assert!(text.contains("waiting on your result"));
+        assert_eq!(details["schema"], "pi.agent-hub.wait/v1");
+        assert_eq!(details["status"], "peerBlocked");
+        assert_eq!(details["nextCursor"], 17);
+        assert_eq!(details["blockedPeers"], serde_json::json!(["parent"]));
+        assert_eq!(details["pendingReplies"][0]["blockedOnCaller"], true);
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Bounded reply waits over the same inbox and authenticated child channel as
 //! ordinary hub messages. Waiting never sends, consumes, or replays a message.
 
+use std::collections::BTreeSet;
+use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +16,39 @@ const MAX_WAIT_MS: u64 = 60_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_TRACKED_PEERS: usize = 256;
 const MAX_TRACKED_PEER_BYTES: usize = 32 * 1024;
+const MAX_WAIT_HOLDS: usize = 1024;
+
+struct ReplyWatch {
+    cursor: u64,
+    all_senders: bool,
+}
+
+/// Only the waiting operation owns a strong reference. Dropping a wait never
+/// needs the registry mutex, even when a process is reaped under that mutex.
+pub(crate) struct DependencyHold {
+    waiter: String,
+    peers: Vec<String>,
+    deadline: Instant,
+    reply: Option<ReplyWatch>,
+    /// A nonblocking clone observes EOF before the channel's next poll.
+    /// The client socket's lifetime is the authenticated release token.
+    channel: Option<TcpStream>,
+}
+
+impl DependencyHold {
+    pub(super) fn active(&self) -> bool {
+        if Instant::now() >= self.deadline {
+            return false;
+        }
+        self.channel.as_ref().is_none_or(|socket| {
+            let mut byte = [0_u8; 1];
+            matches!(socket.peek(&mut byte), Err(error) if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ))
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +56,7 @@ pub enum InboxWaitStatus {
     Pending,
     Messages,
     PeerStopped,
+    PeerBlocked,
     HistoryLost,
     TimedOut,
     NothingPending,
@@ -34,6 +71,9 @@ pub struct PendingReply {
     pub sent_cursor: u64,
     pub peer_status: Option<ChildStatus>,
     pub can_reply: bool,
+    /// A live peer depends directly or transitively on this caller.
+    #[serde(default)]
+    pub blocked_on_caller: bool,
 }
 
 /// A cursor belongs to this recipient/peer selection. An inbox read remains
@@ -61,6 +101,8 @@ pub struct InboxWaitResult {
     /// send must not become an invented claim that nobody owes a reply.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub dropped_tracking_through_cursor: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_peers: Vec<String>,
 }
 
 const fn is_zero(value: &u64) -> bool {
@@ -92,6 +134,159 @@ fn expired_probe(
 }
 
 impl AgentHubRegistry {
+    /// A foreground native call awaits the child's result, including accepted
+    /// writeback. Background jobs must not install this execution dependency.
+    pub(crate) fn hold_child_result(
+        &mut self,
+        child: &str,
+        remaining: Duration,
+    ) -> Result<Arc<DependencyHold>> {
+        if self.entries.get(child).is_none_or(|entry| entry.status.settled()) {
+            return Err(wait_error("PEER", "the awaited native child is unavailable"));
+        }
+        self.prune_wait_holds()?;
+        let deadline = Instant::now()
+            .checked_add(remaining)
+            .ok_or_else(|| wait_error("INPUT", "child result deadline is out of range"))?;
+        let hold = Arc::new(DependencyHold {
+            waiter: "parent".to_string(),
+            peers: vec![child.to_string()],
+            deadline,
+            reply: None,
+            channel: None,
+        });
+        self.wait_holds.push(Arc::downgrade(&hold));
+        Ok(hold)
+    }
+
+    fn prune_wait_holds(&mut self) -> Result<()> {
+        self.wait_holds
+            .retain(|hold| hold.upgrade().is_some_and(|hold| hold.active()));
+        if self.wait_holds.len() >= MAX_WAIT_HOLDS {
+            return Err(wait_error("LIMIT", "too many active dependency waits"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_reply_wait(
+        &mut self,
+        recipient: &str,
+        peer: Option<&str>,
+        cursor: u64,
+        remaining: Duration,
+        channel: Option<TcpStream>,
+    ) -> Result<Arc<DependencyHold>> {
+        // Validate identities and readiness before publishing a dependency.
+        let snapshot = self.wait_snapshot(recipient, peer, cursor)?;
+        self.prune_wait_holds()?;
+        let peers = if snapshot.status != InboxWaitStatus::Pending {
+            Vec::new()
+        } else if let Some(peer) = peer {
+            vec![peer.to_string()]
+        } else {
+            snapshot
+                .pending_replies
+                .into_iter()
+                .filter(|reply| reply.can_reply)
+                .map(|reply| reply.peer)
+                .collect()
+        };
+        let hold = Arc::new(DependencyHold {
+            waiter: recipient.to_string(),
+            peers,
+            deadline: Instant::now() + remaining.min(Duration::from_millis(MAX_WAIT_MS)),
+            reply: Some(ReplyWatch {
+                cursor,
+                all_senders: peer.is_none(),
+            }),
+            channel,
+        });
+        self.wait_holds.push(Arc::downgrade(&hold));
+        Ok(hold)
+    }
+
+    fn peer_can_reply(&self, peer: &str) -> bool {
+        let status = self.entries.get(peer).map(|entry| entry.status);
+        peer == "parent"
+            || status == Some(ChildStatus::Starting)
+            || (status == Some(ChildStatus::Running) && self.control_pid(peer).is_some())
+    }
+
+    /// Reply holds wake for messages, history loss or peer completion. A
+    /// delivered reply must release its dependency before the wait polls again.
+    fn hold_peers(&self, hold: &DependencyHold) -> Vec<String> {
+        // A lease opened after a terminal snapshot remains inert, even if a
+        // concurrent send later adds a new pending recipient.
+        if hold.peers.is_empty() {
+            return Vec::new();
+        }
+        let Some(reply) = &hold.reply else {
+            return hold.peers.clone();
+        };
+        let ready = self.bus.get(&hold.waiter).is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.seq > reply.cursor
+                    && (reply.all_senders || hold.peers.contains(&message.from))
+            })
+        });
+        let history_lost = self
+            .dropped_bus_through
+            .get(&hold.waiter)
+            .is_some_and(|cursor| *cursor > reply.cursor)
+            || (reply.all_senders
+                && self.dropped_reply_tracking_through
+                    .get(&hold.waiter)
+                    .is_some_and(|cursor| *cursor > reply.cursor));
+        if ready || history_lost {
+            return Vec::new();
+        }
+        if reply.all_senders {
+            // Other concurrent tools may add unanswered sends while this
+            // wait is open. Every current live alternative can wake it.
+            return self.pending_replies
+                .get(&hold.waiter)
+                .into_iter()
+                .flat_map(|pending| pending.keys())
+                .filter(|peer| self.peer_can_reply(peer))
+                .cloned()
+                .collect();
+        }
+        hold.peers
+            .iter()
+            .filter(|peer| self.peer_can_reply(peer))
+            .cloned()
+            .collect()
+    }
+
+    /// Every alternative of a reply hold must depend on the caller. Separate
+    /// holds (including foreground children) are conjunctive obligations:
+    /// any one blocked hold prevents that agent's completion. Fixed-point
+    /// propagation handles transitive dependencies without recursive searches.
+    fn blocked_on(&self, caller: &str) -> BTreeSet<String> {
+        let holds = self
+            .wait_holds
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|hold| {
+                hold.active()
+                    && (hold.waiter == "parent" || self.control_pid(&hold.waiter).is_some())
+            })
+            .map(|hold| (hold.waiter.clone(), self.hold_peers(&hold)))
+            .collect::<Vec<_>>();
+        let mut blocked = BTreeSet::from([caller.to_string()]);
+        loop {
+            let prior = blocked.len();
+            for (waiter, peers) in &holds {
+                if !peers.is_empty() && peers.iter().all(|peer| blocked.contains(peer)) {
+                    blocked.insert(waiter.clone());
+                }
+            }
+            if blocked.len() == prior {
+                return blocked;
+            }
+        }
+    }
+
     pub(super) fn record_reply_delivery(&mut self, message: &BusMessage) {
         let known = |id: &str| id == "parent" || self.entries.contains_key(id);
         if message.from == message.to || !known(&message.from) || !known(&message.to) {
@@ -127,7 +322,11 @@ impl AgentHubRegistry {
         }
     }
 
-    fn pending_reply_snapshot(&self, recipient: &str) -> Vec<PendingReply> {
+    fn pending_reply_snapshot(
+        &self,
+        recipient: &str,
+        blocked: &BTreeSet<String>,
+    ) -> Vec<PendingReply> {
         let Some(pending) = self.pending_replies.get(recipient) else {
             return Vec::new();
         };
@@ -135,15 +334,14 @@ impl AgentHubRegistry {
             .iter()
             .map(|(peer, sent_cursor)| {
                 let peer_status = self.entries.get(peer).map(|entry| entry.status);
-                let can_reply = peer == "parent"
-                    || peer_status == Some(ChildStatus::Starting)
-                    || (peer_status == Some(ChildStatus::Running)
-                        && self.control_pid(peer).is_some());
+                let live = self.peer_can_reply(peer);
+                let blocked_on_caller = live && blocked.contains(peer);
                 PendingReply {
                     peer: peer.clone(),
                     sent_cursor: *sent_cursor,
                     peer_status,
-                    can_reply,
+                    can_reply: live && !blocked_on_caller,
+                    blocked_on_caller,
                 }
             })
             .collect::<Vec<_>>();
@@ -173,11 +371,28 @@ impl AgentHubRegistry {
         } else {
             None
         };
+        let blocked = self.blocked_on(recipient);
         let pending_replies = if peer.is_none() {
-            self.pending_reply_snapshot(recipient)
+            self.pending_reply_snapshot(recipient, &blocked)
         } else {
             Vec::new()
         };
+        let blocked_peers = peer.map_or_else(
+            || {
+                pending_replies
+                    .iter()
+                    .filter(|reply| reply.blocked_on_caller)
+                    .map(|reply| reply.peer.clone())
+                    .collect::<Vec<_>>()
+            },
+            |peer| {
+                if blocked.contains(peer) {
+                    vec![peer.to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+        );
         let dropped_tracking_through_cursor = if peer.is_none() {
             self.dropped_reply_tracking_through
                 .get(recipient)
@@ -225,6 +440,10 @@ impl AgentHubRegistry {
             InboxWaitStatus::HistoryLost
         } else if peer_status.is_some_and(ChildStatus::settled) {
             InboxWaitStatus::PeerStopped
+        } else if !blocked_peers.is_empty()
+            && (peer.is_some() || !pending_replies.iter().any(|reply| reply.can_reply))
+        {
+            InboxWaitStatus::PeerBlocked
         } else if peer.is_none() && pending_replies.is_empty() {
             InboxWaitStatus::NothingPending
         } else if peer.is_none() && !pending_replies.iter().any(|reply| reply.can_reply) {
@@ -244,6 +463,7 @@ impl AgentHubRegistry {
             peer_status,
             pending_replies,
             dropped_tracking_through_cursor,
+            blocked_peers,
         })
     }
 }
@@ -350,6 +570,7 @@ async fn probe_inbox(
 /// wait. A child can only read its own
 /// authenticated inbox; a root caller reads the parent inbox. An inherited
 /// channel never falls back to a different local registry.
+#[allow(clippy::too_many_lines)] // Keep lease ownership and probes in one budgeted scope.
 pub async fn wait_for_replies(
     peer: Option<&str>,
     cursor: Option<u64>,
@@ -379,6 +600,10 @@ pub async fn wait_for_replies(
     }
     let mut cursor = cursor.unwrap_or(0);
     let mut last_pending: Option<InboxWaitResult> = None;
+    // Every return, cancellation and dropped future releases these owners.
+    // Neither cleanup path acquires the registry lock or cancels a child.
+    let mut local_hold = None;
+    let mut inherited_hold = None;
     loop {
         let remaining = budget.remaining(&owner)?;
         if inherited && remaining.is_zero() {
@@ -422,6 +647,49 @@ pub async fn wait_for_replies(
         }
         cursor = result.next_cursor;
         last_pending = Some(result);
+        if (inherited && inherited_hold.is_none()) || (!inherited && local_hold.is_none()) {
+            let acquired = if inherited {
+                match ipc::open_wait_channel(&owner, peer, cursor, claimed_from, remaining).await {
+                    Ok((snapshot, channel)) => {
+                        inherited_hold = Some(channel);
+                        if snapshot.status != InboxWaitStatus::Pending {
+                            return Ok(snapshot);
+                        }
+                        cursor = snapshot.next_cursor;
+                        last_pending = Some(snapshot);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                match super::registry().try_lock() {
+                    Ok(mut hub) => hub
+                        .begin_reply_wait("parent", peer, cursor, remaining, None)
+                        .map(|hold| local_hold = Some(hold)),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        Err(wait_error("BUSY", "the parent agent registry is busy"))
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => Err(wait_error(
+                        "UNAVAILABLE",
+                        "the parent agent registry is unavailable",
+                    )),
+                }
+            };
+            if let Err(error) = acquired {
+                let remaining = budget.remaining(&owner)?;
+                if !remaining.is_zero()
+                    && (has_code(&error, "PI_HUB_IPC_BUSY:")
+                        || has_code(&error, "PI_HUB_WAIT_BUSY:"))
+                {
+                    owner.time().sleep(Duration::from_millis(10).min(remaining)).await;
+                    continue;
+                }
+                return expired_probe(error, remaining, last_pending);
+            }
+            // A new edge can close a cycle, or race a final reply. Probe
+            // immediately; lease acquisition never adds an idle interval.
+            continue;
+        }
         // A local final probe is nonblocking and observes messages/exit/loss
         // that arrived in the last slice. For IPC, leave half the remaining
         // budget for another exchange rather than sleeping through it.

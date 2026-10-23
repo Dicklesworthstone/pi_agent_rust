@@ -116,8 +116,9 @@ impl Prepared {
         progress: futures::channel::oneshot::Receiver<workflow::Progress>,
     ) -> Result<ToolOutput> {
         match self {
-            Self::Delegation { request, mode } => {
+            Self::Delegation { mut request, mode } => {
                 drop(progress);
+                request.runner = request.runner.into_background();
                 Ok(result_output(request.run(None).await, mode, structured_results))
             }
             Self::Workflow(plan) => {

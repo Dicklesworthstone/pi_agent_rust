@@ -45,6 +45,7 @@ The result has schema `pi.agent-hub.wait/v1` and one of these statuses:
 | --- | --- |
 | `messages` | New messages from the named peer are available. |
 | `peerStopped` | The peer finished, failed, or was killed without a newer retained reply. |
+| `peerBlocked` | Every remaining answerable peer depends on this caller finishing; continue without the answer to break the dependency cycle. |
 | `historyLost` | Retention evicted messages after the requested cursor; an answer may have been lost. |
 | `timedOut` | The requested wait ended with no matching reply observed. The peer may still be working. |
 | `nothingPending` | An automatic wait has no unanswered sends and no newer inbox messages. |
@@ -76,10 +77,13 @@ acknowledgment does not lose an accepted question.
 An automatic wait returns any newer message in the caller's own inbox. With no
 new messages, it waits only while at least one messaged peer can still reply.
 Unasked workers never sustain it. The result includes `pendingReplies`, ordered
-by `sentCursor`, with each `peer`, `peerStatus`, and `canReply`. A reaped process
-cannot reply even if its result is still awaiting writeback. When all asked peers
-stop, the wait returns `peerStopped`; when every send has been answered, it
-returns `nothingPending`. The `peer` field is absent for automatic waits.
+by `sentCursor`, with each `peer`, `peerStatus`, `canReply`, and
+`blockedOnCaller`. A reaped process cannot reply even if its result is still
+awaiting writeback. A dependency-blocked peer has `canReply:false` and is listed
+in `blockedPeers`. An unblocked alternative keeps the wait open. When all asked
+peers stop, the wait returns `peerStopped`; when the remaining live alternatives
+depend on the caller, it returns `peerBlocked`; when every send has been answered,
+it returns `nothingPending`. The `peer` field is absent for automatic waits.
 
 Continue automatic reads with `nextCursor` and omit `name` again. Reads remain
 nonconsuming: repeating a cursor deliberately repeats its messages. Switching
@@ -101,22 +105,49 @@ never sends or replays a question, consumes a message, starts a model turn, or
 revives a finished child. Reading the inbox later still returns those messages.
 A terminal peer's retained replies are returned before `peerStopped`.
 
-Native workers use bounded read-only probes on their existing parent channel;
-root callers read the local registry. Ordinary lock contention retries inside
-the original budget. Authentication, revocation, broken channels and earlier
-transport timeouts remain errors. No registry lock is held while waiting, and
-no listener or helper thread is added. This is an explicit reply wait; it does
-not infer dependency cycles between workers. Child replies arriving after the
-last completed probe remain available in the next wait or inbox read.
+A wait records its dependencies for its lifetime. A named wait depends on its
+one peer; an automatic wait can wake for any of its answerable peers, so every
+alternative must depend on the caller before that wait is blocked. An automatic
+wait also considers new unanswered sends made while it is open. Dependencies
+can be transitive. For example, if scout is waiting for reviewer and reviewer
+tries to wait for scout, reviewer receives `peerBlocked` immediately.
+
+Foreground native delegations also record that the parent is waiting for each
+child's accepted result. A child that asks its synchronously waiting parent a
+question can therefore receive `peerBlocked` instead of spending its whole
+budget on an answer that cannot arrive. Explicit background delegations,
+background workflows, and `/tan` do not create this parent dependency. Persistent
+worker turns and later `hub jobs wait` calls do not yet contribute execution
+dependencies; reply waits over their authenticated hub channel still use the
+same dependency checks.
+
+Native workers use bounded read-only probes and an authenticated wait lease on
+their existing parent channel; root callers retain a local lease. Dropping a
+wait releases its lease without acquiring the registry lock or cancelling a
+peer. A disconnected socket, expired budget, reaped waiter, or delivered reply
+cannot leave an active reply dependency behind. Foreground result dependencies
+remain until their owning execution finishes. The registry holds only weak
+references and admits at most 1,024 active dependency leases.
+
+Ordinary lock contention retries inside the original budget. Authentication,
+revocation, broken channels and earlier transport timeouts remain errors. No
+registry lock is held while waiting, and no listener or helper thread is added.
+Retained replies and reported history loss take precedence over dependency
+status. Child replies arriving after the last completed probe remain available
+in the next wait or inbox read.
 
 The regression coverage includes automatic outstanding-reply discovery, failed
 delivery, reaped peers, authenticated tracking isolation, tracking bounds,
 sender filtering, ordered byte-bounded
 pagination, actual eviction versus sequence gaps, authenticated inbox ownership,
 terminal peers, cancellation/deadline handling, ordinary IPC wait expiry, and
-public `HubTool` delivery during the final wait interval. These Rust regressions
-were authored but could not be executed in the implementation environment;
-the required DSR compiler/test lanes need the configured RCH fleet.
+public `HubTool` delivery during the final wait interval. Dependency regressions
+cover direct and transitive waits, alternative peers, foreground parent waits,
+delivered replies, retention precedence, lease limits, expiration, process reap,
+socket disconnection, authenticated lease refusals, cancellation, and structured
+tool rendering. These Rust regressions were authored but could not be executed
+in the implementation environment; the required DSR compiler/test lanes remain
+outstanding.
 
 ## Result acceptance and privacy
 

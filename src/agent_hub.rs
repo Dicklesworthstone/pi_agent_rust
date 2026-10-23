@@ -29,6 +29,7 @@ use crate::error::{Error, Result};
 pub mod ipc;
 mod wait;
 
+pub(crate) use wait::DependencyHold;
 pub use wait::{InboxWaitResult, InboxWaitStatus, PendingReply, wait_for_replies};
 
 /// Maximum transcript bytes paged back per `transcript` call.
@@ -168,6 +169,8 @@ pub struct AgentHubRegistry {
     /// bounded tracker contains identities and sequence numbers, never bodies.
     pending_replies: BTreeMap<String, BTreeMap<String, u64>>,
     dropped_reply_tracking_through: BTreeMap<String, u64>,
+    /// Weak entries never own a wait or lock the registry during cleanup.
+    wait_holds: Vec<std::sync::Weak<wait::DependencyHold>>,
     bus_seq: u64,
     /// Artifacts dir for this session's hub files.
     dir: Option<PathBuf>,

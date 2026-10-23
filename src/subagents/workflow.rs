@@ -200,6 +200,7 @@ pub(super) struct PreparedWorkflow {
 impl PreparedWorkflow {
     pub(super) fn with_progress(mut self, progress: Progress) -> Self {
         self.progress = Some(progress);
+        self.runner = self.runner.into_background();
         self
     }
 
