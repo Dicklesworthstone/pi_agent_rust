@@ -2060,7 +2060,7 @@ fn spawn_managed(
 }
 
 #[cfg(windows)]
-mod windows_job_pipe {
+pub(crate) mod windows_job_pipe {
     use mio::windows::NamedPipe;
     use mio::{Events, Interest, Poll, Registry, Token};
     use std::fs::{File, OpenOptions};
@@ -2176,9 +2176,25 @@ mod windows_job_pipe {
         }
     }
 
-    pub(super) struct Reader {
+    pub(crate) struct Reader {
         pipe: NamedPipe,
         reactor: &'static Reactor,
+    }
+
+    impl Reader {
+        /// Poll buffered output without waiting for a readiness notification.
+        /// Async helper runners retain their own byte, work and time budgets;
+        /// an idle pipe returns WouldBlock and must never block their executor.
+        ///
+        /// # Errors
+        ///
+        /// Returns WouldBlock while idle, or an I/O error when the shared
+        /// reactor or pipe fails. With a nonempty buffer, only a closed writer
+        /// produces an empty read.
+        pub(crate) fn try_read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reactor.check()?;
+            self.pipe.read(buffer)
+        }
     }
 
     impl Read for Reader {
@@ -2221,7 +2237,7 @@ mod windows_job_pipe {
         }
     }
 
-    pub(super) fn pair() -> io::Result<(Reader, File)> {
+    pub(crate) fn pair() -> io::Result<(Reader, File)> {
         let reactor = reactor()?;
         let name = format!(r"\\.\pipe\pi-job-{}", uuid::Uuid::new_v4().simple());
         let mut pipe = NamedPipe::new(&name)?;
@@ -2245,6 +2261,37 @@ mod windows_job_pipe {
             .stdout(Stdio::from(stdout_writer))
             .stderr(Stdio::from(stderr_writer));
         Ok((stdout, stderr))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn try_read_does_not_wait_for_the_readiness_notification_lock() {
+            let _guard = super::super::process_test_guard();
+            let (mut reader, writer) = pair().expect("Windows helper pipe");
+            let state = Arc::clone(&reader.reactor.state);
+            let progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = reader.try_read(&mut [0]).map_err(|error| error.kind());
+                let _ = sent.send(result);
+                reader
+            });
+            // A blocking Read would wait for the mutex above. Always release
+            // it before joining, including when this regression is detected,
+            // so a failure leaves neither a blocked worker nor a locked reactor.
+            let result = received.recv_timeout(Duration::from_secs(2));
+            drop(progress);
+            let reader = worker.join().expect("helper pipe poll worker");
+            assert_eq!(result, Ok(Err(io::ErrorKind::WouldBlock)));
+            drop(reader);
+            drop(writer);
+        }
     }
 }
 
@@ -3980,10 +4027,15 @@ mod tests {
     fn windows_repeated_pipe_cancellation_retires_handles_with_writers_held() {
         let _guard = process_test_guard();
         let mut writers = Vec::new();
-        for _ in 0..32 {
+        for attempt in 0..32 {
             let (mut reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+            let result = if attempt % 2 == 0 {
+                reader.try_read(&mut [0])
+            } else {
+                reader.read(&mut [0])
+            };
             assert_eq!(
-                reader.read(&mut [0]).expect_err("pending read").kind(),
+                result.expect_err("pending read").kind(),
                 std::io::ErrorKind::WouldBlock
             );
             drop(reader);

@@ -2,6 +2,8 @@
 
 The same `read` tool handles document text and structured data. See [JSON and JSONL queries](#json-and-jsonl-queries) and [SQLite queries](#sqlite-queries) below.
 
+Local video paths also support [contact sheets and individual frames](media_tools.md#reading-local-video-frames), including zero-based frame indices and timestamp suffixes.
+
 The `read` tool extracts saved text from local Word documents, PowerPoint presentations, Excel workbooks, and EPUB books, and from document URLs. Conversion runs natively in the default build; it does not need an installed Office application, a conversion service, or an additional build feature.
 
 Pass the document path as ordinary `read` input:

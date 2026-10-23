@@ -6898,7 +6898,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read local files, document URLs, ZIP archive members, and images (jpg, png, gif, webp). Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Browse local SQLite with data.sqlite, data.sqlite:table, :table:key, :table?where=...&order=column:desc&limit=N&offset=N, or data.sqlite?q=SELECT...; queries are read-only and include committed WAL data. Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, EPUB renders chapters, and notebooks render saved cells and outputs. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
+        "Read local files, document URLs, ZIP archive members, images (jpg, png, gif, webp), and video frames. Local videos return metadata and a contact sheet; clip.mp4:42 selects a zero-based frame, and clip.mp4:1m2s or :00:01:02 selects a timestamp. Video decoding requires ffmpeg/ffprobe with the fd protocol and does not support hashline or line windows. Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Browse local SQLite with data.sqlite, data.sqlite:table, :table:key, :table?where=...&order=column:desc&limit=N&offset=N, or data.sqlite?q=SELECT...; queries are read-only and include committed WAL data. Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, EPUB renders chapters, and notebooks render saved cells and outputs. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -6907,7 +6907,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path, archive.zip:member/path, http(s) URL, internal resource URL, JSON source?q=<jq filter>, or SQLite path[:table[:key]][?q=<SQL>|where=<predicate>&order=column:asc&limit=N&offset=N]. Encode literal query ampersands as %26; + remains arithmetic."
+                    "description": "File path, video.mp4[:frame-index|timestamp], archive.zip:member/path, http(s) URL, internal resource URL, JSON source?q=<jq filter>, or SQLite path[:table[:key]][?q=<SQL>|where=<predicate>&order=column:asc&limit=N&offset=N]. Video timestamps include 1m2s and 00:01:02; a bare integer is a zero-based frame. Encode literal query ampersands as %26; + remains arithmetic."
                 },
                 "offset": {
                     "type": "integer",
@@ -6987,9 +6987,24 @@ impl Tool for ReadTool {
             .map_or(input.path.as_str(), |request| request.source_path.as_str());
         let archive_path = crate::archive_read::parse_path(file_path)?
             .filter(|archive| !input.raw || !archive.member.is_empty());
-        let source_path = archive_path
-            .as_ref()
-            .map_or(file_path, |archive| archive.archive_path.as_str());
+        // Preserve literal colon filenames before interpreting a video frame
+        // selector. Even that existence probe stays within the read scope.
+        // Archive members and SQLite selectors keep their own routing rules.
+        let video_target = if input.raw || sqlite_request.is_some() || archive_path.is_some() {
+            None
+        } else {
+            let literal_exists = if input.path.contains(':') {
+                let literal_path = resolve_read_path(&input.path, &self.cwd);
+                enforce_read_scope(&literal_path, &self.cwd, &self.workspace)?.is_file()
+            } else {
+                false
+            };
+            crate::media_tools::video::parse_target(&input.path, literal_exists)?
+        };
+        let source_path = archive_path.as_ref().map_or_else(
+            || video_target.as_ref().map_or(file_path, |video| video.path.as_str()),
+            |archive| archive.archive_path.as_str(),
+        );
         let path = resolve_read_path(source_path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
 
@@ -7055,6 +7070,28 @@ impl Tool for ReadTool {
                 "read",
                 "[SQLITE_READ] Table and SQL selectors require a SQLite format 3 database",
             ));
+        }
+
+        if let Some(video) = video_target {
+            // Visual reads do not have source-line edit anchors or line
+            // windows. Check policy before looking up or spawning a decoder;
+            // video results never bypass it through the text result cache.
+            if self.block_images {
+                return Err(Error::tool("read", "Images are blocked by configuration"));
+            }
+            if input.hashline || input.offset.is_some() || input.limit.is_some() {
+                return Err(Error::tool(
+                    "read",
+                    "[VIDEO_READ_OPTIONS] Video frames do not support hashline, offset, or limit; use a frame or timestamp suffix on the path",
+                ));
+            }
+            return crate::media_tools::video::render_open_file(
+                std_file,
+                PathBuf::from(video.path),
+                video.selector,
+                crate::agent_cx::AgentCx::for_current_or_request(),
+            )
+            .await;
         }
 
         let cache_key = tool_cache_key("read", &self.cwd, &input_value);
@@ -20468,6 +20505,109 @@ mod tests {
     // ========================================================================
     // Read Tool Tests
     // ========================================================================
+
+    #[test]
+    fn read_video_respects_image_policy_before_decoder_dispatch() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), b"not decoded")
+                .expect("video placeholder");
+            let tool = ReadTool::with_settings(workspace.path(), true, true);
+            for path in ["clip.mp4", "clip.mp4:42", "clip.mp4:00:00:01"] {
+                let error = tool
+                    .execute("blocked-video", serde_json::json!({"path": path}), None)
+                    .await
+                    .expect_err("blocked images must not invoke a decoder");
+                assert!(
+                    error.to_string().contains("Images are blocked by configuration"),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn read_video_rejects_text_windows_and_edit_anchors() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), b"not decoded")
+                .expect("video placeholder");
+            let tool = ReadTool::new(workspace.path());
+            for args in [
+                serde_json::json!({"path": "clip.mp4", "hashline": true}),
+                serde_json::json!({"path": "clip.mp4:1m2s", "offset": 1}),
+                serde_json::json!({"path": "clip.mp4:42", "limit": 10}),
+            ] {
+                let error = tool
+                    .execute("video-text-options", args, None)
+                    .await
+                    .expect_err("visual results do not have source lines");
+                assert!(error.to_string().contains("VIDEO_READ_OPTIONS"), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn read_video_raw_mode_preserves_source_text_behavior() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), "literal source\n")
+                .expect("source placeholder");
+            let output = ReadTool::new(workspace.path())
+                .execute(
+                    "video-raw",
+                    serde_json::json!({"path": "clip.mp4", "raw": true, "hashline": true}),
+                    None,
+                )
+                .await
+                .expect("raw source read");
+            let text = get_text(&output.content);
+            assert!(text.contains("literal source"), "{text}");
+            assert!(text.starts_with("1#"), "{text}");
+            assert!(output.content.iter().all(|part| matches!(part, ContentBlock::Text(_))));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_video_preserves_existing_literal_colon_filenames() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            for name in ["clip.mp4:42", "clip.mp4:not-a-selector"] {
+                std::fs::write(workspace.path().join(name), "literal colon file\n")
+                    .expect("colon filename");
+                let output = ReadTool::new(workspace.path())
+                    .execute("literal-colon", serde_json::json!({"path": name}), None)
+                    .await
+                    .expect("literal file takes precedence over selector parsing");
+                assert!(get_text(&output.content).contains("literal colon file"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_video_selector_cannot_escape_workspace_through_symlink() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let outside = tempfile::tempdir().expect("outside workspace");
+            let secret = outside.path().join("secret.mp4");
+            std::fs::write(&secret, b"must not reach a decoder").expect("outside video");
+            std::os::unix::fs::symlink(&secret, workspace.path().join("clip.mp4"))
+                .expect("video symlink");
+            let tool = ReadTool::new(workspace.path());
+            for path in ["clip.mp4", "clip.mp4:42", "clip.mp4:00:00:01"] {
+                let error = tool
+                    .execute("video-scope", serde_json::json!({"path": path}), None)
+                    .await
+                    .expect_err("video source must pass the ordinary read scope");
+                assert!(
+                    error.to_string().contains("outside the working directory"),
+                    "{error}"
+                );
+            }
+        });
+    }
 
     #[test]
     fn test_read_valid_file() {
