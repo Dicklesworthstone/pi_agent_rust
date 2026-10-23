@@ -138,10 +138,11 @@ and [workspace roots](https://modelcontextprotocol.io/specification/2025-11-25/c
 
 ## Native HTTP OAuth
 
-Trusted HTTP MCP servers can use a native browser sign-in flow through print
-commands, ACP operator commands, and RPC requests. The client discovers the
-resource and authorization-server metadata, uses PKCE with an S256 challenge,
-and receives the authorization response on a temporary loopback listener.
+Trusted HTTP MCP servers can use a native browser sign-in flow through both
+terminal interfaces, print commands, ACP operator commands, and RPC requests.
+The client discovers the resource and authorization-server metadata, uses PKCE
+with an S256 challenge, and receives the authorization response on a temporary
+loopback listener.
 OAuth endpoints must use HTTPS; loopback HTTP is accepted for local servers
 and development.
 
@@ -189,6 +190,19 @@ configuration before switching to managed OAuth. Authentication failures appear
 as authentication-required status and do not spend the server-crash restart
 budget. A rejected tool call is not replayed. If authentication fails after a
 request has already been accepted, the result remains outcome-unknown.
+
+### Terminal authentication
+
+Both terminal interfaces accept `/mcp reauth <name>` and `/mcp unauth <name>`.
+The sign-in URL appears in the transcript; open it in a browser to continue.
+Escape or Ctrl-C cancels the active authentication request. Login does not
+submit a model turn, and new foreground input waits until the operation ends.
+
+Authentication retains its own cancellation handle even when an earlier
+command is still finishing. A delayed background message cannot release the
+login's busy state, and a queued session change cannot redirect it to another
+session. Login and logout reconcile the live tool catalog before releasing
+the terminal for further work.
 
 ### One-shot authentication
 
@@ -245,8 +259,8 @@ client, provide its identifier through RPC:
 {"id":"login-docs","type":"mcp_reauth","server":"docs","clientId":"registered-public-client"}
 ```
 
-The manager API also accepts this optional client ID. Print and ACP commands
-use dynamic registration by default. Custom callback ports, scopes, and OMP
+The manager API also accepts this optional client ID. Terminal, print, and ACP
+commands use dynamic registration by default. Custom callback ports, scopes, and OMP
 OAuth configuration fields are not imported by this native flow.
 
 ## Request timeouts

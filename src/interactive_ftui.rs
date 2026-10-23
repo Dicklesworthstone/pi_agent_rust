@@ -1502,6 +1502,33 @@ impl PartialEq for HandoffRequest {
 
 impl Eq for HandoffRequest {}
 
+/// MCP authentication keeps its exact cancellation and session owner while
+/// earlier commands finish in the sequential driver.
+#[derive(Debug, Clone)]
+pub struct McpAuthRequest {
+    id: String,
+    owner_session_id: String,
+    abort: crate::agent::AbortHandle,
+}
+
+impl McpAuthRequest {
+    fn new(owner_session_id: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner_session_id,
+            abort: crate::agent::AbortHandle::new().0,
+        }
+    }
+}
+
+impl PartialEq for McpAuthRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.owner_session_id == other.owner_session_id
+    }
+}
+
+impl Eq for McpAuthRequest {}
+
 /// Command from the UI to the agent driver.
 ///
 /// The seed of the bubbletea stack's input-routing chain: prompts run agent
@@ -1552,6 +1579,12 @@ pub enum UiCommand {
     Mcp {
         subcommand: String,
         name: Option<String>,
+    },
+    /// A browser login/logout with request-scoped completion and cancellation.
+    McpAuth {
+        subcommand: String,
+        name: String,
+        request: McpAuthRequest,
     },
     /// Dispatch a non-built-in slash command to the extension runtime; the
     /// driver checks registration and reports unknown commands.
@@ -1994,6 +2027,7 @@ pub struct PiFtuiModel {
     /// reply clears it (the driver is sequential, so the next non-tick
     /// message belongs to the in-flight operation).
     busy: Option<BusyOp>,
+    mcp_auth_request: Option<McpAuthRequest>,
     /// Transcript markdown spacing policy (issue #202), resolved from
     /// `markdown.spacing` in settings at launch.
     markdown_spacing: crate::config::MarkdownSpacing,
@@ -2239,6 +2273,7 @@ impl PiFtuiModel {
             render_cache_width: std::cell::Cell::new(0),
             render_stats: std::cell::Cell::new((0, 0)),
             busy: None,
+            mcp_auth_request: None,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             #[cfg(test)]
             suspend_task_override: None,
@@ -2889,6 +2924,23 @@ impl PiFtuiModel {
 
     #[allow(clippy::too_many_lines)]
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
+        if let PiMsg::McpAuthFinished { request_id, message } = msg {
+            if self.mcp_auth_request.as_ref().map(|request| request.id.as_str())
+                != Some(request_id.as_str())
+            {
+                return Cmd::none();
+            }
+            self.mcp_auth_request = None;
+            self.busy = None;
+            self.dismiss_pending_interactions();
+            self.flush_stream();
+            self.state = AgentUiState::Ready;
+            self.current_tool = None;
+            self.thinking.clear();
+            self.settle_pending_cards();
+            self.drain_deferred_notes();
+            return self.handle_agent(PiMsg::System(message));
+        }
         if let PiMsg::HandoffFinished { request_id, event } = msg {
             if self.busy.as_ref().and_then(|op| op.handoff.as_ref().map(|request| request.id.as_str()))
                 != Some(request_id.as_str())
@@ -2915,11 +2967,13 @@ impl PiFtuiModel {
         // ticks don't count, and neither does the in-progress chatter of an
         // extension command's own tool card (its ToolEnd/System reply is
         // what settles it).
-        if self.busy.as_ref().is_some_and(|op| op.handoff.is_none())
+        if self.mcp_auth_request.is_none()
+            && self.busy.as_ref().is_some_and(|op| op.handoff.is_none())
             && !matches!(
                 msg,
                 PiMsg::AutocompleteRefresh
                     | PiMsg::AutocompleteCatalog(_)
+                    | PiMsg::SystemNote(_)
                     | PiMsg::ToolStart { .. }
                     | PiMsg::ToolInvocation { .. }
                     | PiMsg::ToolUpdate { .. }
@@ -2928,8 +2982,10 @@ impl PiFtuiModel {
             self.busy = None;
         }
         match msg {
-            PiMsg::HandoffFinished { .. } => return Cmd::none(),
-            PiMsg::AgentError(message) if self.handoff_in_progress() => {
+            PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return Cmd::none(),
+            PiMsg::AgentError(message)
+                if self.handoff_in_progress() || self.mcp_auth_request.is_some() =>
+            {
                 // An unrelated background failure must not dismiss a native
                 // before-compaction hook's active question or capability card.
                 self.push_entry(EntryRole::Error, sanitize(&message).into_owned());
@@ -3019,7 +3075,7 @@ impl PiFtuiModel {
                 error_message,
                 ..
             } => {
-                let handoff_running = self.handoff_in_progress();
+                let handoff_running = self.handoff_in_progress() || self.mcp_auth_request.is_some();
                 if !handoff_running {
                     self.dismiss_pending_interactions();
                 }
@@ -3412,6 +3468,10 @@ impl PiFtuiModel {
     /// Commands wait for the turn to end; text the lane cannot take yet (the
     /// turn is starting or ending) becomes the next prompt instead.
     fn submit_mid_turn(&mut self, follow_up: bool) {
+        if self.mcp_auth_request.is_some() {
+            self.push_entry(EntryRole::Error, String::from("MCP authentication is still running; press Escape to cancel it."));
+            return;
+        }
         if self.handoff_in_progress() {
             self.push_entry(EntryRole::Error, String::from("Handoff is still running; press Escape to cancel it."));
             return;
@@ -3589,6 +3649,10 @@ impl PiFtuiModel {
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
+        if self.mcp_auth_request.is_some() {
+            self.push_entry(EntryRole::Error, String::from("MCP authentication is still running; press Escape to cancel it."));
+            return;
+        }
         if self.settings_pending {
             return;
         }
@@ -4029,20 +4093,43 @@ impl PiFtuiModel {
             return true;
         }
         if let Some(rest) = strip_command(clean, "/mcp") {
-            let mut parts = rest.split_whitespace();
-            let subcommand = parts.next().unwrap_or("list").to_ascii_lowercase();
-            let name = parts.next().map(str::to_string);
-            let valid = match subcommand.as_str() {
-                "list" => name.is_none() && parts.next().is_none(),
-                "trust" | "deny" | "test" => name.is_some() && parts.next().is_none(),
+            let rest = rest.trim();
+            let (verb, remainder) = rest
+                .split_once(char::is_whitespace)
+                .map_or((rest, ""), |(verb, name)| (verb, name.trim()));
+            let subcommand = if verb.is_empty() { "list" } else { verb }.to_ascii_lowercase();
+            let authentication = matches!(subcommand.as_str(), "reauth" | "unauth");
+            let name = (!remainder.is_empty()).then(|| remainder.to_string());
+            let valid = !rest.contains(['\r', '\n']) && match subcommand.as_str() {
+                "list" => name.is_none(),
+                "trust" | "deny" | "test" =>
+                    name.is_some() && remainder.split_whitespace().count() == 1,
+                "reauth" | "unauth" => name.is_some(),
                 _ => false,
             };
             if valid {
-                self.send_command(UiCommand::Mcp { subcommand, name });
+                if authentication {
+                    if self.busy.is_some() || self.state == AgentUiState::Working {
+                        self.push_entry(EntryRole::Error, String::from("MCP authentication needs an idle session"));
+                        return true;
+                    }
+                    let Some(owner_session_id) = self.displayed_session_id.clone() else {
+                        self.push_entry(EntryRole::Error, String::from("MCP authentication unavailable: session is still loading"));
+                        return true;
+                    };
+                    let request = McpAuthRequest::new(owner_session_id);
+                    self.mcp_auth_request = Some(request.clone());
+                    self.begin_busy("MCP authentication (Escape to cancel) ...");
+                    self.send_command(UiCommand::McpAuth {
+                        subcommand, name: remainder.to_string(), request,
+                    });
+                } else {
+                    self.send_command(UiCommand::Mcp { subcommand, name });
+                }
             } else {
                 self.push_entry(
                     EntryRole::Error,
-                    String::from("usage: /mcp [list|trust <name>|deny <name>|test <name>]"),
+                    String::from("usage: /mcp [list|trust <name>|deny <name>|test <name>|reauth <name>|unauth <name>]"),
                 );
             }
             return true;
@@ -4720,6 +4807,29 @@ impl PiFtuiModel {
         self.busy.as_ref().is_some_and(|op| op.handoff.is_some())
     }
 
+    /// Cancel an operator command that uses the driver's shared abort lane.
+    fn abort_driver_operation(&mut self) -> bool {
+        let abort = self.mcp_auth_request.as_ref().map(|request| request.abort.clone())
+            .or_else(|| self.turn_abort.as_ref().and_then(|slot| {
+                slot.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            }));
+        if let Some(abort) = abort {
+            // Later keys can still reach an older turn or the normal exit path.
+            if abort.signal().is_aborted() {
+                return false;
+            }
+            abort.abort();
+            if let Some(busy) = &mut self.busy {
+                busy.label = "cancelling operation ...".to_string();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn abort_handoff(&mut self) {
         if let Some(busy) = &mut self.busy
             && let Some(request) = &busy.handoff
@@ -4921,6 +5031,10 @@ impl PiFtuiModel {
                 let double_tap = self
                     .last_ctrl_c
                     .is_some_and(|at| at.elapsed() < CTRL_C_EXIT_WINDOW);
+                if ctrl_c && self.busy.is_some() && self.abort_driver_operation() {
+                    self.last_ctrl_c = None;
+                    return Cmd::none();
+                }
                 if ctrl_c && !double_tap {
                     self.last_ctrl_c = Some(std::time::Instant::now());
                     if self.picker.is_some() {
@@ -5124,6 +5238,11 @@ impl PiFtuiModel {
                     }
                     Some(AppAction::Interrupt) if self.handoff_in_progress() => {
                         self.abort_handoff();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt)
+                        if self.busy.is_some() && self.abort_driver_operation() =>
+                    {
                         return Cmd::none();
                     }
                     Some(AppAction::Interrupt) if self.state == AgentUiState::Working => {
@@ -7355,6 +7474,82 @@ async fn run_mcp_command(
         Err(err) => format!("MCP {name:?}: {err}"),
     };
     let _ = agent_tx.send(PiMsg::System(message));
+}
+
+/// Operator-owned browser login, separate from an LLM turn.
+async fn run_mcp_auth_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    subcommand: &str,
+    name: &str,
+    request: &McpAuthRequest,
+    turn_abort: &TurnAbortSlot,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let finish = |message: String| {
+        *turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = agent_tx.send(PiMsg::McpAuthFinished {
+            request_id: request.id.clone(), message,
+        });
+    };
+    let abort_signal = request.abort.signal();
+    *turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.abort.clone());
+    if abort_signal.is_aborted() {
+        finish("MCP authentication cancelled".to_string());
+        return;
+    }
+    let Some(manager) = handle.mcp_manager() else {
+        finish("MCP discovery is disabled".to_string());
+        return;
+    };
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    let output_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_failed = Arc::clone(&output_failed);
+    let callback_tx = agent_tx.clone();
+    let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+        if callback_tx.send(PiMsg::SystemNote(format!(
+            "Open this URL to sign in to the MCP server:\n{url}\n"
+        ))).is_err() {
+            callback_failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+    let work = owner.with_current(async {
+        let current_session = handle.with_session(|session| session.header.id.clone()).await?;
+        if current_session != request.owner_session_id {
+            return Err(crate::error::Error::validation(
+                "MCP authentication cancelled: the session changed before it started",
+            ));
+        }
+        if subcommand == "reauth" {
+            manager.reauthenticate(name, None, on_url).await
+        } else {
+            manager.unauthenticate(name).await
+        }
+    });
+    let cancelled = async {
+        while !abort_signal.is_aborted()
+            && !owner.is_cancel_requested()
+            && !output_failed.load(std::sync::atomic::Ordering::Acquire)
+        {
+            owner.time().sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let outcome = match futures::future::select(Box::pin(cancelled), Box::pin(work)).await {
+        futures::future::Either::Left(((), pending)) => {
+            drop(pending);
+            Err(crate::error::Error::tool(
+                "mcp", "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
+            ))
+        }
+        futures::future::Either::Right((result, _)) => result,
+    };
+    crate::mcp::reconcile_tools(&manager, &handle.session().agent.shared_tools());
+    let message = match outcome {
+        Ok(()) if subcommand == "unauth" =>
+            format!("Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."),
+        Ok(()) => format!("Signed in to MCP server {name:?}; its tool catalog has been refreshed."),
+        Err(error) => format!("MCP {name:?}: {error}"),
+    };
+    finish(message);
 }
 
 /// A `/login` waiting for the user's input, with the localhost callback
@@ -9614,8 +9809,15 @@ pub fn run(
                         Ok(UiCommand::Usage { refresh }) => {
                             run_usage_command(&bash_cwd, refresh, &agent_tx).await;
                         }
+                        Ok(UiCommand::McpAuth { subcommand, name, request }) => {
+                            run_mcp_auth_command(
+                                &handle, &subcommand, &name, &request, &driver_turn_abort, &agent_tx,
+                            ).await;
+                        }
                         Ok(UiCommand::Mcp { subcommand, name }) => {
-                            run_mcp_command(&handle, &subcommand, name.as_deref(), &agent_tx).await;
+                            run_mcp_command(
+                                &handle, &subcommand, name.as_deref(), &agent_tx,
+                            ).await;
                         }
                         Ok(UiCommand::ExtensionCommand { name, args }) => {
                             // A prompt template runs as a turn, unless an
@@ -13078,6 +13280,76 @@ mod tests {
             height: 40,
         });
         assert_eq!(sim.model().scroll_from_tail, 0);
+    }
+
+    #[test]
+    fn mcp_auth_routes_exact_names_and_stays_cancellable_without_a_model_turn() {
+        for cancel in [
+            key(KeyCode::Escape, Modifiers::empty()),
+            key(KeyCode::Char('c'), Modifiers::CTRL),
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let slot: TurnAbortSlot = Arc::new(Mutex::new(None));
+            let mut model = PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_turn_abort(Arc::clone(&slot));
+            model.displayed_session_id = Some("owner-session".to_string());
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, "earlier prompt");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Prompt("earlier prompt".into()));
+            // The preceding prompt has not yet delivered AgentStart.
+            type_str(&mut sim, "/mcp reauth remote  service");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            let UiCommand::McpAuth { subcommand, name, request } =
+                submit_rx.try_recv().expect("operator command")
+            else {
+                panic!("expected native MCP authentication command");
+            };
+            assert_eq!(subcommand, "reauth");
+            assert_eq!(name, "remote  service");
+            assert_eq!(request.owner_session_id, "owner-session");
+            let auth_signal = request.abort.signal();
+            // An earlier queued command can replace the shared driver lane.
+            // The admitted auth command must retain its own exact handle.
+            let (earlier_handle, earlier_signal) = crate::agent::AbortHandle::new();
+            *slot.lock().expect("slot") = Some(earlier_handle);
+            sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+            for notice in [
+                PiMsg::SystemNote("Open the sign-in URL".into()),
+                PiMsg::System("An older MCP test completed".into()),
+                PiMsg::AgentError("Unrelated background task failed".into()),
+                PiMsg::AgentDone {
+                    usage: None, stop_reason: crate::model::StopReason::Stop, error_message: None,
+                },
+                PiMsg::McpAuthFinished { request_id: "older-auth".into(), message: "stale".into() },
+            ] {
+                sim.send(PiFtuiMsg::Agent(notice));
+                assert!(sim.model().busy.is_some(), "only the matching auth completion ends busy");
+                assert_eq!(sim.model().mcp_auth_request.as_ref().unwrap().id, request.id);
+                assert!(matches!(sim.model().state, AgentUiState::Working));
+            }
+            for draft in ["keep this draft", "/queue next", "/new"] {
+                sim.model_mut().input.set_text(draft);
+                sim.model_mut().submit_input();
+                sim.model_mut().submit_mid_turn(true);
+                assert_eq!(sim.model().input.text(), draft);
+                assert!(submit_rx.try_recv().is_err(), "auth must not enqueue foreground work");
+            }
+            sim.inject_event(cancel);
+            assert!(auth_signal.is_aborted());
+            assert!(!earlier_signal.is_aborted(), "cancel targets the admitted auth request");
+            assert!(!sim.model_mut().abort_driver_operation(), "an aborted auth request must not swallow later cancellation keys");
+            sim.send(PiFtuiMsg::Agent(PiMsg::McpAuthFinished {
+                request_id: request.id, message: "MCP authentication cancelled".into(),
+            }));
+            assert!(sim.model().busy.is_none());
+            assert!(sim.model().mcp_auth_request.is_none());
+            assert!(matches!(sim.model().state, AgentUiState::Ready));
+            assert!(slot.lock().expect("slot").is_some(), "UI cannot erase another driver handle");
+        }
     }
 
     /// Issue #205: Ctrl-C must fire the in-flight turn's abort handle before

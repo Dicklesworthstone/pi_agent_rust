@@ -426,7 +426,7 @@ impl SlashCommand {
   /reload            - Reload skills/prompts from disk
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
-  /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
+  /mcp               - Manage MCP servers: list, add, remove, test, trust, reauth, unauth
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /prewalk [status|off] - Hand off to @smol after planning and the first edit
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
@@ -4399,17 +4399,24 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             });
             return None;
         };
+        let trimmed = args.trim();
+        if let Some((verb @ ("reauth" | "unauth"), name)) =
+            trimmed.split_once(char::is_whitespace)
+        {
+            return self.mcp_handle_auth(&manager, verb, name.trim());
+        }
         let mut parts = args.split_whitespace();
         let subcommand = parts.next().unwrap_or("list");
         let rest: Vec<&str> = parts.collect();
         match subcommand {
+            "reauth" | "unauth" => self.mcp_handle_auth(&manager, subcommand, ""),
             "list" => self.mcp_handle_list(&manager),
             "add" => self.mcp_handle_add(&rest),
             "remove" => self.mcp_handle_remove(&rest),
             "trust" | "deny" | "test" => self.mcp_handle_action(&manager, subcommand, &rest),
             other => {
                 self.status_message = Some(format!(
-                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny"
+                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny|reauth|unauth"
                 ));
                 None
             }
@@ -4538,6 +4545,88 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
             Err(err) => self.status_message = Some(format!("/mcp remove failed: {err}")),
         }
+        None
+    }
+
+    /// Browser login is an operator action, with the same abort lane as a turn.
+    /// No agent lock is held while the callback waits for the browser.
+    fn mcp_handle_auth(
+        &mut self,
+        manager: &std::sync::Arc<crate::mcp::McpManager>,
+        subcommand: &str,
+        name: &str,
+    ) -> Option<Cmd> {
+        if name.is_empty() || name.contains(['\r', '\n']) {
+            self.status_message = Some(format!("usage: /mcp {subcommand} <name>"));
+            return None;
+        }
+        if self.agent_state != AgentState::Idle || self.bash_running {
+            self.status_message = Some("MCP authentication needs an idle session".to_string());
+            return None;
+        }
+        let name = name.to_string();
+        let subcommand = subcommand.to_string();
+        let manager = Arc::clone(manager);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some(format!("MCP {subcommand} {name:?} (Esc to cancel)…"));
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.mcp_auth_request_id = Some(request_id.clone());
+        self.runtime_handle.spawn(async move {
+            let output_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_failed = Arc::clone(&output_failed);
+            let callback_tx = event_tx.clone();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                if callback_tx.try_send(PiMsg::SystemNote(format!(
+                    "Open this URL to sign in to the MCP server:\n{url}\n"
+                ))).is_err() {
+                    callback_failed.store(true, Ordering::Release);
+                }
+            });
+            let work = owner.with_current(async {
+                if subcommand == "reauth" {
+                    manager.reauthenticate(&name, None, on_url).await
+                } else {
+                    manager.unauthenticate(&name).await
+                }
+            });
+            let cancelled = async {
+                while !abort_signal.is_aborted()
+                    && !owner.is_cancel_requested()
+                    && !output_failed.load(Ordering::Acquire)
+                {
+                    owner.time().sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            let outcome = match futures::future::select(
+                Box::pin(cancelled), Box::pin(work),
+            ).await {
+                futures::future::Either::Left(((), pending)) => {
+                    drop(pending);
+                    Err(crate::error::Error::tool(
+                        "mcp", "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
+                    ))
+                }
+                futures::future::Either::Right((result, _)) => result,
+            };
+            let cleanup = Cx::for_request();
+            if let Ok(agent) = agent.lock(&cleanup).await {
+                crate::mcp::reconcile_tools(&manager, &agent.shared_tools());
+            }
+            let message = match outcome {
+                Ok(()) if subcommand == "unauth" =>
+                    format!("Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."),
+                Ok(()) => format!("Signed in to MCP server {name:?}; its tool catalog has been refreshed."),
+                Err(error) => format!("MCP {name:?}: {error}"),
+            };
+            let _ = enqueue_pi_event(
+                &event_tx, &cleanup, PiMsg::McpAuthFinished { request_id, message },
+            ).await;
+        });
         None
     }
 

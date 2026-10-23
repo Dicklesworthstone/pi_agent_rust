@@ -833,6 +833,15 @@ impl PiApp {
         msg: PiMsg,
         attempts_remaining: u8,
     ) -> Option<Cmd> {
+        if let PiMsg::McpAuthFinished { request_id, message } = msg {
+            if self.mcp_auth_request_id.as_deref() != Some(request_id.as_str()) {
+                return None;
+            }
+            self.mcp_auth_request_id = None;
+            return self.handle_pi_message_with_session_retry(
+                PiMsg::System(message), attempts_remaining,
+            );
+        }
         let (msg, handoff_completion) = match msg {
             PiMsg::HandoffFinished { request_id, event } => {
                 if self.handoff_request_id.as_deref() != Some(request_id.as_str()) {
@@ -846,11 +855,11 @@ impl PiApp {
             self.finish_handoff_ui();
         }
         match msg {
-            PiMsg::HandoffFinished { .. } => return None,
+            PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return None,
             PiMsg::System(message) | PiMsg::AgentError(message)
-                if self.handoff_request_id.is_some() =>
+                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() =>
             {
-                // Background notices cannot release the active handoff's
+                // Background notices cannot release an operator request's
                 // abort handle or admit another foreground operation.
                 self.messages.push(ConversationMessage::new(MessageRole::System, message, None));
                 self.scroll_to_bottom();
@@ -1093,7 +1102,7 @@ impl PiApp {
                     add_usage(&mut self.total_usage, u);
                 }
 
-                if self.handoff_request_id.is_some() {
+                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() {
                     // A delayed terminal from an earlier turn may finalize its
                     // display, but it does not own this handoff's cancellation
                     // handle, hook dialogs, or foreground admission state.
@@ -1502,6 +1511,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.abort_handle = None;
                 if is_replacement {
                     self.handoff_request_id = None;
+                    self.mcp_auth_request_id = None;
                     self.title_cancellation = None;
                     self.pending_inputs_paused_by_time_cap = false;
                     self.title_requested = !self.messages.is_empty();
@@ -2994,6 +3004,12 @@ After approving access in the browser, press Enter in Pi to complete login."
             return;
         }
 
+        if self.mcp_auth_request_id.is_some() {
+            self.status_message = Some(
+                "MCP authentication is still running; Escape cancels it".to_string(),
+            );
+            return;
+        }
         if self.handoff_request_id.is_some()
             || matches!(SlashCommand::parse(trimmed), Some((SlashCommand::Handoff, _)))
         {
@@ -3329,6 +3345,12 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
 
+        if self.mcp_auth_request_id.is_some() {
+            self.status_message = Some(
+                "MCP authentication is still running; Escape cancels it".to_string(),
+            );
+            return None;
+        }
         if self.handoff_request_id.is_some() {
             self.status_message = Some(
                 "Handoff is still running; Escape cancels it".to_string(),
@@ -5774,6 +5796,46 @@ mod stream_delta_batcher_tests {
         assert!(app.status_message.as_deref().unwrap().contains("Handoff saved"));
         assert!(app.status_message.as_deref().unwrap().contains("display refresh"));
         drop(held);
+    }
+
+    #[test]
+    fn classic_mcp_auth_keeps_ownership_until_its_matching_completion() {
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, _receiver) = build_test_app_with_provider(
+            Arc::new(ContinueProbeProvider { state: Arc::clone(&state) }));
+        let (abort, signal) = AbortHandle::new();
+        app.mcp_auth_request_id = Some("current-auth".into());
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        for notice in [
+            PiMsg::SystemNote("Open the sign-in URL".into()),
+            PiMsg::System("An older MCP test completed".into()),
+            PiMsg::AgentError("Unrelated background task failed".into()),
+            PiMsg::AgentDone {
+                usage: None, stop_reason: StopReason::Stop, error_message: None,
+            },
+            PiMsg::McpAuthFinished { request_id: "older-auth".into(), message: "stale".into() },
+        ] {
+            let _ = app.handle_pi_message(notice);
+            assert_eq!(app.mcp_auth_request_id.as_deref(), Some("current-auth"));
+            assert_eq!(app.agent_state, AgentState::Processing);
+            assert!(app.abort_handle.is_some());
+        }
+        app.input.set_value("Keep this draft");
+        app.queue_input(QueuedMessageKind::FollowUp);
+        assert_eq!(app.input.value(), "Keep this draft");
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        let _ = app.submit_message("must wait for authentication");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        app.abort_agent();
+        assert!(signal.is_aborted());
+        let _ = app.handle_pi_message(PiMsg::McpAuthFinished {
+            request_id: "current-auth".into(), message: "Authentication cancelled".into(),
+        });
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.mcp_auth_request_id.is_none());
+        assert!(app.abort_handle.is_none());
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
     }
 
     #[test]

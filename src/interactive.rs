@@ -2072,6 +2072,11 @@ pub enum PiMsg {
         request_id: String,
         message: String,
     },
+    /// Only the matching operator request can end an MCP authentication wait.
+    McpAuthFinished {
+        request_id: String,
+        message: String,
+    },
     /// A terminal handoff reply can settle only the request that admitted it.
     HandoffFinished {
         request_id: String,
@@ -2878,6 +2883,7 @@ pub struct PiApp {
     abort_handle: Option<AbortHandle>,
     review_request_id: Option<String>,
     handoff_request_id: Option<String>,
+    mcp_auth_request_id: Option<String>,
     bash_running: bool,
 
     // Token tracking
@@ -3416,6 +3422,7 @@ impl PiApp {
             abort_handle: None,
             review_request_id: None,
             handoff_request_id: None,
+            mcp_auth_request_id: None,
             bash_running: false,
             pending_oauth: None,
             extensions,
