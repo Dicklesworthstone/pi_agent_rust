@@ -2,7 +2,8 @@
 //!
 //! Stdio uses MCP's newline-delimited JSON-RPC wire format with a strict env
 //! allowlist; streamable HTTP does POST-per-message with JSON or SSE responses,
-//! `Mcp-Session-Id` continuity, and custom headers.
+//! `Mcp-Session-Id` continuity, and custom headers. Legacy SSE discovers a
+//! separate POST endpoint and routes responses over one persistent GET stream.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -31,6 +32,10 @@ mod progress_tests;
 #[cfg(unix)]
 mod cancellable_stdio;
 
+#[path = "sse_transport.rs"]
+mod legacy_sse;
+pub use legacy_sse::SseTransport;
+
 /// Default per-request timeout for MCP calls.
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on an HTTP response body (10 MiB).
@@ -46,7 +51,7 @@ const MAX_HTTP_SSE_EVENT_IDS: usize = 4096;
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 /// Revisions whose shared handshake, tools, resources, and prompts we support.
 const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
-    &[MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26"];
+    &[MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"];
 
 fn tool_err(code: &str, message: impl Into<String>) -> Error {
     Error::tool("mcp", format!("[{code}] {}", message.into()))
@@ -176,6 +181,10 @@ pub trait McpTransport: Send + Sync {
     fn configure_workspace_root(&self, _workspace: &Path) -> Result<()> {
         Ok(())
     }
+    /// Preferred revision for this transport's initialization handshake.
+    fn preferred_protocol_version(&self) -> &'static str {
+        MCP_PROTOCOL_VERSION
+    }
     /// Capabilities actually implemented by this configured transport.
     fn client_capabilities(&self) -> Value {
         serde_json::json!({})
@@ -227,7 +236,8 @@ pub trait McpTransport: Send + Sync {
     fn abort(&self);
     /// Activate transport-owned background work after the MCP handshake.
     /// Stdio has no separate receive channel; Streamable HTTP uses this for
-    /// its optional server-message GET stream.
+    /// its optional server-message GET stream. Legacy SSE starts its required
+    /// reader during the first request, because initialization replies use it.
     async fn activate(self: std::sync::Arc<Self>) -> Result<()> {
         Ok(())
     }
@@ -4909,7 +4919,7 @@ pub(crate) mod tests {
     #[test]
     fn initialize_validation_accepts_supported_revisions_and_rejects_malformed_results() {
         assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
-        for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+        for version in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] {
             let mut result = initialize_success_body();
             result["protocolVersion"] = serde_json::json!(version);
             assert_eq!(
@@ -4920,7 +4930,7 @@ pub(crate) mod tests {
         for result in [
             serde_json::json!(null),
             serde_json::json!({}),
-            serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"old","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2024-10-07","capabilities":{},"serverInfo":{"name":"unsupported","version":"1"}}),
             serde_json::json!({"protocolVersion":"2099-01-01","capabilities":{},"serverInfo":{"name":"future","version":"1"}}),
             serde_json::json!({"protocolVersion":"2025-11-25\r\nInjected: yes","capabilities":{},"serverInfo":{"name":"bad","version":"1"}}),
             serde_json::json!({"protocolVersion":"2025-11-25","capabilities":[],"serverInfo":{"name":"bad","version":"1"}}),

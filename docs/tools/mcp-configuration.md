@@ -107,11 +107,13 @@ trust fingerprint. Pi does not change the host process's working directory.
 ## Protocol negotiation and workspace roots
 
 Native stdio and Streamable HTTP connections request **MCP 2025-11-25**, the
-revision used by OMP 18.12.6. Servers can select **2025-06-18** or **2025-03-26**
-instead. Unsupported revisions and malformed initialization results stop the
-connection before tool discovery or mounting. HTTP requests use the exact
-negotiated `MCP-Protocol-Version`, including after session renewal and during
-orderly shutdown.
+revision used by OMP 18.12.6. Legacy SSE connections request **2024-11-05**.
+The shared handshake, tools, resources, and prompts also support negotiation of
+**2025-06-18**, **2025-03-26**, and **2024-11-05**. Unsupported revisions and
+malformed initialization results stop the connection before tool discovery
+or mounting. Streamable HTTP requests use the exact negotiated
+`MCP-Protocol-Version`, including after session renewal and during orderly
+shutdown.
 
 The client advertises `roots: {"listChanged": false}` and answers `roots/list`
 with one canonical `file://` URI for the session workspace. The root stays
@@ -135,6 +137,43 @@ Configured authentication headers and credential references remain supported.
 Protocol references: [OMP v18.12.6 client](https://github.com/can1357/oh-my-pi/blob/v18.12.6/packages/coding-agent/src/mcp/client.ts),
 [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
 and [workspace roots](https://modelcontextprotocol.io/specification/2025-11-25/client/roots).
+
+## Legacy HTTP+SSE servers
+
+An explicit `"type": "sse"` selects the legacy HTTP+SSE transport. Definitions
+using `"http"`, `"streamable-http"`, or an untyped URL use Streamable HTTP.
+
+```json
+{
+  "mcpServers": {
+    "legacy-docs": {
+      "type": "sse",
+      "url": "https://mcp.example.com/sse",
+      "timeout": 30000
+    }
+  }
+}
+```
+
+Pi opens the event stream with GET, waits for its `endpoint` event, and posts
+JSON-RPC messages to that advertised endpoint. Relative endpoint URLs are
+resolved against the configured stream URL and must remain on the same origin.
+Neither GET nor POST follows redirects. Configured headers and managed OAuth
+credentials apply to the stream, requests, server replies, and bounded
+cancellation notifications.
+
+The persistent reader routes initialization replies, tool results, progress,
+and tool-list invalidation. It also answers `roots/list` and `ping`; server
+requests are bounded and processed without blocking other responses. Each
+event has a 10 MiB limit, while a healthy long-lived connection can carry more
+than 10 MiB in total. The receive task belongs to the connection and survives
+completion of the request that established it.
+
+The operation deadline includes endpoint discovery and waiting for the request
+lane. Cancellation and shutdown retire the connection promptly. A lost stream
+or an ambiguous POST failure after dispatch is reported as an indeterminate
+outcome; Pi does not reconnect and replay that request. A later operator
+reconnect or eligible new operation establishes a new connection.
 
 ## Native HTTP OAuth
 

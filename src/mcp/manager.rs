@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::config::{ConfiguredServer, McpDiscovery, McpOAuthConfig, Provenance};
-use super::transport::{DEFAULT_MCP_TIMEOUT, MCP_PROTOCOL_VERSION, McpTransport};
+use super::transport::{DEFAULT_MCP_TIMEOUT, McpTransport};
+#[cfg(test)]
+use super::transport::MCP_PROTOCOL_VERSION;
 use super::trust::{TrustDecision, TrustStore, TrustWriteGuard};
 use crate::error::{Error, Result};
 
@@ -1309,7 +1311,7 @@ impl McpManager {
             .request(
                 "initialize",
                 serde_json::json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "protocolVersion": transport.preferred_protocol_version(),
                     "capabilities": transport.client_capabilities(),
                     "clientInfo": {
                         "name": "pi_agent_rust",
@@ -1507,17 +1509,35 @@ impl McpManager {
                 let has_static_auth = headers
                     .iter()
                     .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
-                let mut transport = super::transport::HttpTransport::new(&url, headers)?;
-                if !has_static_auth {
-                    let binding = super::auth::AuthBinding::new(
+                let authentication = if has_static_auth {
+                    None
+                } else {
+                    Some(super::auth::AuthBinding::new(
                         &global_dir,
                         &config.fingerprint_for_workspace(&cwd, &workspace),
                         &url,
-                    )?;
-                    transport = transport.with_authentication(binding)?;
-                }
+                    )?)
+                };
+                let transport: Box<dyn McpTransport> =
+                    if config.transport_hint.as_deref().map(str::trim) == Some("sse") {
+                        let mut transport = super::transport::SseTransport::new(&url, headers)?;
+                        if let Some(binding) = authentication {
+                            transport = transport.with_authentication(binding)?;
+                        }
+                        Box::new(transport)
+                    } else {
+                        let mut transport = super::transport::HttpTransport::new(&url, headers)?;
+                        if let Some(binding) = authentication {
+                            transport = transport.with_authentication(binding)?;
+                        }
+                        Box::new(transport)
+                    };
                 transport.configure_workspace_root(&workspace)?;
-                return Ok(Box::new(transport) as Box<dyn McpTransport>);
+                if let Err(error) = ensure_active() {
+                    transport.abort();
+                    return Err(error);
+                }
+                return Ok(transport);
             }
             let command = config.command.clone().ok_or_else(|| {
                 tool_err(
