@@ -147,6 +147,48 @@ Reasoning models on the `openrouter` provider forward pi's thinking level as Ope
 
 A custom OpenAI-compatible proxy that speaks the same shape can opt in with `"compat": {"thinkingFormat": "openrouter"}`.
 
+### DeepSeek tool calls emitted as text
+
+Some DeepSeek endpoints return tool markup in the assistant's text channel
+instead of the structured `tool_calls` field. The OpenAI-compatible transport
+recovers those calls automatically for the `deepseek` provider and for models
+whose path components explicitly identify DeepSeek, such as
+`deepseek/deepseek-chat`. Unrelated models keep their ordinary text behavior.
+
+Recovery recognizes DeepSeek's DSML invocation/parameter format and V3
+template markers, including the documented fullwidth-bar and separator
+variants. String parameters remain strings; DSML parameters marked
+`string="false"` must contain complete JSON. Template arguments must be a
+complete JSON object. Duplicate JSON keys, repeated DSML parameters, invalid
+function names, incomplete envelopes, and oversized captures are rejected.
+The parser never repairs missing arguments or invents values.
+
+Ordinary prose streams as it arrives. Once a possible tool envelope begins,
+its tail is withheld until the terminal response so incomplete markup does
+not enter conversation replay. Code fences and closed inline-code examples
+are protected by a conservative quotation guard. `<think>` envelopes remain
+text, and their contents are excluded from tool recovery even when a closing
+tag never arrives. Captured markup is limited to 1 MiB and 128 recovered calls
+per response.
+
+Structured native calls remain authoritative if the endpoint supplies them:
+the text copy is not executed again, and a malformed text copy does not
+invalidate otherwise valid native calls. Native arguments still undergo
+their existing strict validation. Without native calls, malformed recovered
+markup fails the response before any completed tool call is emitted.
+Token-limited, failed, and aborted responses cannot gain recovered calls.
+
+Successful recovery creates the same tool events and assistant content as a
+structured call. Normal tool registration, argument validation, approvals,
+execution, and session persistence still apply. No tools are enabled or
+executed by the parser itself.
+
+Implementation: `src/providers/openai_deepseek.rs`, integrated by
+`src/providers/openai.rs`. Streaming regressions live in
+`src/providers/openai_deepseek_tests.rs`. These regression tests were authored
+and source-reviewed; DSR execution was unavailable in the implementation
+environment, so a passing quality gate is not claimed.
+
 ## Bundled Provider Registry
 
 The canonical list of bundled providers, aliases, auth environment keys, and

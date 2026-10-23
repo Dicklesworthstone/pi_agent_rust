@@ -32,6 +32,9 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
 
+#[path = "openai_deepseek.rs"]
+mod deepseek;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -915,6 +918,7 @@ where
     event_source: SseStream<S>,
     partial: AssistantMessage,
     tool_calls: Vec<ToolCallState>,
+    deepseek_recovery: Option<deepseek::Recovery>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
@@ -1089,6 +1093,8 @@ where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
     fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
+        let deepseek_recovery =
+            deepseek::is_target(&provider, &model).then(deepseek::Recovery::default);
         Self {
             event_source,
             partial: AssistantMessage {
@@ -1103,6 +1109,7 @@ where
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
             tool_calls: Vec::new(),
+            deepseek_recovery,
             pending_events: VecDeque::new(),
             started: false,
             done: false,
@@ -1219,11 +1226,108 @@ where
         Ok(())
     }
 
+    /// Append only text that is safe to expose to streaming clients and replay.
+    fn append_text(&mut self, content: String) {
+        let content_index = if matches!(self.partial.content.last(), Some(ContentBlock::Text(_))) {
+            self.partial.content.len() - 1
+        } else {
+            let index = self.partial.content.len();
+            self.partial.content.push(ContentBlock::Text(TextContent::new("")));
+            self.pending_events
+                .push_back(StreamEvent::TextStart { content_index: index });
+            index
+        };
+        if let Some(ContentBlock::Text(text)) = self.partial.content.get_mut(content_index) {
+            text.text.push_str(&content);
+        }
+        self.pending_events.push_back(StreamEvent::TextDelta {
+            content_index,
+            delta: content,
+        });
+    }
+
+    fn process_text(&mut self, content: String) {
+        let visible = match &mut self.deepseek_recovery {
+            Some(recovery) => match recovery.feed(&content) {
+                Ok(visible) if visible.is_empty() => return,
+                Ok(visible) => visible,
+                // Defer rejection until terminal: genuine native calls may
+                // still arrive and remain authoritative over the text lane.
+                Err(_) => return,
+            },
+            None => content,
+        };
+        self.append_text(visible);
+    }
+
+    fn finalize_deepseek_content(&mut self) {
+        let Some(mut recovery) = self.deepseek_recovery.take() else {
+            return;
+        };
+        let native_calls = !self.tool_calls.is_empty();
+        if native_calls && self.partial.stop_reason == StopReason::Stop {
+            self.partial.stop_reason = StopReason::ToolUse;
+        }
+        let parts = match recovery.finish() {
+            Ok(parts) => parts,
+            Err(_) if native_calls => {
+                tracing::debug!("Ignored malformed DeepSeek text markup beside native tool calls");
+                return;
+            }
+            Err(message) => {
+                self.record_error(message.to_string());
+                return;
+            }
+        };
+        // Some hosts send the same call through both text and the native lane.
+        // Native deltas are authoritative, even if they arrived after the text.
+        // Interrupted/refused/failed responses never gain executable calls.
+        let recover_calls = !native_calls
+            && matches!(self.partial.stop_reason, StopReason::Stop | StopReason::ToolUse);
+        for part in parts {
+            match part {
+                deepseek::Part::Text(text) => self.append_text(text),
+                deepseek::Part::Call { name, arguments } if recover_calls => {
+                    let content_index = self.partial.content.len();
+                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    let raw_arguments = arguments.to_string();
+                    self.partial.content.push(ContentBlock::ToolCall(ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments,
+                        thought_signature: None,
+                    }));
+                    self.pending_events.push_back(StreamEvent::ToolCallStart {
+                        content_index,
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
+                    self.pending_events.push_back(StreamEvent::ToolCallDelta {
+                        content_index,
+                        delta: raw_arguments.clone(),
+                    });
+                    self.tool_calls.push(ToolCallState {
+                        index: self.tool_calls.len(),
+                        content_index,
+                        id,
+                        name,
+                        arguments: raw_arguments,
+                    });
+                    if self.partial.stop_reason == StopReason::Stop {
+                        self.partial.stop_reason = StopReason::ToolUse;
+                    }
+                }
+                deepseek::Part::Call { .. } => {}
+            }
+        }
+    }
+
     fn finalize_content(&mut self) {
         if self.finalized {
             return;
         }
         self.finalized = true;
+        self.finalize_deepseek_content();
 
         if let Err(error) = self.finalize_tool_call_arguments() {
             self.record_error(error.to_string());
@@ -1358,37 +1462,10 @@ where
             });
         }
 
-        // Handle text content
-
+        // Handle text content. DeepSeek markup stays out of client snapshots
+        // until the entire terminal tool batch has been validated.
         if let Some(content) = delta.content {
-            // Update partial content
-
-            let last_is_text = matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-
-            let content_index = if last_is_text {
-                self.partial.content.len() - 1
-            } else {
-                let idx = self.partial.content.len();
-
-                self.partial
-                    .content
-                    .push(ContentBlock::Text(TextContent::new("")));
-
-                self.pending_events
-                    .push_back(StreamEvent::TextStart { content_index: idx });
-
-                idx
-            };
-
-            if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(content_index) {
-                t.text.push_str(&content);
-            }
-
-            self.pending_events.push_back(StreamEvent::TextDelta {
-                content_index,
-
-                delta: content,
-            });
+            self.process_text(content);
         }
 
         // Handle tool calls
@@ -1620,6 +1697,10 @@ impl<'de> serde::de::Visitor<'de> for UniqueToolArgumentKeys {
 #[cfg(test)]
 #[path = "openai_terminal_safety_tests.rs"]
 mod terminal_safety_tests;
+
+#[cfg(test)]
+#[path = "openai_deepseek_tests.rs"]
+mod deepseek_tests;
 
 // ============================================================================
 // OpenAI API Types
