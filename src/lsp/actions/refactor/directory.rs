@@ -1,4 +1,4 @@
-//! Directory-aware rename_file through the existing LSP/refactor transaction.
+//! Coordinated rename_file through the existing LSP/refactor transaction.
 //!
 //! Coordinate all selected language servers in one workspace. Retain each
 //! request's evidence, reconcile independent imports, and move the tree once.
@@ -15,6 +15,7 @@ use super::{
 };
 use crate::lsp::edits::{FileEvidence, WorkspaceEditPlan};
 use crate::lsp::refactor_preview::{MAX_REFACTOR_SERVERS, RefactorGroup, check_owner};
+use crate::lsp::registry::ServerSpec;
 
 mod merge;
 
@@ -29,7 +30,7 @@ fn validate_input(input: &LspInput) -> Result<()> {
     {
         return Err(tool_err(
             "LSP_USAGE",
-            "directory rename_file accepts only file, newFile, apply and timeout",
+            "coordinated rename_file accepts only file, newFile, apply and timeout",
         ));
     }
     Ok(())
@@ -44,16 +45,17 @@ fn notification_params(
     source: &Path,
     destination: &Path,
     before: &PreparedEdit,
+    directory: bool,
 ) -> Result<Option<Value>> {
     let filters = file_operation_filters(capabilities, operation)?;
     let mut files = Vec::new();
-    if filters.iter().any(|filter| filter.matches(source, true)) {
+    if filters.iter().any(|filter| filter.matches(source, directory)) {
         files.push(json!({
             "oldUri":try_path_to_uri(source)?,
             "newUri":try_path_to_uri(destination)?
         }));
-    } else {
-        for path in before.paths() {
+    } else if directory {
+        for path in before.paths().filter(|path| path.starts_with(source)) {
             if filters.iter().any(|filter| filter.matches(path, false)) {
                 let relative = path.strip_prefix(source).map_err(|_| {
                     tool_err("LSP_EDIT_SCOPE", "directory snapshot escaped its source")
@@ -80,6 +82,11 @@ struct Contributor {
     did: Option<Value>,
 }
 
+struct RenameAnchor {
+    path: PathBuf,
+    spec: ServerSpec,
+}
+
 fn pair_count(params: &Option<Value>) -> usize {
     params.as_ref().map_or(0, |params| params["files"].as_array().map_or(0, Vec::len))
 }
@@ -97,7 +104,7 @@ fn evidence(
     let mut expected = HashMap::new();
     for (contributor, raw) in contributors.iter().zip(responses) {
         if !contributor.entry.client.is_alive() {
-            return Err(tool_err("LSP_TRANSPORT_CLOSED", "a directory rename contributor disconnected"));
+            return Err(tool_err("LSP_TRANSPORT_CLOSED", "a rename contributor disconnected"));
         }
         for (path, hash) in contributor.snapshot.validate(&contributor.entry, raw, plan)? {
             let state = FileEvidence::Text(hash);
@@ -110,39 +117,46 @@ fn evidence(
 }
 
 impl LspTool {
-    fn directory_anchors(&self, source: &Path, before: &PreparedEdit) -> Result<(PathBuf, Vec<PathBuf>)> {
+    fn rename_anchors(&self, source: &Path, before: &PreparedEdit) -> Result<(PathBuf, Vec<RenameAnchor>)> {
         let mut workspace: Option<PathBuf> = None;
         let mut selected = BTreeMap::new();
-        for path in before.paths() {
-            let Some(spec) = self.registry.spec_for_file(path) else { continue };
-            let root = self.registry.workspace_root(path, spec).canonicalize()?;
-            inside_root(source, &root)?;
-            if workspace.as_ref().is_some_and(|previous| previous != &root) {
-                return Err(tool_err(
-                    "LSP_RENAME_MULTIPLE_WORKSPACES",
-                    "directory spans different language-server roots; rename a smaller subtree",
-                ));
-            }
-            workspace = Some(root);
-            selected.entry(spec.name.clone()).or_insert_with(|| path.clone());
-            if selected.len() > MAX_REFACTOR_SERVERS {
-                return Err(tool_err("LSP_EDIT_LIMIT", "directory rename exceeds 8 language servers"));
+        // A regular-file transaction also retains the absent destination.
+        // Only original source paths may select participants or workspace roots.
+        for path in before.paths().filter(|path| path.starts_with(source)) {
+            for spec in self.registry.specs_for_file(path) {
+                let root = self.registry.workspace_root(path, spec).canonicalize()?;
+                inside_root(source, &root)?;
+                if workspace.as_ref().is_some_and(|previous| previous != &root) {
+                    return Err(tool_err(
+                        "LSP_RENAME_MULTIPLE_WORKSPACES",
+                        "rename participants resolve to different language-server roots",
+                    ));
+                }
+                workspace = Some(root);
+                selected.entry(spec.name.clone()).or_insert_with(|| RenameAnchor {
+                    path: path.clone(),
+                    spec: spec.clone(),
+                });
+                if selected.len() > MAX_REFACTOR_SERVERS {
+                    return Err(tool_err("LSP_EDIT_LIMIT", "rename exceeds 8 language servers"));
+                }
             }
         }
         let root = workspace.ok_or_else(|| tool_err(
             "LSP_NO_SERVER",
-            "directory needs at least one file handled by a configured language server",
+            "rename needs at least one file handled by a configured language server",
         ))?;
         // Stable server-name order; file traversal and HashMap order never
         // decide which response or annotation receives the first identity.
         Ok((root, selected.into_values().collect()))
     }
 
-    pub(super) async fn run_rename_directory(
+    pub(super) async fn run_rename_group(
         &self,
         input: &LspInput,
         requested: &Path,
         new_file: &str,
+        directory: bool,
     ) -> Result<ToolOutput> {
         validate_input(input)?;
         let owner = AgentCx::for_current_or_request();
@@ -151,7 +165,7 @@ impl LspTool {
         let remaining = || {
             check_owner(&owner)?;
             timeout.checked_sub(started.elapsed()).filter(|left| !left.is_zero())
-                .ok_or_else(|| tool_err("LSP_TIMEOUT", "directory rename request budget expired"))
+                .ok_or_else(|| tool_err("LSP_TIMEOUT", "rename request budget expired"))
         };
         remaining()?;
         let cwd = self.cwd.canonicalize()?;
@@ -168,19 +182,19 @@ impl LspTool {
         // Snapshot before starting ANY server, including unknown/binary files.
         let before = PreparedEdit::new(&parse_workspace_edit(&move_only)?, &HashMap::new())?;
         remaining()?;
-        let (root, anchors) = self.directory_anchors(&source, &before)?;
+        let (root, anchors) = self.rename_anchors(&source, &before)?;
         inside_root(&destination, &root)?;
         let mut contributors = Vec::with_capacity(anchors.len());
         // Synchronize all participants before asking any of them for edits.
         // A failed startup never turns into a partial-success filesystem move.
-        for anchor in anchors {
+        for RenameAnchor { path: anchor, spec } in anchors {
             remaining()?;
             let anchor_hash = file_hash(&anchor)?;
             let now = owner.cx().timer_driver()
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             let (_, entry) = asupersync::time::timeout(
-                now, remaining()?, self.synced_with_timeout(&anchor, remaining()?),
-            ).await.map_err(|_| tool_err("LSP_TIMEOUT", "directory rename server startup timed out"))??;
+                now, remaining()?, self.synced_for_spec_with_timeout(&anchor, &spec, remaining()?),
+            ).await.map_err(|_| tool_err("LSP_TIMEOUT", "rename server startup timed out"))??;
             remaining()?;
             before.verify()?;
             if entry.client.root() != root.as_path() {
@@ -188,8 +202,8 @@ impl LspTool {
             }
             let snapshot = RefactorSnapshot::capture(&entry, &anchor, anchor_hash)?;
             let capabilities = entry.client.capabilities().raw;
-            let will = notification_params(&capabilities, "willRename", &source, &destination, &before)?;
-            let did = notification_params(&capabilities, "didRename", &source, &destination, &before)?;
+            let will = notification_params(&capabilities, "willRename", &source, &destination, &before, directory)?;
+            let did = notification_params(&capabilities, "didRename", &source, &destination, &before, directory)?;
             contributors.push(Contributor { entry, snapshot, will, did });
         }
         let mut responses = Vec::with_capacity(contributors.len());
@@ -250,10 +264,11 @@ impl LspTool {
         let will_count: usize = contributors.iter().map(|source| pair_count(&source.will)).sum();
         let did_count: usize = contributors.iter().map(|source| pair_count(&source.did)).sum();
         let mut metadata = json!({
-            "action":"rename_file","directory":true,
+            "action":"rename_file","directory":directory,
             "from":display_path(&source, &cwd),"to":display_path(&destination, &cwd),
             "server":if contributors.len() == 1 { Some(contributors[0].entry.spec_name.as_str()) } else { None },
-            "servers":servers,"serverCount":contributors.len(),"filesMoved":before.paths().count(),
+            "servers":servers,"serverCount":contributors.len(),
+            "filesMoved":before.paths().filter(|path| path.starts_with(&source)).count(),
             "deduplicatedEdits":merged.duplicates,
             "willRenameFiles":will_count > 0,"willRenamePairs":will_count,"didRenamePairs":did_count,
             "atomic":false,"rollbackOnError":true,

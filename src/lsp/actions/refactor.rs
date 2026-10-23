@@ -420,7 +420,7 @@ impl LspTool {
         let requested = resolve_tool_path(file, &self.cwd);
         let metadata = std::fs::symlink_metadata(&requested)?;
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            return self.run_rename_directory(input, &requested, new_file).await;
+            return self.run_rename_group(input, &requested, new_file, true).await;
         }
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(tool_err(
@@ -429,6 +429,9 @@ impl LspTool {
             ));
         }
         let old_path = requested.canonicalize()?;
+        if self.registry.specs_for_file(&old_path).len() > 1 {
+            return self.run_rename_group(input, &requested, new_file, false).await;
+        }
         let hash = file_hash(&old_path)?;
         let (old_uri, entry) = self
             .synced_with_timeout(&old_path, self.request_timeout(input))

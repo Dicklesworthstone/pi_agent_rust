@@ -26,6 +26,14 @@ impl Fixture {
     }
 
     fn with_second(mode: &str, secondary: Option<&str>) -> Option<Self> {
+        Self::configured(mode, secondary, false)
+    }
+
+    fn with_matching_servers(mode: &str, secondary: &str) -> Option<Self> {
+        Self::configured(mode, Some(secondary), true)
+    }
+
+    fn configured(mode: &str, secondary: Option<&str>, same_source: bool) -> Option<Self> {
         let python = ["python3", "python"].into_iter().find(|program| {
             Command::new(program).arg("--version").stdout(Stdio::null())
                 .stderr(Stdio::null()).status().is_ok_and(|status| status.success())
@@ -62,12 +70,25 @@ impl Fixture {
                 std::fs::write(root.join(path), "old\n").unwrap();
             }
             std::fs::write(root.join("shared.refactor"), "abcdef\n").unwrap();
+            let mut args = vec!["-I".to_string(), "-u".to_string(), script.display().to_string(), mode.to_string(), "secondary".to_string()];
+            let mut extensions = vec![".other".to_string()];
+            if same_source {
+                args.push("same-source".to_string());
+                extensions.push(".refactor".to_string());
+            }
             servers.insert("secondary-fixture".to_string(), LspServerSettings {
                 command: Some(python.to_string()),
-                args: Some(vec!["-I".to_string(), "-u".to_string(), script.display().to_string(), mode.to_string(), "secondary".to_string()]),
-                extensions: Some(vec![".other".to_string()]),
+                args: Some(args),
+                extensions: Some(extensions),
                 languages: Some(vec!["plaintext".to_string()]),
                 root_markers: Some(vec![".refactor-root".to_string()]),
+                ..Default::default()
+            });
+        }
+        if same_source {
+            servers.insert("destination-only".to_string(), LspServerSettings {
+                command: Some("pi-lsp-destination-must-not-start".to_string()),
+                extensions: Some(vec![".destination".to_string()]),
                 ..Default::default()
             });
         }
@@ -90,11 +111,13 @@ impl Fixture {
     }
 
     fn flush(&self) {
-        self.run(json!({"action":"request","file":"imports.refactor",
-            "method":"fixture/barrier","timeout":5})).unwrap();
-        if self.root.join("imports.other").exists() {
-            self.run(json!({"action":"request","file":"imports.other",
-                "method":"fixture/barrier","timeout":5})).unwrap();
+        // A source can now match several servers, so routing a normal request
+        // through the first match would not fence every participant's log.
+        for status in self.tool.registry.status() {
+            let entry = self.tool.registry.entry_for_root(&status.name, &status.root).unwrap();
+            self.runtime.block_on(entry.client.call(
+                "fixture/barrier", json!({}), std::time::Duration::from_secs(5),
+            )).unwrap();
         }
     }
 
@@ -266,4 +289,82 @@ fn independent_duplicate_edits_apply_once_and_conflicts_apply_nothing() {
     assert!(fixture.requests("workspace/didRenameFiles").is_empty());
     assert!(fixture.peer_requests("secondary-requests.jsonl", "workspace/didRenameFiles").is_empty());
     eprintln!("{}", json!({"case":"multi_language_conflict","event":"verified","writes":0}));
+}
+
+#[test]
+fn same_language_servers_both_contribute_to_a_directory_rename() {
+    let Some(fixture) = Fixture::with_matching_servers("normal", "normal") else { return };
+    let details = fixture.rename(false).unwrap().details.unwrap();
+    assert_eq!(details["serverCount"], 2);
+    assert_eq!(details["willRenamePairs"], 4);
+    assert_eq!(details["deduplicatedEdits"], 1);
+    fixture.flush();
+    assert_eq!(fixture.peer_requests("secondary-requests.jsonl", "workspace/willRenameFiles").len(), 1);
+    assert_eq!(std::fs::read(fixture.root.join("imports.other")).unwrap(), b"new\n");
+    let requests = fixture.peer_requests("secondary-requests.jsonl", "textDocument/didOpen");
+    assert!(requests.iter().any(|request| request["params"]["textDocument"]["uri"]
+        .as_str().is_some_and(|uri| uri.ends_with("/old/lib.refactor"))));
+}
+
+#[test]
+fn single_file_review_retains_all_matching_servers_and_applies_once() {
+    let Some(fixture) = Fixture::with_matching_servers("shared", "shared") else { return };
+    let preview = fixture.run(json!({"action":"rename_file","file":"old/lib.refactor",
+        "newFile":"nested/new.destination","apply":false,"timeout":5})).unwrap().details.unwrap();
+    fixture.unchanged();
+    assert!(!fixture.root.join("nested").exists());
+    assert_eq!(preview["directory"], false);
+    assert_eq!(preview["serverCount"], 2);
+    assert_eq!(preview["filesMoved"], 1);
+    assert_eq!(preview["willRenamePairs"], 2);
+    assert_eq!(preview["deduplicatedEdits"], 2);
+    let approval = json!({"action":"rename_file","refactorId":preview["refactorId"],"apply":true});
+    let applied = fixture.run(approval.clone()).unwrap().details.unwrap();
+    assert_eq!(applied["applied"], true);
+    fixture.flush();
+    assert!(!fixture.root.join("old/lib.refactor").exists());
+    assert_eq!(std::fs::read(fixture.root.join("nested/new.destination")).unwrap(), b"new\n");
+    assert_eq!(std::fs::read(fixture.root.join("imports.refactor")).unwrap(), b"new\n");
+    assert_eq!(std::fs::read(fixture.root.join("imports.other")).unwrap(), b"new\n");
+    assert_eq!(std::fs::read(fixture.root.join("shared.refactor")).unwrap(), b"Xbcdef\n");
+    for prefix in ["", "secondary-"] {
+        assert_eq!(fixture.peer_requests(&format!("{prefix}requests.jsonl"), "workspace/willRenameFiles").len(), 1);
+        let evidence: Value = serde_json::from_slice(&std::fs::read(fixture.root.join(format!("{prefix}notification.json"))).unwrap()).unwrap();
+        assert_eq!(evidence["oldExists"], false);
+        assert_eq!(evidence["newExists"], true);
+        assert_eq!(evidence["newText"], "new\n");
+        assert_eq!(evidence["otherImports"], "new\n");
+    }
+    assert!(fixture.run(approval).is_err());
+}
+
+#[test]
+fn a_second_matching_servers_conflict_or_error_prevents_a_single_file_move() {
+    for mode in ["conflict", "error"] {
+        let Some(fixture) = Fixture::with_matching_servers("shared", mode) else { return };
+        let error = fixture.run(json!({"action":"rename_file","file":"old/lib.refactor",
+            "newFile":"nested/new.refactor","timeout":5})).unwrap_err();
+        if mode == "conflict" {
+            assert!(error.to_string().contains("LSP_RENAME_CONFLICT"), "{error}");
+        }
+        fixture.unchanged();
+        assert!(!fixture.root.join("nested/new.refactor").exists());
+        assert_eq!(std::fs::read(fixture.root.join("imports.other")).unwrap(), b"old\n");
+        assert_eq!(std::fs::read(fixture.root.join("shared.refactor")).unwrap(), b"abcdef\n");
+        fixture.flush();
+        assert!(fixture.requests("workspace/didRenameFiles").is_empty());
+        assert!(fixture.peer_requests("secondary-requests.jsonl", "workspace/didRenameFiles").is_empty());
+    }
+}
+
+#[test]
+fn reload_invalidates_every_matching_participant_of_a_reviewed_file_move() {
+    let Some(fixture) = Fixture::with_matching_servers("normal", "normal") else { return };
+    let preview = fixture.run(json!({"action":"rename_file","file":"old/lib.refactor",
+        "newFile":"nested/new.refactor","apply":false,"timeout":5})).unwrap().details.unwrap();
+    let reloaded = fixture.run(json!({"action":"reload","file":"old/lib.refactor"})).unwrap().details.unwrap();
+    assert_eq!(reloaded["killed"], 2);
+    assert!(fixture.run(json!({"action":"rename_file","refactorId":preview["refactorId"],"apply":true})).is_err());
+    fixture.unchanged();
+    assert!(!fixture.root.join("nested/new.refactor").exists());
 }

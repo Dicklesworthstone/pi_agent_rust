@@ -3,7 +3,8 @@
 `lsp`'s existing `rename_file` action also accepts a directory. The OMP-inspired
 refactoring workflow requests language-server import changes, reviews them
 together with the move, and applies one retained native edit transaction.
-Mixed-language trees can now coordinate multiple servers in the same workspace.
+Files and mixed-language trees coordinate all matching servers in the same
+workspace, including multiple servers handling the same source language.
 
 ## Review and apply
 
@@ -36,8 +37,8 @@ confirmation must first be previewed and approved.
 
 ## Coordinated language-server scope
 
-Each recognized source file selects its configured server using the existing
-extension registry. Up to **eight distinct selected servers** may participate,
+Each recognized source file selects every configured server matching its
+original extension. Up to **eight distinct selected servers** may participate,
 but all must resolve to the **same canonical workspace root**. All selection
 and root checks happen before startup; all participants are then synchronized
 before the first import-edit request. There is no partial-success fallback
@@ -45,9 +46,22 @@ when a selected server cannot start or rejects preparation. One timeout and
 owner cancellation budget cover the complete workflow, not a new budget per
 server. Requests are sequential and ordered by server name.
 
-This is not a fanout to every configured server advertising the same extension:
-the registry still selects one definition per file. Nested/different workspace
-roots, a workspace root itself and the tool working directory remain rejected.
+The same coordination applies when `file` names one regular file matched by
+multiple servers. Each server receives that original source/destination pair;
+the destination's extension never selects an additional participant. Duplicate
+import edits are applied once, and all participants must succeed before any
+write. `filesMoved` counts that file once. A source handled by one server keeps
+the existing single-server ordered-edit workflow. `reload` with a source file
+stops all matching servers and invalidates the reviewed plan.
+
+An additional server configured for the same extension participates even if
+it has never been started. To replace a built-in server, override that server's
+definition; to stop routing files to it, set its `extensions` to an empty array.
+A missing selected executable is a preparation failure, not permission to
+move without that server's import updates.
+
+Nested/different workspace roots, a workspace root itself and the tool working
+directory remain rejected.
 Both paths must stay inside the working directory and selected workspace.
 At least one recognized source file is required; this is not a general-purpose
 move command for empty or asset-only trees. Unknown-extension files are moved

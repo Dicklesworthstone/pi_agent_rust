@@ -150,6 +150,22 @@ impl LspTool {
         Ok((uri, entry))
     }
 
+    async fn synced_for_spec_with_timeout(
+        &self,
+        path: &Path,
+        spec: &registry::ServerSpec,
+        timeout: Duration,
+    ) -> Result<(String, Arc<ServerEntry>)> {
+        let entry = self.registry.client_for_spec(path, spec).await?;
+        actions::install_apply_edit_handler(&entry, Arc::clone(&self.actions));
+        let language_id = Self::language_id_for(path, spec);
+        let uri = entry
+            .client
+            .ensure_synced_with_timeout(path, &language_id, timeout)
+            .await?;
+        Ok((uri, entry))
+    }
+
     fn resolve_position(path: &Path, line: Option<u32>, symbol: &str) -> Result<Position> {
         let content = std::fs::read_to_string(path).map_err(|err| {
             tool_err(
@@ -593,7 +609,7 @@ impl Tool for LspTool {
         concat!(
             "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then select actionId or a fresh title/index query to resolve and preview an edit-only action; approve the returned refactorId with apply:true. Direct apply:true with actionId or query retains edit-then-command execution; command-backed actions cannot be statically previewed. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16.",
             " signature_help inspects callable overloads and the active parameter at file + exact position. inlay_hints inspects inferred types and argument labels over file + optional exact range; resolve:true obtains lazy tooltips and label locations. Both actions are read-only and never accept hint edits or run commands.",
-            " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. Omitting apply on a fresh rename preserves immediate application.",
+            " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. rename_file consults all configured servers matching the original file or directory members; coordinated servers must share one workspace and conflicting import edits are rejected. Omitting apply on a fresh rename preserves immediate application.",
             " prepare_rename inspects the server-confirmed symbol range and placeholder without computing edits. It and rename accept file + exact position instead of symbol/line. Fresh rename automatically prepares when supported; a refusal stops before computing edits. Preparation is not an approval handle.",
             " symbols with query searches the workspace selected by an anchor file (file or symbol, not both). resolve:true fills missing workspace symbol location ranges when supported. File without query returns a source-checked document outline, including streamed nested symbols, exact ranges and explicit parentIndex/depth. Inspect total, count, truncated and responseComplete; limits shorten only the display, not validation. Document outlines never resolve symbols, open returned URIs or authorize edits.",
             " format previews retain an exact plan too. Approve with action:format, refactorId and apply:true without file or formatting options; no second formatter request is made. The full workspaceEdit must fit the preview budget, even when its edits overview is shortened. A fresh format with file and apply:true computes and applies immediately.",

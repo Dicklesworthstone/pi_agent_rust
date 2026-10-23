@@ -7,12 +7,15 @@ import json
 import pathlib
 import sys
 import time
+import urllib.parse
+import urllib.request
 
 ROOT = pathlib.Path.cwd()
 MODE = sys.argv[1]
 SECONDARY = len(sys.argv) > 2 and sys.argv[2] == "secondary"
 PREFIX = "secondary-" if SECONDARY else ""
-EXTENSION = "other" if SECONDARY else "refactor"
+SAME_SOURCE = len(sys.argv) > 3 and sys.argv[3] == "same-source"
+EXTENSION = "other" if SECONDARY and not SAME_SOURCE else "refactor"
 MAX_FRAME = 2 * 1024 * 1024
 
 
@@ -54,20 +57,27 @@ def replacement():
                        "end": {"line": 0, "character": 3}}, "newText": "new"}]
 
 
+def native(uri):
+    return pathlib.Path(urllib.request.url2pathname(urllib.parse.urlsplit(uri).path))
+
+
 while (message := receive()) is not None:
     with (ROOT / f"{PREFIX}requests.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps(message) + "\n")
     method = message.get("method")
     if method == "workspace/didRenameFiles":
         new = ROOT / "nested/new"
+        single = not new.is_dir()
+        pair = message["params"]["files"][0]
+        target = native(pair["newUri"]) if single else new
         evidence = {
-            "oldExists": (ROOT / "old").exists(),
-            "newExists": new.is_dir(),
-            "newText": (new / "lib.refactor").read_text(encoding="utf-8"),
+            "oldExists": (native(pair["oldUri"]) if single else ROOT / "old").exists(),
+            "newExists": target.exists(),
+            "newText": (target if single else new / "lib.refactor").read_text(encoding="utf-8"),
             "imports": (ROOT / "imports.refactor").read_text(encoding="utf-8"),
             "otherImports": (ROOT / "imports.other").read_text(encoding="utf-8") if (ROOT / "imports.other").exists() else None,
-            "binary": list((new / "asset.bin").read_bytes()),
-            "emptyDirectory": (new / "empty").is_dir(),
+            "binary": None if single else list((new / "asset.bin").read_bytes()),
+            "emptyDirectory": not single and (new / "empty").is_dir(),
             "pairs": message["params"]["files"],
         }
         (ROOT / f"{PREFIX}notification.json").write_text(json.dumps(evidence), encoding="utf-8")
@@ -90,6 +100,8 @@ while (message := receive()) is not None:
             time.sleep(5)
         paths = ([ROOT / "old/secondary.other", ROOT / "imports.other"] if SECONDARY else
                  [ROOT / "old/lib.refactor", ROOT / "old/sub/use.refactor", ROOT / "imports.refactor"])
+        if SAME_SOURCE:
+            paths[0] = ROOT / "old/lib.refactor"
         result = {"changes": {path.as_uri(): replacement() for path in paths}}
         if MODE == "invalid":
             result["changes"][paths[-1].as_uri()][0]["range"]["end"]["line"] = 999

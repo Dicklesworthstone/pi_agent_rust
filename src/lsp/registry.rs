@@ -326,6 +326,24 @@ impl LspRegistry {
             .find(|spec| spec.extensions.iter().any(|ext| ext == &dotted))
     }
 
+    /// Every configured server matching the original source file, ordered by
+    /// name. Coordinated file operations need each server's import edits even
+    /// when several servers handle the same language.
+    #[must_use]
+    pub(super) fn specs_for_file(&self, path: &Path) -> Vec<&ServerSpec> {
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            return Vec::new();
+        };
+        let dotted = format!(".{}", extension.to_ascii_lowercase());
+        let mut matches: Vec<_> = self
+            .servers
+            .iter()
+            .filter(|spec| spec.extensions.iter().any(|extension| extension == &dotted))
+            .collect();
+        matches.sort_by(|left, right| left.name.cmp(&right.name));
+        matches
+    }
+
     /// Detect the workspace root for `file`: nearest ancestor containing a
     /// root marker; falls back to the tool working directory.
     #[must_use]
@@ -368,7 +386,6 @@ impl LspRegistry {
     ///   the spec's install hint).
     /// - Transport/handshake errors from [`LspClient::connect`].
     pub async fn client_for(&self, path: &Path) -> Result<Arc<ServerEntry>> {
-        self.sweep_idle();
         let spec = self.spec_for_file(path).ok_or_else(|| {
             let extension = path
                 .extension()
@@ -382,6 +399,17 @@ impl LspRegistry {
                 ),
             )
         })?;
+        self.client_for_spec(path, spec).await
+    }
+
+    /// Start the exact selected participant rather than routing again to the
+    /// first matching server. Callers select `spec` from this registry.
+    pub(super) async fn client_for_spec(
+        &self,
+        path: &Path,
+        spec: &ServerSpec,
+    ) -> Result<Arc<ServerEntry>> {
+        self.sweep_idle();
         let root = spec.workspace_root_for(&self.cwd, path);
         let key = format!("{}\n{}", spec.name, root.display());
         if let Some(entry) = self.lock_entries().get(&key)
@@ -462,20 +490,18 @@ impl LspRegistry {
         &self.servers
     }
 
-    /// Kill servers. With `path`, only the server that would serve it;
+    /// Kill servers. With `path`, every configured server that would serve it;
     /// otherwise every entry.
     pub async fn kill_matching(&self, path: Option<&Path>) -> usize {
         let doomed: Vec<Arc<ServerEntry>> = {
             let mut entries = self.lock_entries();
             match path {
                 Some(path) => {
+                    let specs = self.specs_for_file(path);
                     let keys: Vec<String> = entries
-                        .keys()
-                        .filter(|key| {
-                            self.spec_for_file(path)
-                                .is_some_and(|spec| key.starts_with(&spec.name))
-                        })
-                        .cloned()
+                        .iter()
+                        .filter(|(_, entry)| specs.iter().any(|spec| spec.name == entry.spec_name))
+                        .map(|(key, _)| key.clone())
                         .collect();
                     keys.into_iter()
                         .filter_map(|key| entries.remove(&key))
@@ -597,6 +623,24 @@ mod tests {
         assert!(!servers.iter().any(|s| s.name == "mystery"));
         // Defaults intact.
         assert!(servers.iter().any(|s| s.name == "rust-analyzer"));
+    }
+
+    #[test]
+    fn coordinated_routing_keeps_all_source_matches_in_stable_name_order() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "lsp":{"servers":{
+                "zeta":{"command":"zeta-server","extensions":[".rs"]},
+                "alpha":{"command":"alpha-server","extensions":[".rs"]},
+                "unrelated":{"command":"other-server","extensions":[".other"]},
+                "rust-analyzer":{"extensions":[]}
+            }}
+        })).unwrap();
+        let registry = LspRegistry::new(Path::new("."), Some(&config));
+        let names: Vec<_> = registry.specs_for_file(Path::new("source.RS"))
+            .into_iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+        assert!(registry.specs_for_file(Path::new("no-extension")).is_empty());
+        assert!(registry.specs_for_file(Path::new("asset.unknown")).is_empty());
     }
 
     #[test]

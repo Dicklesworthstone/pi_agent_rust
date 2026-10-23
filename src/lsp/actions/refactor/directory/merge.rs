@@ -69,7 +69,7 @@ pub(super) fn combine(raws: &[Value], root: &Path) -> Result<Merged> {
     for (source, raw) in raws.iter().enumerate() {
         let plan = parse_workspace_edit(raw)?;
         if !plan.file_ops.is_empty() {
-            return Err(conflict("directory import edits cannot contain server resource operations"));
+            return Err(conflict("coordinated import edits cannot contain server resource operations"));
         }
         let annotations: BTreeMap<_, _> = raw.get("changeAnnotations")
             .and_then(Value::as_object).into_iter().flat_map(|table| table.iter())
