@@ -47,6 +47,11 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use uuid::Uuid;
 
+mod connect;
+mod stream_limits;
+#[cfg(test)]
+mod wire_tests;
+
 /// Default Cursor Connect endpoint (full RPC path).
 pub const CURSOR_API_URL: &str = "https://api2.cursor.sh/agent.v1.AgentService/Run";
 
@@ -117,15 +122,21 @@ mod pb {
         I32(u32),
     }
 
-    /// A forward-only reader over one protobuf message body.
+    /// A forward-only reader over one protobuf message body. Call `finish`
+    /// after iteration to distinguish clean exhaustion from malformed input.
     pub struct Reader<'a> {
         buf: &'a [u8],
         pos: usize,
+        failed: bool,
     }
 
     impl<'a> Reader<'a> {
         pub const fn new(buf: &'a [u8]) -> Self {
-            Self { buf, pos: 0 }
+            Self {
+                buf,
+                pos: 0,
+                failed: false,
+            }
         }
 
         fn read_varint(&mut self) -> Option<u64> {
@@ -134,26 +145,48 @@ mod pb {
             loop {
                 let byte = *self.buf.get(self.pos)?;
                 self.pos += 1;
+                // Only one payload bit fits in the tenth byte. Without this
+                // check, an overflowing varint silently wraps to a valid u64.
+                if shift == 63 && byte > 1 {
+                    return None;
+                }
                 result |= u64::from(byte & 0x7f) << shift;
                 if byte & 0x80 == 0 {
                     return Some(result);
                 }
                 shift += 7;
                 if shift >= 64 {
-                    return None; // malformed varint
+                    return None;
                 }
             }
         }
 
-        /// Read the next `(field_number, value)` pair, or `None` at end of
-        /// buffer / on malformed input. Unknown wire types (groups) stop
-        /// iteration rather than mis-parse.
+        /// Return the next field, preserving any parse failure until `finish`.
+        /// A failed reader cannot be resumed at an arbitrary byte boundary.
         pub fn next_field(&mut self) -> Option<(u32, Field<'a>)> {
-            if self.pos >= self.buf.len() {
+            if self.failed || self.pos >= self.buf.len() {
                 return None;
             }
+            let field = self.read_field();
+            if field.is_none() {
+                self.failed = true;
+            }
+            field
+        }
+
+        pub fn finish(&self) -> super::Result<()> {
+            if self.failed || self.pos != self.buf.len() {
+                return Err(super::invalid_protobuf());
+            }
+            Ok(())
+        }
+
+        fn read_field(&mut self) -> Option<(u32, Field<'a>)> {
             let tag = self.read_varint()?;
             let field = u32::try_from(tag >> 3).ok()?;
+            if field == 0 || field > 0x1fff_ffff {
+                return None;
+            }
             match tag & 0x7 {
                 WIRE_VARINT => Some((field, Field::Varint(self.read_varint()?))),
                 WIRE_LEN => {
@@ -181,7 +214,7 @@ mod pb {
                         Field::I32(u32::from_le_bytes(bytes.try_into().ok()?)),
                     ))
                 }
-                _ => None, // start/end group: not used by agent.v1
+                _ => None, // groups are not part of the supported agent.v1 subset
             }
         }
     }
@@ -245,6 +278,9 @@ impl FrameBuffer {
             return None;
         }
         let flags = self.buf[0];
+        if flags & !(CONNECT_END_STREAM_FLAG | CONNECT_COMPRESSED_FLAG) != 0 {
+            return Some(Err(connect::protocol("unsupported envelope flags")));
+        }
         let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
         if len > MAX_CONNECT_FRAME_LEN {
             return Some(Err(Error::api(format!(
@@ -381,88 +417,162 @@ enum ServerEvent {
     UsedTokens(u64),
 }
 
-/// Decode one `AgentServerMessage` protobuf body into semantic events.
-fn decode_server_message(bytes: &[u8]) -> Vec<ServerEvent> {
+// Byte limits alone do not bound allocations from millions of tiny fields.
+// These budgets cover the entire frame, including all recognized submessages.
+const MAX_PROTOBUF_FIELDS: usize = 16_384;
+const MAX_PROTOBUF_EVENTS: usize = 4_096;
+
+fn invalid_protobuf() -> Error {
+    connect::protocol("malformed Cursor protobuf")
+}
+
+fn next_proto_field<'a>(
+    reader: &mut pb::Reader<'a>,
+    remaining_fields: &mut usize,
+) -> Result<Option<(u32, pb::Field<'a>)>> {
+    match reader.next_field() {
+        Some(field) => {
+            *remaining_fields = remaining_fields
+                .checked_sub(1)
+                .ok_or_else(|| connect::protocol("Cursor protobuf field limit exceeded"))?;
+            Ok(Some(field))
+        }
+        None => {
+            reader.finish()?;
+            Ok(None)
+        }
+    }
+}
+
+fn push_server_event(events: &mut Vec<ServerEvent>, event: ServerEvent) -> Result<()> {
+    if events.len() >= MAX_PROTOBUF_EVENTS {
+        return Err(connect::protocol("Cursor protobuf event limit exceeded"));
+    }
+    events.push(event);
+    Ok(())
+}
+
+/// Decode and validate the complete frame before publishing any of its events.
+/// Malformed trailing fields must not turn a valid prefix into a partial success.
+fn decode_server_message(bytes: &[u8]) -> Result<Vec<ServerEvent>> {
+    let mut remaining_fields = MAX_PROTOBUF_FIELDS;
     let mut events = Vec::new();
     let mut reader = pb::Reader::new(bytes);
-    while let Some((field, value)) = reader.next_field() {
+    while let Some((field, value)) = next_proto_field(&mut reader, &mut remaining_fields)? {
         match (field, value) {
-            (1, pb::Field::Len(inner)) => decode_interaction_update(inner, &mut events),
+            (1, pb::Field::Len(inner)) => {
+                decode_interaction_update(inner, &mut events, &mut remaining_fields)?;
+            }
             (3, pb::Field::Len(inner)) => {
-                if let Some(used) = decode_checkpoint_used_tokens(inner) {
-                    events.push(ServerEvent::UsedTokens(used));
+                if let Some(used) = decode_checkpoint_used_tokens(inner, &mut remaining_fields)? {
+                    push_server_event(&mut events, ServerEvent::UsedTokens(used))?;
                 }
             }
+            (1 | 3, _) => return Err(invalid_protobuf()),
             _ => {}
         }
     }
-    events
+    Ok(events)
 }
 
-fn decode_interaction_update(bytes: &[u8], events: &mut Vec<ServerEvent>) {
+fn decode_interaction_update(
+    bytes: &[u8],
+    events: &mut Vec<ServerEvent>,
+    remaining_fields: &mut usize,
+) -> Result<()> {
     let mut reader = pb::Reader::new(bytes);
-    while let Some((field, value)) = reader.next_field() {
+    while let Some((field, value)) = next_proto_field(&mut reader, remaining_fields)? {
         match (field, value) {
-            (1, pb::Field::Len(inner)) => {
-                if let Some(text) = decode_delta_text(inner) {
-                    events.push(ServerEvent::TextDelta(text));
-                }
-            }
-            (4, pb::Field::Len(inner)) => {
-                if let Some(text) = decode_delta_text(inner) {
-                    events.push(ServerEvent::ThinkingDelta(text));
+            (1 | 4, pb::Field::Len(inner)) => {
+                if let Some(text) = decode_delta_text(inner, remaining_fields)? {
+                    let event = if field == 1 {
+                        ServerEvent::TextDelta(text)
+                    } else {
+                        ServerEvent::ThinkingDelta(text)
+                    };
+                    push_server_event(events, event)?;
                 }
             }
             (8, pb::Field::Len(inner)) => {
-                if let Some(tokens) = decode_token_delta(inner) {
-                    events.push(ServerEvent::TokenDelta(tokens));
+                if let Some(tokens) = decode_token_delta(inner, remaining_fields)? {
+                    push_server_event(events, ServerEvent::TokenDelta(tokens))?;
                 }
             }
-            (14, _) => events.push(ServerEvent::TurnEnded),
+            (14, pb::Field::Len(inner)) => {
+                let mut terminal = pb::Reader::new(inner);
+                while next_proto_field(&mut terminal, remaining_fields)?.is_some() {}
+                push_server_event(events, ServerEvent::TurnEnded)?;
+            }
+            (1 | 4 | 8 | 14, _) => return Err(invalid_protobuf()),
             _ => {}
         }
     }
+    Ok(())
 }
 
-/// Read field 1 (a string) of a `TextDeltaUpdate` / `ThinkingDeltaUpdate`.
-fn decode_delta_text(bytes: &[u8]) -> Option<String> {
+/// Validate the whole delta, including fields after the text. Protobuf strings
+/// require UTF-8; lossy replacement would silently change the model's answer.
+fn decode_delta_text(bytes: &[u8], remaining_fields: &mut usize) -> Result<Option<String>> {
     let mut reader = pb::Reader::new(bytes);
-    while let Some((field, value)) = reader.next_field() {
-        if let (1, pb::Field::Len(raw)) = (field, value) {
-            return Some(String::from_utf8_lossy(raw).into_owned());
+    let mut text = None;
+    while let Some((field, value)) = next_proto_field(&mut reader, remaining_fields)? {
+        match (field, value) {
+            (1, pb::Field::Len(raw)) => {
+                text = Some(
+                    std::str::from_utf8(raw)
+                        .map_err(|_| invalid_protobuf())?
+                        .to_string(),
+                );
+            }
+            (1, _) => return Err(invalid_protobuf()),
+            _ => {}
         }
     }
-    None
+    Ok(text)
+}
+
+fn decode_varint_field_one(bytes: &[u8], remaining_fields: &mut usize) -> Result<Option<u64>> {
+    let mut reader = pb::Reader::new(bytes);
+    let mut result = None;
+    while let Some((field, value)) = next_proto_field(&mut reader, remaining_fields)? {
+        match (field, value) {
+            (1, pb::Field::Varint(value)) => result = Some(value),
+            (1, _) => return Err(invalid_protobuf()),
+            _ => {}
+        }
+    }
+    Ok(result)
 }
 
 /// Read `TokenDeltaUpdate.tokens` (field 1, int32 encoded as a varint).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn decode_token_delta(bytes: &[u8]) -> Option<i64> {
-    let mut reader = pb::Reader::new(bytes);
-    while let Some((field, value)) = reader.next_field() {
-        if let (1, pb::Field::Varint(raw)) = (field, value) {
-            // proto3 `int32` is sign-extended to a 64-bit varint on the wire;
-            // truncating to i32 then widening recovers the signed value.
-            return Some(i64::from(raw as i32));
-        }
-    }
-    None
+fn decode_token_delta(bytes: &[u8], remaining_fields: &mut usize) -> Result<Option<i64>> {
+    // proto3 int32 is sign-extended on the wire. Preserve negative deltas so
+    // the usage accumulator can continue ignoring them instead of inflating it.
+    Ok(decode_varint_field_one(bytes, remaining_fields)?.map(|raw| i64::from(raw as i32)))
 }
 
 /// Read `ConversationStateStructure.token_details.used_tokens` (5 -> 1).
-fn decode_checkpoint_used_tokens(bytes: &[u8]) -> Option<u64> {
+fn decode_checkpoint_used_tokens(
+    bytes: &[u8],
+    remaining_fields: &mut usize,
+) -> Result<Option<u64>> {
     let mut reader = pb::Reader::new(bytes);
-    while let Some((field, value)) = reader.next_field() {
-        if let (5, pb::Field::Len(token_details)) = (field, value) {
-            let mut inner = pb::Reader::new(token_details);
-            while let Some((f, v)) = inner.next_field() {
-                if let (1, pb::Field::Varint(used)) = (f, v) {
-                    return Some(used);
+    let mut used_tokens = None;
+    while let Some((field, value)) = next_proto_field(&mut reader, remaining_fields)? {
+        match (field, value) {
+            (5, pb::Field::Len(token_details)) => {
+                if let Some(used) = decode_varint_field_one(token_details, remaining_fields)? {
+                    // Repeated singular message fields merge; an empty later
+                    // token_details message must not erase an earlier value.
+                    used_tokens = Some(used);
                 }
             }
+            (5, _) => return Err(invalid_protobuf()),
+            _ => {}
         }
     }
-    None
+    Ok(used_tokens)
 }
 
 // ============================================================================
@@ -480,6 +590,8 @@ enum BlockKind {
 struct StreamState {
     source: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
     frames: FrameBuffer,
+    encoding: connect::Encoding,
+    budget: stream_limits::Budget,
     partial: AssistantMessage,
     pending: VecDeque<StreamEvent>,
     /// The currently-open content block (index + kind), if any.
@@ -501,6 +613,8 @@ impl StreamState {
         Self {
             source,
             frames: FrameBuffer::default(),
+            encoding: connect::Encoding::default(),
+            budget: stream_limits::Budget::default(),
             partial,
             pending: VecDeque::new(),
             open_block: None,
@@ -521,6 +635,15 @@ impl StreamState {
                 partial: self.partial.clone(),
             });
         }
+    }
+
+    /// Release the response body and wire buffer immediately on termination,
+    /// even if the consumer retains the stream after seeing its final event.
+    /// Already accepted preview/terminal events remain available to drain.
+    fn stop_reading(&mut self) {
+        self.done = true;
+        self.source = Box::pin(stream::empty());
+        self.frames = FrameBuffer::default();
     }
 
     /// Close the currently-open content block, emitting its `*End` event.
@@ -629,41 +752,47 @@ impl StreamState {
                 self.used_tokens = Some(used);
             }
             ServerEvent::TurnEnded => {
-                // Turn completion is confirmed by the Connect end-of-stream
-                // frame (or the body closing); nothing to emit here.
+                // An application-level turn marker cannot stand in for the
+                // Connect terminal frame, which may still carry a failure.
             }
         }
     }
 
     /// Process one Connect frame, buffering the resulting pi events.
     fn process_frame(&mut self, frame: &ConnectFrame) -> Result<()> {
-        if frame.compressed {
-            return Err(Error::api(
-                "Cursor stream sent a compressed Connect frame; compression is not supported",
-            ));
+        if self.done {
+            return Err(connect::protocol("frame received after stream termination"));
         }
+        let result = self.process_frame_inner(frame);
+        if result.is_err() {
+            // A direct decoder caller must not be able to recover from a
+            // rejected frame by appending a successful terminal afterward.
+            self.stop_reading();
+        }
+        result
+    }
+
+    fn process_frame_inner(&mut self, frame: &ConnectFrame) -> Result<()> {
+        self.budget.frame()?;
+        let payload = self.encoding.decode(&frame.payload, frame.compressed)?;
+        self.budget.decoded(payload.len())?;
         if frame.end_stream {
-            // Terminal frame: JSON trailers, optionally carrying an error.
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame.payload)
-                && let Some(error) = value.get("error")
-            {
-                let message = error
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("Cursor stream returned an error")
-                    .to_string();
-                self.error_message = Some(message);
-            }
+            // Invalid or absent terminal metadata must never promote partial
+            // output to a successful assistant message.
+            self.error_message = connect::terminal_error(&payload)?;
             self.finalize();
             // The end-of-stream frame is the protocol terminator: stop reading so
             // we neither process data frames that arrive after `Done` nor block on
             // `source.next()` if the server holds the HTTP body open. `finalize`
             // has already enqueued the terminal `Done`/`Error` into `pending`,
             // which `next_event` drains before it observes `done`.
-            self.done = true;
+            self.stop_reading();
             return Ok(());
         }
-        for event in decode_server_message(&frame.payload) {
+        let events = decode_server_message(&payload)?;
+        self.budget
+            .admit(&events, self.open_block.map(|(_, kind)| kind))?;
+        for event in events {
             self.apply(event);
         }
         Ok(())
@@ -713,6 +842,10 @@ impl StreamState {
     /// body as needed. Returns `None` once the stream is fully drained.
     async fn next_event(&mut self) -> Option<Result<StreamEvent>> {
         loop {
+            if self.done && self.pending.is_empty() {
+                return None;
+            }
+            self.budget.cooperate().await;
             if let Some(event) = self.pending.pop_front() {
                 return Some(Ok(event));
             }
@@ -723,7 +856,6 @@ impl StreamState {
             match self.frames.next_frame() {
                 Some(Ok(frame)) => {
                     if let Err(err) = self.process_frame(&frame) {
-                        self.done = true;
                         return Some(Err(err));
                     }
                     continue;
@@ -731,7 +863,7 @@ impl StreamState {
                 Some(Err(err)) => {
                     // Malformed framing (e.g. an over-cap length prefix): the
                     // stream can't be resynced, so surface it and stop reading.
-                    self.done = true;
+                    self.stop_reading();
                     return Some(Err(err));
                 }
                 None => {}
@@ -739,6 +871,10 @@ impl StreamState {
 
             match self.source.next().await {
                 Some(Ok(chunk)) => {
+                    if let Err(err) = self.budget.receive(chunk.len()) {
+                        self.stop_reading();
+                        return Some(Err(err));
+                    }
                     self.transient_error_count = 0;
                     self.frames.push(&chunk);
                 }
@@ -756,13 +892,23 @@ impl StreamState {
                             continue;
                         }
                     }
-                    self.done = true;
+                    self.stop_reading();
                     return Some(Err(Error::sse(&err)));
                 }
                 None => {
-                    // Body closed: finalize with whatever we accumulated.
-                    self.finalize();
-                    self.done = true;
+                    let message = if self.frames.buf.is_empty() {
+                        "PI_CURSOR_STREAM_INCOMPLETE: response ended without a Connect terminal frame"
+                    } else {
+                        "PI_CURSOR_STREAM_INCOMPLETE: response ended inside a Connect frame"
+                    };
+                    self.stop_reading();
+                    // Actual EOF is a transport interruption. Preserve the
+                    // existing incomplete-stream marker while using the same
+                    // source-classified recovery path as other providers.
+                    return Some(Err(Error::sse(&std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        message,
+                    ))));
                 }
             }
         }
@@ -886,6 +1032,7 @@ impl Provider for CursorProvider {
             .post(&self.base_url)
             .header("content-type", "application/connect+proto")
             .header("connect-protocol-version", "1")
+            .header("connect-accept-encoding", connect::ACCEPT_ENCODING)
             .header("authorization", format!("Bearer {token}"))
             .header("x-ghost-mode", "true")
             .header("x-cursor-client-type", "cli")
@@ -905,6 +1052,7 @@ impl Provider for CursorProvider {
                 format!("Cursor API error (HTTP {status}): {body}"),
             ));
         }
+        let encoding = connect::Encoding::from_headers(response.headers())?;
 
         let partial = AssistantMessage {
             api: CURSOR_API_NAME.to_string(),
@@ -915,7 +1063,8 @@ impl Provider for CursorProvider {
             ..AssistantMessage::default()
         };
 
-        let state = StreamState::new(response.bytes_stream(), partial);
+        let mut state = StreamState::new(response.bytes_stream(), partial);
+        state.encoding = encoding;
         let stream = stream::unfold(state, |mut state| async move {
             state.next_event().await.map(|event| (event, state))
         });
@@ -1175,11 +1324,11 @@ mod tests {
     #[test]
     fn decode_text_and_thinking_deltas() {
         assert_eq!(
-            decode_server_message(&interaction_update(1, "hi")),
+            decode_server_message(&interaction_update(1, "hi")).unwrap(),
             vec![ServerEvent::TextDelta("hi".into())]
         );
         assert_eq!(
-            decode_server_message(&interaction_update(4, "pondering")),
+            decode_server_message(&interaction_update(4, "pondering")).unwrap(),
             vec![ServerEvent::ThinkingDelta("pondering".into())]
         );
     }
@@ -1187,11 +1336,11 @@ mod tests {
     #[test]
     fn decode_token_and_checkpoint() {
         assert_eq!(
-            decode_server_message(&token_delta_message(7)),
+            decode_server_message(&token_delta_message(7)).unwrap(),
             vec![ServerEvent::TokenDelta(7)]
         );
         assert_eq!(
-            decode_server_message(&checkpoint_message(1234)),
+            decode_server_message(&checkpoint_message(1234)).unwrap(),
             vec![ServerEvent::UsedTokens(1234)]
         );
     }
@@ -1309,12 +1458,15 @@ mod tests {
     fn stream_state_surfaces_end_stream_error() {
         let events = drive(
             &[interaction_update(1, "partial")],
-            br#"{"error":{"message":"boom"}}"#,
+            br#"{"error":{"code":"unknown","message":"boom"}}"#,
         );
         match events.last() {
             Some(StreamEvent::Error { reason, error }) => {
                 assert_eq!(*reason, StopReason::Error);
-                assert_eq!(error.error_message.as_deref(), Some("boom"));
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("PI_CONNECT_ERROR[unknown]: boom")
+                );
             }
             other => panic!("expected Error, got {other:?}"),
         }

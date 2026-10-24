@@ -16,7 +16,7 @@ import urllib.request
 
 REPO = "Dicklesworthstone/pi_agent_rust"
 PUBLIC_KEY_SHA256 = "262444717bc7a49d8e8f7ee34b01b5b6a87734a6d168b008f481fa47c35c882a"
-USER_AGENT = "OpenAI File Downloader, XaiImageApiFetch/1.0"
+USER_AGENT = "pi-release-verify (+https://github.com/Dicklesworthstone/pi_agent_rust)"
 HOSTS = {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
 
 

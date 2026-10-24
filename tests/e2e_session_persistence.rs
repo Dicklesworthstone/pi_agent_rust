@@ -3,6 +3,11 @@
 //! These tests exercise the real `AgentSession` + `Session` persistence path
 //! using deterministic in-process provider streams.
 
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 mod common;
 
 use asupersync::runtime::RuntimeBuilder;
@@ -779,7 +784,14 @@ fn run_persistence_failpoint_child(
         .env("PI_SESSION_PERSISTENCE_TEST_PATH", session_path)
         .env("PI_SESSION_PERSISTENCE_TEST_BACKEND", backend)
         .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT", failpoint)
-        .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION", "hard_exit")
+        .env(
+            "PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION",
+            if save_mode == Some("append-retry") {
+                "error"
+            } else {
+                "hard_exit"
+            },
+        )
         .env("PI_SESSION_PERSISTENCE_TEST_MARKER_PATH", marker_path)
         .env("PI_SESSION_PERSISTENCE_TEST_MESSAGE", message)
         .env(
@@ -824,7 +836,7 @@ fn persistence_failpoint_worker_process_entrypoint() {
     let backend = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_BACKEND");
     // Read only to fail fast when the parent omitted it; the backend consumes
     // the variable itself at the checkpoint.
-    let _failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
+    let failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
     let message = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_MESSAGE");
 
     run_async_test(async {
@@ -838,13 +850,67 @@ fn persistence_failpoint_worker_process_entrypoint() {
         // A dirty header forces the full-rewrite path; leaving it clean takes
         // the incremental append path. Defaults: JSONL rewrites, SQLite
         // appends; the save-mode variable selects the other path.
-        let rewrite = match std::env::var("PI_SESSION_PERSISTENCE_TEST_SAVE_MODE").as_deref() {
+        let save_mode = std::env::var("PI_SESSION_PERSISTENCE_TEST_SAVE_MODE");
+        let rewrite = match save_mode.as_deref() {
             Ok("rewrite") => true,
-            Ok("append") => false,
+            Ok("append" | "append-retry") => false,
             _ => backend == "jsonl",
         };
         if rewrite {
             session.set_model_header(Some(format!("failpoint-{backend}")), None, None);
+        }
+        if save_mode.as_deref() == Ok("append-retry") {
+            let initial_metrics = session.autosave_metrics();
+            assert!(initial_metrics.pending_mutations > 0);
+            let expected_ids = session
+                .entries
+                .iter()
+                .map(|entry| entry.base().id.clone())
+                .collect::<Vec<_>>();
+            let mut written_bytes = None;
+            for attempt in 0..3 {
+                let result = match attempt {
+                    0 => session.save().await,
+                    1 => {
+                        session
+                            .flush_autosave(pi::session::AutosaveFlushTrigger::Periodic)
+                            .await
+                    }
+                    _ => {
+                        session
+                            .flush_autosave(pi::session::AutosaveFlushTrigger::Shutdown)
+                            .await
+                    }
+                };
+                let error =
+                    result.expect_err("the same pending append must cross the sync boundary");
+                assert!(error.to_string().contains(&failpoint));
+                let metrics = session.autosave_metrics();
+                assert_eq!(metrics.pending_mutations, initial_metrics.pending_mutations);
+                assert_eq!(metrics.flush_succeeded, initial_metrics.flush_succeeded);
+                assert_eq!(
+                    metrics.flush_failed,
+                    initial_metrics.flush_failed + attempt + 1
+                );
+
+                let bytes = std::fs::read(&session_path).expect("read failed append bytes");
+                if let Some(expected) = &written_bytes {
+                    assert_eq!(&bytes, expected, "replay must not append duplicate rows");
+                } else {
+                    written_bytes = Some(bytes);
+                }
+                let reopened = reopen_strict(&session_path, "append retry").await;
+                assert_eq!(
+                    reopened
+                        .entries
+                        .iter()
+                        .map(|entry| entry.base().id.clone())
+                        .collect::<Vec<_>>(),
+                    expected_ids,
+                    "the original pending row IDs must remain intact on disk"
+                );
+            }
+            return;
         }
         let result = session.save().await;
         panic!("hard-exit persistence failpoint returned unexpectedly: {result:?}");
@@ -1668,9 +1734,7 @@ async fn invoke_turn_save_entrypoint(
                 )
                 .await
         }
-        TurnSaveEntrypoint::Continue => {
-            agent_session.run_continue_with_abort(None, on_event).await
-        }
+        TurnSaveEntrypoint::Continue => agent_session.run_continue_with_abort(None, on_event).await,
     }
 }
 
@@ -1804,6 +1868,331 @@ fn completed_turn_save_failure_fences_every_agent_session_entrypoint() {
             TurnSaveEntrypoint::Continue,
         ] {
             assert_agent_turn_save_failure_fences_reentry(entrypoint, false).await;
+        }
+    });
+}
+
+struct InterruptedTurnSaveFixture {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    stored: Arc<asupersync::sync::Mutex<Session>>,
+    provider: Arc<PlannedProvider>,
+    agent_session: AgentSession,
+}
+
+impl InterruptedTurnSaveFixture {
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().expect("interrupted save tempdir");
+        let path = directory.path().join("interrupted-turn.jsonl");
+        let mut stored = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        stored.path = Some(path.clone());
+        // Keep model synchronization out of the save boundary under test.
+        stored.set_model_header(
+            Some("planned-provider".to_string()),
+            Some("planned-model".to_string()),
+            Some("off".to_string()),
+        );
+        stored.append_message(SessionMessage::User {
+            content: UserContent::Text("original input".to_string()),
+            timestamp: Some(0),
+        });
+        stored.save().await.expect("save baseline transcript");
+        let stored = Arc::new(asupersync::sync::Mutex::new(stored));
+        let provider = Arc::new(PlannedProvider::new(vec![
+            text_step("completed provider work", 1, 8),
+            text_step("a later provider call", 1, 8),
+        ]));
+        let agent_session = make_agent_session(
+            directory.path(),
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            Arc::clone(&stored),
+        );
+        Self {
+            _directory: directory,
+            path,
+            stored,
+            provider,
+            agent_session,
+        }
+    }
+
+    fn persistence_lock(&self) -> Arc<std::fs::File> {
+        let mut path = self.path.as_os_str().to_os_string();
+        path.push(".lock");
+        Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(PathBuf::from(path))
+                .expect("open real JSONL persistence lock"),
+        )
+    }
+
+    async fn assert_provider_reentry_blocked(&mut self, expected_calls: usize) {
+        let disk_before = std::fs::read(&self.path).expect("durable transcript snapshot");
+        let stored_before = session_turn_snapshot(&self.stored.try_lock().unwrap());
+        let agent_before = serde_json::to_value(self.agent_session.agent.messages()).unwrap();
+        for entrypoint in [
+            TurnSaveEntrypoint::Text,
+            TurnSaveEntrypoint::Content,
+            TurnSaveEntrypoint::Continue,
+        ] {
+            let result = invoke_turn_save_entrypoint(&mut self.agent_session, entrypoint, |_| {
+                panic!("a dropped save must fence provider events");
+            })
+            .await;
+            assert!(
+                result.as_ref().is_err_and(Error::is_session_persistence),
+                "later {entrypoint:?} must remain quarantined: {result:?}"
+            );
+            assert_eq!(
+                self.provider.call_count.load(Ordering::SeqCst),
+                expected_calls
+            );
+            assert_eq!(
+                session_turn_snapshot(&self.stored.try_lock().unwrap()),
+                stored_before
+            );
+            assert_eq!(
+                serde_json::to_value(self.agent_session.agent.messages()).unwrap(),
+                agent_before
+            );
+            assert_eq!(std::fs::read(&self.path).unwrap(), disk_before);
+        }
+    }
+}
+
+/// These tests use a single blocking worker. After releasing the file lock,
+/// a FIFO barrier retires the abandoned save before taking disk snapshots or
+/// dropping its temporary directory. The queued save may have been cancelled
+/// before execution, or a running save may have completed after its future
+/// was dropped; neither outcome can remove the provider quarantine.
+async fn drain_interrupted_turn_save() {
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        Duration::from_secs(5),
+        asupersync::runtime::spawn_blocking(|| ()),
+    )
+    .await
+    .expect("the unlocked persistence worker must retire within the deadline");
+}
+
+async fn assert_interrupted_turn_save_fences_reentry(
+    entrypoint: TurnSaveEntrypoint,
+    before_provider: bool,
+) {
+    let mut fixture = InterruptedTurnSaveFixture::new().await;
+    let baseline = fixture.stored.try_lock().unwrap().autosave_metrics();
+    let lock = fixture.persistence_lock();
+    if before_provider {
+        fs4::FileExt::try_lock(lock.as_ref()).expect("hold initial prompt save");
+    }
+    let save_reached = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&save_reached);
+    let completion_lock = Arc::clone(&lock);
+    let mut turn = Box::pin(invoke_turn_save_entrypoint(
+        &mut fixture.agent_session,
+        entrypoint,
+        move |event| {
+            if !before_provider
+                && matches!(
+                    event,
+                    AgentEvent::MessageEnd {
+                        message: Message::Assistant(_)
+                    }
+                )
+            {
+                fs4::FileExt::try_lock(completion_lock.as_ref())
+                    .expect("hold completed turn save after prompt persistence");
+                assert_eq!(observed.fetch_add(1, Ordering::SeqCst), 0);
+            }
+        },
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = futures::poll!(turn.as_mut());
+        assert!(
+            state.is_pending(),
+            "save completed while its lock was held: {state:?}"
+        );
+        if before_provider || save_reached.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider did not reach its final save"
+        );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(1)).await;
+    }
+    drop(turn);
+
+    let expected_calls = usize::from(!before_provider);
+    assert_eq!(
+        fixture.provider.call_count.load(Ordering::SeqCst),
+        expected_calls
+    );
+    let earlier_prompt_save =
+        u64::from(!before_provider && !matches!(entrypoint, TurnSaveEntrypoint::Continue));
+    let after_drop = fixture.stored.try_lock().unwrap().autosave_metrics();
+    assert_eq!(
+        after_drop.flush_started,
+        baseline.flush_started + earlier_prompt_save + 1
+    );
+    assert_eq!(
+        after_drop.flush_succeeded,
+        baseline.flush_succeeded + earlier_prompt_save
+    );
+    assert!(after_drop.pending_mutations > 0);
+    assert!(
+        !std::fs::read_to_string(&fixture.path)
+            .unwrap()
+            .contains("completed provider work"),
+        "the held file lock must prevent the pending transcript write"
+    );
+
+    fs4::FileExt::unlock(lock.as_ref()).expect("release interrupted save");
+    drain_interrupted_turn_save().await;
+    // An explicit successful flush may settle the queued transcript, but it
+    // cannot establish what the caller observed during the interrupted turn.
+    fixture
+        .agent_session
+        .persist_session()
+        .await
+        .expect("flush repaired session");
+    fixture
+        .agent_session
+        .save_and_index()
+        .await
+        .expect("flush empty autosave queue");
+    fixture
+        .assert_provider_reentry_blocked(expected_calls)
+        .await;
+}
+
+#[test]
+fn dropped_prompt_and_completion_saves_fence_every_agent_session_entrypoint() {
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("runtime with a serial persistence worker");
+    runtime.block_on(async {
+        for entrypoint in [TurnSaveEntrypoint::Text, TurnSaveEntrypoint::Content] {
+            assert_interrupted_turn_save_fences_reentry(entrypoint, true).await;
+        }
+        for entrypoint in [
+            TurnSaveEntrypoint::Text,
+            TurnSaveEntrypoint::Content,
+            TurnSaveEntrypoint::Continue,
+        ] {
+            assert_interrupted_turn_save_fences_reentry(entrypoint, false).await;
+        }
+    });
+}
+
+#[test]
+fn completed_save_and_cancellation_before_persistence_leave_provider_admission_open() {
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("runtime with a serial persistence worker");
+    runtime.block_on(async {
+        let mut fixture = InterruptedTurnSaveFixture::new().await;
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let session_lock = fixture
+            .stored
+            .lock(cx.cx())
+            .await
+            .expect("hold preflight lock");
+        {
+            let mut turn = Box::pin(
+                fixture
+                    .agent_session
+                    .run_text("not yet saved".into(), |_| {}),
+            );
+            assert!(futures::poll!(turn.as_mut()).is_pending());
+        }
+        drop(session_lock);
+        assert_eq!(fixture.provider.call_count.load(Ordering::SeqCst), 0);
+
+        let file_lock = fixture.persistence_lock();
+        fs4::FileExt::try_lock(file_lock.as_ref()).expect("hold initial save");
+        let mut turn = Box::pin(
+            fixture
+                .agent_session
+                .run_text("save normally".into(), |_| {}),
+        );
+        assert!(futures::poll!(turn.as_mut()).is_pending());
+        fs4::FileExt::unlock(file_lock.as_ref()).expect("release normal save");
+        turn.await
+            .expect("an observed successful save must not quarantine");
+        fixture
+            .agent_session
+            .run_text("next prompt".into(), |_| {})
+            .await
+            .expect("next prompt");
+        assert_eq!(fixture.provider.call_count.load(Ordering::SeqCst), 2);
+    });
+}
+
+async fn invoke_explicit_session_save(
+    session: &mut AgentSession,
+    save_and_index: bool,
+) -> Result<()> {
+    if save_and_index {
+        session.save_and_index().await
+    } else {
+        session.persist_session().await
+    }
+}
+
+#[test]
+fn interrupted_or_failed_explicit_session_saves_fence_provider_reentry() {
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("runtime with a serial persistence worker");
+    runtime.block_on(async {
+        for save_and_index in [false, true] {
+            for drop_pending_save in [false, true] {
+                let mut fixture = InterruptedTurnSaveFixture::new().await;
+                fixture.stored.try_lock().unwrap().append_custom_entry(
+                    "pending-audit".to_string(),
+                    Some(json!({"source": "interrupted-save-test"})),
+                );
+                let baseline = fixture.stored.try_lock().unwrap().autosave_metrics();
+                if drop_pending_save {
+                    let lock = fixture.persistence_lock();
+                    fs4::FileExt::try_lock(lock.as_ref()).expect("hold explicit session save");
+                    {
+                        let mut save = Box::pin(invoke_explicit_session_save(
+                            &mut fixture.agent_session,
+                            save_and_index,
+                        ));
+                        assert!(futures::poll!(save.as_mut()).is_pending());
+                    }
+                    let after_drop = fixture.stored.try_lock().unwrap().autosave_metrics();
+                    assert_eq!(after_drop.flush_started, baseline.flush_started + 1);
+                    assert_eq!(after_drop.flush_succeeded, baseline.flush_succeeded);
+                    fs4::FileExt::unlock(lock.as_ref()).expect("release explicit session save");
+                    drain_interrupted_turn_save().await;
+                } else {
+                    let blocked = fixture.path.with_file_name("directory-not-a-session.jsonl");
+                    std::fs::create_dir(&blocked).expect("block explicit save destination");
+                    fixture.stored.try_lock().unwrap().path = Some(blocked);
+                    let error =
+                        invoke_explicit_session_save(&mut fixture.agent_session, save_and_index)
+                            .await
+                            .expect_err("an explicit save failure must be reported");
+                    assert!(error.is_session_persistence());
+                    fixture.stored.try_lock().unwrap().path = Some(fixture.path.clone());
+                }
+                fixture
+                    .agent_session
+                    .persist_session()
+                    .await
+                    .expect("an explicit successful flush cannot clear quarantine");
+                fixture.assert_provider_reentry_blocked(0).await;
+            }
         }
     });
 }
@@ -2977,6 +3366,52 @@ fn jsonl_append_fault_windows_preserve_integrity() {
             vec!["append-base", "append-written-unsynced", "append-synced"]
         );
         assert_no_duplicate_user_texts(&texts, "jsonl append after fsync");
+    });
+}
+
+/// A failed append can leave complete rows on disk while its original caller
+/// still has pending work. Retrying those same IDs must cross the durability
+/// boundary again, even when deduplication means no new bytes are written.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn jsonl_append_retries_require_durable_acknowledgement() {
+    let harness = TestHarness::new("e2e_jsonl_append_retry_durability");
+    run_async_test(async {
+        for point in [
+            "jsonl_append_after_write_before_sync",
+            "jsonl_append_after_sync",
+        ] {
+            let mut session = Session::create_with_dir_and_store(
+                Some(harness.temp_dir().to_path_buf()),
+                SessionStoreKind::Jsonl,
+            );
+            session.append_message(SessionMessage::User {
+                content: UserContent::Text("retry-base".to_string()),
+                timestamp: Some(0),
+            });
+            session.save().await.expect("save retry baseline");
+            let path = session.path.clone().expect("retry session path");
+            let marker = harness.temp_path(format!("{point}.marker"));
+            let child = run_persistence_failpoint_child(
+                &path,
+                &marker,
+                "jsonl",
+                point,
+                "pending-replay",
+                Some("append-retry"),
+            );
+            assert!(
+                child.status.success(),
+                "{point} retry worker failed: {}\nstdout:\n{}\nstderr:\n{}",
+                child.status,
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let reopened = reopen_strict(&path, point).await;
+            let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+            assert_eq!(texts, vec!["retry-base", "pending-replay"]);
+            assert_no_duplicate_user_texts(&texts, point);
+        }
     });
 }
 

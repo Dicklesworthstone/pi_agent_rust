@@ -31,6 +31,101 @@ Filename format: `YYYY-MM-DDTHH-MM-SS.sssZ_id.jsonl`
 - `label`: Metadata label assignment on an entry.
 - `custom`: Extension-defined structured payload.
 
+### Image, video, and audio attachments
+
+JSONL stores canonical image and media payloads larger than 64 KiB in a private
+sibling directory. For example, `example.jsonl` owns
+`example.jsonl.blobs/<sha256-hex>`. Identical decoded bytes share one immutable
+blob within the session, including when the same bytes appear in an image and a
+media block. Small payloads and historical noncanonical base64 remain inline.
+
+The persisted `data` field contains a typed reference:
+
+```json
+{
+  "type": "media",
+  "data": {
+    "$piBlob": "sha256:<64 lowercase hexadecimal characters>",
+    "sizeBytes": 123456,
+    "encoding": "base64"
+  },
+  "mimeType": "video/mp4",
+  "name": "clip.mp4"
+}
+```
+
+`encoding` is `base64` or `base64NoPad`; reopening preserves the original
+canonical spelling. Native messages returned to providers, extensions, SDK
+callers, and fork plans contain the complete payload. The reference format is
+internal to persistence and must not be sent directly to a provider.
+
+Blob bytes are synced before JSONL references are committed. Reads verify each
+blob's hash and size, reject symlinks and unsafe reference names, and bound the
+complete hydrated entry before allocating payloads. Missing or corrupt
+attachments produce `PI_SESSION_ATTACHMENT_INVALID` and prevent session open;
+they are not silently skipped. A later save never overwrites an existing corrupt
+blob. Per-blob admission remains 64 MiB and hydrated entries retain the existing
+100 MiB JSONL limit. The media input limit is unchanged.
+
+V2 sidecars retain compact references and resolve media only for the entries
+being hydrated, using the authoritative JSONL source path. A healthy V2 cache
+does not substitute cached media for a missing or corrupt referenced blob.
+Metadata listing does not read media payloads. Context-free low-level V2 frame
+decoding cannot resolve attachment references without a source path.
+
+V2 migration, dry runs, source verification, and frame integrity checks keep
+stored attachment references compact. Blob verification streams through a
+16 KiB buffer and checks the complete payload's size, digest, and file identity
+without materializing its base64 representation. Legacy rows without an entry
+ID are hydrated one at a time when needed to preserve their deterministic IDs.
+Ordinary session loading still returns complete in-memory messages.
+
+Incremental JSONL saves reconcile the authoritative history using compact
+attachment records. The writer streams blob verification and the corresponding
+native serialization fingerprint through bounded buffers; entries that match
+the caller's complete in-memory payload are reused after the save succeeds.
+Only entries absent or different in the caller's view are fully hydrated,
+including concurrent writes and hidden V2 branches. A changed public entry never
+replaces its authoritative persisted payload during append, and a cancelled
+save can safely replay an identical row
+without appending it twice. Missing or corrupted blobs still fail the save even
+when their complete payload is already present in memory. Initial loading,
+full checkpoint rewrites, and repair of a complete final record lacking its
+newline retain their existing hydration behavior.
+
+Forking, or saving a hydrated session clone to a new path, writes the destination's
+own blobs. It can subsequently be opened without access to the parent session.
+HTML exports embed images and playable audio/video payloads and remain
+self-contained. For a filesystem copy or backup, carry **both the JSONL file and
+its `.blobs` directory**; rename the directory to match if the JSONL filename
+changes. The V2 index can be rebuilt from that pair. Copying only the JSONL file
+is insufficient when it contains attachment references.
+
+Compaction, branch navigation, and ordinary saves do not garbage-collect blobs.
+The existing session deletion flow removes the owned attachment directory after
+removing the primary session file. In-memory messages and RPC completion events
+still contain full payloads; this storage feature does not introduce lazy public
+message types or raise `media.maxBytes`.
+
+Context estimation uses recording duration when supported container metadata is
+available: MP4/MOV/M4A movie headers, WebM duration/timescale, PCM or float WAVE
+sample counts, FLAC STREAMINFO, MP3 Xing/Info frame counts, and Ogg Vorbis/Opus
+granule positions. Ogg inspection handles complete single streams, including
+Opus pre-skip and its fixed 48 kHz granule clock. Inspection reads bounded base64
+header ranges and skips the encoded audio/video bodies, including movie headers
+placed after large payloads. It does not run a decoder or an external program.
+`MediaContent::duration()` exposes the same optional estimate to SDK consumers.
+
+Audio contributes an estimated 32 tokens per second; video uses a conservative
+300 tokens per second, including audio and timestamp overhead. Both retain a
+256-token minimum. Measured provider usage takes precedence. Unsupported or
+malformed duration metadata retains the decoded-byte fallback, as do chained or
+multiplexed Ogg streams, ambiguous initial granule positions, and containers
+whose structure cannot be resolved within the bounded inspection budget. An
+unreadable hint cannot prevent a session from opening. These are context
+estimates rather than billing predictions; actual media resolution and provider
+behavior vary.
+
 ### Tree structure
 
 Pi supports conversation branching. Each entry has an `id` and an optional `parent_id`.
@@ -65,6 +160,96 @@ Creates a new session file starting from the current point (or a selected point)
 #### Compaction (`/compact`)
 
 Manually triggers context compaction. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
+
+### Session commands in print mode
+
+Explicit command-line arguments can perform session maintenance without opening
+the terminal UI:
+
+```sh
+pi --continue -p '/compact'
+pi --session ./run.jsonl -p '/compact shake'
+pi --session ./run.jsonl -p '/handoff preserve migration decisions and next steps'
+pi --session ./run.jsonl -p '/retry'
+```
+
+`/compact` uses the selected session's native summarizer, privacy policy,
+extension hooks and durable compaction transaction. `/compact shake` uses the
+same transaction with local removal of bulky older tool output and no summary
+model request. Disabled compaction is an error; an eligible session with nothing
+to compact reports that no change was made. Custom compaction instructions are
+not accepted on this surface.
+
+`/handoff [focus]` asks the selected model for a continuation brief and compacts
+the selected session in place. It preserves the session ID, path, name, branch
+history and recent native messages. The brief records goals, decisions,
+constraints, completed work, failed approaches, open questions and next steps;
+the optional focus tells the model what to emphasize. The command appends a
+normal compaction entry with `details.mode: "handoff"`. Original history remains
+in the session tree, and the next prompt uses the brief and retained tail.
+
+Manual handoff runs even when automatic compaction is disabled or below its
+threshold. It uses the configured `keepRecentTokens` budget, rounds retention
+back to complete turns, and always keeps the latest authored user turn with its
+ordered images, audio, video and completed tool work. A single authored turn,
+an already compacted leaf, or a budget retaining all history has no safe older
+prefix: the command returns an error without calling the model. It does not
+split the last turn to force a checkpoint. Automatic aggressive, shake and
+snapcompact policies do not change this manual operation.
+
+Handoff uses the existing compaction privacy policy for history, focus and the
+stored summary. The model request has no tools, uses isolated transport/cache
+identity, and has a 60-second generation deadline and a 64-KiB text limit. Empty,
+truncated, tool-requesting or otherwise incomplete responses fail without a
+local fallback or a new compaction entry. A changed source session also refuses
+installation. Before-compaction hooks can cancel; replacement summaries from
+those hooks are explicitly refused for handoff. The ordinary post-compaction
+hook runs after durable installation. Optional focus is limited to 4096 UTF-8
+bytes and cannot contain NUL.
+
+`/retry` immediately repeats the latest retryable user turn from the selected
+branch. It preserves ordered text and image/audio/video content, saves the
+rewound parent before invoking the provider, and retains the abandoned attempt
+as a sibling in the session tree. Missing retryable input or failed persistence
+stops the command. The repeated turn uses the ordinary print-mode provider
+retry, failover and tool-approval behavior. Stored input is not rescanned for
+magic keywords because its original authored/template provenance is unavailable.
+
+Use `--continue`, `--resume`, `--session` or `--session-dir` when the result should
+persist. Print mode without a requested session remains ephemeral. Commands and
+ordinary message arguments can be mixed; they run in argument order.
+
+Only original command-line message arguments have command authority. Piped
+stdin and file bytes remain input, including text beginning with `/retry`,
+`/compact`, `/handoff` or `@`. A command produced by prompt-template expansion also remains
+input. A command explicitly paired with `@file` attachments is refused rather
+than dropping the attachments; submit it separately. If stdin and files are
+both supplied, files retain their normal pairing with the first input message,
+and later explicit CLI commands still execute.
+
+Command failures return a nonzero exit status, including an error-valued
+provider response during `/retry` in JSON mode. `--mode json` retains the session
+header and native events, adds `command_start` when a retry begins, and emits a
+successful `command_result` only after the operation finishes. Compaction results
+include `data.changed` and the native compaction result when one was produced.
+Ctrl+C and extension cancellation fail the command without acknowledging success;
+interrupted persistence retains the native session admission fence.
+
+Both terminal frontends also run this native transaction with `/handoff [focus]`.
+Escape requests cancellation, and the UI waits for the transaction to finish
+before accepting another foreground request. A queued handoff stays bound to its
+original session and cancellation handle. Unknown leading options are errors;
+use `/handoff -- <focus>` for focus text beginning with a dash.
+
+The `pi handoff` subcommand remains the local structured report. In either
+terminal, `/handoff --report [human|agent|target] [path]` selects that report
+explicitly. The default terminal also retains `/handoff --model` and its
+`--export` options for a separate preview or evidence bundle; those modes do not
+compact the conversation. Its `/handoff --import <absolute-bundle.json>` mode
+inspects an exported bundle and can create a separate native continuation
+session with explicit output and workspace paths. Import leaves the active
+session unchanged and does not start a model turn. See
+[Model-assisted handoff](model-handoff.md) and [Handoff import](handoff-import.md).
 
 ## ADR: Session Store V2 + Wire-Format Contract
 

@@ -128,6 +128,7 @@ fn setup_rpc_with_save(
     let auth = AuthStorage::load(auth_dir.path().join("auth.json")).unwrap();
     let options = RpcOptions {
         config: Config::default(),
+        working_directory: None,
         resources: ResourceLoader::empty(false),
         available_models: Vec::new(),
         scoped_models: Vec::new(),

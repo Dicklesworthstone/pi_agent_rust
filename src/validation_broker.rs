@@ -4,6 +4,8 @@
 //! unavailable records produce a degraded snapshot instead of inventing a green
 //! validation state.
 
+mod doctor;
+
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fs::{self, OpenOptions};
@@ -704,11 +706,17 @@ pub struct ValidationDoctorInput {
     pub has_failures: bool,
 }
 
+/// Normalize legacy preflight checks or a native `pi doctor` report.
+/// Native reports must contain explicit swarm resource and admission evidence;
+/// a healthy consumer-only report is not authority to launch validation work.
 pub fn normalize_doctor_json(
     provenance: ValidationSourceProvenance,
     value: &Value,
 ) -> Result<ValidationDoctorInput> {
     provenance.validate()?;
+    if value.get("findings").is_some() {
+        return Ok(doctor::normalize_native_doctor_json(provenance, value));
+    }
     let mut degraded_reasons = Vec::new();
     let checks_value = value.get("checks").or_else(|| {
         value
@@ -1356,10 +1364,20 @@ pub fn decide_validation_admission(
         reuse_required: policy.reuse_required,
     };
 
+    // Cached artifacts are not a bypass for failed or missing authority. In
+    // particular, a damaged later store record cannot revive an earlier result.
     let decision = if rch_required && inputs.rch.local_fallback {
         reasons.push("rch_required_but_local_fallback_detected".to_string());
         required_actions.push("restore_remote_rch_or_run_later_do_not_run_locally".to_string());
         ValidationAdmissionDecision::DenyLocalFallback
+    } else if !blocking_source_reasons.is_empty() {
+        reasons.extend(blocking_source_reasons);
+        required_actions.push("refresh_degraded_authoritative_sources".to_string());
+        ValidationAdmissionDecision::DegradedBlock
+    } else if inputs.doctor.has_failures {
+        reasons.push("doctor_preflight_has_failures".to_string());
+        required_actions.push("resolve_doctor_failures_before_validation".to_string());
+        ValidationAdmissionDecision::DegradedBlock
     } else if let Some(lease) = matching.reusable.first().copied() {
         reasons.push(format!(
             "equivalent_reusable_slot_available:{}",
@@ -1389,14 +1407,6 @@ pub fn decide_validation_admission(
         ));
         required_actions.push("wait_for_equivalent_validation_result".to_string());
         ValidationAdmissionDecision::Wait
-    } else if !blocking_source_reasons.is_empty() {
-        reasons.extend(blocking_source_reasons);
-        required_actions.push("refresh_degraded_authoritative_sources".to_string());
-        ValidationAdmissionDecision::DegradedBlock
-    } else if inputs.doctor.has_failures {
-        reasons.push("doctor_preflight_has_failures".to_string());
-        required_actions.push("resolve_doctor_failures_before_validation".to_string());
-        ValidationAdmissionDecision::DegradedBlock
     } else if low_headroom && broad_gate && policy.allow_narrow_scope {
         reasons.push("broad_gate_has_insufficient_target_or_tmp_headroom".to_string());
         required_actions.push("narrow_to_package_test_or_non_compile_gate".to_string());
@@ -1471,6 +1481,14 @@ fn collect_source_reasons(
     degraded_reasons: &mut Vec<String>,
     source_health: &ValidationSourceHealth,
 ) {
+    // Deserialized inputs can carry an explicit bad state without explanatory
+    // strings. The state remains authoritative; missing prose is not health.
+    if source_health.is_degraded() && source_health.degraded_reasons.is_empty() {
+        degraded_reasons.push(format!(
+            "{}: source_state_not_available",
+            source_health.provenance.source
+        ));
+    }
     for reason in &source_health.degraded_reasons {
         degraded_reasons.push(format!("{}: {reason}", source_health.provenance.source));
     }
@@ -1704,6 +1722,9 @@ fn blocking_source_reasons(
     collect_source_reasons(&mut reasons, &inputs.git.health);
     collect_source_reasons(&mut reasons, &inputs.beads.health);
     collect_source_reasons(&mut reasons, &inputs.scratch_headroom.health);
+    if slot_store.is_degraded() && slot_store.degraded_reasons.is_empty() {
+        reasons.push("validation_slot_store: store_degraded".to_string());
+    }
     for reason in &slot_store.degraded_reasons {
         reasons.push(format!("validation_slot_store: {reason}"));
     }

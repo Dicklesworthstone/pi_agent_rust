@@ -8,7 +8,8 @@
 //! 4. `~/.pi/agent/mcp.json` (global native)
 //! 5. Foreign files (`.claude/mcp.json`, `.cursor/mcp.json`,
 //!    `.windsurf/mcp.json`, `.gemini/settings.json`, `.codex/config.toml`
-//!    under the project) — marked `provenance=foreign`.
+//!    under the project, including OMP and VS Code) — marked `provenance=foreign`.
+//! 6. Project-root `mcp.json` / `.mcp.json` portable fallbacks.
 //!
 //! Merge semantics: per server name, the highest-precedence source wins the
 //! whole definition; every server records where it came from. Malformed
@@ -28,8 +29,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v2";
+const TRUST_FINGERPRINT_DOMAIN: &[u8] = b"pi_agent_rust:mcp-trust-surface:v3";
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
+/// Keep every MCP operation bounded, including imported OMP configurations.
+pub(super) const MAX_MCP_TIMEOUT_MS: u64 = 3_600_000;
 
 /// `HttpTransport` always installs Content-Type + Accept and may add an MCP
 /// session and protocol-version headers after initialize. Leave room for all
@@ -148,6 +151,181 @@ impl Provenance {
     }
 }
 
+/// OAuth client and loopback callback settings imported from OMP.
+///
+/// Values remain authored templates until the server has been trusted. In
+/// particular, discovery and trust fingerprinting never resolve client secrets.
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpOAuthConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub scope: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub callback_port: Option<u16>,
+    pub callback_path: Option<String>,
+    /// An empty string explicitly suppresses the authorization prompt.
+    pub prompt: Option<String>,
+}
+
+impl std::fmt::Debug for McpOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("scope", &self.scope)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("callback_port", &self.callback_port)
+            .field("callback_path", &self.callback_path)
+            .field("prompt", &self.prompt)
+            .finish()
+    }
+}
+
+impl McpOAuthConfig {
+    /// Validate authored settings without reading variables or running helpers.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid fields or literal callback targets. Callback templates
+    /// receive full URL validation after trusted variable expansion.
+    pub fn validate_raw(&self) -> Result<(), String> {
+        self.validate_fields()?;
+        self.validate_callbacks(true)
+    }
+
+    /// Validate trusted, resolved settings before binding a callback listener.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid fields, non-loopback callbacks, or conflicting explicit
+    /// redirect URI and callback port/path settings. Errors never echo values.
+    pub fn validate_resolved(&self) -> Result<(), String> {
+        self.validate_fields()?;
+        self.validate_callbacks(false)
+    }
+
+    fn validate_fields(&self) -> Result<(), String> {
+        for (name, value, limit, allow_empty) in [
+            ("clientId", self.client_id.as_deref(), 4096, false),
+            (
+                "clientSecret",
+                self.client_secret.as_deref(),
+                16 * 1024,
+                false,
+            ),
+            ("scope", self.scope.as_deref(), 4096, true),
+            ("redirectUri", self.redirect_uri.as_deref(), 4096, false),
+            ("callbackPath", self.callback_path.as_deref(), 4096, false),
+            ("prompt", self.prompt.as_deref(), 4096, true),
+        ] {
+            if let Some(value) = value
+                && (value.len() > limit
+                    || (!allow_empty && value.trim().is_empty())
+                    || value.chars().any(is_terminal_control))
+            {
+                return Err(format!(
+                    "oauth.{name} has an invalid length or contains control characters"
+                ));
+            }
+        }
+        if self.client_secret.is_some() && self.client_id.is_none() {
+            return Err("oauth.clientSecret requires oauth.clientId".to_string());
+        }
+        if self.callback_port == Some(0) {
+            return Err("oauth.callbackPort must be an integer from 1 to 65535".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_callbacks(&self, allow_templates: bool) -> Result<(), String> {
+        let callback_path = self
+            .callback_path
+            .as_deref()
+            .filter(|value| !(allow_templates && value.contains("${")));
+        if let Some(path) = callback_path {
+            validate_oauth_callback_path(path)?;
+        }
+        let Some(redirect_uri) = self.redirect_uri.as_deref() else {
+            return Ok(());
+        };
+        if allow_templates && redirect_uri.contains("${") {
+            return Ok(());
+        }
+        let redirect = url::Url::parse(redirect_uri)
+            .map_err(|_| "oauth.redirectUri must be an absolute HTTP loopback URL".to_string())?;
+        let loopback = match redirect.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            Some(url::Host::Domain("localhost")) => true,
+            _ => false,
+        };
+        if redirect.scheme() != "http"
+            || !loopback
+            || redirect_uri.chars().any(char::is_whitespace)
+            || redirect_uri.contains('\\')
+            || !redirect_uri
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+            || !redirect.username().is_empty()
+            || redirect.password().is_some()
+            || redirect.query().is_some()
+            || redirect.fragment().is_some()
+            || redirect.port_or_known_default() == Some(0)
+        {
+            return Err(
+                "oauth.redirectUri must be an HTTP loopback URL without credentials, query, or fragment"
+                    .to_string(),
+            );
+        }
+        // Browser URL parsing must not change the registered callback path.
+        // An omitted HTTP path is the ordinary root path used on the wire.
+        let authority_and_path = redirect_uri
+            .get(7..)
+            .ok_or_else(|| "oauth.redirectUri must be an absolute HTTP loopback URL".to_string())?;
+        let (authority, raw_path) = authority_and_path
+            .find('/')
+            .map_or((authority_and_path, "/"), |start| {
+                authority_and_path.split_at(start)
+            });
+        if authority.contains('@') || raw_path != redirect.path() {
+            return Err(
+                "oauth.redirectUri must not contain credentials or a path requiring normalization"
+                    .to_string(),
+            );
+        }
+        validate_oauth_callback_path(redirect.path())?;
+        if self
+            .callback_port
+            .is_some_and(|port| Some(port) != redirect.port_or_known_default())
+        {
+            return Err("oauth.callbackPort conflicts with oauth.redirectUri".to_string());
+        }
+        if callback_path.is_some_and(|path| path != redirect.path()) {
+            return Err("oauth.callbackPath conflicts with oauth.redirectUri".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn validate_oauth_callback_path(path: &str) -> Result<(), String> {
+    let invalid = || {
+        "oauth.callbackPath must be an absolute URL path without query, fragment, or normalization"
+            .to_string()
+    };
+    if !path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#', '\\']) {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(&format!("http://127.0.0.1{path}")).map_err(|_| invalid())?;
+    if url.path() != path {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// One server definition after merging.
 #[derive(Debug, Clone)]
 pub struct ConfiguredServer {
@@ -163,8 +341,16 @@ pub struct ConfiguredServer {
     pub url: Option<String>,
     /// Extra HTTP headers (values may use `$ENV:`/`$CMD:`).
     pub headers: Vec<(String, String)>,
+    /// Authored OAuth settings; secret references resolve only after trust.
+    pub oauth: Option<McpOAuthConfig>,
     /// Explicit transport hint (`"stdio"` / `"http"` / `"sse"`).
     pub transport_hint: Option<String>,
+    /// Explicit configuration disablement is independent of operator trust.
+    pub enabled: bool,
+    /// Working directory, anchored to the session workspace during discovery.
+    pub cwd: Option<PathBuf>,
+    /// Per-operation timeout in milliseconds; absent means the native default.
+    pub timeout_ms: Option<u64>,
     /// Where the definition came from.
     pub provenance: Provenance,
     /// Source file it was read from.
@@ -172,16 +358,40 @@ pub struct ConfiguredServer {
 }
 
 impl ConfiguredServer {
-    /// Versioned cryptographic fingerprint of the complete execution surface.
+    /// Resolve execution paths consistently for trust, identity, and spawn.
+    #[must_use]
+    pub fn effective_cwd(&self, workspace: &Path) -> PathBuf {
+        self.cwd.as_ref().map_or_else(
+            || canonical_cwd(workspace),
+            |cwd| {
+                let path = if cwd.is_absolute() {
+                    cwd.clone()
+                } else {
+                    workspace.join(cwd)
+                };
+                canonical_cwd(&path)
+            },
+        )
+    }
+
+    /// Versioned fingerprint when the session workspace and execution cwd match.
     ///
     /// Trust is global on disk, so the digest binds not only the target but
     /// also its name, raw secret definitions, provenance/source identity, and
     /// the effective working directory for local process resolution. Secret
     /// references are intentionally hashed before resolution: environment
     /// rotation does not re-prompt, while changing `$ENV:`/`$CMD:` definitions
-    /// does.
+    /// does. Use [`Self::fingerprint_for_workspace`] for a separate server cwd.
     #[must_use]
     pub fn fingerprint(&self, effective_cwd: &Path) -> String {
+        self.fingerprint_for_workspace(effective_cwd, effective_cwd)
+    }
+
+    /// Bind both local process execution and the workspace exposed by roots/list.
+    /// Use this when the server's working directory differs from its session's
+    /// workspace. Secret definitions remain bound before their resolution.
+    #[must_use]
+    pub fn fingerprint_for_workspace(&self, effective_cwd: &Path, workspace: &Path) -> String {
         let mut hasher = Sha256::new();
         hash_part(&mut hasher, "domain", TRUST_FINGERPRINT_DOMAIN);
         hash_part(&mut hasher, "name", self.name.as_bytes());
@@ -190,6 +400,23 @@ impl ConfiguredServer {
         hash_definitions(&mut hasher, "env", &self.env, false);
         hash_optional(&mut hasher, "url", self.url.as_deref());
         hash_definitions(&mut hasher, "headers", &self.headers, true);
+        if let Some(oauth) = &self.oauth {
+            // Retain the existing digest for definitions without OAuth, while
+            // binding every authored option (including raw secret references).
+            hash_part(&mut hasher, "oauth.state", b"present");
+            for (label, value) in [
+                ("oauth.client_id", oauth.client_id.as_deref()),
+                ("oauth.client_secret", oauth.client_secret.as_deref()),
+                ("oauth.scope", oauth.scope.as_deref()),
+                ("oauth.redirect_uri", oauth.redirect_uri.as_deref()),
+                ("oauth.callback_path", oauth.callback_path.as_deref()),
+                ("oauth.prompt", oauth.prompt.as_deref()),
+            ] {
+                hash_optional(&mut hasher, label, value);
+            }
+            let port = oauth.callback_port.map(|value| value.to_string());
+            hash_optional(&mut hasher, "oauth.callback_port", port.as_deref());
+        }
         hash_optional(
             &mut hasher,
             "transport_hint",
@@ -208,7 +435,7 @@ impl ConfiguredServer {
             source.as_os_str().as_encoded_bytes(),
         );
         // HTTP headers can contain `$CMD:` references too, and their helper
-        // processes inherit the Pi process working directory. Bind cwd for all
+        // processes run in the server's selected working directory. Bind cwd for all
         // transports so global/CLI trust cannot authorize a different local
         // helper merely because Pi was launched from another project.
         let cwd = canonical_cwd(effective_cwd);
@@ -216,6 +443,12 @@ impl ConfiguredServer {
             &mut hasher,
             "effective_cwd",
             cwd.as_os_str().as_encoded_bytes(),
+        );
+        let workspace = canonical_cwd(workspace);
+        hash_part(
+            &mut hasher,
+            "workspace_root",
+            workspace.as_os_str().as_encoded_bytes(),
         );
 
         crate::package_manager::hex_encode(&hasher.finalize())
@@ -378,6 +611,15 @@ impl ConfiguredServer {
 pub(super) fn validate_transport_shape(
     config: &ConfiguredServer,
 ) -> std::result::Result<(), String> {
+    validate_timeout(config.timeout_ms)?;
+    if let Some(oauth) = &config.oauth {
+        oauth.validate_raw()?;
+    }
+    if let Some(cwd) = &config.cwd
+        && (cwd.as_os_str().is_empty() || cwd.to_string_lossy().chars().any(is_terminal_control))
+    {
+        return Err("cwd must be a nonempty path without control characters".to_string());
+    }
     let hint = config.transport_hint.as_deref().map(str::trim);
     if hint.is_some_and(str::is_empty) {
         return Err("transport type must not be empty".to_string());
@@ -399,6 +641,9 @@ pub(super) fn validate_transport_shape(
             }
             if !config.headers.is_empty() {
                 return Err("stdio transport must not define HTTP headers".to_string());
+            }
+            if config.oauth.is_some() {
+                return Err("stdio transport must not define OAuth settings".to_string());
             }
             Ok(())
         }
@@ -430,7 +675,7 @@ fn canonical_identity(path: &Path, base: &Path) -> PathBuf {
     })
 }
 
-fn canonical_cwd(path: &Path) -> PathBuf {
+pub(super) fn canonical_cwd(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
@@ -660,7 +905,7 @@ pub(crate) fn display_safe(text: &str) -> String {
 }
 
 /// One raw server entry (tolerant: unknown fields ignored).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawServer {
     #[serde(default)]
@@ -673,13 +918,221 @@ struct RawServer {
     url: Option<String>,
     #[serde(default)]
     headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    oauth: Option<McpOAuthConfig>,
     #[serde(default, rename = "type")]
     transport: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default, rename = "timeout", alias = "timeoutMs", alias = "timeout_ms")]
+    timeout_ms: Option<u64>,
+}
+
+/// Reject malformed OAuth values before serde can echo a credential in an error.
+fn validate_oauth_shape(value: &Value) -> Result<(), String> {
+    let fields = value
+        .as_object()
+        .ok_or_else(|| "oauth must be an object".to_string())?;
+    for (name, value) in fields {
+        match name.as_str() {
+            "clientId" | "clientSecret" | "scope" | "redirectUri" | "callbackPath" | "prompt" => {
+                if !value.is_string() {
+                    return Err(format!("oauth.{name} must be a string"));
+                }
+            }
+            "callbackPort" => {
+                if !value
+                    .as_u64()
+                    .is_some_and(|port| (1..=65535).contains(&port))
+                {
+                    return Err("oauth.callbackPort must be an integer from 1 to 65535".to_string());
+                }
+            }
+            _ => return Err("oauth contains an unknown field".to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Parse OAuth settings without resolving authored secret or variable references.
+///
+/// # Errors
+///
+/// Rejects malformed settings using diagnostics that never include field values.
+pub(crate) fn parse_oauth_config(value: &Value) -> Result<McpOAuthConfig, String> {
+    validate_oauth_shape(value)?;
+    let oauth: McpOAuthConfig = serde_json::from_value(value.clone())
+        .map_err(|_| "oauth settings are malformed".to_string())?;
+    oauth.validate_raw()?;
+    Ok(oauth)
 }
 
 /// Parse one server entry; `Err` carries the skip reason.
 fn parse_server(name: &str, raw: &Value) -> std::result::Result<RawServer, String> {
-    serde_json::from_value(raw.clone()).map_err(|err| format!("entry {name:?}: {err}"))
+    for key in [
+        "enabled",
+        "disabled",
+        "cwd",
+        "timeout",
+        "timeoutMs",
+        "timeout_ms",
+        "oauth",
+    ] {
+        if raw.get(key).is_some_and(Value::is_null) {
+            return Err(format!("entry {name:?}: field {key:?} must not be null"));
+        }
+    }
+    if let Some(oauth) = raw.get("oauth") {
+        parse_oauth_config(oauth).map_err(|reason| format!("entry {name:?}: {reason}"))?;
+    }
+    let server: RawServer =
+        serde_json::from_value(raw.clone()).map_err(|err| format!("entry {name:?}: {err}"))?;
+    validate_timeout(server.timeout_ms)?;
+    Ok(server)
+}
+
+pub(super) fn validate_timeout(timeout_ms: Option<u64>) -> std::result::Result<(), String> {
+    if timeout_ms.is_some_and(|value| !(1..=MAX_MCP_TIMEOUT_MS).contains(&value)) {
+        return Err(format!(
+            "timeout must be an integer from 1 to {MAX_MCP_TIMEOUT_MS} milliseconds; zero/unbounded timeouts are not supported"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn configured_enabled(value: &Value) -> Result<bool, String> {
+    let flag = |key: &str| -> Result<Option<bool>, String> {
+        value
+            .get(key)
+            .map(|flag| {
+                flag.as_bool()
+                    .ok_or_else(|| format!("field {key:?} must be a boolean"))
+            })
+            .transpose()
+    };
+    Ok(flag("enabled")? != Some(false) && flag("disabled")? != Some(true))
+}
+
+pub(super) fn configured_timeout(value: &Value) -> Result<Option<u64>, String> {
+    let mut timeout = None;
+    for key in ["timeout", "timeoutMs", "timeout_ms"] {
+        if let Some(value) = value.get(key) {
+            if timeout.is_some() {
+                return Err("timeout aliases must not be combined".to_string());
+            }
+            timeout = Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| "timeout must be an integer in milliseconds".to_string())?,
+            );
+        }
+    }
+    validate_timeout(timeout)?;
+    Ok(timeout)
+}
+
+/// Expand OMP `${VAR}` / `${VAR:-default}` and VS Code `${env:VAR}`.
+/// Non-secret fields expand before trust; env/header values use this same
+/// parser only at the already-trusted transport-construction boundary.
+pub(super) fn expand_config_value(raw: &str, cwd: &Path) -> Result<String, String> {
+    expand_config_value_with(raw, cwd, |name| std::env::var(name).ok())
+}
+
+fn expand_config_value_with(
+    raw: &str,
+    cwd: &Path,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<String, String> {
+    let mut output = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let expression = &rest[start + 2..];
+        let Some(end) = expression.find('}') else {
+            return Err("unterminated MCP configuration variable".to_string());
+        };
+        let expression = &expression[..end];
+        let value = if expression == "workspaceFolder" {
+            cwd.to_string_lossy().into_owned()
+        } else {
+            let expression = expression.strip_prefix("env:").unwrap_or(expression);
+            let (name, fallback) = expression
+                .split_once(":-")
+                .map_or((expression, None), |(name, fallback)| {
+                    (name, Some(fallback))
+                });
+            let mut bytes = name.bytes();
+            if !bytes
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == b'_')
+                || !bytes.all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+            {
+                return Err("unsupported MCP configuration variable; use ${VAR}, ${VAR:-default}, ${env:VAR}, or ${workspaceFolder}".to_string());
+            }
+            lookup(name)
+                .filter(|value| !value.is_empty())
+                .or_else(|| fallback.map(str::to_string))
+                .ok_or_else(|| {
+                    format!("MCP configuration environment variable {name:?} is unset or empty")
+                })?
+        };
+        if output.len().saturating_add(value.len()) > MAX_MCP_ENV_VALUE_BYTES {
+            return Err("expanded MCP configuration value exceeds 65536 bytes".to_string());
+        }
+        output.push_str(&value);
+        rest = &rest[start + 2 + end + 1..];
+    }
+    if output.len().saturating_add(rest.len()) > MAX_MCP_ENV_VALUE_BYTES {
+        return Err("expanded MCP configuration value exceeds 65536 bytes".to_string());
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+#[derive(Default)]
+struct ServerSelection {
+    disabled: std::collections::HashSet<String>,
+    disabled_sources: HashMap<String, (Provenance, PathBuf)>,
+    enabled: std::collections::HashSet<String>,
+    invalid: bool,
+}
+
+impl ServerSelection {
+    fn load(
+        &mut self,
+        root: &serde_json::Map<String, Value>,
+        provenance: Provenance,
+        path: &Path,
+    ) -> Result<(), String> {
+        for (key, destination) in [
+            ("disabledServers", &mut self.disabled),
+            ("enabledServers", &mut self.enabled),
+        ] {
+            let Some(value) = root.get(key) else {
+                continue;
+            };
+            let names = value
+                .as_array()
+                .ok_or_else(|| format!("{key} must be an array of server names"))?;
+            for name in names {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| format!("{key} must contain only server names"))?;
+                validate_server_name(name)?;
+                destination.insert(name.to_string());
+                if key == "disabledServers" {
+                    self.disabled_sources
+                        .entry(name.to_string())
+                        .or_insert_with(|| (provenance, path.to_path_buf()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn read_bounded_config(path: &Path) -> std::io::Result<String> {
@@ -726,6 +1179,74 @@ fn read_bounded_config(path: &Path) -> std::io::Result<String> {
     })
 }
 
+/// Parse the file envelope without interpreting individual server definitions.
+fn parse_server_map(
+    path: &Path,
+    provenance: Provenance,
+    content: &str,
+    selection: &mut ServerSelection,
+) -> Result<HashMap<String, Value>, String> {
+    // Use the TOML parser so booleans, nested env/header tables, quoted names,
+    // multiline arrays and comments keep their meaning during Codex import.
+    let value = if path.extension().is_some_and(|e| e == "toml") {
+        parse_codex_toml(content)?
+    } else {
+        serde_json::from_str(content).map_err(|err| format!("invalid JSON: {err}"))?
+    };
+    // Accept both `{"mcpServers": {...}}` and a bare `{name: {...}}` map.
+    // Presence of the wrapper is authoritative even when it is empty; never
+    // reinterpret unrelated top-level settings as a fallback server map.
+    let root = value
+        .as_object()
+        .ok_or_else(|| "MCP config root must be an object".to_string())?;
+    // Only operator-selected and native user files may override another
+    // source's enable flag. A lower-priority project's enable list cannot
+    // authorize a disabled global definition. Deny always wins over enable.
+    if matches!(provenance, Provenance::Cli | Provenance::GlobalPi)
+        && let Err(reason) = selection.load(root, provenance, path)
+    {
+        selection.invalid = true;
+        return Err(reason);
+    }
+    let vscode = path.ends_with(Path::new(".vscode/mcp.json"));
+    let wrapped = root.get("mcpServers").or_else(|| {
+        if vscode {
+            root.get("servers")
+                .or_else(|| root.get("mcp").and_then(|mcp| mcp.get("servers")))
+        } else {
+            None
+        }
+    });
+    if let Some(wrapped) = wrapped {
+        let wrapped = wrapped.as_object().ok_or_else(|| {
+            "MCP server map must be an object (mcpServers, or VS Code servers)".to_string()
+        })?;
+        Ok(wrapped.clone().into_iter().collect())
+    } else if provenance.is_native() {
+        // Native and explicit CLI files are MCP-only surfaces. Claim every
+        // bare-map key before parsing so a malformed high-precedence override
+        // cannot fall through to an older, already-trusted definition.
+        Ok(root
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "$schema" | "disabledServers" | "enabledServers"
+                )
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect())
+    } else {
+        // Foreign settings files share their root with unrelated settings, so
+        // only object values carrying an MCP execution field are candidates.
+        Ok(root
+            .iter()
+            .filter(|(_, value)| value.get("command").is_some() || value.get("url").is_some())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect())
+    }
+}
+
 /// Load one config file.
 ///
 /// Returns `true` when a whole-file failure in a native or explicitly selected
@@ -737,6 +1258,7 @@ fn load_file(
     out: &mut Vec<(String, RawServer, Provenance, PathBuf)>,
     warnings: &mut Vec<ConfigWarning>,
     claimed_names: &mut std::collections::HashSet<String>,
+    selection: &mut ServerSelection,
 ) -> bool {
     let content = match read_bounded_config(path) {
         Ok(content) => content,
@@ -752,16 +1274,8 @@ fn load_file(
             return provenance.is_native();
         }
     };
-    // TOML is only supported for .codex/config.toml via a minimal parse: the
-    // [mcp_servers.NAME] tables. Everything else is JSON.
-    let parsed: std::result::Result<Value, String> =
-        if path.extension().is_some_and(|e| e == "toml") {
-            Ok(parse_codex_toml(&content))
-        } else {
-            serde_json::from_str(&content).map_err(|err| format!("invalid JSON: {err}"))
-        };
-    let value = match parsed {
-        Ok(value) => value,
+    let servers = match parse_server_map(path, provenance, &content, selection) {
+        Ok(servers) => servers,
         Err(reason) => {
             warnings.push(ConfigWarning {
                 source_file: path.to_path_buf(),
@@ -770,40 +1284,6 @@ fn load_file(
             });
             return provenance.is_native();
         }
-    };
-    // Accept both `{"mcpServers": {...}}` and a bare `{name: {...}}` map.
-    // Presence of the wrapper is authoritative even when it is empty; never
-    // reinterpret unrelated top-level settings as a fallback server map.
-    let Some(root) = value.as_object() else {
-        warnings.push(ConfigWarning {
-            source_file: path.to_path_buf(),
-            entry: "<file>".to_string(),
-            reason: "MCP config root must be an object".to_string(),
-        });
-        return provenance.is_native();
-    };
-    let servers: HashMap<String, Value> = if let Some(wrapped) = root.get("mcpServers") {
-        let Some(wrapped) = wrapped.as_object() else {
-            warnings.push(ConfigWarning {
-                source_file: path.to_path_buf(),
-                entry: "<file>".to_string(),
-                reason: "mcpServers must be an object".to_string(),
-            });
-            return provenance.is_native();
-        };
-        wrapped.clone().into_iter().collect()
-    } else if provenance.is_native() {
-        // Native and explicit CLI files are MCP-only surfaces. Claim every
-        // bare-map key before parsing so a malformed high-precedence override
-        // cannot fall through to an older, already-trusted definition.
-        root.clone().into_iter().collect()
-    } else {
-        // Foreign settings files share their root with unrelated settings, so
-        // only object values carrying an MCP execution field are candidates.
-        root.iter()
-            .filter(|(_, value)| value.get("command").is_some() || value.get("url").is_some())
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
     };
     for (name, raw) in servers {
         // A higher-precedence definition owns its name even when malformed.
@@ -814,77 +1294,67 @@ fn load_file(
         }
         match parse_server(&name, &raw) {
             Ok(server) => out.push((name, server, provenance, path.to_path_buf())),
-            Err(reason) => warnings.push(ConfigWarning {
-                source_file: path.to_path_buf(),
-                entry: name,
-                reason,
-            }),
+            Err(reason) => {
+                // A disabled entry still owns its name when another field is
+                // malformed. Keep an inert reservation so later extension
+                // registration cannot bypass that explicit disablement.
+                if raw.get("enabled").and_then(Value::as_bool) == Some(false)
+                    || raw.get("disabled").and_then(Value::as_bool) == Some(true)
+                {
+                    out.push((
+                        name.clone(),
+                        RawServer {
+                            disabled: Some(true),
+                            ..RawServer::default()
+                        },
+                        provenance,
+                        path.to_path_buf(),
+                    ));
+                }
+                warnings.push(ConfigWarning {
+                    source_file: path.to_path_buf(),
+                    entry: name,
+                    reason,
+                });
+            }
         }
     }
     false
 }
 
-/// Minimal TOML extraction for `.codex/config.toml` `[mcp_servers.NAME]`
-/// tables (string values and string arrays only — the MCP surface).
-/// Never fails: unrecognized lines are ignored.
-fn parse_codex_toml(content: &str) -> Value {
-    let mut servers = serde_json::Map::new();
-    let mut current: Option<(String, serde_json::Map<String, Value>)> = None;
-    let flush = |current: Option<(String, serde_json::Map<String, Value>)>,
-                 servers: &mut serde_json::Map<String, Value>| {
-        if let Some((name, table)) = current {
-            servers.insert(name, Value::Object(table));
-        }
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(name) = line
-            .strip_prefix("[mcp_servers.")
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            let finished = current.take();
-            flush(finished, &mut servers);
-            current = Some((name.trim_matches('"').to_string(), serde_json::Map::new()));
-            continue;
-        }
-        if line.starts_with('[') {
-            let finished = current.take();
-            flush(finished, &mut servers);
-            continue;
-        }
-        if let (Some((_, table)), Some((key, value))) = (current.as_mut(), line.split_once('=')) {
-            let key = key.trim().to_string();
-            let value = value.trim();
-            let parsed = value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .map_or_else(
-                    || {
-                        if value.starts_with('[') {
-                            serde_json::from_str(&value.replace('\'', "\"")).unwrap_or(Value::Null)
-                        } else {
-                            Value::String(value.trim_matches('"').to_string())
-                        }
-                    },
-                    |stripped| Value::String(stripped.to_string()),
-                );
-            table.insert(key, parsed);
+/// Extract only Codex's MCP tables from a fully parsed TOML document.
+fn parse_codex_toml(content: &str) -> Result<Value, String> {
+    let value: toml::Value =
+        toml::from_str(content).map_err(|_| "invalid TOML in MCP configuration".to_string())?;
+    let servers = value
+        .get("mcp_servers")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+    let mut servers = serde_json::to_value(servers)
+        .map_err(|_| "cannot decode Codex MCP configuration".to_string())?;
+    if let Some(servers) = servers.as_object_mut() {
+        for server in servers.values_mut().filter_map(Value::as_object_mut) {
+            if let Some(headers) = server.remove("http_headers") {
+                server.entry("headers").or_insert(headers);
+            }
         }
     }
-    flush(current, &mut servers);
-    Value::Object(serde_json::Map::from_iter([(
-        "mcpServers".to_string(),
-        Value::Object(servers),
-    )]))
+    Ok(serde_json::json!({"mcpServers": servers}))
 }
 
 /// Foreign discovery candidates under the project root.
 const FOREIGN_PROJECT_FILES: &[&str] = &[
+    ".omp/mcp.json",
     ".claude/mcp.json",
+    ".claude/.mcp.json",
     ".cursor/mcp.json",
     ".windsurf/mcp.json",
+    ".windsurf/mcp_config.json",
     ".gemini/settings.json",
     ".codex/config.toml",
+    ".vscode/mcp.json",
+    "mcp.json",
+    ".mcp.json",
 ];
 
 /// The merged discovery result.
@@ -918,6 +1388,7 @@ pub fn discover(
     let mut layered: Vec<(String, RawServer, Provenance, PathBuf)> = Vec::new();
     let mut warnings = Vec::new();
     let mut claimed_names = std::collections::HashSet::new();
+    let mut selection = ServerSelection::default();
 
     // Precedence high → low. Later layers only fill names not already set. A
     // whole-file failure in a native or explicit source blocks every lower
@@ -934,6 +1405,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked && project_trusted {
@@ -943,6 +1415,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked && project_trusted {
@@ -952,6 +1425,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked {
@@ -961,6 +1435,7 @@ pub fn discover(
             &mut layered,
             &mut warnings,
             &mut claimed_names,
+            &mut selection,
         );
     }
     if !lower_layers_blocked && project_trusted {
@@ -971,17 +1446,45 @@ pub fn discover(
                 &mut layered,
                 &mut warnings,
                 &mut claimed_names,
+                &mut selection,
             );
         }
     }
 
     let mut servers = Vec::new();
+    if selection.invalid {
+        return McpDiscovery { servers, warnings };
+    }
     for (name, raw, provenance, source_file) in layered {
         if let Err(reason) = validate_server_name(&name) {
             warnings.push(ConfigWarning {
                 source_file,
                 entry: name,
                 reason,
+            });
+            continue;
+        }
+        let enabled = !selection.disabled.contains(&name)
+            && raw.disabled != Some(true)
+            && (raw.enabled != Some(false) || selection.enabled.contains(&name));
+        if !enabled {
+            // Keep the name occupied even without an executable, credentials,
+            // or a currently available working directory. Neither a lower
+            // file nor an extension may revive a disabled definition.
+            servers.push(ConfiguredServer {
+                name,
+                command: raw.command,
+                args: raw.args.unwrap_or_default(),
+                env: Vec::new(),
+                url: raw.url,
+                headers: Vec::new(),
+                oauth: raw.oauth,
+                transport_hint: raw.transport,
+                enabled: false,
+                cwd: None,
+                timeout_ms: raw.timeout_ms,
+                provenance,
+                source_file,
             });
             continue;
         }
@@ -1008,14 +1511,66 @@ pub fn discover(
                 continue;
             }
         };
+        let execution = (|| -> Result<_, String> {
+            let command = raw
+                .command
+                .as_deref()
+                .map(|value| expand_config_value(value, cwd))
+                .transpose()?;
+            let args = raw
+                .args
+                .unwrap_or_default()
+                .iter()
+                .map(|value| expand_config_value(value, cwd))
+                .collect::<Result<Vec<_>, _>>()?;
+            let url = raw
+                .url
+                .as_deref()
+                .map(|value| expand_config_value(value, cwd))
+                .transpose()?;
+            let server_cwd = raw
+                .cwd
+                .as_deref()
+                .map(|value| expand_config_value(value, cwd))
+                .transpose()?;
+            let server_cwd = server_cwd
+                .map(|value| {
+                    if value.is_empty() {
+                        return Err("cwd must not be empty".to_string());
+                    }
+                    let path = PathBuf::from(value);
+                    Ok(canonical_cwd(&if path.is_absolute() {
+                        path
+                    } else {
+                        cwd.join(path)
+                    }))
+                })
+                .transpose()?;
+            Ok((command, args, url, server_cwd))
+        })();
+        let (command, args, url, server_cwd) = match execution {
+            Ok(values) => values,
+            Err(reason) => {
+                warnings.push(ConfigWarning {
+                    source_file,
+                    entry: name,
+                    reason,
+                });
+                continue;
+            }
+        };
         let config = ConfiguredServer {
             name,
-            command: raw.command,
-            args: raw.args.unwrap_or_default(),
+            command,
+            args,
             env,
-            url: raw.url,
+            url,
             headers,
+            oauth: raw.oauth,
             transport_hint: raw.transport,
+            enabled,
+            cwd: server_cwd,
+            timeout_ms: raw.timeout_ms,
             provenance,
             source_file,
         };
@@ -1028,6 +1583,27 @@ pub fn discover(
             continue;
         }
         servers.push(config);
+    }
+    // The denylist also applies to extension definitions registered after
+    // discovery, even when no file currently defines that server name.
+    for (name, (provenance, source_file)) in selection.disabled_sources {
+        if !servers.iter().any(|server| server.name == name) {
+            servers.push(ConfiguredServer {
+                name,
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                url: None,
+                headers: Vec::new(),
+                oauth: None,
+                transport_hint: None,
+                enabled: false,
+                cwd: None,
+                timeout_ms: None,
+                provenance,
+                source_file,
+            });
+        }
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
     McpDiscovery { servers, warnings }
@@ -1061,6 +1637,58 @@ pub fn read_project_config(path: &Path) -> Result<Value, crate::error::Error> {
             format!("[MCP_CONFIG_IO] cannot read {}: {err}", path.display()),
         )),
     }
+}
+
+/// Insert or replace `name` in a project config's `mcpServers` object.
+///
+/// A missing or `null` `mcpServers` member (and a `null` document) starts
+/// empty, as before.
+///
+/// # Errors
+///
+/// Refuses a config whose top level or whose `mcpServers` member is some
+/// other non-object value. Indexing such a [`Value`] by key panics, and
+/// replacing it would discard what the user wrote.
+pub fn insert_project_server(
+    config: &mut Value,
+    name: &str,
+    entry: Value,
+) -> Result<(), crate::error::Error> {
+    let not_an_object = |what: &str| {
+        crate::error::Error::tool(
+            "mcp",
+            format!("[MCP_CONFIG_INVALID] {what} must be a JSON object"),
+        )
+    };
+    if config.is_null() {
+        *config = Value::Object(serde_json::Map::new());
+    }
+    let servers = config
+        .as_object_mut()
+        .ok_or_else(|| not_an_object("the project MCP config"))?
+        .entry("mcpServers")
+        .or_insert(Value::Null);
+    if servers.is_null() {
+        *servers = Value::Object(serde_json::Map::new());
+    }
+    servers
+        .as_object_mut()
+        .ok_or_else(|| not_an_object("`mcpServers`"))?
+        .insert(name.to_string(), entry);
+    Ok(())
+}
+
+/// Remove `name` from a project config's `mcpServers` object.
+///
+/// Returns whether an entry was removed. A config whose top level or whose
+/// `mcpServers` member is not an object has no such server and is left
+/// untouched: it is never indexed, because indexing a non-object [`Value`]
+/// by key panics.
+pub fn remove_project_server(config: &mut Value, name: &str) -> bool {
+    config
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|servers| servers.remove(name).is_some())
 }
 
 /// Write the project config back (pretty JSON, parent dirs created).
@@ -1618,7 +2246,11 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: None,
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::GlobalPi,
             source_file: PathBuf::from("/tmp/whatever.json"),
         }
@@ -1794,7 +2426,11 @@ mod tests {
             env: Vec::new(),
             url: Some("https://example.invalid/mcp".to_string()),
             headers: Vec::new(),
+            oauth: None,
             transport_hint: None,
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::GlobalPi,
             source_file: PathBuf::from("/tmp/remote.json"),
         };
@@ -1856,6 +2492,618 @@ mod tests {
         assert!(
             !path.exists(),
             "rejected output must not create the config file"
+        );
+    }
+
+    #[test]
+    fn project_server_edits_never_index_a_non_object_config() {
+        use serde_json::json;
+
+        // `/mcp add` and `/mcp remove` used to index these by key, which
+        // panics for every shape below except a bare `null`.
+        for config in [
+            json!([]),
+            json!("text"),
+            json!(7),
+            json!({"mcpServers": []}),
+            json!({"mcpServers": "text"}),
+        ] {
+            let mut removed = config.clone();
+            assert!(!remove_project_server(&mut removed, "docs"), "{config}");
+            assert_eq!(removed, config, "a refused removal must not edit");
+
+            let mut added = config.clone();
+            let error = insert_project_server(&mut added, "docs", json!({"command": "x"}))
+                .expect_err("a non-object config is refused");
+            assert!(error.to_string().contains("MCP_CONFIG_INVALID"), "{error}");
+            assert_eq!(added, config, "a refused insertion must not edit");
+        }
+
+        for config in [json!(null), json!({}), json!({"mcpServers": null})] {
+            let mut removed = config.clone();
+            assert!(!remove_project_server(&mut removed, "docs"), "{config}");
+            assert_eq!(removed, config, "an unknown server must not edit");
+
+            let mut added = config;
+            insert_project_server(&mut added, "docs", json!({"command": "x"}))
+                .expect("an empty config accepts a server");
+            assert_eq!(added, json!({"mcpServers": {"docs": {"command": "x"}}}));
+        }
+
+        let mut config = json!({"mcpServers": {"docs": {"command": "x"}, "db": {}}, "other": 1});
+        insert_project_server(&mut config, "docs", json!({"url": "https://example.test"}))
+            .expect("replace");
+        assert!(remove_project_server(&mut config, "db"));
+        assert!(!remove_project_server(&mut config, "db"));
+        assert_eq!(
+            config,
+            json!({"mcpServers": {"docs": {"url": "https://example.test"}}, "other": 1})
+        );
+    }
+
+    #[test]
+    fn omp_vscode_and_portable_configs_follow_native_precedence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("project");
+        for (file, contents) in [
+            (
+                ".pi/mcp.json",
+                r#"{"mcpServers":{"shared":{"command":"native"}}}"#,
+            ),
+            (
+                ".omp/mcp.json",
+                r#"{"mcpServers":{"shared":{"command":"omp"},"omp":{"command":"omp"}}}"#,
+            ),
+            (
+                ".vscode/mcp.json",
+                r#"{"servers":{"shared":{"command":"vscode"},"vscode":{"command":"code"}},"inputs":[{}]}"#,
+            ),
+            (
+                "mcp.json",
+                r#"{"mcpServers":{"shared":{"command":"portable"},"portable":{"command":"root"}}}"#,
+            ),
+            (
+                ".mcp.json",
+                r#"{"mcpServers":{"portable":{"command":"hidden"},"hidden":{"command":"hidden"}}}"#,
+            ),
+        ] {
+            write(&cwd.join(file), contents);
+        }
+        let discovery = discover(&cwd, &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        assert_eq!(discovery.servers.len(), 5);
+        let server = |name| {
+            discovery
+                .servers
+                .iter()
+                .find(|server| server.name == name)
+                .unwrap()
+        };
+        assert_eq!(server("shared").command.as_deref(), Some("native"));
+        assert_eq!(server("portable").command.as_deref(), Some("root"));
+        for name in ["omp", "vscode", "portable", "hidden"] {
+            assert_eq!(server(name).provenance, Provenance::Foreign);
+        }
+    }
+
+    #[test]
+    fn vscode_nested_servers_are_not_confused_with_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".vscode/mcp.json"),
+            r#"{
+            "mcp":{"servers":{"docs":{"command":"docs-server","enabled":false}}},
+            "inputs":[{"id":"token","type":"promptString"}]
+        }"#,
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty());
+        assert_eq!(discovery.servers.len(), 1);
+        assert!(!discovery.servers[0].enabled);
+    }
+
+    #[test]
+    fn imported_configs_are_not_read_without_workspace_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for file in [".omp/mcp.json", ".vscode/mcp.json", "mcp.json", ".mcp.json"] {
+            write(&temp.path().join(file), "{malformed must never be read");
+        }
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], false);
+        assert!(discovery.servers.is_empty());
+        assert!(discovery.warnings.is_empty());
+    }
+
+    #[test]
+    fn disabled_override_keeps_its_name_without_resolving_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{
+            "docs":{"enabled":false,"command":"${PI_MCP_MISSING_DISABLED_COMMAND}"},
+            "absent":{"disabled":true}
+        }}"#,
+        );
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"docs":{"command":"fallback"},"absent":{"command":"fallback"}}}"#,
+        );
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.warnings.is_empty());
+        assert_eq!(discovery.servers.len(), 2);
+        assert!(discovery.servers.iter().all(|server| !server.enabled));
+        assert!(
+            discovery
+                .servers
+                .iter()
+                .all(|server| server.provenance == Provenance::ProjectPi)
+        );
+    }
+
+    #[test]
+    fn native_user_selection_deny_wins_and_can_enable_foreign_definitions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &temp.path().join(".omp/mcp.json"),
+            r#"{"mcpServers":{
+            "allowed":{"command":"server","enabled":false},
+            "blocked":{"command":"server","enabled":false},
+            "explicit":{"command":"server","disabled":true}
+        }}"#,
+        );
+        write(
+            &global.join("mcp.json"),
+            r#"{
+            "enabledServers":["allowed","blocked","explicit"],
+            "disabledServers":["blocked","extension-only"]
+        }"#,
+        );
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.warnings.is_empty());
+        assert_eq!(discovery.servers.len(), 4);
+        let enabled: Vec<_> = discovery
+            .servers
+            .iter()
+            .filter(|server| server.enabled)
+            .map(|server| server.name.as_str())
+            .collect();
+        assert_eq!(enabled, ["allowed"]);
+        let placeholder = discovery
+            .servers
+            .iter()
+            .find(|server| server.name == "extension-only")
+            .unwrap();
+        assert_eq!(placeholder.source_file, global.join("mcp.json"));
+        assert!(placeholder.command.is_none());
+    }
+
+    #[test]
+    fn malformed_enable_and_timeout_fields_cannot_fall_back_to_trusted_definitions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        for invalid in [
+            serde_json::json!({"enabled":"false"}),
+            serde_json::json!({"enabled":null}),
+            serde_json::json!({"disabled":"true"}),
+            serde_json::json!({"timeout":0}),
+            serde_json::json!({"timeout":-1}),
+            serde_json::json!({"timeout":1.5}),
+            serde_json::json!({"timeout":3_600_001}),
+            serde_json::json!({"timeout":1000,"timeout_ms":1000}),
+            serde_json::json!({"cwd":null}),
+        ] {
+            write(
+                &temp.path().join(".pi/mcp.json"),
+                &serde_json::json!({"mcpServers":{"docs":invalid}}).to_string(),
+            );
+            write(
+                &global.join("mcp.json"),
+                r#"{"mcpServers":{"docs":{"command":"fallback"}}}"#,
+            );
+            let discovery = discover(temp.path(), &global, &[], true);
+            assert!(discovery.servers.is_empty(), "{invalid}");
+            assert_eq!(discovery.warnings.len(), 1, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn malformed_user_denylist_cannot_leave_project_servers_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{"docs":{"command":"server"}}}"#,
+        );
+        write(&global.join("mcp.json"), r#"{"disabledServers":"docs"}"#);
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.servers.is_empty());
+        assert_eq!(discovery.warnings.len(), 1);
+    }
+
+    #[test]
+    fn malformed_disabled_entry_still_reserves_the_name_for_later_extensions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".omp/mcp.json"),
+            r#"{"mcpServers":{
+            "docs":{"enabled":false,"timeout":0,"command":"server"}
+        }}"#,
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert_eq!(discovery.warnings.len(), 1);
+        assert_eq!(discovery.servers.len(), 1);
+        assert_eq!(discovery.servers[0].name, "docs");
+        assert!(!discovery.servers[0].enabled);
+        assert!(discovery.servers[0].command.is_none());
+    }
+
+    #[test]
+    fn file_cwd_expansion_and_timeout_survive_discovery_and_bind_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("project");
+        std::fs::create_dir_all(cwd.join("server")).unwrap();
+        write(
+            &cwd.join(".omp/mcp.json"),
+            r#"{"mcpServers":{"docs":{
+            "command":"./serve","args":["${workspaceFolder}/input"],
+            "cwd":"server","timeout":120000,
+            "env":{"TOKEN":"${PI_MCP_DEFERRED_TOKEN}"}
+        }}}"#,
+        );
+        let discovery = discover(&cwd, &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        let server = &discovery.servers[0];
+        assert_eq!(server.cwd, Some(cwd.join("server").canonicalize().unwrap()));
+        assert_eq!(server.timeout_ms, Some(120_000));
+        assert_eq!(
+            server.args,
+            [cwd.join("input").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            server.env,
+            [("TOKEN".to_string(), "${PI_MCP_DEFERRED_TOKEN}".to_string())]
+        );
+        let mut changed = server.clone();
+        changed.cwd = Some(cwd.clone());
+        assert_ne!(
+            server.fingerprint(&server.effective_cwd(&cwd)),
+            changed.fingerprint(&changed.effective_cwd(&cwd))
+        );
+    }
+
+    #[test]
+    fn config_variables_expand_once_with_no_command_interpretation() {
+        let workspace = Path::new("/workspace/project");
+        let lookup = |name: &str| match name {
+            "TOKEN" => Some("secret-token".to_string()),
+            "DATA" => Some("$CMD:do-not-run".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(
+            expand_config_value_with("Bearer ${TOKEN}", workspace, lookup).unwrap(),
+            "Bearer secret-token"
+        );
+        assert_eq!(
+            expand_config_value_with("${env:TOKEN}", workspace, lookup).unwrap(),
+            "secret-token"
+        );
+        assert_eq!(
+            expand_config_value_with("${MISSING:-fallback}/${EMPTY:-value}", workspace, lookup)
+                .unwrap(),
+            "fallback/value"
+        );
+        assert_eq!(
+            expand_config_value_with("${DATA}", workspace, lookup).unwrap(),
+            "$CMD:do-not-run"
+        );
+        assert_eq!(
+            expand_config_value_with("${workspaceFolder}/src", workspace, lookup).unwrap(),
+            "/workspace/project/src"
+        );
+        for value in ["${MISSING}", "${input:secret}", "${TOKEN", "${}"] {
+            assert!(
+                expand_config_value_with(value, workspace, lookup).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_oauth_settings_survive_discovery_without_resolving_secrets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let options = serde_json::json!({
+            "clientId": "${PI_MCP_CONFIGURED_CLIENT}",
+            "clientSecret": "$CMD:exit 97",
+            "scope": "${PI_MCP_CONFIGURED_SCOPE}",
+            "redirectUri": "${PI_MCP_CONFIGURED_REDIRECT}",
+            "callbackPort": 43121,
+            "callbackPath": "${PI_MCP_CONFIGURED_CALLBACK}",
+            "prompt": ""
+        });
+        write(
+            &temp.path().join(".omp/mcp.json"),
+            &serde_json::json!({"mcpServers": {
+                "protected": {"url": "https://mcp.example.test", "oauth": options},
+                "disabled": {
+                    "url": "https://mcp.example.test", "enabled": false, "oauth": options
+                }
+            }})
+            .to_string(),
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        assert_eq!(discovery.servers.len(), 2);
+        let server = discovery
+            .servers
+            .iter()
+            .find(|server| server.name == "protected")
+            .expect("protected server");
+        let oauth = server.oauth.as_ref().expect("OAuth settings");
+        assert_eq!(server.provenance, Provenance::Foreign);
+        assert_eq!(
+            oauth.client_id.as_deref(),
+            Some("${PI_MCP_CONFIGURED_CLIENT}")
+        );
+        assert_eq!(oauth.client_secret.as_deref(), Some("$CMD:exit 97"));
+        assert_eq!(oauth.scope.as_deref(), Some("${PI_MCP_CONFIGURED_SCOPE}"));
+        assert_eq!(
+            oauth.redirect_uri.as_deref(),
+            Some("${PI_MCP_CONFIGURED_REDIRECT}")
+        );
+        assert_eq!(oauth.callback_port, Some(43121));
+        assert_eq!(
+            oauth.callback_path.as_deref(),
+            Some("${PI_MCP_CONFIGURED_CALLBACK}")
+        );
+        assert_eq!(oauth.prompt.as_deref(), Some(""));
+        let disabled = discovery
+            .servers
+            .iter()
+            .find(|server| server.name == "disabled")
+            .expect("disabled server");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.oauth.as_ref(), Some(oauth));
+        let debug = format!("{server:?}");
+        assert!(!debug.contains("$CMD:exit 97"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn malformed_oauth_blocks_lower_precedence_without_echoing_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        write(
+            &global.join("mcp.json"),
+            r#"{"mcpServers":{"remote":{"url":"https://fallback.example.test"}}}"#,
+        );
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("DO_NOT_ECHO_CREDENTIAL"),
+            serde_json::json!({"clientSecret": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"clientId": "client", "clientSecret": null}),
+            serde_json::json!({"clientId": "client", "clientSecret": ["DO_NOT_ECHO_CREDENTIAL"]}),
+            serde_json::json!({"clientId": "", "clientSecret": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"clientId": "client", "clientSecret": "DO_NOT_ECHO_CREDENTIAL\n"}),
+            serde_json::json!({"callbackPort": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"callbackPort": 0}),
+            serde_json::json!({"callbackPort": -1}),
+            serde_json::json!({"callbackPort": 65536}),
+            serde_json::json!({"callbackPort": 1.5}),
+            serde_json::json!({"prompt": null}),
+            serde_json::json!({"unknown": "DO_NOT_ECHO_CREDENTIAL"}),
+            serde_json::json!({"redirectUri": "https://127.0.0.1:43121/callback"}),
+            serde_json::json!({"redirectUri": "http://remote.example.test:43121/callback"}),
+            serde_json::json!({
+                "redirectUri": "http://127.0.0.1:43121/callback", "callbackPort": 43122
+            }),
+            serde_json::json!({
+                "redirectUri": "http://127.0.0.1:43121/callback", "callbackPath": "/other"
+            }),
+        ] {
+            write(
+                &temp.path().join(".pi/mcp.json"),
+                &serde_json::json!({"mcpServers": {"remote": {
+                    "url": "https://mcp.example.test", "oauth": invalid
+                }}})
+                .to_string(),
+            );
+            let discovery = discover(temp.path(), &global, &[], true);
+            assert!(discovery.servers.is_empty(), "{invalid}");
+            assert_eq!(discovery.warnings.len(), 1, "{invalid}");
+            assert!(!format!("{:?}", discovery.warnings).contains("DO_NOT_ECHO_CREDENTIAL"));
+        }
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{"remote":{"command":"server","oauth":{"clientId":"client"}}}}"#,
+        );
+        let discovery = discover(temp.path(), &global, &[], true);
+        assert!(discovery.servers.is_empty());
+        assert!(discovery.warnings[0].reason.contains("stdio transport"));
+    }
+
+    #[test]
+    fn oauth_callback_validation_accepts_loopback_without_rewriting_registered_uri() {
+        for redirect in [
+            "http://127.0.0.1:43121/callback",
+            "http://127.0.0.2:43121/callback",
+            "http://[::1]:43121/callback",
+            "http://localhost:43121/callback",
+            "http://127.0.0.1:80/callback",
+            "http://127.0.0.1:43121/callback%20path",
+        ] {
+            let options = McpOAuthConfig {
+                redirect_uri: Some(redirect.to_string()),
+                prompt: Some(String::new()),
+                ..McpOAuthConfig::default()
+            };
+            options.validate_raw().expect("raw loopback callback");
+            options
+                .validate_resolved()
+                .expect("resolved loopback callback");
+            assert_eq!(options.redirect_uri.as_deref(), Some(redirect));
+        }
+        let options = McpOAuthConfig {
+            redirect_uri: Some("http://localhost/callback".to_string()),
+            callback_port: Some(80),
+            callback_path: Some("/callback".to_string()),
+            ..McpOAuthConfig::default()
+        };
+        options
+            .validate_resolved()
+            .expect("matching default HTTP port");
+        for redirect in [
+            "http://0.0.0.0:43121/callback",
+            "http://[::]:43121/callback",
+            "http://localhost.example:43121/callback",
+            "http://127.0.0.1:0/callback",
+            "http://user:secret@127.0.0.1:43121/callback",
+            "http://127.0.0.1:43121/callback?state=fixed",
+            "http://127.0.0.1:43121/callback#fragment",
+            "http://127.0.0.1:43121/call back",
+            "http://127.0.0.1:43121/a/../callback",
+            "http://127.0.0.1:43121/%2e%2e/callback",
+            "http://@127.0.0.1:43121/callback",
+            " http://127.0.0.1:43121/callback",
+            "http://127.0.0.1:43121\\callback",
+            "http:127.0.0.1:43121/callback",
+        ] {
+            let options = McpOAuthConfig {
+                redirect_uri: Some(redirect.to_string()),
+                ..McpOAuthConfig::default()
+            };
+            assert!(options.validate_resolved().is_err(), "{redirect}");
+        }
+        for path in [
+            "",
+            "callback",
+            "//other/callback",
+            "/a/../callback",
+            "/a b",
+            "/cb?x",
+            "/cb#x",
+        ] {
+            let options = McpOAuthConfig {
+                callback_path: Some(path.to_string()),
+                ..McpOAuthConfig::default()
+            };
+            assert!(options.validate_resolved().is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn oauth_callback_templates_are_checked_after_trusted_expansion() {
+        let mut options = McpOAuthConfig {
+            redirect_uri: Some("${CALLBACK}".to_string()),
+            callback_path: Some("${CALLBACK_PATH}".to_string()),
+            callback_port: Some(43121),
+            ..McpOAuthConfig::default()
+        };
+        options.validate_raw().expect("retain callback templates");
+        assert!(options.validate_resolved().is_err());
+        options.redirect_uri = Some(
+            expand_config_value_with(
+                options.redirect_uri.as_deref().unwrap(),
+                Path::new("."),
+                |_| Some("http://127.0.0.1:43121/login".to_string()),
+            )
+            .expect("expand redirect"),
+        );
+        options.callback_path = Some(
+            expand_config_value_with(
+                options.callback_path.as_deref().unwrap(),
+                Path::new("."),
+                |_| Some("/login".to_string()),
+            )
+            .expect("expand path"),
+        );
+        options
+            .validate_resolved()
+            .expect("resolved matching callback");
+        options.callback_path = Some("/different".to_string());
+        assert!(options.validate_resolved().is_err());
+    }
+
+    #[test]
+    fn oauth_trust_fingerprint_binds_every_authored_option_and_secret_reference() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".pi/mcp.json"),
+            r#"{"mcpServers":{"remote":{
+                "url":"https://mcp.example.test",
+                "oauth":{
+                    "clientId":"client",
+                    "clientSecret":"$ENV:SECRET_A",
+                    "scope":"read offline_access",
+                    "redirectUri":"http://127.0.0.1:43121/callback",
+                    "callbackPort":43121,
+                    "callbackPath":"/callback",
+                    "prompt":""
+                }
+            }}}"#,
+        );
+        let server = discover(temp.path(), &temp.path().join("global"), &[], true)
+            .servers
+            .remove(0);
+        let fingerprint = server.fingerprint(temp.path());
+        let changes: [fn(&mut McpOAuthConfig); 7] = [
+            |oauth| oauth.client_id = Some("other-client".to_string()),
+            |oauth| oauth.client_secret = Some("$ENV:SECRET_B".to_string()),
+            |oauth| oauth.scope = Some("write offline_access".to_string()),
+            |oauth| oauth.redirect_uri = Some("http://localhost:43121/callback".to_string()),
+            |oauth| oauth.callback_port = Some(43122),
+            |oauth| oauth.callback_path = Some("/other".to_string()),
+            |oauth| oauth.prompt = None,
+        ];
+        for change in changes {
+            let mut changed = server.clone();
+            change(changed.oauth.as_mut().expect("OAuth settings"));
+            assert_ne!(fingerprint, changed.fingerprint(temp.path()));
+        }
+        let mut absent = server.clone();
+        absent.oauth = None;
+        assert_ne!(fingerprint, absent.fingerprint(temp.path()));
+        let absent_fingerprint = absent.fingerprint(temp.path());
+        absent.oauth = Some(McpOAuthConfig::default());
+        assert_ne!(absent_fingerprint, absent.fingerprint(temp.path()));
+        assert_eq!(
+            server.oauth.as_ref().unwrap().client_secret.as_deref(),
+            Some("$ENV:SECRET_A")
+        );
+    }
+
+    #[test]
+    fn codex_toml_preserves_disabled_flags_nested_env_and_multiline_arguments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write(
+            &temp.path().join(".codex/config.toml"),
+            r#"
+            [mcp_servers."docs.api"]
+            command = 'server'
+            args = [
+                'first', # comments are TOML, not argv
+                'second',
+            ]
+            enabled = true
+            cwd = 'service'
+            [mcp_servers."docs.api".env]
+            TOKEN = '${env:TOKEN}'
+            [mcp_servers.disabled]
+            command = 'never'
+            enabled = false
+        "#,
+        );
+        let discovery = discover(temp.path(), &temp.path().join("global"), &[], true);
+        assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+        assert_eq!(discovery.servers.len(), 2);
+        assert!(!discovery.servers[0].enabled);
+        let server = &discovery.servers[1];
+        assert_eq!(server.name, "docs.api");
+        assert_eq!(server.args, ["first", "second"]);
+        assert_eq!(
+            server.env,
+            [("TOKEN".to_string(), "${env:TOKEN}".to_string())]
         );
     }
 }

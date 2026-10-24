@@ -1,0 +1,415 @@
+diff --git a/src/interactive_ftui.rs b/src/interactive_ftui.rs
+--- a/src/interactive_ftui.rs
++++ b/src/interactive_ftui.rs
+@@ -370,20 +370,37 @@ fn drain_agent_events(
+     stopped: impl Fn() -> bool,
+ ) {
+     loop {
+         if stopped() {
+             return;
+         }
+         match rx.recv_timeout(AGENT_EVENT_POLL) {
+             Ok(msg) => {
++                let is_shutdown = matches!(&msg, PiMsg::UiShutdown);
+                 if send(PiFtuiMsg::Agent(msg)).is_err() {
+                     // The runtime disconnected or cancelled a full-queue wait.
+                     return;
+                 }
++                if is_shutdown {
++                    // UiShutdown is terminal even while extensions retain
++                    // senders. Do not wait for disconnection or forward late
++                    // callbacks after the runtime has been asked to stop.
++                    return;
++                }
+             }
+             Err(RecvTimeoutError::Timeout) => {}
+             Err(RecvTimeoutError::Disconnected) => {
+-                // Agent side hung up (bridge shutdown). Nothing more to
+-                // forward; let the runtime reap the thread.
++                // No producer remains: an apparently live editor cannot
++                // submit anything now. This includes startup failure and a
++                // driver panic, not just an intentional shutdown. All queued
++                // messages were delivered before recv reports Disconnected.
++                // The launcher joins the driver and reports its real error.
++                if !stopped() {
++                    tracing::debug!(
++                        event = "ftui.agent_event_stream.disconnected",
++                        "agent event stream ended; requesting FTUI shutdown"
++                    );
++                    let _ = send(PiFtuiMsg::Agent(PiMsg::UiShutdown));
++                }
+                 return;
+             }
+         }
+@@ -5585,8 +5602,20 @@ impl Model for PiFtuiModel {
+         // receiver from the shared slot.
+         vec![Box::new(AgentEventSubscription::from_shared(Arc::clone(
+             &self.agent_rx,
+         )))]
+     }
++
++    fn on_shutdown(&mut self) -> Cmd<PiFtuiMsg> {
++        // Ctrl+C and failed editor recovery are not the only exit paths.
++        // The runtime also shuts down for /exit, Ctrl+D, and terminal errors.
++        // Stop live work before teardown joins the driver, and resolve cards
++        // while their reply channels still exist. Both operations are safe
++        // when an earlier terminal-failure handler already began shutdown.
++        self.pending_quit = true;
++        self.abort_running_turn();
++        self.dismiss_pending_interactions();
++        Cmd::none()
++    }
+ }
+ 
+ impl PiFtuiModel {
+@@ -6066,5 +6095,24 @@
+ const EXT_UI_TIMEOUT_MS: u64 = 300_000;
+ 
++/// Notify the UI when the driver scope exits, independent of event-sender
++/// lifetime. The UI's command registry can retain an extension manager that
++/// owns an FtuiExtensionUiHandler, whose sender keeps the event stream open.
++/// Waiting for RecvTimeoutError::Disconnected is therefore insufficient.
++///
++/// Install after runtime construction, before session startup: it notifies
++/// before the runtime is dropped, including on an unwinding panic. Aborting
++/// panics terminate the process and do not run Rust destructors.
++#[must_use]
++struct DriverExitNotice(Sender<PiMsg>);
++
++impl Drop for DriverExitNotice {
++    fn drop(&mut self) {
++        // This is the existing unbounded driver-to-bridge channel. Do not
++        // acquire a UI lock or wait for a reply while unwinding the driver.
++        let _ = self.0.send(PiMsg::UiShutdown);
++    }
++}
++
+ /// Driver-side extension UI surface (bd-1eoh4): forwards requests to the UI
+ /// as `PiMsg::ExtensionUiRequest` and awaits the typed reply routed back over
+ /// the extension reply channel — the same oneshot-pending shape as
+@@ -9159,5 +9207,6 @@
+                 Err(err) => {
+                     let _ = agent_tx.send(PiMsg::AgentError(format!("runtime build: {err}")));
++                    let _ = agent_tx.send(PiMsg::UiShutdown);
+                     return Err(std::io::Error::other(format!(
+                         "FTUI runtime build failed: {err}"
+                     )));
+@@ -9165,5 +9214,9 @@
+                 }
+             };
++            // Declared after runtime so the UI is notified before runtime
++            // teardown, even when the UI still owns extension sender clones.
++            // Session startup and every driver return are inside this scope.
++            let _driver_exit = DriverExitNotice(agent_tx.clone());
+             let runtime_handle = runtime.handle();
+             let terminal_agent_tx = agent_tx.clone();
+             // The driver future is a few bytes over clippy's 16 KiB
+@@ -10072,6 +10125,308 @@ mod tests {
+         let (tx, rx) = mpsc::channel();
+         (tx, PiFtuiModel::new(rx))
+     }
+ 
++    #[test]
++    fn driver_disconnect_delivers_queued_events_before_shutdown() {
++        let (agent_tx, agent_rx) = mpsc::channel();
++        let (bridge_tx, bridge_rx) = mpsc::channel();
++        agent_tx.send(PiMsg::System(String::from("initializing"))).unwrap();
++        agent_tx.send(PiMsg::AgentError(String::from("driver failed"))).unwrap();
++        drop(agent_tx);
++
++        drain_agent_events(&agent_rx, |message| bridge_tx.send(message), || false);
++
++        let messages: Vec<_> = bridge_rx.try_iter().collect();
++        assert!(matches!(
++            messages.as_slice(),
++            [
++                PiFtuiMsg::Agent(PiMsg::System(first)),
++                PiFtuiMsg::Agent(PiMsg::AgentError(error)),
++                PiFtuiMsg::Agent(PiMsg::UiShutdown),
++            ] if first == "initializing" && error == "driver failed"
++        ));
++    }
++
++    #[test]
++    fn driver_disconnect_stops_the_real_model_without_a_keystroke() {
++        let (agent_tx, model) = new_model();
++        // The bridge takes this exact receiver, as Subscription::run does;
++        // no synthetic UiShutdown is injected by the test.
++        let source = model
++            .agent_rx
++            .lock()
++            .expect("receiver slot")
++            .take()
++            .expect("one driver stream");
++        let (bridge_tx, bridge_rx) = mpsc::channel();
++        let mut sim = ProgramSimulator::new(model);
++        sim.init();
++        agent_tx.send(PiMsg::AgentError(String::from("startup failed"))).unwrap();
++        drop(agent_tx);
++
++        drain_agent_events(&source, |message| bridge_tx.send(message), || false);
++        for message in bridge_rx.try_iter() {
++            sim.send(message);
++        }
++
++        assert!(!sim.is_running(), "a dead driver must not leave a live prompt");
++        assert_eq!(sim.model().error_banner.as_deref(), Some("startup failed"));
++        assert_eq!(
++            sim.command_log().iter().filter(|cmd| matches!(cmd, CmdRecord::Quit)).count(),
++            1,
++            "the disconnected bridge requests exactly one runtime quit"
++        );
++    }
++
++    #[test]
++    fn bridge_stop_racing_disconnect_does_not_enqueue_another_shutdown() {
++        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
++        let (bridge_tx, bridge_rx) = mpsc::channel();
++        drop(agent_tx);
++        let checks = Cell::new(0);
++
++        drain_agent_events(
++            &agent_rx,
++            |message| bridge_tx.send(message),
++            || {
++                let check = checks.get() + 1;
++                checks.set(check);
++                check >= 2 // runtime stops between the loop guard and receive
++            },
++        );
++
++        assert_eq!(checks.get(), 2, "recheck stop after observing disconnect");
++        assert!(bridge_rx.try_iter().next().is_none());
++    }
++
++    #[test]
++    fn orderly_shutdown_is_forwarded_exactly_once() {
++        let (agent_tx, agent_rx) = mpsc::channel();
++        let (bridge_tx, bridge_rx) = mpsc::channel();
++        agent_tx.send(PiMsg::UiShutdown).expect("orderly shutdown");
++        drop(agent_tx);
++
++        drain_agent_events(&agent_rx, |message| bridge_tx.send(message), || false);
++
++        let messages: Vec<_> = bridge_rx.try_iter().collect();
++        assert!(matches!(
++            messages.as_slice(),
++            [PiFtuiMsg::Agent(PiMsg::UiShutdown)]
++        ));
++    }
++
++    #[test]
++    fn shutdown_send_cancellation_is_terminal_not_a_retry_loop() {
++        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
++        drop(agent_tx);
++        let sends = Cell::new(0);
++
++        drain_agent_events(
++            &agent_rx,
++            |message| {
++                assert!(matches!(&message, PiFtuiMsg::Agent(PiMsg::UiShutdown)));
++                sends.set(sends.get() + 1);
++                // Same failure shape as the runtime's stop-aware sender when
++                // shutdown interrupts a wait on a full subscription queue.
++                Err(mpsc::SendError(message))
++            },
++            || false,
++        );
++
++        assert_eq!(sends.get(), 1, "a cancelled terminal send is never retried");
++    }
++
++    #[test]
++    fn runtime_shutdown_aborts_live_work_and_is_idempotent() {
++        let (_tx, model) = new_model();
++        let (abort, signal) = crate::agent::AbortHandle::new();
++        let abort_slot = Arc::new(Mutex::new(Some(abort)));
++        let mut model = model.with_turn_abort(Arc::clone(&abort_slot));
++
++        assert!(matches!(model.on_shutdown(), Cmd::None));
++        assert!(signal.is_aborted(), "shutdown must not await a live turn");
++        assert!(abort_slot.lock().expect("abort slot").is_none());
++        assert!(model.pending_quit);
++        assert!(matches!(model.on_shutdown(), Cmd::None));
++        assert!(model.terminal_failure.lock().expect("failure slot").is_none());
++    }
++
++    #[test]
++    fn runtime_shutdown_aborts_the_controlled_turn_not_only_the_legacy_slot() {
++        let provider = Arc::new(
++            crate::providers::openai::OpenAIProvider::new("shutdown-fixture")
++                .with_base_url("http://127.0.0.1:1/v1"),
++        );
++        let agent = crate::agent::Agent::new(
++            provider,
++            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
++            crate::agent::AgentConfig::default(),
++        );
++        let session = crate::agent::AgentSession::new(
++            agent,
++            Arc::new(asupersync::sync::Mutex::new(crate::session::Session::in_memory())),
++            false,
++            crate::compaction::ResolvedCompactionSettings::default(),
++        );
++        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
++            session,
++            crate::sdk::EventListeners::default(),
++        );
++        // Never polled: the real control lane exists, but no provider request
++        // can be made. The default FTUI driver uses this lane, not turn_abort.
++        let turn = handle.prompt_controlled(String::from("start"), |_| {});
++        let control = turn.control();
++        let (_tx, model) = new_model();
++        let mut model = model.with_turn_control(Arc::new(Mutex::new(Some(control.clone()))));
++        assert!(control.snapshot().accepting_input);
++
++        assert!(matches!(model.on_shutdown(), Cmd::None));
++        assert!(!control.snapshot().accepting_input);
++        assert!(matches!(model.on_shutdown(), Cmd::None));
++        drop(turn);
++    }
++
++    #[test]
++    fn runtime_shutdown_resolves_active_and_queued_cards_once() {
++        let (_tx, model) = new_model();
++        let (ask_tx, ask_rx) = mpsc::channel();
++        let (ext_tx, ext_rx) = mpsc::channel();
++        let model = model.with_ask_reply_channel(ask_tx).with_ext_reply_channel(ext_tx);
++        let mut sim = ProgramSimulator::new(model);
++        sim.init();
++        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
++        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
++            "shutdown-ask",
++            vec![question("Continue?", &["yes", "no"], false)],
++        ))));
++        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
++            "shutdown-extension",
++            "confirm",
++            serde_json::json!({"title": "Queued?"}),
++        ))));
++        assert_eq!(sim.model().ext_queue.len(), 1);
++
++        assert!(matches!(sim.model_mut().on_shutdown(), Cmd::None));
++        let ask = ask_rx.try_recv().expect("Ask waiter released");
++        assert_eq!(ask.request_id, "shutdown-ask");
++        assert!(ask.response.dismissed);
++        let ext = ext_rx.try_recv().expect("extension waiter released");
++        assert_eq!(ext.id, "shutdown-extension");
++        assert!(ext.cancelled);
++        assert!(sim.model().active_ask.is_none());
++        assert!(sim.model().active_ext.is_none());
++        assert!(sim.model().ext_queue.is_empty());
++
++        assert!(matches!(sim.model_mut().on_shutdown(), Cmd::None));
++        assert!(ask_rx.try_iter().next().is_none());
++        assert!(ext_rx.try_iter().next().is_none());
++    }
++
++    #[test]
++    fn driver_return_notifies_while_an_extension_owns_the_event_sender() {
++        for fail in [false, true] {
++            let (agent_tx, agent_rx) = mpsc::channel();
++            let retained_handler = FtuiExtensionUiHandler::new(agent_tx.clone());
++            let driver = std::thread::spawn(move || -> std::io::Result<()> {
++                let _exit = DriverExitNotice(agent_tx.clone());
++                if fail {
++                    agent_tx
++                        .send(PiMsg::AgentError(String::from("driver failed")))
++                        .expect("connected UI");
++                    return Err(std::io::Error::other("driver failed"));
++                }
++                Ok(())
++            });
++            let result = driver.join().expect("nonpanicking driver");
++            assert_eq!(result.is_err(), fail);
++            if fail {
++                assert!(matches!(agent_rx.try_recv(), Ok(PiMsg::AgentError(_))));
++            }
++            assert!(matches!(agent_rx.try_recv(), Ok(PiMsg::UiShutdown)));
++            // A real handler, not just a bare extra Sender: the handler can
++            // survive through the UI's extension-manager routing reference.
++            assert!(matches!(agent_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
++            drop(retained_handler);
++            assert!(matches!(
++                agent_rx.try_recv(),
++                Err(mpsc::TryRecvError::Disconnected)
++            ));
++        }
++    }
++
++    #[cfg(panic = "unwind")]
++    #[test]
++    fn driver_unwind_notifies_despite_a_retained_extension_handler() {
++        let (agent_tx, agent_rx) = mpsc::channel();
++        let retained_handler = FtuiExtensionUiHandler::new(agent_tx.clone());
++        let driver = std::thread::spawn(move || {
++            let _exit = DriverExitNotice(agent_tx);
++            panic!("injected driver panic");
++        });
++        assert!(driver.join().is_err());
++        assert!(matches!(agent_rx.try_recv(), Ok(PiMsg::UiShutdown)));
++        assert!(matches!(agent_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
++        drop(retained_handler);
++    }
++
++    #[test]
++    fn driver_exit_ends_the_bridge_and_model_with_live_extension_senders() {
++        let (agent_tx, model) = new_model();
++        let retained_handler = FtuiExtensionUiHandler::new(agent_tx.clone());
++        let source = model
++            .agent_rx
++            .lock()
++            .expect("receiver slot")
++            .take()
++            .expect("one driver stream");
++        agent_tx
++            .send(PiMsg::AgentError(String::from("session initialization failed")))
++            .expect("connected UI");
++        drop(DriverExitNotice(agent_tx));
++        retained_handler
++            .agent_tx
++            .send(PiMsg::System(String::from("late extension callback")))
++            .expect("retained extension can still send");
++
++        let (bridge_tx, bridge_rx) = mpsc::channel();
++        let (done_tx, done_rx) = mpsc::channel();
++        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let worker_stop = Arc::clone(&stop);
++        let worker = std::thread::spawn(move || {
++            drain_agent_events(
++                &source,
++                |message| bridge_tx.send(message),
++                || worker_stop.load(std::sync::atomic::Ordering::Acquire),
++            );
++            let remaining = source.try_recv();
++            let _ = done_tx.send(());
++            remaining
++        });
++        let finished = done_rx.recv_timeout(Duration::from_secs(2));
++        // A regression that waits for all Sender clones is released before
++        // asserting, so this test cannot leave its bridge thread parked.
++        stop.store(true, std::sync::atomic::Ordering::Release);
++        let remaining = worker.join().expect("bridge worker");
++        finished.expect("UiShutdown must end the bridge while the handler is alive");
++        assert!(matches!(remaining, Ok(PiMsg::System(text)) if text == "late extension callback"));
++
++        let messages: Vec<_> = bridge_rx.try_iter().collect();
++        assert!(matches!(
++            messages.as_slice(),
++            [PiFtuiMsg::Agent(PiMsg::AgentError(_)), PiFtuiMsg::Agent(PiMsg::UiShutdown)]
++        ));
++        let mut sim = ProgramSimulator::new(model);
++        sim.init();
++        for message in messages {
++            sim.send(message);
++        }
++        assert!(!sim.is_running(), "driver loss must stop the UI without a key");
++        assert_eq!(
++            sim.model().error_banner.as_deref(),
++            Some("session initialization failed")
++        );
++        drop(retained_handler);
++    }
++
+     /// Body width for tests that call `conversation_text` directly. Cached
+     /// blocks are width-specific (issue #227), so repeated calls in one test

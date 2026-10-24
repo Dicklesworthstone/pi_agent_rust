@@ -1,6 +1,6 @@
 [package]
 name = "pi_agent_rust"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native AI coding agent CLI - Rust port of Pi Agent"
@@ -225,6 +225,10 @@ async-trait = "0.1"
 # (release binary size budget, 22 MiB). `full` includes it.
 htmd = "0.5.5"
 pdf-extract = { version = "0.12", optional = true }
+# Native archive/document reads. Reuse the existing flate2 backend without
+# enabling ZIP encryption, additional codecs, or the write-only zopfli backend.
+zip = { version = "=9.0.5", default-features = false, features = ["deflate-flate2"] }
+quick-xml = { version = "=0.42.0", default-features = false, features = ["escape-html"] }
 
 # URL parsing/building
 url = "2"
@@ -240,6 +244,12 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 json5 = "1.3.1"
 
+# Native jq-compatible Read filters run in resource-bounded Pi workers.
+jaq-core = "=3.1.1"
+jaq-std = "=3.0.3"
+jaq-json = "=2.0.3"
+jaq-fmts = { version = "=0.1.1", default-features = false, features = ["tabular"] }
+
 # Error handling
 anyhow = "1.0.104"
 thiserror = "2"
@@ -247,7 +257,7 @@ thiserror = "2"
 # Terminal output (rich_rust for beautiful TUI).
 # rich_rust is shared by non-TUI code paths (plain styled stdout/markdown
 # rendering in src/tui.rs and elsewhere), so it stays unconditional.
-rich_rust = { version = "0.2.2", features = ["markdown"] }
+rich_rust = { version = "0.2.3", features = ["markdown"] }
 # crossterm is the low-level terminal driver used exclusively by the
 # interactive front-end, so it is gated behind the `tui` feature.
 crossterm = { version = "0.29", optional = true }
@@ -257,9 +267,16 @@ enable-ansi-support = "0.3"
 # These are used exclusively by the interactive terminal front-end and are
 # gated behind the `tui` feature so SDK/library consumers can build the lib
 # with `--no-default-features` without pulling in the terminal stack.
-bubbletea = { package = "charmed-bubbletea", version = "0.2.0", optional = true }
+# bubbletea and bubbles are pinned to exactly 0.2.0. The 0.2.1..0.2.4 renderer
+# diffs only changed rows and overwrites the soft-wrapped tail of a line longer
+# than the terminal width, which hides the end of long classic-TUI status
+# lines (bd-charmed-bubbletea-024-wrapped-tail-drtao; pinned by
+# e2e_tui_share_rejects_public_argument_without_invoking_gh). A caret
+# requirement let a lockfile refresh move them to 0.2.4 once already
+# (bada02307). Lift the pin when a charmed_rust release fixes the renderer.
+bubbletea = { package = "charmed-bubbletea", version = "=0.2.0", optional = true }
 lipgloss = { package = "charmed-lipgloss", version = "0.2.0", optional = true }
-bubbles = { package = "charmed-bubbles", version = "0.2.0", optional = true }
+bubbles = { package = "charmed-bubbles", version = "=0.2.0", optional = true }
 # 0.2.4 is the first release that re-pads table cells truncated at a
 # wide-char boundary (charmed_rust 4150912, GH #195).
 glamour = { package = "charmed-glamour", version = "0.2.4", optional = true }
@@ -269,16 +286,17 @@ unicode-width = { version = "0.2", optional = true }
 textwrap = { version = "0.16", optional = true }
 arboard = { version = "3.6.1", optional = true }
 
-# FrankenTUI migration target (bd-cv653.9.1). Coexists with the charmed_rust
-# stack behind the default-OFF `ftui` feature while the interactive runtime is
-# ported module by module; the bubbletea stack is deleted at cutover.
-# crossterm backend for now (pi already ships crossterm via `tui`); the Unix
-# native-backend (ftui-tty) switch is a later rollout step per the bead.
-ftui = { version = "0.7", default-features = false, features = ["runtime", "crossterm"], optional = true }
+# Default FrankenTUI stack (bd-cv653.9.1); --classic selects charmed_rust.
+# 0.9.0 includes the styled WordChar progress fix needed by GH #255:
+# a wide grapheme that cannot fit the remainder of a nonempty row must
+# flush that row before retrying, or live thinking and session replay hang.
+# Keep the crossterm backend and existing feature set; this is not a switch
+# to the native backend or an opt-in to the facade's heavier defaults.
+ftui = { version = "0.9.0", default-features = false, features = ["runtime", "crossterm"], optional = true }
 # Markdown rendering for the ftui conversation view. Direct dep because the
 # facade's `extras` feature enables no ftui-extras features (markdown stays
 # off); default-features off keeps the heavy extras (charts, doom, ...) out.
-ftui-extras = { version = "0.7", default-features = false, features = ["markdown"], optional = true }
+ftui-extras = { version = "0.9.0", default-features = false, features = ["markdown"], optional = true }
 
 # Filesystem
 dirs = "7"
@@ -308,7 +326,12 @@ crossbeam-queue = "0.3"
 # writer fix (GH#404 — pi uses the fts5 feature), the GH#402 checkpoint
 # backfill watermark (super-linear autocommit cost with schema size), and
 # PRAGMA wal_checkpoint cumulative-nBackfill stock parity.
-fsqlite = { version = "0.3.14", default-features = false, features = ["native", "fts5"] }
+# MOVED 0.3.14 (locked 0.3.18) -> 0.4.10 on 2026-10-12: pi's use of the API
+# (Connection, Row, SqliteValue, FrankenError) compiles unchanged. 0.4 is
+# built on asupersync 0.5, the version pi itself uses, so the second copy of
+# asupersync (0.4.11) and its franken-kernel/decision/evidence 0.4.11
+# companions leave the dependency graph.
+fsqlite = { version = "0.4.10", default-features = false, features = ["native", "fts5"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -463,6 +486,8 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 # crate unsafe-free while encapsulating the Win32 FFI.
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
+# Nonblocking job-pipe readers; one process-wide reactor owns IOCP completions.
+mio = { version = "1.2.4", features = ["os-ext"] }
 # `GetFileInformationByHandle` without `unsafe`: std's own accessors for the
 # volume serial number and file index are behind the unstable
 # `windows_by_handle` feature, which this crate cannot use because it also has
@@ -505,9 +530,8 @@ tui = [
     "dep:unicode-width",
     "dep:textwrap",
 ]
-# FrankenTUI migration stack (bd-cv653.9.1): default-OFF while the interactive
-# runtime is ported. Requires `tui` because the bridge reuses PiMsg and the
-# existing agent-event plumbing during coexistence.
+# Default FrankenTUI stack. Requires `tui` because the bridge reuses PiMsg
+# and shared interactive helpers while --classic remains available.
 ftui = ["dep:ftui", "dep:ftui-extras", "tui"]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
@@ -548,6 +572,13 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Shipped release binaries: dsr builds `--profile dist`. Same LTO, codegen,
+# panic and strip settings as `release`, optimised for speed instead of size.
+# `release` stays the size-budgeted profile that scripts/perf measures.
+[profile.dist]
+inherits = "release"
+opt-level = 3
 
 [profile.dev]
 opt-level = 0

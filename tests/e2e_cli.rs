@@ -8,7 +8,7 @@ mod common;
 
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
-use common::TestHarness;
+use common::{MockHttpResponse, MockHttpServer, TestHarness};
 use pi::config::Config;
 #[cfg(unix)]
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
@@ -1230,6 +1230,171 @@ fn read_catalog_request_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
         }
     }
     request
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
+    use std::io::BufRead as _;
+
+    let harness = CliTestHarness::new("e2e_acp_launch_options_reach_the_actual_stdio_session");
+    let agent_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent directory"),
+    );
+    fs::create_dir_all(&agent_dir).expect("create agent directory");
+    fs::write(agent_dir.join("auth.json"), b"{}").expect("write empty auth store");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec_pretty(&json!({
+            "providers": {
+                "acp-launch-fixture": {
+                    "api": "openai-completions",
+                    "baseUrl": "https://acp-launch.invalid/v1",
+                    "authHeader": true,
+                    "models": [
+                        { "id": "configured-default", "reasoning": false },
+                        { "id": "cli-selected", "reasoning": true }
+                    ]
+                }
+            }
+        }))
+        .expect("serialize launch models"),
+    )
+    .expect("write launch models");
+    fs::write(
+        harness.global_settings_path(),
+        serde_json::to_vec_pretty(&json!({
+            "defaultProvider": "acp-launch-fixture",
+            "defaultModel": "configured-default",
+            "defaultThinkingLevel": "off"
+        }))
+        .expect("serialize launch settings"),
+    )
+    .expect("write launch settings");
+
+    // No configured key makes this custom provider unready. The explicit
+    // launch key must enable selection without becoming protocol metadata.
+    // We never send a prompt, so no provider HTTP request is needed.
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let stderr_path = harness.harness.temp_path("acp.stderr.txt");
+    let stderr = fs::File::create(&stderr_path).expect("create ACP diagnostics");
+    harness
+        .harness
+        .record_artifact("acp.stderr.txt", &stderr_path);
+    let mut command = owner.process().command(&harness.binary_path);
+    command
+        .args([
+            "--acp",
+            "--provider",
+            "acp-launch-fixture",
+            "--model",
+            "cli-selected",
+            "--thinking",
+            "high",
+            "--api-key",
+            "acp-launch-fixture-key",
+            "--request-timeout",
+            "60",
+        ])
+        .env_clear()
+        .envs(harness.env.clone())
+        // A launch flag already overrides this invalid inherited value.
+        // Session construction must not reparse unrelated environment flags.
+        .env("PI_HTTP_REQUEST_TIMEOUT_SECS", "invalid")
+        .current_dir(harness.harness.temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr));
+    // AgentChild also kills and reaps on an assertion failure.
+    let mut child = command.spawn().expect("start ACP CLI");
+    let mut input = child.take_stdin().expect("ACP stdin");
+    let output = child.take_stdout().expect("ACP stdout");
+    let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+    let reader = std::thread::spawn(move || {
+        let mut output = std::io::BufReader::new(output);
+        loop {
+            let mut line = String::new();
+            // Bound each protocol frame, including the full model catalogue.
+            let read = (&mut output).take(8 * 1024 * 1024).read_line(&mut line);
+            let result = match read {
+                Ok(0) => break,
+                Ok(_) if !line.ends_with('\n') => {
+                    Err("ACP frame exceeded its bound or ended early".to_string())
+                }
+                Ok(_) => serde_json::from_str::<serde_json::Value>(&line)
+                    .map_err(|error| format!("invalid ACP JSON: {error}")),
+                Err(error) => Err(format!("ACP stdout read: {error}")),
+            };
+            let failed = result.is_err();
+            if sender.send(result).is_err() || failed {
+                break;
+            }
+        }
+    });
+    let mut exchange = |request: serde_json::Value| {
+        serde_json::to_writer(&mut input, &request).expect("write ACP request");
+        input.write_all(b"\n").expect("delimit ACP request");
+        input.flush().expect("flush ACP request");
+        let response = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("ACP response before deadline")
+            .expect("valid ACP protocol frame");
+        assert_eq!(response["id"], request["id"], "matching JSON-RPC response");
+        assert!(response.get("error").is_none(), "ACP error: {response}");
+        response
+    };
+
+    let initialized = exchange(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": 1, "clientCapabilities": {} }
+    }));
+    assert_eq!(initialized["result"]["protocolVersion"], 1);
+    let created = exchange(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": { "cwd": harness.harness.temp_dir(), "mcpServers": [] }
+    }));
+    assert!(created["result"]["sessionId"].as_str().is_some());
+    let selections = created["result"]["configOptions"]
+        .as_array()
+        .expect("ACP configuration selectors");
+    let selected = |id: &str| {
+        selections
+            .iter()
+            .find(|option| option["id"].as_str() == Some(id))
+            .and_then(|option| option["currentValue"].as_str())
+            .expect("selected ACP configuration value")
+    };
+    assert_eq!(selected("model"), "acp-launch-fixture/cli-selected");
+    assert_eq!(selected("thought_level"), "high");
+    assert!(
+        !serde_json::to_string(&created)
+            .expect("serialize ACP response")
+            .contains("acp-launch-fixture-key"),
+        "a launch credential must not appear in editor metadata"
+    );
+
+    // Keep stdin open until all replies arrive: this tests the real dispatcher,
+    // without a race between an early client EOF and response delivery.
+    let _ = exchange(json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown" }));
+    input
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}\n")
+        .expect("send ACP exit notification");
+    input.flush().expect("flush ACP exit");
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll ACP exit") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "ACP did not stop after exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "ACP exited unsuccessfully: {status}");
+    reader.join().expect("ACP output reader stopped");
 }
 
 #[test]
@@ -3940,6 +4105,274 @@ fn collect_json_mode_text_deltas(lines: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+fn prewalk_stream_response(tool_path: Option<&str>) -> MockHttpResponse {
+    let delta = tool_path.map_or_else(
+        || json!({"role": "assistant", "content": "Prewalk destination finished."}),
+        |path| {
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0, "id": format!("write-{path}"), "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json!({"path": path, "content": "one completed edit"}).to_string()
+                    }
+                }]
+            })
+        },
+    );
+    let start = json!({
+        "id": "prewalk-completion", "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+    });
+    let end = json!({
+        "id": "prewalk-completion",
+        "choices": [{"index": 0, "delta": {},
+            "finish_reason": if tool_path.is_some() { "tool_calls" } else { "stop" }}]
+    });
+    MockHttpResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body: format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n").into_bytes(),
+    }
+}
+
+fn configure_prewalk_cli(
+    harness: &CliTestHarness,
+    destination: Vec<MockHttpResponse>,
+    retries: u32,
+) -> MockHttpServer {
+    let server = harness.harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/source/v1/chat/completions",
+        vec![prewalk_stream_response(Some("first-edit.txt"))],
+    );
+    server.add_route_queue("POST", "/target/v1/chat/completions", destination);
+    let agent_dir = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&agent_dir).expect("create isolated prewalk configuration");
+    fs::write(agent_dir.join("auth.json"), b"{}").expect("write isolated auth store");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec(&json!({"providers": {
+            "prewalk-source": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/source/v1", server.base_url()),
+                "apiKey": "source-fixture-key", "authHeader": true,
+                "models": [{"id": "source", "reasoning": false,
+                    "contextWindow": 32_000, "maxTokens": 512}]
+            },
+            "prewalk-target": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/target/v1", server.base_url()),
+                "apiKey": "target-fixture-key", "authHeader": true,
+                "models": [{"id": "target", "reasoning": false,
+                    "contextWindow": 64_000, "maxTokens": 256}]
+            }
+        }}))
+        .unwrap(),
+    )
+    .expect("write prewalk models");
+    fs::write(
+        &harness.env["PI_CONFIG_PATH"],
+        serde_json::to_vec(&json!({
+            "defaultProvider": "prewalk-source", "defaultModel": "source",
+            "compaction": {"enabled": false},
+            "retry": {"enabled": retries > 0, "maxRetries": retries,
+                "baseDelayMs": 0, "maxDelayMs": 0}
+        }))
+        .unwrap(),
+    )
+    .expect("write prewalk settings");
+    server
+}
+
+fn run_prewalk_cli(harness: &CliTestHarness, mode: &str, tool_limit: &str) -> CliResult {
+    let mut args = vec![
+        "--mode",
+        mode,
+        "--prewalk-into",
+        "prewalk-target/target:off",
+        "--tools",
+        "read,write",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "--session",
+        "prewalk-session.jsonl",
+        "--max-tool-iterations",
+        tool_limit,
+    ];
+    if mode == "rpc" {
+        harness.run_with_stdin(
+            &args,
+            Some(b"{\"id\":\"prewalk\",\"type\":\"prompt\",\"message\":\"Complete this prewalk task.\"}\n"),
+        )
+    } else {
+        args.extend(["--print", "Complete this prewalk task."]);
+        harness.run(&args)
+    }
+}
+
+fn assert_prewalk_cli_transcript(
+    harness: &CliTestHarness,
+    server: &MockHttpServer,
+    requests: usize,
+) {
+    let captured = server.requests();
+    assert_eq!(
+        captured.len(),
+        requests,
+        "exact native provider admission count"
+    );
+    assert_eq!(captured[0].path, "/source/v1/chat/completions");
+    for request in &captured[1..] {
+        assert_eq!(request.path, "/target/v1/chat/completions");
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer target-fixture-key"
+        }));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "target");
+        let messages = body["messages"].as_array().expect("destination transcript");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            1,
+            "completed source edit must appear once in every destination attempt"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "user"
+                        && message.to_string().contains("Complete this prewalk task.")
+                })
+                .count(),
+            1,
+            "continuation must not replay the authored prompt"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(harness.harness.temp_path("first-edit.txt")).unwrap(),
+        "one completed edit"
+    );
+    let saved = fs::read_to_string(harness.harness.temp_path("prewalk-session.jsonl")).unwrap();
+    let entries = parse_json_mode_stdout_lines(&saved);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["message"]["role"] == "toolResult")
+            .count(),
+        1,
+        "the native edit result must be durably recorded exactly once"
+    );
+    assert!(entries.iter().any(|entry| {
+        entry["type"] == "model_change"
+            && entry["provider"] == "prewalk-target"
+            && entry["modelId"] == "target"
+    }));
+}
+
+#[test]
+fn e2e_cli_print_prewalk_continues_even_with_retries_disabled() {
+    for mode in ["text", "json"] {
+        let harness = CliTestHarness::new(&format!("print_prewalk_{mode}"));
+        let server = configure_prewalk_cli(&harness, vec![prewalk_stream_response(None)], 0);
+        let result = run_prewalk_cli(&harness, mode, "8");
+        assert_exit_code(&harness.harness, &result, 0);
+        assert_contains(
+            &harness.harness,
+            &result.stdout,
+            "Prewalk destination finished.",
+        );
+        assert_prewalk_cli_transcript(&harness, &server, 2);
+        if mode == "json" {
+            let events = parse_json_mode_stdout_lines(&result.stdout);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "prewalk_switched")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn e2e_cli_rpc_prewalk_retries_the_destination_without_replaying_tools() {
+    let harness = CliTestHarness::new("rpc_prewalk_retry");
+    let server = configure_prewalk_cli(
+        &harness,
+        vec![
+            MockHttpResponse::json(
+                503,
+                &json!({"error": {
+                    "message": "fixture unavailable", "type": "server_error"
+                }}),
+            ),
+            prewalk_stream_response(None),
+        ],
+        1,
+    );
+    let result = run_prewalk_cli(&harness, "rpc", "8");
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_prewalk_cli_transcript(&harness, &server, 3);
+    let events = parse_json_mode_stdout_lines(&result.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "prewalk_switched")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "auto_retry_end" && event["success"] == true)
+    );
+    assert_eq!(events.last().unwrap()["type"], "agent_end");
+    assert!(events.last().unwrap().get("error").is_none());
+}
+
+#[test]
+fn e2e_cli_prewalk_preserves_the_original_tool_iteration_limit() {
+    for mode in ["json", "rpc"] {
+        let harness = CliTestHarness::new(&format!("prewalk_tool_budget_{mode}"));
+        let server = configure_prewalk_cli(
+            &harness,
+            vec![prewalk_stream_response(Some("must-not-execute.txt"))],
+            0,
+        );
+        let result = run_prewalk_cli(&harness, mode, "1");
+        assert_prewalk_cli_transcript(&harness, &server, 2);
+        assert!(!harness.harness.temp_path("must-not-execute.txt").exists());
+        let events = parse_json_mode_stdout_lines(&result.stdout);
+        assert!(events.iter().any(|event| {
+            event
+                .to_string()
+                .contains("Maximum tool iterations (1) exceeded")
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "tool_execution_end")
+                .count(),
+            1
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn assert_json_mode_lifecycle_shape(lines: &[serde_json::Value]) {
     assert!(
@@ -4682,6 +5115,89 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
         result.stdout,
     );
     assert_contains(&harness.harness, &result.stdout, "ok");
+}
+
+/// A process isolation flag must also skip already acknowledged MCP servers
+/// and command-based credential resolvers, not merely hide their tool names.
+#[cfg(unix)]
+#[test]
+fn e2e_cli_no_mcp_skips_acknowledged_servers_and_credentials() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_no_mcp_skips_acknowledged_servers_and_credentials");
+    let cwd = harness.harness.temp_dir().to_path_buf();
+    let global = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&global).expect("global MCP directory");
+    let server_marker = harness.harness.temp_path("mcp-server-started");
+    let credential_marker = harness.harness.temp_path("mcp-credential-resolved");
+    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    fs::write(
+        global.join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "isolation-fixture": {
+                    "command": "/bin/sh",
+                    "args": ["-c", format!("printf started > {}; exit 1", quote(&server_marker))],
+                    "env": {
+                        "TOKEN": format!(
+                            "$CMD:printf resolved > {}; printf fixture-token",
+                            quote(&credential_marker)
+                        )
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write MCP fixture");
+    let discovery = pi::mcp::config::discover(&cwd, &global, &[], true);
+    assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+    let server = discovery.servers.first().expect("discover fixture");
+    pi::mcp::TrustStore::load(&global.join("mcp-trust.json"))
+        .expect("load MCP trust")
+        .acknowledge(
+            &server.name,
+            &server.fingerprint(&cwd),
+            "CLI isolation test",
+        )
+        .expect("acknowledge fixture without executing it");
+
+    let system_prompt = "Test MCP isolation.";
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Say ok."}]}
+        ],
+        "system": expected_system_prompt(system_prompt),
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
+        "stream": true
+    });
+    setup_vcr_anthropic(&mut harness, "e2e_no_mcp", &request_body, "ok");
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-mcp",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        system_prompt,
+        "Say ok.",
+    ]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "ok");
+    assert!(!server_marker.exists(), "disabled MCP server was started");
+    assert!(
+        !credential_marker.exists(),
+        "disabled MCP credential command was resolved"
+    );
 }
 
 /// `--tools read,grep` enables only read and grep tools.

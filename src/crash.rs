@@ -491,6 +491,38 @@ mod tests {
     }
 
     #[test]
+    fn panic_bundle_masks_debug_escaped_keys_before_persistence() {
+        const OPENAI: &str = "sk-proj-0123456789abcdefghijklmn";
+        const ANTHROPIC: &str = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaa";
+        let dir = agent_dir("debug-escaped-keys");
+        let payload = format!("before\n{OPENAI}\t{ANTHROPIC}\rafter");
+        let debug_payload = format!("{payload:?}");
+        let bundle = CrashBundle {
+            schema: CRASH_SCHEMA.to_string(),
+            kind: "panic".into(),
+            panic_message: Some(debug_payload.clone()),
+            backtrace: Some(debug_payload.clone()),
+            build_git_sha: "testsha".into(),
+            build_timestamp: "t".into(),
+            session_path: None,
+            recent_operations: vec![debug_payload],
+            created_at: utc_stamp(),
+        };
+        let bundle_dir = write_bundle(&dir, bundle).expect("write");
+        let raw = std::fs::read_to_string(bundle_dir.join("bundle.json")).unwrap();
+        let report = std::fs::read_to_string(bundle_dir.join("report.txt")).unwrap();
+        for published in [&raw, &report] {
+            assert!(!published.contains(OPENAI), "OpenAI canary leaked");
+            assert!(!published.contains(ANTHROPIC), "Anthropic canary leaked");
+        }
+        let persisted: CrashBundle = serde_json::from_str(&raw).unwrap();
+        let expected = r#""before\n[REDACTED:openai-key]\t[REDACTED:anthropic-key]\rafter""#;
+        assert_eq!(persisted.panic_message.as_deref(), Some(expected));
+        assert_eq!(persisted.backtrace.as_deref(), Some(expected));
+        assert_eq!(persisted.recent_operations, vec![expected.to_string()]);
+    }
+
+    #[test]
     fn panic_bundle_round_trips_with_schema_and_redaction() {
         let dir = agent_dir("panic-bundle");
         let bundle = CrashBundle {

@@ -22,6 +22,7 @@
 mod extension_bootstrap;
 mod recovery;
 
+use crate::agent::SessionEditSnapshot;
 use crate::app;
 use crate::auth::AuthStorage;
 use crate::cli::Cli;
@@ -29,14 +30,16 @@ use crate::models::default_models_path;
 use crate::provider::ThinkingBudgets;
 use crate::providers;
 use clap::Parser;
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
@@ -50,9 +53,9 @@ pub use crate::extensions::{
 };
 pub use crate::model::ThinkingLevel;
 pub use crate::model::{
-    AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails,
-    StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage,
-    UserContent, UserMessage,
+    AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, MediaContent, Message,
+    StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall,
+    ToolResultMessage, Usage, UserContent, UserMessage,
 };
 pub use crate::models::{ModelEntry, ModelRegistry};
 pub use crate::provider::{
@@ -357,11 +360,30 @@ impl FailoverOptions {
 pub struct SessionOptions {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Ordered model patterns, including optional `:thinking` suffixes, as
+    /// supplied by `--models`. `None` uses the matching workspace scope or
+    /// configured enabled models; an empty vector explicitly clears that scope.
+    pub model_scope: Option<Vec<String>>,
     pub api_key: Option<String>,
     pub thinking: Option<crate::model::ThinkingLevel>,
+    /// One-shot handoff after planning and the first successful project edit.
+    /// Explicitly opt in for this session; resumed sessions never re-arm it
+    /// from saved history. The destination must be registered and authenticated.
+    pub prewalk: Option<crate::prewalk::PrewalkTarget>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// Built-in selection. `None` keeps CLI defaults; an empty vector disables
+    /// all built-ins, including implicit configuration-driven tools.
+    ///
+    /// Explicit extensions and MCP tools remain available. A custom
+    /// [`ToolFactory`] controls its own registry; [`default_tool_registry`]
+    /// with an empty list retains the disabled-builtins policy.
+    /// Plan entry and checkpoint restoration report `PLAN_TOOLS_DISABLED`
+    /// under that policy; opening a saved conversation remains available.
     pub enabled_tools: Option<Vec<String>>,
+    /// Primary workspace for a new session. When resuming, an explicit value
+    /// must identify the saved workspace; omitting it selects the session's
+    /// latest workdir attachment rather than the caller's process cwd.
     pub working_directory: Option<PathBuf>,
     /// Whether project-local configuration under the working directory may
     /// be loaded. Programmatic callers default to fail-closed; CLI hosts pass
@@ -391,6 +413,11 @@ pub struct SessionOptions {
     /// AGENTS.md / CLAUDE.md and no foreign workspace rules are loaded.
     pub no_context_files: bool,
     pub max_tool_iterations: usize,
+    /// Wall-clock run limit, checked at agent turn boundaries. An admitted
+    /// provider/tool call finishes before the agent emits its time-cap marker
+    /// and saves the turn. `None` keeps the run unbounded; zero stops before
+    /// the first provider call. Mirrors the CLI's `--max-time` option.
+    pub max_time: Option<Duration>,
 
     /// Provider retry for turns driven through this session.
     ///
@@ -470,6 +497,8 @@ pub struct SessionOptions {
     /// Optional multi-root workspace handle (bd-cv653.3.12). When set, the
     /// session's tool registry confines paths to primary + additional roots
     /// and `/add-dir` // `/remove-dir` mutate the shared set live.
+    /// When omitted on resume, saved additional roots are restored if they
+    /// still exist; unavailable roots are reported and skipped.
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
     /// Session-level event listener invoked for every [`AgentEvent`].
@@ -550,8 +579,10 @@ impl Default for SessionOptions {
         Self {
             provider: None,
             model: None,
+            model_scope: None,
             api_key: None,
             thinking: None,
+            prewalk: None,
             system_prompt: None,
             append_system_prompt: None,
             enabled_tools: None,
@@ -571,6 +602,7 @@ impl Default for SessionOptions {
             skills_prompt: None,
             no_context_files: false,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
+            max_time: None,
             retry: None,
             failover: None,
             mcp: None,
@@ -621,7 +653,11 @@ pub trait ToolFactory: Send + Sync {
 /// (e.g. wrap each tool with an approval gate, or add a `Task` tool
 /// that spawns a nested session).
 pub fn default_tool_registry(enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry {
-    ToolRegistry::new(enabled, cwd, Some(config))
+    if enabled.is_empty() {
+        ToolRegistry::without_builtins(Some(config))
+    } else {
+        ToolRegistry::new(enabled, cwd, Some(config))
+    }
 }
 
 /// Lightweight handle for programmatic embedding.
@@ -749,10 +785,85 @@ pub struct RpcSessionState {
     pub auto_retry_enabled: bool,
     #[serde(default)]
     pub message_count: usize,
+    /// Estimated tokens in the selected branch's active model context.
+    /// Read at an idle boundary; this excludes archived and sibling history.
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// Resolved current model capacity, when the model is registered.
+    #[serde(default)]
+    pub context_window: Option<u32>,
     #[serde(default)]
     pub pending_message_count: usize,
     #[serde(default)]
     pub durability_mode: String,
+}
+
+/// Goal operation accepted by RPC `goal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcGoalOp {
+    Get,
+    Create,
+    Resume,
+    Pause,
+    Drop,
+}
+
+impl RpcGoalOp {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Create => "create",
+            Self::Resume => "resume",
+            Self::Pause => "pause",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+/// OMP-compatible goal progress returned by RPC `goal`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGoal {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub time_used_seconds: u64,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub max_prompts: Option<u32>,
+    #[serde(default)]
+    pub prompts_started: Option<u32>,
+    #[serde(default)]
+    pub interrupted: bool,
+}
+
+/// Goal-mode state returned alongside RPC goal progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcGoalModeState {
+    pub enabled: bool,
+    pub mode: String,
+    pub goal: RpcGoal,
+}
+
+/// Result payload returned by RPC `goal`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGoalResult {
+    #[serde(default)]
+    pub goal: Option<RpcGoal>,
+    #[serde(default)]
+    pub state: Option<RpcGoalModeState>,
+    #[serde(default)]
+    pub persistence: Option<String>,
+    #[serde(default)]
+    pub persistence_error: Option<String>,
 }
 
 /// Session-level token aggregates returned by RPC `get_session_stats`.
@@ -814,7 +925,7 @@ pub struct RpcBashResult {
     pub full_output_path: Option<String>,
 }
 
-/// Compaction result returned by RPC `compact`.
+/// Compaction result returned by RPC `compact` or in-place `handoff`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcCompactionResult {
@@ -898,27 +1009,176 @@ impl Default for RpcTransportOptions {
 }
 
 /// Subprocess-backed SDK transport for `pi --mode rpc`.
-const RPC_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+// Native prompts admit up to 64 MiB of normalized content JSON, including
+// escaped text, encoded attachment payloads, and metadata.
+// User-message events echo that content; keep bounded headroom for those
+// envelopes instead of killing a subprocess after it accepts a valid prompt.
+// The pre-acknowledgement aggregate accommodates both user-message echoes
+// together with their envelopes and other lifecycle events.
+const RPC_MAX_LINE_BYTES: usize = 128 * 1024 * 1024;
 const RPC_MAX_PRE_ACK_EVENTS: usize = 256;
-const RPC_MAX_PRE_ACK_BYTES: usize = 4 * 1024 * 1024;
+const RPC_MAX_PRE_ACK_BYTES: usize = 256 * 1024 * 1024;
+const RPC_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub struct RpcTransportClient {
-    child: Child,
-    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
-    stdout: BufReader<ChildStdout>,
+    owner: Arc<RpcSubprocessOwner>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    stdout: futures::channel::mpsc::Receiver<Result<Value>>,
+    reader_worker: Option<std::thread::JoinHandle<()>>,
+    writer_worker: Option<std::thread::JoinHandle<()>>,
     next_request_id: Arc<AtomicU64>,
+}
+
+struct RpcWriteRequest {
+    encoded: Vec<u8>,
+    completed: futures::channel::oneshot::Sender<Result<()>>,
+}
+
+/// Every operation shares this lifetime, including controls retained after the
+/// client is dropped. Closing it revokes writes before stopping the subprocess.
+struct RpcSubprocessOwner {
+    process: Mutex<RpcProcessCleanup>,
+    closed: Arc<AtomicBool>,
+    writer: Mutex<Option<std::sync::mpsc::SyncSender<RpcWriteRequest>>>,
+    reader_abort: futures::future::AbortHandle,
+}
+
+struct RpcProcessCleanup {
+    child: Option<crate::tools::ProcessGuard>,
+    reaper: Option<RpcProcessReaper>,
+}
+
+struct RpcProcessReaper {
+    worker: std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+    child: Arc<Mutex<Option<crate::tools::ProcessGuard>>>,
+}
+
+impl RpcSubprocessOwner {
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(Error::api("RPC subprocess transport is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close(&self, wait: bool) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
+        self.reader_abort.abort();
+        drop(
+            self.writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        let mut process = self
+            .process
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = process.child.take() {
+            // Preserve ownership even if the OS refuses another worker. An
+            // interrupted future starts cleanup without waiting; a later
+            // shutdown still owns and joins this exact reap obligation.
+            let child = Arc::new(Mutex::new(Some(child)));
+            let reaper_child = Arc::clone(&child);
+            if let Ok(worker) = std::thread::Builder::new()
+                .name("pi-sdk-rpc-reaper".to_string())
+                .spawn(move || {
+                    let mut child = reaper_child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    child
+                        .as_mut()
+                        .expect("RPC reaper owns its child")
+                        .terminate_and_wait()
+                })
+            {
+                process.reaper = Some(RpcProcessReaper { worker, child });
+            } else {
+                let mut child = child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("failed RPC reaper spawn retains its child");
+                if let Err(error) = child.terminate_and_wait() {
+                    process.child = Some(child);
+                    return Err(Error::Io(Box::new(error)));
+                }
+            }
+        }
+        let reaper = if wait { process.reaper.take() } else { None };
+        drop(process);
+        if let Some(reaper) = reaper {
+            let result = reaper
+                .worker
+                .join()
+                .map_err(|_| Error::api("RPC subprocess reaper panicked"))
+                .and_then(|result| result.map_err(|error| Error::Io(Box::new(error))));
+            if result.is_err() {
+                // A failed wait or worker panic does not release cleanup
+                // ownership. A later explicit shutdown or final owner drop
+                // can retry the same actual child handle and retained Job.
+                self.process
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .child = reaper
+                    .child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RpcSubprocessOwner {
+    fn drop(&mut self) {
+        let _ = self.close(true);
+    }
+}
+
+/// A dropped request has no safe next frame boundary. Stop its connection rather
+/// than letting another call consume a delayed acknowledgement or terminal event.
+struct RpcOperation {
+    owner: Arc<RpcSubprocessOwner>,
+    finished: bool,
+}
+
+impl RpcOperation {
+    fn new(owner: &Arc<RpcSubprocessOwner>) -> Result<Self> {
+        owner.ensure_open()?;
+        Ok(Self {
+            owner: Arc::clone(owner),
+            finished: false,
+        })
+    }
+
+    const fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for RpcOperation {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.owner.close(false);
+        }
+    }
 }
 
 /// Write-only control lane for a running RPC prompt.
 ///
-/// The prompt task remains the sole stdout reader. A cloned control handle may
-/// be used from another thread or from a live event callback to dispatch steer,
+/// The prompt task remains the sole consumer of parsed stdout frames. A cloned
+/// control handle may be used from another thread or from a live event callback to dispatch steer,
 /// follow-up, or abort requests while that prompt is still active. Dispatch
 /// success means the command was written and flushed, not that the subprocess
 /// acknowledged or completed it.
 #[derive(Clone)]
 pub struct RpcControlHandle {
-    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
+    owner: Arc<RpcSubprocessOwner>,
+    stdin: Arc<Mutex<ChildStdin>>,
     next_request_id: Arc<AtomicU64>,
 }
 
@@ -930,12 +1190,17 @@ impl std::fmt::Debug for RpcControlHandle {
 
 impl RpcControlHandle {
     fn send(&self, command: &str, payload: Map<String, Value>) -> Result<String> {
+        self.owner.ensure_open()?;
         let request_id = next_rpc_request_id(&self.next_request_id)?;
         let mut frame = Map::new();
         frame.insert("type".to_string(), Value::String(command.to_string()));
         frame.insert("id".to_string(), Value::String(request_id.clone()));
         frame.extend(payload);
-        write_rpc_json_line(&self.stdin, &Value::Object(frame))?;
+        let encoded = encode_rpc_json_line(&Value::Object(frame))?;
+        if let Err(error) = write_rpc_bytes(&self.stdin, &self.owner.closed, &encoded) {
+            let _ = self.owner.close(false);
+            return Err(error);
+        }
         Ok(request_id)
     }
 
@@ -1056,6 +1321,7 @@ impl SessionTransport {
 }
 
 impl RpcTransportClient {
+    #[allow(clippy::too_many_lines)]
     pub fn connect(options: RpcTransportOptions) -> Result<Self> {
         let mut command = Command::new(&options.binary_path);
         command
@@ -1066,45 +1332,152 @@ impl RpcTransportClient {
         if let Some(cwd) = options.cwd {
             command.current_dir(cwd);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
 
-        let mut child = command.spawn().map_err(|err| {
-            Error::config(format!(
-                "Failed to spawn RPC subprocess {}: {err}",
-                options.binary_path.display()
-            ))
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::config("RPC subprocess stdin is not piped"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::config("RPC subprocess stdout is not piped"))?;
+        let child =
+            crate::tools::spawn_command_with_job_discipline(&mut command).map_err(|err| {
+                Error::config(format!(
+                    "Failed to spawn RPC subprocess {}: {err}",
+                    options.binary_path.display()
+                ))
+            })?;
+        let mut child = crate::tools::ProcessGuard::new(
+            child,
+            crate::tools::ProcessCleanupMode::ProcessGroupTree,
+        );
+        let pipes = (|| {
+            let stdin = child
+                .take_stdin()
+                .ok_or_else(|| Error::config("RPC subprocess stdin is not piped"))?;
+            let stdout = child
+                .take_stdout()
+                .ok_or_else(|| Error::config("RPC subprocess stdout is not piped"))?;
+            #[cfg(unix)]
+            {
+                prepare_rpc_pipe(&stdin)?;
+                prepare_rpc_pipe(&stdout)?;
+            }
+            Ok::<_, Error>((stdin, stdout))
+        })();
+        let (stdin, stdout) = match pipes {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
+        let stdin = Arc::new(Mutex::new(stdin));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<RpcWriteRequest>(1);
+        // A zero-capacity futures channel gives its sole sender one reserved
+        // slot. The pump can hold at most one additional bounded frame locally.
+        let (mut reader_tx, reader_rx) = futures::channel::mpsc::channel(0);
+        let (reader_abort, reader_registration) = futures::future::AbortHandle::new_pair();
+        let owner = Arc::new(RpcSubprocessOwner {
+            process: Mutex::new(RpcProcessCleanup {
+                child: Some(child),
+                reaper: None,
+            }),
+            closed: Arc::clone(&closed),
+            writer: Mutex::new(Some(writer_tx)),
+            reader_abort,
+        });
+
+        let read_closed = Arc::clone(&closed);
+        let reader_worker = std::thread::Builder::new()
+            .name("pi-sdk-rpc-reader".to_string())
+            .spawn(move || {
+                let mut stdout = BufReader::new(stdout);
+                let read = async move {
+                    while !read_closed.load(Ordering::Acquire) {
+                        let frame = read_rpc_json_line(&mut stdout, &read_closed);
+                        let terminal = frame.is_err();
+                        if reader_tx.send(frame).await.is_err() || terminal {
+                            break;
+                        }
+                    }
+                };
+                // This executor belongs to an OS pipe worker, never to the
+                // caller's runtime. Abort wakes it even under channel pressure.
+                let _ = futures::executor::block_on(futures::future::Abortable::new(
+                    read,
+                    reader_registration,
+                ));
+            });
+        let reader_worker = match reader_worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let _ = owner.close(true);
+                return Err(Error::Io(Box::new(error)));
+            }
+        };
+        let write_stdin = Arc::clone(&stdin);
+        let write_closed = Arc::clone(&closed);
+        let writer_worker = std::thread::Builder::new()
+            .name("pi-sdk-rpc-writer".to_string())
+            .spawn(move || {
+                while let Ok(request) = writer_rx.recv() {
+                    if write_closed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let result = write_rpc_bytes(&write_stdin, &write_closed, &request.encoded);
+                    let terminal = result.is_err();
+                    let _ = request.completed.send(result);
+                    if terminal {
+                        break;
+                    }
+                }
+            });
+        let writer_worker = match writer_worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                if let Err(cleanup_error) = owner.close(true) {
+                    // The owner's final drop retries its retained child. Do
+                    // not join a pipe that the OS has failed to unblock.
+                    return Err(Error::api(format!(
+                        "Failed to start RPC writer worker: {error}; subprocess cleanup failed: {cleanup_error}"
+                    )));
+                }
+                let _ = reader_worker.join();
+                return Err(Error::Io(Box::new(error)));
+            }
+        };
 
         Ok(Self {
-            child,
-            stdin: Arc::new(Mutex::new(BufWriter::new(stdin))),
-            stdout: BufReader::new(stdout),
+            owner,
+            stdin,
+            stdout: reader_rx,
+            reader_worker: Some(reader_worker),
+            writer_worker: Some(writer_worker),
             next_request_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
-    /// Clone a write-only lane that remains usable while `prompt*` borrows
-    /// this client for its single stdout reader.
+    /// Clone a write-only lane that remains usable while `prompt*` or
+    /// `handoff*` borrows this client for its single response consumer.
     #[must_use]
     pub fn control_handle(&self) -> RpcControlHandle {
         RpcControlHandle {
+            owner: Arc::clone(&self.owner),
             stdin: Arc::clone(&self.stdin),
             next_request_id: Arc::clone(&self.next_request_id),
         }
     }
 
-    #[allow(
-        clippy::unused_async,
-        reason = "SDK RPC transport keeps an async public API"
-    )]
     pub async fn request(&mut self, command: &str, payload: Map<String, Value>) -> Result<Value> {
+        self.request_with_events(command, payload, |_| {}).await
+    }
+
+    async fn request_with_events(
+        &mut self,
+        command: &str,
+        payload: Map<String, Value>,
+        on_event: impl FnMut(Value),
+    ) -> Result<Value> {
         if payload.contains_key("type") || payload.contains_key("id") {
             return Err(Error::validation(
                 "RPC request payload cannot override reserved type/id fields",
@@ -1116,8 +1489,24 @@ impl RpcTransportClient {
         command_payload.insert("id".to_string(), Value::String(request_id.clone()));
         command_payload.extend(payload);
 
-        self.write_json_line(&Value::Object(command_payload))?;
-        self.wait_for_response(&request_id, command)
+        let mut operation = RpcOperation::new(&self.owner)?;
+        self.write_json_line(&Value::Object(command_payload))
+            .await?;
+        let response = self
+            .wait_for_response(&request_id, command, on_event)
+            .await?;
+        let success = response
+            .get("success")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::api("RPC response did not include a boolean success flag"))?;
+        // A valid failure response ends this request just as conclusively as a
+        // successful one. Only interrupted or malformed exchanges close the lane.
+        operation.finish();
+        if success {
+            Ok(response.get("data").cloned().unwrap_or(Value::Null))
+        } else {
+            Err(rpc_error_from_response(&response, command))
+        }
     }
 
     fn parse_response_data<T: DeserializeOwned>(data: Value, command: &str) -> Result<T> {
@@ -1178,6 +1567,52 @@ impl RpcTransportClient {
 
     pub async fn get_session_stats(&mut self) -> Result<RpcSessionStats> {
         self.request_typed("get_session_stats", Map::new()).await
+    }
+
+    /// Read or mutate the persistent goal attached to the current RPC session.
+    ///
+    /// This matches OMP's get/create/resume/pause/drop operation set. Create
+    /// accepts an optional token budget; `max_prompts` is an additive Rust
+    /// extension. No operation here automatically starts a provider turn.
+    pub async fn goal(
+        &mut self,
+        op: RpcGoalOp,
+        objective: Option<&str>,
+        token_budget: Option<u64>,
+    ) -> Result<RpcGoalResult> {
+        self.goal_with_limits(op, objective, token_budget, None)
+            .await
+    }
+
+    /// `goal` with an optional native prompt-count budget.
+    pub async fn goal_with_limits(
+        &mut self,
+        op: RpcGoalOp,
+        objective: Option<&str>,
+        token_budget: Option<u64>,
+        max_prompts: Option<u32>,
+    ) -> Result<RpcGoalResult> {
+        let mut payload = Map::new();
+        payload.insert("op".to_string(), Value::String(op.as_str().to_string()));
+        if let Some(objective) = objective {
+            payload.insert(
+                "objective".to_string(),
+                Value::String(objective.to_string()),
+            );
+        }
+        if let Some(token_budget) = token_budget {
+            payload.insert(
+                "token_budget".to_string(),
+                Value::Number(token_budget.into()),
+            );
+        }
+        if let Some(max_prompts) = max_prompts {
+            payload.insert(
+                "max_prompts".to_string(),
+                Value::Number(u64::from(max_prompts).into()),
+            );
+        }
+        self.request_typed("goal", payload).await
     }
 
     pub async fn get_messages(&mut self) -> Result<Vec<Value>> {
@@ -1301,6 +1736,39 @@ impl RpcTransportClient {
         self.request_typed("compact", payload).await
     }
 
+    /// Durably replace an older safe prefix with a continuation brief in the
+    /// same session. Manual handoff works even when automatic compaction is off.
+    ///
+    /// Use [`Self::control_handle`] to send `abort` while this request is pending,
+    /// and keep polling this future until its terminal response arrives.
+    pub async fn handoff(&mut self, focus: Option<&str>) -> Result<RpcCompactionResult> {
+        self.handoff_with_events(focus, |_| {}).await
+    }
+
+    /// Handoff with the native compaction lifecycle and extension UI events.
+    ///
+    /// The callback receives non-response frames. Success is the terminal
+    /// `handoff` response after durable installation, not `agent_end`.
+    pub async fn handoff_with_events(
+        &mut self,
+        focus: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCompactionResult> {
+        let mut payload = Map::new();
+        if let Some(focus) = focus {
+            if focus.len() > 4096 || focus.contains('\0') {
+                return Err(Error::validation(
+                    "Handoff focus must fit 4096 bytes and contain no NUL",
+                ));
+            }
+            payload.insert("focus".to_string(), Value::String(focus.to_string()));
+        }
+        let data = self
+            .request_with_events("handoff", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "handoff")
+    }
+
     pub async fn switch_session(&mut self, session_path: &Path) -> Result<RpcCancelledResult> {
         let mut payload = Map::new();
         payload.insert(
@@ -1387,27 +1855,60 @@ impl RpcTransportClient {
             .await
     }
 
+    /// Send ordered native text, image, audio, and video content over RPC.
+    ///
+    /// The RPC `content` field preserves block order without splitting text
+    /// from its attachments. Empty input and assistant-only blocks are rejected
+    /// before allocating a request ID or writing to the subprocess. The server
+    /// applies its configured media limits before acknowledging the prompt.
+    /// Native prompts are limited to 256 blocks and 64 MiB of normalized
+    /// content JSON, including escaped text, encoded attachment payloads, and
+    /// metadata, with at most 32 audio/video blocks. Received JSON lines have
+    /// a 128 MiB byte bound; buffered pre-acknowledgement events have a 256 MiB
+    /// aggregate bound. Oversized output fails without truncating history.
+    pub async fn prompt_with_content(&mut self, content: Vec<ContentBlock>) -> Result<Vec<Value>> {
+        self.prompt_with_content_streaming(content, None, |_| {})
+            .await
+    }
+
+    /// Send native content and deliver acknowledged events as they arrive.
+    ///
+    /// `streaming_behavior` has the same meaning as in
+    /// [`Self::prompt_with_options_streaming`]. Native content uses the same
+    /// bounded pre-acknowledgement buffer and terminal `agent_end` handling as
+    /// text and image prompts. Input is validated before dispatch.
+    pub async fn prompt_with_content_streaming(
+        &mut self,
+        content: Vec<ContentBlock>,
+        streaming_behavior: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<Vec<Value>> {
+        AgentSession::validate_user_content_blocks(&content)?;
+        let content = serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?;
+        let content = crate::rpc::parse_native_prompt_content(&content, 64 * 1024 * 1024)?;
+        let mut payload = Map::new();
+        payload.insert(
+            "content".to_string(),
+            serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?,
+        );
+        self.prompt_payload_streaming(payload, streaming_behavior, on_event)
+            .await
+    }
+
     /// Run one RPC prompt while delivering raw events as soon as they are read.
     ///
     /// Some servers can emit lifecycle events before the prompt response is
     /// flushed. Those events are retained under explicit count/byte bounds and
     /// released in order once the matching success acknowledgement arrives.
     /// A failed acknowledgement never leaks speculative events to the caller.
-    #[allow(
-        clippy::unused_async,
-        reason = "SDK RPC transport keeps an async public API"
-    )]
     pub async fn prompt_with_options_streaming(
         &mut self,
         message: impl Into<String>,
         images: Option<Vec<ImageContent>>,
         streaming_behavior: Option<&str>,
-        mut on_event: impl FnMut(Value),
+        on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
-        let request_id = self.next_request_id()?;
         let mut payload = Map::new();
-        payload.insert("type".to_string(), Value::String("prompt".to_string()));
-        payload.insert("id".to_string(), Value::String(request_id.clone()));
         payload.insert("message".to_string(), Value::String(message.into()));
         if let Some(images) = images {
             payload.insert(
@@ -1415,13 +1916,30 @@ impl RpcTransportClient {
                 serde_json::to_value(images).map_err(|err| Error::Json(Box::new(err)))?,
             );
         }
+        self.prompt_payload_streaming(payload, streaming_behavior, on_event)
+            .await
+    }
+
+    /// Dispatch an already validated prompt through the single response owner.
+    /// Public prompt methods choose their wire input shape before reaching
+    /// this boundary; only this method allocates the ID and reads stdout.
+    async fn prompt_payload_streaming(
+        &mut self,
+        mut payload: Map<String, Value>,
+        streaming_behavior: Option<&str>,
+        mut on_event: impl FnMut(Value),
+    ) -> Result<Vec<Value>> {
+        let request_id = self.next_request_id()?;
+        payload.insert("type".to_string(), Value::String("prompt".to_string()));
+        payload.insert("id".to_string(), Value::String(request_id.clone()));
         if let Some(streaming_behavior) = streaming_behavior {
             payload.insert(
                 "streamingBehavior".to_string(),
                 Value::String(streaming_behavior.to_string()),
             );
         }
-        self.write_json_line(&Value::Object(payload))?;
+        let mut operation = RpcOperation::new(&self.owner)?;
+        self.write_json_line(&Value::Object(payload)).await?;
 
         let mut saw_ack = false;
         let mut events = Vec::new();
@@ -1433,7 +1951,7 @@ impl RpcTransportClient {
         let mut pre_ack: Vec<Value> = Vec::new();
         let mut pre_ack_bytes = 0usize;
         loop {
-            let item = self.read_json_line()?;
+            let item = self.read_json_line().await?;
             let item_type = item.get("type").and_then(Value::as_str);
             if item_type == Some("response") {
                 if item.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
@@ -1444,15 +1962,20 @@ impl RpcTransportClient {
                         "RPC prompt acknowledgement used the matching id with the wrong command",
                     ));
                 }
+                if saw_ack {
+                    return Err(Error::api("RPC prompt sent a duplicate acknowledgement"));
+                }
                 let success = item
                     .get("success")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                    .ok_or_else(|| {
+                        Error::api(
+                            "RPC prompt acknowledgement did not include a boolean success flag",
+                        )
+                    })?;
                 if !success {
+                    operation.finish();
                     return Err(rpc_error_from_response(&item, "prompt"));
-                }
-                if saw_ack {
-                    return Err(Error::api("RPC prompt sent a duplicate acknowledgement"));
                 }
                 saw_ack = true;
                 // `mem::take` rather than `drain(..)`: same result (the buffer
@@ -1464,6 +1987,7 @@ impl RpcTransportClient {
                     on_event(event.clone());
                     events.push(event);
                     if reached_end {
+                        operation.finish();
                         return Ok(events);
                     }
                 }
@@ -1490,96 +2014,95 @@ impl RpcTransportClient {
             on_event(item.clone());
             events.push(item);
             if reached_end {
+                operation.finish();
                 return Ok(events);
             }
         }
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        if self
-            .child
-            .try_wait()
-            .map_err(|err| Error::Io(Box::new(err)))?
-            .is_none()
-        {
-            self.child.kill().map_err(|err| Error::Io(Box::new(err)))?;
+        let result = self.owner.close(true);
+        self.stdout.close();
+        // If the OS did not stop the child, a Windows pipe may still be in a
+        // blocking operation. Preserve the workers for a cleanup retry instead
+        // of turning the reported termination failure into an unbounded join.
+        result?;
+        let reader_panicked = self
+            .reader_worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        let writer_panicked = self
+            .writer_worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        if reader_panicked || writer_panicked {
+            Err(Error::api("RPC subprocess pipe worker panicked"))
+        } else {
+            Ok(())
         }
-        let _ = self.child.wait();
-        Ok(())
     }
 
     fn next_request_id(&self) -> Result<String> {
         next_rpc_request_id(&self.next_request_id)
     }
 
-    fn write_json_line(&self, payload: &Value) -> Result<()> {
-        write_rpc_json_line(&self.stdin, payload)
+    // The writer guard spans the "still open" check and the enqueue, so
+    // `RpcSubprocessOwner::close` cannot take the sender between them.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn write_json_line(&self, payload: &Value) -> Result<()> {
+        self.owner.ensure_open()?;
+        let encoded = encode_rpc_json_line(payload)?;
+        let (completed, completion) = futures::channel::oneshot::channel();
+        {
+            let writer = self
+                .owner
+                .writer
+                .lock()
+                .map_err(|_| Error::api("RPC subprocess writer queue lock poisoned"))?;
+            let writer = writer
+                .as_ref()
+                .ok_or_else(|| Error::api("RPC subprocess transport is closed"))?;
+            writer
+                .try_send(RpcWriteRequest { encoded, completed })
+                .map_err(|_| Error::api("RPC subprocess writer is unavailable"))?;
+        }
+        completion
+            .await
+            .map_err(|_| Error::api("RPC subprocess writer stopped before completing the frame"))?
     }
 
-    fn read_json_line(&mut self) -> Result<Value> {
-        let mut line = Vec::new();
-        loop {
-            let available = self
-                .stdout
-                .fill_buf()
-                .map_err(|err| Error::Io(Box::new(err)))?;
-            if available.is_empty() {
-                if line.is_empty() {
-                    return Err(Error::api(
-                        "RPC subprocess exited before sending a response",
-                    ));
-                }
-                return Err(Error::api(
-                    "RPC subprocess ended in the middle of a JSON line",
-                ));
-            }
-            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-                if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
-                    let _ = self.shutdown();
-                    return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
-                }
-                line.extend_from_slice(&available[..newline]);
-                self.stdout.consume(newline + 1);
-                break;
-            }
-            if available.len() > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
-                let _ = self.shutdown();
-                return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
-            }
-            let available_len = available.len();
-            line.extend_from_slice(available);
-            self.stdout.consume(available_len);
-        }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        serde_json::from_slice(&line).map_err(|err| Error::Json(Box::new(err)))
+    async fn read_json_line(&mut self) -> Result<Value> {
+        self.owner.ensure_open()?;
+        self.stdout
+            .next()
+            .await
+            .ok_or_else(|| Error::api("RPC subprocess reader stopped before sending a response"))?
     }
 
-    fn wait_for_response(&mut self, request_id: &str, command: &str) -> Result<Value> {
+    async fn wait_for_response(
+        &mut self,
+        request_id: &str,
+        command: &str,
+        mut on_event: impl FnMut(Value),
+    ) -> Result<Value> {
         loop {
-            let item = self.read_json_line()?;
+            let item = self.read_json_line().await?;
             let Some(item_type) = item.get("type").and_then(Value::as_str) else {
                 continue;
             };
             if item_type != "response" {
+                on_event(item);
                 continue;
             }
             if item.get("id").and_then(Value::as_str) != Some(request_id) {
                 continue;
             }
             if item.get("command").and_then(Value::as_str) != Some(command) {
-                continue;
+                return Err(Error::api(
+                    "RPC response used the matching id with the wrong command",
+                ));
             }
-
-            let success = item
-                .get("success")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if success {
-                return Ok(item.get("data").cloned().unwrap_or(Value::Null));
-            }
-            return Err(rpc_error_from_response(&item, command));
+            return Ok(item);
         }
     }
 }
@@ -1593,18 +2116,86 @@ fn next_rpc_request_id(counter: &AtomicU64) -> Result<String> {
     Ok(format!("rpc-{id}"))
 }
 
-fn write_rpc_json_line(stdin: &Mutex<BufWriter<ChildStdin>>, payload: &Value) -> Result<()> {
-    let encoded = serde_json::to_string(payload).map_err(|err| Error::Json(Box::new(err)))?;
+#[cfg(unix)]
+fn prepare_rpc_pipe(pipe: &impl std::os::fd::AsFd) -> Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe)
+        .map_err(|error| Error::Io(Box::new(std::io::Error::from(error))))?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|error| Error::Io(Box::new(std::io::Error::from(error))))
+}
+
+fn encode_rpc_json_line(payload: &Value) -> Result<Vec<u8>> {
+    let mut encoded = serde_json::to_vec(payload).map_err(|err| Error::Json(Box::new(err)))?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn write_rpc_bytes(stdin: &Mutex<ChildStdin>, closed: &AtomicBool, encoded: &[u8]) -> Result<()> {
+    if closed.load(Ordering::Acquire) {
+        return Err(Error::api("RPC subprocess transport is closed"));
+    }
     let mut stdin = stdin
         .lock()
         .map_err(|_| Error::api("RPC subprocess stdin writer lock poisoned"))?;
-    stdin
-        .write_all(encoded.as_bytes())
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    stdin
-        .write_all(b"\n")
-        .map_err(|err| Error::Io(Box::new(err)))?;
-    stdin.flush().map_err(|err| Error::Io(Box::new(err)))
+    let mut written = 0;
+    while written < encoded.len() {
+        if closed.load(Ordering::Acquire) {
+            return Err(Error::api("RPC subprocess transport is closed"));
+        }
+        match stdin.write(&encoded[written..]) {
+            Ok(0) => return Err(Error::api("RPC subprocess stdin closed during a frame")),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(RPC_PIPE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(Error::Io(Box::new(error))),
+        }
+    }
+    Ok(())
+}
+
+fn read_rpc_json_line(stdout: &mut BufReader<ChildStdout>, closed: &AtomicBool) -> Result<Value> {
+    let mut line = Vec::new();
+    loop {
+        if closed.load(Ordering::Acquire) {
+            return Err(Error::api("RPC subprocess transport is closed"));
+        }
+        let available = match stdout.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(RPC_PIPE_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(Error::Io(Box::new(error))),
+        };
+        if available.is_empty() {
+            return Err(Error::api(if line.is_empty() {
+                "RPC subprocess exited before sending a response"
+            } else {
+                "RPC subprocess ended in the middle of a JSON line"
+            }));
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+                return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
+            }
+            line.extend_from_slice(&available[..newline]);
+            stdout.consume(newline + 1);
+            break;
+        }
+        if available.len() > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+            return Err(Error::api("RPC subprocess JSON line exceeded 128 MiB"));
+        }
+        let available_len = available.len();
+        line.extend_from_slice(available);
+        stdout.consume(available_len);
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    serde_json::from_slice(&line).map_err(|err| Error::Json(Box::new(err)))
 }
 
 impl Drop for RpcTransportClient {
@@ -1621,11 +2212,16 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
     Error::api(format!("RPC {command} failed: {error}"))
 }
 
-/// Proof that replacement preflight completed without mutating runtime
-/// resources. The caller must install the prepared candidate before consuming
-/// the old handle with `commit_resource_shutdown`.
+/// A durable outgoing snapshot held stable while its replacement is prepared.
+/// Dropping this token cancels preparation and releases mutation admission.
+/// Install the candidate before consuming the old handle and token with
+/// `commit_resource_shutdown`.
 pub(crate) struct PreparedSessionShutdown {
     owner_session_id: String,
+    // Drop the store before mutation admission on an uncommitted token too.
+    session: asupersync::sync::OwnedMutexGuard<Session>,
+    session_actions: crate::agent::SessionActionAdmissionGate,
+    session_action_permit: asupersync::sync::OwnedMutexGuard<()>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1736,9 +2332,10 @@ impl AgentSessionHandle {
         self.mcp_manager = None;
     }
 
-    /// Flush durable state and capture session ownership without stopping any
-    /// runtime resource. On success the caller can synchronously install its
-    /// prepared replacement before cleanup reaches an irreversible step.
+    /// Flush durable state and retain exclusive mutation admission while a
+    /// replacement is prepared, without stopping runtime resources. Dropping
+    /// the returned token keeps the current session available; a successful
+    /// replacement consumes it only after installing its candidate.
     // `&mut self` is deliberate: the preflight must hold exclusive access to
     // the handle while ownership is captured, even though no field is mutated.
     #[allow(clippy::needless_pass_by_ref_mut)]
@@ -1746,6 +2343,19 @@ impl AgentSessionHandle {
         &mut self,
     ) -> std::result::Result<PreparedSessionShutdown, SessionResourceShutdown> {
         let cx = crate::agent_cx::AgentCx::for_request();
+        // Extension mutations take action admission before the store. Keep
+        // that order so an in-flight callback can finish before we freeze it.
+        let session_actions = self.session.session_action_admission_gate();
+        let session_action_permit = match session_actions.acquire(cx.cx()).await {
+            Ok(permit) => permit,
+            Err(err) => {
+                let warning = format!("failed to reserve session replacement: {err}");
+                tracing::warn!(event = "sdk.session.shutdown.admission_failed", "{warning}");
+                let mut report = SessionResourceShutdown::default();
+                report.fail(warning);
+                return Err(report);
+            }
+        };
         let mut session = match asupersync::sync::OwnedMutexGuard::lock(
             Arc::clone(&self.session.session),
             cx.cx(),
@@ -1765,8 +2375,13 @@ impl AgentSessionHandle {
             }
         };
         let owner_session_id = session.header.id.clone();
+        // Replacing the only live handle must preserve every pending mutation,
+        // even when final process shutdown is configured as best-effort or
+        // skips its flush. A failed preflight leaves this handle available.
         if self.session.save_enabled()
-            && let Err(err) = session.flush_autosave_on_shutdown().await
+            && let Err(err) = session
+                .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                .await
         {
             let warning = format!("failed to flush session autosave: {err}");
             tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
@@ -1774,7 +2389,12 @@ impl AgentSessionHandle {
             report.fail(warning);
             return Err(report);
         }
-        Ok(PreparedSessionShutdown { owner_session_id })
+        Ok(PreparedSessionShutdown {
+            owner_session_id,
+            session,
+            session_actions,
+            session_action_permit,
+        })
     }
 
     async fn shutdown_runtime_resources(
@@ -1831,8 +2451,20 @@ impl AgentSessionHandle {
         self,
         prepared: PreparedSessionShutdown,
     ) -> SessionResourceShutdown {
+        let PreparedSessionShutdown {
+            owner_session_id,
+            session,
+            session_actions,
+            session_action_permit,
+        } = prepared;
+        // Queued extension work must fail its old-origin check after the
+        // commit. Release both guards before awaiting runtime shutdown, whose
+        // callbacks may themselves need Session access.
+        session_actions.advance_generation();
+        drop(session);
+        drop(session_action_permit);
         self.shutdown_runtime_resources(
-            Some(prepared.owner_session_id.as_str()),
+            Some(owner_session_id.as_str()),
             SessionResourceShutdown::default(),
         )
         .await
@@ -1900,33 +2532,37 @@ impl AgentSessionHandle {
             .await
     }
 
-    /// Mount cached tools for one MCP server, skipping exact names already
-    /// present in this Agent. Returns the number of wrappers added.
+    /// Synchronize MCP tools after a named server's trust/test operation.
+    /// Returns the number of wrappers added, replaced, or removed.
     ///
-    /// Runtime trust/test controls use this shared seam so repeated commands
-    /// cannot duplicate provider-visible tool definitions (bd-vjfol).
+    /// Existing names receive their current schemas, withdrawn tools disappear,
+    /// and unrelated registrations are preserved. Repeated unchanged catalogs
+    /// return zero.
     #[must_use]
-    pub fn mount_mcp_server_tools_if_absent(&mut self, server_name: &str) -> usize {
+    pub fn refresh_mcp_server_tools(&mut self, server_name: &str) -> usize {
         let Some(manager) = self.mcp_manager.clone() else {
             return 0;
         };
-        let mut wrappers = crate::mcp::mount_server_tools(&manager, server_name);
-        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
-        let mounted = wrappers.len();
-        self.session.agent.extend_tools(wrappers);
-        mounted
+        if !manager
+            .list()
+            .iter()
+            .any(|server| server.name == server_name)
+        {
+            return 0;
+        }
+        crate::mcp::reconcile_tools(&manager, &self.session.agent.shared_tools())
     }
 
     /// Start acknowledged MCP servers and mount their cached tools into this
     /// exact Agent. Session replacement calls this only after the previous
     /// handle has been dropped, preventing overlapping singleton transports.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn activate_mcp(&mut self) {
         let Some(manager) = self.mcp_manager.clone() else {
             return;
         };
-        let mut wrappers = crate::mcp::connect_trusted_and_mount_tools(&manager).await;
-        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
-        self.session.agent.extend_tools(wrappers);
+        manager.connect_trusted().await;
+        crate::mcp::reconcile_tools(&manager, &self.session.agent.shared_tools());
     }
 
     /// Bring MCP servers that extensions registered after startup into the
@@ -1938,11 +2574,15 @@ impl AgentSessionHandle {
     /// unreachable until restart. This drains the snapshot: every definition
     /// whose name the MCP manager does not know yet is registered under the
     /// same trust gate as at startup, and when anything was new the trusted
-    /// servers are connected and only tool names not already mounted are
-    /// added. Returns the number of newly registered definitions. Called at
-    /// the start of every prompt; cheap when nothing changed.
+    /// servers are connected and their owned tool catalogs are reconciled.
+    /// Returns the number of newly registered definitions. Called at the start
+    /// of every prompt; cheap when nothing changed.
     pub async fn sync_extension_mcp_registrations(&mut self) -> usize {
-        let Some(manager) = self.mcp_manager.clone() else {
+        let Some(manager) = self
+            .mcp_manager
+            .clone()
+            .or_else(|| self.session.mcp_manager())
+        else {
             return 0;
         };
         let Some(extensions) = self.extension_manager().cloned() else {
@@ -2064,6 +2704,24 @@ impl AgentSessionHandle {
         // must leave the existing primary, cooldown and chain cursor intact.
         self.failover_state.clear();
         Ok(())
+    }
+
+    /// Arm a one-shot prewalk. Repeated calls preserve an already armed target.
+    /// `None` means the destination already matches the active model/reasoning.
+    pub async fn arm_prewalk(
+        &mut self,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        self.session.arm_prewalk(target).await
+    }
+
+    #[must_use]
+    pub fn prewalk_target(&self) -> Option<&crate::prewalk::PrewalkTarget> {
+        self.session.agent.prewalk_target()
+    }
+
+    pub fn disarm_prewalk(&mut self) {
+        self.session.agent.disarm_prewalk();
     }
 
     /// Return the currently configured thinking level.
@@ -2193,85 +2851,114 @@ impl AgentSessionHandle {
         name: &str,
         note: Option<&str>,
     ) -> Result<crate::checkpoint::Checkpoint> {
-        let messages = self.session.agent.messages().to_vec();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let checkpoint = {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            crate::checkpoint::mark_checkpoint(&mut guard, name, note, &messages)
-        };
-        self.session.persist_session().await?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let messages = candidate.to_messages_for_current_path();
+        let checkpoint = crate::checkpoint::mark_checkpoint(&mut candidate, name, note, &messages);
+        self.session
+            .install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
+            .await?;
         Ok(checkpoint)
     }
 
     /// `/rewind [name]` (bd-cv653.3.7): collapse the active context since the
     /// named (default: latest) checkpoint into one summarized report. The
     /// session tree keeps every original entry; the rewind is recorded in it.
+    /// Summary failures leave the active context unchanged. A checkpoint
+    /// removed from the active context by compaction or an earlier rewind
+    /// cannot be used until its original branch is restored.
     pub async fn rewind_to_checkpoint(
         &mut self,
         name: Option<&str>,
     ) -> Result<crate::checkpoint::RewindOutcome> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let checkpoint = {
-            let guard = self
-                .session
-                .session
-                .lock(cx.cx())
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        // Match compaction's provider-permit contract. Do not hold Session or
+        // Session-action authority across provider callbacks: extensions may
+        // read or mutate that store while producing the summary.
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let store = self.session_store();
+        let (snapshot, mut candidate, checkpoint, span) = {
+            let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+            let guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            crate::checkpoint::find_checkpoint(&guard, name)
-        }
-        .ok_or_else(|| {
-            Error::session(name.map_or_else(
-                || String::from("No checkpoints yet — mark one with /checkpoint"),
-                |name| format!("No checkpoint named '{name}'"),
-            ))
-        })?;
+            let snapshot = SessionEditSnapshot::capture(&guard)?;
+            let mut candidate = guard.clone();
+            candidate.ensure_full_v2_hydration_before_save()?;
+            let checkpoint =
+                crate::checkpoint::find_checkpoint(&candidate, name).ok_or_else(|| {
+                    Error::session(name.map_or_else(
+                        || String::from("No checkpoints yet — mark one with /checkpoint"),
+                        |name| format!("No checkpoint named '{name}'"),
+                    ))
+                })?;
+            let (messages, boundary) = checkpoint
+                .entry_id
+                .as_deref()
+                .and_then(|id| candidate.context_for_checkpoint(id))
+                .ok_or_else(|| {
+                    Error::session(format!(
+                        "Checkpoint '{}' is no longer in the active context after compaction or rewind; restore its branch or mark a new checkpoint",
+                        checkpoint.name
+                    ))
+                })?;
+            let span = messages[boundary..].to_vec();
+            (snapshot, candidate, checkpoint, span)
+        };
         let agent = &self.session.agent;
-        let span =
-            agent.messages()[checkpoint.message_count.min(agent.messages().len())..].to_vec();
         if span.is_empty() {
             return Err(Error::session(format!(
                 "Nothing to rewind — the active context is already at '{}'.",
                 checkpoint.name
             )));
         }
-        // Keyless providers (replay/test/local) summarize fine without a key.
-        let api_key = agent.stream_options().api_key.clone().unwrap_or_default();
+        let privacy = agent.compaction_privacy();
         let settings = crate::compaction::ResolvedCompactionSettings {
             enabled: true,
             ..Default::default()
         };
-        let summary =
-            crate::checkpoint::summarize_span(&span, agent.provider(), &api_key, &settings)
-                .await
-                .unwrap_or_else(|err| {
-                    format!(
-                        "(summarization failed: {err}; the span was collapsed without a report)"
-                    )
-                });
-        let outcome = crate::checkpoint::apply_rewind_to_active(
-            &mut self.session.agent,
-            &checkpoint,
+        let summary = crate::checkpoint::summarize_span(
+            &span,
+            agent.provider(),
+            agent.stream_options(),
+            &settings,
+            &privacy,
+        )
+        .await?;
+        let outcome = crate::checkpoint::RewindOutcome {
+            schema: crate::checkpoint::CHECKPOINT_SCHEMA.to_string(),
+            checkpoint: checkpoint.name,
+            checkpoint_entry_id: checkpoint.entry_id,
+            collapsed_messages: span.len(),
+            summary_tokens_estimate: (summary.len() / 4) as u64,
             summary,
-        );
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.append_custom_entry(
-                "rewind".to_string(),
-                Some(serde_json::to_value(&outcome).unwrap_or_default()),
-            );
+            tree_preserved: true,
+        };
+        candidate.append_custom_entry("rewind".to_string(), Some(serde_json::to_value(&outcome)?));
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        admission.ensure_allowed()?;
+        if SessionEditSnapshot::capture(&guard)? != snapshot {
+            return Err(Error::session(
+                "Session changed while the rewind summary was running; the result was not applied",
+            ));
         }
-        self.session.persist_session().await?;
+        self.session
+            .install_context_candidate(&mut guard, candidate, true, &admission, "checkpoint rewind")
+            .await?;
         Ok(outcome)
     }
 
@@ -2279,22 +2966,27 @@ impl AgentSessionHandle {
     /// retryable user turn, so re-sending its text (returned) lands as a
     /// SIBLING branch. The abandoned turn stays in the tree for `/tree`. The
     /// agent's context is rebuilt from the new path before this returns.
+    /// Structured user input is refused before changing the session; use
+    /// [`Self::prepare_retry_content`] to retain its ordered content blocks.
     pub async fn prepare_retry(&mut self) -> Result<String> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let (text, messages) = {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            let prepared = crate::checkpoint::prepare_retry_branch(&mut guard)
-                .ok_or_else(|| Error::session("No user turn to retry".to_string()))?;
-            (prepared.text, guard.to_messages_for_current_path())
-        };
-        self.session.agent.replace_messages(messages);
-        self.session.persist_session().await?;
-        Ok(text)
+        match self.session.prepare_retry_input(true).await? {
+            UserContent::Text(text) => Ok(text),
+            UserContent::Blocks(_) => Err(Error::session(
+                "Structured retry input requires prepare_retry_content",
+            )),
+        }
+    }
+
+    /// Prepare a sibling retry while preserving native text, images, audio,
+    /// and video in their original order. Re-send the returned `Text` through
+    /// [`Self::prompt`] or the returned `Blocks` through
+    /// [`Self::prompt_with_content`].
+    ///
+    /// The abandoned branch remains in the session tree. The parent leaf is
+    /// persisted before the live context changes. A failed save leaves the
+    /// live turn intact and fences subsequent provider calls until recovery.
+    pub async fn prepare_retry_content(&mut self) -> Result<UserContent> {
+        self.session.prepare_retry_content().await
     }
 
     /// OMP `/branch` and double-Esc rewind: move the session leaf to just
@@ -2306,22 +2998,22 @@ impl AgentSessionHandle {
         &mut self,
         entry_id: &str,
     ) -> Result<crate::checkpoint::RewindPreparation> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let (prepared, messages) = {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            let prepared = crate::checkpoint::rewind_to_user_entry(&mut guard, entry_id)
-                .ok_or_else(|| {
-                    Error::session(format!("No user message {entry_id} on this branch"))
-                })?;
-            (prepared, guard.to_messages_for_current_path())
-        };
-        self.session.agent.replace_messages(messages);
-        self.session.persist_session().await?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let prepared = crate::checkpoint::rewind_to_user_entry(&mut candidate, entry_id)
+            .ok_or_else(|| Error::session(format!("No user message {entry_id} on this branch")))?;
+        self.session
+            .install_context_candidate(&mut guard, candidate, true, &admission, "branch rewind")
+            .await?;
         Ok(prepared)
     }
 
@@ -2347,29 +3039,58 @@ impl AgentSessionHandle {
 
     /// `/add-dir` driver (bd-cv653.3.12): validate + add an additional
     /// workspace root on the shared handle and persist the canonical set
-    /// into the session header. Returns a user-facing status line.
+    /// into the session header. Relative paths use the saved primary workspace,
+    /// including an explicit workdir attachment. New access is published only
+    /// after persistence succeeds; an interrupted save fences provider re-entry.
     pub async fn add_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
-        let canonical = crate::workspace::validate_new_root(dir.as_ref())?;
+        let dir = dir.as_ref();
+        if dir.as_os_str().is_empty() {
+            return Err(Error::validation(
+                "cannot add an empty path as a workspace root",
+            ));
+        }
         let mut workspace = self
             .workspace
             .clone()
             .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
-        let already = workspace
-            .snapshot_or(Path::new("."))
-            .contains_canonical(&canonical);
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(self.session_store(), cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let cwd = crate::session_workdir::require_session_workdir(&candidate)?;
+        let snapshot = workspace.snapshot_or(&cwd);
+        crate::session_workdir::check_session_workdir(&candidate, snapshot.primary())?;
+        let canonical = crate::workspace::validate_new_root(&resolve_path_for_cwd(dir, &cwd))?;
+        let previous_roots = snapshot.additional();
+        let mut roots = previous_roots.to_vec();
+        let already = snapshot.contains_canonical(&canonical);
         if !already {
-            workspace.add_root(&canonical);
+            roots.push(canonical.clone());
         }
-        let roots = workspace.additional_roots();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.set_additional_roots(&roots);
+        candidate.set_additional_roots(&roots);
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "workspace root grant",
+            )
+            .await?;
+        if !workspace.replace_additional_roots_if_unchanged(previous_roots, roots) {
+            // The candidate reached disk, but another host changed live access.
+            // Preserve that authority and require deliberate reconciliation.
+            guard.set_additional_roots(&workspace.additional_roots());
+            let reason = "Workspace roots changed while a root grant was being saved; \
+                          live access was not overwritten";
+            admission.block(reason.to_string());
+            return Err(Error::session_persistence(reason));
         }
         let display = canonical.display().to_string();
         Ok(if already {
@@ -2381,31 +3102,66 @@ impl AgentSessionHandle {
 
     /// `/remove-dir` driver (bd-cv653.3.12): revoke an additional root on
     /// the shared handle (immediate for every tool holding a clone) and
-    /// persist. Returns a user-facing status line.
+    /// persist before reporting success. Relative paths use the saved primary
+    /// workspace. A failed or interrupted save keeps access revoked in memory
+    /// and fences provider re-entry until the session is recovered.
     pub async fn remove_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
+        let dir = dir.as_ref();
+        if dir.as_os_str().is_empty() {
+            return Err(Error::validation(
+                "cannot remove an empty workspace root path",
+            ));
+        }
         let mut workspace = self
             .workspace
             .clone()
             .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
-        let removed = workspace.remove_root(dir.as_ref());
-        if !removed {
-            return Ok(format!("Not a workspace root: {}", dir.as_ref().display()));
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(self.session_store(), cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let cwd = crate::session_workdir::require_session_workdir(&candidate)?;
+        let snapshot = workspace.snapshot_or(&cwd);
+        crate::session_workdir::check_session_workdir(&candidate, snapshot.primary())?;
+        let canonical = crate::extensions::safe_canonicalize(&resolve_path_for_cwd(dir, &cwd));
+        let previous_roots = snapshot.additional();
+        let mut roots = previous_roots.to_vec();
+        roots.retain(|root| root != &canonical);
+        if roots.len() == previous_roots.len() {
+            return Ok(format!("Not a workspace root: {}", canonical.display()));
         }
-        let roots = workspace.additional_roots();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.set_additional_roots(&roots);
+        if !workspace.replace_additional_roots_if_unchanged(previous_roots, roots.clone()) {
+            return Err(Error::session(
+                "Workspace roots changed while preparing a root removal; retry the removal",
+            ));
         }
-        Ok(format!(
-            "Workspace root removed: {}",
-            dir.as_ref().display()
-        ))
+        // Revocation is conservative: a failed or dropped save must never
+        // restore access, including through a later flush of the live Session.
+        guard.set_additional_roots(&roots);
+        candidate.set_additional_roots(&roots);
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "workspace root removal",
+            )
+            .await?;
+        if !workspace.replace_additional_roots_if_unchanged(&roots, roots.clone()) {
+            guard.set_additional_roots(&workspace.additional_roots());
+            let reason = "Workspace roots changed while a root removal was being saved; \
+                          live access was not overwritten";
+            admission.block(reason.to_string());
+            return Err(Error::session_persistence(reason));
+        }
+        Ok(format!("Workspace root removed: {}", canonical.display()))
     }
 
     /// Return all model messages for the current session path.
@@ -2482,6 +3238,37 @@ impl AgentSessionHandle {
         self.session.shake_now(on_event).await
     }
 
+    /// Generate and durably install a continuation brief in this session.
+    ///
+    /// Uses the native handoff transaction, including safe recent-turn
+    /// retention, privacy screening, extension hooks and source validation.
+    /// Automatic compaction settings do not disable this explicit operation.
+    /// Cancellation is cooperative; keep polling until it returns so an
+    /// in-progress persistence transaction can finish or retain its fence.
+    /// Session subscribers and the supplied callback receive native compaction
+    /// events. No user prompt or new session is created.
+    pub async fn handoff(
+        &mut self,
+        focus: &str,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session.handoff_now(focus, abort, on_event).await?;
+        // Installation has already committed. Caller cancellation must not
+        // leave idle observers reading the old, uncompacted Agent projection.
+        let cleanup_cx = crate::agent_cx::AgentCx::for_request();
+        let messages = self
+            .session
+            .session
+            .lock(cleanup_cx.cx())
+            .await
+            .map_err(|err| Error::session(err.to_string()))?
+            .to_messages_for_current_path();
+        self.session.agent.replace_messages(messages);
+        Ok(())
+    }
+
     /// Access the underlying `AgentSession`.
     pub const fn session(&self) -> &AgentSession {
         &self.session
@@ -2490,6 +3277,31 @@ impl AgentSessionHandle {
     /// Mutable access to the underlying `AgentSession`.
     pub const fn session_mut(&mut self) -> &mut AgentSession {
         &mut self.session
+    }
+
+    /// The recovery policy used by the next turn. `None` disables both
+    /// transient-error retries and fallback-provider requests. Automatic
+    /// context-overflow compaction is controlled by the session's compaction
+    /// settings and may still shrink the context and continue once.
+    pub const fn retry_policy(&self) -> Option<crate::failover::RetryPolicy> {
+        self.retry
+    }
+
+    /// Change recovery for subsequent turns without discarding fallback
+    /// credentials, chain position, or the current primary's cooldown.
+    /// Hosts can retain [`Self::retry_policy`] when temporarily disabling it.
+    pub const fn set_retry_policy(&mut self, policy: Option<crate::failover::RetryPolicy>) {
+        self.retry = policy;
+    }
+
+    /// Apply credentials changed by an interactive login/logout to both the
+    /// live model and future fallback candidates, retaining the CLI key pin.
+    pub(crate) fn adopt_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
+        self.session.scope_auth_storage(&mut auth);
+        self.session.adopt_auth_storage(auth.clone());
+        if let Some(options) = &mut self.failover {
+            Arc::make_mut(options).auth = auth;
+        }
     }
 
     /// Consume the handle and return the inner `AgentSession`.
@@ -2769,24 +3581,54 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 ) -> Result<AgentSessionHandle> {
     let process_cwd =
         std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
-    let cwd = options.working_directory.as_deref().map_or_else(
+    let requested_cwd = options.working_directory.as_deref().map_or_else(
         || process_cwd.clone(),
         |path| resolve_path_for_cwd(path, &process_cwd),
     );
-    let resolved_session_path = options
+    // Resolve caller-supplied locations before discovering a saved workspace.
+    // A relative session path must not be reinterpreted inside its own saved
+    // cwd once metadata chooses the runtime's project directory.
+    let mut resolved_session_path = options
         .session_path
         .as_deref()
-        .map(|path| resolve_path_for_cwd(path, &cwd));
+        .map(|path| resolve_path_for_cwd(path, &requested_cwd));
     let resolved_session_dir = options
         .session_dir
         .as_deref()
-        .map(|path| resolve_path_for_cwd(path, &cwd));
+        .map(|path| resolve_path_for_cwd(path, &requested_cwd));
+    let saved_workdir = if !options.no_session
+        && let Some(path) = resolved_session_path.as_deref()
+        && crate::session::session_path_entry_exists(path)?
+    {
+        Some(crate::session_workdir::inspect_saved_session_workdir(path).await?)
+    } else {
+        None
+    };
+    let cwd = if let Some(saved) = &saved_workdir {
+        let cwd = saved.resolve_runtime_cwd(
+            options
+                .working_directory
+                .as_ref()
+                .map(|_| requested_cwd.as_path()),
+        )?;
+        if let Some(workspace) = &options.workspace {
+            saved.check_runtime_cwd(workspace.snapshot_or(&cwd).primary())?;
+        }
+        resolved_session_path = Some(saved.source_path.clone());
+        cwd
+    } else {
+        requested_cwd
+    };
 
     let mut cli = Cli::try_parse_from(["pi"])
         .map_err(|e| Error::validation(format!("CLI init failed: {e}")))?;
     cli.no_session = options.no_session;
     cli.provider = options.provider.clone();
     cli.model = options.model.clone();
+    cli.models = options
+        .model_scope
+        .as_ref()
+        .map(|patterns| patterns.join(","));
     cli.api_key = options.api_key.clone();
     cli.system_prompt = options.system_prompt.clone();
     cli.append_system_prompt = options.append_system_prompt.clone();
@@ -2816,6 +3658,50 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         config_override.as_deref(),
         options.workspace_trusted,
     )?;
+    let mut session = Session::new(&cli, &config).await?;
+    if let Some(saved) = &saved_workdir {
+        // Recheck the observation after native transcript validation and
+        // before credential refresh, providers, tools or extensions start.
+        // This covers source replacement during configuration loading too.
+        saved.check_loaded_session(&session)?;
+        saved.check_runtime_cwd(&cwd)?;
+    } else {
+        if !options.no_session
+            && let Some(path) = resolved_session_path.as_deref()
+            && crate::session::session_path_entry_exists(path)?
+        {
+            return Err(Error::session(
+                "PI_SESSION_WORKDIR_SOURCE_CHANGED: session appeared during startup; \
+                 retry discovery before resuming. No workspace was substituted.",
+            ));
+        }
+        session.header.cwd = cwd.display().to_string();
+    }
+    let workspace = options.workspace.clone().or_else(|| {
+        let roots = session.additional_roots();
+        if roots.is_empty() {
+            return None;
+        }
+        let mut restored = crate::workspace::WorkspaceHandle::single(&cwd);
+        for root in roots {
+            if !root.is_absolute() {
+                tracing::warn!(path = %root.display(), "Skipping non-absolute saved workspace root");
+                continue;
+            }
+            match crate::workspace::validate_new_root(&root) {
+                Ok(canonical) => restored.add_root(&canonical),
+                Err(error) => tracing::warn!(%error, "Skipping unavailable saved workspace root"),
+            }
+        }
+        Some(restored)
+    });
+    if options.workspace.is_some()
+        && let Some(workspace) = &workspace
+    {
+        // An explicit live root set is authoritative and must survive the
+        // next save, including CLI --add-dir handed through the FTUI SDK.
+        session.set_additional_roots(&workspace.additional_roots());
+    }
     let auth_path = Config::auth_path();
     let auth_result = AuthStorage::load_async(auth_path.clone()).await;
     let mut auth = match auth_result {
@@ -2833,6 +3719,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         }
         Err(err) => return Err(err),
     };
+    auth.set_command_working_directory(&cwd)?;
     // gh #218: refresh per provider; only a failure for the provider this
     // session actually selects is an error (checked after selection below).
     let oauth_refresh = auth.refresh_expired_oauth_tokens_report().await;
@@ -2853,25 +3740,36 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let models_path = default_models_path(&global_dir);
     let mut model_registry = ModelRegistry::load(&auth, Some(models_path));
 
-    let mut session = Session::new(&cli, &config).await?;
-    if resolved_session_path.is_none() {
-        session.header.cwd = cwd.display().to_string();
-    }
+    let scope_override = config
+        .model_scope_overrides
+        .as_deref()
+        .and_then(|overrides| crate::failover::best_scope_override(overrides, &cwd));
     let scoped_patterns = if let Some(models_arg) = &cli.models {
         app::parse_models_arg(models_arg)
+    } else if let Some(patterns) = scope_override.and_then(|scope| scope.enabled_models.clone()) {
+        patterns
     } else {
         config.enabled_models.clone().unwrap_or_default()
     };
-    let scoped_models = if scoped_patterns.is_empty() {
-        Vec::new()
-    } else {
-        app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
-    };
-
     // The session owns the extension runtime, so registration must precede
     // final provider selection. Do not persist a provisional model: resumed
     // extension identities and explicit selectors must survive registration.
     let has_extensions = !options.extension_paths.is_empty();
+    let scoped_models = if has_extensions {
+        // An allowed extension model may not exist in the native catalog yet.
+        // Validate the complete scoped pool after registration instead.
+        Vec::new()
+    } else {
+        app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &scoped_patterns,
+            &model_registry,
+            &config,
+            &cwd,
+        )
+        .map_err(|error| Error::validation(error.to_string()))?
+    };
     let selection = if has_extensions {
         extension_bootstrap::provisional_selection(&model_registry)?
     } else {
@@ -2886,7 +3784,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         .map_err(|err| Error::validation(err.to_string()))?
     };
     if !has_extensions {
-        app::update_session_for_selection(&mut session, &selection);
+        app::update_session_for_selection(&mut session, &selection, &model_registry);
     }
 
     let enabled_tools_owned = cli
@@ -2925,7 +3823,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
-    let provider = providers::create_provider(&selection.model_entry, None)
+    let provider = providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))
         .map_err(|e| Error::provider("sdk", e.to_string()))?;
 
     let api_key = if has_extensions {
@@ -2960,7 +3858,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: options.tool_approval.clone(),
         keyword_settings: config.keywords.clone(),
-        max_time: None,
+        max_time: options.max_time,
         turn_recovery: config.turn_recovery_mode(),
         approval_state: options.approval_state.clone(),
         bash_settings: config.bash.clone(),
@@ -2975,6 +3873,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         // The default registry carries an undo recorder (bd-cv653.3.13) so
         // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
         || {
+            if cli.no_tools {
+                return ToolRegistry::without_builtins(Some(&config));
+            }
             ToolRegistry::with_mutation_recorder(
                 &enabled_tools,
                 &cwd,
@@ -2982,7 +3883,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 Some(std::sync::Arc::new(
                     crate::undo::FileMutationRecorder::default(),
                 )),
-                options.workspace.as_ref(),
+                workspace.as_ref(),
             )
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
@@ -3023,14 +3924,24 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // whatever was configured. Extensions enabled below copy these modes.
     agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
-    agent_session.advisor = options
-        .advisor
-        .as_ref()
-        .map(crate::advisor::AdvisorOptions::runtime);
+    agent_session.advisor = options.advisor.as_ref().map(|options| {
+        options
+            .runtime()
+            .with_secrets_settings(config.secrets.as_ref())
+    });
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent
             .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
+    }
+    if !sdk_test_mode && !cli.no_context_files {
+        agent_session
+            .agent
+            .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
+                cwd.clone(),
+                global_dir.clone(),
+                options.workspace_trusted,
+            ))?;
     }
     // Session-coupled todo tool joins after construction (opt-in), matching
     // the CLI wiring in main.rs.
@@ -3096,6 +4007,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             extension_bootstrap::SelectionInputs {
                 cli: &cli,
                 config: &config,
+                cwd: &cwd,
                 scoped_patterns: &scoped_patterns,
                 global_dir: &global_dir,
                 oauth_refresh: &oauth_refresh,
@@ -3186,6 +4098,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         agent_session.agent.replace_messages(history);
     }
 
+    if let Some(target) = options.prewalk {
+        agent_session.arm_prewalk(target).await?;
+    }
+
     let mut listeners = EventListeners::new();
     if let Some(on_event) = options.on_event {
         listeners.subscribe(on_event);
@@ -3210,15 +4126,19 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             )
         }
     };
+    let failover = options.failover.map(|mut options| {
+        agent_session.scope_auth_storage(&mut options.auth);
+        Arc::new(options)
+    });
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
         ask_tool: ask_tool_handle,
-        workspace: options.workspace.clone(),
+        workspace,
         mcp_manager,
         retry: options.retry,
         failover_state,
-        failover: options.failover.map(Arc::new),
+        failover,
         event_runtime,
     })
 }
@@ -3265,8 +4185,146 @@ mod tests {
         runtime.block_on(Box::pin(future))
     }
 
+    /// `run_async` with a blocking pool, as the CLI runtime has
+    /// (`blocking_threads(1, 2)` in `src/main.rs`). Without a pool,
+    /// asupersync's `spawn_blocking` runs the closure inline, so a test that
+    /// holds the session persistence lock while polling a save would block
+    /// its own thread in `flock` and never get to release the lock.
+    fn run_async_with_blocking_pool<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let reactor = create_reactor().expect("create reactor");
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build runtime");
+        runtime.block_on(Box::pin(future))
+    }
+
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_current_dir_lock()
+    }
+
+    struct RewindPrivacyProvider {
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for RewindPrivacyProvider {
+        fn name(&self) -> &str {
+            "rewind-privacy"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let request = serde_json::to_string(context.messages.as_ref())?;
+            self.requests
+                .lock()
+                .map_err(|_| Error::session("fixture request lock poisoned"))?
+                .push(request);
+            let message = crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("privacy-aware rewind report"),
+                )],
+                stop_reason: crate::model::StopReason::Stop,
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                crate::model::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RewindCallbackAction {
+        Append,
+        Header,
+        Pending,
+    }
+
+    struct RewindCallbackProvider {
+        delegate: RewindPrivacyProvider,
+        store: Arc<AsyncMutex<Session>>,
+        actions: crate::agent::SessionActionAdmissionGate,
+        action: RewindCallbackAction,
+        after_callback: Arc<Mutex<Option<SessionEditSnapshot>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RewindCallbackProvider {
+        fn name(&self) -> &str {
+            self.delegate.name()
+        }
+
+        fn api(&self) -> &str {
+            self.delegate.api()
+        }
+
+        fn model_id(&self) -> &str {
+            self.delegate.model_id()
+        }
+
+        async fn stream(
+            &self,
+            context: &ProviderContext<'_>,
+            options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let mut action = Box::pin(self.actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(_action_permit)) = futures::poll!(action.as_mut())
+                else {
+                    return Err(Error::session(
+                        "rewind held Session-action authority across its provider callback",
+                    ));
+                };
+                let mut session = self.store.try_lock().map_err(|_| {
+                    Error::session("rewind held the Session lock across its provider callback")
+                })?;
+                match self.action {
+                    RewindCallbackAction::Append => {
+                        session.append_custom_entry("callback-mutation".to_string(), None);
+                    }
+                    RewindCallbackAction::Header => {
+                        session.header.additional_roots = Some(vec!["/callback-root".to_string()]);
+                    }
+                    RewindCallbackAction::Pending => {}
+                }
+                *self.after_callback.lock().unwrap() =
+                    Some(SessionEditSnapshot::capture(&session)?);
+            }
+            if matches!(self.action, RewindCallbackAction::Pending) {
+                return futures::future::pending().await;
+            }
+            self.delegate.stream(context, options).await
+        }
     }
 
     /// Fails its first `failures` calls with a retryable provider error, then
@@ -3362,6 +4420,13 @@ mod tests {
     /// build an in-memory session with saving off, which cannot distinguish a
     /// turn that persisted from one that did not.
     fn saving_handle(dir: &Path) -> AgentSessionHandle {
+        saving_handle_with_store(dir, crate::session::SessionStoreKind::Jsonl)
+    }
+
+    fn saving_handle_with_store(
+        dir: &Path,
+        store_kind: crate::session::SessionStoreKind,
+    ) -> AgentSessionHandle {
         let provider = Arc::new(FlakyThenOkProvider {
             failures: 0,
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3376,13 +4441,469 @@ mod tests {
         );
         let session = AgentSession::new(
             agent,
-            Arc::new(AsyncMutex::new(crate::session::Session::create_with_dir(
-                Some(dir.to_path_buf()),
-            ))),
+            Arc::new(AsyncMutex::new(
+                crate::session::Session::create_with_dir_and_store(
+                    Some(dir.to_path_buf()),
+                    store_kind,
+                ),
+            )),
             true,
             crate::compaction::ResolvedCompactionSettings::default(),
         );
         AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
+    }
+
+    fn workspace_handle_with_store(
+        root: &Path,
+        store_kind: crate::session::SessionStoreKind,
+    ) -> AgentSessionHandle {
+        let cwd = root.join("primary");
+        std::fs::create_dir(&cwd).expect("primary workspace");
+        let workspace = crate::workspace::WorkspaceHandle::single(&cwd);
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            name: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 0,
+        });
+        let tools = ToolRegistry::with_mutation_recorder(
+            &["read", "write"],
+            &cwd,
+            None,
+            None,
+            Some(&workspace),
+        );
+        let mut store = Session::create_with_dir_and_store(Some(root.join("sessions")), store_kind);
+        store.header.cwd = cwd.display().to_string();
+        let session = AgentSession::new(
+            Agent::new(provider, tools, AgentConfig::default()),
+            Arc::new(AsyncMutex::new(store)),
+            true,
+            ResolvedCompactionSettings::default(),
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        handle.workspace = Some(workspace);
+        handle
+    }
+
+    #[test]
+    fn workspace_root_changes_reopen_durably_and_revoke_existing_tool_handles() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            let root = tempdir().unwrap();
+            let mut handle = workspace_handle_with_store(root.path(), store_kind);
+            let extra = root.path().join("additional");
+            std::fs::create_dir(&extra).unwrap();
+            let canonical = extra.canonicalize().unwrap();
+            let probe = extra.join("probe.txt");
+            std::fs::write(&probe, "before grant").unwrap();
+            let tools = handle.session.agent.shared_tools().snapshot();
+            let write = tools.get("write").unwrap();
+            run_async(async {
+                assert!(
+                    write
+                        .execute(
+                            "before-grant",
+                            serde_json::json!({"path": probe, "content": "denied"}),
+                            None,
+                        )
+                        .await
+                        .is_err()
+                );
+                handle.add_workspace_root(&extra).await.unwrap();
+                let path = handle
+                    .session_store()
+                    .try_lock()
+                    .unwrap()
+                    .path
+                    .clone()
+                    .unwrap();
+                let reopened = Session::open(&path.display().to_string()).await.unwrap();
+                assert_eq!(reopened.additional_roots(), vec![canonical.clone()]);
+                let output = write
+                    .execute(
+                        "after-grant",
+                        serde_json::json!({"path": probe, "content": "allowed"}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!output.is_error);
+
+                let nested = extra.join("nested");
+                std::fs::create_dir(&nested).unwrap();
+                assert!(
+                    handle
+                        .add_workspace_root(&nested)
+                        .await
+                        .unwrap()
+                        .starts_with("Already")
+                );
+                assert_eq!(
+                    Session::open(&path.display().to_string())
+                        .await
+                        .unwrap()
+                        .additional_roots(),
+                    vec![canonical]
+                );
+                handle.remove_workspace_root(&extra).await.unwrap();
+                assert!(
+                    Session::open(&path.display().to_string())
+                        .await
+                        .unwrap()
+                        .additional_roots()
+                        .is_empty()
+                );
+                assert!(handle.workspace().unwrap().additional_roots().is_empty());
+                assert!(
+                    write
+                        .execute(
+                            "after-revocation",
+                            serde_json::json!({"path": probe, "content": "must stay denied"}),
+                            None,
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(std::fs::read_to_string(&probe).unwrap(), "allowed");
+            });
+        }
+    }
+
+    #[test]
+    fn workspace_root_save_failures_do_not_grant_access_or_undo_revocation() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            for remove in [false, true] {
+                let root = tempdir().unwrap();
+                let mut handle = workspace_handle_with_store(root.path(), store_kind);
+                let extra = root.path().join("additional");
+                std::fs::create_dir(&extra).unwrap();
+                let probe = extra.join("probe.txt");
+                std::fs::write(&probe, "must remain untouched").unwrap();
+                let tools = handle.session.agent.shared_tools().snapshot();
+                run_async(async {
+                    handle
+                        .mark_checkpoint("before root change", None)
+                        .await
+                        .unwrap();
+                    if remove {
+                        handle.add_workspace_root(&extra).await.unwrap();
+                    }
+                    let store = handle.session_store();
+                    let original_path = store.try_lock().unwrap().path.clone().unwrap();
+                    let original_bytes = std::fs::read(&original_path).unwrap();
+                    let blocked_path = root
+                        .path()
+                        .join("directory-not-session")
+                        .with_extension(original_path.extension().unwrap());
+                    std::fs::create_dir(&blocked_path).unwrap();
+                    store.try_lock().unwrap().path = Some(blocked_path);
+                    let result = if remove {
+                        handle.remove_workspace_root(&extra).await
+                    } else {
+                        handle.add_workspace_root(&extra).await
+                    };
+                    assert!(result.unwrap_err().is_session_persistence());
+                    assert!(handle.workspace().unwrap().additional_roots().is_empty());
+                    assert!(store.try_lock().unwrap().additional_roots().is_empty());
+                    assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+                    assert!(
+                        tools
+                            .get("write")
+                            .unwrap()
+                            .execute(
+                                "failed-root-change",
+                                serde_json::json!({"path": probe, "content": "denied"}),
+                                None,
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&probe).unwrap(),
+                        "must remain untouched"
+                    );
+                    store.try_lock().unwrap().path = Some(original_path.clone());
+                    assert!(
+                        handle
+                            .prompt("must remain fenced", |_| {})
+                            .await
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                    assert!(
+                        handle
+                            .add_workspace_root(&extra)
+                            .await
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                    // A later explicit flush must not revive a removed root.
+                    handle.session.persist_session().await.unwrap();
+                    assert!(
+                        Session::open(&original_path.display().to_string())
+                            .await
+                            .unwrap()
+                            .additional_roots()
+                            .is_empty()
+                    );
+                    assert!(
+                        handle
+                            .session
+                            .ensure_provider_reentry_allowed()
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_root_paths_use_a_resumed_workdir_attachment() {
+        let _lock = current_dir_lock();
+        let root = tempdir().unwrap();
+        let process_cwd = root.path().join("process/workspace");
+        let attached = root.path().join("attached/workspace");
+        let extra = root.path().join("attached/additional");
+        let decoy = root.path().join("process/additional");
+        for dir in [&process_cwd, &attached, &extra, &decoy] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let _cwd = CurrentDirGuard::new(&process_cwd);
+        let path = root.path().join("resumed.jsonl");
+        let mut source = Session::in_memory();
+        source.header.cwd = root
+            .path()
+            .join("original-moved-away")
+            .display()
+            .to_string();
+        source.path = Some(path.clone());
+        source.session_dir = Some(root.path().join("sessions"));
+        crate::session_workdir::attach_session_workdir(&mut source, &attached).unwrap();
+        run_async(async {
+            source.save().await.unwrap();
+            let mut handle = create_agent_session(SessionOptions {
+                provider: Some("openai".to_string()),
+                model: Some("gpt-4o".to_string()),
+                api_key: Some("dummy-key".to_string()),
+                session_path: Some(path.clone()),
+                session_dir: Some(root.path().join("sessions")),
+                no_session: false,
+                no_context_files: true,
+                enabled_tools: Some(vec!["read".to_string(), "write".to_string()]),
+                workspace: Some(crate::workspace::WorkspaceHandle::single(&attached)),
+                ..SessionOptions::default()
+            })
+            .await
+            .unwrap();
+            handle.add_workspace_root("../additional").await.unwrap();
+            let expected = vec![extra.canonicalize().unwrap()];
+            assert_eq!(handle.workspace().unwrap().additional_roots(), expected);
+            assert_eq!(
+                Session::open(&path.display().to_string())
+                    .await
+                    .unwrap()
+                    .additional_roots(),
+                expected
+            );
+            assert!(!handle.workspace().unwrap().is_within(&decoy));
+            handle.remove_workspace_root("../additional").await.unwrap();
+            let reopened = Session::open(&path.display().to_string()).await.unwrap();
+            assert!(reopened.additional_roots().is_empty());
+            assert_eq!(
+                crate::session_workdir::require_session_workdir(&reopened).unwrap(),
+                attached.canonicalize().unwrap()
+            );
+            assert_eq!(reopened.header.cwd, source.header.cwd);
+        });
+    }
+
+    #[test]
+    fn waiting_workspace_root_changes_cancel_without_mutation_or_quarantine() {
+        for remove in [false, true] {
+            let root = tempdir().unwrap();
+            let mut handle =
+                workspace_handle_with_store(root.path(), crate::session::SessionStoreKind::Jsonl);
+            let extra = root.path().join("additional");
+            std::fs::create_dir(&extra).unwrap();
+            run_async(async {
+                handle
+                    .mark_checkpoint("before root change", None)
+                    .await
+                    .unwrap();
+                if remove {
+                    handle.add_workspace_root(&extra).await.unwrap();
+                }
+                let store = handle.session_store();
+                let workspace = handle.workspace().unwrap();
+                let before_roots = workspace.additional_roots();
+                let before_session =
+                    SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+                let admission = handle.session.provider_admission_gate();
+                let actions = handle.session.session_action_admission_gate();
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let provider_permit = admission.acquire(cx.cx()).await.unwrap();
+                let mut change = Box::pin(async {
+                    if remove {
+                        handle.remove_workspace_root(&extra).await
+                    } else {
+                        handle.add_workspace_root(&extra).await
+                    }
+                });
+                assert!(futures::poll!(change.as_mut()).is_pending());
+                let mut callback_action = Box::pin(actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(action_permit)) =
+                    futures::poll!(callback_action.as_mut())
+                else {
+                    panic!("a waiting root change must not hold Session-action authority");
+                };
+                assert_eq!(workspace.additional_roots(), before_roots);
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap()
+                        == before_session
+                );
+                drop(change);
+                drop(action_permit);
+                drop(provider_permit);
+                admission.ensure_allowed().unwrap();
+                if remove {
+                    handle.remove_workspace_root(&extra).await.unwrap();
+                } else {
+                    handle.add_workspace_root(&extra).await.unwrap();
+                }
+                admission.ensure_allowed().unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn workspace_root_grant_stays_private_and_preserves_host_edits_during_save() {
+        let root = tempdir().unwrap();
+        let mut handle =
+            workspace_handle_with_store(root.path(), crate::session::SessionStoreKind::Jsonl);
+        let previous = root.path().join("previous");
+        let proposed = root.path().join("proposed");
+        std::fs::create_dir(&previous).unwrap();
+        std::fs::create_dir(&proposed).unwrap();
+        run_async_with_blocking_pool(async {
+            handle.add_workspace_root(&previous).await.unwrap();
+            let store = handle.session_store();
+            let path = store.try_lock().unwrap().path.clone().unwrap();
+            let admission = handle.session.provider_admission_gate();
+            let mut host_workspace = handle.workspace().unwrap();
+            let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
+            let mut change = Box::pin(handle.add_workspace_root(&proposed));
+            assert!(futures::poll!(change.as_mut()).is_pending());
+            assert!(
+                admission
+                    .ensure_allowed()
+                    .unwrap_err()
+                    .is_session_persistence()
+            );
+            assert_eq!(
+                host_workspace.additional_roots(),
+                vec![previous.canonicalize().unwrap()]
+            );
+            assert!(!host_workspace.is_within(&proposed));
+            assert!(host_workspace.remove_root(&previous));
+            drop(disk_lock);
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(10),
+                change,
+            )
+            .await
+            .expect("root save must finish after releasing the persistence lock");
+            assert!(result.unwrap_err().is_session_persistence());
+            assert!(host_workspace.additional_roots().is_empty());
+            assert!(store.try_lock().unwrap().additional_roots().is_empty());
+            assert!(
+                admission
+                    .ensure_allowed()
+                    .unwrap_err()
+                    .is_session_persistence()
+            );
+            handle.session.persist_session().await.unwrap();
+            assert!(
+                Session::open(&path.display().to_string())
+                    .await
+                    .unwrap()
+                    .additional_roots()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn workspace_root_removal_revokes_existing_tools_before_save_completes() {
+        let root = tempdir().unwrap();
+        let mut handle =
+            workspace_handle_with_store(root.path(), crate::session::SessionStoreKind::Jsonl);
+        let extra = root.path().join("additional");
+        std::fs::create_dir(&extra).unwrap();
+        let probe = extra.join("probe.txt");
+        std::fs::write(&probe, "must remain untouched").unwrap();
+        let tools = handle.session.agent.shared_tools().snapshot();
+        run_async_with_blocking_pool(async {
+            handle.add_workspace_root(&extra).await.unwrap();
+            let store = handle.session_store();
+            let path = store.try_lock().unwrap().path.clone().unwrap();
+            let workspace = handle.workspace().unwrap();
+            let admission = handle.session.provider_admission_gate();
+            let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
+            let mut change = Box::pin(handle.remove_workspace_root(&extra));
+            assert!(futures::poll!(change.as_mut()).is_pending());
+            assert!(workspace.additional_roots().is_empty());
+            assert!(
+                admission
+                    .ensure_allowed()
+                    .unwrap_err()
+                    .is_session_persistence()
+            );
+            assert!(
+                tools
+                    .get("write")
+                    .unwrap()
+                    .execute(
+                        "revoked-before-save",
+                        serde_json::json!({"path": probe, "content": "denied"}),
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            drop(disk_lock);
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(10),
+                change,
+            )
+            .await
+            .expect("root removal must finish after releasing the persistence lock")
+            .unwrap();
+            admission.ensure_allowed().unwrap();
+            assert!(
+                Session::open(&path.display().to_string())
+                    .await
+                    .unwrap()
+                    .additional_roots()
+                    .is_empty()
+            );
+            assert_eq!(
+                std::fs::read_to_string(&probe).unwrap(),
+                "must remain untouched"
+            );
+        });
     }
 
     fn flaky_handle_as(
@@ -3419,6 +4940,87 @@ mod tests {
     /// requirement, so the walk reaches provider construction.
     fn with_chain(handle: AgentSessionHandle, spec: &str) -> AgentSessionHandle {
         with_chain_cooldown(handle, spec, 300)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_reload_and_failover_keep_the_active_workspace() {
+        let root = tempdir().expect("fixture root");
+        let workspace = root.path().join("workspace");
+        let other = root.path().join("other");
+        std::fs::create_dir(&workspace).expect("runtime workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        std::fs::write(workspace.join("credential.txt"), "runtime-key\n")
+            .expect("runtime credential");
+        std::fs::write(other.join("credential.txt"), "other-key\n").expect("other credential");
+        let auth_path = root.path().join("auth.json");
+        let fresh_auth = || {
+            let mut auth = AuthStorage::empty_at(auth_path.clone());
+            auth.set(
+                "test-provider",
+                crate::auth::AuthCredential::ApiKey {
+                    key: "$CMD:cat credential.txt".to_string(),
+                },
+            );
+            auth
+        };
+        let (mut handle, _) = flaky_handle(0);
+        let mut initial = AuthStorage::empty_at(auth_path.clone());
+        initial
+            .set_command_working_directory(&workspace)
+            .expect("scope active runtime");
+        handle.session_mut().set_auth_storage(initial);
+        let mut incoming = fresh_auth();
+        incoming
+            .set_command_working_directory(&other)
+            .expect("incoming context must not replace runtime workspace");
+        handle = handle.with_failover(Some(FailoverOptions {
+            chains: std::collections::HashMap::new(),
+            available_models: Vec::new(),
+            auth: incoming.clone(),
+            cli_api_key: None,
+            cooldown_secs: 0,
+        }));
+        assert_eq!(
+            handle
+                .failover
+                .as_ref()
+                .expect("installed failover")
+                .auth
+                .api_key("test-provider")
+                .as_deref(),
+            Some("runtime-key"),
+            "caller-supplied fallback credentials use the active runtime cwd"
+        );
+
+        handle.adopt_auth_storage(incoming);
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("runtime-key"),
+            "login adoption resolves the running model in its original workspace"
+        );
+        assert_eq!(
+            handle
+                .failover
+                .as_ref()
+                .expect("retained failover")
+                .auth
+                .api_key("test-provider")
+                .as_deref(),
+            Some("runtime-key"),
+            "future fallback candidates keep the same scoped credentials"
+        );
+
+        handle
+            .session_mut()
+            .adopt_auth_storage(AuthStorage::empty_at(auth_path.clone()));
+        assert!(handle.session().agent.stream_options().api_key.is_none());
+        handle.session_mut().adopt_auth_storage(fresh_auth());
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some("runtime-key"),
+            "direct session adoption retains cwd through logout and another login"
+        );
     }
 
     /// A loopback HTTP endpoint that answers every request with a 401, the
@@ -3487,6 +5089,8 @@ mod tests {
             handle.with_retry(Some(crate::failover::RetryPolicy {
                 max_retries: 1,
                 max_failovers_per_turn: 1,
+                model_fallback: true,
+                fallback_on: crate::failover::FallbackOn::Any,
                 base_delay_ms: 1,
                 max_delay_ms: 1,
             })),
@@ -3528,9 +5132,46 @@ mod tests {
         crate::failover::RetryPolicy {
             max_retries,
             max_failovers_per_turn: 0,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 1,
             max_delay_ms: 1,
         }
+    }
+
+    #[test]
+    fn changing_retry_policy_controls_subsequent_turns_without_rebuilding_the_session() {
+        let (mut handle, calls) = flaky_handle(2);
+        let store = handle.session_store();
+        let policy = fast_retry_policy(3);
+        handle.set_retry_policy(None);
+        let first = run_async(handle.prompt("first", |_| {})).expect("first turn");
+        assert_eq!(first.stop_reason, crate::model::StopReason::Error);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        handle.set_retry_policy(Some(policy));
+        let second = run_async(handle.prompt("second", |_| {})).expect("recovered turn");
+        assert_eq!(second.stop_reason, crate::model::StopReason::Stop);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(Arc::ptr_eq(&store, &handle.session_store()));
+    }
+
+    #[test]
+    fn toggling_retry_preserves_the_active_fallback_and_primary_cooldown() {
+        let mut handle = handle_after_one_failover(3600);
+        let policy = handle.retry_policy().expect("recovery policy");
+        let fallback = Arc::clone(handle.failover.as_ref().expect("fallback configuration"));
+        let before = format!("{:?}", handle.failover_state);
+        let model = handle.model();
+        handle.set_retry_policy(None);
+        assert_eq!(handle.model(), model);
+        assert_eq!(format!("{:?}", handle.failover_state), before);
+        handle.set_retry_policy(Some(policy));
+        assert!(Arc::ptr_eq(
+            handle.failover.as_ref().expect("same fallback"),
+            &fallback
+        ));
+        assert_eq!(format!("{:?}", handle.failover_state), before);
     }
 
     /// The gap bd-u2qv4 names: a transient provider failure is a hard error on
@@ -3617,6 +5258,8 @@ mod tests {
             handle.with_retry(Some(crate::failover::RetryPolicy {
                 max_retries: 1,
                 max_failovers_per_turn: 1,
+                model_fallback: true,
+                fallback_on: crate::failover::FallbackOn::Any,
                 base_delay_ms: 1,
                 max_delay_ms: 1,
             })),
@@ -3871,6 +5514,12 @@ mod tests {
         let wrong = run_async(handle.rewind_to_checkpoint(Some("nope"))).unwrap_err();
         assert!(wrong.to_string().contains("No checkpoint named 'nope'"));
 
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }));
         let outcome = run_async(handle.rewind_to_checkpoint(Some("start"))).expect("rewind");
         assert_eq!(outcome.collapsed_messages, turn_len);
         assert!(
@@ -3891,6 +5540,715 @@ mod tests {
             entry,
             crate::session::SessionEntry::Custom(custom) if custom.custom_type == "rewind"
         )));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One failure matrix covers the public checkpoint transitions.
+    fn checkpoint_save_failures_preserve_live_state_and_fence_every_rewind() {
+        for operation in ["mark", "checkpoint", "branch"] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            run_async(async {
+                handle
+                    .prompt("keep this turn", |_| {})
+                    .await
+                    .expect("first turn");
+                handle
+                    .mark_checkpoint("kept", None)
+                    .await
+                    .expect("checkpoint");
+                handle
+                    .prompt("rewind this turn", |_| {})
+                    .await
+                    .expect("second turn");
+            });
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            handle
+                .session
+                .agent
+                .set_provider(Arc::new(RewindPrivacyProvider {
+                    requests: Arc::clone(&requests),
+                }));
+            let store = handle.session_store();
+            let (original_path, target_id) = {
+                let guard = store.try_lock().expect("session");
+                let target_id = guard
+                    .entries
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        crate::session::SessionEntry::Message(entry)
+                            if matches!(
+                                entry.message,
+                                crate::session::SessionMessage::User { .. }
+                            ) =>
+                        {
+                            entry.base.id.clone()
+                        }
+                        _ => None,
+                    })
+                    .expect("latest user entry");
+                (guard.path.clone().expect("saved path"), target_id)
+            };
+            let original_bytes = std::fs::read(&original_path).expect("session bytes");
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let blocked_path = dir.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked_path).expect("block candidate save");
+            let before_session = {
+                let mut guard = store.try_lock().expect("session");
+                guard.path = Some(blocked_path);
+                SessionEditSnapshot::capture(&guard).expect("snapshot")
+            };
+            let result = run_async(async {
+                match operation {
+                    "mark" => handle
+                        .mark_checkpoint("must-not-appear", None)
+                        .await
+                        .map(|_| ()),
+                    "checkpoint" => handle.rewind_to_checkpoint(Some("kept")).await.map(|_| ()),
+                    "branch" => handle.rewind_to_user_message(&target_id).await.map(|_| ()),
+                    _ => unreachable!(),
+                }
+            });
+            assert!(
+                result.as_ref().is_err_and(Error::is_session_persistence),
+                "{operation}"
+            );
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent
+            );
+            {
+                let mut guard = store.try_lock().expect("live session");
+                assert!(SessionEditSnapshot::capture(&guard).unwrap() == before_session);
+                guard.path = Some(original_path.clone());
+            }
+            let calls_before = requests.lock().unwrap().len();
+            run_async(async {
+                assert!(
+                    handle
+                        .mark_checkpoint("refused", None)
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+                assert!(
+                    handle
+                        .rewind_to_checkpoint(Some("kept"))
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+                assert!(
+                    handle
+                        .rewind_to_user_message(&target_id)
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+                assert!(
+                    handle
+                        .prompt("refused", |_| {})
+                        .await
+                        .as_ref()
+                        .is_err_and(Error::is_session_persistence)
+                );
+            });
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                calls_before,
+                "quarantine must prevent summary requests too"
+            );
+            assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Root selection must survive both backends and all rewind forms.
+    fn first_turn_rewind_and_retry_keep_root_selected_after_save_and_reopen() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            for operation in ["branch", "retry", "native-retry"] {
+                let dir = tempdir().expect("tempdir");
+                let mut handle = saving_handle_with_store(dir.path(), store_kind);
+                let store = handle.session_store();
+                let (first_user, path) = run_async(async {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut session = store.lock(cx.cx()).await.expect("session");
+                    let content = if operation == "native-retry" {
+                        UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(
+                            "original first turn",
+                        ))])
+                    } else {
+                        UserContent::Text("original first turn".to_string())
+                    };
+                    let first_user = session.append_message(crate::session::SessionMessage::User {
+                        content,
+                        timestamp: Some(0),
+                    });
+                    session.append_message(crate::session::SessionMessage::Assistant {
+                        message: AssistantMessage {
+                            content: vec![ContentBlock::Text(TextContent::new("original answer"))],
+                            stop_reason: StopReason::Stop,
+                            ..Default::default()
+                        },
+                    });
+                    session.save().await.expect("original session");
+                    handle
+                        .session
+                        .agent
+                        .replace_messages(session.to_messages_for_current_path());
+                    (first_user, session.path.clone().expect("saved path"))
+                });
+                assert_eq!(handle.session.agent.messages().len(), 2);
+                run_async(async {
+                    match operation {
+                        "branch" => {
+                            let prepared = handle
+                                .rewind_to_user_message(&first_user)
+                                .await
+                                .expect("first-user rewind");
+                            assert_eq!(prepared.text, "original first turn");
+                        }
+                        "retry" => {
+                            assert_eq!(
+                                handle.prepare_retry().await.expect("only-turn retry"),
+                                "original first turn"
+                            );
+                        }
+                        "native-retry" => {
+                            let prepared =
+                                handle.prepare_retry_content().await.expect("native retry");
+                            assert!(matches!(prepared, UserContent::Blocks(_)));
+                        }
+                        _ => unreachable!(),
+                    }
+                });
+                assert!(
+                    handle.session.agent.messages().is_empty(),
+                    "{operation}: live context"
+                );
+                {
+                    let session = store.try_lock().expect("selected root");
+                    assert!(session.leaf_id().is_none());
+                    assert_eq!(session.header.current_leaf.as_deref(), Some(""));
+                    assert!(session.to_messages_for_current_path().is_empty());
+                    assert_eq!(session.entries.len(), 2, "history remains in the tree");
+                }
+                let reopened =
+                    run_async(Session::open(&path.display().to_string())).expect("root reopen");
+                assert!(reopened.leaf_id().is_none(), "{operation}: reopened root");
+                assert!(reopened.to_messages_for_current_path().is_empty());
+                assert_eq!(reopened.entries.len(), 2);
+                run_async(handle.prompt("replacement first turn", |_| {})).expect("sibling turn");
+                let live_context = checkpoint_context_value(handle.session.agent.messages());
+                assert!(!live_context.to_string().contains("original first turn"));
+                let reopened =
+                    run_async(Session::open(&path.display().to_string())).expect("sibling reopen");
+                assert_eq!(
+                    checkpoint_context_value(&reopened.to_messages_for_current_path()),
+                    live_context
+                );
+                assert!(
+                    reopened.get_entry(&first_user).is_some(),
+                    "abandoned branch survives"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_checkpoint_summary_keeps_the_span_available_for_retry() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        run_async(async {
+            handle
+                .mark_checkpoint("start", None)
+                .await
+                .expect("checkpoint");
+            handle
+                .prompt("valuable work must remain visible", |_| {})
+                .await
+                .expect("turn");
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(FlakyThenOkProvider {
+                failures: usize::MAX,
+                calls: Arc::clone(&calls),
+                name: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                input_tokens: 0,
+            }));
+        let store = handle.session_store();
+        let before_session = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+        let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+        let path = store.try_lock().unwrap().path.clone().unwrap();
+        let before_file = std::fs::read(&path).unwrap();
+        let error =
+            run_async(handle.rewind_to_checkpoint(Some("start"))).expect_err("failed summary");
+        assert!(error.to_string().contains("503"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            before_agent
+        );
+        assert!(
+            SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before_session
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before_file);
+        assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }));
+        let outcome = run_async(handle.rewind_to_checkpoint(Some("start"))).expect("retry summary");
+        assert_eq!(outcome.collapsed_messages, 2);
+        assert_eq!(handle.session.agent.messages().len(), 1);
+    }
+
+    /// Synthetic compaction summaries carry fresh timestamps on projection;
+    /// every other message field must still agree between live and reopened
+    /// context. Do not normalize content, tool calls, order or provider data.
+    fn checkpoint_context_value(messages: &[Message]) -> Value {
+        let mut value = serde_json::to_value(messages).expect("messages");
+        for message in value.as_array_mut().expect("message array") {
+            message
+                .as_object_mut()
+                .expect("message object")
+                .remove("timestamp");
+        }
+        value
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn checkpoint_rewind_uses_compacted_boundary_and_reopens_identically() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        run_async(async {
+            for index in 0..4 {
+                handle
+                    .prompt(format!("retained history {index}"), |_| {})
+                    .await
+                    .expect("history turn");
+            }
+            let checkpoint = handle
+                .mark_checkpoint("before-experiment", None)
+                .await
+                .expect("checkpoint");
+            assert_eq!(checkpoint.message_count, 8);
+            handle
+                .prompt("experiment to summarize", |_| {})
+                .await
+                .expect("experiment turn");
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut guard = store.lock(cx.cx()).await.expect("session");
+            let retained_user = guard
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    crate::session::SessionEntry::Message(entry)
+                        if matches!(entry.message, crate::session::SessionMessage::User { .. }) =>
+                    {
+                        entry.base.id.clone()
+                    }
+                    _ => None,
+                })
+                .nth(3)
+                .expect("last history turn");
+            guard.append_compaction(
+                "earlier history summary".to_string(),
+                retained_user,
+                10_000,
+                None,
+                None,
+            );
+            guard.save().await.expect("persist compaction");
+            handle
+                .session
+                .agent
+                .replace_messages(guard.to_messages_for_current_path());
+        });
+        assert_eq!(
+            handle.session.agent.messages().len(),
+            5,
+            "compaction renumbers the checkpoint boundary"
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            }));
+        let store = handle.session_store();
+        let entries_before = store.try_lock().unwrap().entries.len();
+        let outcome = run_async(handle.rewind_to_checkpoint(Some("before-experiment")))
+            .expect("rewind after compaction");
+        assert_eq!(outcome.collapsed_messages, 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("experiment to summarize"));
+        assert!(
+            !requests[0].contains("retained history 3"),
+            "kept context must not enter the collapsed span"
+        );
+        let live_context = checkpoint_context_value(handle.session.agent.messages());
+        let (path, entries_after) = {
+            let guard = store.try_lock().unwrap();
+            assert_eq!(
+                checkpoint_context_value(&guard.to_messages_for_current_path()),
+                live_context
+            );
+            (guard.path.clone().unwrap(), guard.entries.len())
+        };
+        assert_eq!(
+            entries_after,
+            entries_before + 1,
+            "append the report without removing history"
+        );
+        let reopened =
+            run_async(Session::open(&path.display().to_string())).expect("reopen rewind");
+        assert_eq!(
+            checkpoint_context_value(&reopened.to_messages_for_current_path()),
+            live_context
+        );
+        assert_eq!(reopened.entries.len(), entries_after);
+        assert_eq!(
+            live_context.as_array().unwrap().len(),
+            4,
+            "summary, retained turn and rewind report"
+        );
+    }
+
+    #[test]
+    fn checkpoint_hidden_by_compaction_or_rewind_is_refused_before_summary() {
+        for compacted in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            run_async(async {
+                handle
+                    .mark_checkpoint("outer", None)
+                    .await
+                    .expect("outer checkpoint");
+                handle
+                    .prompt("first span", |_| {})
+                    .await
+                    .expect("first turn");
+                handle
+                    .mark_checkpoint("inner", None)
+                    .await
+                    .expect("inner checkpoint");
+                handle
+                    .prompt("second span", |_| {})
+                    .await
+                    .expect("second turn");
+            });
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            handle
+                .session
+                .agent
+                .set_provider(Arc::new(RewindPrivacyProvider {
+                    requests: Arc::clone(&requests),
+                }));
+            let store = handle.session_store();
+            run_async(async {
+                if compacted {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let mut guard = store.lock(cx.cx()).await.expect("session");
+                    let retained_user = guard
+                        .entries
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            crate::session::SessionEntry::Message(entry)
+                                if matches!(
+                                    entry.message,
+                                    crate::session::SessionMessage::User { .. }
+                                ) =>
+                            {
+                                entry.base.id.clone()
+                            }
+                            _ => None,
+                        })
+                        .expect("last user entry");
+                    guard.append_compaction(
+                        "old context".to_string(),
+                        retained_user,
+                        10_000,
+                        None,
+                        None,
+                    );
+                    guard.save().await.expect("save compaction");
+                    handle
+                        .session
+                        .agent
+                        .replace_messages(guard.to_messages_for_current_path());
+                } else {
+                    handle
+                        .rewind_to_checkpoint(Some("outer"))
+                        .await
+                        .expect("outer rewind");
+                }
+            });
+            let before_agent = checkpoint_context_value(handle.session.agent.messages());
+            let before_session = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+            let calls_before = requests.lock().unwrap().len();
+            let error = run_async(handle.rewind_to_checkpoint(Some("inner")))
+                .expect_err("hidden checkpoint");
+            assert!(
+                error
+                    .to_string()
+                    .contains("no longer in the active context"),
+                "{error}"
+            );
+            assert_eq!(requests.lock().unwrap().len(), calls_before);
+            assert_eq!(
+                checkpoint_context_value(handle.session.agent.messages()),
+                before_agent
+            );
+            assert!(
+                SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before_session
+            );
+            assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+        }
+    }
+
+    #[test]
+    fn checkpoint_rewind_does_not_overwrite_provider_callback_changes() {
+        for action in [RewindCallbackAction::Append, RewindCallbackAction::Header] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            run_async(async {
+                handle
+                    .mark_checkpoint("start", None)
+                    .await
+                    .expect("checkpoint");
+                handle.prompt("source context", |_| {}).await.expect("turn");
+            });
+            let store = handle.session_store();
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let path = store.try_lock().unwrap().path.clone().unwrap();
+            let before_file = std::fs::read(&path).unwrap();
+            let after_callback = Arc::new(Mutex::new(None));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let actions = handle.session.session_action_admission_gate();
+            handle
+                .session
+                .agent
+                .set_provider(Arc::new(RewindCallbackProvider {
+                    delegate: RewindPrivacyProvider {
+                        requests: Arc::new(Mutex::new(Vec::new())),
+                    },
+                    store: Arc::clone(&store),
+                    actions,
+                    action,
+                    after_callback: Arc::clone(&after_callback),
+                    calls: Arc::clone(&calls),
+                }));
+            let error =
+                run_async(handle.rewind_to_checkpoint(Some("start"))).expect_err("stale summary");
+            assert!(
+                error.to_string().contains("Session changed while"),
+                "{error}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent
+            );
+            let live = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+            assert!(
+                after_callback.lock().unwrap().as_ref() == Some(&live),
+                "callback changes must survive the refused rewind"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before_file);
+            assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+        }
+    }
+
+    #[test]
+    fn dropping_checkpoint_summary_preserves_state_without_quarantining() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        run_async(async {
+            handle
+                .mark_checkpoint("start", None)
+                .await
+                .expect("checkpoint");
+            handle
+                .prompt("context before cancelled summary", |_| {})
+                .await
+                .expect("turn");
+        });
+        let store = handle.session_store();
+        let before_session = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+        let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+        let path = store.try_lock().unwrap().path.clone().unwrap();
+        let before_file = std::fs::read(&path).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let actions = handle.session.session_action_admission_gate();
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindCallbackProvider {
+                delegate: RewindPrivacyProvider {
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                store: Arc::clone(&store),
+                actions,
+                action: RewindCallbackAction::Pending,
+                after_callback: Arc::new(Mutex::new(None)),
+                calls: Arc::clone(&calls),
+            }));
+        run_async(async {
+            let mut rewind = Box::pin(handle.rewind_to_checkpoint(Some("start")));
+            assert!(futures::poll!(rewind.as_mut()).is_pending());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "drop during the provider request"
+            );
+            drop(rewind);
+        });
+        assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            before_agent
+        );
+        assert!(
+            SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before_session
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before_file);
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }));
+        let result =
+            run_async(handle.rewind_to_checkpoint(Some("start"))).expect("retry after drop");
+        assert_eq!(result.collapsed_messages, 2);
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn assert_rewind_privacy(mode: &str) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(RewindPrivacyProvider {
+            requests: Arc::clone(&requests),
+        });
+        let mut agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::without_builtins(None),
+            crate::agent::AgentConfig {
+                secrets: Some(crate::secrets::SecretsSettings {
+                    mode: Some(mode.to_string()),
+                    extra_patterns: Some(vec!["ACME-[0-9]{6}".to_string()]),
+                }),
+                ..Default::default()
+            },
+        );
+        let learned = "historicalValue482610";
+        if mode == "obfuscate" {
+            let masked =
+                agent // ubs:ignore[rust.ownership.unwrap-expect] -- Seed a secret through the real live-vault API.
+                    .secrets_transform_outbound_text(&format!("API_KEY={learned}"))
+                    .expect("learn earlier credential");
+            assert!(!masked.contains(learned)); // ubs:ignore[rust.panic.assert-macros] -- Fixture must learn the credential before its bare reuse.
+        }
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::in_memory())),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        let raw = format!("Explore customer ACME-123456 and prior reference {learned}.");
+        let message = crate::model::Message::User(crate::model::UserMessage {
+            content: crate::model::UserContent::Text(raw.clone()),
+            timestamp: 0,
+        });
+        let outcome = run_async(async {
+            handle // ubs:ignore[rust.ownership.unwrap-expect] -- Exercise public checkpoint/rewind operations.
+                .mark_checkpoint("start", None)
+                .await
+                .expect("mark checkpoint");
+            handle.session.agent.add_message(message.clone());
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            {
+                let mut stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Populate original durable history.
+                stored.append_message(crate::session::SessionMessage::from(message));
+            }
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let before_session = {
+                let stored = store.lock(cx.cx()).await.expect("session snapshot");
+                SessionEditSnapshot::capture(&stored).expect("snapshot")
+            };
+            let outcome = handle.rewind_to_checkpoint(Some("start")).await;
+            let stored = store.lock(cx.cx()).await.expect("session lock"); // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect original entries after context replacement.
+            assert!(stored.entries.iter().any(
+                |entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- Privacy must not rewrite the session tree.
+                    entry,
+                    crate::session::SessionEntry::Message(entry)
+                        if matches!(&entry.message,
+                            crate::session::SessionMessage::User {
+                                content: crate::model::UserContent::Text(text), ..
+                            } if text == &raw)
+                )
+            ));
+            if mode == "block" {
+                assert_eq!(
+                    serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                    before_agent,
+                    "privacy refusal must retain the active span"
+                );
+                assert!(
+                    SessionEditSnapshot::capture(&stored).unwrap() == before_session,
+                    "privacy refusal must not append a replacement report"
+                );
+            }
+            outcome
+        });
+        let requests = requests.lock().expect("recorded provider requests"); // ubs:ignore[rust.ownership.unwrap-expect] -- Observe what crossed the provider boundary.
+        if mode == "block" {
+            assert!(requests.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Configured blocking must prevent any provider dispatch.
+            assert!(outcome.unwrap_err().to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- Refusal is returned without discarding the active span.
+        } else {
+            assert_eq!(requests.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- One real summarization request.
+            let request = requests.first().expect("summarization request"); // ubs:ignore[rust.ownership.unwrap-expect] -- Count was asserted above.
+            assert!(request.contains("Explore customer")); // ubs:ignore[rust.panic.assert-macros] -- Useful non-secret context reaches the summarizer.
+            assert!(!request.contains("ACME-123456")); // ubs:ignore[rust.panic.assert-macros] -- User-defined pattern is applied.
+            assert!(!request.contains(learned)); // ubs:ignore[rust.panic.assert-macros] -- Bare reuse is protected by the live session vault.
+            assert!(!request.contains("<pi-secret:000")); // ubs:ignore[rust.panic.assert-macros] -- Neither remembered nor newly allocated reversible IDs cross this fixture's provider boundary.
+            assert!(
+                outcome
+                    .expect("rewind")
+                    .summary
+                    .contains("privacy-aware rewind report")
+            ); // ubs:ignore[rust.panic.assert-macros] -- Successful model summary reaches the public result.
+        }
+    }
+
+    #[test]
+    fn rewind_screens_configured_patterns_and_live_vault_secrets() {
+        assert_rewind_privacy("obfuscate");
+    }
+
+    #[test]
+    fn rewind_block_mode_refuses_provider_dispatch_and_preserves_history() {
+        assert_rewind_privacy("block");
     }
 
     /// OMP `/retry`: the re-sent turn is a sibling of the abandoned one. On
@@ -3943,6 +6301,184 @@ mod tests {
             .filter(|message| matches!(message, crate::model::Message::User(_)))
             .count();
         assert_eq!(users_on_path, 1, "the active path holds only the retry");
+    }
+
+    #[test]
+    fn prepare_retry_save_failure_preserves_live_context_and_fences_reentry() {
+        for native in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let mut handle = saving_handle(dir.path());
+            let content = vec![ContentBlock::Media(MediaContent {
+                data: "YQ==".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("voice.wav".to_string()),
+            })];
+            run_async(async {
+                if native {
+                    handle.prompt_with_content(content.clone(), |_| {}).await
+                } else {
+                    handle.prompt("original turn", |_| {}).await
+                }
+            })
+            .expect("original turn");
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let store = handle.session_store();
+            let (original_path, original_leaf, original_entries) = {
+                let guard = store.try_lock().expect("original session");
+                (
+                    guard.path.clone().expect("saved path"),
+                    guard.leaf_id().map(str::to_string),
+                    serde_json::to_value(&guard.entries).unwrap(),
+                )
+            };
+            let original_file = std::fs::read(&original_path).expect("saved session bytes");
+            let blocked = dir.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked).expect("block persistence");
+            store.try_lock().unwrap().path = Some(blocked);
+
+            let result = run_async(async {
+                if native {
+                    handle.prepare_retry_content().await
+                } else {
+                    handle.prepare_retry().await.map(UserContent::Text)
+                }
+            });
+            assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent,
+                "failed retry persistence must not rewind the live agent"
+            );
+            {
+                let mut guard = store.try_lock().expect("unchanged live session");
+                assert_eq!(guard.leaf_id(), original_leaf.as_deref());
+                assert_eq!(
+                    serde_json::to_value(&guard.entries).unwrap(),
+                    original_entries
+                );
+                guard.path = Some(original_path.clone());
+            }
+            let blocked_prompt = run_async(handle.prompt_with_content(content, |_| {
+                panic!("quarantined retry must not begin another provider turn");
+            }));
+            assert!(
+                blocked_prompt
+                    .as_ref()
+                    .is_err_and(Error::is_session_persistence),
+                "repairing the path alone must not clear uncertain transition state"
+            );
+            assert_eq!(
+                std::fs::read(&original_path).unwrap(),
+                original_file,
+                "failed preparation and refused reentry must leave the durable branch intact"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_retry_content_refuses_invalid_latest_input_without_rewinding() {
+        let (mut handle, calls) = flaky_handle(0);
+        let store = handle.session_store();
+        let leaf = {
+            let mut guard = store.try_lock().expect("session");
+            guard.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("older valid input".to_string()),
+                timestamp: Some(0),
+            });
+            let leaf = guard.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Blocks(Vec::new()),
+                timestamp: Some(0),
+            });
+            handle
+                .session
+                .agent
+                .replace_messages(guard.to_messages_for_current_path());
+            leaf
+        };
+        let before = serde_json::to_value(handle.session.agent.messages()).unwrap();
+        let error = run_async(handle.prepare_retry_content()).expect_err("invalid native input");
+        assert!(error.to_string().contains("PI_INPUT_CONTENT"));
+        assert_eq!(store.try_lock().unwrap().leaf_id(), Some(leaf.as_str()));
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            before
+        );
+        assert!(
+            handle
+                .session
+                .provider_admission_gate()
+                .ensure_allowed()
+                .is_ok()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepare_retry_waits_for_provider_before_session_locks_and_cancels_cleanly() {
+        let (mut handle, calls) = flaky_handle(0);
+        let store = handle.session_store();
+        let original =
+            store
+                .try_lock()
+                .unwrap()
+                .append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("original input".to_string()),
+                    timestamp: Some(0),
+                });
+        let provider_gate = handle.session.provider_admission_gate();
+        let action_gate = handle.session.session_action_admission_gate();
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let provider_call = provider_gate.acquire(cx.cx()).await.unwrap();
+            let mut retry = Box::pin(handle.prepare_retry_content());
+            assert!(futures::poll!(retry.as_mut()).is_pending());
+
+            let mut callback_action = Box::pin(action_gate.acquire(cx.cx()));
+            let std::task::Poll::Ready(Ok(action_permit)) =
+                futures::poll!(callback_action.as_mut())
+            else {
+                panic!("provider callbacks must retain access to Session actions");
+            };
+            let callback_entry = store
+                .try_lock()
+                .expect("waiting retry must not hold the Session store")
+                .append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("input from provider callback".to_string()),
+                    timestamp: Some(0),
+                });
+            drop(action_permit);
+            drop(retry);
+            provider_gate.ensure_allowed().unwrap();
+            assert_eq!(
+                store.try_lock().unwrap().leaf_id(),
+                Some(callback_entry.as_str())
+            );
+            drop(provider_call);
+
+            let action_permit = action_gate.acquire(cx.cx()).await.unwrap();
+            let mut retry = Box::pin(handle.prepare_retry_content());
+            assert!(futures::poll!(retry.as_mut()).is_pending());
+            assert!(store.try_lock().is_ok());
+            provider_gate.ensure_allowed().unwrap();
+            drop(retry);
+            drop(action_permit);
+
+            let prepared = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(5),
+                handle.prepare_retry_content(),
+            )
+            .await
+            .expect("cancelled preparation must release every admission permit")
+            .expect("retry after the callback finishes");
+            assert!(matches!(
+                prepared,
+                UserContent::Text(text) if text == "input from provider callback"
+            ));
+            assert_eq!(store.try_lock().unwrap().leaf_id(), Some(original.as_str()));
+            provider_gate.ensure_allowed().unwrap();
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// bd-9o9i2 criterion 3, and the half that matters for safety rather than
@@ -4926,6 +7462,108 @@ mod tests {
     }
 
     #[test]
+    fn native_handoff_fans_out_events_and_refreshes_live_history_after_installation() {
+        run_async(async {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            });
+            let mut stored = Session::in_memory();
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("older authored context ".repeat(100)),
+                timestamp: Some(1),
+            });
+            stored.append_message(crate::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("older answer"))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            });
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("keep this current request")),
+                    ContentBlock::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ]),
+                timestamp: Some(2),
+            });
+            let session_id = stored.header.id.clone();
+            let before = serde_json::to_value(stored.to_messages_for_current_path()).unwrap();
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            agent.replace_messages(stored.to_messages_for_current_path());
+            let mut handle = AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::new(AsyncMutex::new(stored)),
+                    false,
+                    ResolvedCompactionSettings {
+                        enabled: false,
+                        keep_recent_tokens: 1,
+                        ..ResolvedCompactionSettings::default()
+                    },
+                ),
+                EventListeners::new(),
+            );
+            let subscriber_events = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = Arc::clone(&subscriber_events);
+            handle.subscribe(move |event| {
+                subscriber
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            });
+
+            let (cancelled, cancelled_signal) = AbortHandle::new();
+            cancelled.abort();
+            assert!(matches!(
+                handle.handoff("", &cancelled_signal, |_| {}).await,
+                Err(Error::Aborted)
+            ));
+            assert!(requests.lock().unwrap().is_empty());
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before,
+            );
+
+            let (_, signal) = AbortHandle::new();
+            let callback_events = Arc::new(Mutex::new(Vec::new()));
+            let callback = Arc::clone(&callback_events);
+            handle
+                .handoff("keep the native attachment", &signal, move |event| {
+                    callback
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                })
+                .await
+                .expect("manual handoff ignores disabled automatic compaction");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let stored = handle.session.session.lock(cx.cx()).await.unwrap();
+            assert_eq!(stored.header.id, session_id);
+            let projected = stored.to_messages_for_current_path();
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                serde_json::to_value(&projected).unwrap(),
+            );
+            assert_eq!(serde_json::to_value(projected.last()).unwrap(), before[2]);
+            let observed = subscriber_events.lock().unwrap();
+            assert_eq!(*observed, *callback_events.lock().unwrap());
+            assert_eq!(observed.len(), 2);
+            assert_eq!(observed[0]["type"], "auto_compaction_start");
+            assert_eq!(observed[0]["reason"], "handoff");
+            assert_eq!(observed[1]["result"]["details"]["mode"], "handoff");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
     fn resolve_path_for_cwd_uses_cwd_for_relative_paths() {
         let cwd = Path::new("/tmp/pi-sdk-cwd");
         assert_eq!(
@@ -5305,6 +7943,164 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preflight_preserves_balanced_session_after_failed_save() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let store = handle.session_store();
+        run_async(async {
+            handle
+                .prompt("persisted before replacement", |_| {})
+                .await
+                .expect("baseline turn");
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let blocked = tmp.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked).expect("block replacement save");
+            let (path, session_id, entry_count) = {
+                let mut session = store.try_lock().expect("session");
+                let path = session.path.clone().expect("saved session path");
+                session
+                    .set_autosave_durability_mode(crate::session::AutosaveDurabilityMode::Balanced);
+                session.append_session_info(Some("pending replacement name".to_string()));
+                session.path = Some(blocked.clone());
+                (path, session.header.id.clone(), session.entries.len())
+            };
+            let before_disk = std::fs::read(&path).expect("baseline session");
+            let failure = handle
+                .preflight_replacement()
+                .await
+                .err()
+                .expect("replacement must refuse an unsaved balanced session");
+            assert!(!failure.completed_cleanly());
+            assert!(
+                failure
+                    .messages()
+                    .any(|message| message.contains("failed to flush"))
+            );
+            assert!(Arc::ptr_eq(&store, &handle.session_store()));
+            assert_eq!(std::fs::read(&path).unwrap(), before_disk);
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent
+            );
+            handle
+                .session
+                .ensure_provider_reentry_allowed()
+                .expect("preflight did not retire the current session");
+            {
+                let mut session = store.try_lock().expect("live session after refusal");
+                assert_eq!(session.header.id, session_id);
+                assert_eq!(session.entries.len(), entry_count);
+                assert_eq!(session.path.as_ref(), Some(&blocked));
+                assert_eq!(session.autosave_metrics().pending_mutations, 1);
+                assert_eq!(
+                    session.get_name().as_deref(),
+                    Some("pending replacement name")
+                );
+                session.path = Some(path.clone());
+            }
+
+            let prepared = handle
+                .preflight_replacement()
+                .await
+                .expect("retry preflight after repairing persistence");
+            assert!(store.try_lock().is_err(), "prepared snapshot stays locked");
+            let reopened = Session::open(path.to_str().expect("session path"))
+                .await
+                .expect("reopen flushed session");
+            assert_eq!(reopened.header.id, session_id);
+            assert_eq!(
+                reopened.get_name().as_deref(),
+                Some("pending replacement name")
+            );
+            assert_eq!(reopened.entries.len(), entry_count);
+
+            let next = saving_handle(tmp.path());
+            let next_store = next.session_store();
+            let old_handle = std::mem::replace(&mut handle, next);
+            assert!(
+                old_handle
+                    .commit_resource_shutdown(prepared)
+                    .await
+                    .completed_cleanly()
+            );
+            assert!(Arc::ptr_eq(&next_store, &handle.session_store()));
+            assert_eq!(
+                store
+                    .try_lock()
+                    .unwrap()
+                    .autosave_metrics()
+                    .pending_mutations,
+                0
+            );
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
+    }
+
+    #[test]
+    fn cancelled_replacement_releases_store_and_action_guards_without_retiring_session() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let store = handle.session_store();
+        let actions = handle.session.session_action_admission_gate();
+        let origin = actions.capture_origin();
+        store
+            .try_lock()
+            .unwrap()
+            .append_session_info(Some("retained pending history".to_string()));
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let prepared = handle.preflight_replacement().await.expect("preflight");
+            assert!(store.try_lock().is_err());
+            let mut waiting_action = Box::pin(actions.acquire(cx.cx()));
+            assert!(futures::poll!(waiting_action.as_mut()).is_pending());
+            drop(prepared);
+            drop(
+                waiting_action
+                    .await
+                    .expect("cancelled preparation releases action admission"),
+            );
+            assert!(actions.origin_source().accepts(&origin));
+            {
+                let session = store
+                    .try_lock()
+                    .expect("cancelled preparation releases store");
+                assert_eq!(
+                    session.get_name().as_deref(),
+                    Some("retained pending history")
+                );
+                assert_eq!(session.autosave_metrics().pending_mutations, 0);
+            }
+
+            // Cancellation while waiting for the store must release the
+            // already-acquired action permit as well.
+            let held_store = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                .await
+                .expect("hold store");
+            let mut preflight = Box::pin(handle.preflight_replacement());
+            assert!(futures::poll!(preflight.as_mut()).is_pending());
+            let mut waiting_action = Box::pin(actions.acquire(cx.cx()));
+            assert!(futures::poll!(waiting_action.as_mut()).is_pending());
+            drop(preflight);
+            drop(
+                waiting_action
+                    .await
+                    .expect("cancelled preflight releases action admission"),
+            );
+            drop(held_store);
+            assert!(actions.origin_source().accepts(&origin));
+            handle
+                .prompt("continue after cancelled replacement", |_| {})
+                .await
+                .expect("the old session remains usable");
+            assert_eq!(
+                store.try_lock().unwrap().get_name().as_deref(),
+                Some("retained pending history")
+            );
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
+    }
+
+    #[test]
     fn shutdown_skips_autosave_for_ephemeral_session() {
         let tmp = tempdir().expect("tempdir");
         let warnings = run_async(async {
@@ -5639,6 +8435,262 @@ export default function init(pi) {
         handle.set_max_tokens(None);
         assert_eq!(handle.max_tokens(), None);
     }
+    #[test]
+    fn empty_default_tool_registry_disables_configured_builtins() {
+        let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+        let config: Config = serde_json::from_value(
+            serde_json::json!({ // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture settings must deserialize.
+                "askPolicy": "recommended",
+                "memory": {"backend": "local"},
+                "media": {
+                    "enableInspectImage": true,
+                    "enableReadMedia": true,
+                    "enableGenerateImage": true,
+                    "enableTts": true
+                },
+                "computer": {"enableComputer": true},
+                "browser": {"enableBrowser": true}
+            }),
+        )
+        .expect("configured builtins");
+        let registry = default_tool_registry(&[], tmp.path(), &config);
+        assert!(registry.tools().is_empty()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+
+        // The host still owns its configured picker, even with no model tools.
+        let picker = registry.host_ask_tool();
+        let output = run_async(crate::tools::Tool::execute(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture host picker must execute.
+            &picker,
+            "host-picker",
+            serde_json::json!({
+                "questions": [{
+                    "question": "Choose a host action",
+                    "recommended": 0,
+                    "options": [{"label": "Continue"}, {"label": "Wait"}]
+                }]
+            }),
+            None,
+        ))
+        .expect("configured host picker remains usable");
+        assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            output
+                .details
+                .as_ref()
+                .and_then(|details| details.get("autoAnswered"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sdk_no_builtins_keeps_explicit_extension_tools_executable() {
+        let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+        let extension_path = tmp.path().join("kept_custom.js");
+        std::fs::write(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture extension must be written.
+            &extension_path,
+            r#"
+export default function init(pi) {
+    pi.registerTool({
+        name: "sdk_kept_custom",
+        label: "Custom tool",
+        description: "Explicitly configured extension tool",
+        parameters: { type: "object", properties: {} },
+        execute: async () => ({
+            content: [{ type: "text", text: "kept custom tool" }],
+            isError: false
+        })
+    });
+}
+"#,
+        )
+        .expect("write custom extension");
+        let options = SessionOptions {
+            enabled_tools: Some(Vec::new()),
+            extension_paths: vec![extension_path],
+            extension_policy: Some("safe".to_string()),
+            persist_extension_permissions: false,
+            ..hermetic_session_options(tmp.path())
+        };
+
+        run_async(async {
+            let handle = create_agent_session(options) // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture session must open.
+                .await
+                .expect("create session");
+            assert!(handle.ask_tool().is_some()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            let registry = handle.session().agent.shared_tools().snapshot();
+            let names: Vec<_> = registry.tools().iter().map(|tool| tool.name()).collect();
+            assert_eq!(names, ["sdk_kept_custom"]); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+
+            let output = registry // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture extension must be registered and executable.
+                .get("sdk_kept_custom")
+                .expect("explicit extension remains registered")
+                .execute("custom-call", serde_json::json!({}), None)
+                .await
+                .expect("execute explicit extension");
+            assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            let text: Vec<_> = output
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, ["kept custom tool"]); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            let shutdown = handle.shutdown_owned_resources().await;
+            assert!(shutdown.completed_cleanly()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn disabled_builtins_survive_extension_mount_and_plan_checkpoint_restore() {
+        run_async(async {
+            let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated fixture storage is required.
+            let mut options = hermetic_session_options(tmp.path());
+            options.no_session = false;
+            options.session_dir = Some(tmp.path().join("sessions"));
+            let mut enabled = create_agent_session(options) // ubs:ignore[rust.ownership.unwrap-expect] -- Build the real enabled SDK session used to save the checkpoint.
+                .await
+                .expect("create enabled session");
+            let owner = crate::agent_cx::AgentCx::for_request();
+            let entered = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- The enabled fixture must enter planning through the public SDK.
+                .enter_plan_mode(&owner)
+                .await
+                .expect("enter enabled plan mode");
+            assert_eq!(entered.persistence, crate::plan::PlanPersistence::Saved); // ubs:ignore[rust.panic.assert-macros] -- The initial plan transition must reach disk.
+            let installed = enabled.session().agent.shared_tools().snapshot();
+            let submit = installed.get("submit_plan").expect("mounted submit_plan"); // ubs:ignore[rust.ownership.unwrap-expect] -- Exercise the tool mounted by the actual SDK transition.
+            let output = submit // ubs:ignore[rust.ownership.unwrap-expect] -- The valid fixture proposal must be submitted successfully.
+                .execute(
+                    "saved-proposal",
+                    serde_json::json!({
+                        "plan": "Goal: update code. Steps: edit the selected source, then verify it.",
+                        "files": ["src/fixture.rs"],
+                    }),
+                    None,
+                )
+                .await
+                .expect("submit persisted proposal");
+            assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- The fixture must save a real submitted proposal.
+            drop(installed);
+            let review = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- The submitted proposal must be available for explicit review.
+                .pending_plan_review()
+                .expect("read pending review")
+                .expect("submitted review");
+            let approved = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- Save approval through the real SDK lifecycle.
+                .approve_plan_review(&owner, &review)
+                .await
+                .expect("approve fixture plan");
+            assert_eq!(approved.persistence, crate::plan::PlanPersistence::Saved); // ubs:ignore[rust.panic.assert-macros] -- The approved checkpoint must be durable before reopening.
+            let path = enabled // ubs:ignore[rust.ownership.unwrap-expect] -- The persistent fixture must expose its saved session path.
+                .with_session(|session| session.path.clone())
+                .await
+                .expect("read saved session path")
+                .expect("saved session path");
+            drop(enabled);
+
+            let extension_path = tmp.path().join("disabled-plan-probe.mjs");
+            std::fs::write(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Install an explicit extension fixture to exercise live registry publication.
+                &extension_path,
+                r#"export default function (pi) {
+  pi.registerTool({
+    name: "sdk_disabled_plan_probe",
+    label: "Plan policy probe",
+    description: "Explicit extension retained when built-ins are disabled",
+    parameters: {type: "object", properties: {}},
+    execute: async () => ({
+      content: [{type: "text", text: "extension retained"}],
+      isError: false
+    })
+  });
+}
+"#,
+            )
+            .expect("write extension fixture");
+            let mut options = hermetic_session_options(tmp.path());
+            options.no_session = false;
+            options.session_path = Some(path.clone());
+            options.enabled_tools = Some(Vec::new());
+            options.extension_paths = vec![extension_path];
+            options.extension_policy = Some("safe".to_string());
+            options.persist_extension_permissions = false;
+            let mut disabled = create_agent_session(options) // ubs:ignore[rust.ownership.unwrap-expect] -- Opening saved history must succeed with built-ins disabled.
+                .await
+                .expect("reopen without built-ins");
+            let shared = disabled.session().agent.shared_tools();
+            let names_before = shared
+                .snapshot()
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>();
+            assert!(disabled.has_tool("sdk_disabled_plan_probe")); // ubs:ignore[rust.panic.assert-macros] -- An actual extension mount must exercise the shared-registry clone path.
+            assert!(!disabled.has_tool("submit_plan")); // ubs:ignore[rust.panic.assert-macros] -- Resuming history cannot mount a disabled built-in.
+            let state = disabled.session().agent.plan_state();
+            assert_eq!(state.mode(), crate::plan::PlanMode::Off); // ubs:ignore[rust.panic.assert-macros] -- Saved approval cannot reactivate planning during SDK startup.
+            assert!(state.plan().is_none()); // ubs:ignore[rust.panic.assert-macros] -- Startup must leave the saved proposal inactive.
+            let prompt_before = disabled.session().agent.system_prompt().map(str::to_string);
+            let entries_before = disabled // ubs:ignore[rust.ownership.unwrap-expect] -- Capture the loaded fixture journal before rejected controls.
+                .with_session(|session| session.entries.clone())
+                .await
+                .expect("read restored journal");
+            assert!(entries_before.iter().any(
+                |entry| matches!( // ubs:ignore[rust.panic.assert-macros] -- The reopened conversation must retain its real saved checkpoint.
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "plan_checkpoint"
+                )
+            ));
+            let journal_before = serde_json::to_value(&entries_before) // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture history must serialize for exact comparison.
+                .expect("serialize journal before rejection");
+            let disk_before = std::fs::read(&path).expect("read saved checkpoint"); // ubs:ignore[rust.ownership.unwrap-expect] -- The durable fixture must remain readable.
+
+            for restore in [false, true] {
+                let result = if restore {
+                    disabled.restore_plan_checkpoint(&owner).await
+                } else {
+                    disabled.enter_plan_mode(&owner).await
+                };
+                let error = result.expect_err("disabled planning must be rejected"); // ubs:ignore[rust.ownership.unwrap-expect] -- Both public controls must reject disabled built-ins.
+                assert!(error.to_string().contains("[PLAN_TOOLS_DISABLED]")); // ubs:ignore[rust.panic.assert-macros] -- Rejection must identify the explicit tool policy.
+                assert_eq!(state.mode(), crate::plan::PlanMode::Off); // ubs:ignore[rust.panic.assert-macros] -- A rejected control cannot activate planning.
+                assert!(state.plan().is_none()); // ubs:ignore[rust.panic.assert-macros] -- A rejected restore cannot install the saved proposal.
+                assert!(!disabled.has_tool("submit_plan")); // ubs:ignore[rust.panic.assert-macros] -- Rejected controls cannot mount a built-in.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Rejection must preserve every currently mounted extension.
+                    shared
+                        .snapshot()
+                        .tools()
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect::<Vec<_>>(),
+                    names_before,
+                );
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Rejection cannot install or remove prompt context.
+                    disabled.session().agent.system_prompt(),
+                    prompt_before.as_deref(),
+                );
+                let journal_after = disabled // ubs:ignore[rust.ownership.unwrap-expect] -- Read and serialize the actual post-control journal.
+                    .with_session(|session| serde_json::to_value(&session.entries))
+                    .await
+                    .expect("read journal after rejection")
+                    .expect("serialize journal after rejection");
+                assert_eq!(journal_after, journal_before); // ubs:ignore[rust.panic.assert-macros] -- Rejection must not append a plan transition or checkpoint.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Rejection must leave durable checkpoint bytes unchanged.
+                    std::fs::read(&path).expect("reread saved checkpoint"), // ubs:ignore[rust.ownership.unwrap-expect] -- Read the same durable fixture after the rejected operation.
+                    disk_before,
+                );
+            }
+        });
+    }
+
     #[test]
     fn session_without_model_ask_still_exposes_host_picker() {
         let tmp = tempdir().expect("tempdir");

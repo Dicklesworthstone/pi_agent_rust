@@ -20,6 +20,8 @@ mod enabled {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
+    const STALL_MS: u64 = 2_000;
+
     struct Progress {
         start: Instant,
         phase: AtomicU8,
@@ -28,6 +30,10 @@ mod enabled {
         keys: AtomicU64,
         resizes: AtomicU64,
         views: AtomicU64,
+        last_tick_ms: AtomicU64,
+        last_key_ms: AtomicU64,
+        last_resize_ms: AtomicU64,
+        last_view_ms: AtomicU64,
         observer_failed: AtomicBool,
         error: Mutex<Option<String>>,
     }
@@ -42,6 +48,10 @@ mod enabled {
                 keys: AtomicU64::new(0),
                 resizes: AtomicU64::new(0),
                 views: AtomicU64::new(0),
+                last_tick_ms: AtomicU64::new(0),
+                last_key_ms: AtomicU64::new(0),
+                last_resize_ms: AtomicU64::new(0),
+                last_view_ms: AtomicU64::new(0),
                 observer_failed: AtomicBool::new(false),
                 error: Mutex::new(None),
             }
@@ -57,6 +67,15 @@ mod enabled {
             self.phase.store(3, Ordering::Relaxed);
         }
 
+        fn mark(now: u64, slot: &AtomicU64) {
+            slot.store(now, Ordering::Relaxed);
+        }
+
+        fn age(elapsed: u64, slot: &AtomicU64) -> Option<u64> {
+            let at = slot.load(Ordering::Relaxed);
+            (at != 0).then(|| elapsed.saturating_sub(at))
+        }
+
         fn record(&self, mode: io::Result<Option<u32>>, native_fix: bool) -> serde_json::Value {
             let elapsed = self.elapsed_ms();
             let (mode, mode_error) = match mode {
@@ -70,15 +89,36 @@ mod enabled {
                 4 => "finished",
                 _ => "outside-model",
             };
+            let callback_age_ms = elapsed.saturating_sub(self.completed_ms.load(Ordering::Relaxed));
+            let cooked_input = mode.is_some_and(|mode| mode & 0x0007 != 0);
+            let active = !matches!(phase, "starting" | "finished");
+            let diagnosis = if active && cooked_input {
+                "lost-raw-mode"
+            } else if callback_age_ms >= STALL_MS && phase == "outside-model" {
+                "runtime-or-terminal-io-stall"
+            } else if callback_age_ms >= STALL_MS {
+                "model-callback-stall"
+            } else {
+                "progressing"
+            };
             serde_json::json!({
-                "schema": "pi.ftui.conhost_probe.v1", "elapsed_ms": elapsed,
-                "native_input_fix": native_fix, "phase": phase,
-                "callback_age_ms": elapsed.saturating_sub(self.completed_ms.load(Ordering::Relaxed)),
+                "schema": "pi.ftui.conhost_probe.v2",
+                "elapsed_ms": elapsed,
+                "native_input_fix": native_fix,
+                "phase": phase,
+                "diagnosis": diagnosis,
+                "stall_threshold_ms": STALL_MS,
+                "callback_age_ms": callback_age_ms,
+                "tick_age_ms": Self::age(elapsed, &self.last_tick_ms),
+                "key_age_ms": Self::age(elapsed, &self.last_key_ms),
+                "resize_age_ms": Self::age(elapsed, &self.last_resize_ms),
+                "view_age_ms": Self::age(elapsed, &self.last_view_ms),
                 "ticks": self.ticks.load(Ordering::Relaxed),
                 "key_events": self.keys.load(Ordering::Relaxed),
                 "resize_events": self.resizes.load(Ordering::Relaxed),
                 "views": self.views.load(Ordering::Relaxed),
-                "input_mode": mode, "input_mode_error": mode_error,
+                "input_mode": mode,
+                "input_mode_error": mode_error,
                 "quick_edit": mode.map(|mode| mode & 0x0040 != 0),
                 "processed_input": mode.map(|mode| mode & 0x0001 != 0),
                 "line_input": mode.map(|mode| mode & 0x0002 != 0),
@@ -177,9 +217,11 @@ mod enabled {
 
         fn update(&mut self, msg: Event) -> Cmd<Event> {
             self.state.phase.store(1, Ordering::Relaxed);
+            let now = self.state.elapsed_ms();
             let command = match msg {
                 Event::Tick => {
                     self.state.ticks.fetch_add(1, Ordering::Relaxed);
+                    Progress::mark(now, &self.state.last_tick_ms);
                     if self.state.observer_failed.load(Ordering::Acquire) {
                         Cmd::quit()
                     } else {
@@ -188,6 +230,7 @@ mod enabled {
                 }
                 Event::Key(key) => {
                     self.state.keys.fetch_add(1, Ordering::Relaxed);
+                    Progress::mark(now, &self.state.last_key_ms);
                     // Keep releases visible in the event count, but do not
                     // cycle terminal modes twice for one Windows keystroke.
                     if key.kind == KeyEventKind::Release {
@@ -218,6 +261,7 @@ mod enabled {
                 }
                 Event::Resize { .. } => {
                     self.state.resizes.fetch_add(1, Ordering::Relaxed);
+                    Progress::mark(now, &self.state.last_resize_ms);
                     Cmd::none()
                 }
                 _ => Cmd::none(),
@@ -231,13 +275,14 @@ mod enabled {
             let text = format!(
                 "FTUI ConHost probe: ticks={} key-events={} resizes={}\n\
                  Type, resize and click/drag to reproduce. q quits; s cycles input modes.\n\
-                 Only event counts and console mode bits are written to the trace.",
+                 Trace v2 classifies lost raw mode vs callback/runtime stalls.",
                 self.state.ticks.load(Ordering::Relaxed),
                 self.state.keys.load(Ordering::Relaxed),
                 self.state.resizes.load(Ordering::Relaxed)
             );
             Paragraph::new(text).render(Rect::new(0, 0, frame.width(), frame.height()), frame);
             self.state.views.fetch_add(1, Ordering::Relaxed);
+            Progress::mark(self.state.elapsed_ms(), &self.state.last_view_ms);
             self.state.completed();
         }
     }

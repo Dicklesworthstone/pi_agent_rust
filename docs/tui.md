@@ -122,7 +122,28 @@ Visualize the conversation branching structure.
 - `Ctrl+U`: Toggle user-only view (hides assistant/tool noise)
 
 ### Settings (`/settings`)
-Change configuration on the fly (Thinking levels, themes, message delivery mode).
+
+On the default FrankenTUI stack, `/settings` or **F2** opens an editor for
+automatic retry and provider fallback, automatic context compaction, steering
+and follow-up delivery, image resizing, thinking-block visibility, transcript
+spacing, the double-Escape action, and completion menu height. Type to filter
+the list, press Enter to choose a setting, and press Enter again to save the
+selected value. Escape returns from a value list to settings, then closes the
+editor. Your unfinished prompt stays in the editor.
+
+Changes apply to the current session and persist to the explicit
+`PI_CONFIG_PATH` file when configured. Otherwise, trusted workspaces save to
+the project's `.pi/settings.json`; untrusted workspaces save to the global
+`settings.json` shown in the picker title. This follows the same configuration
+layers used when starting or reloading a session. Without an explicit override,
+untrusted project settings remain ignored and untouched. A save failure leaves
+the live preferences unchanged and reports the error. Disabling automatic
+recovery preserves its retry budgets and fallback state for re-enabling;
+disabling compaction invalidates any pending background summary. Settings open
+when the agent is idle. Custom `openSettings` keybindings are supported.
+
+Use `/thinking` to change reasoning level and `/theme` to select a theme. The
+classic stack retains its own settings selector.
 
 ## Message Queue
 

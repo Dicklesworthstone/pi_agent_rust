@@ -11,6 +11,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod sparse;
+
 const MAX_INDEX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Git revision syntax that peels `HEAD` to a commit object, rejecting a tag or
@@ -156,11 +158,25 @@ impl Scratch {
         let mut command = command(repo);
         command
             .env("GIT_INDEX_FILE", self.root.join("index"))
-            .args(["-c", "core.splitIndex=false", "-c", "core.ignorestat=false"]);
+            .args([
+                "-c",
+                "core.splitIndex=false",
+                "-c",
+                "core.ignorestat=false",
+                "-c",
+                "core.sparseCheckout=false",
+                "-c",
+                "index.sparse=false",
+            ]);
         command
     }
 
     fn entries(&self, mut command: Command, name: &str) -> Result<Vec<u8>> {
+        command.args(["ls-files", "--stage", "--full-name", "-z"]);
+        self.records(command, name)
+    }
+
+    fn records(&self, mut command: Command, name: &str) -> Result<Vec<u8>> {
         let path = self.root.join(name);
         let file = File::create(&path).map_err(|error| {
             failure(
@@ -168,12 +184,7 @@ impl Scratch {
                 &format!("Cannot stage index records: {error}"),
             )
         })?;
-        run(
-            command
-                .args(["ls-files", "--stage", "--full-name", "-z"])
-                .stdout(file),
-            "read index records",
-        )?;
+        run(command.stdout(file), "read index records")?;
         let mut bytes = Vec::new();
         File::open(&path)
             .and_then(|file| {
@@ -199,7 +210,16 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // Remove only our known scratch files, not arbitrary descendants.
-        for name in ["index", "index.lock", "parent", "verify", "materialized"] {
+        for name in [
+            "index",
+            "index.lock",
+            "parent",
+            "verify",
+            "materialized",
+            "flags",
+            "verify-flags",
+            "skip",
+        ] {
             let _ = fs::remove_file(self.root.join(name));
         }
         let _ = fs::remove_dir(self.root.join("hooks"));
@@ -224,6 +244,7 @@ fn reject_gitlinks(records: &[u8]) -> Result<()> {
 pub(super) struct Snapshot {
     pub(super) baseline: String,
     scratch: Scratch,
+    checkout_mode: sparse::CheckoutMode,
 }
 
 impl Snapshot {
@@ -246,8 +267,15 @@ impl Snapshot {
         }
         let mut hook_setting = std::ffi::OsString::from("core.hooksPath=");
         hook_setting.push(self.scratch.root.join("hooks"));
+        self.checkout_mode.require_current(repo)?;
         run(
             command(repo)
+                .args([
+                    "-c",
+                    "core.sparseCheckout=false",
+                    "-c",
+                    "index.sparse=false",
+                ])
                 .arg("-c")
                 .arg(hook_setting)
                 .args(["worktree", "add", "-b", branch])
@@ -255,6 +283,8 @@ impl Snapshot {
                 .arg(&self.baseline),
             "create isolated checkout",
         )?;
+        self.checkout_mode.configure_child(path)?;
+        self.checkout_mode.require_current(repo)?;
         Ok(())
     }
 }
@@ -263,24 +293,7 @@ impl Snapshot {
 /// Seed from its index, not HEAD, so newly tracked ignored files and staged
 /// additions remain tracked. Refresh only the private index from the filesystem.
 pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
-    let sparse = command(repo)
-        .args(["config", "--bool", "core.sparseCheckout"])
-        .output()
-        .map_err(|error| {
-            failure(
-                "PI_ISO_SNAPSHOT",
-                &format!("Cannot inspect checkout mode: {error}"),
-            )
-        })?;
-    if sparse.status.success() && sparse.stdout.starts_with(b"true") {
-        return Err(failure(
-            "PI_ISO_SPARSE_UNSUPPORTED",
-            "Sparse checkouts require an explicit full checkout before isolation",
-        ));
-    }
-    if !sparse.status.success() && sparse.status.code() != Some(1) {
-        return Err(failure("PI_ISO_SNAPSHOT", "Cannot inspect checkout mode"));
-    }
+    let checkout_mode = sparse::CheckoutMode::read(repo)?;
     let head = object_id(&run(
         command(repo).args(["rev-parse", "--verify", HEAD_COMMIT_REV]),
         "resolve parent commit",
@@ -288,6 +301,7 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
     let scratch = Scratch::new(repo)?;
     let parent_entries = scratch.entries(command(repo), "parent")?;
     reject_gitlinks(&parent_entries)?;
+    let skipped = sparse::Skipped::capture(repo, &scratch, &parent_entries)?;
     run(
         scratch.command(repo).args(["read-tree", "--empty"]),
         "initialize private index",
@@ -305,11 +319,14 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
             .stdin(input),
         "seed private index",
     )?;
+    skipped.prepare(repo, &scratch)?;
     run(
         scratch.command(repo).args(["add", "--all", "--", "."]),
         "snapshot working files",
     )?;
-    reject_gitlinks(&scratch.entries(scratch.command(repo), "materialized")?)?;
+    let materialized = scratch.entries(scratch.command(repo), "materialized")?;
+    reject_gitlinks(&materialized)?;
+    skipped.verify_materialized(&materialized)?;
     let tree = object_id(&run(
         scratch.command(repo).arg("write-tree"),
         "write snapshot tree",
@@ -348,7 +365,13 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
             "Parent HEAD or index changed while capturing isolation; retry the delegation",
         ));
     }
-    Ok(Snapshot { baseline, scratch })
+    skipped.verify_source(repo, &scratch)?;
+    checkout_mode.require_current(repo)?;
+    Ok(Snapshot {
+        baseline,
+        scratch,
+        checkout_mode,
+    })
 }
 
 #[cfg(test)]

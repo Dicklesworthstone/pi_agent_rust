@@ -8,6 +8,7 @@
 /// The JS source for the `node:http` virtual module.
 pub const NODE_HTTP_JS: &str = r#"
 import EventEmitter from "node:events";
+import { StringDecoder } from "node:string_decoder";
 
 // ─── STATUS_CODES ────────────────────────────────────────────────────────────
 
@@ -120,7 +121,26 @@ function __pi_http_decode_chunk(chunk, encoding) {
 
 // ─── IncomingMessage ─────────────────────────────────────────────────────────
 
-class IncomingMessage extends EventEmitter {
+// The general PiJS EventEmitter isolates listener failures and continues
+// dispatch. HTTP callbacks instead own live bodies: a failed callback must
+// propagate to the request's teardown boundary, not leave its producer alive.
+// Use the public raw-listener API so once wrappers and listener ordering stay
+// intact without changing node:events for other extensions.
+class HttpEventEmitter extends EventEmitter {
+  emit(event, ...args) {
+    const listeners = super.rawListeners(event).slice();
+    if (listeners.length === 0) {
+      if (event === 'error') {
+        throw args[0] instanceof Error ? args[0] : new Error(String(args[0]));
+      }
+      return false;
+    }
+    for (const listener of listeners) Reflect.apply(listener, this, args);
+    return true;
+  }
+}
+
+class IncomingMessage extends HttpEventEmitter {
   constructor(statusCode, headers, body) {
     super();
     this.statusCode = statusCode;
@@ -128,6 +148,14 @@ class IncomingMessage extends EventEmitter {
     this.headers = headers || {};
     this._body = body || '';
     this._destroyed = false;
+    this._closed = false;
+    this.destroyed = false;
+    this._reader = null;
+    this._bodyStream = null;
+    this._bodyCancelled = false;
+    this._paused = false;
+    this._resumeRead = null;
+    this._cancelRequest = null;
     this.complete = false;
     this.httpVersion = '1.1';
     this.method = null;
@@ -148,35 +176,115 @@ class IncomingMessage extends EventEmitter {
       return;
     }
 
+    this._finish();
+  }
+
+  _close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._bodyStream = null;
+    this._cancelRequest = null;
+    this.emit('close');
+  }
+
+  _finish() {
+    if (this._destroyed || this._closed) return;
     this.complete = true;
-    this.emit('end');
+    // An end listener may destroy the response or throw. Neither may skip
+    // cleanup or cause a second close notification.
+    try { this.emit('end'); } finally { this._close(); }
+  }
+
+  _cancelBody(error) {
+    if (this.complete || this._bodyCancelled) return;
+    const source = this._reader || this._bodyStream;
+    if (!source) return;
+    this._bodyCancelled = true;
+    try { Promise.resolve(source.cancel(error)).catch(() => {}); } catch (_) {}
   }
 
   setEncoding(encoding) {
     this._encoding = encoding ? String(encoding) : 'utf8';
+    this._decoder = new StringDecoder(this._encoding);
     return this;
   }
-  resume() { return this; }
-  pause() { return this; }
-  destroy() {
-    if (this._destroyed) {
+  resume() {
+    this._paused = false;
+    if (this._resumeRead) { const resume = this._resumeRead; this._resumeRead = null; resume(); }
+    return this;
+  }
+  pause() { this._paused = true; return this; }
+  destroy(error) {
+    if (this._destroyed || this._closed) {
       return this;
     }
     this._destroyed = true;
-    this.emit('close');
+    this.destroyed = true;
+    this._cancelBody(error);
+    try { if (!this.complete && this._cancelRequest) this._cancelRequest(error); } catch (_) {}
+    this.resume();
+    try { if (error) this.emit('error', error); } finally { this._close(); }
     return this;
+  }
+
+  async _deliverWeb(body, onActivity) {
+    this._bodyStream = body;
+    if (!body || this._destroyed) {
+      if (!this._destroyed) this._finish();
+      else this._cancelBody();
+      this._bodyStream = null;
+      return;
+    }
+    let reader;
+    try {
+      reader = body.getReader();
+      this._reader = reader;
+      while (!this._destroyed) {
+        if (this._paused) await new Promise(resolve => { this._resumeRead = resolve; });
+        if (this._destroyed) break;
+        const { done, value } = await reader.read();
+        if (done || this._destroyed) break;
+        onActivity();
+        const bytes = __pi_http_clone_body_chunk(value);
+        const chunk = this._decoder ? this._decoder.write(bytes) : bytes;
+        if (chunk.length > 0) this.emit('data', chunk);
+      }
+      if (!this._destroyed) {
+        const tail = this._decoder ? this._decoder.end() : '';
+        if (tail) this.emit('data', tail);
+        if (!this._destroyed) this._finish();
+      }
+    } catch (error) {
+      if (!this._destroyed) {
+        // A response error listener may handle the notification, but the
+        // request must still fail and release its host transport.
+        try { this.destroy(error); } finally { throw error; }
+      }
+    } finally {
+      this._reader = null;
+      this._bodyStream = null;
+      try { if (reader) reader.releaseLock(); } catch (_) {}
+    }
   }
 }
 
 // ─── ClientRequest ───────────────────────────────────────────────────────────
 
-class ClientRequest extends EventEmitter {
+class ClientRequest extends HttpEventEmitter {
   constructor(options, callback) {
     super();
     this._options = options;
     this._body = [];
     this._ended = false;
+    this._sent = false;
     this._aborted = false;
+    this._closed = false;
+    this.destroyed = false;
+    this._controller = new AbortController();
+    this._response = null;
+    this._responseBody = null;
+    this._timeoutId = null;
+    this._timeoutMs = Number(options.timeout) > 0 ? Number(options.timeout) : 0;
     this._headers = {};
     this.socket = { remoteAddress: '127.0.0.1', remotePort: 0 };
     this.method = options.method || 'GET';
@@ -216,22 +324,62 @@ class ClientRequest extends EventEmitter {
   }
 
   abort() {
-    this._aborted = true;
-    this.emit('abort');
-    this.destroy();
+    if (this._aborted || this._closed) return;
+    try { this.emit('abort'); } finally { this.destroy(); }
   }
 
   destroy(error) {
+    if (this._aborted || this._closed) return this;
     this._aborted = true;
-    if (error) this.emit('error', error);
-    this.emit('close');
+    this.destroyed = true;
+    this._clearTimeout();
+    this._body.length = 0;
+    // User callbacks can throw while cancelling or reporting an error. The
+    // transport and both lifecycle notifications must still be finalized.
+    try { this._controller.abort(error); } finally {
+      try {
+        if (this._response) this._response.destroy();
+        else if (this._responseBody) {
+          try { Promise.resolve(this._responseBody.cancel(error)).catch(() => {}); } catch (_) {}
+        }
+      } finally {
+        try { if (error) this.emit('error', error); } finally { this._close(); }
+      }
+    }
     return this;
+  }
+
+  _close() {
+    if (this._closed) return;
+    this._closed = true;
+    this.destroyed = true;
+    this._responseBody = null;
+    this._body.length = 0;
+    this._clearTimeout();
+    this.emit('close');
   }
 
   setTimeout(ms, callback) {
     if (typeof callback === 'function') this.once('timeout', callback);
-    this._timeoutMs = ms;
+    if (!Number.isFinite(Number(ms)) || Number(ms) < 0) throw new RangeError('Invalid HTTP timeout');
+    this._timeoutMs = Number(ms);
+    if (this._ended && !this._aborted) this._armTimeout();
     return this;
+  }
+
+  _clearTimeout() {
+    if (this._timeoutId !== null) clearTimeout(this._timeoutId);
+    this._timeoutId = null;
+  }
+
+  _armTimeout() {
+    this._clearTimeout();
+    if (!this._timeoutMs || this._aborted || this._closed || (this._response && this._response.complete)) return;
+    this._timeoutId = setTimeout(() => {
+      const error = new Error('HTTP request timed out');
+      error.code = 'ETIMEDOUT';
+      try { this.emit('timeout'); } finally { this.destroy(error); }
+    }, this._timeoutMs);
   }
 
   setNoDelay() { return this; }
@@ -252,9 +400,10 @@ class ClientRequest extends EventEmitter {
   }
 
   _send() {
-    if (this._aborted) {
+    if (this._aborted || this._sent) {
       return;
     }
+    this._sent = true;
 
     const opts = this._options;
     const protocol = opts.protocol || 'http:';
@@ -275,37 +424,54 @@ class ClientRequest extends EventEmitter {
         request.body = this._body.join('');
       }
     }
-    if (this._timeoutMs) request.timeout = this._timeoutMs;
-
-    // Use pi.http() hostcall if available
+    // Reuse global fetch so requests and response streams share the same host
+    // capability checks, cancellation, deadlines, and virtual loopback routing.
     if (typeof globalThis.pi === 'object' && typeof globalThis.pi.http === 'function') {
       try {
-        const promise = globalThis.pi.http(request);
-        if (promise && typeof promise.then === 'function') {
-          promise.then(
-            (result) => {
-              if (!this._aborted) {
-                this._handleResponse(result);
-              }
-            },
-            (err) => {
-              if (!this._aborted) {
-                this.emit('error', typeof err === 'string' ? new Error(err) : err);
-              }
-            }
-          );
-        } else {
-          this._handleResponse(promise);
+        if (opts.rejectUnauthorized === false || opts.ca !== undefined || opts.cert !== undefined ||
+            opts.key !== undefined || opts.createConnection !== undefined || opts.lookup !== undefined || opts.socketPath !== undefined) {
+          throw new Error('Custom HTTP sockets and TLS trust are not supported in PiJS; configure host networking instead');
         }
+        const signal = opts.signal ? AbortSignal.any([this._controller.signal, opts.signal]) : this._controller.signal;
+        this._armTimeout();
+        const body = request.body_bytes !== undefined ? __pi_http_decode_body_bytes(request.body_bytes) : request.body;
+        const fetchHttp = globalThis.__pi_fetch_for_node_http || globalThis.fetch;
+        Promise.resolve(fetchHttp(url, { method, headers, body, signal, timeout: this._timeoutMs || undefined })).then(async (response) => {
+          if (this._aborted) { if (response.body) await response.body.cancel(); return; }
+          // Take ownership before any header iterator or response listener
+          // executes. A throw before getReader() used to orphan the body.
+          this._responseBody = response.body;
+          const responseHeaders = {};
+          for (const [name, value] of response.headers.entries()) responseHeaders[name] = value;
+          const incoming = new IncomingMessage(response.status, responseHeaders, '');
+          incoming._bodyStream = this._responseBody;
+          incoming._cancelRequest = (reason) => this._controller.abort(reason);
+          this._response = incoming;
+          this._responseBody = null;
+          this._armTimeout();
+          this.emit('response', incoming);
+          await incoming._deliverWeb(response.body, () => this._armTimeout());
+          if (incoming.complete) this._close();
+          else this.destroy();
+        }).catch((error) => {
+          if (!this._aborted) this.destroy(error instanceof Error ? error : new Error(String(error)));
+        }).finally(() => this._clearTimeout());
+        this._body.length = 0;
       } catch (err) {
-        this.emit('error', err);
+        this._clearTimeout();
+        // http.get(...).on('error', ...) must be able to observe preflight
+        // failures too, without allowing the rejected request to reach I/O.
+        queueMicrotask(() => this.destroy(err));
+        return;
       }
     } else {
       // No pi.http available — emit error
-      this.emit('error', new Error('HTTP requests require pi.http() hostcall'));
+      queueMicrotask(() => this.destroy(new Error('HTTP requests require pi.http() hostcall')));
+      return;
     }
 
-    this.emit('finish');
+    try { this.emit('finish'); }
+    catch (error) { queueMicrotask(() => this.destroy(error)); }
   }
 
   _handleResponse(result) {
@@ -386,12 +552,392 @@ export function get(input, optionsOrCallback, callback) {
   return req;
 }
 
-export function createServer() {
-  throw new Error('node:http.createServer is not available in PiJS');
+// These servers are extension-owned in-memory routes. They never open a socket,
+// and only the owning extension and its explicitly registered providers can
+// dispatch requests to them. Every outbound request still uses the host bridge.
+const VIRTUAL_HTTP_QUEUE_LIMIT = 1024 * 1024;
+const VIRTUAL_HTTP_HIGH_WATER_MARK = 64 * 1024;
+const VIRTUAL_HTTP_REQUEST_LIMIT = 10 * 1024 * 1024;
+const VIRTUAL_HTTP_REQUEST_CHUNK_BYTES = 16 * 1024;
+
+function virtualHttpError(message, code = 'ERR_PIJS_VIRTUAL_HTTP') {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
-export { STATUS_CODES, METHODS, IncomingMessage, ClientRequest };
-export default { request, get, createServer, STATUS_CODES, METHODS, IncomingMessage, ClientRequest };
+function virtualHttpHeader(name, value) {
+  const key = String(name).toLowerCase();
+  const text = Array.isArray(value) ? value.map(String).join(', ') : String(value);
+  if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(key) || /[\r\n\0]/.test(text)) {
+    throw virtualHttpError('Invalid virtual HTTP header', 'ERR_INVALID_HTTP_TOKEN');
+  }
+  return [key, text];
+}
+
+function makeVirtualTransaction(server, request) {
+  const url = new URL(request.url);
+  let body = request.body_bytes !== undefined
+    ? __pi_http_decode_body_bytes(request.body_bytes)
+    : __pi_http_clone_body_chunk(request.body || '');
+  if (body.length > VIRTUAL_HTTP_REQUEST_LIMIT) {
+    throw virtualHttpError('Virtual HTTP request exceeds 10 MiB');
+  }
+  // Request listeners run inside the transaction's failure boundary. Unlike
+  // the general EventEmitter, swallowing a data/end exception here can leave
+  // a live relay operation waiting forever or continue it after rejection.
+  const req = new HttpEventEmitter();
+  req.method = String(request.method || 'GET').toUpperCase();
+  req.url = url.pathname + url.search;
+  req.headers = Object.create(null);
+  for (const [name, value] of Object.entries(request.headers || {})) {
+    const [key, text] = virtualHttpHeader(name, value);
+    req.headers[key] = text;
+  }
+  req.headers.host = url.host;
+  req.httpVersion = '1.1';
+  req.complete = false;
+  req.aborted = false;
+  req.destroyed = false;
+  req.socket = new EventEmitter();
+  req.socket.remoteAddress = url.hostname === '[::1]' ? '::1' : '127.0.0.1';
+  req.socket.localAddress = req.socket.remoteAddress;
+  req.socket.localPort = Number(url.port || 80);
+  req.socket.setNoDelay = () => req.socket;
+  req.socket.setKeepAlive = () => req.socket;
+  req.connection = req.socket;
+  let requestStarted = false;
+  let requestScheduled = false;
+  let requestPaused = false;
+  let requestOffset = 0;
+  let requestDecoder = null;
+  req.setEncoding = (encoding) => {
+    const name = encoding ? String(encoding) : 'utf8';
+    const decoder = new StringDecoder(name);
+    req._encoding = name;
+    requestDecoder = decoder;
+    return req;
+  };
+  req.pause = () => { requestPaused = true; return req; };
+  req.resume = () => { requestPaused = false; scheduleRequestBody(); return req; };
+  req.isPaused = () => requestPaused;
+
+  const res = new HttpEventEmitter();
+  res.statusCode = 200;
+  res.headersSent = false;
+  res.writableEnded = false;
+  res.writableFinished = false;
+  res.destroyed = false;
+  res.socket = req.socket;
+  const headers = Object.create(null);
+  const queue = [];
+  let queuedBytes = 0;
+  let backpressured = false;
+  let head = null;
+  let headDelivered = false;
+  let failure = null;
+  let finished = false;
+  let waiting = null;
+  let timeoutMs = 0;
+  let timeoutHandle = null;
+  let finish;
+  const finishedPromise = new Promise((resolve) => { finish = resolve; });
+  const wake = () => {
+    if (waiting) { const resolve = waiting; waiting = null; resolve(); }
+  };
+  const complete = () => {
+    if (finished) return;
+    finished = true;
+    // The response may outlive the upload, or reject it before consumption.
+    // Do not retain up to 10 MiB in the transaction after either terminal path.
+    body = null;
+    requestDecoder = null;
+    if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+    timeoutHandle = null;
+    wake();
+    finish();
+  };
+  const notifyCleanup = (emitter, event) => {
+    // Once wrappers and ordering are retained, but one cleanup observer must
+    // never prevent a later observer from releasing its upstream operation.
+    for (const listener of emitter.rawListeners(event).slice()) {
+      try { Reflect.apply(listener, emitter, []); } catch (_) {}
+    }
+  };
+  const fail = (reason) => {
+    // Producer teardown after finish must not discard the successful response
+    // that its consumer has yet to read. Reader cancellation is separate below.
+    if (res.destroyed || finished) return;
+    failure = reason instanceof Error ? reason : virtualHttpError(String(reason || 'Virtual HTTP request cancelled'), 'ABORT_ERR');
+    queue.length = 0;
+    queuedBytes = 0;
+    req.aborted = !req.complete;
+    req.destroyed = true;
+    res.destroyed = true;
+    // Notify every cancellation observer even if one listener throws.
+    for (const [emitter, event] of [
+      [req, 'aborted'], [req, 'close'],
+      [res, 'close'], [req.socket, 'close'],
+    ]) {
+      if (event === 'aborted' && !req.aborted) continue;
+      notifyCleanup(emitter, event);
+    }
+    complete();
+  };
+  const acknowledge = (callback) => {
+    if (typeof callback !== 'function') return;
+    queueMicrotask(() => {
+      // A cancellation between enqueue and delivery is not a successful write.
+      // Callback failures belong to this transaction, not the realm scheduler.
+      try { callback(failure || undefined); } catch (error) { fail(error); }
+    });
+  };
+  const armTimeout = () => {
+    if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+    timeoutHandle = null;
+    if (!timeoutMs || finished) return;
+    timeoutHandle = setTimeout(() => {
+      timeoutHandle = null;
+      try { res.emit('timeout'); } catch (error) { fail(error); }
+      if (!finished && timeoutHandle === null) {
+        fail(virtualHttpError('Virtual HTTP request timed out', 'ETIMEDOUT'));
+      }
+    }, timeoutMs);
+  };
+  req.destroy = (err) => { fail(err); return req; };
+  req.socket.destroy = (err) => { fail(err); return req.socket; };
+  res.destroy = (err) => { fail(err); return res; };
+  res.setHeader = (name, value) => {
+    if (res.headersSent) throw virtualHttpError('Headers already sent', 'ERR_HTTP_HEADERS_SENT');
+    const [key, text] = virtualHttpHeader(name, value);
+    if (!(key in headers) && Object.keys(headers).length >= 100) {
+      throw virtualHttpError('Too many virtual HTTP response headers');
+    }
+    headers[key] = text;
+    return res;
+  };
+  res.getHeader = (name) => headers[String(name).toLowerCase()];
+  res.getHeaders = () => ({ ...headers });
+  res.hasHeader = (name) => Object.prototype.hasOwnProperty.call(headers, String(name).toLowerCase());
+  res.removeHeader = (name) => {
+    if (res.headersSent) throw virtualHttpError('Headers already sent', 'ERR_HTTP_HEADERS_SENT');
+    delete headers[String(name).toLowerCase()];
+  };
+  res.flushHeaders = () => {
+    if (res.destroyed || res.headersSent) return;
+    const status = Number(res.statusCode);
+    if (!Number.isInteger(status) || status < 100 || status > 599) {
+      throw virtualHttpError('Invalid virtual HTTP response status');
+    }
+    res.headersSent = true;
+    head = { status, headers: { ...headers } };
+    wake();
+  };
+  res.writeHead = (status, reasonOrHeaders, maybeHeaders) => {
+    if (res.headersSent) throw virtualHttpError('Headers already sent', 'ERR_HTTP_HEADERS_SENT');
+    res.statusCode = status;
+    const values = typeof reasonOrHeaders === 'string' ? maybeHeaders : reasonOrHeaders;
+    for (const [name, value] of Object.entries(values || {})) res.setHeader(name, value);
+    res.flushHeaders();
+    return res;
+  };
+  res.write = (chunk, encoding, callback) => {
+    const cb = typeof encoding === 'function' ? encoding : callback;
+    if (res.destroyed) { acknowledge(cb); return false; }
+    if (res.writableEnded) throw virtualHttpError('Write after end', 'ERR_STREAM_WRITE_AFTER_END');
+    res.flushHeaders();
+    const bytes = typeof chunk === 'string' && typeof Buffer !== 'undefined'
+      ? Buffer.from(chunk, typeof encoding === 'string' ? encoding : 'utf8')
+      : __pi_http_clone_body_chunk(chunk);
+    if (queuedBytes + bytes.length > VIRTUAL_HTTP_QUEUE_LIMIT) {
+      fail(virtualHttpError('Virtual HTTP response buffer exceeds 1 MiB'));
+      acknowledge(cb);
+      return false;
+    }
+    if (bytes.length > 0) {
+      queue.push(bytes);
+      queuedBytes += bytes.length;
+      armTimeout();
+      wake();
+    }
+    acknowledge(cb);
+    backpressured = queuedBytes >= VIRTUAL_HTTP_HIGH_WATER_MARK;
+    return !backpressured;
+  };
+  res.end = (chunk, encoding, callback) => {
+    const cb = typeof chunk === 'function' ? chunk : typeof encoding === 'function' ? encoding : callback;
+    if (res.destroyed) { acknowledge(cb); return res; }
+    if (res.writableEnded) return res;
+    if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') {
+      // The second argument may be the end callback, not a write callback.
+      res.write(chunk, typeof encoding === 'string' ? encoding : undefined);
+    }
+    if (res.destroyed) { acknowledge(cb); return res; }
+    res.flushHeaders();
+    res.writableEnded = true;
+    res.writableFinished = true;
+    // Commit the terminal result before user cleanup runs. A finish/close
+    // observer may destroy the request, response, or socket reentrantly.
+    complete();
+    notifyCleanup(res, 'finish');
+    notifyCleanup(res, 'close');
+    acknowledge(cb);
+    return res;
+  };
+  res.setTimeout = (ms, callback) => {
+    if (!Number.isFinite(Number(ms)) || Number(ms) < 0) throw new RangeError('Invalid virtual HTTP timeout');
+    if (typeof callback === 'function') res.once('timeout', callback);
+    timeoutMs = Number(ms);
+    armTimeout();
+    return res;
+  };
+  req.setTimeout = (ms, callback) => { res.setTimeout(ms, callback); return req; };
+  req.socket.setTimeout = (ms, callback) => { res.setTimeout(ms, callback); return req.socket; };
+  const poll = () => {
+    if (failure) throw failure;
+    if (head && !headDelivered) {
+      headDelivered = true;
+      return { done: false, value: head };
+    }
+    if (queue.length > 0) {
+      const bytes = queue.shift();
+      queuedBytes -= bytes.length;
+      armTimeout();
+      if (backpressured && queuedBytes < VIRTUAL_HTTP_HIGH_WATER_MARK) {
+        backpressured = false;
+        queueMicrotask(() => {
+          if (finished || res.destroyed || queuedBytes >= VIRTUAL_HTTP_HIGH_WATER_MARK) return;
+          try { res.emit('drain'); } catch (error) { fail(error); }
+        });
+      }
+      return { done: false, value: { body_bytes: __pi_http_chunks_to_base64([bytes]) } };
+    }
+    return finished ? { done: true } : { done: false, value: { pending: true } };
+  };
+  function canDeliverRequestBody() {
+    return requestStarted && !requestPaused && body !== null &&
+      !req.destroyed && !res.destroyed && !res.writableEnded;
+  }
+  function scheduleRequestBody() {
+    if (requestScheduled || !canDeliverRequestBody()) return;
+    requestScheduled = true;
+    queueMicrotask(deliverRequestBody);
+  }
+  function deliverRequestBody() {
+    requestScheduled = false;
+    if (!canDeliverRequestBody()) return;
+    try {
+      if (requestOffset < body.length) {
+        const end = Math.min(requestOffset + VIRTUAL_HTTP_REQUEST_CHUNK_BYTES, body.length);
+        const bytes = __pi_http_clone_body_chunk(body.subarray(requestOffset, end));
+        requestOffset = end;
+        armTimeout();
+        const chunk = requestDecoder ? requestDecoder.write(bytes) : bytes;
+        if (chunk.length > 0) req.emit('data', chunk);
+        // Even the last chunk yields before end. A data listener may pause,
+        // destroy, respond early, or queue cancellation in a microtask.
+        scheduleRequestBody();
+        return;
+      }
+      const tail = requestDecoder ? requestDecoder.end() : '';
+      requestDecoder = null;
+      if (tail) {
+        req.emit('data', tail);
+        scheduleRequestBody();
+        return;
+      }
+      if (!canDeliverRequestBody()) return;
+      req.complete = true;
+      body = null;
+      req.emit('end');
+    } catch (error) { fail(error); }
+  }
+  // Dispatch only after callers own cancellation. Bounded body deliveries on
+  // later microtasks honor pause/resume without opening a socket or accepting
+  // streaming fetch uploads; the existing whole-request limit is unchanged.
+  queueMicrotask(() => {
+    if (res.destroyed) return;
+    try {
+      server.emit('request', req, res);
+      requestStarted = true;
+      scheduleRequestBody();
+    } catch (error) { fail(error); }
+  });
+  return {
+    finished: finishedPromise,
+    poll,
+    async next() {
+      for (;;) {
+        const result = poll();
+        if (!result.value || !result.value.pending) return result;
+        await new Promise((resolve) => { waiting = resolve; });
+      }
+    },
+    cancel(reason) {
+      if (finished && !failure) {
+        // Only the consumer may discard an already completed unread body.
+        queue.length = 0;
+        queuedBytes = 0;
+      } else {
+        fail(reason);
+      }
+      return { done: true };
+    },
+  };
+}
+
+class Server extends EventEmitter {
+  constructor(listener) {
+    super();
+    this._binding = null;
+    this.listening = false;
+    this.on('request', (req, res) => {
+      try { Promise.resolve(listener.call(this, req, res)).catch((error) => res.destroy(error)); }
+      catch (error) { res.destroy(error); }
+    });
+  }
+  listen(portOrOptions, hostOrCallback, callback) {
+    if (this.listening) throw virtualHttpError('Server is already listening', 'ERR_SERVER_ALREADY_LISTEN');
+    const options = portOrOptions && typeof portOrOptions === 'object' ? portOrOptions : { port: portOrOptions, host: hostOrCallback };
+    const cb = typeof hostOrCallback === 'function' ? hostOrCallback : callback;
+    this._binding = globalThis.__pi_virtual_http_listen(options.host, options.port, (request) => makeVirtualTransaction(this, request), () => {
+      this.listening = false;
+      this._binding = null;
+      this.emit('close');
+    });
+    this.listening = true;
+    queueMicrotask(() => {
+      if (!this.listening) return;
+      this.emit('listening');
+      if (typeof cb === 'function') cb();
+    });
+    return this;
+  }
+  address() {
+    return this._binding ? { address: this._binding.host, family: this._binding.host === '::1' ? 'IPv6' : 'IPv4', port: this._binding.port } : null;
+  }
+  close(callback) {
+    if (typeof callback === 'function') this.once('close', callback);
+    if (this._binding) this._binding.close();
+    else if (typeof callback === 'function') queueMicrotask(() => callback());
+    return this;
+  }
+  closeAllConnections() { if (this._binding) this._binding.cancelRequests(); }
+  closeIdleConnections() {}
+  ref() { return this; }
+  unref() { return this; }
+}
+
+export function createServer(optionsOrListener, listener) {
+  const callback = typeof optionsOrListener === 'function' ? optionsOrListener : listener;
+  if (typeof callback !== 'function') {
+    throw new Error('node:http.createServer is not available without an explicit request listener in PiJS');
+  }
+  return new Server(callback);
+}
+
+export { STATUS_CODES, METHODS, IncomingMessage, ClientRequest, Server };
+export default { request, get, createServer, STATUS_CODES, METHODS, IncomingMessage, ClientRequest, Server };
 "#;
 
 /// The JS source for the `node:https` virtual module.

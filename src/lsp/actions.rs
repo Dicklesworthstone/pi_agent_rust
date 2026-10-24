@@ -627,7 +627,9 @@ impl LspTool {
             let path = resolve_tool_path(file, &self.cwd).canonicalize()?;
             let hash = file_hash(&path)?;
             let range = Self::code_action_range(input, &path)?;
-            let (uri, entry) = self.synced(&path).await?;
+            let (uri, entry) = self
+                .synced_with_timeout(&path, self.request_timeout(input))
+                .await?;
             let snapshot = Arc::new(refactor::RefactorSnapshot::capture(&entry, &path, hash)?);
             let pulls_diagnostics = entry
                 .client

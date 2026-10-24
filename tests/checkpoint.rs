@@ -150,8 +150,12 @@ fn mark_twenty_turns_rewind_tree_preserved() {
     let summary = block_on_local(pi::checkpoint::summarize_span(
         &span,
         Arc::new(SummaryProvider),
-        "test-key",
+        &StreamOptions {
+            api_key: Some("test-key".to_string()),
+            ..StreamOptions::default()
+        },
         &settings,
+        &agent.compaction_privacy(),
     ))
     .expect("summarize");
     assert!(summary.contains("REPORT"));

@@ -3,6 +3,10 @@
 //! Sessions are stored as JSONL files with a tree structure that enables
 //! branching and history navigation.
 
+pub(crate) mod attachments;
+#[cfg(test)]
+pub(crate) mod fork_tests;
+
 use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -12,7 +16,6 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, TextContent, ToolResultMessage,
     UserContent, UserMessage,
 };
-use crate::provider_metadata::{canonical_provider_id, provider_ids_match};
 use crate::session_index::{
     SessionIndex, SessionIndexRefreshSummary, begin_session_index_namespace_change,
     enqueue_session_index_snapshot_update, is_session_file_path, session_file_stats,
@@ -1095,6 +1098,15 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
 
     let mut encoded = serde_json::to_vec(document)?;
     encoded.push(b'\n');
+    write_v2_source_state_bytes(v2_root, initial_identity, &encoded)
+}
+
+fn write_v2_source_state_bytes(
+    v2_root: &Path,
+    initial_identity: Option<crate::file_identity::FileIdentity>,
+    encoded: &[u8],
+) -> Result<()> {
+    let path = v2_source_state_path(v2_root);
 
     #[cfg(unix)]
     {
@@ -1141,25 +1153,42 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
             "V2 source state write",
         )?;
         file.set_len(0)?;
-        file.write_all(&encoded)?;
+        file.write_all(encoded)?;
         file.sync_all()?;
         std::fs::File::from(directory).sync_all()?;
     }
 
     #[cfg(not(unix))]
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
+        // An entry observed absent must be created exclusively. An existing
+        // entry must still exist, and opening it must not truncate anything
+        // before its identity and type have been validated.
+        let mut options = std::fs::OpenOptions::new();
+        options
             .write(true)
-            .truncate(true)
-            .open(&path)?;
+            .create_new(initial_identity.is_none())
+            .truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(&path)?;
+        let opened_metadata = file.metadata()?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(invalid_v2_source_state(
+                    &path,
+                    "state entry must not be a Windows reparse point",
+                ));
+            }
+        }
         let opened_identity = crate::file_identity::FileIdentity::of_open_file(&file)?;
-        // The same re-check the Unix arm performs: without it a same-name
-        // replacement landing between the validation above and this open was
-        // written through unnoticed (bd-vr2b8). A reparse point substituted
-        // here fails it too, because the recorded identity was read without
-        // following one while this open does.
-        if !file.metadata()?.is_file()
+        if !opened_metadata.is_file()
             || initial_identity.is_some_and(|initial| initial != opened_identity)
         {
             return Err(invalid_v2_source_state(
@@ -1167,7 +1196,8 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
                 "state entry changed while it was being opened",
             ));
         }
-        file.write_all(&encoded)?;
+        file.set_len(0)?;
+        file.write_all(encoded)?;
         file.sync_all()?;
         sync_parent_dir(&path)?;
     }
@@ -1263,6 +1293,8 @@ pub(crate) fn open_existing_session_file_for_read(path: &Path) -> Result<std::fs
 }
 
 fn open_existing_session_file_for_append(path: &Path) -> Result<std::fs::File> {
+    #[cfg(windows)]
+    let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(path)?;
     let initial_metadata = std::fs::symlink_metadata(path)?;
     if initial_metadata.file_type().is_symlink() || !initial_metadata.is_file() {
         return Err(Error::Io(Box::new(std::io::Error::new(
@@ -1308,7 +1340,12 @@ fn open_existing_session_file_for_append(path: &Path) -> Result<std::fs::File> {
         Ok(file)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        open_windows_session_file_for_append(path, initial_identity)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let file = std::fs::OpenOptions::new().append(true).open(path)?;
         if !file.metadata()?.is_file() {
@@ -1319,6 +1356,40 @@ fn open_existing_session_file_for_append(path: &Path) -> Result<std::fs::File> {
         }
         Ok(file)
     }
+}
+
+#[cfg(windows)]
+fn open_windows_session_file_for_append(
+    path: &Path,
+    initial_identity: crate::file_identity::FileIdentity,
+) -> Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    // The outer save path resolves intentional terminal symlinks before taking
+    // its lock. A new link or regular-file replacement here is a race, and must
+    // not receive any append bytes. Omit FILE_SHARE_DELETE to prevent renaming
+    // or deleting the checked file until the append and sync finish.
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || crate::file_identity::FileIdentity::of_open_file(&file)? != initial_identity
+    {
+        return Err(Error::Io(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "session append target changed while it was being opened",
+        ))));
+    }
+    Ok(file)
 }
 
 fn jsonl_ends_with_newline(path: &Path) -> Result<bool> {
@@ -1404,12 +1475,13 @@ fn persist_jsonl_snapshot_locked(
     let original_perms = std::fs::metadata(path).ok().map(|meta| meta.permissions());
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+    let mut attachments = attachments::EntryEncoder::new(path);
     {
         let mut writer = std::io::BufWriter::with_capacity(1 << 20, temp_file.as_file());
         serde_json::to_writer(&mut writer, header)?;
         writer.write_all(b"\n")?;
         for entry in entries {
-            serde_json::to_writer(&mut writer, entry)?;
+            serde_json::to_writer(&mut writer, &attachments.encode(entry)?)?;
             writer.write_all(b"\n")?;
         }
         writer.flush()?;
@@ -1426,6 +1498,7 @@ fn persist_jsonl_snapshot_locked(
         .map_err(|e| crate::Error::Io(Box::new(e)))?;
     // The authoritative JSONL has not changed yet. Mark any current V2
     // sidecar dirty immediately before the atomic source replacement.
+    attachments.validate()?;
     mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
     temp_file
         .persist(path)
@@ -1463,6 +1536,7 @@ fn save_jsonl_full_rewrite_blocking(
         sessions_root,
         path,
         &header_to_write,
+        &entries_to_write,
         message_count,
         session_name,
         Some(index_generation),
@@ -1471,29 +1545,36 @@ fn save_jsonl_full_rewrite_blocking(
 }
 
 struct JsonlAppendPlan {
-    ordered_entries: Vec<SessionEntry>,
-    serialized_entries: Vec<u8>,
+    stored_entries: Vec<attachments::StoredEntry>,
     entries_appended: Vec<SessionEntry>,
     message_count: u64,
     session_name: Option<String>,
 }
 
 fn plan_jsonl_incremental_append(
-    disk_session: &Session,
-    new_entries: &[SessionEntry],
+    source: &Path,
+    stored_entries: Vec<attachments::StoredEntry>,
+    new_entries: Vec<SessionEntry>,
 ) -> Result<JsonlAppendPlan> {
-    let mut persisted_entries = HashMap::with_capacity(disk_session.entries.len());
-    for entry in &disk_session.entries {
+    let mut persisted_entries = HashMap::with_capacity(stored_entries.len());
+    let mut message_count = 0_u64;
+    let mut session_name = None;
+    for (index, entry) in stored_entries.iter().enumerate() {
         let id = entry
-            .base_id()
+            .base()
+            .id
+            .as_ref()
             .ok_or_else(|| Error::session("persisted session entry is missing its ID"))?;
-        if persisted_entries
-            .insert(id.clone(), serde_json::to_vec(entry)?)
-            .is_some()
-        {
+        if persisted_entries.insert(id.as_str(), index).is_some() {
             return Err(Error::session(format!(
                 "persisted session contains duplicate entry ID {id}"
             )));
+        }
+        if entry.entry_type() == "message" {
+            message_count = message_count.saturating_add(1);
+        }
+        if let Some(name) = entry.session_name() {
+            session_name = Some(name.to_string());
         }
     }
 
@@ -1508,12 +1589,10 @@ fn plan_jsonl_incremental_append(
                 "incremental session append contains duplicate entry ID {id}"
             )));
         }
-        let serialized = serde_json::to_vec(entry)?;
-        let serialized_len = u64::try_from(serialized.len())
-            .map_err(|_| Error::session("serialized session entry length exceeds u64"))?;
-        ensure_jsonl_line_len_within_limit(serialized_len, MAX_JSONL_LINE_BYTES, "session entry")?;
-        if let Some(persisted) = persisted_entries.get(id) {
-            if persisted != &serialized {
+        if let Some(index) = persisted_entries.get(id.as_str()).copied() {
+            if stored_entries[index].native_fingerprint(source)?
+                != attachments::native_entry_fingerprint(&entry)?
+            {
                 return Err(Error::session(format!(
                     "session entry ID {id} has conflicting persisted and in-memory payloads"
                 )));
@@ -1521,31 +1600,19 @@ fn plan_jsonl_incremental_append(
             continue;
         }
 
-        persisted_entries.insert(id.clone(), serialized);
-        pending_entries.push(entry.clone());
+        pending_entries.push(entry);
     }
 
-    let pending_entry_ids = pending_entries
+    let bases = stored_entries
         .iter()
-        .filter_map(SessionEntry::base_id)
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut merged_entries = disk_session.entries.clone();
-    merged_entries.extend(pending_entries);
-    ensure_session_parent_links_closed(&merged_entries)?;
-    let ordered_entries = stable_parent_topological_order(merged_entries)?;
-    let mut serialized_entries = Vec::new();
-    let mut entries_appended = Vec::new();
-    let mut message_count = disk_session.cached_message_count;
-    let mut session_name = disk_session.cached_name.clone();
-    for entry in ordered_entries.iter().filter(|entry| {
-        entry
-            .base_id()
-            .is_some_and(|id| pending_entry_ids.contains(id))
-    }) {
-        serde_json::to_writer(&mut serialized_entries, entry)?;
-        serialized_entries.push(b'\n');
-        entries_appended.push(entry.clone());
+        .map(attachments::StoredEntry::base)
+        .chain(pending_entries.iter().map(SessionEntry::base))
+        .collect::<Vec<_>>();
+    validate_entry_base_graph(&bases, false)?;
+    // Existing rows retain their exact disk order. Among pending rows, parents
+    // precede children and the caller's order breaks ties between branches.
+    let entries_appended = stable_parent_topological_order(pending_entries)?;
+    for entry in &entries_appended {
         match entry {
             SessionEntry::Message(_) => message_count = message_count.saturating_add(1),
             SessionEntry::SessionInfo(info) if info.name.is_some() => {
@@ -1556,86 +1623,252 @@ fn plan_jsonl_incremental_append(
     }
 
     Ok(JsonlAppendPlan {
-        ordered_entries,
-        serialized_entries,
+        stored_entries,
         entries_appended,
         message_count,
         session_name,
     })
 }
 
+struct JsonlReusableEntry {
+    position: usize,
+    fingerprint: [u8; 32],
+}
+
+#[derive(Debug)]
+enum JsonlPersistedEntry {
+    Reuse(usize),
+    Hydrated(Box<SessionEntry>),
+}
+
+#[derive(Debug)]
+struct JsonlAppendOutcome {
+    header: SessionHeader,
+    entries: Vec<JsonlPersistedEntry>,
+}
+
+impl JsonlAppendOutcome {
+    /// The writer never owns the caller's complete history. Until its receipt
+    /// is accepted, cancellation therefore leaves every in-memory byte intact.
+    fn accept(self, current: &mut Vec<SessionEntry>) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+        let mut reused = HashSet::new();
+        for entry in &self.entries {
+            if let JsonlPersistedEntry::Reuse(position) = entry
+                && (*position >= current.len() || !reused.insert(*position))
+            {
+                return Err(Error::session("invalid session append reuse receipt"));
+            }
+        }
+        // No fallible operation follows taking the entries out of the caller.
+        // A receipt only reuses rows whose complete native payload matched the
+        // authoritative disk row, so public entry mutations cannot leak back.
+        let mut slots = std::mem::take(current)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|entry| match entry {
+                JsonlPersistedEntry::Reuse(position) => slots[position]
+                    .take()
+                    .expect("reuse positions were validated before consuming entries"),
+                JsonlPersistedEntry::Hydrated(entry) => *entry,
+            })
+            .collect();
+        Ok((self.header, entries))
+    }
+}
+
+async fn jsonl_reusable_entries(
+    entries: &[SessionEntry],
+) -> Result<HashMap<String, JsonlReusableEntry>> {
+    let mut reusable = HashMap::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        let id = entry
+            .base_id()
+            .ok_or_else(|| Error::session("in-memory session entry is missing its ID"))?;
+        reusable.insert(
+            id.clone(),
+            JsonlReusableEntry {
+                position,
+                fingerprint: attachments::native_entry_fingerprint(entry)?,
+            },
+        );
+        // Public entries can be mutated in place, so cached IDs or allocation
+        // addresses cannot prove payload equality. Yield between bounded rows
+        // while inspecting the caller's data, before admitting a disk writer.
+        asupersync::runtime::yield_now().await;
+    }
+    Ok(reusable)
+}
+
+fn open_jsonl_for_append(path: &Path) -> Result<(SessionHeader, Vec<attachments::StoredEntry>)> {
+    let file = open_existing_session_file_for_read(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let header_line = read_capped_utf8_line(&mut reader)?
+        .filter(|line| !line.trim().is_empty())
+        .ok_or_else(|| Error::session("Empty session file"))?;
+    let header: SessionHeader = serde_json::from_str(&header_line)
+        .map_err(|error| Error::session(format!("Invalid header: {error}")))?;
+    header
+        .validate()
+        .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
+    let (header, _) = normalize_loaded_header(header);
+    let entries = read_jsonl_entries_for_v2(&mut reader, path).map_err(|error| {
+        let invalid_source = matches!(&error, Error::Json(_) | Error::Session(_))
+            || matches!(&error, Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData);
+        if invalid_source && !attachments::is_attachment_error(&error) {
+            Error::session(format!(
+                "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to append to recovered session {}: {error}",
+                path.display()
+            ))
+        } else {
+            error
+        }
+    })?;
+    Ok((header, entries))
+}
+
+#[allow(clippy::too_many_lines)]
 fn append_jsonl_entries_blocking(
     path: &Path,
     sessions_root: &Path,
     expected_session_id: &str,
-    new_entries: &[SessionEntry],
-) -> Result<(SessionHeader, Vec<SessionEntry>)> {
-    validate_jsonl_entries_for_write(new_entries)?;
+    new_entries: Vec<SessionEntry>,
+    reusable: &HashMap<String, JsonlReusableEntry>,
+) -> Result<JsonlAppendOutcome> {
+    validate_jsonl_entries_for_write(&new_entries)?;
     let resolved_path = resolve_session_persistence_path(path)?;
     let path = resolved_path.as_path();
     ensure_session_file_writable(path).map_err(|err| crate::Error::Io(Box::new(err)))?;
     let _lock = lock_session_persistence(path)?;
-    let (disk_session, _) = open_jsonl_blocking(path)?;
-    if disk_session.source_integrity_failed {
-        return Err(Error::session(format!(
-            "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to append to recovered session {}",
-            path.display()
-        )));
-    }
-    if disk_session.header.id != expected_session_id {
+    let (header, stored_entries) = open_jsonl_for_append(path)?;
+    if header.id != expected_session_id {
         return Err(Error::session(
             "persisted session header ID does not match the in-memory session ID",
         ));
     }
 
     let JsonlAppendPlan {
-        ordered_entries,
-        serialized_entries,
+        stored_entries,
         entries_appended,
         message_count,
         session_name,
-    } = plan_jsonl_incremental_append(&disk_session, new_entries)?;
+    } = plan_jsonl_incremental_append(path, stored_entries, new_entries)?;
+
+    let binding_entries = stored_entries
+        .iter()
+        .filter_map(attachments::StoredEntry::workdir_binding)
+        .chain(entries_appended.iter().filter(|entry| {
+            matches!(entry, SessionEntry::Custom(custom)
+                if custom.custom_type.starts_with(crate::session_workdir::WORKDIR_BINDING_PREFIX))
+        }))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut attachments = attachments::EntryEncoder::new(path);
+    let mut serialized_entries = Vec::new();
+    for entry in &entries_appended {
+        serde_json::to_writer(&mut serialized_entries, &attachments.encode(entry)?)?;
+        serialized_entries.push(b'\n');
+    }
 
     let rewrite_unterminated = !serialized_entries.is_empty() && !jsonl_ends_with_newline(path)?;
-    let index_generation = if serialized_entries.is_empty() {
-        None
-    } else {
-        Some(begin_session_index_namespace_change(sessions_root)?)
-    };
     let persisted_entries = if rewrite_unterminated {
         // A complete final record can survive an interrupted delimiter write.
         // Never concatenate the next object onto it: atomically rewrite the
         // already-validated rows with their delimiters restored. An invalid
         // torn record is diagnosed during open and rejected above so its bytes
         // remain available for explicit recovery.
-        persist_jsonl_snapshot_locked(path, &disk_session.header, &ordered_entries)?;
-        ordered_entries
+        let mut entries = stored_entries
+            .into_iter()
+            .map(|entry| entry.into_hydrated(path))
+            .collect::<Result<Vec<_>>>()?;
+        entries.extend(entries_appended);
+        let entries = stable_parent_topological_order(entries)?;
+        let generation = begin_session_index_namespace_change(sessions_root)?;
+        persist_jsonl_snapshot_locked(path, &header, &entries)?;
+        enqueue_session_index_snapshot_update(
+            sessions_root,
+            path,
+            &header,
+            &entries,
+            message_count,
+            session_name,
+            Some(generation),
+        );
+        return Ok(JsonlAppendOutcome {
+            header,
+            entries: entries
+                .into_iter()
+                .map(|entry| JsonlPersistedEntry::Hydrated(Box::new(entry)))
+                .collect(),
+        });
     } else {
-        if !serialized_entries.is_empty() {
-            mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
-            let mut file = open_existing_session_file_for_append(path)?;
-            file.write_all(&serialized_entries)?;
-            persistence_test_failpoint("jsonl_append_after_write_before_sync", None)?;
-            file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
-            persistence_test_failpoint(
-                "jsonl_append_after_sync",
-                Some("append_sync_completed=true"),
-            )?;
+        // Materialize only rows genuinely adopted from another writer (or a
+        // partial V2 view). Existing media stays in the caller's owned entries.
+        // Build this receipt before publishing any append bytes so adoption
+        // failures leave both the caller and authoritative JSONL unchanged.
+        let mut entries = Vec::with_capacity(stored_entries.len() + entries_appended.len());
+        for stored in stored_entries {
+            let reusable_entry = stored.base().id.as_ref().and_then(|id| reusable.get(id));
+            if let Some(known) = reusable_entry
+                && known.fingerprint == stored.native_fingerprint(path)?
+            {
+                entries.push(JsonlPersistedEntry::Reuse(known.position));
+            } else {
+                entries.push(JsonlPersistedEntry::Hydrated(Box::new(
+                    stored.into_hydrated(path)?,
+                )));
+            }
         }
-        let mut persisted_entries = disk_session.entries.clone();
-        persisted_entries.extend(entries_appended);
-        persisted_entries
+        for entry in entries_appended {
+            let reusable_entry = entry.base_id().and_then(|id| reusable.get(id));
+            if let Some(known) = reusable_entry
+                && known.fingerprint == attachments::native_entry_fingerprint(&entry)?
+            {
+                entries.push(JsonlPersistedEntry::Reuse(known.position));
+            } else {
+                entries.push(JsonlPersistedEntry::Hydrated(Box::new(entry)));
+            }
+        }
+        let index_generation = if serialized_entries.is_empty() {
+            None
+        } else {
+            Some(begin_session_index_namespace_change(sessions_root)?)
+        };
+        let mut file = open_existing_session_file_for_append(path)?;
+        if !serialized_entries.is_empty() {
+            attachments.validate()?;
+            mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
+            file.write_all(&serialized_entries)?;
+        }
+        // A failed or cancelled append can leave every requested row visible
+        // without a durable acknowledgement. Deduplicating that replay must
+        // still cross the sync boundary before the caller clears pending work.
+        persistence_test_failpoint("jsonl_append_after_write_before_sync", None)?;
+        file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
+        persistence_test_failpoint(
+            "jsonl_append_after_sync",
+            Some("append_sync_completed=true"),
+        )?;
+        enqueue_session_index_snapshot_update(
+            sessions_root,
+            path,
+            &header,
+            &binding_entries,
+            message_count,
+            session_name,
+            index_generation,
+        );
+        entries
     };
 
-    enqueue_session_index_snapshot_update(
-        sessions_root,
-        path,
-        &disk_session.header,
-        message_count,
-        session_name,
-        index_generation,
-    );
-    Ok((disk_session.header, persisted_entries))
+    Ok(JsonlAppendOutcome {
+        header,
+        entries: persisted_entries,
+    })
 }
 
 fn session_persistence_lock_path(path: &Path) -> PathBuf {
@@ -1682,8 +1915,20 @@ fn reject_windows_session_lock_reparse_components(path: &Path) -> Result<()> {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
     let mut current = PathBuf::new();
-    for component in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         current.push(component.as_os_str());
+        // A rooted Windows path is not ready to probe until RootDir has been
+        // appended: canonicalize() returns \\?\D:\..., and inspecting the bare
+        // \\?\D: volume fails with ERROR_INVALID_FUNCTION. Only defer prefixes
+        // followed by a root. In a drive-relative path such as D:session.jsonl,
+        // D: denotes that drive's current directory and must still be checked.
+        // The completed root and every descendant retain the reparse checks.
+        if matches!(component, std::path::Component::Prefix(_))
+            && matches!(components.peek(), Some(std::path::Component::RootDir))
+        {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink()
@@ -1698,7 +1943,10 @@ fn reject_windows_session_lock_reparse_components(path: &Path) -> Result<()> {
                     ))));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            // A missing component does not imply that every later prefix is
+            // missing: Windows can normalize `missing\..` away. Keep walking
+            // so a subsequent junction or other reparse point is still checked.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(crate::Error::Io(Box::new(error))),
         }
     }
@@ -1911,10 +2159,18 @@ fn validate_session_entry_graph_inner(
     entries: &[SessionEntry],
     allow_missing_parents: bool,
 ) -> Result<()> {
+    let bases = entries.iter().map(SessionEntry::base).collect::<Vec<_>>();
+    validate_entry_base_graph(&bases, allow_missing_parents)
+}
+
+/// Graph checks depend only on entry metadata. Reference-preserving migration
+/// shares this validator without cloning or hydrating conversation payloads.
+fn validate_entry_base_graph(entries: &[&EntryBase], allow_missing_parents: bool) -> Result<()> {
     let mut positions = HashMap::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let id = entry
-            .base_id()
+            .id
+            .as_ref()
             .ok_or_else(|| Error::session("session entry is missing its ID"))?;
         if positions.insert(id.as_str(), index).is_some() {
             return Err(Error::session(format!(
@@ -1926,7 +2182,7 @@ fn validate_session_entry_graph_inner(
     let mut indegree = vec![0_u8; entries.len()];
     let mut children = vec![Vec::new(); entries.len()];
     for (index, entry) in entries.iter().enumerate() {
-        let Some(parent_id) = entry.base().parent_id.as_deref() else {
+        let Some(parent_id) = entry.parent_id.as_deref() else {
             continue;
         };
         let Some(parent_index) = positions.get(parent_id).copied() else {
@@ -1935,7 +2191,7 @@ fn validate_session_entry_graph_inner(
             }
             return Err(Error::session(format!(
                 "session entry {} references missing parent {parent_id}",
-                entry.base_id().map_or("<missing-id>", String::as_str)
+                entry.id.as_deref().unwrap_or("<missing-id>")
             )));
         };
         indegree[index] = 1;
@@ -2326,32 +2582,20 @@ impl ExtensionSession for SessionHandle {
         model_id: String,
         _origin: Option<SessionActionOrigin>,
     ) -> Result<()> {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        if provider.is_empty() || model_id.is_empty() {
+            return Err(Error::validation(
+                "setModel: provider and modelId must be non-empty strings",
+            ));
+        }
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
             .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        let normalized_provider = canonical_provider_id(&provider)
-            .unwrap_or(&provider)
-            .to_string();
-        let (stored_provider, stored_model_id, changed) = match current_path_model_pair(&session) {
-            Some((current_provider, current_model_id))
-                if provider_ids_match(&current_provider, &provider)
-                    && current_model_id.eq_ignore_ascii_case(&model_id) =>
-            {
-                (current_provider, current_model_id, false)
-            }
-            _ => (normalized_provider, model_id.clone(), true),
-        };
-        if changed || session.active_failover_provenance_for_current_path().is_some() {
-            // Selecting the current fallback explicitly retires automatic
-            // restoration just like selecting a different model. Keep one
-            // ordinary model-change record to distinguish that intent from
-            // continuing the existing failover cycle.
-            session.append_model_change(stored_provider.clone(), stored_model_id.clone());
-        }
-        session.set_model_header(Some(stored_provider), Some(stored_model_id), None);
+        session.select_model(provider.to_string(), model_id.to_string());
         Ok(())
     }
 
@@ -2842,6 +3086,12 @@ pub struct ForkPlan {
     pub leaf_id: Option<String>,
     /// Text of the selected user message (for editor pre-fill).
     pub selected_text: String,
+    // Session-wide metadata must come from the source, independently of the
+    // selected conversation ancestry or the caller's process directory.
+    original_cwd: String,
+    additional_roots: Option<Vec<String>>,
+    parent_session: Option<String>,
+    inherited_workdir_binding: Option<Value>,
 }
 
 /// Lightweight snapshot of session data for non-blocking export.
@@ -3265,6 +3515,206 @@ impl PathRebuildState {
     }
 }
 
+/// Track surviving stream reminders without cloning historical message bodies.
+/// Checkpoint offsets use model-message counts, just like `PathRebuildState`.
+#[derive(Default)]
+struct StreamReminderProjection<'a> {
+    message_count: usize,
+    /// Source path index and surviving model-message position.
+    reminders: Vec<(usize, usize)>,
+    /// A later compaction can retain part of a collapsed span while dropping
+    /// its checkpoint. Those reminders must not become active again.
+    rewound_reminders: HashSet<usize>,
+    checkpoint_positions: HashMap<&'a str, usize>,
+}
+
+fn stream_reminder_rule_id(entry: &SessionEntry) -> Option<&str> {
+    let SessionEntry::Message(message) = entry else {
+        return None;
+    };
+    let SessionMessage::Custom {
+        custom_type,
+        details,
+        ..
+    } = &message.message
+    else {
+        return None;
+    };
+    if custom_type != crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE {
+        return None;
+    }
+    details
+        .as_ref()?
+        .get("ruleId")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+}
+
+impl<'a> StreamReminderProjection<'a> {
+    fn append(&mut self, index: usize, entry: &'a SessionEntry) {
+        match entry {
+            SessionEntry::Message(message) => {
+                if matches!(
+                    &message.message,
+                    SessionMessage::BashExecution { extra, .. }
+                        if extra.get("excludeFromContext").and_then(Value::as_bool) == Some(true)
+                ) {
+                    return;
+                }
+                if stream_reminder_rule_id(entry).is_some() {
+                    self.reminders.push((index, self.message_count));
+                }
+                self.message_count += 1;
+            }
+            SessionEntry::BranchSummary(_) => self.message_count += 1,
+            SessionEntry::Custom(custom) if custom.custom_type == "checkpoint" => {
+                if let Some(id) = &custom.base.id {
+                    self.checkpoint_positions
+                        .insert(id.as_str(), self.message_count);
+                }
+            }
+            SessionEntry::Custom(custom) if custom.custom_type == "rewind" => {
+                let Some(data) = &custom.data else { return };
+                let Some(boundary) = data
+                    .get("checkpointEntryId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.checkpoint_positions.get(id))
+                    .copied()
+                else {
+                    return;
+                };
+                let rewound = &mut self.rewound_reminders;
+                self.reminders.retain(|(index, position)| {
+                    if *position < boundary {
+                        true
+                    } else {
+                        rewound.insert(*index);
+                        false
+                    }
+                });
+                self.checkpoint_positions
+                    .retain(|_, position| *position <= boundary);
+                self.message_count = boundary;
+                if data
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .is_some_and(|summary| !summary.is_empty())
+                {
+                    self.message_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn newest_before<F>(&self, keep_from: usize, entry_at: &F) -> Vec<usize>
+    where
+        F: Fn(usize) -> &'a SessionEntry,
+    {
+        let mut rule_ids = HashSet::new();
+        let mut reminders = Vec::new();
+        for &(index, _) in self.reminders.iter().rev() {
+            if self.rewound_reminders.contains(&index) {
+                continue;
+            }
+            let Some(rule_id) = stream_reminder_rule_id(entry_at(index)) else {
+                continue;
+            };
+            if !rule_ids.insert(rule_id) {
+                continue;
+            }
+            if index < keep_from {
+                reminders.push(index);
+            }
+            if rule_ids.len() >= crate::stream_rules::MAX_STREAM_RULES {
+                break;
+            }
+        }
+        reminders.reverse();
+        reminders
+    }
+
+    fn remove_rewound_messages(
+        &self,
+        rebuild: &mut PathRebuildState,
+        rewound_reminders: &HashSet<usize>,
+    ) {
+        // A raw cut point can fall inside an already rewound span. If its
+        // checkpoint was compacted away, the retained rewind is a no-op and
+        // would revive the span's reminders. Filter after replay so checkpoint
+        // invalidation uses the original positions, then translate boundaries.
+        let removed_positions: Vec<usize> = self
+            .reminders
+            .iter()
+            .filter(|(index, _)| rewound_reminders.contains(index))
+            .map(|(_, position)| *position)
+            .collect();
+        if removed_positions.is_empty() {
+            return;
+        }
+        let mut position = 0;
+        rebuild.messages.retain(|_| {
+            let keep = removed_positions.binary_search(&position).is_err();
+            position += 1;
+            keep
+        });
+        for boundary in rebuild.checkpoint_positions.values_mut() {
+            *boundary -= removed_positions.partition_point(|position| *position < *boundary);
+        }
+    }
+}
+
+fn preserved_stream_reminders<'a, F>(path_len: usize, entry_at: &F) -> (Vec<usize>, HashSet<usize>)
+where
+    F: Fn(usize) -> &'a SessionEntry,
+{
+    // Only compaction boundaries need an index: storing every message id
+    // would make this metadata-only pass expensive on long linear sessions.
+    let kept_ids: HashSet<&str> = (0..path_len)
+        .filter_map(|index| match entry_at(index) {
+            SessionEntry::Compaction(compaction) => Some(compaction.first_kept_entry_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let kept_positions: HashMap<&str, usize> = (0..path_len)
+        .filter_map(|index| {
+            let id = entry_at(index).base_id()?.as_str();
+            kept_ids.contains(id).then_some((id, index))
+        })
+        .collect();
+    let mut projection = StreamReminderProjection::default();
+    let mut keep_from = 0;
+    for index in 0..path_len {
+        let entry = entry_at(index);
+        if let SessionEntry::Compaction(compaction) = entry {
+            keep_from = kept_positions
+                .get(compaction.first_kept_entry_id.as_str())
+                .copied()
+                .unwrap_or(index);
+            let reminders = projection.newest_before(keep_from, entry_at);
+            projection = StreamReminderProjection {
+                message_count: 1, // The compaction summary.
+                rewound_reminders: std::mem::take(&mut projection.rewound_reminders),
+                ..StreamReminderProjection::default()
+            };
+            for reminder in reminders {
+                projection.append(reminder, entry_at(reminder));
+            }
+            // Rebuild retained checkpoints as well as reminders. A rewind
+            // targeting a checkpoint already compacted away must stay inert.
+            for retained in keep_from..index {
+                projection.append(retained, entry_at(retained));
+            }
+        } else if index >= keep_from {
+            projection.append(index, entry);
+        }
+    }
+    (
+        projection.newest_before(keep_from, entry_at),
+        projection.rewound_reminders,
+    )
+}
+
 impl Session {
     /// Create a new session from CLI args and config.
     pub async fn new(cli: &Cli, config: &Config) -> Result<Self> {
@@ -3362,16 +3812,14 @@ impl Session {
         let cwd = std::env::current_dir()?;
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
-        let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
         let base_dir_clone = base_dir.clone();
         let cwd_display = cwd.display().to_string();
         let (tx, mut rx) = oneshot::channel();
 
         let handle = thread::spawn(move || {
-            let indexed_meta = SessionIndex::for_sessions_root(&base_dir_clone)
-                .list_sessions(Some(&cwd_display))
-                .unwrap_or_default();
+            let index = SessionIndex::for_sessions_root(&base_dir_clone);
+            let indexed_meta = index.discover_sessions(&cwd_display);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_meta));
         });
@@ -3389,10 +3837,6 @@ impl Session {
                 path,
                 "Failed to prune missing session from index during picker refresh",
             );
-        }
-
-        if project_session_dir_missing {
-            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
         }
 
         let scanned = scan_sessions_on_disk(&project_session_dir, entries.clone()).await?;
@@ -3414,7 +3858,10 @@ impl Session {
             "Failed to refresh session metadata in index during picker refresh",
         );
         merge_scanned_session_entries(&mut by_path, scanned.entries);
-        let mut entries = by_path.into_values().collect::<Vec<_>>();
+        let mut entries = by_path
+            .into_values()
+            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .collect::<Vec<_>>();
 
         if entries.is_empty() {
             return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
@@ -3733,6 +4180,9 @@ impl Session {
                 match Self::open_v2_with_diagnostics(&path).await {
                     Ok(result) => return Ok(result),
                     Err(e) => {
+                        if attachments::is_attachment_error(&e) {
+                            return Err(e);
+                        }
                         if matches!(
                             &e,
                             Error::Io(io_error)
@@ -3976,6 +4426,15 @@ impl Session {
         header: SessionHeader,
         mode: V2OpenMode,
     ) -> Result<(Self, SessionOpenDiagnostics)> {
+        Self::open_from_v2_with_source(store, header, mode, None)
+    }
+
+    fn open_from_v2_with_source(
+        store: &SessionStoreV2,
+        header: SessionHeader,
+        mode: V2OpenMode,
+        jsonl_source: Option<&Path>,
+    ) -> Result<(Self, SessionOpenDiagnostics)> {
         let index = store.read_index()?;
         let active_leaf = select_v2_active_leaf(&header, &index);
         let entry_count = u64::try_from(index.len()).unwrap_or(u64::MAX);
@@ -3987,9 +4446,11 @@ impl Session {
             mode,
             active_leaf.entry_id(),
             None,
+            jsonl_source,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_from_v2_with_active_leaf(
         store: &SessionStoreV2,
         index: &[session_store_v2::OffsetIndexEntry],
@@ -3997,6 +4458,7 @@ impl Session {
         mode: V2OpenMode,
         active_leaf_id: Option<&str>,
         validated_total_message_count: Option<u64>,
+        jsonl_source: Option<&Path>,
     ) -> Result<(Self, SessionOpenDiagnostics)> {
         header
             .validate()
@@ -4027,8 +4489,9 @@ impl Session {
         let mut diagnostics = SessionOpenDiagnostics::default();
         let mut entries = Vec::with_capacity(frames.len());
         for frame in &frames {
-            match session_store_v2::frame_to_session_entry(frame) {
+            match session_store_v2::frame_to_session_entry_with_source(frame, jsonl_source) {
                 Ok(entry) => entries.push(entry),
+                Err(error) if attachments::is_attachment_error(&error) => return Err(error),
                 Err(e) => {
                     diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
                         line_number: usize::try_from(frame.entry_seq).unwrap_or(0),
@@ -4204,8 +4667,8 @@ impl Session {
 
     /// The most recent openable session in this directory, with its path.
     ///
-    /// `None` means there is nothing to continue: the project directory is
-    /// absent, or no candidate could be opened. Unreadable candidates are
+    /// `None` means there is nothing to continue: no candidate attached to
+    /// this workspace could be opened. Unreadable candidates are
     /// pruned from the index on the way past, which is why this both selects
     /// and opens rather than merely ranking paths.
     async fn resolve_recent_session_in_dir(
@@ -4216,7 +4679,6 @@ impl Session {
         let cwd_display = cwd.display().to_string();
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
-        let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
         // Prefer the session index for fast lookup.
         let base_dir_clone = base_dir.clone();
@@ -4225,15 +4687,7 @@ impl Session {
 
         let handle = thread::spawn(move || {
             let index = SessionIndex::for_sessions_root(&base_dir_clone);
-            let mut indexed_sessions = index
-                .list_sessions(Some(&cwd_display_clone))
-                .unwrap_or_default();
-
-            if indexed_sessions.is_empty() && index.reindex_all().is_ok() {
-                indexed_sessions = index
-                    .list_sessions(Some(&cwd_display_clone))
-                    .unwrap_or_default();
-            }
+            let indexed_sessions = index.discover_sessions(&cwd_display_clone);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_sessions));
         });
@@ -4252,10 +4706,6 @@ impl Session {
                 path,
                 "Failed to prune missing session from index during recent-session refresh",
             );
-        }
-
-        if project_session_dir_missing {
-            return Ok(None);
         }
 
         let scanned = scan_sessions_on_disk(&project_session_dir, indexed_sessions.clone()).await?;
@@ -4279,7 +4729,10 @@ impl Session {
         );
         merge_scanned_session_entries(&mut by_path, scanned.entries);
 
-        let mut candidates = by_path.into_values().collect::<Vec<_>>();
+        let mut candidates = by_path
+            .into_values()
+            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .collect::<Vec<_>>();
         candidates.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified_ms));
 
         for entry in &candidates {
@@ -4399,8 +4852,12 @@ impl Session {
         migrate_jsonl_to_v2_locked(jsonl_path, "automatic-v2-full-rehydration-repair")?;
         let (store, _, manifest) = inspect_v2_store_without_recovery(v2_root)?;
         validate_v2_resume_manifest_jsonl_identity(&manifest, &self.header)?;
-        let (session, diagnostics) =
-            Self::open_from_v2(&store, self.header.clone(), V2OpenMode::Full)?;
+        let (session, diagnostics) = Self::open_from_v2_with_source(
+            &store,
+            self.header.clone(),
+            V2OpenMode::Full,
+            Some(jsonl_path),
+        )?;
         Ok((session, diagnostics, "v2"))
     }
 
@@ -4428,10 +4885,12 @@ impl Session {
                 V2OpenMode::Full,
                 index.last().map(|row| row.entry_id.as_str()),
                 Some(manifest.counters.messages_total),
+                self.path.as_deref(),
             )
         })();
         match inspected {
             Ok((session, diagnostics)) => Ok((session, diagnostics, "v2")),
+            Err(error) if attachments::is_attachment_error(&error) => Err(error),
             Err(error)
                 if matches!(
                     &error,
@@ -4455,12 +4914,16 @@ impl Session {
         }
     }
 
+    pub(crate) const fn has_partial_v2_hydration(&self) -> bool {
+        self.v2_partial_hydration
+    }
+
     /// Ensure a lazily hydrated V2 session is fully hydrated before persisting.
     ///
     /// Partial V2 hydration intentionally loads only a subset of entries for fast
     /// resume. Before any save path that could trigger a full JSONL rewrite, we
     /// must rehydrate all V2 entries to preserve non-active branches.
-    fn ensure_full_v2_hydration_before_save(&mut self) -> Result<()> {
+    pub(crate) fn ensure_full_v2_hydration_before_save(&mut self) -> Result<()> {
         if !self.v2_partial_hydration {
             return Ok(());
         }
@@ -4727,26 +5190,27 @@ impl Session {
                     let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
                     if new_start < self.entries.len() {
                         let new_entries = self.entries[new_start..].to_vec();
+                        let reusable_entries = jsonl_reusable_entries(&self.entries).await?;
                         let expected_session_id = self.header.id.clone();
 
                         let path_for_task = path_clone.clone();
                         let sessions_root_for_task = sessions_root.clone();
-                        let (saved_header, saved_entries) =
-                            asupersync::runtime::spawn_blocking(move || {
-                                append_jsonl_entries_blocking(
-                                    &path_for_task,
-                                    &sessions_root_for_task,
-                                    &expected_session_id,
-                                    &new_entries,
-                                )
-                            })
-                            .await?;
+                        let saved = asupersync::runtime::spawn_blocking(move || {
+                            append_jsonl_entries_blocking(
+                                &path_for_task,
+                                &sessions_root_for_task,
+                                &expected_session_id,
+                                new_entries,
+                                &reusable_entries,
+                            )
+                        })
+                        .await?;
+                        let (saved_header, saved_entries) = saved.accept(&mut self.entries)?;
 
-                        // Incremental reconciliation reads and returns the full
-                        // authoritative JSONL, even when this handle started
-                        // from a bounded V2 hydration. Normalize that bookkeeping
-                        // before rebuilding caches so the hidden-message offset
-                        // is not added to a now-complete entry set.
+                        // The accepted receipt represents the full authoritative
+                        // JSONL, even if this handle began as a partial V2 view.
+                        // Reset its hidden-message offset before rebuilding
+                        // caches over the now-complete entry set.
                         if self.v2_partial_hydration {
                             self.v2_partial_hydration = false;
                             self.v2_resume_mode = Some(V2OpenMode::Full);
@@ -4803,6 +5267,7 @@ impl Session {
                     &sessions_root,
                     &path_clone,
                     &self.header,
+                    &self.entries,
                     message_count,
                     session_name,
                     index_generation,
@@ -4823,9 +5288,13 @@ impl Session {
             .message_count
             .saturating_add(self.v2_message_count_offset);
         self.cached_name = finalized.name;
-        self.leaf_id = previous_leaf
+        let fallback_leaf = previous_leaf
             .filter(|id| self.entry_index.contains_key(id))
             .or_else(|| finalized.leaf_id.clone());
+        // Saving may select an explicit branch or the empty root. Interpret
+        // the accepted header exactly as reopening does; otherwise a root
+        // rewind resurrects the abandoned tip immediately after a good save.
+        self.leaf_id = resolve_loaded_leaf_id(&self.header, fallback_leaf, &self.entry_index);
         self.is_linear = finalized.is_linear && self.leaf_id.eq(&finalized.leaf_id);
         self.persisted_entry_count
             .store(self.entries.len(), Ordering::SeqCst);
@@ -4869,7 +5338,9 @@ impl Session {
 
     /// Include the entry identity when reconciling an in-memory cooldown: two
     /// branch records may otherwise carry identical older failover metadata.
-    pub(crate) fn active_failover_model_change_for_current_path(&self) -> Option<&ModelChangeEntry> {
+    pub(crate) fn active_failover_model_change_for_current_path(
+        &self,
+    ) -> Option<&ModelChangeEntry> {
         for entry in self.entries_for_current_path().into_iter().rev() {
             if let SessionEntry::ModelChange(change) = entry {
                 return (change.role.as_deref() == Some("failover")).then_some(change);
@@ -5188,6 +5659,66 @@ impl Session {
         id
     }
 
+    /// Append custom state with the stable identity of an associated operation.
+    /// Terminal recovery uses this for metadata coupled to an acknowledged
+    /// input, so a cancelled candidate save can replay the same session branch.
+    pub(crate) fn append_custom_entry_with_identity(
+        &mut self,
+        custom_type: String,
+        data: Option<serde_json::Value>,
+        id: &str,
+        timestamp: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String> {
+        if id.trim().is_empty() {
+            return Err(Error::session("stable session entry ID cannot be empty"));
+        }
+        chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|err| {
+            Error::session(format!(
+                "stable session entry timestamp is not RFC 3339: {err}"
+            ))
+        })?;
+
+        let id = id.to_string();
+        let base = EntryBase {
+            id: Some(id.clone()),
+            parent_id: parent_id.map(str::to_string),
+            timestamp: timestamp.to_string(),
+        };
+        let entry = SessionEntry::Custom(CustomEntry {
+            base,
+            custom_type,
+            data,
+        });
+        if let Some(&existing_index) = self.entry_index.get(&id) {
+            if serde_json::to_vec(&self.entries[existing_index])? != serde_json::to_vec(&entry)? {
+                return Err(Error::session(format!(
+                    "stable session entry ID {id} has conflicting in-memory content"
+                )));
+            }
+            if !self.navigate_to(&id) {
+                return Err(Error::session(format!(
+                    "stable session entry ID {id} disappeared during replay"
+                )));
+            }
+            return Ok(id);
+        }
+        if let Some(parent_id) = parent_id
+            && !self.entry_ids.contains(parent_id)
+        {
+            return Err(Error::session(format!(
+                "stable session entry ID {id} references missing parent {parent_id}"
+            )));
+        }
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        self.entry_index.insert(id.clone(), self.entries.len() - 1);
+        self.entry_ids.insert(id.clone());
+        self.clear_persisted_leaf_override_after_append();
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        Ok(id)
+    }
+
     pub fn append_bash_execution(
         &mut self,
         command: String,
@@ -5366,6 +5897,29 @@ impl Session {
         Ok(html)
     }
 
+    /// Record an explicit selection using an already resolved provider identity.
+    /// A session has no catalog, so it cannot decide whether different provider
+    /// names denote a built-in alias or independently configured destinations.
+    pub(crate) fn select_model(&mut self, provider: String, model_id: String) {
+        let (stored_provider, stored_model_id, changed) = match current_path_model_pair(self) {
+            Some((current_provider, current_model_id))
+                if current_provider.trim().eq_ignore_ascii_case(&provider)
+                    && current_model_id.trim().eq_ignore_ascii_case(&model_id) =>
+            {
+                (current_provider, current_model_id, false)
+            }
+            _ => (provider, model_id, true),
+        };
+        if changed || self.active_failover_provenance_for_current_path().is_some() {
+            // Selecting the current fallback explicitly retires automatic
+            // restoration just like selecting a different model. Keep one
+            // ordinary model-change record to distinguish that intent from
+            // continuing the existing failover cycle.
+            self.append_model_change(stored_provider.clone(), stored_model_id.clone());
+        }
+        self.set_model_header(Some(stored_provider), Some(stored_model_id), None);
+    }
+
     /// Update header model info.
     // `changed` accumulates across three conditional updates; folding it into
     // one if/else expression would duplicate the update bodies.
@@ -5453,6 +6007,15 @@ impl Session {
     /// Returns the entries to copy into a new session (path to the parent of the selected
     /// user message), the new leaf id, and the selected user message text for editor pre-fill.
     pub fn plan_fork_from_user_message(&self, entry_id: &str) -> Result<ForkPlan> {
+        if self.v2_partial_hydration {
+            // A tail/active-path view can omit both the selected message's
+            // ancestry and the latest session-wide workspace attachment.
+            // Hydrate a clone so preparing a fork never navigates or mutates
+            // the live source session, including its pending local entries.
+            let mut complete = self.clone();
+            complete.ensure_full_v2_hydration_before_save()?;
+            return complete.plan_fork_from_user_message(entry_id);
+        }
         let entry = self
             .get_entry(entry_id)
             .ok_or_else(|| Error::session(format!("Fork target not found: {entry_id}")))?;
@@ -5493,10 +6056,33 @@ impl Session {
             Vec::new()
         };
 
+        // Validate the latest reserved record before carrying it forward; an
+        // invalid/newer binding must never revive an older copied directory.
+        crate::session_workdir::inspect_session_workdir(self)?;
+        let inherited_workdir_binding = self.entries.iter().rev().find_map(|entry| {
+            let SessionEntry::Custom(custom) = entry else {
+                return None;
+            };
+            (custom.custom_type == crate::session_workdir::WORKDIR_BINDING_TYPE).then_some(custom)
+        });
+        let inherited_workdir_binding = inherited_workdir_binding
+            .filter(|binding| {
+                !binding.base.id.as_deref().is_some_and(|binding_id| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.base_id().map(String::as_str) == Some(binding_id))
+                })
+            })
+            .and_then(|binding| binding.data.clone());
+
         Ok(ForkPlan {
             entries,
             leaf_id,
             selected_text,
+            original_cwd: self.header.cwd.clone(),
+            additional_roots: self.header.additional_roots.clone(),
+            parent_session: self.path.as_ref().map(|path| path.display().to_string()),
+            inherited_workdir_binding,
         })
     }
 
@@ -5636,15 +6222,29 @@ impl Session {
         self.leaf_id.as_deref()
     }
 
-    /// Initialize the session entries and leaf from a `ForkPlan`.
+    /// Initialize a new session's history and source provenance from a `ForkPlan`.
     ///
-    /// This safely applies the new entries and leaf, and rebuilds
-    /// all internal caches (including the `is_linear` optimization flag).
+    /// A workspace binding outside the selected ancestry is inherited as a
+    /// separate metadata entry. It never becomes the selected conversation
+    /// leaf, and its parent cannot point into an omitted source branch.
     pub fn init_from_fork_plan(&mut self, plan: ForkPlan) {
         self.entries = plan.entries;
         self.leaf_id = plan.leaf_id;
+        self.header.cwd = plan.original_cwd;
+        self.header.additional_roots = plan.additional_roots;
+        self.header.parent_session = plan.parent_session;
+        if let Some(data) = plan.inherited_workdir_binding {
+            let id = generate_entry_id(&entry_id_set(&self.entries));
+            self.entries.push(SessionEntry::Custom(CustomEntry {
+                base: EntryBase::new(self.leaf_id.clone(), id),
+                custom_type: crate::session_workdir::WORKDIR_BINDING_TYPE.to_string(),
+                data: Some(data),
+            }));
+        }
         self.rebuild_all_caches();
         self.sync_navigation_state_to_header();
+        self.header_dirty = true;
+        self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
     }
 
     /// Set the leaf ID directly (for tests only).
@@ -5836,19 +6436,42 @@ impl Session {
     pub(crate) fn to_messages_for_current_path_with_timestamp_provenance(
         &self,
     ) -> Vec<(Message, bool)> {
+        self.rebuild_current_path().messages
+    }
+
+    /// Resolve a checkpoint against the context that is active now. Stored
+    /// message counts describe the context at mark time and become stale when
+    /// compaction or an earlier rewind changes the projected prefix.
+    pub(crate) fn context_for_checkpoint(
+        &self,
+        checkpoint_entry_id: &str,
+    ) -> Option<(Vec<Message>, usize)> {
+        let rebuild = self.rebuild_current_path();
+        let boundary = *rebuild.checkpoint_positions.get(checkpoint_entry_id)?;
+        Some((
+            rebuild
+                .messages
+                .into_iter()
+                .map(|(message, _)| message)
+                .collect(),
+            boundary,
+        ))
+    }
+
+    fn rebuild_current_path(&self) -> PathRebuildState {
         if self.leaf_id.is_none() {
-            return Vec::new();
+            return PathRebuildState::with_capacity(0);
         }
 
         if self.is_linear {
-            return Self::to_messages_from_path(self.entries.len(), |idx| &self.entries[idx]);
+            return Self::rebuild_from_path(self.entries.len(), |idx| &self.entries[idx]);
         }
 
         let path_entries = self.entries_for_current_path();
-        Self::to_messages_from_path(path_entries.len(), |idx| path_entries[idx])
+        Self::rebuild_from_path(path_entries.len(), |idx| path_entries[idx])
     }
 
-    fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<(Message, bool)>
+    fn rebuild_from_path<'a, F>(path_len: usize, entry_at: F) -> PathRebuildState
     where
         F: Fn(usize) -> &'a SessionEntry,
     {
@@ -5887,6 +6510,21 @@ impl Session {
                     .is_some_and(|id| id.eq(&compaction.first_kept_entry_id))
             });
 
+            // A summary is not an exact record of the constraints that have
+            // already corrected this conversation. Keep the newest reminder
+            // per rule on this branch, including reminders before the kept
+            // boundary. A newer reminder in the ordinary retained tail wins
+            // without adding a second copy. Never read sibling branches here.
+            let (preserved_reminders, rewound_reminders) =
+                preserved_stream_reminders(path_len, &entry_at);
+            for idx in preserved_reminders {
+                rebuild.append(entry_at(idx));
+            }
+
+            let mut retained_projection = StreamReminderProjection {
+                message_count: rebuild.messages.len(),
+                ..StreamReminderProjection::default()
+            };
             let mut keep = false;
             let mut past_compaction = false;
             for idx in 0..path_len {
@@ -5914,17 +6552,20 @@ impl Session {
                         continue;
                     }
                 }
+                retained_projection.append(idx, entry);
                 rebuild.append(entry);
             }
 
-            return rebuild.messages;
+            retained_projection.remove_rewound_messages(&mut rebuild, &rewound_reminders);
+
+            return rebuild;
         }
 
         let mut rebuild = PathRebuildState::with_capacity(path_len);
         for idx in 0..path_len {
             rebuild.append(entry_at(idx));
         }
-        rebuild.messages
+        rebuild
     }
 
     /// Find the nearest ancestor that is a fork point (has multiple children)
@@ -6255,18 +6896,25 @@ async fn scan_sessions_on_disk(
                 let mut entries = Vec::new();
                 let mut refreshed_entries = Vec::new();
                 let mut failed_paths = Vec::new();
-                ensure_session_directory_readable(&path_buf)
-                    .map_err(|err| Error::Io(Box::new(err)))?;
-                let dir_entries = std::fs::read_dir(&path_buf)
-                    .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
-
                 let known_map: HashMap<PathBuf, SessionPickEntry> =
                     known.into_iter().map(|e| (e.path.clone(), e)).collect();
+                // A recovered session stays in its original storage folder.
+                // Revalidate those indexed paths as well as files physically
+                // stored under this workspace's encoded directory.
+                let mut paths = known_map.keys().cloned().collect::<HashSet<_>>();
+                if !indexed_session_path_is_missing(&path_buf) {
+                    ensure_session_directory_readable(&path_buf)
+                        .map_err(|err| Error::Io(Box::new(err)))?;
+                    let dir_entries = std::fs::read_dir(&path_buf)
+                        .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
+                    for entry in dir_entries {
+                        let entry =
+                            entry.map_err(|e| Error::session(format!("Read dir entry: {e}")))?;
+                        paths.insert(entry.path());
+                    }
+                }
 
-                for entry in dir_entries {
-                    let entry =
-                        entry.map_err(|e| Error::session(format!("Read dir entry: {e}")))?;
-                    let path = entry.path();
+                for path in paths {
                     if is_session_file_path(&path) {
                         // Optimization: if we already have this file indexed and both mtime and
                         // size match, reuse indexed metadata to avoid a full parse.
@@ -6315,60 +6963,11 @@ fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
     }
 }
 
-#[derive(Deserialize)]
-struct PartialEntry {
-    #[serde(default)]
-    r#type: String,
-    #[serde(default)]
-    name: Option<String>,
-}
-
 fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
     let resolved_path = resolve_session_persistence_path(path)?;
-    let file = open_existing_session_file_for_read(&resolved_path)
-        .map_err(|e| Error::session(format!("Failed to read session: {e}")))?;
-    let mut reader = BufReader::new(file);
-
-    let Some(header_line) = read_capped_utf8_line(&mut reader)
-        .map_err(|e| Error::session(format!("Failed to read header: {e}")))?
-    else {
-        return Err(Error::session("Empty session file"));
-    };
-
-    let header: SessionHeader =
-        serde_json::from_str(&header_line).map_err(|e| Error::session(format!("{e}")))?;
-    header
-        .validate()
-        .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
-
-    let mut message_count = 0u64;
-    let mut name = None;
-    while let Some(line_content) = read_capped_utf8_line(&mut reader)
-        .map_err(|e| Error::session(format!("Failed to read session entry: {e}")))?
-    {
-        if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_content) {
-            match entry.r#type.as_str() {
-                "message" => message_count += 1,
-                "session_info" if entry.name.is_some() => {
-                    name = entry.name;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let (last_modified_ms, size_bytes) = session_file_stats(path)?;
-
-    Ok(SessionPickEntry {
-        path: path.to_path_buf(),
-        id: header.id,
-        cwd: header.cwd,
-        timestamp: header.timestamp,
-        message_count,
-        name,
-        last_modified_ms,
-        size_bytes,
-    })
+    let mut meta = crate::session_index::build_meta_from_file(&resolved_path)?;
+    meta.path = path.display().to_string();
+    Ok(SessionPickEntry::from_meta(meta))
 }
 
 #[cfg(feature = "sqlite-sessions")]
@@ -6386,7 +6985,7 @@ fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
     Ok(SessionPickEntry {
         path: path.to_path_buf(),
         id: header.id,
-        cwd: header.cwd,
+        cwd: meta.cwd,
         timestamp: header.timestamp,
         message_count: meta.message_count,
         name: meta.name,
@@ -7390,6 +7989,19 @@ fn render_blocks(blocks: &[ContentBlock]) -> String {
                     "<p class=\"media\">{}</p>",
                     escape_html(&media.placeholder())
                 );
+                let element = match media.input_type() {
+                    Some(crate::provider::InputType::Video) => Some("video"),
+                    Some(crate::provider::InputType::Audio) => Some("audio"),
+                    _ => None,
+                };
+                if let Some(element) = element {
+                    let _ = write!(
+                        html,
+                        "<{element} controls preload=\"none\" src=\"data:{};base64,{}\"></{element}>",
+                        escape_html(&media.mime_type),
+                        escape_html(&media.data)
+                    );
+                }
             }
             ContentBlock::ToolCall(tool_call) => {
                 let args = serde_json::to_string_pretty(&tool_call.arguments)
@@ -7536,7 +8148,10 @@ fn open_jsonl_blocking_with_entry_limit(
     max_entry_line_bytes: usize,
 ) -> Result<(Session, SessionOpenDiagnostics)> {
     let path_buf = resolve_session_persistence_path(path)?;
-    let file = open_existing_session_file_for_read(&path_buf)?;
+    // Keep attachment resolution pinned to the same source as the JSONL file,
+    // including callers of this blocking entrypoint that pass a terminal link.
+    let path = path_buf.as_path();
+    let file = open_existing_session_file_for_read(path)?;
     let mut reader = std::io::BufReader::new(file);
 
     let Some(header_line) =
@@ -7595,17 +8210,18 @@ fn open_jsonl_blocking_with_entry_limit(
                                 let mut ok = Vec::with_capacity(chunk.len());
                                 let mut skip = Vec::new();
                                 for (line_num, line) in chunk {
-                                    match serde_json::from_str::<SessionEntry>(line) {
+                                    match attachments::decode_entry(Some(path), line) {
                                         Ok(entry) => ok.push(entry),
-                                        Err(e) => {
+                                        Err(Error::Json(e)) => {
                                             skip.push(SessionOpenSkippedEntry {
                                                 line_number: *line_num,
                                                 error: e.to_string(),
                                             });
                                         }
+                                        Err(error) => return Err(error),
                                     }
                                 }
-                                (ok, skip)
+                                Ok((ok, skip))
                             })
                         })
                         .collect::<Vec<_>>()
@@ -7625,7 +8241,7 @@ fn open_jsonl_blocking_with_entry_limit(
                                 Error::session(format!(
                                     "parallel session parse worker panicked: {panic_message}"
                                 ))
-                            })
+                            })?
                         })
                         .collect()
                 });
@@ -7638,14 +8254,15 @@ fn open_jsonl_blocking_with_entry_limit(
         } else {
             // Sequential path
             for (line_num, line) in &line_batch {
-                match serde_json::from_str::<SessionEntry>(line) {
+                match attachments::decode_entry(Some(path), line) {
                     Ok(entry) => entries.push(entry),
-                    Err(e) => {
+                    Err(Error::Json(e)) => {
                         diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
                             line_number: *line_num,
                             error: e.to_string(),
                         });
                     }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -7789,7 +8406,9 @@ fn read_jsonl_header_for_v2(jsonl_path: &Path) -> Result<SessionHeader> {
     Ok(header)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hydrate_v2_resume(
+    jsonl_source: &Path,
     store: &SessionStoreV2,
     index: &[session_store_v2::OffsetIndexEntry],
     header: SessionHeader,
@@ -7822,6 +8441,7 @@ fn hydrate_v2_resume(
         mode,
         active_leaf.entry_id(),
         Some(total_message_count),
+        Some(jsonl_source),
     )?;
     if let Some(skipped) = diagnostics.skipped_entries.first() {
         return Err(Error::session(format!(
@@ -7860,6 +8480,7 @@ fn repair_v2_resume_locked(
     validate_v2_resume_manifest_jsonl_identity(&manifest, &locked_header)?;
     let active_leaf = select_v2_active_leaf(&locked_header, &index);
     hydrate_v2_resume(
+        jsonl_path,
         &store,
         &index,
         locked_header,
@@ -7924,6 +8545,7 @@ fn open_from_v2_store_blocking(jsonl_path: &Path) -> Result<(Session, SessionOpe
         validate_v2_resume_manifest_jsonl_identity(&manifest, &header)?;
         let active_leaf = select_v2_active_leaf(&header, &index);
         hydrate_v2_resume(
+            &jsonl_path,
             &store,
             &index,
             header.clone(),
@@ -7936,6 +8558,7 @@ fn open_from_v2_store_blocking(jsonl_path: &Path) -> Result<(Session, SessionOpe
 
     let hydration = match inspected {
         Ok(hydration) => hydration,
+        Err(error) if attachments::is_attachment_error(&error) => return Err(error),
         Err(inspection_error)
             if matches!(
                 &inspection_error,
@@ -8076,9 +8699,8 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
         }
         let mut store = SessionStoreV2::create(v2_root, 64 * 1024 * 1024)?;
 
-        for entry in read_jsonl_entries_for_v2(&mut reader)? {
-            let (entry_id, parent_entry_id, entry_type, payload) =
-                session_store_v2::session_entry_to_frame_args(&entry)?;
+        for entry in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
+            let (entry_id, parent_entry_id, entry_type, payload) = entry.frame_args()?;
             store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
         }
 
@@ -8095,8 +8717,12 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
 }
 
 /// Strictly parse the entry portion of a JSONL session and apply the same
-/// deterministic legacy-ID synthesis used by normal JSONL loading.
-fn read_jsonl_entries_for_v2<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<SessionEntry>> {
+/// deterministic legacy-ID synthesis used by normal JSONL loading. Keep
+/// referenced attachments compact throughout graph checks and index writing.
+fn read_jsonl_entries_for_v2<R: std::io::BufRead>(
+    reader: &mut R,
+    jsonl_source: &Path,
+) -> Result<Vec<attachments::StoredEntry>> {
     let mut entries = Vec::new();
     while let Some(line) =
         read_capped_utf8_line(reader).map_err(|err| crate::Error::Io(Box::new(err)))?
@@ -8104,8 +8730,16 @@ fn read_jsonl_entries_for_v2<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<
         if line.trim().is_empty() {
             continue;
         }
-        let entry = serde_json::from_str(&line)
-            .map_err(|err| crate::Error::session(format!("Bad JSONL entry: {err}")))?;
+        let entry = match attachments::decode_stored_entry(Some(jsonl_source), &line) {
+            Ok(entry) => entry,
+            // Name a row that is not a session entry, as migration did before
+            // attachment-aware decoding. Attachment and I/O failures keep
+            // their own classification.
+            Err(Error::Json(source)) => {
+                return Err(Error::session(format!("Bad JSONL entry: {source}")));
+            }
+            Err(other) => return Err(other),
+        };
         entries.push(entry);
     }
     // Legacy rows without IDs must be normalized before validating the graph,
@@ -8113,23 +8747,7 @@ fn read_jsonl_entries_for_v2<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<
     // into an apparently verified indexed store. In particular, the V2 index
     // is keyed by entry ID, so accepting duplicates would silently overwrite
     // graph semantics even when sequence and payload hashes still matched.
-    finalize_loaded_entries(&mut entries);
-    let mut entry_ids = HashSet::with_capacity(entries.len());
-    for entry in &entries {
-        let id = entry
-            .base_id()
-            .ok_or_else(|| Error::session("normalized JSONL entry is missing its ID"))?;
-        if !entry_ids.insert(id.clone()) {
-            return Err(Error::session(format!(
-                "authoritative JSONL contains duplicate entry ID {id}; refusing V2 migration"
-            )));
-        }
-    }
-    ensure_session_parent_links_closed(&entries)?;
-    // Validation only: preserve authoritative source order in the staged V2
-    // log while using the same graph walk as JSONL rewrite reconciliation to
-    // reject cycles.
-    drop(stable_parent_topological_order(entries.clone())?);
+    attachments::StoredEntry::normalize_and_validate(&mut entries, jsonl_source)?;
     Ok(entries)
 }
 
@@ -8341,17 +8959,18 @@ pub fn verify_v2_against_jsonl(
         crate::Error::session(format!("Invalid session header in JSONL: {reason}"))
     })?;
 
-    let entries = read_jsonl_entries_for_v2(&mut reader)?;
+    let entries = read_jsonl_entries_for_v2(&mut reader, jsonl_path)?;
     let mut jsonl_ids: Vec<String> = Vec::with_capacity(entries.len());
     let mut jsonl_chain_hash = V2_CHAIN_HASH_GENESIS.to_string();
 
     for entry in entries {
         let id = entry
-            .base_id()
-            .cloned()
+            .base()
+            .id
+            .clone()
             .expect("V2 JSONL normalization assigns every entry an ID");
         jsonl_ids.push(id);
-        jsonl_chain_hash = session_entry_chain_hash_step(&jsonl_chain_hash, &entry)?;
+        jsonl_chain_hash = session_payload_chain_hash_step(&jsonl_chain_hash, &entry.payload()?)?;
     }
 
     // Read V2 store entries.
@@ -8368,7 +8987,7 @@ pub fn verify_v2_against_jsonl(
     // Check frame/index integrity and ensure the bounded manifest describes the
     // exact store that would become visible after migration.
     let index_consistent = store
-        .validate_session_integrity()
+        .validate_session_integrity_with_source(Some(jsonl_path))
         .and_then(|()| validate_v2_manifest_jsonl_identity(store, &header))
         .is_ok();
 
@@ -8492,10 +9111,9 @@ fn is_v2_sidecar_stale_read_only(jsonl_path: &Path, v2_root: &Path) -> Result<bo
     Ok(!v2_verification_is_complete(&verification))
 }
 
-fn session_entry_chain_hash_step(prev_chain: &str, entry: &SessionEntry) -> Result<String> {
-    let (_, _, _, payload) = session_store_v2::session_entry_to_frame_args(entry)?;
+fn session_payload_chain_hash_step(prev_chain: &str, payload: &Value) -> Result<String> {
     let payload_sha256 =
-        crate::package_manager::hex_encode(&Sha256::digest(serde_json::to_vec(&payload)?));
+        crate::package_manager::hex_encode(&Sha256::digest(serde_json::to_vec(payload)?));
     let mut hasher = Sha256::new();
     hasher.update(prev_chain.as_bytes());
     hasher.update(payload_sha256.as_bytes());
@@ -8626,7 +9244,7 @@ pub fn migration_status(jsonl_path: &Path) -> MigrationState {
 
     match inspector.read_index() {
         Ok(_) => match inspector
-            .validate_session_integrity()
+            .validate_session_integrity_with_source(Some(jsonl_path))
             .and_then(|()| validate_v2_manifest_jsonl_identity(&inspector, &header))
         {
             Ok(()) => match is_v2_sidecar_stale_read_only(jsonl_path, &v2_root) {
@@ -8679,9 +9297,8 @@ pub fn migrate_dry_run(jsonl_path: &Path) -> Result<session_store_v2::MigrationV
 
     // Exercise the exact entry-normalization contract used by a real
     // migration, including deterministic IDs for legacy ID-less rows.
-    for entry in read_jsonl_entries_for_v2(&mut reader)? {
-        let (entry_id, parent_entry_id, entry_type, payload) =
-            session_store_v2::session_entry_to_frame_args(&entry)?;
+    for entry in read_jsonl_entries_for_v2(&mut reader, jsonl_path)? {
+        let (entry_id, parent_entry_id, entry_type, payload) = entry.frame_args()?;
         store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
     }
     store.write_manifest(header.id, "jsonl_v3")?;
@@ -9114,6 +9731,31 @@ mod tests {
             content: UserContent::Text(text.to_string()),
             timestamp: Some(0),
         }
+    }
+
+    fn make_stream_reminder(rule_id: &str, body: &str) -> SessionMessage {
+        SessionMessage::Custom {
+            custom_type: crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE.to_string(),
+            content: body.to_string(),
+            display: true,
+            details: Some(serde_json::json!({ "ruleId": rule_id })),
+            timestamp: Some(17),
+        }
+    }
+
+    fn stream_reminder_bodies(session: &Session) -> Vec<String> {
+        session
+            .to_messages_for_current_path()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Custom(custom)
+                    if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE =>
+                {
+                    Some(custom.content)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[cfg(unix)]
@@ -10432,54 +11074,66 @@ mod tests {
     }
 
     #[test]
-    fn test_session_handle_preserves_alias_equivalent_model_state() {
-        let mut session = Session::in_memory();
-        session.append_model_change("google".to_string(), "gemini-2.5-pro".to_string());
-        session.set_model_header(
-            Some("google".to_string()),
-            Some("gemini-2.5-pro".to_string()),
-            None,
-        );
-        let handle = SessionHandle(Arc::new(AsyncMutex::new(session)));
+    fn test_session_handle_preserves_explicit_provider_without_a_catalog() {
+        for (previous, selected) in [
+            ("google", "gemini"),
+            ("gemini", "google"),
+            ("azure-openai", "azure"),
+            ("azure", "azure-openai"),
+        ] {
+            let mut session = Session::in_memory();
+            session.append_model_change(previous.to_string(), "shared-model".to_string());
+            session.set_model_header(
+                Some(previous.to_string()),
+                Some("shared-model".to_string()),
+                None,
+            );
+            let handle = SessionHandle(Arc::new(AsyncMutex::new(session)));
 
-        run_async(async {
-            handle
-                .set_model("gemini".to_string(), "GEMINI-2.5-PRO".to_string(), None)
-                .await
-        })
-        .expect("alias-equivalent model should dedupe");
-
-        let branch = run_async(async { handle.get_branch().await });
-        let model_changes: Vec<_> = branch
-            .iter()
-            .filter_map(|entry| {
-                if entry
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|entry_type| entry_type.eq("model_change"))
-                {
-                    Some((
-                        entry.get("provider").and_then(Value::as_str),
-                        entry.get("modelId").and_then(Value::as_str),
-                    ))
-                } else {
-                    None
-                }
+            run_async(async {
+                handle
+                    .set_model(format!(" {selected} "), "shared-model".to_string(), None)
+                    .await
             })
-            .collect();
-        assert_eq!(
-            model_changes,
-            vec![(Some("google"), Some("gemini-2.5-pro"))],
-            "alias-equivalent set_model should not append duplicate history"
-        );
+            .expect("explicit provider selection");
+            run_async(async {
+                handle
+                    .set_model(selected.to_uppercase(), "SHARED-MODEL".to_string(), None)
+                    .await
+            })
+            .expect("repeated identity should dedupe");
 
-        let (provider, model_id) = run_async(async { handle.get_model().await });
-        assert_eq!(provider.as_deref(), Some("google"));
-        assert_eq!(model_id.as_deref(), Some("gemini-2.5-pro"));
+            let branch = run_async(async { handle.get_branch().await });
+            let model_changes: Vec<_> = branch
+                .iter()
+                .filter(|entry| entry["type"] == "model_change")
+                .map(|entry| entry["provider"].as_str().expect("provider"))
+                .collect();
+            assert_eq!(model_changes, vec![previous, selected]);
 
-        let state = run_async(async { handle.get_state().await });
-        assert_eq!(state["model"]["provider"], "google");
-        assert_eq!(state["model"]["id"], "gemini-2.5-pro");
+            let (provider, model_id) = run_async(async { handle.get_model().await });
+            assert_eq!(provider.as_deref(), Some(selected));
+            assert_eq!(model_id.as_deref(), Some("shared-model"));
+            let state = run_async(async { handle.get_state().await });
+            assert_eq!(state["model"]["provider"], selected);
+            assert_eq!(state["model"]["id"], "shared-model");
+        }
+    }
+
+    #[test]
+    fn test_session_handle_rejects_blank_model_selection_without_mutation() {
+        let handle = SessionHandle(Arc::new(AsyncMutex::new(Session::in_memory())));
+        for (provider, model) in [(" ", "shared"), ("custom", "\t"), ("", "")] {
+            let error = run_async(async {
+                handle
+                    .set_model(provider.to_string(), model.to_string(), None)
+                    .await
+            })
+            .expect_err("blank destination must fail");
+            assert!(error.to_string().contains("non-empty"));
+        }
+        assert!(run_async(async { handle.get_branch().await }).is_empty());
+        assert_eq!(run_async(async { handle.get_model().await }), (None, None));
     }
 
     #[test]
@@ -12912,6 +13566,207 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_rule_reminders_survive_compaction_and_session_reopen() {
+        let temp = tempfile::tempdir().expect("session directory");
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("original request"));
+        session.append_message(make_stream_reminder("ownership", "Keep ownership scoped."));
+        let first_kept = session.append_message(make_test_message("first retained request"));
+        session.append_compaction("first summary".to_string(), first_kept, 1000, None, None);
+        let second_kept = session.append_message(make_test_message("second retained request"));
+        session.append_compaction("second summary".to_string(), second_kept, 2000, None, None);
+        session.append_message(make_test_assistant_message("finished", 12));
+
+        assert_eq!(stream_reminder_bodies(&session), ["Keep ownership scoped."]);
+        run_async(async { session.save().await }).expect("save compacted session");
+        let path = session.path.as_ref().expect("session path");
+        let loaded = run_async(Session::open(path.to_string_lossy().as_ref()))
+            .expect("reopen compacted session");
+        assert_eq!(stream_reminder_bodies(&loaded), ["Keep ownership scoped."]);
+        assert_eq!(loaded.entries.len(), session.entries.len());
+    }
+
+    #[test]
+    fn stream_rule_compaction_keeps_newest_per_rule_without_duplicating_tail() {
+        let mut session = Session::in_memory();
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Old ownership directive.",
+        ));
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Current ownership directive.",
+        ));
+        session.append_message(make_stream_reminder("testing", "Run meaningful tests."));
+        let kept = session.append_message(make_test_message("continue"));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Current ownership directive.", "Run meaningful tests."]
+        );
+
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Updated directive in tail.",
+        ));
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Run meaningful tests.", "Updated directive in tail."]
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_ignores_reminders_on_sibling_branches() {
+        let mut session = Session::in_memory();
+        session.append_message(make_stream_reminder("shared", "Shared instruction."));
+        let branch_point = session.append_message(make_test_message("choose a direction"));
+        session.append_message(make_stream_reminder("branch", "Left branch instruction."));
+        session.append_message(make_stream_reminder("left-only", "Left-only instruction."));
+        session.append_message(make_test_message("left branch finish"));
+
+        assert!(session.create_branch_from(&branch_point));
+        session.append_message(make_stream_reminder("branch", "Right branch instruction."));
+        let kept = session.append_message(make_test_message("right branch finish"));
+        session.append_compaction("right summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Shared instruction.", "Right branch instruction."]
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_does_not_resurrect_rewound_reminders() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("original request"));
+        session.append_message(make_stream_reminder("ownership", "Surviving directive."));
+        let checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        session.append_message(make_stream_reminder(
+            "ownership",
+            "Discarded newer directive.",
+        ));
+        let discarded_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        session.append_message(make_stream_reminder(
+            "discarded",
+            "Discarded unique directive.",
+        ));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": checkpoint,
+                "summary": "Abandoned the exploration."
+            })),
+        );
+        session.append_message(make_stream_reminder("later", "Post-rewind directive."));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": discarded_checkpoint,
+                "summary": "An invalidated checkpoint cannot hide later work."
+            })),
+        );
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Surviving directive.", "Post-rewind directive."]
+        );
+        let kept = session.append_message(make_test_message("continue after rewind"));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Surviving directive.", "Post-rewind directive."]
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_replays_only_retained_checkpoint_rewinds() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("original request"));
+        let obsolete_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        let first_kept = session.append_message(make_test_message("first retained request"));
+        session.append_compaction("first summary".to_string(), first_kept, 1000, None, None);
+        session.append_message(make_stream_reminder("survives", "Keep this directive."));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": obsolete_checkpoint,
+                "summary": "The old checkpoint was compacted away."
+            })),
+        );
+        let second_kept = session.append_message(make_test_message("second retained request"));
+        let retained_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        session.append_message(make_stream_reminder(
+            "discarded",
+            "Do not revive this directive.",
+        ));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": retained_checkpoint,
+                "summary": "This exploration was collapsed."
+            })),
+        );
+        assert_eq!(stream_reminder_bodies(&session), ["Keep this directive."]);
+        session.append_compaction("second summary".to_string(), second_kept, 2000, None, None);
+        assert_eq!(stream_reminder_bodies(&session), ["Keep this directive."]);
+    }
+
+    #[test]
+    fn stream_rule_compaction_cannot_revive_reminders_inside_a_rewound_tail() {
+        let mut session = Session::in_memory();
+        session.append_message(make_stream_reminder("ownership", "Surviving directive."));
+        let checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        let kept = session.append_message(make_test_message("discarded exploration"));
+        session.append_message(make_stream_reminder("ownership", "Discarded replacement."));
+        session.append_message(make_stream_reminder(
+            "discarded",
+            "Discarded unique directive.",
+        ));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": checkpoint,
+                "summary": "The exploration was collapsed."
+            })),
+        );
+        session.append_message(make_stream_reminder("later", "Post-rewind directive."));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        assert_eq!(
+            stream_reminder_bodies(&session),
+            ["Surviving directive.", "Post-rewind directive."]
+        );
+
+        let current_checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        let (context, boundary) = session
+            .context_for_checkpoint(&current_checkpoint)
+            .expect("retained checkpoint");
+        assert_eq!(
+            boundary,
+            context.len(),
+            "filtered reminders must not inflate the checkpoint"
+        );
+    }
+
+    #[test]
+    fn stream_rule_compaction_bounds_preserved_historical_rules() {
+        let mut session = Session::in_memory();
+        for index in 0..crate::stream_rules::MAX_STREAM_RULES + 2 {
+            let id = format!("rule-{index}");
+            session.append_message(make_stream_reminder(&id, &id));
+        }
+        let kept = session.append_message(make_test_message("continue"));
+        session.append_compaction("summary".to_string(), kept, 1000, None, None);
+        let bodies = stream_reminder_bodies(&session);
+        assert_eq!(bodies.len(), crate::stream_rules::MAX_STREAM_RULES);
+        assert_eq!(bodies.first().map(String::as_str), Some("rule-2"));
+        assert_eq!(
+            bodies.last(),
+            Some(&format!(
+                "rule-{}",
+                crate::stream_rules::MAX_STREAM_RULES + 1
+            ))
+        );
+    }
+
     // ======================================================================
     // Large session handling
     // ======================================================================
@@ -13915,6 +14770,87 @@ mod tests {
         );
     }
 
+    fn attached_session_discovery_reopens_original_store(extension: &str, index_unavailable: bool) {
+        let _lock = current_dir_lock();
+        let root = tempfile::tempdir().expect("fixture root");
+        let original = root.path().join("original");
+        let replacement = root.path().join("replacement");
+        let sessions_root = root.path().join("sessions");
+        std::fs::create_dir_all(&replacement).expect("replacement workspace");
+        if index_unavailable {
+            // A directory at the cache filename refuses SQLite opens without
+            // changing the authoritative session store or needing permissions
+            // that a privileged test runner might bypass.
+            std::fs::create_dir_all(sessions_root.join("session-index.sqlite"))
+                .expect("block derived cache");
+        }
+        let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+        session.header.cwd = original.display().to_string();
+        session.header.parent_session = Some("parent-history.jsonl".to_string());
+        let path = sessions_root
+            .join(encode_cwd(&original))
+            .join(format!("recovered.{extension}"));
+        // An explicit JSONL path is saved in place: its original storage
+        // folder must exist, exactly as it did before the project moved.
+        std::fs::create_dir_all(path.parent().expect("original storage folder"))
+            .expect("create original storage folder");
+        session.path = Some(path.clone());
+        session.append_message(make_test_message("before recovery"));
+        crate::session_workdir::attach_session_workdir(&mut session, &replacement).expect("attach");
+        run_async(async { session.save().await }).expect("persist attachment");
+        let id = session.header.id.clone();
+        drop(session);
+        assert!(!sessions_root.join(encode_cwd(&replacement)).exists());
+        let _guard = CurrentDirGuard::new(&replacement);
+
+        let recent = run_async(Session::recent_session_path_in_dir(Some(&sessions_root)))
+            .expect("resolve recovered session");
+        assert_eq!(recent.as_deref(), Some(path.as_path()));
+        let continued = run_async(Session::continue_recent_in_dir(
+            Some(&sessions_root),
+            &Config::default(),
+        ))
+        .expect("continue recovered session");
+        assert_eq!(continued.header.id, id);
+        assert_eq!(continued.header.cwd, original.display().to_string());
+        assert_eq!(continued.path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            continued.header.parent_session.as_deref(),
+            Some("parent-history.jsonl")
+        );
+        assert_eq!(continued.to_messages().len(), 1);
+        let picked = run_async(Session::resume_with_picker(
+            Some(&sessions_root),
+            &Config::default(),
+            Some("1".to_string()),
+        ))
+        .expect("pick recovered session");
+        assert_eq!(picked.header.id, id);
+        assert_eq!(picked.path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn continue_and_resume_find_jsonl_attached_to_workspace_without_a_storage_folder() {
+        attached_session_discovery_reopens_original_store("jsonl", false);
+    }
+
+    #[test]
+    fn continue_and_resume_find_attached_jsonl_when_index_cannot_open() {
+        attached_session_discovery_reopens_original_store("jsonl", true);
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn continue_and_resume_find_sqlite_attached_to_workspace_without_a_storage_folder() {
+        attached_session_discovery_reopens_original_store("sqlite", false);
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn continue_and_resume_find_attached_sqlite_when_index_cannot_open() {
+        attached_session_discovery_reopens_original_store("sqlite", true);
+    }
+
     /// Nothing to continue is not an error: the classic stack starts a new
     /// session there, and a path-driven surface must be told `None` rather than
     /// a path that does not exist.
@@ -14057,7 +14993,9 @@ mod tests {
         let expected_path = path.display().to_string();
         let cwd = std::path::Path::new(&cwd_display);
         let project_session_dir = temp.path().join(encode_cwd(cwd));
-        let moved_project_dir = temp.path().join("moved-project-dir");
+        // Move outside the managed namespace. A directory renamed *within*
+        // it remains discoverable by the binding-aware namespace refresh.
+        let moved_project_dir = process_cwd.path().join("moved-project-dir");
 
         std::fs::rename(&project_session_dir, &moved_project_dir)
             .expect("move project session dir away");
@@ -14490,10 +15428,7 @@ mod tests {
         drop(file);
 
         let err = load_session_meta_jsonl(&session_path).expect_err("invalid utf8 should error");
-        assert!(
-            err.to_string().contains("Failed to read session entry"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("Read session entry line"), "{err}");
     }
 
     #[cfg(feature = "sqlite-sessions")]
@@ -15669,6 +16604,265 @@ mod tests {
         assert_eq!(reopened.entries.len(), 2);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_append_retains_validated_file_through_sync() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        for (index, root) in windows_session_lock_test_roots(temp_dir.path())
+            .iter()
+            .enumerate()
+        {
+            let path = root.join(format!("append-会話-{index}.jsonl"));
+            let moved = root.join(format!("moved-{index}.jsonl"));
+            std::fs::write(&path, b"before\n").expect("seed append target");
+
+            let mut file = open_existing_session_file_for_append(&path)
+                .expect("open ordinary or verbatim append target");
+            std::fs::rename(&path, &moved)
+                .expect_err("the checked append handle must prevent replacement while live");
+            file.write_all(b"after\n").expect("append bytes");
+            file.sync_all().expect("sync append");
+            drop(file);
+
+            assert_eq!(
+                std::fs::read(&path).expect("read appended target"),
+                b"before\nafter\n"
+            );
+            std::fs::rename(&path, &moved).expect("closing the handle must release the name");
+            assert_eq!(
+                std::fs::read(&moved).expect("read moved target"),
+                b"before\nafter\n"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_append_rejects_replacement_and_missing_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        for (index, root) in windows_session_lock_test_roots(temp_dir.path())
+            .iter()
+            .enumerate()
+        {
+            let path = root.join(format!("replaced-{index}.jsonl"));
+            let retained = root.join(format!("original-{index}.jsonl"));
+            let original = b"validated session bytes\n";
+            let replacement = b"unrelated replacement bytes\n";
+            std::fs::write(&path, original).expect("seed append target");
+            let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+                .expect("capture preflight identity");
+
+            // Retain the original object so its file index cannot be recycled.
+            std::fs::rename(&path, &retained).expect("move original aside");
+            let missing = open_windows_session_file_for_append(&path, initial_identity)
+                .expect_err("append must not recreate a missing validated target");
+            assert!(
+                matches!(&missing, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "unexpected missing-file error: {missing}"
+            );
+            assert!(!path.exists());
+
+            std::fs::write(&path, replacement).expect("install replacement");
+            let error = open_windows_session_file_for_append(&path, initial_identity)
+                .expect_err("append must reject a different regular file at the same name");
+            assert!(
+                matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidData),
+                "unexpected replacement error: {error}"
+            );
+            assert_eq!(std::fs::read(&path).expect("read replacement"), replacement);
+            assert_eq!(std::fs::read(&retained).expect("read original"), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_append_rejects_substituted_symlink_to_same_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        for (index, root) in windows_session_lock_test_roots(temp_dir.path())
+            .iter()
+            .enumerate()
+        {
+            let path = root.join(format!("linked-{index}.jsonl"));
+            let retained = root.join(format!("retained-{index}.jsonl"));
+            let sentinel = b"symlink target must remain intact\n";
+            std::fs::write(&path, sentinel).expect("seed append target");
+            let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+                .expect("capture preflight identity");
+            std::fs::rename(&path, &retained).expect("move original aside");
+
+            // Following this link would yield the expected file identity. The
+            // open itself must reject reparse traversal before returning a writer.
+            if let Err(error) = std::os::windows::fs::symlink_file(&retained, &path) {
+                if error.raw_os_error() == Some(1314) {
+                    eprintln!(
+                        "skipping append symlink test: Windows requires Developer Mode or symlink privilege"
+                    );
+                    return;
+                }
+                test_fail!("create append symlink: {}", error);
+            }
+
+            open_windows_session_file_for_append(&path, initial_identity)
+                .expect_err("append must reject a substituted link even to the same file");
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .expect("link metadata")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&retained).expect("read sentinel"), sentinel);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_rejects_replacement_without_truncating_it() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = v2_source_state_path(temp_dir.path());
+        let original_path = temp_dir.path().join("original-state.json");
+        let original = b"validated source state must remain intact";
+        let replacement = b"replacement source state must remain intact";
+        std::fs::write(&path, original).expect("write original state");
+        let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+            .expect("capture preflight identity");
+
+        // Hold the original inode/file index alive while replacing its name
+        // between preflight and the same write boundary production uses.
+        std::fs::rename(&path, &original_path).expect("move original state aside");
+        #[cfg(windows)]
+        {
+            let error = write_v2_source_state_bytes(
+                temp_dir.path(),
+                Some(initial_identity),
+                b"must not be written\n",
+            )
+            .expect_err("a vanished validated entry must not be recreated");
+            assert!(matches!(&error, Error::Io(io_error)
+                if io_error.kind() == std::io::ErrorKind::NotFound));
+            assert!(!path.exists());
+        }
+        std::fs::write(&path, replacement).expect("install replacement state");
+        let error = write_v2_source_state_bytes(
+            temp_dir.path(),
+            Some(initial_identity),
+            b"must not be written\n",
+        )
+        .expect_err("a substituted state file must be rejected");
+        assert!(error.to_string().contains("state entry changed"));
+        assert_eq!(std::fs::read(&path).expect("read replacement"), replacement);
+        assert_eq!(
+            std::fs::read(&original_path).expect("read original"),
+            original
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_requires_exclusive_creation_after_absent_preflight() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = v2_source_state_path(temp_dir.path());
+        assert!(!path.exists());
+
+        // None records an absent entry. A file arriving after that observation
+        // belongs to another writer and must not be opened for replacement.
+        let sentinel = b"state created after preflight must remain intact";
+        std::fs::write(&path, sentinel).expect("install intervening state");
+        let error = write_v2_source_state_bytes(temp_dir.path(), None, b"must not be written\n")
+            .expect_err("an intervening state file must block exclusive creation");
+        assert!(
+            matches!(&error, Error::Io(io_error)
+                if io_error.kind() == std::io::ErrorKind::AlreadyExists),
+            "expected AlreadyExists, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read intervening state"),
+            sentinel
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_rewrite_truncates_only_after_validation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = v2_source_state_path(temp_dir.path());
+        let clean = V2SourceState {
+            schema: V2_SOURCE_STATE_SCHEMA.to_string(),
+            state: V2SourceStateValue::Clean,
+            source_fingerprint: Some(V2SourceFingerprint {
+                byte_length: 123,
+                sha256: "a".repeat(64),
+                file_identity: None,
+            }),
+        };
+        write_v2_source_state(temp_dir.path(), &clean).expect("create clean state");
+        let original_length = std::fs::metadata(&path).expect("state metadata").len();
+
+        let dirty = V2SourceState {
+            schema: V2_SOURCE_STATE_SCHEMA.to_string(),
+            state: V2SourceStateValue::Dirty,
+            source_fingerprint: None,
+        };
+        write_v2_source_state(temp_dir.path(), &dirty).expect("rewrite as shorter dirty state");
+        let mut expected = serde_json::to_vec(&dirty).expect("encode expected state");
+        expected.push(b'\n');
+        let actual = std::fs::read(&path).expect("read rewritten state");
+        assert_eq!(actual, expected);
+        assert!(u64::try_from(actual.len()).expect("state length") < original_length);
+        assert_eq!(
+            read_v2_source_state_document(temp_dir.path()).expect("read complete state"),
+            Some(dirty)
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn v2_source_state_rejects_substituted_symlink_without_touching_target() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = std::fs::canonicalize(temp_dir.path()).expect("canonical test root");
+        let path = v2_source_state_path(&root);
+        let original_path = root.join("original-state.json");
+        let target = root.join("external-state-target");
+        let original = b"original source state";
+        let sentinel = b"external symlink target must remain intact";
+        std::fs::write(&path, original).expect("write original state");
+        std::fs::write(&target, sentinel).expect("write target sentinel");
+        let initial_identity = crate::file_identity::FileIdentity::of_path_nofollow(&path)
+            .expect("capture preflight identity");
+        std::fs::rename(&path, &original_path).expect("move original state aside");
+        if let Err(error) = symlink(&target, &path) {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "skipping state symlink test: Windows requires Developer Mode or symlink privilege"
+                );
+                return;
+            }
+            test_fail!("create state symlink: {}", error);
+        }
+
+        write_v2_source_state_bytes(&root, Some(initial_identity), b"must not be written\n")
+            .expect_err("a substituted state symlink must be rejected");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("state link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target sentinel"),
+            sentinel
+        );
+        assert_eq!(
+            std::fs::read(&original_path).expect("read original"),
+            original
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn jsonl_mutation_fails_before_write_when_v2_dirty_state_is_not_writable() {
@@ -15705,18 +16899,31 @@ mod tests {
         mode_guard.restore();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn save_rejects_symlink_persistence_lock_without_touching_target() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("guarded-lock.jsonl");
-        let external_target = temp_dir.path().join("external-lock-target");
+        let root = std::fs::canonicalize(temp_dir.path()).expect("canonical temp dir");
+        let path = root.join("guarded-lock.jsonl");
+        let external_target = root.join("external-lock-target");
         let sentinel = b"external lock target must stay unchanged".as_slice();
         std::fs::write(&external_target, sentinel).expect("write external lock target");
         let lock_path = session_persistence_lock_path(&path);
-        symlink(&external_target, &lock_path).expect("create lock symlink");
+        if let Err(error) = symlink(&external_target, &lock_path) {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "skipping lock symlink test: Windows requires Developer Mode or symlink privilege"
+                );
+                return;
+            }
+            test_fail!("create lock symlink: {}", error);
+        }
 
         let mut session = Session::create();
         session.path = Some(path.clone());
@@ -15743,6 +16950,279 @@ mod tests {
             std::fs::read(&external_target).expect("read external lock target"),
             sentinel,
             "rejected lock symlink must not touch its target"
+        );
+    }
+
+    #[cfg(windows)]
+    fn windows_session_lock_test_roots(path: &Path) -> [PathBuf; 2] {
+        use std::path::{Component, Prefix};
+
+        let canonical = std::fs::canonicalize(path).expect("canonical test root");
+        let mut components = canonical.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            test_fail!("canonical Windows path must have a prefix");
+        };
+        // Only the test fixture needs an ordinary spelling. Production keeps
+        // the original path, including verbatim syntax and long-path support.
+        let mut ordinary = match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut unc = std::ffi::OsString::from(r"\\");
+                unc.push(server);
+                unc.push(r"\");
+                unc.push(share);
+                PathBuf::from(unc)
+            }
+            other => test_fail!("expected canonical disk or UNC prefix, got {:?}", other),
+        };
+        for component in components {
+            ordinary.push(component.as_os_str());
+        }
+        [ordinary, canonical]
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_lock_accepts_ordinary_and_verbatim_paths() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let nested = temp_dir.path().join("nested directory");
+        std::fs::create_dir(&nested).expect("create nested directory");
+        let roots = windows_session_lock_test_roots(&nested);
+        for (index, root) in roots.iter().enumerate() {
+            let path = root.join(format!("session-会話-{index}.jsonl"));
+            let lock_path = session_persistence_lock_path(&path);
+            assert!(!lock_path.exists());
+            drop(lock_session_persistence(&path).expect("create persistence lock"));
+            assert!(lock_path.is_file());
+
+            let sentinel = b"existing lock contents";
+            std::fs::write(&lock_path, sentinel).expect("write lock sentinel");
+            // Reuse the same lock through the other path spelling too.
+            let other_path = roots[1 - index].join(path.file_name().expect("session filename"));
+            drop(lock_session_persistence(&other_path).expect("reuse persistence lock"));
+            assert_eq!(std::fs::read(&lock_path).expect("read lock"), sentinel);
+            assert!(!path.exists(), "locking alone must not create a session");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_lock_preserves_metadata_errors() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let canonical = std::fs::canonicalize(temp_dir.path()).expect("canonical test root");
+        let mut invalid = canonical
+            .join("invalid-session.jsonl.lock")
+            .into_os_string();
+        invalid.push("\0");
+        let invalid = PathBuf::from(invalid);
+        let expected = std::fs::symlink_metadata(&invalid).expect_err("invalid path must fail");
+        let error = reject_windows_session_lock_reparse_components(&invalid)
+            .expect_err("metadata errors on real entries must propagate");
+        assert!(
+            matches!(&error, Error::Io(io_error)
+                if io_error.kind() == expected.kind()
+                    && io_error.raw_os_error() == expected.raw_os_error()),
+            "expected original metadata error {expected}, got {error}"
+        );
+
+        // Without a following RootDir, a prefix must still be inspected.
+        // In particular, the raw verbatim volume's error must not be ignored.
+        if let Some(std::path::Component::Prefix(prefix)) = canonical.components().next()
+            && matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        {
+            let bare_volume = Path::new(prefix.as_os_str());
+            let expected = std::fs::symlink_metadata(bare_volume)
+                .expect_err("a bare verbatim volume is not a directory path");
+            let error = reject_windows_session_lock_reparse_components(bare_volume)
+                .expect_err("a prefix without a root must not bypass metadata inspection");
+            assert!(matches!(&error, Error::Io(io_error)
+                if io_error.raw_os_error() == expected.raw_os_error()));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_lock_checks_paths_after_missing_components() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let [ordinary, _] = windows_session_lock_test_roots(temp_dir.path());
+        let missing = ordinary.join("missing");
+        assert_eq!(
+            std::fs::symlink_metadata(&missing)
+                .expect_err("fixture component must be missing")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        // Ordinary Windows paths normalize `missing\..` before opening. A
+        // missing lexical component must neither reject a safe path nor end
+        // the validation of the remaining components.
+        let path = ordinary.join(r"missing\..\normalized.jsonl");
+        assert!(
+            path.components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        );
+        drop(lock_session_persistence(&path).expect("lock a safe normalized path"));
+        assert!(ordinary.join("normalized.jsonl.lock").is_file());
+        assert!(!ordinary.join("normalized.jsonl").exists());
+        assert!(!missing.exists());
+
+        let mut invalid = ordinary
+            .join(r"missing\..\invalid-session.jsonl.lock")
+            .into_os_string();
+        invalid.push("\0");
+        let invalid = PathBuf::from(invalid);
+        let expected = std::fs::symlink_metadata(&invalid).expect_err("invalid path must fail");
+        let error = reject_windows_session_lock_reparse_components(&invalid)
+            .expect_err("a missing component must not hide later metadata errors");
+        assert!(
+            matches!(&error, Error::Io(io_error)
+                if io_error.kind() == expected.kind()
+                    && io_error.raw_os_error() == expected.raw_os_error()),
+            "expected original metadata error {expected}, got {error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_lock_rejects_junctions_in_ordinary_and_verbatim_paths() {
+        use std::os::windows::fs::MetadataExt as _;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let roots = windows_session_lock_test_roots(temp_dir.path());
+        let target = roots[0].join("target");
+        std::fs::create_dir(&target).expect("create junction target");
+        let sentinel_path = target.join("sentinel");
+        let sentinel = b"junction target must stay unchanged";
+        std::fs::write(&sentinel_path, sentinel).expect("write target sentinel");
+
+        // Junctions exercise FILE_ATTRIBUTE_REPARSE_POINT without requiring
+        // Developer Mode or the privilege needed to create symbolic links.
+        // Constant relative arguments keep temporary paths out of shell syntax.
+        for name in ["junction", "terminal.jsonl.lock"] {
+            let output = std::process::Command::new("cmd")
+                .args(["/D", "/C", "mklink", "/J", name, "target"])
+                .current_dir(&roots[0])
+                .output()
+                .expect("run mklink /J");
+            assert!(
+                output.status.success(),
+                "create junction {name}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_ne!(
+                std::fs::symlink_metadata(roots[0].join(name))
+                    .expect("junction metadata")
+                    .file_attributes()
+                    & 0x400,
+                0,
+                "fixture must be a reparse point"
+            );
+        }
+
+        // Prove that the OS can reach the junction even though the first
+        // lexical component does not exist. Stopping at that NotFound would
+        // miss the reparse point, and OPEN_REPARSE_POINT only protects the
+        // final lock entry, not the directory junction preceding it.
+        assert_eq!(
+            std::fs::symlink_metadata(roots[0].join("missing"))
+                .expect_err("fixture component must be missing")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let normalized_junction = roots[0].join(r"missing\..\junction");
+        assert!(
+            normalized_junction
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        );
+        assert_ne!(
+            std::fs::symlink_metadata(&normalized_junction)
+                .expect("normalized path must still reach the junction")
+                .file_attributes()
+                & 0x400,
+            0,
+            "normalized fixture must identify the junction itself"
+        );
+
+        // Canonicalize only the safe root. Canonicalizing the whole path would
+        // resolve away the very junction that the validator must reject.
+        for root in &roots {
+            for path in [
+                root.join(r"junction\session.jsonl"),
+                root.join("terminal.jsonl"),
+                root.join(r"missing\..\junction\session.jsonl"),
+                root.join(r"missing\..\terminal.jsonl"),
+            ] {
+                let mut session = Session::create_with_dir(Some(root.clone()));
+                session.path = Some(path.clone());
+                session.append_message(make_test_message("must not persist"));
+                let error = run_async(async { session.save().await })
+                    .expect_err("session persistence must reject junction traversal");
+                assert!(
+                    matches!(&error, Error::Io(io_error)
+                        if io_error.kind() == std::io::ErrorKind::InvalidData),
+                    "expected typed InvalidData error, got {error}"
+                );
+                assert!(error.to_string().contains("Windows reparse point"));
+                assert!(!path.exists(), "rejected save must not create a session");
+                assert_eq!(
+                    std::fs::read(&sentinel_path).expect("read sentinel"),
+                    sentinel
+                );
+                assert_eq!(
+                    std::fs::read_dir(&target).expect("read target").count(),
+                    1,
+                    "rejected save must not create a lock or session in the target"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_accepts_canonical_verbatim_session_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("resumed-verbatim.jsonl");
+        let mut session = Session::create_with_dir(Some(temp_dir.path().to_path_buf()));
+        session.path = Some(path.clone());
+        session.append_message(make_test_message("before resume"));
+        run_async(async { session.save().await }).expect("seed session");
+
+        let canonical = std::fs::canonicalize(&path).expect("canonical session path");
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "Windows canonicalize should produce a verbatim path: {}",
+            canonical.display()
+        );
+
+        let session_id = session.header.id.clone();
+        drop(session);
+        let mut session = run_async(async { Session::open(&canonical.to_string_lossy()).await })
+            .expect("resume through the canonical session path");
+        assert_eq!(session.path.as_deref(), Some(canonical.as_path()));
+        assert_eq!(session.header.id, session_id);
+        session.append_message(make_test_message("after resume"));
+        run_async(async { session.save().await })
+            .expect("saving through a canonical verbatim path must succeed");
+        assert_eq!(session.appends_since_checkpoint, 1);
+
+        session.set_model_header(Some("resumed-provider".to_string()), None, None);
+        run_async(async { session.save().await }).expect("rewrite through a verbatim path");
+        assert_eq!(session.appends_since_checkpoint, 0);
+
+        let reopened = run_async(async { Session::open(&canonical.to_string_lossy()).await })
+            .expect("reopen canonical session");
+        assert_eq!(reopened.header.id, session_id);
+        assert_eq!(
+            reopened.header.provider.as_deref(),
+            Some("resumed-provider")
+        );
+        assert_eq!(reopened.entries.len(), 2);
+        assert_eq!(
+            serde_json::to_value(reopened.to_messages_for_current_path())
+                .expect("reopened messages"),
+            serde_json::to_value(session.to_messages_for_current_path()).expect("saved messages"),
         );
     }
 
@@ -15973,12 +17453,26 @@ mod tests {
 
         session.append_message(make_test_message("replayed after cancellation"));
         let replay = session.entries[1].clone();
-        append_jsonl_entries_blocking(&path, temp_dir.path(), &session.header.id, &[replay])
-            .expect("simulate writer reaching disk before cancellation");
+        append_jsonl_entries_blocking(
+            &path,
+            temp_dir.path(),
+            &session.header.id,
+            vec![replay],
+            &HashMap::new(),
+        )
+        .expect("simulate writer reaching disk before cancellation");
         assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
+        assert_eq!(session.autosave_metrics().pending_mutations, 1);
+        let before_replay = std::fs::read(&path).expect("read unacknowledged append");
 
         run_async(async { session.save().await })
             .expect("one identical persisted replay must remain idempotent");
+        assert_eq!(session.autosave_metrics().pending_mutations, 0);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(&path).expect("read acknowledged replay"),
+            before_replay
+        );
         let (reloaded, diagnostics) =
             open_jsonl_blocking(&path).expect("reload idempotently reconciled JSONL");
         assert!(diagnostics.skipped_entries.is_empty());
@@ -16008,7 +17502,8 @@ mod tests {
             &path,
             temp_dir.path(),
             "different-session-id",
-            &[pending],
+            vec![pending],
+            &HashMap::new(),
         )
         .expect_err("incremental append must bind to the expected session identity");
 

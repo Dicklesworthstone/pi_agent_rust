@@ -44,6 +44,109 @@ fn secret_json_depth(depth: usize) -> Result<()> {
     Ok(())
 }
 
+/// Restore tool arguments atomically before approval or execution.
+///
+/// Only strings and object keys are restored, exactly once. A model can emit
+/// both a placeholder key and its literal counterpart, so collecting restored
+/// pairs directly into a map would silently discard one of the arguments.
+/// Refuse that ambiguity rather than execute a different call. The borrowed
+/// input and session vault remain unchanged on every outcome.
+pub fn restore_inbound_json(
+    value: &serde_json::Value,
+    vault: &SecretVault,
+) -> Result<serde_json::Value> {
+    transform_known_json_inner(
+        value,
+        &|text| vault.restore(text),
+        false,
+        "PI_SECRET_JSON_RESTORE_KEY_COLLISION: placeholder restoration would merge distinct object members; correct the tool arguments",
+        0,
+    )
+}
+
+/// Mask known secrets in structured tool output without serializing first.
+///
+/// Ordinary primitive types are preserved. A secret echoed as a number,
+/// boolean or null becomes masked text, because output must not disclose the
+/// credential merely to retain its type. Key collisions and excessive depth
+/// refuse the projection; callers must omit the affected output on failure,
+/// never fall back to the original unscreened value. No new secrets are learned.
+pub fn mask_known_json(
+    value: &serde_json::Value,
+    vault: &SecretVault,
+) -> Result<serde_json::Value> {
+    mask_known_json_with_replacements(value, vault, &vault.mask_replacements())
+}
+
+pub(super) fn mask_known_json_with_replacements(
+    value: &serde_json::Value,
+    vault: &SecretVault,
+    replacements: &super::MaskReplacements<'_>,
+) -> Result<serde_json::Value> {
+    transform_known_json_inner(
+        value,
+        &|text| vault.mask_literal_text(text, replacements),
+        true,
+        "PI_SECRET_JSON_MASK_KEY_COLLISION: secret masking would merge distinct object members",
+        0,
+    )
+}
+
+fn transform_known_json_inner(
+    value: &serde_json::Value,
+    transform_text: &impl Fn(&str) -> String,
+    mask_primitives: bool,
+    collision_error: &'static str,
+    depth: usize,
+) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    secret_json_depth(depth)?;
+    match value {
+        Value::String(text) => Ok(Value::String(transform_text(text))),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                transform_known_json_inner(
+                    item,
+                    transform_text,
+                    mask_primitives,
+                    collision_error,
+                    depth + 1,
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(map) => {
+            let mut output = serde_json::Map::new();
+            for (key, item) in map {
+                let key = transform_text(key);
+                if output.contains_key(&key) {
+                    return Err(Error::validation(collision_error));
+                }
+                let item = transform_known_json_inner(
+                    item,
+                    transform_text,
+                    mask_primitives,
+                    collision_error,
+                    depth + 1,
+                )?;
+                output.insert(key, item);
+            }
+            Ok(Value::Object(output))
+        }
+        primitive => {
+            if mask_primitives {
+                let text = primitive.to_string();
+                let protected = transform_text(&text);
+                if protected != text {
+                    return Ok(Value::String(protected));
+                }
+            }
+            Ok(primitive.clone())
+        }
+    }
+}
+
 fn secret_block_error() -> Error {
     Error::validation(
         "PI_SECRET_BLOCK: outbound input contains a detected or remembered secret; refusing to send"
@@ -173,6 +276,12 @@ fn rewrite_json_text(
     Ok(output)
 }
 
+#[derive(Clone, Copy)]
+enum PrimitivePolicy {
+    RefuseReplacement,
+    PreserveModelOutput,
+}
+
 fn rewrite_json_inner(
     value: &serde_json::Value,
     vault: &mut SecretVault,
@@ -180,6 +289,7 @@ fn rewrite_json_inner(
     extra_patterns: &[regex::Regex],
     audit: &mut TransformAudit,
     depth: usize,
+    primitive_policy: PrimitivePolicy,
 ) -> Result<serde_json::Value> {
     secret_json_depth(depth)?;
     match value {
@@ -192,7 +302,17 @@ fn rewrite_json_inner(
         )?)),
         serde_json::Value::Array(items) => items
             .iter()
-            .map(|item| rewrite_json_inner(item, vault, mode, extra_patterns, audit, depth + 1))
+            .map(|item| {
+                rewrite_json_inner(
+                    item,
+                    vault,
+                    mode,
+                    extra_patterns,
+                    audit,
+                    depth + 1,
+                    primitive_policy,
+                )
+            })
             .collect::<Result<Vec<_>>>()
             .map(serde_json::Value::Array),
         serde_json::Value::Object(map) => {
@@ -205,13 +325,30 @@ fn rewrite_json_inner(
                             .to_string(),
                     ));
                 }
-                let protected_value =
-                    rewrite_json_inner(item, vault, mode, extra_patterns, audit, depth + 1)?;
+                let protected_value = rewrite_json_inner(
+                    item,
+                    vault,
+                    mode,
+                    extra_patterns,
+                    audit,
+                    depth + 1,
+                    primitive_policy,
+                )?;
                 output.insert(protected_key, protected_value);
             }
             Ok(serde_json::Value::Object(output))
         }
         primitive => {
+            if mode == SecretsMode::Obfuscate
+                && matches!(primitive_policy, PrimitivePolicy::PreserveModelOutput)
+            {
+                // The originating model already produced these exact values.
+                // Replaying a number/bool/null without changing its type must
+                // not permanently wedge that model's own tool-use history.
+                // Discovery still learns these values so string echoes and
+                // unrelated outbound fields receive their usual protection.
+                return Ok(primitive.clone());
+            }
             let text = primitive.to_string();
             if rewrite_json_text(&text, vault, mode, extra_patterns, audit)? != text {
                 // Turning a numeric credential into a string placeholder and
@@ -246,6 +383,44 @@ pub fn transform_outbound_json(
     mode: SecretsMode,
     extra_patterns: &[regex::Regex],
 ) -> Result<(serde_json::Value, TransformAudit)> {
+    transform_json(
+        value,
+        vault,
+        mode,
+        extra_patterns,
+        PrimitivePolicy::RefuseReplacement,
+    )
+}
+
+/// Screen unsigned assistant tool arguments returning to their original model.
+///
+/// The caller must verify the assistant's provider, API and model all match the
+/// destination. Only obfuscate mode preserves model-authored JSON primitives;
+/// strings and keys are still screened, and block mode still refuses secrets.
+/// This exception must never apply to user input, tool results, tool schemas or
+/// assistant history sent to another origin.
+pub fn transform_assistant_replay_json(
+    value: &serde_json::Value,
+    vault: &mut SecretVault,
+    mode: SecretsMode,
+    extra_patterns: &[regex::Regex],
+) -> Result<(serde_json::Value, TransformAudit)> {
+    transform_json(
+        value,
+        vault,
+        mode,
+        extra_patterns,
+        PrimitivePolicy::PreserveModelOutput,
+    )
+}
+
+fn transform_json(
+    value: &serde_json::Value,
+    vault: &mut SecretVault,
+    mode: SecretsMode,
+    extra_patterns: &[regex::Regex],
+    primitive_policy: PrimitivePolicy,
+) -> Result<(serde_json::Value, TransformAudit)> {
     let mut audit = TransformAudit {
         schema: SECRETS_SCHEMA.to_string(),
         direction: "outbound".to_string(),
@@ -257,7 +432,15 @@ pub fn transform_outbound_json(
     }
     let mut staged = vault.clone();
     discover_outbound_json(value, &mut staged, mode, extra_patterns)?;
-    let output = rewrite_json_inner(value, &mut staged, mode, extra_patterns, &mut audit, 0)?;
+    let output = rewrite_json_inner(
+        value,
+        &mut staged,
+        mode,
+        extra_patterns,
+        &mut audit,
+        0,
+        primitive_policy,
+    )?;
     *vault = staged;
     Ok((output, audit))
 }
@@ -407,6 +590,189 @@ mod structured_outbound_tests {
             assert_eq!(vault.len(), 0);
         }
         assert!(input["token"].is_u64());
+    }
+
+    #[test]
+    fn assistant_replay_preserves_primitives_but_protects_strings_and_keys() {
+        let numeric = 123_456_789_012_345_678_u64;
+        let mut input = json!({
+            "a_echo": numeric.to_string(),
+            "flags": [true, false, null],
+            "token": numeric,
+            "secret": KEY,
+        });
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert(KEY.to_string(), json!("ordinary"));
+        let original = input.clone();
+        let patterns = [regex::Regex::new(r"^(?:true|false|null)$").unwrap()];
+        let mut vault = SecretVault::default();
+
+        let (output, _) =
+            transform_assistant_replay_json(&input, &mut vault, SecretsMode::Obfuscate, &patterns)
+                .expect("model-authored primitive replay");
+
+        assert_eq!(output["token"].as_u64(), Some(numeric));
+        assert_eq!(output["flags"], input["flags"]);
+        assert_ne!(output["a_echo"], input["a_echo"]);
+        assert!(!output.to_string().contains(KEY));
+        assert_eq!(restore_value(&output, &vault), original);
+        assert_eq!(input, original, "only the outbound projection changes");
+
+        // The exception does not suppress discovery or block-mode policy.
+        // Check each primitive separately so the numeric assignment cannot
+        // hide an accidental bool/null exemption.
+        for protected in [
+            json!({"token": numeric}),
+            json!(true),
+            json!(false),
+            json!(null),
+        ] {
+            let mut blocked_vault = SecretVault::default();
+            let error = transform_assistant_replay_json(
+                &protected,
+                &mut blocked_vault,
+                SecretsMode::Block,
+                &patterns,
+            )
+            .expect_err("block mode still applies to every primitive");
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert_eq!(blocked_vault.len(), 0);
+        }
+    }
+
+    #[test]
+    fn inbound_restore_preserves_json_types_and_escaped_keys_and_values() {
+        let mut vault = SecretVault::default();
+        let raw = "line one\n\"quoted\" C:\\keys\\value";
+        let placeholder = vault.placeholder_for(raw, "user");
+        let nested_secret = "literal <pi-secret:000001>";
+        let nested_placeholder = vault.placeholder_for(nested_secret, "user");
+        let input = json!({
+            "nested": [{placeholder.clone(): placeholder}],
+            "literal": nested_placeholder,
+            "ordinary": [17, true, false, null],
+            "unknown": "<pi-secret:ffffff>",
+        });
+        let original = input.clone();
+
+        let restored = restore_inbound_json(&input, &vault).expect("unambiguous tool arguments");
+
+        assert_eq!(restored["nested"][0][raw], raw);
+        assert_eq!(restored["literal"], nested_secret);
+        assert_eq!(restored["ordinary"], input["ordinary"]);
+        assert_eq!(restored["unknown"], "<pi-secret:ffffff>");
+        assert_eq!(input, original);
+        assert_eq!(vault.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored.to_string()).unwrap(),
+            restored,
+        );
+    }
+
+    #[test]
+    fn inbound_restore_refuses_nested_key_collisions_without_losing_arguments() {
+        let mut vault = SecretVault::default();
+        let placeholder = vault.placeholder_for(KEY, "user");
+        let input = json!({
+            "safe": "unchanged",
+            "nested": [{
+                KEY: "literal-member",
+                placeholder.clone(): "placeholder-member",
+            }],
+        });
+        let original = input.clone();
+
+        let error = restore_inbound_json(&input, &vault).expect_err("ambiguous object must refuse");
+
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SECRET_JSON_RESTORE_KEY_COLLISION")
+        );
+        assert!(!error.to_string().contains(KEY));
+        assert_eq!(input, original);
+        assert_eq!(input["nested"][0].as_object().unwrap().len(), 2);
+        assert_eq!(vault.restore(&placeholder), KEY);
+    }
+
+    #[test]
+    fn known_output_masking_protects_scalar_primitives_and_retains_nonsecret_types() {
+        let mut vault = SecretVault::default();
+        let numeric = vault.placeholder_for("1234567890123456", "user");
+        let boolean = vault.placeholder_for("true", "user");
+        let empty = vault.placeholder_for("null", "user");
+        let cases = [
+            (json!(1_234_567_890_123_456_u64), json!(numeric)),
+            (json!(true), json!(boolean)),
+            (Value::Null, json!(empty)),
+            (json!(17), json!(17)),
+            (json!(false), json!(false)),
+        ];
+
+        for (input, expected) in cases {
+            let output = mask_known_json(&input, &vault).expect("screen scalar output");
+            assert_eq!(output, expected);
+        }
+        let partial_numeric = json!(12_345_678_901_234_567_u64);
+        assert_eq!(
+            mask_known_json(&partial_numeric, &vault).unwrap(),
+            json!(format!("{numeric}7")),
+            "a numeric suffix cannot expose a remembered secret prefix",
+        );
+        assert_eq!(vault.len(), 3);
+    }
+
+    #[test]
+    fn known_output_masking_refuses_key_collisions_atomically() {
+        let mut vault = SecretVault::default();
+        let placeholder = vault.placeholder_for(KEY, "user");
+        let input = json!({
+            "nested": {
+                KEY: {"credential": KEY},
+                placeholder: "a different member",
+            },
+        });
+        let original = input.clone();
+
+        let error = mask_known_json(&input, &vault).expect_err("ambiguous output must refuse");
+
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SECRET_JSON_MASK_KEY_COLLISION")
+        );
+        assert!(!error.to_string().contains(KEY));
+        assert_eq!(input, original);
+        assert_eq!(input["nested"].as_object().unwrap().len(), 2);
+        assert_eq!(vault.len(), 1);
+    }
+
+    #[test]
+    fn inbound_and_output_projections_enforce_the_same_depth_boundary() {
+        let mut vault = SecretVault::default();
+        let placeholder = vault.placeholder_for(KEY, "user");
+        let mut arguments = json!(placeholder);
+        let mut output = json!(KEY);
+        for _ in 0..MAX_SECRET_JSON_DEPTH {
+            arguments = Value::Array(vec![arguments]);
+            output = Value::Array(vec![output]);
+        }
+
+        assert_eq!(restore_inbound_json(&arguments, &vault).unwrap(), output);
+        assert_eq!(mask_known_json(&output, &vault).unwrap(), arguments);
+
+        arguments = Value::Array(vec![arguments]);
+        output = Value::Array(vec![output]);
+        for error in [
+            restore_inbound_json(&arguments, &vault).unwrap_err(),
+            mask_known_json(&output, &vault).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("PI_SECRET_JSON_DEPTH"));
+            assert!(!error.to_string().contains(KEY));
+        }
+        assert_eq!(vault.len(), 1);
     }
 
     #[test]

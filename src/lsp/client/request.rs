@@ -1,8 +1,9 @@
 //! One owner and deadline from request admission through response delivery.
 //!
-//! The transport still performs synchronous pipe writes. These checks bound
-//! async lane/response/retry waits, not a blocked OS write. Abandonment sends
-//! the protocol cancellation notification; it does not undo server side effects.
+//! A dedicated transport pump owns blocking pipe writes. These checks bound
+//! async lane/response/retry waits, including time spent queued for that pump.
+//! Abandonment withdraws an unclaimed request or schedules protocol cancellation
+//! after a claimed write; it does not undo server side effects.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -18,6 +19,11 @@ use super::{
     WARMUP_RETRY_CADENCE, is_empty_result, is_warmup_empty_retryable,
 };
 use crate::agent_cx::AgentCx;
+
+mod array_results;
+mod partial_results;
+mod workspace_diagnostics;
+pub(super) use partial_results::PartialResults;
 
 pub(super) struct RequestBudget {
     owner: AgentCx,
@@ -85,6 +91,35 @@ fn now(owner: &AgentCx) -> Time {
         .map_or_else(asupersync::time::wall_now, |timer| timer.now())
 }
 
+fn is_retryable_request_error(method: &str, error: &LspCallError) -> bool {
+    // Only idempotent lookups participate in the warmup policy. A failed
+    // command is not evidence that its effects were undone.
+    let diagnostic = matches!(method, "textDocument/diagnostic" | "workspace/diagnostic");
+    if !diagnostic && !is_warmup_empty_retryable(method) {
+        return false;
+    }
+    let LspCallError::Transport(TransportError::Server(error)) = error else {
+        return false;
+    };
+    match error.code {
+        -32602 => error.message.contains("No references found"),
+        -32801 => true,
+        -32802 => {
+            // LSP 3.17 diagnostic cancellation can explicitly decline a new
+            // request (for example, the document no longer has a provider).
+            // Keep the bounded legacy retry for servers omitting this data.
+            !diagnostic
+                || error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("retriggerRequest"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+        }
+        _ => false,
+    }
+}
+
 /// A posted request remains owned even when its calling future is dropped.
 /// Declare this after the lane guard so cancellation happens before another
 /// request can enter the serialized lane.
@@ -122,16 +157,10 @@ impl LspClient {
         loop {
             let attempt = self.call_once(method, params.clone(), budget).await;
             self.poll_notifications();
-            // Only idempotent lookups participate in the warmup policy.
-            // A failed command is not evidence that its effects were undone.
-            let retryable = (is_warmup_empty_retryable(method)
-                || method == "textDocument/diagnostic")
-                && matches!(
-                    &attempt, Err(LspCallError::Transport(TransportError::Server(err)))
-                        if (err.code == -32602 && err.message.contains("No references found"))
-                            || err.code == -32801
-                            || err.code == -32802
-                );
+            let retryable = attempt
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_retryable_request_error(method, error));
             let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
                 && is_warmup_empty_retryable(method)
                 && !self.quiescent.load(Ordering::SeqCst)
@@ -153,11 +182,34 @@ impl LspClient {
         budget: &RequestBudget,
     ) -> Result<Value, LspCallError> {
         let _lane = budget.acquire(&self.request_lane).await?;
+        self.call_once_in_lane(method, params, budget).await
+    }
+
+    /// The caller retains the lane through response observation and any
+    /// request-owned partial-result collection. Wire admission/cancellation
+    /// remain identical for ordinary and streaming requests.
+    async fn call_once_in_lane(
+        &self,
+        method: &str,
+        params: Value,
+        budget: &RequestBudget,
+    ) -> Result<Value, LspCallError> {
         budget.remaining()?;
-        let (id, rx) = self
+        let mut request = self
             .rpc
-            .request(method, params)
+            .prepare_request(method, params)
             .map_err(LspCallError::Transport)?;
+        let (id, rx) = loop {
+            // Encoding and queue admission spend the same budget as the lane
+            // and response. The retained frame has not been posted yet, so
+            // even a command may wait here without replaying remote effects.
+            budget.remaining()?;
+            match self.rpc.try_admit_request(&mut request) {
+                Ok(completion) => break completion,
+                Err(TransportError::Backpressure(_)) => budget.pause(WAIT_TICK).await?,
+                Err(error) => return Err(LspCallError::Transport(error)),
+            }
+        };
         let mut pending = PendingRequest {
             rpc: &self.rpc,
             id,
@@ -187,3 +239,90 @@ impl LspClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod diagnostic_cancellation_tests {
+    use super::super::test_server::Fixture;
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn diagnostic_cancellation_opt_out_preserves_error_without_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+            return;
+        };
+        peer.configure(json!({
+            "textDocument/diagnostic": [
+                {"error": {
+                    "code": -32802,
+                    "message": "diagnostic provider detached",
+                    "data": {"retriggerRequest": false}
+                }},
+                {"result": {"kind": "full", "items": []}}
+            ]
+        }));
+        let error = peer
+            .runtime
+            .block_on(peer.client.call(
+                "textDocument/diagnostic",
+                json!({"textDocument": {"uri": "file:///test.rs"}}),
+                Duration::from_secs(5),
+            ))
+            .unwrap_err();
+        let LspCallError::Transport(TransportError::Server(error)) = error else {
+            panic!("expected the original server cancellation");
+        };
+        assert_eq!(error.code, -32802);
+        assert_eq!(error.data, Some(json!({"retriggerRequest": false})));
+        let frames = peer.frames();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "textDocument/diagnostic")
+                .count(),
+            1,
+            "a server opt-out must not become an automatic second request"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["method"] == "$/cancelRequest")
+        );
+        assert!(peer.client.is_alive());
+    }
+
+    #[test]
+    fn retrigger_and_legacy_diagnostic_cancellations_retry_within_the_same_call() {
+        for data in [Some(json!({"retriggerRequest": true})), None] {
+            let temp = tempfile::tempdir().unwrap();
+            let Some(peer) = Fixture::connect(temp.path(), json!({})) else {
+                return;
+            };
+            let mut error = json!({"code": -32802, "message": "diagnostics recomputing"});
+            if let Some(data) = data {
+                error["data"] = data;
+            }
+            let report = json!({"kind": "full", "resultId": "ready", "items": []});
+            peer.configure(json!({
+                "textDocument/diagnostic": [{"error": error}, {"result": report}]
+            }));
+            let result = peer
+                .runtime
+                .block_on(peer.client.call(
+                    "textDocument/diagnostic",
+                    json!({"textDocument": {"uri": "file:///test.rs"}}),
+                    Duration::from_secs(5),
+                ))
+                .unwrap();
+            assert_eq!(result, report);
+            assert_eq!(
+                peer.frames()
+                    .iter()
+                    .filter(|frame| frame["method"] == "textDocument/diagnostic")
+                    .count(),
+                2
+            );
+        }
+    }
+}

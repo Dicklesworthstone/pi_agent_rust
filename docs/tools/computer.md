@@ -10,11 +10,19 @@ nodes or a one-pixel screenshot.
 
 ## Platform and activation
 
-The native backend in this increment is **Linux X11**. It requires the
+Native operations are available through **Linux X11** and the
+[macOS backend](computer-macos.md). macOS requires macOS 14 or newer and Xcode
+Command Line Tools; its source path implements display/window discovery,
+screenshots, clipboard access, accessibility trees, focus, mouse movement,
+clicks, dragging, scrolling, Unicode typing and key chords. See that backend's
+guide for permissions, desktop-point coordinates, input-release limitations and
+validation status. Live macOS behavior remains unverified.
+Windows and native Wayland adapters are not implemented.
+
+The Linux-specific details below describe **X11**. It requires the
 session's authorized `DISPLAY` and, where applicable, `XAUTHORITY`. Window
 operations require an EWMH-capable window manager. A detected Wayland session
 is rejected rather than silently inspecting only its XWayland subset.
-macOS, Windows and native Wayland adapters are not implemented here.
 
 Register the tool with `--tools ...,computer` or the existing opt-in setting:
 
@@ -27,7 +35,7 @@ Register the tool with `--tools ...,computer` or the existing opt-in setting:
 }
 ```
 
-The Rust binary does not install its desktop dependencies:
+The Rust binary does not install its desktop dependencies. Linux uses:
 
 | Operations | Helpers |
 |---|---|
@@ -97,8 +105,8 @@ Container checks are not a full PNG decoder or a general image sanitizer.
 
 Screenshots within the 4.5 MiB inline-image budget also return an image content
 block for the model. Larger captures are saved with a note to inspect the file.
-The default destination is `screenshots/desktop_<id>.png`; `output_path` may be
-absolute or project-relative and must use `.png`. The legacy `screenshotDir`
+The default destination is `screenshots/desktop_<id>.png`; `output_path` must be
+workspace-relative and use `.png`. The legacy `screenshotDir`
 field is not forwarded by the current registry; use `output_path` explicitly.
 
 ## Input and clipboard
@@ -181,7 +189,7 @@ avoid private-text diagnostics and persistent-service pipe backpressure.
 fixtures, marked `mock: true`. `with_mock(false)` overrides the environment.
 Fixture data is never used as a live failure fallback.
 
-Twenty-two Rust test functions were authored for the new modules, including
+Twenty-two Rust test functions were authored for the initial X11 modules, including
 approval boundaries, no-fallback behavior, subprocess limits, release guards,
 parsers, no-clobber screenshots and accessibility validation. They were **not
 executed** in the implementation environment: neither a Rust compiler nor DSR

@@ -120,12 +120,15 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         io::stdin().read_to_string(&mut data)?;
         if data.is_empty() { None } else { Some(data) }
     };
-    pi::app::apply_piped_stdin(&mut cli, stdin_content);
+    let piped_stdin = pi::app::apply_piped_stdin(&mut cli, stdin_content);
     pi::app::normalize_cli(&mut cli);
     step!("   CLI normalized");
 
     step!("7. Preparing initial message...");
     let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
+    if let Some(input) = piped_stdin {
+        messages.insert(0, input);
+    }
     let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
     let initial = pi::app::prepare_initial_message(
         &cwd,
@@ -196,7 +199,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
 
     step!("11. Building agent...");
     let mut session = session;
-    pi::app::update_session_for_selection(&mut session, &selection);
+    pi::app::update_session_for_selection(&mut session, &selection, &model_registry);
     let enabled_tools = cli.enabled_tools();
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()

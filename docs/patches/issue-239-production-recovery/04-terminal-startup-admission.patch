@@ -1,0 +1,187 @@
+diff --git a/src/interactive_ftui.rs b/src/interactive_ftui.rs
+--- a/src/interactive_ftui.rs
++++ b/src/interactive_ftui.rs
+@@ -1961,4 +1961,8 @@ pub struct PiFtuiModel {
+     /// after cleanup instead of silently treating that quit as successful.
+     terminal_failure: Arc<Mutex<Option<std::io::Error>>>,
++    /// One-shot admission for the production driver. FTUI calls `init` only
++    /// after constructing its terminal session. Dropping an uninitialized
++    /// model closes this channel instead of starting queued provider work.
++    ui_ready_tx: Option<Sender<()>>,
+ }
+ 
+@@ -2238,5 +2242,6 @@ impl PiFtuiModel {
+             submit_tx: None,
+             terminal_failure: Arc::new(Mutex::new(None)),
++            ui_ready_tx: None,
+         }
+     }
+ 
+@@ -5481,5 +5486,25 @@ impl Model for PiFtuiModel {
+ impl Model for PiFtuiModel {
+     type Message = PiFtuiMsg;
+ 
++    fn init(&mut self) -> Cmd<PiFtuiMsg> {
++        if let Some(ready) = self.ui_ready_tx.take()
++            && ready.send(()).is_err()
++        {
++            // No driver owns the readiness receiver. Do not show a prompt
++            // that cannot submit, or let Cmd::quit hide the startup failure.
++            let error = std::io::Error::new(
++                std::io::ErrorKind::BrokenPipe,
++                "FTUI driver unavailable at terminal startup",
++            );
++            self.terminal_failure
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .get_or_insert(error);
++            self.pending_quit = true;
++            return Cmd::quit();
++        }
++        Cmd::none()
++    }
++
+     fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
+         let probe = self.watchdog.start();
+@@ -9060,4 +9086,14 @@
++/// Wait on the driver thread, never on the terminal thread. Sender teardown
++/// means terminal construction failed or the unrun app was dropped. No SDK
++/// session, extension startup, or queued initial prompt may start in that case.
++/// This is startup admission only: once `init` succeeds, the runtime shutdown
++/// hook and active-turn controls own cancellation. It is not proof that the
++/// first frame was presented successfully.
++fn await_ftui_start(ready: Receiver<()>) -> bool {
++    ready.recv().is_ok()
++}
++
+ #[allow(clippy::too_many_lines)]
+ pub fn run(
+     session_options: crate::sdk::SessionOptions,
+     theme: &crate::theme::Theme,
+@@ -9177,10 +9213,19 @@ pub fn run(
+     let command_registry: ExtensionCommandRegistry = Arc::default();
+     let driver_command_registry = Arc::clone(&command_registry);
++    let (ui_ready_tx, ui_ready_rx) = std::sync::mpsc::channel();
+ 
+     let driver = std::thread::Builder::new()
+         .name("pi-ftui-agent-driver".into())
+         .stack_size(DRIVER_STACK_BYTES)
+         .spawn(move || -> std::io::Result<()> {
++            // Starting the driver before App::run can otherwise start a CLI
++            // prompt before console acquisition fails. Dropping the command
++            // sender alone does not discard its buffered startup commands.
++            if !await_ftui_start(ui_ready_rx) {
++                // The launcher retains and returns the terminal startup
++                // error. No session resources were created to shut down.
++                return Ok(());
++            }
+             let runtime = match asupersync::runtime::RuntimeBuilder::new().build() {
+                 Ok(runtime) => runtime,
+                 Err(err) => {
+@@ -9880,6 +9926,7 @@ pub fn run(
+     if let Some(workspace) = workspace {
+         model.autocomplete.provider.set_workspace(workspace);
+     }
++    model.ui_ready_tx = Some(ui_ready_tx);
+     // Retain the terminal failure after App::run consumes the model. A normal
+     // Cmd::quit must not hide an unrecoverable raw-mode/console-mode failure.
+     let terminal_failure = Arc::clone(&model.terminal_failure);
+@@ -10105,6 +10152,98 @@ mod tests {
+         (tx, PiFtuiModel::new(rx))
+     }
+ 
++    #[test]
++    fn ftui_init_releases_driver_start_exactly_once() {
++        let (_agent_tx, mut model) = new_model();
++        let (ready_tx, ready_rx) = mpsc::channel();
++        model.ui_ready_tx = Some(ready_tx);
++        assert_eq!(ready_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
++
++        assert!(matches!(model.init(), Cmd::None));
++        assert_eq!(ready_rx.try_recv(), Ok(()));
++        assert!(model.ui_ready_tx.is_none());
++        assert!(matches!(model.init(), Cmd::None));
++        assert_eq!(ready_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
++    }
++
++    #[test]
++    fn dropping_uninitialized_ftui_cancels_start_with_buffered_commands() {
++        let (_agent_tx, model) = new_model();
++        let (submit_tx, submit_rx) = mpsc::channel();
++        queue_initial_commands(
++            &submit_tx,
++            true,
++            false,
++            vec![String::from("must not run without a terminal")],
++        )
++        .expect("buffer the CLI startup work");
++        let (ready_tx, ready_rx) = mpsc::channel();
++        let mut model = model.with_submit_channel(submit_tx);
++        model.ui_ready_tx = Some(ready_tx);
++
++        // This is the model ownership path on failed console acquisition or
++        // failed FTUI construction: init was never called, then App is dropped.
++        drop(model);
++        assert!(!await_ftui_start(ready_rx));
++
++        // Channel disconnection does NOT remove the queued commands. This is
++        // why dropping submit_tx alone cannot be the startup cancellation gate.
++        assert!(matches!(
++            submit_rx.try_recv(),
++            Ok(UiCommand::Plan { action }) if action == "enter"
++        ));
++        assert!(matches!(
++            submit_rx.try_recv(),
++            Ok(UiCommand::Prompt(prompt)) if prompt == "must not run without a terminal"
++        ));
++        assert!(matches!(
++            submit_rx.try_recv(),
++            Err(mpsc::TryRecvError::Disconnected)
++        ));
++    }
++
++    #[test]
++    fn actual_ftui_init_admits_the_waiting_driver_without_user_input() {
++        let (_agent_tx, mut model) = new_model();
++        let (ready_tx, ready_rx) = mpsc::channel();
++        let (admitted_tx, admitted_rx) = mpsc::channel();
++        model.ui_ready_tx = Some(ready_tx);
++        let worker = std::thread::spawn(move || {
++            if await_ftui_start(ready_rx) {
++                let _ = admitted_tx.send(());
++            }
++        });
++
++        assert_eq!(admitted_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
++        let mut sim = ProgramSimulator::new(model);
++        sim.init(); // calls the production Model::init, not an injected token
++        let admitted = admitted_rx.recv_timeout(Duration::from_secs(2));
++        // On regression, dropping the model also releases a still-waiting
++        // worker, so the test does not leave a blocked driver thread behind.
++        drop(sim);
++        worker.join().expect("startup gate worker");
++        admitted.expect("model startup must admit the driver without a key");
++    }
++
++    #[test]
++    fn missing_startup_driver_quits_and_preserves_the_startup_error() {
++        let (_agent_tx, mut model) = new_model();
++        let failure = Arc::clone(&model.terminal_failure);
++        let (ready_tx, ready_rx) = mpsc::channel();
++        model.ui_ready_tx = Some(ready_tx);
++        drop(ready_rx);
++
++        let mut sim = ProgramSimulator::new(model);
++        sim.init();
++        assert!(!sim.is_running());
++        assert!(sim.model().pending_quit);
++        assert!(sim.model().ui_ready_tx.is_none());
++        let error = finish_terminal_run(Ok(()), &failure)
++            .expect_err("a startup quit cannot become a successful exit");
++        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
++        assert!(error.to_string().contains("driver unavailable"));
++    }
++
+     #[test]
+     fn driver_disconnect_delivers_queued_events_before_shutdown() {
+         let (agent_tx, agent_rx) = mpsc::channel();

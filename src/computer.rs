@@ -244,14 +244,14 @@ impl Tool for ComputerTool {
                 "action": {"type":"string", "enum":["list_displays","list_windows","screenshot","mouse_move","mouse_click","mouse_drag","key_type","key_press","ax_tree","clipboard_read","clipboard_write","scroll","focus_window"]},
                 "display_id": {"type":"integer", "minimum":1, "description":"Monitor ID from list_displays"},
                 "window_id": {"type":"integer", "minimum":1, "description":"Window ID from list_windows; input with this field requires that window to be focused"},
-                "x": {"type":"integer", "description":"Desktop pixel X coordinate"},
-                "y": {"type":"integer", "description":"Desktop pixel Y coordinate"},
+                "x": {"type":"integer", "description":"Desktop X coordinate: pixels on X11, points on macOS. Convert screenshot pixels using its bounds and pixels_per_point_x metadata"},
+                "y": {"type":"integer", "description":"Desktop Y coordinate: pixels on X11, points on macOS. Convert screenshot pixels using its bounds and pixels_per_point_y metadata"},
                 "button": {"type":"string", "enum":["left","right","middle"]},
                 "text": {"type":"string", "maxLength":4096, "description":"Literal input/clipboard text, never executed as helper commands"},
                 "key": {"type":"string", "description":"One key/chord, e.g. Return, Tab, Escape, Ctrl+C"},
                 "direction": {"type":"string", "enum":["up","down","left","right"]},
                 "amount": {"type":"integer", "minimum":1, "maximum":100},
-                "output_path": {"type":"string", "description":"New PNG destination; existing files are never overwritten"},
+                "output_path": {"type":"string", "description":"New workspace-relative PNG destination; existing files are never overwritten"},
                 "timeout_ms": {"type":"integer", "minimum":1, "maximum":120_000, "default":30_000}
             }
         })
@@ -428,6 +428,8 @@ mod tests {
         let tool = ComputerTool::new(dir.path())
             .with_mock(false)
             .with_helper_path("scrot", dir.path().join("missing-scrot"))
+            .unwrap()
+            .with_helper_path("swift", dir.path().join("missing-swift"))
             .unwrap();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()

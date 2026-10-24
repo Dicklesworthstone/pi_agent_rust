@@ -147,6 +147,16 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "model": model,
             "restoredPrimary": restored_primary,
         }),
+        AgentEvent::PrewalkSwitched {
+            provider,
+            model,
+            thinking,
+        } => json!({
+            "event": "prewalk_switched",
+            "provider": provider,
+            "model": model,
+            "thinking": thinking,
+        }),
         AgentEvent::ExtensionError {
             extension_id,
             event,

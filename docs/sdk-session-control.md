@@ -84,6 +84,21 @@ complete; dropping all owners is not durable storage.
 
 ## Attachments and authored-source tracking
 
+For a reusable `ControllableSession`, `prompt_with_content(content, on_event)`
+accepts ordered native blocks, and `prompt_with_images(text, images, on_event)`
+accepts text plus images. `prompt_with_content_with_control` and
+`prompt_with_images_with_control` also pass the current control handle to each
+callback. These methods share the text prompt's turn lifecycle, cancellation,
+and SDK persistence path. Empty images preserve ordinary text input; image-only
+input does not introduce an empty text block.
+
+For a borrowed handle, `prompt_controlled_with_content(content, on_event)`
+starts a controlled turn with ordered native text, image, audio, and video
+blocks. It uses the SDK's normal validation, persistence, retry, and cancellation
+path. `prompt_controlled` and image prompts without images retain ordinary
+text semantics. The FTUI frontend uses this same control lane for prepared
+file attachments and native retries.
+
 `steer_with_content(&UserContent, authored_source)` and
 `follow_up_with_content(&UserContent, authored_source)` preserve native text,
 image and media blocks in order. `authored_source` is the user's original
@@ -108,11 +123,12 @@ budget also counts its retained authored source. Overflow rejects the new
 input without dropping the oldest input. Reclaiming or handing off an input
 releases its mailbox budget. Debug output excludes input text and payloads.
 
-The wrapper installs its two additive fetchers once. `session_mut()` permits
-idle configuration and normal in-place session operations; it cannot be
-borrowed while a controlled turn holds the session. Do not replace the entire
-handle or its inner agent through that accessor, since doing so replaces the
-fetchers too; construct a new controllable wrapper for a replacement handle.
+The wrapper registers scoped fetchers on the current agent for each turn and
+retires them when that turn ends. `session_mut()` permits idle configuration
+and normal in-place session operations; it cannot be borrowed while a
+controlled turn holds the session. If the handle is replaced while idle, the
+next turn registers its fetchers on the replacement. Controls from an earlier
+turn remain closed and cannot affect the replacement session.
 
 ## Validation scope
 

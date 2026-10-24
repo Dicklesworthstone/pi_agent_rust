@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tool": "write",
-  "description": "Conformance tests for the write tool (pi-mono parity)",
+  "description": "Conformance tests for ordinary writes and guarded conflict input validation",
   "cases": [
     {
       "name": "write_new_file",
@@ -97,6 +97,30 @@
       },
       "expect_error": true,
       "error_contains": "Cannot write outside the working directory",
+      "expected": {}
+    },
+    {
+      "name": "conflict_write_requires_snapshot_token",
+      "description": "Tokenless conflict writes fail before Git inspection",
+      "input": {"path": "conflict://0", "content": "replacement"},
+      "expect_error": true,
+      "error_contains": "PI_CONFLICT_REFERENCE",
+      "expected": {}
+    },
+    {
+      "name": "conflict_batch_requires_choices",
+      "description": "An empty conflict batch is rejected before Git inspection",
+      "input": {"path": "conflict://*", "conflicts": []},
+      "expect_error": true,
+      "error_contains": "PI_CONFLICT_CHOICES",
+      "expected": {}
+    },
+    {
+      "name": "ordinary_write_rejects_conflict_choices",
+      "description": "Conflict fields must not be ignored on an ordinary write",
+      "input": {"path": "ordinary.txt", "content": "replacement", "conflicts": []},
+      "expect_error": true,
+      "error_contains": "conflicts requires path conflict://*",
       "expected": {}
     }
   ]

@@ -20,10 +20,15 @@
 //! - Frames are stored inside `CompactionEntry.details` under the
 //!   [`SNAPCOMPACT_DETAILS_KEY`] key with a versioned schema, so session
 //!   JSONL/SQLite persistence needs zero format changes.
+//! - Archive construction is streaming and bounded. If the complete visual
+//!   history exceeds its budget, the ordinary text summary remains authoritative.
 
 use crate::model::{ContentBlock, ImageContent, Message, TextContent, UserContent};
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+
+mod archive;
+mod replay;
+pub use archive::{SnapLimits, SnapRenderError, render_frames_with_limits};
 
 /// Schema tag stored with the frames inside `CompactionEntry.details`.
 pub const SNAPCOMPACT_DETAILS_SCHEMA: &str = "pi.compaction.snapcompact.v1";
@@ -197,55 +202,22 @@ fn draw_glyph(buf: &mut [u8], width: u32, height: u32, x: u32, y: u32, c: char, 
 ///
 /// Lines wrap at [`CHARS_PER_LINE`] columns; output taller than
 /// [`MAX_FRAME_HEIGHT`] splits across frames at line boundaries. An empty
-/// transcript produces no frames (callers stay text-only).
+/// transcript produces no frames. Archives exceeding [`SnapLimits::default`]
+/// also produce no frames, with a logged reason; callers retain the complete
+/// text summary rather than attaching a misleading partial visual archive.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
 pub fn render_frames(transcript: &str) -> Vec<SnapFrame> {
-    let mut wrapped: Vec<(String, Rgb)> = Vec::new();
-    for raw in transcript.lines() {
-        let color = color_for_line(raw);
-        let expanded = raw.replace('\t', "    ");
-        if expanded.is_empty() {
-            wrapped.push((String::new(), color));
-            continue;
-        }
-        let chars: Vec<char> = expanded.chars().map(normalize_char).collect();
-        for chunk in chars.chunks(CHARS_PER_LINE as usize) {
-            wrapped.push((chunk.iter().collect(), color));
+    match render_frames_with_limits(transcript, SnapLimits::default()) {
+        Ok(frames) => frames,
+        Err(error) => {
+            tracing::warn!(
+                target: "snapcompact",
+                reason_code = error.reason_code(),
+                "Visual archive exceeds its budget; retaining the text-only compaction summary"
+            );
+            Vec::new()
         }
     }
-
-    let total_frames = wrapped.len().div_ceil(LINES_PER_FRAME as usize).max(1);
-    let mut frames = Vec::with_capacity(total_frames);
-    for group in wrapped.chunks(LINES_PER_FRAME as usize) {
-        let height = PAD * 2 + u32::try_from(group.len()).unwrap_or(u32::MAX) * LINE_HEIGHT;
-        let mut buf = vec![0u8; (FRAME_WIDTH * height * 3) as usize];
-        // Background fill.
-        for px in buf.as_chunks_mut::<3>().0 {
-            *px = BACKGROUND;
-        }
-        for (li, (line, color)) in group.iter().enumerate() {
-            let y = PAD + u32::try_from(li).unwrap_or(0) * LINE_HEIGHT;
-            for (ci, ch) in line.chars().enumerate() {
-                draw_glyph(
-                    &mut buf,
-                    FRAME_WIDTH,
-                    height,
-                    PAD + u32::try_from(ci).unwrap_or(0) * CHAR_ADVANCE,
-                    y,
-                    ch,
-                    *color,
-                );
-            }
-        }
-        let png = png_encode(FRAME_WIDTH, height, &buf);
-        frames.push(SnapFrame {
-            png: base64::engine::general_purpose::STANDARD.encode(png),
-            width: FRAME_WIDTH,
-            height,
-        });
-    }
-    frames
 }
 
 // ── PNG encoding ────────────────────────────────────────────────────────────
@@ -312,6 +284,8 @@ pub fn png_encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 
 /// Merge a snapcompact payload into existing compaction details JSON,
 /// preserving all other keys (readFiles, modifiedFiles, mode, …).
+/// Invalid or over-budget archives remove any stale snapcompact value;
+/// unrelated details and the separately stored text summary are preserved.
 #[must_use]
 pub fn payload_to_details(
     existing: Option<serde_json::Value>,
@@ -322,6 +296,15 @@ pub fn payload_to_details(
         Some(Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
+    if let Err(error) = replay::validate_payload(payload, SnapLimits::default()) {
+        tracing::warn!(
+            target: "snapcompact",
+            reason_code = error.reason_code(),
+            "Visual archive was not persisted; retaining the text-only compaction summary"
+        );
+        details.remove(SNAPCOMPACT_DETAILS_KEY);
+        return Value::Object(details);
+    }
     if let Ok(v) = serde_json::to_value(payload) {
         details.insert(SNAPCOMPACT_DETAILS_KEY.to_string(), v);
     }
@@ -329,16 +312,23 @@ pub fn payload_to_details(
 }
 
 /// Extract validated snapcompact frames from compaction entry details.
-/// Returns `None` when absent or when the schema tag does not match exactly
-/// (fail-closed against foreign/malformed payloads).
+/// Returns `None` when absent, invalid, or over the local archive budget.
+/// Known fields are borrowed until the complete archive passes count, byte,
+/// geometry and native PNG integrity checks; unknown JSON fields are not cloned.
 #[must_use]
 pub fn frames_from_details(details: Option<&serde_json::Value>) -> Option<SnapPayload> {
     let value = details?.get(SNAPCOMPACT_DETAILS_KEY)?;
-    let payload: SnapPayload = serde_json::from_value(value.clone()).ok()?;
-    if payload.schema != SNAPCOMPACT_DETAILS_SCHEMA {
-        return None;
+    match replay::parse_payload(value, SnapLimits::default()) {
+        Ok(payload) => Some(payload),
+        Err(error) => {
+            tracing::warn!(
+                target: "snapcompact",
+                reason_code = error.reason_code(),
+                "Stored visual archive was rejected; retaining the text-only compaction summary"
+            );
+            None
+        }
     }
-    Some(payload)
 }
 
 /// Attach snapcompact frames to a freshly converted compaction-summary
@@ -346,16 +336,32 @@ pub fn frames_from_details(details: Option<&serde_json::Value>) -> Option<SnapPa
 /// without available frames is returned unchanged.
 ///
 /// Timestamps are preserved from the incoming message so context rebuilds
-/// stay deterministic relative to the source entry.
+/// stay deterministic relative to the source entry. Direct SDK payloads are
+/// validated too. Reattaching the same complete archive is a no-op; identical
+/// frames within an archive are not collapsed, since they may encode repeated
+/// history.
 #[must_use]
 pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Message {
     let Some(payload) = payload else {
         return message;
     };
-    if payload.frames.is_empty() {
+    if payload.frames.is_empty() || !matches!(&message, Message::User(_)) {
+        return message;
+    }
+    if let Err(error) = replay::validate_payload(payload, SnapLimits::default()) {
+        tracing::warn!(
+            target: "snapcompact",
+            reason_code = error.reason_code(),
+            "Visual archive was not attached; retaining the original summary message"
+        );
         return message;
     }
     if let Message::User(user) = &mut message {
+        if let UserContent::Blocks(existing) = &user.content
+            && has_archive_suffix(existing, &payload.frames)
+        {
+            return message;
+        }
         let mut blocks = match &user.content {
             UserContent::Text(text) => {
                 vec![ContentBlock::Text(TextContent::new(text.clone()))]
@@ -371,6 +377,16 @@ pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Mes
         user.content = UserContent::Blocks(blocks);
     }
     message
+}
+
+fn has_archive_suffix(blocks: &[ContentBlock], frames: &[SnapFrame]) -> bool {
+    let Some(start) = blocks.len().checked_sub(frames.len()) else {
+        return false;
+    };
+    blocks[start..].iter().zip(frames).all(|(block, frame)| {
+        matches!(block, ContentBlock::Image(image)
+            if image.mime_type == "image/png" && image.data == frame.png)
+    })
 }
 
 /// Outcome of vision gating over an outbound message list.

@@ -291,11 +291,10 @@ fn reload_and_dead_connections_retire_plans_without_new_servers() {
             return;
         };
         let preview = f.preview("rename");
-        let entry = lock(&f.tool.refactors.0)
-            .as_ref()
-            .unwrap()
-            .entry
-            .upgrade()
+        let entry = f
+            .tool
+            .registry
+            .entry_for_root("preview-peer", &f.root)
             .unwrap();
         if reload {
             f.execute(json!({"action":"reload"})).unwrap();
@@ -324,11 +323,10 @@ fn closing_and_reopening_identical_text_invalidates_document_identity() {
     };
     let preview = f.preview("rename");
     let path = f.root.join("source.preview");
-    let entry = lock(&f.tool.refactors.0)
-        .as_ref()
-        .unwrap()
-        .entry
-        .upgrade()
+    let entry = f
+        .tool
+        .registry
+        .entry_for_root("preview-peer", &f.root)
         .unwrap();
     entry.client.invalidate(&uri(&path));
     entry.client.ensure_synced(&path, "plaintext").unwrap();

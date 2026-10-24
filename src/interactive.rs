@@ -39,11 +39,11 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::agent::{
-    AbortHandle, Agent, AgentEvent, QueueMode, QueuedAgentMessage, SessionActionAdmissionGate,
+    AbortHandle, Agent, AgentEvent, AgentSession, QueueMode, QueuedAgentMessage,
+    SessionActionAdmissionGate,
 };
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
 use crate::config::{Config, ExtensionPolicyConfig, SettingsScope, parse_queue_mode_or_default};
-use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
     ExtensionManager, ExtensionSendMessage, ExtensionSendUserMessage, ExtensionSession,
@@ -51,8 +51,8 @@ use crate::extensions::{
 };
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
-    AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message as ModelMessage,
-    StopReason, TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
+    AssistantMessageEvent, ContentBlock, CustomMessage, Message as ModelMessage, StopReason,
+    TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::package_manager::PackageManager;
@@ -688,7 +688,7 @@ impl PiApp {
 
     async fn try_install_session(
         session: &Arc<Mutex<Session>>,
-        agent: &Arc<Mutex<Agent>>,
+        agent: &Arc<Mutex<InteractiveAgent>>,
         admission: &SessionActionAdmissionGate,
         new_session: Session,
         messages_for_agent: Vec<ModelMessage>,
@@ -711,6 +711,7 @@ impl PiApp {
         if let Some(level) = thinking_level {
             agent_guard.stream_options_mut().thinking_level = Some(level);
         }
+        agent_guard.session_was_replaced(crate::plan::replayed_plan_mode(&session_guard));
         admission.advance_generation();
         Ok(())
     }
@@ -1133,7 +1134,15 @@ impl PiApp {
             return;
         }
 
-        let session = Arc::clone(&self.session);
+        let Some(owner_session_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone())
+        else {
+            return;
+        };
+        let agent = Arc::clone(&self.agent);
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
@@ -1154,21 +1163,30 @@ impl PiApp {
         runtime_handle.spawn(async move {
             // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9), and
             // `RuntimeHandle::spawn` requires the future to be `Send`.
-            let mut session_guard =
-                match OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
+            let mut agent_guard = match OwnedMutexGuard::lock(agent, &task_cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to lock agent for saving: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
-            if let Err(err) = session_guard.save().await {
+            let current_session_id = agent_guard
+                .handle
+                .session()
+                .session
+                .try_lock()
+                .ok()
+                .map(|session| session.header.id.clone());
+            if current_session_id.as_deref() != Some(owner_session_id.as_str()) {
+                return;
+            }
+            if let Err(err) = agent_guard.handle.session_mut().persist_session().await {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &Cx::for_request(),
@@ -1523,6 +1541,7 @@ impl PiApp {
         }
 
         let path = path.to_string();
+        let runtime_cwd = self.cwd.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
         let admission = self.session_action_admission.clone();
@@ -1569,7 +1588,12 @@ impl PiApp {
                 }
             }
 
-            let mut loaded_session = match Session::open(&path).await {
+            let mut loaded_session = match crate::session_workdir::open_session_for_runtime(
+                std::path::Path::new(&path),
+                &runtime_cwd,
+            )
+            .await
+            {
                 Ok(session) => session,
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(
@@ -1641,21 +1665,23 @@ const fn bool_label(value: bool) -> &'static str {
 }
 
 /// Run the interactive mode.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub async fn run_interactive(
-    agent: Agent,
-    session: Arc<Mutex<Session>>,
+    agent_session: AgentSession,
     config: Config,
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
-    title_model_entry: Option<ModelEntry>,
+    title_client: Option<Arc<crate::session_title::TitleClient>>,
     pending_inputs: Vec<PendingInput>,
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     package_manager: PackageManager,
-    extensions: Option<ExtensionManager>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     workspace: WorkspaceHandle,
@@ -1663,16 +1689,27 @@ pub async fn run_interactive(
     btw_client: Option<Arc<pi::btw::BtwClient>>,
     btw_factory: Option<pi::btw::BtwClientFactory>,
     mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
+    failover: Option<crate::sdk::FailoverOptions>,
 ) -> anyhow::Result<()> {
+    let session = Arc::clone(&agent_session.session);
+    let extensions = agent_session
+        .extensions
+        .as_ref()
+        .map(|region| region.manager().clone());
     // Resolve the initial transcript before taking ownership of the terminal
     // or installing request/reply bridges. A lock failure can therefore
     // return normally without leaving the cursor hidden or UI senders open.
     let (messages, usage) = {
         let cx = Cx::for_request();
-        let guard = session
-            .lock(&cx)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to lock session: {e}"))?;
+        let guard = match session.lock(&cx).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                if let Some(region) = &agent_session.extensions {
+                    region.shutdown().await;
+                }
+                return Err(anyhow::anyhow!("Failed to lock session: {error}"));
+            }
+        };
         conversation_from_session(&guard)
     };
 
@@ -1717,7 +1754,6 @@ pub async fn run_interactive(
         });
     }
 
-    let extensions = extensions;
     let terminal_extensions = extensions.clone();
     let terminal_ask_tool = ask_tool.clone();
 
@@ -1773,10 +1809,10 @@ pub async fn run_interactive(
     // PI_NO_MOUSE_CAPTURE so terminal-native copy/paste keeps working
     // (Windows-specific UX win — see pi_agent_rust#78). When disabled,
     // users scroll with Page Up/Down or arrow keys instead.
+    let shutdown_owner;
     let program_result = {
-        let mut app = Box::new(PiApp::new(
-            agent,
-            session,
+        let mut app = Box::new(PiApp::from_agent_session(
+            agent_session,
             config,
             resources,
             resource_cli,
@@ -1784,18 +1820,21 @@ pub async fn run_interactive(
             model_entry,
             model_scope,
             available_models,
-            title_model_entry,
+            title_client,
             pending_inputs,
             event_tx,
             runtime_handle,
             save_enabled,
             true,
-            extensions,
             None,
             messages,
             usage,
             mcp_manager,
+            failover,
         ));
+        // Keep the actual AgentSession/ExtensionRegion alive until async
+        // shutdown finishes, even after the terminal program drops PiApp.
+        shutdown_owner = Arc::clone(&app.agent);
         // `/reload` must reuse the exact startup trust decision. Rebuilding a
         // default PackageManager here would silently re-enable project package
         // resolution in an untrusted workspace.
@@ -1832,7 +1871,17 @@ pub async fn run_interactive(
     }
     if let Some(manager) = &terminal_extensions {
         manager.close_ui_sender_and_cancel_pending();
+        let _ = manager
+            .dispatch_event(ExtensionEventName::SessionShutdown, None)
+            .await;
+        if !manager
+            .shutdown(ExtensionManager::DEFAULT_CLEANUP_BUDGET)
+            .await
+        {
+            tracing::warn!("classic extension shutdown exceeded its cleanup budget");
+        }
     }
+    drop(shutdown_owner);
 
     // Tell the async bridge to exit promptly even if some background task still
     // holds an event sender clone after the TUI has already shut down.
@@ -1897,6 +1946,15 @@ pub struct FtuiStatusSnapshot {
 pub enum PiMsg {
     /// Agent started processing.
     AgentStart,
+    /// Delimits assistant output so a retry discards only the incomplete
+    /// response, preserving output from completed tool cycles in the turn.
+    AssistantMessageStart,
+    /// Automatic provider recovery is visible without marking the turn idle.
+    ProviderRecovery {
+        message: String,
+        model: Option<(String, String)>,
+        discard_incomplete: bool,
+    },
     /// Trigger processing of the next queued input (CLI startup messages).
     RunPending,
     /// Enqueue an input only while its originating session remains current.
@@ -1925,6 +1983,13 @@ pub enum PiMsg {
     /// state the line shows. The charmed stack renders its own and ignores
     /// this.
     StatusSnapshot(FtuiStatusSnapshot),
+    /// Saved/effective preferences for the default stack's settings editor.
+    /// `changed` names the only live display preference to update.
+    #[cfg(feature = "ftui")]
+    Settings {
+        snapshot: crate::interactive_ftui::SettingsSnapshot,
+        changed: Option<crate::interactive_ftui::SettingsKey>,
+    },
     /// The user messages on the current path, oldest first, as
     /// `(summary, entry id)`, for the FTUI's `/branch` and double-Esc picker.
     /// `fork` means the pick forks a new session instead of rewinding in
@@ -1977,8 +2042,13 @@ pub enum PiMsg {
         stop_reason: StopReason,
         error_message: Option<String>,
     },
-    /// Auto-titling result: a tiny/smol-role model suggested a session name
-    /// (bd-cv653.3.1). Applied only if the session is still unnamed.
+    /// A durably completed turn stopped at its time cap; queued input stays paused.
+    AgentTimeCap {
+        usage: Option<Usage>,
+        message: String,
+    },
+    /// A background title was durably installed. The UI only acknowledges
+    /// it while the same session and name remain current.
     SessionTitleSuggestion {
         owner_session_id: String,
         title: String,
@@ -1996,8 +2066,29 @@ pub enum PiMsg {
         owner_session_id: String,
         message: String,
     },
+    /// Classic terminal review completion, scoped to its session and request.
+    ReviewFinished {
+        owner_session_id: String,
+        request_id: String,
+        message: String,
+    },
+    /// Only the matching operator request can end an MCP authentication wait.
+    McpAuthFinished { request_id: String, message: String },
+    /// A terminal handoff reply can settle only the request that admitted it.
+    HandoffFinished {
+        request_id: String,
+        event: Box<Self>,
+    },
     /// Update last user message content (input transform/redaction).
     UpdateLastUserMessage(String),
+    /// Display driver-submitted input that did not pass through the editor.
+    /// Startup prompts use this once, before the corresponding agent turn.
+    UserInputSubmitted {
+        owner_session_id: String,
+        text: String,
+        /// Authored input only; display text may include generated file bodies.
+        history_text: String,
+    },
     /// Bash command result (non-agent).
     BashResult {
         display: String,
@@ -2029,6 +2120,11 @@ pub enum PiMsg {
     },
     /// Set the editor contents (used by /tree selection of user/custom messages).
     SetEditorText {
+        owner_session_id: String,
+        text: String,
+    },
+    /// Return unclaimed turn input without replacing a newer editor draft.
+    RestorePendingInput {
         owner_session_id: String,
         text: String,
     },
@@ -2651,6 +2747,42 @@ fn apply_editor_keybinding_overrides(keybindings: &KeyBindings, input: &mut Text
     }
 }
 
+/// The classic UI's live agent and its durable Session have one owner.
+///
+/// Idle editor operations access the Agent through this owner; complete user
+/// turns use its SDK handle so persistence, retry and failover share the same
+/// admission authority and state for the lifetime of the UI.
+pub struct InteractiveAgent {
+    handle: crate::sdk::AgentSessionHandle,
+}
+
+impl InteractiveAgent {
+    /// Called only after a new, loaded, or durably forked Session and its
+    /// matching transcript have been installed together under both locks.
+    fn session_was_replaced(&mut self, plan_mode: crate::plan::PlanMode) {
+        self.handle.session_mut().invalidate_background_compaction();
+        self.handle
+            .session_mut()
+            .agent
+            .reset_session_scoped_state(plan_mode);
+        self.handle.session().provider_admission_gate().clear();
+    }
+}
+
+impl std::ops::Deref for InteractiveAgent {
+    type Target = Agent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle.session().agent
+    }
+}
+
+impl std::ops::DerefMut for InteractiveAgent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle.session_mut().agent
+    }
+}
+
 /// The main interactive TUI application model.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
@@ -2661,6 +2793,7 @@ pub struct PiApp {
     history: HistoryList,
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
+    pending_inputs_paused_by_time_cap: bool,
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
     injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
 
@@ -2694,6 +2827,8 @@ pub struct PiApp {
     messages: Vec<ConversationMessage>,
     current_response: String,
     current_thinking: String,
+    current_assistant_start: (usize, usize),
+    discard_incomplete_on_next_assistant: bool,
     thinking_visible: bool,
     tools_expanded: bool,
     current_tool: Option<String>,
@@ -2740,9 +2875,12 @@ pub struct PiApp {
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
     model: String,
-    agent: Arc<Mutex<Agent>>,
+    agent: Arc<Mutex<InteractiveAgent>>,
     save_enabled: bool,
     abort_handle: Option<AbortHandle>,
+    review_request_id: Option<String>,
+    handoff_request_id: Option<String>,
+    mcp_auth_request_id: Option<String>,
     bash_running: bool,
 
     // Token tracking
@@ -2795,11 +2933,12 @@ pub struct PiApp {
     /// role-aware features (advisor, plan mode, titling) as they land.
     role_model_overrides: std::collections::HashMap<crate::models::ModelRole, (String, String)>,
 
-    /// Model used for automatic session titling (tiny/smol role), or None
-    /// when titling is disabled/unresolvable (bd-cv653.3.1).
-    title_model_entry: Option<ModelEntry>,
+    /// Bounded, authenticated tiny/smol completion for automatic naming.
+    title_client: Option<Arc<crate::session_title::TitleClient>>,
     /// Guard so titling fires at most once per session.
     title_requested: bool,
+    /// Dropping the UI or replacing its session cancels provider work.
+    title_cancellation: Option<crate::session_title::TitleCancellation>,
 
     // Track last Ctrl+C time for double-tap quit detection
     last_ctrlc_time: Option<std::time::Instant>,
@@ -2949,14 +3088,14 @@ impl PiApp {
     pub fn new(
         agent: Agent,
         session: Arc<Mutex<Session>>,
-        mut config: Config,
+        config: Config,
         resources: ResourceLoader,
         resource_cli: ResourceCliOptions,
         cwd: PathBuf,
         model_entry: ModelEntry,
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
-        title_model_entry: Option<ModelEntry>,
+        title_client: Option<Arc<crate::session_title::TitleClient>>,
         pending_inputs: Vec<PendingInput>,
         event_tx: mpsc::Sender<PiMsg>,
         runtime_handle: RuntimeHandle,
@@ -2968,6 +3107,87 @@ impl PiApp {
         total_usage: Usage,
         mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
     ) -> Self {
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            save_enabled,
+            crate::compaction::ResolvedCompactionSettings {
+                enabled: config.compaction_enabled(),
+                reserve_tokens: config.compaction_reserve_tokens(),
+                keep_recent_tokens: config.compaction_keep_recent_tokens(),
+                context_window_tokens: if model_entry.model.context_window == 0 {
+                    crate::compaction::ResolvedCompactionSettings::default().context_window_tokens
+                } else {
+                    model_entry.model.context_window
+                },
+                mode: config.compaction_mode(),
+                render_mode: config.compaction_render_mode(),
+            },
+        )
+        .with_runtime_handle(runtime_handle.clone());
+        agent_session.extensions = extensions.map(crate::extensions::ExtensionRegion::new);
+        Self::from_agent_session(
+            agent_session,
+            config,
+            resources,
+            resource_cli,
+            cwd,
+            model_entry,
+            model_scope,
+            available_models,
+            title_client,
+            pending_inputs,
+            event_tx,
+            runtime_handle,
+            save_enabled,
+            persist_startup_settings,
+            keybindings_override,
+            messages,
+            total_usage,
+            mcp_manager,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn from_agent_session(
+        mut agent_session: AgentSession,
+        mut config: Config,
+        resources: ResourceLoader,
+        resource_cli: ResourceCliOptions,
+        cwd: PathBuf,
+        model_entry: ModelEntry,
+        model_scope: Vec<ModelEntry>,
+        available_models: Vec<ModelEntry>,
+        title_client: Option<Arc<crate::session_title::TitleClient>>,
+        pending_inputs: Vec<PendingInput>,
+        event_tx: mpsc::Sender<PiMsg>,
+        runtime_handle: RuntimeHandle,
+        save_enabled: bool,
+        persist_startup_settings: bool,
+        keybindings_override: Option<KeyBindings>,
+        messages: Vec<ConversationMessage>,
+        total_usage: Usage,
+        mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
+        failover: Option<crate::sdk::FailoverOptions>,
+    ) -> Self {
+        let session = Arc::clone(&agent_session.session);
+        // Keep the authoritative routes, including unready models, and admit
+        // entries supplied by embedders before extensions receive this catalog.
+        let mut registry = agent_session.model_registry().cloned().unwrap_or_default();
+        registry.merge_missing_entries(available_models.clone());
+        registry.merge_missing_entries(vec![model_entry.clone()]);
+        agent_session.set_model_registry(registry);
+        let extensions = agent_session
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().clone());
+        let session_action_admission = agent_session.session_action_admission_gate();
+        let provider_admission = agent_session.provider_admission_gate();
+        let extension_model_catalog = agent_session.extension_model_catalog();
+        if let Some(manager) = &mcp_manager {
+            agent_session.set_mcp_manager(Arc::clone(manager));
+        }
         // Get terminal size
         let (term_width, term_height) =
             terminal::size().map_or((80, 24), |(w, h)| (w as usize, h as usize));
@@ -3023,7 +3243,7 @@ impl PiApp {
             follow_up_mode,
         )));
 
-        let mut agent = agent;
+        let agent = &mut agent_session.agent;
         agent.set_queue_modes(steering_mode, follow_up_mode);
         {
             let steering_queue = Arc::clone(&message_queue);
@@ -3118,12 +3338,24 @@ impl PiApp {
             .try_lock()
             .ok()
             .map(|session| session.header.id.clone());
+        // A resumed conversation already has an established topic. Automatic
+        // naming is admitted only for a new session's first exchange.
+        let title_requested = !agent_session.agent.messages().is_empty();
+        let agent = InteractiveAgent {
+            handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                agent_session,
+                crate::sdk::EventListeners::default(),
+            )
+            .with_retry(crate::failover::RetryPolicy::from_config(&config))
+            .with_failover(failover),
+        };
         let mut app = Self {
             input,
             workspace: WorkspaceHandle::default(),
             history: HistoryList::new(),
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
+            pending_inputs_paused_by_time_cap: false,
             message_queue,
             injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
@@ -3139,6 +3371,8 @@ impl PiApp {
             messages,
             current_response: String::new(),
             current_thinking: String::new(),
+            current_assistant_start: (0, 0),
+            discard_incomplete_on_next_assistant: false,
             thinking_visible,
             tools_expanded: true,
             current_tool: None,
@@ -3148,7 +3382,7 @@ impl PiApp {
             pending_tool_output: None,
             todo_summary: None,
             session,
-            session_action_admission: SessionActionAdmissionGate::default(),
+            session_action_admission,
             displayed_session_id,
             config,
             theme,
@@ -3183,14 +3417,18 @@ impl PiApp {
             status_message: None,
             save_enabled,
             abort_handle: None,
+            review_request_id: None,
+            handoff_request_id: None,
+            mcp_auth_request_id: None,
             bash_running: false,
             pending_oauth: None,
             extensions,
             mcp_manager,
             keybindings,
             role_model_overrides: std::collections::HashMap::new(),
-            title_model_entry,
-            title_requested: false,
+            title_client,
+            title_requested,
+            title_cancellation: None,
             last_ctrlc_time: None,
             last_escape_time: None,
             autocomplete,
@@ -3219,10 +3457,12 @@ impl PiApp {
             let session_handle = Arc::new(InteractiveExtensionSession {
                 session: Arc::clone(&app.session),
                 model_entry: model_entry_shared,
+                model_catalog: extension_model_catalog,
                 is_streaming: extension_streaming,
                 is_compacting: extension_compacting,
                 config: app.config.clone(),
                 save_enabled: app.save_enabled,
+                provider_admission,
                 session_action_admission: app.session_action_admission.clone(),
             });
             manager.set_session(session_handle);
@@ -3260,7 +3500,7 @@ impl PiApp {
     }
 
     #[must_use]
-    pub fn agent_handle(&self) -> Arc<Mutex<Agent>> {
+    pub fn agent_handle(&self) -> Arc<Mutex<InteractiveAgent>> {
         Arc::clone(&self.agent)
     }
 

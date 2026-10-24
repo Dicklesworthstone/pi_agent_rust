@@ -3,16 +3,92 @@
 //!
 //! v1 is fully native: regex rule packs (versioned in-tree, project
 //! overrides under `.pi/security-rules/`), a per-project disposition store
-//! (`.pi/security-dispositions.json`), and an optional OSV dependency lookup
-//! that degrades to a warning offline. Code never leaves the machine.
+//! (`.pi/security-dispositions.json`). These source operations are offline;
+//! the separate dependency engine owns explicit network lookups.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+
+mod operation;
+mod storage;
+
+const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SCAN_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SCOPE_FILES: usize = 20_000;
+const MAX_FINDINGS: usize = 10_000;
+
+fn scan_error(message: impl Into<String>) -> Error {
+    Error::tool(
+        "security_scan",
+        format!("[SOURCE_SCAN_INCOMPLETE] {}", message.into()),
+    )
+}
+
+// A failed read is not a binary-file classification. Check regular-file type
+// and cap the read itself, not just a racy metadata length. NONBLOCK prevents
+// a Unix FIFO substituted after traversal from hanging a blocking worker.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    operation::checkpoint()?;
+    let metadata =
+        fs::metadata(path).map_err(|_| scan_error(format!("cannot inspect {}", path.display())))?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(scan_error(format!(
+            "{} must be a regular file of at most {limit} bytes",
+            path.display()
+        )));
+    }
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        fs::File::from(
+            rustix::fs::open(
+                path,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|_| scan_error(format!("cannot open {}", path.display())))?,
+        )
+    };
+    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
+    let file =
+        fs::File::open(path).map_err(|_| scan_error(format!("cannot open {}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| scan_error(format!("cannot inspect opened {}", path.display())))?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(scan_error(format!(
+            "{} changed type or exceeds its byte limit",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    let mut reader = file.take(limit + 1);
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        operation::checkpoint()?;
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|_| scan_error(format!("cannot read {}", path.display())))?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    operation::checkpoint()?;
+    if bytes.len() as u64 > limit {
+        return Err(scan_error(format!(
+            "{} grew beyond its byte limit",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
 
 pub const SCAN_SCHEMA: &str = "pi.security-scan/v1";
 /// SARIF version emitted by `run`.
@@ -24,7 +100,9 @@ pub const SARIF_SCHEMA_URI: &str = "https://raw.githubusercontent.com/oasis-tcs/
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
     pub id: String,
-    /// Regex matched per line (multi-line rules may embed `(?s)`).
+    /// Regex over the complete file, with line-aware ^/$ and CRLF handling.
+    /// Explicit newlines, whitespace classes and inline flags retain their
+    /// regex meaning; no textual flag heuristic selects a different engine.
     pub pattern: String,
     /// error | warning | note
     pub severity: String,
@@ -146,29 +224,50 @@ fixHint = "Canonicalize and check against allowed roots."
 /// `<project>/.pi/security-rules/*.toml`. A malformed project pack is a
 /// named error (fail loud — silently dropping security rules is worse).
 pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
+    operation::checkpoint()?;
     let mut packs: Vec<RulePack> = vec![toml::from_str(DEFAULT_PACK).map_err(|e| {
         Error::validation(format!("embedded security rule pack failed to parse: {e}"))
     })?];
     let overrides = project_root.join(".pi").join("security-rules");
-    if overrides.is_dir() {
-        let mut entries: Vec<PathBuf> = fs::read_dir(&overrides)
-            .map_err(|e| {
-                Error::tool(
-                    "security_scan",
-                    format!("read {}: {e}", overrides.display()),
-                )
-            })?
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
-            .collect();
+    let has_overrides = match fs::symlink_metadata(&overrides) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => return Err(scan_error("project security-rules path is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            return Err(scan_error(
+                "cannot inspect project security-rules directory",
+            ));
+        }
+    };
+    if has_overrides {
+        let reader = fs::read_dir(&overrides).map_err(|e| {
+            Error::tool(
+                "security_scan",
+                format!("read {}: {e}", overrides.display()),
+            )
+        })?;
+        let mut entries = Vec::new();
+        for entry in reader {
+            operation::checkpoint()?;
+            let path = entry
+                .map_err(|_| scan_error("cannot enumerate every project security rule pack"))?
+                .path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                if entries.len() == 64 {
+                    return Err(scan_error(
+                        "project rule packs exceed 64; narrow the rule inventory",
+                    ));
+                }
+                entries.push(path);
+            }
+        }
         entries.sort();
         for path in entries {
-            let text = fs::read_to_string(&path).map_err(|e| {
-                Error::tool("security_scan", format!("read {}: {e}", path.display()))
-            })?;
+            operation::checkpoint()?;
+            let text = String::from_utf8(read_bounded(&path, 1024 * 1024)?)
+                .map_err(|_| scan_error(format!("rule pack {} is not UTF-8", path.display())))?;
             let pack: RulePack = toml::from_str(&text)
-                .map_err(|e| Error::validation(format!("rule pack {}: {e}", path.display())))?;
+                .map_err(|_| scan_error(format!("rule pack {} is malformed", path.display())))?;
             packs.push(pack);
         }
     }
@@ -178,7 +277,11 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
 /// Scope a scan: explicit paths, or the project root. Directories walk
 /// gitignore-respecting file lists via the repo's ignore machinery.
 fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
+    operation::checkpoint()?;
+    if paths.len() > 256 {
+        return Err(scan_error("at most 256 scan roots may be selected"));
+    }
+    let mut files = BTreeSet::new();
     let roots: Vec<PathBuf> = if paths.is_empty() {
         vec![cwd.to_path_buf()]
     } else {
@@ -188,16 +291,17 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
             .collect::<Result<Vec<_>>>()?
     };
     for root in roots {
+        operation::checkpoint()?;
         // A mistyped scope must not yield a false-clean "0 findings".
-        if !root.exists() {
-            return Err(Error::validation(format!(
-                "security_scan scope path does not exist: {}",
+        let metadata = fs::metadata(&root).map_err(|_| {
+            scan_error(format!(
+                "scope path does not exist or cannot be inspected: {}",
                 root.display()
-            )));
-        }
-        if root.is_file() {
-            files.push(root);
-        } else if root.is_dir() {
+            ))
+        })?;
+        if metadata.is_file() {
+            files.insert(root);
+        } else if metadata.is_dir() {
             // `.hidden(false)` so dotfiles are scanned: `.env`, `.npmrc`,
             // `.aws/credentials` and CI workflow files are the classic
             // secret carriers. `.git/` itself is still skipped below.
@@ -206,30 +310,64 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
                 .git_ignore(true)
                 .filter_entry(|entry| entry.file_name() != ".git")
                 .build();
-            for entry in walker.flatten() {
+            for entry in walker {
+                operation::checkpoint()?;
+                let entry = entry.map_err(|_| {
+                    scan_error(format!(
+                        "cannot completely traverse scope {}",
+                        root.display()
+                    ))
+                })?;
+                // Walk errors can accompany an otherwise usable entry (for
+                // example an invalid ignore file). Such a scope is not proven.
+                if entry.error().is_some() {
+                    return Err(scan_error(format!(
+                        "invalid ignore rules while traversing {}",
+                        root.display()
+                    )));
+                }
                 let path = entry.path();
-                if path.is_file() {
-                    files.push(path.to_path_buf());
+                let metadata = fs::metadata(path).map_err(|_| {
+                    scan_error(format!("cannot inspect discovered {}", path.display()))
+                })?;
+                if metadata.is_file() {
+                    files.insert(path.to_path_buf());
+                    if files.len() > MAX_SCOPE_FILES {
+                        return Err(scan_error("scan exceeds 20000 files; narrow paths"));
+                    }
+                } else if !metadata.is_dir() {
+                    return Err(scan_error(format!(
+                        "unsupported non-regular scan entry {}",
+                        path.display()
+                    )));
                 }
             }
+        } else {
+            return Err(scan_error(format!(
+                "scope {} is not a file or directory",
+                root.display()
+            )));
+        }
+        if files.len() > MAX_SCOPE_FILES {
+            return Err(scan_error("scan exceeds 20000 files; narrow paths"));
         }
     }
-    files.sort();
-    files.dedup();
-    Ok(files)
+    Ok(files.into_iter().collect())
 }
 
-/// A rule compiled for scanning: regex, optional glob scope, multi-line flag.
+/// A rule compiled for scanning: whole-file regex and optional glob scope.
 struct CompiledRule {
     rule: Rule,
     regex: regex::Regex,
     applies_to: Option<globset::GlobSet>,
-    multi_line: bool,
 }
 
 impl CompiledRule {
     fn build(rule: &Rule) -> Result<Self> {
-        let regex = regex::Regex::new(&rule.pattern)
+        let regex = regex::RegexBuilder::new(&rule.pattern)
+            .multi_line(true)
+            .crlf(true)
+            .build()
             .map_err(|e| Error::validation(format!("rule {} pattern invalid: {e}", rule.id)))?;
         // Validate the severity vocabulary at load: an unknown severity
         // would count as "active" while appearing in no summary bucket.
@@ -252,70 +390,110 @@ impl CompiledRule {
                 Error::validation(format!("rule {} applies_to globs: {e}", rule.id))
             })?)
         };
-        let multi_line = rule.pattern.contains("(?s)") || rule.pattern.contains("(?s");
         Ok(Self {
             rule: rule.clone(),
             regex,
             applies_to,
-            multi_line,
+        })
+    }
+
+    fn applies_to_path(&self, path: &Path) -> bool {
+        self.applies_to.as_ref().is_none_or(|globs| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            globs.is_match(path) || globs.is_match(name)
         })
     }
 }
 
+// Component normalization keeps ./src, src/ and src equivalent without
+// admitting parent traversal. Use one platform-independent separator in
+// finding identities, so scan and compare do not disagree about the scope.
+fn relative_key(path: &Path) -> Result<String> {
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| scan_error("source path is not UTF-8"))?;
+                if part.chars().any(char::is_control) {
+                    return Err(scan_error("source path contains control characters"));
+                }
+                parts.push(part);
+            }
+            _ => return Err(scan_error("source path must stay relative to the project")),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
 /// Run compiled rules over one file, returning findings with paths relative
-/// to `cwd`. Binary/undecodable files are skipped.
-fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec<Finding>) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return; // binary or unreadable — regex packs only scan text
-    };
+/// to `cwd`. The caller has already completed a bounded UTF-8 read.
+fn scan_file(
+    cwd: &Path,
+    path: &Path,
+    content: &str,
+    rules: &[CompiledRule],
+    findings: &mut Vec<Finding>,
+) -> Result<()> {
     let rel = path
         .strip_prefix(cwd)
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf);
-    let rel_display = rel.display().to_string();
-    // Per (rule, matched-text) occurrence counter within this file, so
-    // identical matches get distinct fingerprints.
-    let mut occurrences: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut push = |rule: &Rule, line_no: usize, matched: &str, out: &mut Vec<Finding>| {
-        let counter = occurrences
-            .entry((rule.id.clone(), matched.to_string()))
-            .or_insert(0);
-        let occurrence = *counter;
-        *counter += 1;
-        out.push(Finding {
-            rule_id: rule.id.clone(),
-            severity: rule.severity.clone(),
-            message: rule.message.clone(),
-            path: rel_display.clone(),
-            line: u32::try_from(line_no).unwrap_or(u32::MAX),
-            fingerprint: fingerprint(&rule.id, &rel_display, matched, occurrence),
-            fix_hint: rule.fix_hint.clone(),
-        });
-    };
+    let rel_display = relative_key(&rel)?;
     for compiled in rules {
-        if let Some(globs) = &compiled.applies_to {
-            let name = rel.file_name().map_or("", |n| n.to_str().unwrap_or(""));
-            // Match both the relative path (`src/*.rs` style globs) and the
-            // bare file name (`*.rs`, `Dockerfile*` style globs).
-            if !globs.is_match(&rel) && !globs.is_match(name) {
-                continue;
-            }
+        operation::checkpoint()?;
+        if !compiled.applies_to_path(Path::new(&rel_display)) {
+            continue;
         }
-        if compiled.multi_line {
-            // `(?s)` rules span lines: match the whole file and derive the
-            // line from the match offset (line-based iteration can never
-            // fire these — a silent false-negative factory).
-            for m in compiled.regex.find_iter(&content) {
-                let line_no = content[..m.start()].matches('\n').count() + 1;
-                push(&compiled.rule, line_no, m.as_str(), findings);
+        // Borrow match text from this file and discard the counters after
+        // each rule. Long matches never create a second retained payload.
+        let mut occurrences: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut cursor = 0;
+        let mut line_no = 1_usize;
+        for matched in compiled.regex.find_iter(content) {
+            operation::checkpoint()?;
+            if findings.len() >= MAX_FINDINGS {
+                return Err(scan_error("scan exceeds 10000 findings; narrow paths"));
             }
-        } else {
-            for (idx, line) in content.lines().enumerate() {
-                for m in compiled.regex.find_iter(line) {
-                    push(&compiled.rule, idx + 1, m.as_str(), findings);
+            // Ordered match offsets let us account for each prefix byte
+            // once per rule instead of rescanning from byte zero per hit.
+            for index in cursor..matched.start() {
+                let byte = content.as_bytes()[index];
+                if byte == b'\n'
+                    || byte == b'\r' && content.as_bytes().get(index + 1) != Some(&b'\n')
+                {
+                    line_no += 1;
                 }
             }
+            cursor = matched.start();
+            let counter = occurrences.entry(matched.as_str()).or_insert(0);
+            let occurrence = *counter;
+            *counter += 1;
+            let rule = &compiled.rule;
+            findings.push(Finding {
+                rule_id: rule.id.clone(),
+                severity: rule.severity.clone(),
+                message: rule.message.clone(),
+                path: rel_display.clone(),
+                line: u32::try_from(line_no).unwrap_or(u32::MAX),
+                fingerprint: fingerprint(&rule.id, &rel_display, matched.as_str(), occurrence),
+                fix_hint: rule.fix_hint.clone(),
+            });
         }
     }
+    Ok(())
+}
+
+struct ScanOutcome {
+    findings: Vec<Finding>,
+    scanned: BTreeSet<String>,
+    skipped_non_utf8: Vec<String>,
+    bytes_read: usize,
 }
 
 /// Compile + run the packs over the scope. Rules with un compilable patterns
@@ -323,23 +501,59 @@ fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec
 /// factory).
 pub fn run_scan(cwd: &Path, paths: &[String]) -> Result<Vec<Finding>> {
     let packs = load_rule_packs(cwd)?;
+    Ok(scan_with_packs(cwd, paths, &packs)?.findings)
+}
+
+fn compile_rules(packs: &[RulePack]) -> Result<Vec<CompiledRule>> {
     let mut compiled: Vec<CompiledRule> = Vec::new();
-    for pack in &packs {
+    let mut ids = BTreeSet::new();
+    for pack in packs {
         for rule in &pack.rules {
+            operation::checkpoint()?;
+            if compiled.len() >= 1024 || rule.id.trim().is_empty() || !ids.insert(&rule.id) {
+                return Err(scan_error(
+                    "rule inventory exceeds 1024 or contains empty/duplicate IDs",
+                ));
+            }
             compiled.push(CompiledRule::build(rule)?);
         }
     }
-    let mut findings = Vec::new();
+    Ok(compiled)
+}
+
+// The same loaded packs drive detection and SARIF metadata. Loading twice
+// could attribute findings to different rules after a concurrent pack change.
+fn scan_with_packs(cwd: &Path, paths: &[String], packs: &[RulePack]) -> Result<ScanOutcome> {
+    let compiled = compile_rules(packs)?;
+    let mut outcome = ScanOutcome {
+        findings: Vec::new(),
+        scanned: BTreeSet::new(),
+        skipped_non_utf8: Vec::new(),
+        bytes_read: 0,
+    };
     for file in scope_files(cwd, paths)? {
-        scan_file(cwd, &file, &compiled, &mut findings);
+        operation::checkpoint()?;
+        let bytes = read_bounded(&file, MAX_SOURCE_BYTES)?;
+        outcome.bytes_read = outcome
+            .bytes_read
+            .checked_add(bytes.len())
+            .filter(|total| *total <= MAX_SCAN_BYTES)
+            .ok_or_else(|| scan_error("scan exceeds 256 MiB; narrow paths"))?;
+        let relative = relative_key(file.strip_prefix(cwd).unwrap_or(&file))?;
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            outcome.skipped_non_utf8.push(relative);
+            continue;
+        };
+        scan_file(cwd, &file, content, &compiled, &mut outcome.findings)?;
+        outcome.scanned.insert(relative);
     }
-    findings.sort_by(|a, b| {
+    outcome.findings.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
             .then(a.line.cmp(&b.line))
             .then(a.rule_id.cmp(&b.rule_id))
     });
-    Ok(findings)
+    Ok(outcome)
 }
 
 /// SARIF level for our severity vocabulary.
@@ -349,6 +563,23 @@ fn sarif_level(severity: &str) -> &'static str {
         "note" => "note",
         _ => "warning",
     }
+}
+
+fn rule_digest(rule: &Rule) -> String {
+    use sha2::Digest as _;
+    // Bind executable matching semantics, not just a user-reused rule ID.
+    // Serialize a tuple so map ordering cannot change the commitment.
+    let bytes = serde_json::to_vec(&(
+        "pi-source-whole-file-regex/v1",
+        &rule.id,
+        &rule.pattern,
+        &rule.severity,
+        &rule.message,
+        &rule.fix_hint,
+        &rule.applies_to,
+    ))
+    .expect("rule fields are strings and string lists");
+    crate::package_manager::hex_encode(&sha2::Sha256::digest(bytes))
 }
 
 /// Emit a SARIF v2.1.0 document for findings (post-disposition filtering
@@ -366,6 +597,7 @@ pub fn to_sarif(
                     "id": r.id,
                     "shortDescription": { "text": r.message },
                     "defaultConfiguration": { "level": sarif_level(&r.severity) },
+                    "properties": { "piSourceRuleDigest": rule_digest(r) },
                 })
             })
         })
@@ -438,53 +670,23 @@ fn confine_to_cwd(cwd: &Path, raw: &str, field: &str) -> Result<PathBuf> {
     Ok(cwd.join(candidate))
 }
 
-fn dispositions_path(project_root: &Path) -> PathBuf {
-    project_root.join(".pi").join("security-dispositions.json")
-}
-
 /// Missing store → empty map; unparseable store → error.
 ///
 /// Silently treating a corrupt store as empty would un-suppress every
 /// finding and, on the next `disposition`, overwrite it — destroying all
 /// prior dispositions.
 pub fn load_dispositions(project_root: &Path) -> Result<BTreeMap<String, Disposition>> {
-    let path = dispositions_path(project_root);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => {
-            return Err(Error::tool(
-                "security_scan",
-                format!("read {}: {e}", path.display()),
-            ));
-        }
-    };
-    serde_json::from_str(&text).map_err(|e| {
-        Error::validation(format!(
-            "corrupt disposition store {} ({e}); repair or move it aside before scanning",
-            path.display()
-        ))
-    })
+    storage::Storage::open(project_root)?.load()
 }
 
+/// Atomically replace a complete validated snapshot. For concurrent individual
+/// decisions use the tool's `disposition` operation, which holds a lock across
+/// read/merge/publication. This SDK snapshot API is intentionally replacement.
 pub fn save_dispositions(
     project_root: &Path,
     dispositions: &BTreeMap<String, Disposition>,
 ) -> Result<()> {
-    let path = dispositions_path(project_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            Error::tool("security_scan", format!("create {}: {e}", parent.display()))
-        })?;
-    }
-    let text = serde_json::to_string_pretty(dispositions)
-        .map_err(|e| Error::validation(format!("serialize dispositions: {e}")))?;
-    // Temp + rename: a crash mid-write must not leave a truncated store.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text)
-        .map_err(|e| Error::tool("security_scan", format!("write {}: {e}", tmp.display())))?;
-    fs::rename(&tmp, &path)
-        .map_err(|e| Error::tool("security_scan", format!("persist {}: {e}", path.display())))
+    storage::Storage::open(project_root)?.save(dispositions)
 }
 
 /// Partition findings into active vs dispositioned (status false-positive or
@@ -556,53 +758,172 @@ pub fn compare(
     }
 }
 
-/// Read a prior SARIF document back into findings (for `compare`).
-pub fn findings_from_sarif(text: &str) -> Vec<Finding> {
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let Some(results) = doc.pointer("/runs/0/results").and_then(|r| r.as_array()) else {
-        return out;
-    };
-    for result in results {
-        let Some(rule_id) = result.get("ruleId").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let path = result
-            .pointer("/locations/0/physicalLocation/artifactLocation/uri")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let line = result
-            .pointer("/locations/0/physicalLocation/region/startLine")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX));
-        let message = result
-            .pointer("/message/text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let fingerprint_value = result
-            .pointer("/fingerprints/pi~1v1")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        out.push(Finding {
-            rule_id: rule_id.to_string(),
-            severity: result
-                .get("level")
-                .and_then(|v| v.as_str())
-                .unwrap_or("warning")
-                .to_string(),
-            message,
+// Typed native fields reject duplicate JSON keys before they can collapse to
+// a different identity. Unrelated SARIF metadata is deliberately not projected
+// into findings or error diagnostics.
+#[derive(Deserialize)]
+struct SourceDocument {
+    version: String,
+    runs: Vec<SourceRun>,
+}
+#[derive(Deserialize)]
+struct SourceRun {
+    tool: SourceTool,
+    results: Vec<SourceResult>,
+    #[serde(default)]
+    invocations: Vec<SourceInvocation>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceInvocation {
+    execution_successful: bool,
+}
+#[derive(Deserialize)]
+struct SourceTool {
+    driver: SourceDriver,
+}
+#[derive(Deserialize)]
+struct SourceDriver {
+    name: String,
+    rules: Vec<SourceRule>,
+}
+#[derive(Deserialize)]
+struct SourceRule {
+    id: String,
+    properties: Option<SourceRuleProperties>,
+}
+#[derive(Deserialize)]
+struct SourceRuleProperties {
+    #[serde(rename = "piSourceRuleDigest")]
+    digest: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceResult {
+    rule_id: String,
+    level: String,
+    message: SourceMessage,
+    locations: Vec<SourceLocation>,
+    fingerprints: SourceFingerprints,
+}
+#[derive(Deserialize)]
+struct SourceMessage {
+    text: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceLocation {
+    physical_location: SourcePhysicalLocation,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourcePhysicalLocation {
+    artifact_location: SourceArtifactLocation,
+    region: SourceRegion,
+}
+#[derive(Deserialize)]
+struct SourceArtifactLocation {
+    uri: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceRegion {
+    start_line: u32,
+}
+#[derive(Deserialize)]
+struct SourceFingerprints {
+    #[serde(rename = "pi/v1")]
+    identity: String,
+}
+
+struct SourceBaseline {
+    findings: Vec<Finding>,
+    rules: BTreeMap<String, Option<String>>,
+}
+
+fn invalid_baseline() -> Error {
+    Error::validation(
+        "[SOURCE_BASELINE_INVALID] expected one bounded native source SARIF run with valid, unique finding identities; regenerate the baseline instead of treating it as empty",
+    )
+}
+
+fn lowercase_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn source_baseline(text: &str) -> Result<SourceBaseline> {
+    if text.len() as u64 > MAX_SOURCE_BYTES {
+        return Err(invalid_baseline());
+    }
+    let doc: SourceDocument = serde_json::from_str(text).map_err(|_| invalid_baseline())?;
+    if doc.version != SARIF_VERSION || doc.runs.len() != 1 {
+        return Err(invalid_baseline());
+    }
+    let run = doc.runs.into_iter().next().ok_or_else(invalid_baseline)?;
+    if run.tool.driver.name != "pi security_scan"
+        || run.results.len() > MAX_FINDINGS
+        || run.tool.driver.rules.len() > 1024
+        || run
+            .invocations
+            .iter()
+            .any(|invocation| !invocation.execution_successful)
+    {
+        return Err(invalid_baseline());
+    }
+    let mut rules = BTreeMap::new();
+    for rule in run.tool.driver.rules {
+        let digest = rule.properties.and_then(|properties| properties.digest);
+        if rule.id.trim().is_empty()
+            || digest
+                .as_ref()
+                .is_some_and(|digest| !lowercase_hex(digest, 64))
+            || rules.insert(rule.id, digest).is_some()
+        {
+            return Err(invalid_baseline());
+        }
+    }
+    let mut identities = BTreeSet::new();
+    let mut findings = Vec::new();
+    for result in run.results {
+        if !rules.contains_key(&result.rule_id)
+            || result.locations.len() != 1
+            || !matches!(result.level.as_str(), "error" | "warning" | "note")
+            || !lowercase_hex(&result.fingerprints.identity, 16)
+            || !identities.insert(result.fingerprints.identity.clone())
+        {
+            return Err(invalid_baseline());
+        }
+        let location = result
+            .locations
+            .into_iter()
+            .next()
+            .ok_or_else(invalid_baseline)?
+            .physical_location;
+        let path = relative_key(Path::new(&location.artifact_location.uri))
+            .map_err(|_| invalid_baseline())?;
+        if path.is_empty() || path.len() > 4096 || location.region.start_line == 0 {
+            return Err(invalid_baseline());
+        }
+        findings.push(Finding {
+            rule_id: result.rule_id,
+            severity: result.level,
+            message: result.message.text,
             path,
-            line,
-            fingerprint: fingerprint_value,
+            line: location.region.start_line,
+            fingerprint: result.fingerprints.identity,
             fix_hint: None,
         });
     }
-    out
+    Ok(SourceBaseline { findings, rules })
+}
+
+/// Read a native source SARIF document. Malformed, partial, multi-run or
+/// dependency reports are errors, never an empty successful finding set.
+pub fn findings_from_sarif(text: &str) -> Result<Vec<Finding>> {
+    Ok(source_baseline(text)?.findings)
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +1013,7 @@ impl Tool for SecurityScanTool {
                     "items": { "type": "string" },
                     "description": "Files/dirs to scope (relative to cwd); default: whole project"
                 },
-                "sarifOut": { "type": "string", "description": "run: SARIF output path (default .pi/security-scan.sarif)" },
+                "sarifOut": { "type": "string", "description": "run: NEW workspace-relative .sarif export, never overwritten; omit to atomically replace .pi/security-scan.sarif" },
                 "fingerprint": { "type": "string", "description": "disposition: finding fingerprint" },
                 "status": {
                     "type": "string",
@@ -727,7 +1048,7 @@ impl Tool for SecurityScanTool {
         let tool = Self {
             cwd: self.cwd.clone(),
         };
-        asupersync::runtime::spawn_blocking(move || match op.as_str() {
+        operation::run(move || match op.as_str() {
             "plan" => tool.op_plan(&parsed),
             "run" => tool.op_run(&parsed),
             "disposition" => tool.op_disposition(&parsed),
@@ -743,6 +1064,7 @@ impl Tool for SecurityScanTool {
 impl SecurityScanTool {
     fn op_plan(&self, input: &ScanInput) -> Result<ToolOutput> {
         let packs = load_rule_packs(&self.cwd)?;
+        compile_rules(&packs)?;
         let files = scope_files(&self.cwd, &input.paths)?;
         let rule_count: usize = packs.iter().map(|p| p.rules.len()).sum();
         let details = json!({
@@ -776,31 +1098,32 @@ impl SecurityScanTool {
 
     fn op_run(&self, input: &ScanInput) -> Result<ToolOutput> {
         use std::fmt::Write as _;
+        // Pin the publication workspace before scanning or other long work.
+        let storage = storage::Storage::open(&self.cwd)?;
+        let relative = storage::report_path(
+            input
+                .sarif_out
+                .as_deref()
+                .unwrap_or(storage::DEFAULT_REPORT),
+        )?;
         let packs = load_rule_packs(&self.cwd)?;
-        let findings = run_scan(&self.cwd, &input.paths)?;
-        let dispositions = load_dispositions(&self.cwd)?;
-        let (active, suppressed) = partition_by_disposition(findings, &dispositions);
-        let sarif = to_sarif(&active, &suppressed, &packs);
-        let out_path = match input.sarif_out.as_deref() {
-            None => self.cwd.join(".pi/security-scan.sarif"),
-            Some(p) => confine_to_cwd(&self.cwd, p, "sarifOut")?,
-        };
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                Error::tool("security_scan", format!("create {}: {e}", parent.display()))
-            })?;
+        let outcome = scan_with_packs(&self.cwd, &input.paths, &packs)?;
+        let dispositions = storage.load()?;
+        let (active, suppressed) = partition_by_disposition(outcome.findings, &dispositions);
+        let mut sarif = to_sarif(&active, &suppressed, &packs);
+        sarif["runs"][0]["invocations"] = json!([{ "executionSuccessful": true }]);
+        sarif["runs"][0]["properties"] = json!({
+            "scannedTextFiles": outcome.scanned.len(),
+            "skippedNonUtf8Files": outcome.skipped_non_utf8,
+            "bytesRead": outcome.bytes_read,
+        });
+        let out_path = self.cwd.join(relative);
+        let encoded = serde_json::to_vec_pretty(&sarif)
+            .map_err(|_| scan_error("source report could not be serialized"))?;
+        if encoded.len() as u64 > MAX_SOURCE_BYTES {
+            return Err(scan_error("source report exceeds 16 MiB; narrow paths"));
         }
-        fs::write(
-            &out_path,
-            serde_json::to_string_pretty(&sarif)
-                .map_err(|e| Error::validation(format!("serialize SARIF: {e}")))?,
-        )
-        .map_err(|e| {
-            Error::tool(
-                "security_scan",
-                format!("write {}: {e}", out_path.display()),
-            )
-        })?;
+        storage.write_report(input.sarif_out.as_deref(), &encoded)?;
         let by_severity = |sev: &str| active.iter().filter(|f| f.severity == sev).count();
         let details = json!({
             "schema": SCAN_SCHEMA,
@@ -810,7 +1133,11 @@ impl SecurityScanTool {
             "errors": by_severity("error"),
             "warnings": by_severity("warning"),
             "notes": by_severity("note"),
-            "findings": active,
+            "findings": active.iter().take(50).collect::<Vec<_>>(),
+            "findingsTruncated": active.len() > 50,
+            "scannedTextFiles": outcome.scanned.len(),
+            "skippedNonUtf8Files": outcome.skipped_non_utf8.len(),
+            "bytesRead": outcome.bytes_read,
         });
         let mut text = format!(
             "Security scan: {} active finding(s) ({} error, {} warning, {} note), {} suppressed. SARIF: {}",
@@ -820,6 +1147,12 @@ impl SecurityScanTool {
             by_severity("note"),
             suppressed.len(),
             out_path.display()
+        );
+        let _ = write!(
+            text,
+            "\nScanned {} UTF-8 file(s); {} non-UTF-8 file(s) were not assessed (listed in SARIF).",
+            outcome.scanned.len(),
+            outcome.skipped_non_utf8.len()
         );
         for finding in active.iter().take(20) {
             let _ = write!(
@@ -860,8 +1193,7 @@ impl SecurityScanTool {
             .clone()
             .filter(|r| !r.trim().is_empty())
             .ok_or_else(|| Error::validation("security_scan disposition requires reason"))?;
-        let mut dispositions = load_dispositions(&self.cwd)?;
-        dispositions.insert(
+        let count = storage::Storage::open(&self.cwd)?.update(
             fingerprint.clone(),
             Disposition {
                 status: status.clone(),
@@ -870,31 +1202,26 @@ impl SecurityScanTool {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             },
-        );
-        save_dispositions(&self.cwd, &dispositions)?;
+        )?;
         Ok(scan_text_output(
             format!("Disposition recorded: {fingerprint} → {status}."),
             json!({
                 "schema": SCAN_SCHEMA,
                 "fingerprint": fingerprint,
                 "status": status,
-                "dispositions": dispositions.len(),
+                "dispositions": count,
             }),
         ))
     }
 
     fn op_compare(&self, input: &ScanInput) -> Result<ToolOutput> {
-        let baseline_path = match input.baseline.as_deref() {
-            None => self.cwd.join(".pi/security-scan.sarif"),
-            Some(p) => confine_to_cwd(&self.cwd, p, "baseline")?,
-        };
-        let text = fs::read_to_string(&baseline_path).map_err(|e| {
-            Error::tool(
-                "security_scan",
-                format!("read baseline {}: {e}", baseline_path.display()),
-            )
-        })?;
-        let mut previous = findings_from_sarif(&text);
+        let storage = storage::Storage::open(&self.cwd)?;
+        let selected = input.baseline.as_deref().unwrap_or(storage::DEFAULT_REPORT);
+        let baseline_path = self.cwd.join(storage::report_path(selected)?);
+        let text =
+            String::from_utf8(storage.read_report(selected)?).map_err(|_| invalid_baseline())?;
+        let baseline = source_baseline(&text)?;
+        let mut previous = baseline.findings;
         // Scope-narrowed compare: baseline findings outside the requested
         // paths are invisible to the current scan and would all read as
         // "fixed". Restrict the baseline to the same scope.
@@ -902,35 +1229,569 @@ impl SecurityScanTool {
             let scope: Vec<String> = input
                 .paths
                 .iter()
-                .map(|p| p.trim_end_matches('/').to_string())
-                .collect();
+                .map(|p| relative_key(Path::new(p)))
+                .collect::<Result<_>>()?;
             previous.retain(|finding| {
                 scope.iter().any(|prefix| {
-                    finding.path == *prefix || finding.path.starts_with(&format!("{prefix}/"))
+                    prefix.is_empty()
+                        || finding.path == *prefix
+                        || finding.path.starts_with(&format!("{prefix}/"))
                 })
             });
         }
-        let current = run_scan(&self.cwd, &input.paths)?;
-        let dispositions = load_dispositions(&self.cwd)?;
-        let report = compare(&previous, &current, &dispositions);
-        let details = serde_json::to_value(&report)
-            .map_err(|e| Error::validation(format!("serialize compare: {e}")))?;
-        Ok(scan_text_output(
+        let packs = load_rule_packs(&self.cwd)?;
+        let current = scan_with_packs(&self.cwd, &input.paths, &packs)?;
+        let dispositions = storage.load()?;
+        let mut report = compare(&previous, &current.findings, &dispositions);
+        let current_rules: BTreeMap<_, _> = compile_rules(&packs)?
+            .into_iter()
+            .map(|rule| {
+                let digest = rule_digest(&rule.rule);
+                (rule.rule.id.clone(), (rule, digest))
+            })
+            .collect();
+        // Absence is meaningful only when we actually inspected this file
+        // with the same rule. Encoding changes, ignore changes, removed files,
+        // removed/glob-narrowed rules and legacy unbound rules are unassessed,
+        // not evidence of a fix. Persistent matches remain visible either way.
+        let (fixed, unassessed): (Vec<_>, Vec<_>) = report.fixed.into_iter().partition(|finding| {
+            current.scanned.contains(&finding.path)
+                && current_rules
+                    .get(&finding.rule_id)
+                    .is_some_and(|(rule, digest)| {
+                        rule.applies_to_path(Path::new(&finding.path))
+                            && baseline
+                                .rules
+                                .get(&finding.rule_id)
+                                .and_then(Option::as_ref)
+                                == Some(digest)
+                    })
+        });
+        report.fixed = fixed;
+        // Computed outside `json!`: inside the macro a leading `[...]` is parsed
+        // as a JSON array literal, so a method call on it does not compile.
+        let truncated = [
+            report.new.len(),
+            report.fixed.len(),
+            report.regressed.len(),
+            unassessed.len(),
+        ]
+        .into_iter()
+        .any(|count| count > 50);
+        let details = json!({
+            "new": report.new.iter().take(50).collect::<Vec<_>>(),
+            "fixed": report.fixed.iter().take(50).collect::<Vec<_>>(),
+            "regressed": report.regressed.iter().take(50).collect::<Vec<_>>(),
+            "unassessed": unassessed.iter().take(50).collect::<Vec<_>>(),
+            "counts": { "new": report.new.len(), "fixed": report.fixed.len(),
+                "regressed": report.regressed.len(), "unassessed": unassessed.len() },
+            "truncated": truncated,
+        });
+        let mut output = scan_text_output(
             format!(
-                "Compare vs {}: {} new, {} fixed, {} regressed.",
+                "Compare vs {}: {} new, {} fixed, {} regressed, {} unassessed. Fixed means no longer matched in a successfully read file under the unchanged rule, not proof of exploitability or remediation.",
                 baseline_path.display(),
                 report.new.len(),
                 report.fixed.len(),
-                report.regressed.len()
+                report.regressed.len(),
+                unassessed.len(),
             ),
-            json!({ "schema": SCAN_SCHEMA, "report": details }),
-        ))
+            json!({ "schema": SCAN_SCHEMA, "comparisonComplete": unassessed.is_empty(), "report": details }),
+        );
+        output.is_error = !unassessed.is_empty();
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_input(value: Value) -> ScanInput {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn pattern_rule(pattern: &str) -> CompiledRule {
+        CompiledRule::build(&Rule {
+            id: "test.pattern".into(),
+            pattern: pattern.into(),
+            severity: "warning".into(),
+            message: "test match".into(),
+            fix_hint: None,
+            applies_to: vec![],
+        })
+        .unwrap()
+    }
+
+    fn pattern_findings(pattern: &str, content: &str) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        scan_file(
+            Path::new("."),
+            Path::new("./code.rs"),
+            content,
+            &[pattern_rule(pattern)],
+            &mut findings,
+        )
+        .unwrap();
+        findings
+    }
+
+    #[test]
+    fn default_rules_detect_multiline_formatted_calls_and_secret_assignments() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "a".repeat(32);
+        let content = format!(
+            concat!(
+                "// 🦀 heading\r\n",
+                "api_key =\r\n",
+                "\"{secret}\";\r\n",
+                "execute(\r\n",
+                "format!(\"SELECT {{}}\", request));\r\n",
+                "Command::new(\r\n",
+                "format!(\"{{}}\", request));\r\n",
+                "path.join(\r\n",
+                "request);\r\n",
+            ),
+            secret = secret
+        );
+        fs::write(dir.path().join("code.rs"), content).unwrap();
+        let findings = run_scan(dir.path(), &["code.rs".into()]).unwrap();
+        for (id, line) in [
+            ("secret.generic-api-key", 2),
+            ("injection.sql-format", 4),
+            ("injection.shell-format", 6),
+            ("traversal.join-unsanitized", 8),
+        ] {
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == id && finding.line == line),
+                "missing {id} at {line}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn newline_classes_and_equivalent_flag_spellings_use_one_matching_engine() {
+        for pattern in [
+            r"alpha\nbeta",
+            r"alpha\s+beta",
+            r"alpha[^Z]+beta",
+            r"(?is:alpha.*beta)",
+            r"(?si:alpha.*beta)",
+        ] {
+            let findings = pattern_findings(pattern, "heading\nalpha\nbeta\ntrailer");
+            assert_eq!(findings.len(), 1, "{pattern}");
+            assert_eq!(findings[0].line, 2, "{pattern}");
+        }
+        assert!(pattern_findings(r"\Aalpha", "heading\nalpha").is_empty());
+        assert!(pattern_findings(r"(?-m:^alpha)", "heading\nalpha").is_empty());
+        assert!(pattern_findings(r"beta\z", "beta\ntrailer").is_empty());
+        assert_eq!(
+            pattern_findings(r"^alpha$", "heading\nalpha\ntrailer").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn line_mapping_and_fingerprints_are_stable_across_unicode_and_line_endings() {
+        for separator in ["\n", "\r\n", "\r"] {
+            let content = ["🦀 heading", "hit", "hit", "tail"].join(separator);
+            let findings = pattern_findings(r"^hit$", &content);
+            assert_eq!(
+                findings
+                    .iter()
+                    .map(|finding| finding.line)
+                    .collect::<Vec<_>>(),
+                [2, 3]
+            );
+            for (occurrence, finding) in findings.iter().enumerate() {
+                assert_eq!(finding.path, "code.rs");
+                assert_eq!(
+                    finding.fingerprint,
+                    fingerprint("test.pattern", "code.rs", "hit", occurrence)
+                );
+            }
+        }
+        let many = pattern_findings("hit", &"🦀 hit\r\n".repeat(1000));
+        assert_eq!(many.len(), 1000);
+        assert_eq!(many[999].line, 1000);
+        assert_eq!(
+            many[999].fingerprint,
+            fingerprint("test.pattern", "code.rs", "hit", 999)
+        );
+    }
+
+    fn native_baseline() -> Value {
+        let packs = packs();
+        let finding = Finding {
+            rule_id: "deserialization.unsafe-pickle".into(),
+            severity: "warning".into(),
+            message: "review".into(),
+            path: "src/code.py".into(),
+            line: 1,
+            fingerprint: fingerprint(
+                "deserialization.unsafe-pickle",
+                "src/code.py",
+                "pickle.loads",
+                0,
+            ),
+            fix_hint: None,
+        };
+        to_sarif(&[finding], &[], &packs)
+    }
+
+    #[test]
+    fn native_baseline_rejects_malformed_rows_failed_runs_and_wrong_namespaces() {
+        for (pointer, replacement) in [
+            ("/version", json!("1.0")),
+            ("/runs/0/tool/driver/name", json!("pi dependency audit")),
+            ("/runs/0/results", Value::Null),
+            ("/runs/0/results/0/ruleId", json!("unknown")),
+            ("/runs/0/results/0/level", json!("none")),
+            (
+                "/runs/0/results/0/fingerprints/pi~1v1",
+                json!("PRIVATE-CANARY"),
+            ),
+            (
+                "/runs/0/results/0/locations/0/physicalLocation/region/startLine",
+                json!(0),
+            ),
+            (
+                "/runs/0/results/0/locations/0/physicalLocation/artifactLocation/uri",
+                json!("../escape"),
+            ),
+        ] {
+            let mut doc = native_baseline();
+            *doc.pointer_mut(pointer).unwrap() = replacement;
+            let failure = findings_from_sarif(&doc.to_string())
+                .unwrap_err()
+                .to_string();
+            assert!(failure.contains("SOURCE_BASELINE_INVALID"));
+            assert!(!failure.contains("PRIVATE-CANARY"));
+        }
+        for text in ["PRIVATE-CANARY", "{}", "{\"runs\":[]}"] {
+            assert!(findings_from_sarif(text).is_err());
+        }
+        let mut doc = native_baseline();
+        doc["runs"][0]["invocations"] = json!([{"executionSuccessful":false}]);
+        assert!(findings_from_sarif(&doc.to_string()).is_err());
+        let mut duplicate = native_baseline();
+        let result = duplicate["runs"][0]["results"][0].clone();
+        duplicate["runs"][0]["results"]
+            .as_array_mut()
+            .unwrap()
+            .push(result);
+        assert!(findings_from_sarif(&duplicate.to_string()).is_err());
+        let mut multiple = native_baseline();
+        let run = multiple["runs"][0].clone();
+        multiple["runs"].as_array_mut().unwrap().push(run);
+        assert!(findings_from_sarif(&multiple.to_string()).is_err());
+        assert!(
+            findings_from_sarif(&to_sarif(&[], &[], &packs()).to_string())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_native_json_fields_cannot_collapse_to_an_accepted_identity() {
+        let text = native_baseline().to_string();
+        for (needle, injected) in [
+            ("\"runs\":", "\"runs\":[],\"runs\":"),
+            ("\"results\":", "\"results\":[],\"results\":"),
+            ("\"ruleId\":", "\"ruleId\":\"PRIVATE-CANARY\",\"ruleId\":"),
+            ("\"pi/v1\":", "\"pi/v1\":\"PRIVATE-CANARY\",\"pi/v1\":"),
+        ] {
+            assert!(text.contains(needle));
+            let duplicate = text.replacen(needle, injected, 1);
+            let failure = findings_from_sarif(&duplicate).unwrap_err().to_string();
+            assert!(!failure.contains("PRIVATE-CANARY"));
+        }
+    }
+
+    fn comparison_fixture() -> (tempfile::TempDir, SecurityScanTool) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/code.py"), "pickle.loads(data)\n").unwrap();
+        let tool = SecurityScanTool::new(dir.path());
+        tool.op_run(&scan_input(
+            json!({"op":"run","paths":["src"],"sarifOut":"baseline.sarif"}),
+        ))
+        .unwrap();
+        (dir, tool)
+    }
+
+    #[test]
+    fn compare_does_not_call_encoding_exclusions_ignored_or_removed_files_fixed() {
+        for kind in ["encoding", "ignored", "removed"] {
+            let (dir, tool) = comparison_fixture();
+            match kind {
+                "encoding" => fs::write(dir.path().join("src/code.py"), [0xff, 0xfe]).unwrap(),
+                "ignored" => fs::write(dir.path().join("src/.ignore"), "code.py\n").unwrap(),
+                _ => {
+                    fs::rename(dir.path().join("src/code.py"), dir.path().join("saved.py"))
+                        .unwrap();
+                }
+            }
+            let output = tool
+                .op_compare(&scan_input(json!({
+                    "op":"compare","paths":["./src/"],"baseline":"baseline.sarif"
+                })))
+                .unwrap();
+            assert!(output.is_error, "{kind}");
+            let details = output.details.unwrap();
+            assert_eq!(details["report"]["counts"]["fixed"], 0, "{kind}");
+            assert_eq!(details["report"]["counts"]["unassessed"], 1, "{kind}");
+            assert_eq!(details["comparisonComplete"], false);
+        }
+    }
+
+    #[test]
+    fn completed_scan_under_the_same_rules_confirms_absence_with_normalized_scope() {
+        let (dir, tool) = comparison_fixture();
+        fs::write(dir.path().join("src/code.py"), "pass\n").unwrap();
+        for paths in [json!(["src"]), json!(["./src/"]), json!(["."]), json!([])] {
+            let output = tool
+                .op_compare(&scan_input(json!({
+                    "op":"compare","paths":paths,"baseline":"baseline.sarif"
+                })))
+                .unwrap();
+            assert!(!output.is_error);
+            let details = output.details.unwrap();
+            assert_eq!(details["report"]["counts"]["fixed"], 1);
+            assert_eq!(details["report"]["counts"]["unassessed"], 0);
+            assert_eq!(details["comparisonComplete"], true);
+        }
+    }
+
+    #[test]
+    fn changed_or_unbound_rule_definitions_cannot_establish_a_fix() {
+        let (dir, tool) = comparison_fixture();
+        fs::write(dir.path().join("src/code.py"), "pass\n").unwrap();
+        let baseline_path = dir.path().join("baseline.sarif");
+        let original: Value = serde_json::from_slice(&fs::read(&baseline_path).unwrap()).unwrap();
+        for digest in [Some("0".repeat(64)), None] {
+            let mut doc = original.clone();
+            for rule in doc["runs"][0]["tool"]["driver"]["rules"]
+                .as_array_mut()
+                .unwrap()
+            {
+                if rule["id"] == "deserialization.unsafe-pickle" {
+                    rule["properties"] = digest
+                        .as_ref()
+                        .map_or_else(|| json!({}), |digest| json!({"piSourceRuleDigest":digest}));
+                }
+            }
+            fs::write(&baseline_path, doc.to_string()).unwrap();
+            let output = tool
+                .op_compare(&scan_input(json!({
+                    "op":"compare","paths":["src"],"baseline":"baseline.sarif"
+                })))
+                .unwrap();
+            let details = output.details.unwrap();
+            assert_eq!(details["report"]["counts"]["fixed"], 0);
+            assert_eq!(details["report"]["counts"]["unassessed"], 1);
+        }
+        let mut rule = pattern_rule("first").rule;
+        let before = rule_digest(&rule);
+        rule.pattern = "second".into();
+        assert_ne!(rule_digest(&rule), before);
+        rule.pattern = "first".into();
+        rule.applies_to.push("*.py".into());
+        assert_ne!(rule_digest(&rule), before);
+    }
+
+    #[test]
+    fn public_source_tool_scan_and_compare_preserve_uncertainty_and_baseline_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("code.py");
+        fs::write(&source, "pickle.loads(data)\n").unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .worker_threads(2)
+            .blocking_threads(1, 8)
+            .build()
+            .unwrap();
+        let tool = crate::security_scan::SecurityScanTool::new(dir.path());
+        let first = runtime
+            .block_on(tool.execute(
+                "scan",
+                json!({
+                    "op":"run","paths":["code.py"],"sarifOut":"baseline.sarif"
+                }),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(first.details.unwrap()["active"], 1);
+        let baseline = fs::read(dir.path().join("baseline.sarif")).unwrap();
+        fs::write(&source, [0xff, 0xfe]).unwrap();
+        let second = runtime
+            .block_on(tool.execute(
+                "compare",
+                json!({
+                    "op":"compare","paths":["code.py"],"baseline":"baseline.sarif"
+                }),
+                None,
+            ))
+            .unwrap();
+        assert!(second.is_error);
+        assert_eq!(second.details.unwrap()["report"]["counts"]["unassessed"], 1);
+        assert_eq!(
+            fs::read(dir.path().join("baseline.sarif")).unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn bounded_reads_distinguish_io_failures_from_non_utf8_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        fs::write(&path, [0xff, 0x00, 0x41, 0x42]).unwrap();
+        assert_eq!(read_bounded(&path, 4).unwrap(), [0xff, 0x00, 0x41, 0x42]);
+        assert!(read_bounded(&path, 3).is_err());
+        assert!(read_bounded(dir.path(), 100).is_err());
+        fs::rename(&path, dir.path().join("moved.bin")).unwrap();
+        let failure = read_bounded(&path, 100).unwrap_err().to_string();
+        assert!(failure.contains("SOURCE_SCAN_INCOMPLETE"));
+    }
+
+    #[test]
+    fn source_scan_reports_unassessed_encoding_in_summary_and_sarif() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("clean.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("opaque.bin"), [0xff, 0xfe, 0x00]).unwrap();
+        let tool = SecurityScanTool::new(dir.path());
+        let output = tool
+            .op_run(&scan_input(json!({"op":"run",
+            "paths":["clean.rs","opaque.bin"], "sarifOut":"report.sarif"})))
+            .unwrap();
+        let details = output.details.unwrap();
+        assert_eq!(details["scannedTextFiles"], 1);
+        assert_eq!(details["skippedNonUtf8Files"], 1);
+        assert_eq!(details["active"], 0);
+        let saved: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("report.sarif")).unwrap()).unwrap();
+        assert_eq!(
+            saved["runs"][0]["properties"]["skippedNonUtf8Files"],
+            json!(["opaque.bin"])
+        );
+        assert_eq!(saved["runs"][0]["properties"]["scannedTextFiles"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_discovered_entry_cannot_replace_an_existing_success_report() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/clean.rs"), "fn main() {}\n").unwrap();
+        std::os::unix::fs::symlink("missing.rs", dir.path().join("src/unreadable.rs")).unwrap();
+        let report = dir.path().join("report.sarif");
+        fs::write(&report, "preserve previous completed scan").unwrap();
+        let tool = SecurityScanTool::new(dir.path());
+        for op in ["plan", "run"] {
+            let input = scan_input(json!({"op":op,"paths":["src"],"sarifOut":"report.sarif"}));
+            let result = if op == "run" {
+                tool.op_run(&input)
+            } else {
+                tool.op_plan(&input)
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("SOURCE_SCAN_INCOMPLETE")
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&report).unwrap(),
+            "preserve previous completed scan"
+        );
+    }
+
+    #[test]
+    fn invalid_rule_directory_and_malformed_pack_never_fall_back_to_default_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let pi = dir.path().join(".pi");
+        fs::create_dir(&pi).unwrap();
+        fs::write(pi.join("security-rules"), "not a directory").unwrap();
+        assert!(load_rule_packs(dir.path()).is_err());
+        fs::rename(pi.join("security-rules"), pi.join("saved-invalid-rules")).unwrap();
+        fs::create_dir(pi.join("security-rules")).unwrap();
+        fs::write(
+            pi.join("security-rules/bad.toml"),
+            "name = PRIVATE-CANARY [",
+        )
+        .unwrap();
+        let failure = load_rule_packs(dir.path()).unwrap_err().to_string();
+        assert!(failure.contains("malformed"));
+        assert!(!failure.contains("PRIVATE-CANARY"));
+    }
+
+    #[test]
+    fn project_rule_ids_cannot_override_or_collide_with_the_embedded_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join(".pi/security-rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(
+            rules.join("duplicate.toml"),
+            r#"
+name = "collision"
+version = "1"
+[[rules]]
+id = "secret.aws-access-key"
+pattern = "never-match"
+severity = "note"
+message = "collision"
+"#,
+        )
+        .unwrap();
+        let tool = SecurityScanTool::new(dir.path());
+        assert!(tool.op_plan(&scan_input(json!({"op":"plan"}))).is_err());
+        assert!(run_scan(dir.path(), &[]).is_err());
+    }
+
+    #[test]
+    fn oversized_source_and_finding_budget_never_publish_a_partial_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.py");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
+        drop(file);
+        let input = scan_input(json!({"op":"run","paths":["large.py"],"sarifOut":"result.sarif"}));
+        let tool = SecurityScanTool::new(dir.path());
+        assert!(tool.op_run(&input).is_err());
+        assert!(!dir.path().join("result.sarif").exists());
+        fs::write(&path, "pickle.loads(data)\n".repeat(MAX_FINDINGS + 1)).unwrap();
+        assert!(
+            tool.op_run(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("10000 findings")
+        );
+        assert!(!dir.path().join("result.sarif").exists());
+    }
+
+    #[test]
+    fn tool_preview_is_bounded_while_saved_findings_remain_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("code.py"),
+            "pickle.loads(data)\n".repeat(51),
+        )
+        .unwrap();
+        let output = SecurityScanTool::new(dir.path())
+            .op_run(&scan_input(json!({
+                "op":"run","paths":["code.py"],"sarifOut":"report.sarif"
+            })))
+            .unwrap();
+        let details = output.details.unwrap();
+        assert_eq!(details["active"], 51);
+        assert_eq!(details["findings"].as_array().unwrap().len(), 50);
+        assert_eq!(details["findingsTruncated"], true);
+        let saved: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("report.sarif")).unwrap()).unwrap();
+        assert_eq!(saved["runs"][0]["results"].as_array().unwrap().len(), 51);
+    }
 
     fn packs() -> Vec<RulePack> {
         load_rule_packs(Path::new("/nonexistent-root")).expect("default pack parses")
@@ -1051,7 +1912,7 @@ mod tests {
         let sarif = to_sarif(std::slice::from_ref(&finding), &[], &packs);
         assert_eq!(sarif["version"].as_str(), Some(SARIF_VERSION));
         let text = serde_json::to_string(&sarif).expect("serialize");
-        let back = findings_from_sarif(&text);
+        let back = findings_from_sarif(&text).expect("valid native source report");
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].rule_id, finding.rule_id);
         assert_eq!(back[0].fingerprint, finding.fingerprint);

@@ -18,6 +18,7 @@ mod pull_diagnostics;
 mod request;
 #[cfg(test)]
 mod test_server;
+pub(in crate::lsp) mod workspace;
 pub use file_uri::{path_to_uri, try_path_to_uri, uri_to_path};
 
 const WAIT_TICK: Duration = Duration::from_millis(10);
@@ -116,6 +117,9 @@ struct OpenDoc {
     language_id: String,
     text: std::sync::Arc<str>,
     opened: bool,
+    // Accepted pushes for this document incarnation. An exhausted counter
+    // never authorizes a pull, so saturation cannot make old output current.
+    push_generation: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,10 +132,17 @@ pub struct ServerCapabilities {
 
 pub struct LspClient {
     rpc: JsonRpcClient,
+    workspace: std::sync::Arc<workspace::Workspace>,
     root: PathBuf,
     root_uri: String,
     open_docs: Mutex<HashMap<String, OpenDoc>>,
     diagnostics: Mutex<HashMap<String, Vec<Value>>>,
+    // Serialize draining and applying notifications, retaining the loss
+    // generation so older queued reports cannot restore invalidated state.
+    notification_generation: Mutex<u64>,
+    // Request-owned fragments share the ordered notification router; snapshot
+    // readers must not silently consume another caller's partial results.
+    partial_results: Mutex<request::PartialResults>,
     pull_reports: Mutex<pull_diagnostics::ReportCache>,
     request_lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
     capabilities: Mutex<ServerCapabilities>,
@@ -150,19 +161,34 @@ impl LspClient {
         env: &[(String, String)],
         root: &Path,
         initialization_options: Option<&Value>,
+        settings: Option<&Value>,
         timeout: Duration,
     ) -> Result<Self> {
+        // Reject invalid configured settings before a server can run. The
+        // same snapshot answers reverse requests during initialize, then is
+        // pushed only after initialized, as required by the protocol.
+        let budget = request::RequestBudget::new(timeout);
+        let settings = settings.map(workspace::Settings::parse).transpose()?;
+        if settings.is_some() {
+            crate::lsp::refactor_preview::check_owner(&AgentCx::for_current_or_request())?;
+        }
+        budget.remaining()?;
         // Resolve the workspace before spawning; never send an ambiguous or
         // relative native path as the server's document root.
         let root = root.canonicalize()?;
         let root_uri = try_path_to_uri(&root)?;
+        let workspace =
+            std::sync::Arc::new(workspace::Workspace::new(&root_uri, settings.as_ref())?);
         let rpc = JsonRpcClient::spawn(command, args, env, &root)?;
         let client = Self {
             rpc,
+            workspace,
             root,
             root_uri: root_uri.clone(),
             open_docs: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
+            notification_generation: Mutex::new(0),
+            partial_results: Mutex::new(request::PartialResults::default()),
             pull_reports: Mutex::new(pull_diagnostics::ReportCache::default()),
             request_lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
             capabilities: Mutex::new(ServerCapabilities::default()),
@@ -170,6 +196,9 @@ impl LspClient {
             quiescent: std::sync::atomic::AtomicBool::new(false),
             next_document_version: AtomicU64::new(1),
         };
+        // A server may ask for workspace data while initialize is pending.
+        // Install the service before posting that request, not at first edit.
+        client.set_server_request_handler(std::sync::Arc::new(|_, _| None));
         let mut params = serde_json::json!({
             "processId":std::process::id(),"rootUri":root_uri,
             "workspaceFolders":[{"uri":root_uri,"name":"workspace"}],
@@ -198,7 +227,7 @@ impl LspClient {
                         "completionItem":{
                             "snippetSupport":true,"insertReplaceSupport":true,
                             "documentationFormat":["markdown","plaintext"],
-                            "insertTextModeSupport":{"valueSet":[1]},
+                            "insertTextModeSupport":{"valueSet":[1,2]},
                             "resolveSupport":{"properties":["detail","documentation","additionalTextEdits"]}
                         },
                         "completionList":{"itemDefaults":["editRange","insertTextFormat","insertTextMode","data"]}
@@ -208,10 +237,11 @@ impl LspClient {
                     "callHierarchy":{"dynamicRegistration":false},
                     "typeHierarchy":{"dynamicRegistration":false},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
-                    "rename":{"prepareSupport":true,"honorsChangeAnnotations":false},
+                    "rename":{"prepareSupport":true,"honorsChangeAnnotations":true},
                     "codeAction":{
                         "dynamicRegistration":false,"dataSupport":true,
                         "disabledSupport":true,"isPreferredSupport":true,
+                        "honorsChangeAnnotations":true,
                         "codeActionLiteralSupport":{"codeActionKind":{"valueSet":[
                             "quickfix","refactor","refactor.extract","refactor.inline","refactor.rewrite","source"
                         ]}},
@@ -219,8 +249,12 @@ impl LspClient {
                     }
                 },
                 "workspace":{
+                    "configuration":true,
+                    "didChangeConfiguration":{"dynamicRegistration":false},
+                    "diagnostics":{"refreshSupport":false},
                     "applyEdit":true,"workspaceEdit":{
-                        "documentChanges":true,"resourceOperations":["create","rename","delete"]
+                        "documentChanges":true,"resourceOperations":["create","rename","delete"],
+                        "changeAnnotationSupport":{"groupsOnLabel":false}
                     },
                     "symbol":{
                         "dynamicRegistration":false,
@@ -238,7 +272,7 @@ impl LspClient {
             params["initializationOptions"] = options.clone();
         }
         let result = client
-            .call("initialize", params, timeout)
+            .call("initialize", params, budget.remaining()?)
             .await
             .map_err(|err| {
                 client.rpc.kill();
@@ -268,6 +302,11 @@ impl LspClient {
             .rpc
             .notify("initialized", serde_json::json!({}))
             .map_err(|err| Error::tool("lsp", format!("[LSP_TRANSPORT_IO] {}", err.message())))?;
+        if let Some(settings) = settings {
+            client
+                .set_workspace_settings_with_timeout(&settings, budget.remaining()?)
+                .await?;
+        }
         Ok(client)
     }
 
@@ -342,9 +381,22 @@ impl LspClient {
             .map(|document| std::sync::Arc::clone(&document.text))
     }
 
+    // The generation guard covers the whole drain-and-apply, so a concurrent
+    // poller cannot publish an older batch after a newer one was applied.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn poll_notifications(&self) {
+        // Hold one owner across drain and apply: concurrent callers must not
+        // publish an earlier batch after a newer one was already applied.
+        let mut generation = Self::lock(&self.notification_generation);
+        self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
         for notification in self.rpc.drain_notifications() {
-            if notification.method == "textDocument/publishDiagnostics" {
+            if notification.dropped_before < *generation {
+                continue;
+            }
+            self.observe_notification_loss(&mut generation, notification.dropped_before);
+            if notification.method == "$/progress" {
+                Self::lock(&self.partial_results).accept(notification.params);
+            } else if notification.method == "textDocument/publishDiagnostics" {
                 self.accept_diagnostics(&notification.params);
             } else if notification.method == "experimental/serverStatus"
                 && let Some(quiescent) = notification
@@ -354,6 +406,22 @@ impl LspClient {
             {
                 self.quiescent.store(quiescent, Ordering::SeqCst);
             }
+        }
+        // A producer can overflow while this batch is being consumed. None
+        // of the reports before that gap can remain evidence of a clean file.
+        self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
+    }
+
+    fn observe_notification_loss(&self, generation: &mut u64, dropped: u64) {
+        if dropped > *generation {
+            Self::lock(&self.diagnostics).clear();
+            self.quiescent.store(false, Ordering::SeqCst);
+            *generation = dropped;
+            // Retain pull_reports: a later pull sends its exact previous
+            // resultId and requires a fresh full/unchanged server response
+            // tied to the current document and latest request. Clearing the
+            // visible cache alone makes push-only readers report unknown
+            // until a new report arrives; it never manufactures zero issues.
         }
     }
 
@@ -407,7 +475,15 @@ impl LspClient {
     }
 
     pub fn set_server_request_handler(&self, handler: super::jsonrpc::ServerRequestHandler) {
-        self.rpc.set_server_request_handler(handler);
+        // Reserved workspace services survive installation/replacement of an
+        // application's applyEdit handler and cannot be overridden by it.
+        let workspace = std::sync::Arc::clone(&self.workspace);
+        self.rpc
+            .set_server_request_responder(std::sync::Arc::new(move |method, params| {
+                workspace
+                    .respond(method, params)
+                    .or_else(|| handler(method, params).map(Ok))
+            }));
     }
 
     pub fn call_no_wait_notify(
@@ -538,5 +614,207 @@ mod tests {
         assert!(!is_warmup_empty_retryable("codeAction/resolve"));
         assert!(is_warmup_empty_retryable("textDocument/definition"));
         assert!(is_warmup_empty_retryable("workspace/willRenameFiles"));
+    }
+
+    #[test]
+    fn notification_overflow_invalidates_clean_reports_and_recovers() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let path = temp.path().join("source.rs");
+        std::fs::write(&path, "fn main() {}\n").expect("source");
+        let Some(peer) =
+            test_server::Fixture::connect(temp.path(), serde_json::json!({"textDocumentSync": 1}))
+        else {
+            return;
+        };
+        let uri = peer.client.ensure_synced(&path, "rust").expect("document");
+        let snapshots = peer.client.document_snapshots();
+        let version = snapshots.values().next().expect("synced snapshot").version;
+        let clean = serde_json::json!({
+            "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "version": version, "diagnostics": []}
+        });
+        let settled = serde_json::json!({
+            "jsonrpc": "2.0", "method": "experimental/serverStatus",
+            "params": {"quiescent": true}
+        });
+        peer.notifications(&[clean.clone(), settled.clone()]);
+        assert!(
+            peer.runtime
+                .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+                .expect("explicit initial clean report")
+                .is_empty()
+        );
+        let diagnostic = serde_json::json!({
+            "message": "dependency now fails", "severity": 1,
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 0, "character": 1}}
+        });
+        let failed = serde_json::json!({
+            "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "version": version, "diagnostics": [diagnostic]}
+        });
+        // Keep both an old clean report and old quiescence in the backlog.
+        // The final error report must overflow the production queue without
+        // any client drain until the peer's following response acknowledges it.
+        let mut flood = vec![clean.clone(), settled.clone()];
+        flood.resize(
+            1024,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "window/logMessage",
+                "params": {"type": 3, "message": "server is analyzing"}
+            }),
+        );
+        flood.push(failed.clone());
+        peer.notifications(&flood);
+        assert_eq!(peer.client.dropped_notifications(), 1);
+        assert!(peer.client.diagnostics_snapshot().is_empty());
+        assert!(!peer.client.quiescent.load(Ordering::SeqCst));
+        let error = peer
+            .runtime
+            .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+            .expect_err("a lost report must not preserve a clean result");
+        assert!(error.to_string().contains("LSP_DIAGNOSTICS_PENDING"));
+        assert!(peer.client.is_alive());
+
+        peer.notifications(&[failed]);
+        assert_eq!(
+            peer.runtime
+                .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+                .expect("fresh error report"),
+            vec![diagnostic]
+        );
+        peer.notifications(&[clean, settled]);
+        assert!(
+            peer.runtime
+                .block_on(peer.client.document_diagnostics(&uri, Duration::ZERO))
+                .expect("fresh explicit clean report")
+                .is_empty()
+        );
+        assert_eq!(
+            peer.runtime
+                .block_on(
+                    peer.client
+                        .call("test/success", Value::Null, Duration::from_secs(5))
+                )
+                .expect("unrelated requests remain usable"),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(peer.client.dropped_notifications(), 1);
+        assert!(peer.client.is_alive());
+    }
+
+    fn workspace_peer(root: &Path) -> Option<test_server::Fixture> {
+        test_server::Fixture::connect(
+            root,
+            serde_json::json!({"diagnosticProvider": {
+                "interFileDependencies": true, "workspaceDiagnostics": true
+            }}),
+        )
+    }
+
+    #[test]
+    fn workspace_diagnostic_handshake_advertises_pull_but_not_automatic_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = workspace_peer(temp.path()) else {
+            return;
+        };
+        let frames = peer.frames();
+        let initialize = frames
+            .iter()
+            .find(|frame| frame["method"] == "initialize")
+            .unwrap();
+        assert_eq!(
+            initialize["params"]["capabilities"]["workspace"]["diagnostics"],
+            serde_json::json!({"refreshSupport": false})
+        );
+        assert_eq!(
+            initialize["params"]["capabilities"]["textDocument"]["diagnostic"]["dynamicRegistration"],
+            false
+        );
+    }
+
+    #[test]
+    fn workspace_pull_cancelled_owner_never_posts_a_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = workspace_peer(temp.path()) else {
+            return;
+        };
+        let owner = AgentCx::for_request();
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("test cancelled"));
+        let error = peer
+            .runtime
+            .block_on(owner.with_current(peer.client.workspace_diagnostics(Duration::from_secs(5))))
+            .unwrap_err();
+        assert!(error.to_string().contains("LSP_CANCELLED"), "{error}");
+        assert!(
+            !peer
+                .frames()
+                .iter()
+                .any(|frame| frame["method"] == "workspace/diagnostic")
+        );
+        assert!(peer.client.is_alive());
+    }
+
+    #[test]
+    fn abandoned_written_workspace_pull_cancels_once_and_releases_the_request_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(peer) = workspace_peer(temp.path()) else {
+            return;
+        };
+        peer.configure(serde_json::json!({"workspace/diagnostic": [{"hold": true}]}));
+        peer.runtime.block_on(async {
+            let mut request = Box::pin(peer.client.workspace_diagnostics(Duration::from_secs(30)));
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            // The first pending poll proves only queue admission. Obtain a
+            // real peer acknowledgement using an independent transport slot
+            // before dropping the owner of the written workspace request.
+            let (id, response) = peer.client.rpc.request("test/frames", Value::Null).unwrap();
+            let observed =
+                crate::lsp::jsonrpc::await_completion(response, Duration::from_secs(5), || {
+                    peer.client.rpc.cancel_request(id);
+                })
+                .await
+                .expect("peer observation arrived")
+                .expect("peer observation succeeded");
+            assert!(
+                observed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|frame| frame["method"] == "workspace/diagnostic")
+            );
+            drop(request);
+            assert_eq!(
+                peer.client
+                    .call("test/success", Value::Null, Duration::from_secs(5))
+                    .await
+                    .unwrap(),
+                serde_json::json!({"ok": true})
+            );
+        });
+        let frames = peer.frames();
+        let posted = frames
+            .iter()
+            .position(|frame| frame["method"] == "workspace/diagnostic")
+            .unwrap();
+        let cancelled = frames
+            .iter()
+            .position(|frame| frame["method"] == "$/cancelRequest")
+            .unwrap();
+        let successor = frames
+            .iter()
+            .position(|frame| frame["method"] == "test/success")
+            .unwrap();
+        assert!(posted < cancelled && cancelled < successor);
+        assert_eq!(frames[cancelled]["params"]["id"], frames[posted]["id"]);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "$/cancelRequest")
+                .count(),
+            1
+        );
+        assert!(peer.client.diagnostics_snapshot().is_empty());
+        assert!(peer.client.is_alive());
     }
 }

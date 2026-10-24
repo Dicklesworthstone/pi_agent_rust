@@ -3,9 +3,9 @@
 //! This keeps LLM compaction off the foreground turn path by running compaction
 //! on the existing runtime and applying results on subsequent turns.
 
-use crate::compaction::{self, CompactionPreparation, CompactionResult};
+use crate::compaction::{self, CompactionPreparation, CompactionPrivacy, CompactionResult};
 use crate::error::{Error, Result};
-use crate::provider::Provider;
+use crate::provider::{Provider, StreamOptions};
 use asupersync::runtime::{JoinHandle, RuntimeHandle};
 use asupersync::sync::OwnedMutexGuard;
 use futures::FutureExt;
@@ -365,8 +365,9 @@ impl CompactionWorkerState {
         runtime_handle: &RuntimeHandle,
         preparation: CompactionPreparation,
         provider: Arc<dyn Provider>,
-        api_key: String,
+        stream_options: StreamOptions,
         custom_instructions: Option<String>,
+        privacy: CompactionPrivacy,
     ) -> Result<()> {
         self.start_inner(
             Some(origin),
@@ -374,8 +375,9 @@ impl CompactionWorkerState {
             runtime_handle,
             preparation,
             provider,
-            api_key,
+            stream_options,
             custom_instructions,
+            privacy,
         )
     }
 
@@ -385,7 +387,7 @@ impl CompactionWorkerState {
         runtime_handle: &RuntimeHandle,
         preparation: CompactionPreparation,
         provider: Arc<dyn Provider>,
-        api_key: String,
+        stream_options: StreamOptions,
         custom_instructions: Option<String>,
     ) {
         self.start_inner(
@@ -394,8 +396,9 @@ impl CompactionWorkerState {
             runtime_handle,
             preparation,
             provider,
-            api_key,
+            stream_options,
             custom_instructions,
+            CompactionPrivacy::default(),
         )
         .expect("test compaction runtime must admit the task");
     }
@@ -408,8 +411,9 @@ impl CompactionWorkerState {
         runtime_handle: &RuntimeHandle,
         preparation: CompactionPreparation,
         provider: Arc<dyn Provider>,
-        api_key: String,
+        stream_options: StreamOptions,
         custom_instructions: Option<String>,
+        privacy: CompactionPrivacy,
     ) -> Result<()> {
         debug_assert!(
             self.can_start(),
@@ -424,10 +428,11 @@ impl CompactionWorkerState {
             run_compaction_task(
                 preparation,
                 provider,
-                api_key,
+                stream_options,
                 custom_instructions,
                 abort_rx,
                 timeout,
+                privacy,
             )
             .await
         };
@@ -530,10 +535,11 @@ impl Drop for CompactionWorkerState {
 async fn run_compaction_task(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
-    api_key: String,
+    stream_options: StreamOptions,
     custom_instructions: Option<String>,
     abort_rx: oneshot::Receiver<()>,
     timeout: Duration,
+    privacy: CompactionPrivacy,
 ) -> CompactionOutcome {
     let abort_fut = async move {
         if abort_rx.await.is_err() {
@@ -549,8 +555,9 @@ async fn run_compaction_task(
         std::panic::AssertUnwindSafe(compaction::compact_auto(
             preparation,
             provider,
-            &api_key,
+            &stream_options,
             custom_instructions.as_deref(),
+            &privacy,
         ))
         .catch_unwind(),
     );
@@ -620,6 +627,216 @@ mod tests {
 
     fn default_worker() -> CompactionWorkerState {
         make_worker(CompactionQuota::default())
+    }
+
+    struct OptionsDispatchProbe {
+        observed: Arc<std::sync::Mutex<Vec<StreamOptions>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for OptionsDispatchProbe {
+        fn name(&self) -> &'static str {
+            "options-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            options: &StreamOptions,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<crate::provider::StreamEvent>> + Send>,
+            >,
+        > {
+            self.observed
+                .lock()
+                .expect("record compaction request options")
+                .push(options.clone());
+            let message = crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("worker summary"),
+                )],
+                api: "test-api".to_string(),
+                provider: "options-probe".to_string(),
+                model: "test-model".to_string(),
+                usage: crate::model::Usage::default(),
+                stop_reason: crate::model::StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(
+                crate::provider::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn background_compaction_preserves_header_auth_and_operation_options() {
+        run_async(|runtime_handle| async move {
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Arc::new(OptionsDispatchProbe {
+                observed: Arc::clone(&observed),
+            });
+            let options = StreamOptions {
+                api_key: None,
+                headers: std::collections::HashMap::from([
+                    (
+                        "authorization".to_string(),
+                        "Bearer worker-token".to_string(),
+                    ),
+                    ("x-tenant".to_string(), "worker-tenant".to_string()),
+                ]),
+                max_tokens: Some(512),
+                temperature: Some(0.25),
+                thinking_level: Some(crate::model::ThinkingLevel::Low),
+                thinking_budgets: Some(crate::provider::ThinkingBudgets {
+                    low: 128,
+                    ..crate::provider::ThinkingBudgets::default()
+                }),
+                cache_retention: crate::provider::CacheRetention::Long,
+                session_id: Some("worker-session".to_string()),
+                prompt_cache_key: Some("worker-cache".to_string()),
+                service_tier: Some("priority".to_string()),
+                ..StreamOptions::default()
+            };
+            let mut preparation = compaction_admission_preparation(1_000);
+            preparation.messages_to_summarize = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("summarize this work".to_string()),
+                timestamp: Some(1),
+            }];
+            let mut worker = default_worker();
+            worker.start(&runtime_handle, preparation, provider, options, None);
+            let pending = worker.pending.take().expect("owned background task");
+            let abort_owner = pending.abort_tx;
+            let result = pending.join.await.expect("summary completes");
+            drop(abort_owner);
+            assert_eq!(result.summary, "worker summary");
+
+            let calls = observed.lock().expect("read dispatched options");
+            assert_eq!(calls.len(), 1);
+            let options = &calls[0];
+            assert!(options.api_key.is_none(), "header auth must remain keyless");
+            assert_eq!(options.headers["authorization"], "Bearer worker-token");
+            assert_eq!(options.headers["x-tenant"], "worker-tenant");
+            assert_eq!(options.max_tokens, Some(512));
+            assert_eq!(options.temperature, Some(0.25));
+            assert_eq!(
+                options.thinking_level,
+                Some(crate::model::ThinkingLevel::Low)
+            );
+            assert_eq!(options.thinking_budgets.as_ref().expect("budgets").low, 128);
+            assert_eq!(
+                options.cache_retention,
+                crate::provider::CacheRetention::Long
+            );
+            assert_eq!(options.session_id.as_deref(), Some("worker-session"));
+            assert_eq!(options.prompt_cache_key.as_deref(), Some("worker-cache"));
+            assert_eq!(options.service_tier.as_deref(), Some("priority"));
+        });
+    }
+
+    struct PrivacyDispatchProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Provider for PrivacyDispatchProbe {
+        fn name(&self) -> &'static str {
+            "privacy-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<crate::provider::StreamEvent>> + Send>,
+            >,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(Error::api("privacy probe reached provider admission"))
+        }
+    }
+
+    #[test]
+    fn background_compaction_refuses_a_blocked_prefix_before_dispatch() {
+        run_async(|runtime_handle| async move {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut preparation = compaction_admission_preparation(600_000);
+            preparation.messages_to_summarize = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("clean history".to_string()),
+                timestamp: Some(0),
+            }];
+            preparation.turn_prefix_messages = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("ACME-123456".to_string()),
+                timestamp: Some(1),
+            }];
+            preparation.is_split_turn = true;
+            let privacy =
+                CompactionPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+                    mode: Some("block".to_string()),
+                    extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+                }));
+            let gate = crate::agent::ProviderAdmissionGate::default();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let permit = gate.acquire(cx.cx()).await.expect("provider authority");
+            let mut worker = default_worker();
+            let origin = CompactionOrigin {
+                session_id: "origin-session".to_string(),
+                provider_id: "privacy-probe".to_string(),
+                model_id: "test-model".to_string(),
+                snapshot_leaf_id: Some("leaf-kept".to_string()),
+            };
+            worker
+                .start_for_origin(
+                    origin.clone(),
+                    permit,
+                    &runtime_handle,
+                    preparation,
+                    Arc::new(PrivacyDispatchProbe(Arc::clone(&calls))),
+                    StreamOptions {
+                        api_key: Some("auth-kept".to_string()),
+                        ..StreamOptions::default()
+                    },
+                    None,
+                    privacy,
+                )
+                .expect("worker starts its owned request");
+            let pending = worker.pending.take().expect("owned background task");
+            assert_eq!(pending.origin, Some(origin));
+            let abort_owner = pending.abort_tx;
+            let error = pending
+                .join
+                .await
+                .expect_err("privacy must refuse before fallback");
+            drop(abort_owner);
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let _released = gate
+                .acquire(cx.cx())
+                .await
+                .expect("provider permit released");
+        });
     }
 
     fn compaction_admission_preparation(tokens_before: u64) -> CompactionPreparation {
@@ -1047,7 +1264,10 @@ mod tests {
                 &runtime_handle,
                 preparation,
                 Arc::new(NeverCompletingProvider),
-                "test-key".to_string(),
+                StreamOptions {
+                    api_key: Some("test-key".to_string()),
+                    ..StreamOptions::default()
+                },
                 None,
             );
             asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(100)).await;

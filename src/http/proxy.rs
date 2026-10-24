@@ -10,7 +10,8 @@
 //! For a request to `<scheme>://<host>:<port>`:
 //!
 //! 1. A bypass match (`http.noProxy` in settings.json, else `NO_PROXY` /
-//!    `no_proxy`) wins over everything — the request goes direct.
+//!    `no_proxy`) wins over everything — the request goes direct. Loopback
+//!    destinations also go direct unless `http.proxyLoopback` is enabled.
 //! 2. `http.httpsProxy` / `http.httpProxy` from settings.json (scheme-specific).
 //! 3. `http.proxy` from settings.json (both schemes).
 //! 4. `PI_HTTPS_PROXY` / `PI_HTTP_PROXY` — the pi-prefixed, unambiguous
@@ -136,6 +137,11 @@ pub struct HttpSettings {
     /// resolution. Malformed entries never widen the bypass policy.
     #[serde(alias = "noProxy")]
     pub no_proxy: Option<Vec<String>>,
+    /// Send loopback destinations through the configured proxy. Defaults to
+    /// false so local model servers stay reachable with a global proxy.
+    /// Explicit `noProxy` matches still go direct when this is enabled.
+    #[serde(alias = "proxyLoopback")]
+    pub proxy_loopback: Option<bool>,
     /// Ignore the ambient `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` /
     /// `NO_PROXY` variables; only the settings above (and `PI_*_PROXY`) apply.
     #[serde(alias = "ignoreEnvProxy")]
@@ -157,6 +163,7 @@ impl fmt::Debug for HttpSettings {
                 &self.http_proxy.as_ref().map(|_| "<redacted>"),
             )
             .field("no_proxy", &self.no_proxy)
+            .field("proxy_loopback", &self.proxy_loopback)
             .field("ignore_env_proxy", &self.ignore_env_proxy)
             .finish()
     }
@@ -297,6 +304,9 @@ pub struct ProxyConfig {
     no_proxy_rules: Vec<NoProxyRule>,
     /// `*` (or `NO_PROXY=*`) — everything is direct.
     bypass_all: bool,
+    /// Explicit opt-in for proxying local model servers and other loopback
+    /// destinations. This never overrides an explicit bypass rule.
+    proxy_loopback: bool,
 }
 
 fn pick_proxy_endpoint(
@@ -379,6 +389,39 @@ fn resolve_no_proxy_raw(
     )
 }
 
+/// Recognize loopback without DNS: resolving arbitrary hosts here would leak
+/// SOCKS5h destination queries and change the user's remote routing policy.
+#[allow(clippy::option_if_let_else)]
+fn is_loopback_host(host: &str) -> bool {
+    if host
+        .strip_suffix('.')
+        .unwrap_or(host)
+        .eq_ignore_ascii_case("localhost")
+    {
+        return true;
+    }
+
+    let address = if let Some(bracketed) = host.strip_prefix('[') {
+        // Brackets are valid only around IPv6, never a hostname or IPv4.
+        bracketed
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6)
+    } else {
+        host.parse::<IpAddr>().ok()
+    };
+    match address {
+        Some(IpAddr::V4(address)) => address.is_loopback(),
+        Some(IpAddr::V6(address)) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+        None => false,
+    }
+}
+
 impl ProxyConfig {
     /// Merge settings and environment into the effective configuration.
     ///
@@ -441,6 +484,7 @@ impl ProxyConfig {
                 no_proxy,
                 no_proxy_rules,
                 bypass_all,
+                proxy_loopback: settings.proxy_loopback.unwrap_or(false),
             },
             warnings,
         )
@@ -456,7 +500,10 @@ impl ProxyConfig {
     /// The proxy a request to `https`/`http` `host:port` must use, if any.
     #[must_use]
     pub fn endpoint_for(&self, https: bool, host: &str, port: u16) -> Option<&ProxyEndpoint> {
-        if self.bypass_all || self.matches_no_proxy(host, port) {
+        if self.bypass_all
+            || self.matches_no_proxy(host, port)
+            || (!self.proxy_loopback && is_loopback_host(host))
+        {
             return None;
         }
         if https {
@@ -787,6 +834,155 @@ mod tests {
 
     fn resolve(settings: Option<&HttpSettings>, pairs: &[(&str, &str)]) -> ProxyConfig {
         ProxyConfig::resolve(settings, &env_from(pairs)).0
+    }
+
+    #[test]
+    fn loopback_bypass_applies_to_every_proxy_protocol_and_source() {
+        let local_hosts = [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "LoCaLhOsT.",
+            "127.0.0.0",
+            "127.0.0.1",
+            "127.2.3.4",
+            "127.255.255.255",
+            "::1",
+            "[::1]",
+            "0:0:0:0:0:0:0:1",
+            "[0:0:0:0:0:0:0:1]",
+            "::ffff:127.0.0.1",
+            "::ffff:7f02:0304",
+            "[::ffff:127.255.255.255]",
+        ];
+        for scheme in ["http", "socks5", "socks5h"] {
+            let endpoint = format!("{scheme}://user:pass@proxy.example:1080");
+            let settings = HttpSettings {
+                proxy: Some(endpoint.clone()),
+                no_proxy: Some(Vec::new()),
+                ignore_env_proxy: Some(true),
+                ..HttpSettings::default()
+            };
+            let configurations = [
+                ("settings", resolve(Some(&settings), &[("NO_PROXY", "*")])),
+                (
+                    "scheme environment",
+                    resolve(
+                        None,
+                        &[("HTTP_PROXY", &endpoint), ("HTTPS_PROXY", &endpoint)],
+                    ),
+                ),
+                ("ALL_PROXY", resolve(None, &[("ALL_PROXY", &endpoint)])),
+                ("all_proxy", resolve(None, &[("all_proxy", &endpoint)])),
+                (
+                    "PI_HTTP_PROXY",
+                    resolve(None, &[("PI_HTTP_PROXY", &endpoint)]),
+                ),
+            ];
+            for (source, config) in configurations {
+                for (https, port) in [(false, 11434), (true, 443)] {
+                    assert!(
+                        config.endpoint_for(https, "remote.invalid", port).is_some(),
+                        "{scheme} from {source} must still proxy remote destinations"
+                    );
+                    for host in local_hosts {
+                        assert!(
+                            config.endpoint_for(https, host, port).is_none(),
+                            "{scheme} from {source} must bypass {host}:{port}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loopback_bypass_does_not_match_private_networks_or_lookalikes() {
+        let config = resolve(None, &[("ALL_PROXY", "socks5h://proxy.example:1080")]);
+        for host in [
+            "localhost.example",
+            "notlocalhost",
+            "service.localhost",
+            "localhost..",
+            "localhost:11434",
+            "leak.127.0.0.1",
+            "126.255.255.255",
+            "128.0.0.0",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "fc00::1",
+            "::127.0.0.1",
+            "::ffff:192.0.2.1",
+            "[::ffff:192.0.2.1]",
+            "[127.0.0.1]",
+            "[[::1]]",
+            "[::1]suffix",
+            "::1.",
+        ] {
+            assert!(
+                config.endpoint_for(false, host, 11434).is_some(),
+                "{host} must not widen the automatic loopback bypass"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_loopback_proxy_opt_in_preserves_remote_proxy_routing() {
+        for scheme in ["http", "socks5", "socks5h"] {
+            for enabled in [false, true] {
+                let settings = HttpSettings {
+                    proxy: Some(format!("{scheme}://proxy.example:1080")),
+                    proxy_loopback: Some(enabled),
+                    no_proxy: Some(Vec::new()),
+                    ignore_env_proxy: Some(true),
+                    ..HttpSettings::default()
+                };
+                let config = resolve(Some(&settings), &[]);
+                for (https, port) in [(false, 11434), (true, 443)] {
+                    for host in ["localhost.", "127.2.3.4", "[::1]", "::ffff:127.0.0.1"] {
+                        assert_eq!(
+                            config.endpoint_for(https, host, port).is_some(),
+                            enabled,
+                            "{scheme}: proxyLoopback={enabled} for {host}:{port}"
+                        );
+                    }
+                    assert!(config.endpoint_for(https, "remote.invalid", port).is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_bypass_keeps_priority_when_loopback_proxying_is_enabled() {
+        for rules in [
+            vec![
+                "localhost".to_string(),
+                "127.0.0.0/8".to_string(),
+                "::1".to_string(),
+            ],
+            vec!["*".to_string()],
+        ] {
+            let settings = HttpSettings {
+                proxy: Some("socks5h://proxy.example:1080".to_string()),
+                proxy_loopback: Some(true),
+                no_proxy: Some(rules),
+                ignore_env_proxy: Some(true),
+                ..HttpSettings::default()
+            };
+            let config = resolve(Some(&settings), &[]);
+            for host in ["localhost", "localhost.", "127.2.3.4", "[::1]"] {
+                for (https, port) in [(false, 11434), (true, 443)] {
+                    assert!(
+                        config.endpoint_for(https, host, port).is_none(),
+                        "explicit bypass must win for {host}:{port}"
+                    );
+                }
+            }
+        }
     }
 
     // ─── URL parsing ────────────────────────────────────────────────────
@@ -1170,15 +1366,19 @@ mod tests {
 
     #[test]
     fn ipv6_host_bypass_matches_without_brackets() {
+        let settings = HttpSettings {
+            proxy_loopback: Some(true),
+            ..HttpSettings::default()
+        };
         let config = resolve(
-            None,
+            Some(&settings),
             &[("HTTPS_PROXY", "http://p:8080"), ("NO_PROXY", "::1")],
         );
         assert!(config.endpoint_for(true, "::1", 443).is_none());
         assert!(config.endpoint_for(true, "[::1]", 443).is_none());
 
         let with_port = resolve(
-            None,
+            Some(&settings),
             &[("HTTPS_PROXY", "http://p:8080"), ("NO_PROXY", "[::1]:8443")],
         );
         assert!(with_port.endpoint_for(true, "::1", 8443).is_none());
@@ -1240,11 +1440,18 @@ mod tests {
 
     #[test]
     fn no_proxy_zero_prefixes_are_family_specific_and_never_resolve_names() {
+        let settings = HttpSettings {
+            proxy_loopback: Some(true),
+            ..HttpSettings::default()
+        };
         for (rule, direct, proxied) in [
             ("0.0.0.0/0", "203.0.113.9", "::1"),
             ("::/0", "::ffff:192.0.2.1", "127.0.0.1"),
         ] {
-            let config = resolve(None, &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)]);
+            let config = resolve(
+                Some(&settings),
+                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)],
+            );
             assert!(config.endpoint_for(true, direct, 443).is_none());
             assert!(config.endpoint_for(true, proxied, 443).is_some());
             assert!(config.endpoint_for(true, "localhost", 443).is_some());
@@ -1254,8 +1461,12 @@ mod tests {
 
     #[test]
     fn no_proxy_addresses_use_numeric_equality_not_dns_suffixes() {
+        let settings = HttpSettings {
+            proxy_loopback: Some(true),
+            ..HttpSettings::default()
+        };
         let config = resolve(
-            None,
+            Some(&settings),
             &[
                 ("ALL_PROXY", "http://p:8080"),
                 ("NO_PROXY", "127.0.0.1:8080,[::1]:8443"),
@@ -1274,6 +1485,10 @@ mod tests {
 
     #[test]
     fn invalid_no_proxy_entries_cannot_disable_the_proxy() {
+        let settings = HttpSettings {
+            proxy_loopback: Some(true),
+            ..HttpSettings::default()
+        };
         for rule in [
             "[::1]:oops",
             "[::1]:",
@@ -1295,7 +1510,10 @@ mod tests {
             "api.example.com/0",
             "*/0",
         ] {
-            let config = resolve(None, &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)]);
+            let config = resolve(
+                Some(&settings),
+                &[("ALL_PROXY", "http://p:8080"), ("NO_PROXY", rule)],
+            );
             for host in ["::1", "127.0.0.1", "api.example.com"] {
                 for port in [80, 443, 8443] {
                     assert!(

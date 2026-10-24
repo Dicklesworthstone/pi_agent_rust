@@ -132,6 +132,73 @@ fn promote_then_fresh_discovery_finds_managed_skill() {
 }
 
 #[test]
+fn learn_promotion_screens_body_description_and_name_before_derivation() {
+    let case = "learn_promotion_screens_body_description_and_name_before_derivation";
+    let harness = TestHarness::new(case);
+    let cwd = harness.temp_path("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let settings = pi::secrets::SecretsSettings {
+        mode: Some("off".to_string()),
+        extra_patterns: Some(vec![
+            r"^ACME-\d{6}$".to_string(),
+            r"NAMEKEY-\d{6}".to_string(),
+        ]),
+    };
+    let store = std::sync::Arc::new(
+        pi::memory::MemoryStore::open(&cwd)
+            .unwrap()
+            .with_secrets_settings(Some(&settings)),
+    );
+    let learn = pi::tools::LearnTool::new(std::sync::Arc::clone(&store));
+    let name = format!("{}-NAMEKEY-123456", unique_name("privacy"));
+    let lesson = format!(
+        "{}password=opaquePromotionCredential1234567",
+        "learn ".repeat(30)
+    );
+    let output = block_on_local(learn.execute(
+        "learn-private-promotion",
+        json!({
+            "lesson": lesson,
+            "context": "ACME-654321",
+            "promote": true,
+            "skillName": name
+        }),
+        None,
+    ))
+    .unwrap();
+    assert!(!output.is_error);
+    let details = output.details.as_ref().unwrap();
+    let promoted = &details["promoted"];
+    let safe_name = promoted["name"].as_str().expect("promoted skill");
+    let path = promoted["path"].as_str().unwrap();
+    let skill = std::fs::read_to_string(path).unwrap();
+    assert!(skill.contains("[REDACTED_GENERIC_SECRET]"));
+    assert!(skill.contains("Context: [REDACTED_USER_PATTERN]"));
+    assert!(safe_name.contains("redacted-user-pattern"));
+    let serialized = serde_json::to_string(details).unwrap();
+    for text in [skill.as_str(), serialized.as_str(), first_text(&output)] {
+        for secret in [
+            "opaquePromotionCredential1234567",
+            "opaquePromotion", // A truncated description must not expose a prefix.
+            "ACME-654321",
+            "NAMEKEY-123456",
+            "namekey-123456",
+        ] {
+            assert!(
+                !text.contains(secret),
+                "promotion reintroduced credential material"
+            );
+        }
+    }
+    let memory = &details["memory"];
+    let body = memory["content"].as_str().unwrap();
+    assert!(skill.ends_with(&format!("{body}\n")));
+    assert_eq!(store.recall("learn", None).unwrap()[0].content, body);
+    cleanup(safe_name);
+    finish_case(&harness, case);
+}
+
+#[test]
 fn user_skill_shadows_managed_with_diagnostic() {
     let case = "user_skill_shadows_managed_with_diagnostic";
     let harness = TestHarness::new(case);

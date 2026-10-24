@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+mod media_duration;
+
 /// Maximum number of visible ASCII characters retained from an image MIME type.
 pub(crate) const MAX_IMAGE_MIME_TYPE_LEN: usize = 80;
 
@@ -303,14 +305,27 @@ where
 }
 
 impl MediaContent {
+    /// Inspect the container's duration without decoding its audio/video or
+    /// allocating a copy of the base64 payload. MP4/MOV/M4A, WebM, PCM/float
+    /// WAVE, FLAC, MP3 Xing/Info, and Ogg Vorbis/Opus metadata are supported.
+    /// Missing, malformed, ambiguous, or unsupported metadata returns `None`;
+    /// this is an estimate, not media validation.
+    #[must_use]
+    pub fn duration(&self) -> Option<std::time::Duration> {
+        media_duration::inspect(&self.data, &self.mime_type)
+    }
+
     /// The model input capability this block needs (`video` or `audio`),
-    /// derived from the MIME type's top-level type. `None` for anything else.
+    /// derived case-insensitively from the MIME type's top-level type. `None`
+    /// for anything else; the stored MIME label remains unchanged.
     pub fn input_type(&self) -> Option<crate::provider::InputType> {
         let top_level = self.mime_type.split('/').next().unwrap_or("");
-        match top_level {
-            "video" => Some(crate::provider::InputType::Video),
-            "audio" => Some(crate::provider::InputType::Audio),
-            _ => None,
+        if top_level.eq_ignore_ascii_case("video") {
+            Some(crate::provider::InputType::Video)
+        } else if top_level.eq_ignore_ascii_case("audio") {
+            Some(crate::provider::InputType::Audio)
+        } else {
+            None
         }
     }
 
@@ -1407,6 +1422,27 @@ mod tests {
             Some(MAX_MEDIA_NAME_LEN)
         );
         assert_eq!(sanitize_media_name(" \u{001b}\n "), None);
+    }
+
+    #[test]
+    fn media_input_type_accepts_mime_case_without_changing_payload_or_label() {
+        for (mime, expected) in [
+            ("VIDEO/MP4", Some(crate::provider::InputType::Video)),
+            (
+                "Audio/Ogg; codecs=opus",
+                Some(crate::provider::InputType::Audio),
+            ),
+            ("IMAGE/PNG", None),
+        ] {
+            let media = MediaContent {
+                data: "aGVsbG8=".to_string(),
+                mime_type: mime.to_string(),
+                name: None,
+            };
+            assert_eq!(media.input_type(), expected);
+            assert_eq!(media.mime_type, mime);
+            assert_eq!(media.data, "aGVsbG8=");
+        }
     }
 
     #[test]

@@ -5,14 +5,23 @@
 //! cannot clear a replacement's cache or return an old generation's result.
 
 use super::{
-    Arc, DEFAULT_MCP_TIMEOUT, Duration, Error, McpManager, McpTransport, Result, ServerEntry,
-    Value, catalog, is_indeterminate_call_delivery, tool_err,
+    Arc, Duration, Error, McpManager, McpTransport, Result, ServerEntry, Value, catalog,
+    is_indeterminate_call_delivery, tool_err,
 };
 use crate::agent_cx::AgentCx;
+use crate::mcp::progress::{self, ProgressSubscription};
+use crate::mcp::transport::RequestDispatch;
+use crate::tools::ToolUpdate;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
+
+#[cfg(test)]
+use super::DEFAULT_MCP_TIMEOUT;
+
+#[cfg(all(test, unix))]
+mod progress_tests;
 
 /// Setup and recovery include more than JSON-RPC requests: lock admission,
 /// secret resolution, initialization notifications and receive activation can
@@ -149,6 +158,7 @@ impl Drop for SetupPublicationGuard {
 struct ToolCallGuard {
     entry: Arc<ServerEntry>,
     transport: Arc<dyn McpTransport>,
+    dispatch: Arc<RequestDispatch>,
     armed: bool,
 }
 
@@ -159,12 +169,37 @@ impl ToolCallGuard {
             self.armed = false;
         }
     }
+
+    /// Revoke queued work before deciding whether its shared server must be
+    /// retired. The writer claims this same lease before touching the pipe;
+    /// once revoked, no late writer can invalidate the "not sent" result.
+    fn preserve_unsent(&mut self) -> bool {
+        if self.armed
+            && self.dispatch.revoke_unsent()
+            && is_current(&self.entry, &self.transport)
+            && self.transport.is_alive()
+        {
+            self.armed = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn abandon(&mut self, error: &Error) -> bool {
+        if self.preserve_unsent() {
+            true
+        } else {
+            self.retire(error);
+            false
+        }
+    }
 }
 
 impl Drop for ToolCallGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.retire(&tool_err(
+            self.abandon(&tool_err(
                 "MCP_DELIVERY_INDETERMINATE",
                 "tools/call was abandoned; remote effects may already have occurred and were not replayed",
             ));
@@ -333,6 +368,7 @@ impl McpManager {
                         "the connection disappeared before tools/call was dispatched",
                     )
                 })?;
+                Self::invalidate_notified_catalog(entry, &transport);
                 let catalog_is_fresh = publication
                     .original
                     .as_ref()
@@ -372,6 +408,24 @@ impl McpManager {
     /// transport, or server errors. An abandoned/superseded call may already
     /// have had remote side effects; output-contract errors are not replayed.
     pub async fn call_tool(&self, server: &str, tool: &str, arguments: Value) -> Result<Value> {
+        self.call_tool_with_updates(server, tool, arguments, None)
+            .await
+    }
+
+    /// Execute through the normal call lifecycle while reporting bounded,
+    /// advisory progress. The observer runs on the initiating task, never on
+    /// a transport reader, and cannot extend the call's absolute deadline.
+    ///
+    /// # Errors
+    /// Returns the same admission, execution and output-contract errors as
+    /// `call_tool`; progress never authorizes replay or substitutes a result.
+    pub async fn call_tool_with_updates(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         // Reject an attenuated/cancelled caller before setup can resolve
         // secrets, run a command, or open a connection.
@@ -380,8 +434,9 @@ impl McpManager {
         owner
             .with_current(async {
                 let entry = self.entry(server)?;
+                let timeout = entry.timeout();
                 let (transport, contract) = self
-                    .prepare_tool_call(&owner, &entry, tool, DEFAULT_MCP_TIMEOUT)
+                    .prepare_tool_call(&owner, &entry, tool, timeout)
                     .await?;
                 // Setup has committed and released its publication guard. An
                 // invalid model input must not tear down a healthy cold-start
@@ -393,15 +448,16 @@ impl McpManager {
                         &transport,
                         tool,
                         &arguments,
-                        DEFAULT_MCP_TIMEOUT,
+                        timeout,
                         contract.output_schema,
+                        on_update.as_deref(),
                     )
                     .await
                 {
                     Ok(value) => Ok(value),
                     Err(error) if is_indeterminate_call_delivery(&error) => {
                         let deadline = Instant::now()
-                            .checked_add(DEFAULT_MCP_TIMEOUT)
+                            .checked_add(timeout)
                             .unwrap_or_else(Instant::now);
                         let recovery = run_phase(
                             &owner,
@@ -454,11 +510,11 @@ impl McpManager {
         arguments: &Value,
         timeout: Duration,
     ) -> Result<Value> {
-        self.execute_tool_call(entry, transport, tool, arguments, timeout, None)
+        self.execute_tool_call(entry, transport, tool, arguments, timeout, None, None)
             .await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn execute_tool_call(
         &self,
         entry: &Arc<ServerEntry>,
@@ -467,6 +523,7 @@ impl McpManager {
         arguments: &Value,
         timeout: Duration,
         output_schema: Option<super::McpOutputSchema>,
+        on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         catalog::check_request_owner(&owner)?;
@@ -499,24 +556,68 @@ impl McpManager {
         let mut guard = ToolCallGuard {
             entry: Arc::clone(entry),
             transport: Arc::clone(transport),
+            dispatch: Arc::new(RequestDispatch::new()),
             armed: true,
         };
-        let result = catalog::request_with_owner(
+        let progress = on_update
+            .and_then(|_| transport.progress_registry())
+            .and_then(|registry| {
+                registry.subscribe(Arc::clone(&guard.dispatch), transport.progress_generation())
+            });
+        let generation = progress.as_ref().map(ProgressSubscription::generation);
+        let mut params = serde_json::json!({"name": tool, "arguments": arguments});
+        if let Some(progress) = &progress {
+            // This is request metadata, never a model-supplied tool argument.
+            params["_meta"] = serde_json::json!({"progressToken": progress.token()});
+        }
+        let result = catalog::operation_with_owner(
             &owner,
-            transport,
-            "tools/call",
-            serde_json::json!({"name": tool, "arguments": arguments}),
+            progress::observe(
+                transport.request_with_dispatch(
+                    "tools/call",
+                    params,
+                    timeout,
+                    Arc::clone(&guard.dispatch),
+                ),
+                progress,
+                on_update,
+                || {
+                    catalog::check_request_owner(&owner).is_ok()
+                        && self.check_running().is_ok()
+                        && is_current(entry, transport)
+                        && transport.is_alive()
+                        && self.check_trust(entry).is_ok()
+                        && generation
+                            .is_none_or(|expected| transport.progress_generation() == expected)
+                },
+            ),
             timeout,
         )
-        .await;
+        .await
+        .and_then(std::convert::identity);
         // Retire cancellation and timeout before any asynchronous revocation
         // cleanup. An uncooperative close must not delay owner cancellation.
         if !is_current(entry, transport) {
             return Err(superseded_call());
         }
         if let Err(error) = catalog::check_request_owner(&owner) {
-            guard.retire(&error);
+            if guard.abandon(&error) {
+                return Err(tool_err(
+                    "MCP_CANCELLED",
+                    "tools/call was cancelled before dispatch; the call was not sent",
+                ));
+            }
             return Err(error);
+        }
+        if let Err(error) = &result
+            && super::is_authentication_error(error)
+        {
+            // An explicit auth rejection is not uncertain delivery and must
+            // never enter the automatic connection-recovery path. Retire this
+            // generation without spending the server-crash restart budget.
+            guard.armed = false;
+            Self::fail_transport_generation(entry, transport, error);
+            return result;
         }
         let result = match result {
             Err(error)
@@ -524,7 +625,21 @@ impl McpManager {
                     || is_cancelled(&error)
                     || !transport.is_alive() =>
             {
-                guard.retire(&error);
+                if guard.abandon(&error) {
+                    // The timeout remains visible, but it is not an uncertain
+                    // call and must not enter the reconnect/replay path in
+                    // call_tool or spend this healthy generation's budget.
+                    return Err(tool_err(
+                        if is_cancelled(&error) {
+                            "MCP_CANCELLED"
+                        } else {
+                            "MCP_REQUEST_NOT_SENT"
+                        },
+                        format!(
+                            "tools/call was withdrawn before dispatch; the call was not sent: {error}"
+                        ),
+                    ));
+                }
                 return Err(error);
             }
             result => result,
@@ -538,7 +653,7 @@ impl McpManager {
             return Err(error);
         }
         if let Err(error) = catalog::check_request_owner(&owner) {
-            guard.retire(&error);
+            guard.abandon(&error);
             return Err(error);
         }
         let value = match result {
@@ -561,7 +676,7 @@ impl McpManager {
             .as_ref()
             .map_or(Ok(()), |schema| schema.validate_result(&value));
         if let Err(error) = catalog::check_request_owner(&owner) {
-            guard.retire(&error);
+            guard.abandon(&error);
             return Err(error);
         }
         self.check_running()?;
@@ -704,7 +819,11 @@ mod tests {
                     env: Vec::new(),
                     url: Some("https://execution.invalid/mcp".to_string()),
                     headers: Vec::new(),
+                    oauth: None,
                     transport_hint: Some("http".to_string()),
+                    enabled: true,
+                    cwd: None,
+                    timeout_ms: None,
                     provenance: Provenance::ProjectPi,
                     source_file: temp.path().join("mcp.json"),
                 }],
@@ -719,6 +838,121 @@ mod tests {
         let transport = Arc::new(CallTransport::new(reply));
         install(&entry, &transport, "execute");
         (manager, entry, transport)
+    }
+
+    /// Exercise both ownership layers with the actual stdio queue, writer,
+    /// OS pipe and response router. An unsent call's manager must not erase
+    /// the catalog, spend recovery budget or kill its sibling's connection.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn queued_tool_abandonment_preserves_the_manager_and_other_stdio_calls() {
+        for ending in ["drop", "cancel", "timeout", "zero"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+            let mut peer = crate::mcp::transport::tests::HeldStdioTransport::new();
+            let transport: Arc<dyn McpTransport> = peer.transport.clone();
+            *McpManager::lock(&entry.transport) = Some(Arc::clone(&transport));
+            McpManager::lock(&entry.restarts).count = 2;
+            let runtime = runtime();
+            let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+            runtime.block_on(async {
+                let mut first =
+                    Box::pin(transport.request("test/first", Value::Null, Duration::from_secs(10)));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                peer.wait_for_writer();
+                let arguments = json!({"marker":"withdrawn"});
+                let operation: Pin<Box<dyn Future<Output = Result<Value>> + '_>> =
+                    if matches!(ending, "timeout" | "zero") {
+                        Box::pin(manager.call_on_transport_with_timeout(
+                            &entry,
+                            &transport,
+                            "execute",
+                            &arguments,
+                            if ending == "zero" {
+                                Duration::ZERO
+                            } else {
+                                Duration::from_millis(250)
+                            },
+                        ))
+                    } else {
+                        Box::pin(manager.call_tool("exec", "execute", arguments.clone()))
+                    };
+                let mut call = Box::pin(owner.with_current(operation));
+                if ending == "zero" {
+                    let error = call.await.expect_err("no dispatch budget");
+                    assert!(error.to_string().contains("MCP_REQUEST_NOT_SENT"));
+                    assert!(!is_indeterminate_call_delivery(&error));
+                } else {
+                    assert!(futures::poll!(call.as_mut()).is_pending());
+                    match ending {
+                        "drop" => drop(call),
+                        "cancel" => {
+                            owner.cancel_with(
+                                asupersync::types::CancelKind::User,
+                                Some("queued tool cancelled"),
+                            );
+                            let error = call.await.expect_err("owner cancelled");
+                            assert!(error.to_string().contains("MCP_CANCELLED"));
+                            assert!(error.to_string().contains("call was not sent"));
+                        }
+                        "timeout" => {
+                            let error = call.await.expect_err("queued deadline");
+                            assert!(error.to_string().contains("MCP_REQUEST_NOT_SENT"));
+                            assert!(error.to_string().contains("MCP_TIMEOUT"));
+                            assert!(!is_indeterminate_call_delivery(&error));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(transport.is_alive(), "{ending}: healthy server retired");
+                assert!(is_current(&entry, &transport));
+                assert_eq!(McpManager::lock(&entry.restarts).count, 2);
+                assert_eq!(manager.mounted_tool_metas().len(), 1);
+                assert!(matches!(
+                    *McpManager::lock(&entry.health),
+                    ServerHealth::Ready { tools: 1 }
+                ));
+                let mut next =
+                    Box::pin(manager.call_tool("exec", "execute", json!({"marker":"kept"})));
+                assert!(futures::poll!(next.as_mut()).is_pending());
+                peer.release();
+                let (first, next) = futures::join!(first, next);
+                assert_eq!(first.expect("sibling completes"), "test/first");
+                assert_eq!(
+                    next.expect("subsequent tool uses same server"),
+                    "tools/call"
+                );
+                assert!(is_current(&entry, &transport));
+                assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+            });
+            let messages = peer.finish();
+            assert_eq!(messages.len(), 2, "{ending}: {messages:?}");
+            assert_eq!(messages[0]["method"], "test/first");
+            assert_eq!(messages[1]["method"], "tools/call");
+            assert_eq!(messages[1]["params"]["arguments"]["marker"], "kept");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoning_a_claimed_stdio_tool_still_retires_its_manager_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+        let mut peer = crate::mcp::transport::tests::HeldStdioTransport::new();
+        let transport: Arc<dyn McpTransport> = peer.transport.clone();
+        *McpManager::lock(&entry.transport) = Some(Arc::clone(&transport));
+        runtime().block_on(async {
+            let mut call = Box::pin(manager.call_tool("exec", "execute", json!({})));
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            peer.wait_for_writer();
+            drop(call);
+            assert!(!transport.is_alive());
+            assert!(McpManager::lock(&entry.transport).is_none());
+            assert!(McpManager::lock(&entry.tools_cache).is_none());
+            assert_eq!(McpManager::lock(&entry.restarts).count, 1);
+        });
+        let _ = peer.finish();
     }
 
     // Install through the discovery parser, not an independently constructed
@@ -1394,7 +1628,11 @@ mod tests {
                     if self.0.stall == "close" {
                         Err(tool_err("MCP_SERVER_ERROR", "initialization refused"))
                     } else {
-                        Ok(json!({}))
+                        Ok(json!({
+                            "protocolVersion": crate::mcp::transport::MCP_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "setup-fixture", "version": "1"}
+                        }))
                     }
                 }
                 "tools/call" => {

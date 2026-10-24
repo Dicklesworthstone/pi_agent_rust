@@ -58,24 +58,24 @@ impl DapTransport {
             use std::os::unix::process::CommandExt as _;
             cmd.process_group(0);
         }
-        let mut child = owner.process().spawn_checked(&mut cmd).map_err(|error| {
+        let child = owner.process().spawn_checked(&mut cmd).map_err(|error| {
             tool_err(
                 "DAP_ADAPTER_MISSING",
                 format!("failed to start Delve: {error}"),
             )
         })?;
-        crate::tools::attach_child_job_discipline(&child);
-        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(tool_err("DAP_TRANSPORT", "Delve output pipes unavailable"));
-        };
+        // spawn_checked registers the existing Job before Delve can execute.
+        // A second attachment would close that Job and terminate the server.
         // This guard remains local across every startup await. Cancellation or
         // discovery/connection failure cannot publish or orphan the process.
         let mut child = crate::tools::ProcessGuard::new(
             child,
             crate::tools::ProcessCleanupMode::ProcessGroupTree,
         );
+        let (Some(stdout), Some(stderr)) = (child.take_stdout(), child.take_stderr()) else {
+            let _ = child.kill();
+            return Err(tool_err("DAP_TRANSPORT", "Delve output pipes unavailable"));
+        };
         let tail = Arc::new(Mutex::new(crate::lsp::jsonrpc::PublicTailBuffer::new()));
         let (ready_tx, ready_rx) = sync_channel(1);
         let stdout_tail = Arc::clone(&tail);
@@ -299,5 +299,56 @@ mod tests {
         ] {
             assert!(validate_args(&["dap".into(), arg.into()]).is_err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_delve_survives_discovery_and_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let executable = directory.path().join("delve-fixture.cmd");
+        std::fs::write(
+            &executable,
+            format!(
+                concat!(
+                    "@echo off\r\n",
+                    "echo DAP server listening at: {endpoint}\r\n",
+                    ":wait\r\n",
+                    "if exist probe >ack echo delve-running\r\n",
+                    "ping -n 2 127.0.0.1 >nul\r\n",
+                    "goto wait\r\n",
+                ),
+                endpoint = endpoint,
+            ),
+        )
+        .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let transport = runtime
+            .block_on(DapTransport::spawn_delve(
+                executable.to_str().unwrap(),
+                &["dap".into()],
+                &[],
+                directory.path(),
+            ))
+            .expect("spawn and connect to the contained Delve fixture");
+        // Keep the peer socket alive while probing the owned server process.
+        let (_peer, _) = listener.accept().unwrap();
+        std::fs::write(directory.path().join("probe"), "ready").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(directory.path().join("ack"))
+            .is_ok_and(|text| text.trim() == "delve-running")
+        {
+            assert!(transport.is_alive(), "Delve lost its Job during startup");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Delve did not acknowledge after its transport connected"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        transport.kill();
+        assert!(!transport.is_alive());
     }
 }

@@ -12,13 +12,54 @@ use crate::session::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Canonical schema identifier for the handoff JSON payload.
 pub const HANDOFF_SCHEMA_V1: &str = "pi.handoff.v1";
+
+type FileObservations = BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>;
+
+#[derive(Clone, Copy)]
+enum ToolOutcome {
+    Succeeded,
+    Failed,
+    Unconfirmed,
+}
+
+/// A result is evidence only for one unambiguous preceding call. Reused IDs,
+/// duplicate outputs, and contradictory names must not select an arbitrary
+/// successful record as proof that a file was changed.
+#[derive(Default)]
+struct ToolEvidence<'a> {
+    call: Option<(usize, &'a str)>,
+    result: Option<(usize, &'a str, bool)>,
+    ambiguous: bool,
+}
+
+impl ToolEvidence<'_> {
+    fn outcome(&self) -> ToolOutcome {
+        let (Some((call_index, name)), Some((result_index, result_name, is_error))) =
+            (self.call, self.result)
+        else {
+            return ToolOutcome::Unconfirmed;
+        };
+        if self.ambiguous
+            || call_index >= result_index
+            || name.trim().is_empty()
+            || (!result_name.is_empty() && result_name != name)
+        {
+            return ToolOutcome::Unconfirmed;
+        }
+        if is_error {
+            ToolOutcome::Failed
+        } else {
+            ToolOutcome::Succeeded
+        }
+    }
+}
 
 /// Target recipient or storage destination for a generated handoff brief.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,12 +125,13 @@ pub struct FailedApproach {
     pub ref_point: Option<String>,
 }
 
-/// File touched during the session and its observed role.
+/// File mentioned by a tool call or compaction report.
+/// Recorded tool outcomes qualify the role; this is not a filesystem audit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTouched {
     /// File path.
     pub path: String,
-    /// Role: "created", "modified", "read", "executed", etc.
+    /// Reported effects and failed or unconfirmed attempts, in stable order.
     pub role: String,
     /// Line or range references if applicable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -290,12 +332,15 @@ pub struct HandoffDeliveryReport {
 pub struct HandoffGenerator;
 
 impl HandoffGenerator {
-    /// Generate a structured handoff document from a loaded `Session`.
+    /// Generate a handoff for the selected branch, not the physical append log.
+    ///
+    /// Abandoned retry attempts and sibling branches stay available in the
+    /// session tree, but must not become the successor's decisions, failures,
+    /// or next steps. Borrow the selected entries so large tool payloads are
+    /// not cloned just to choose the branch.
     #[must_use]
     pub fn generate_from_session(session: &Session) -> HandoffDocument {
-        let session_id = session.header.id.clone();
-        let entries = session.entries.as_slice();
-        Self::generate_from_entries(&session_id, entries)
+        Self::generate_from_entry_refs(&session.header.id, session.entries_for_current_path())
     }
 
     fn extract_user_text(content: &UserContent) -> String {
@@ -314,21 +359,12 @@ impl HandoffGenerator {
         }
     }
 
-    fn extract_assistant_text_and_tools(
-        message: &AssistantMessage,
-        files_touched_map: &mut BTreeMap<String, (String, BTreeSet<String>)>,
-    ) -> String {
+    fn extract_assistant_text(message: &AssistantMessage) -> String {
         let mut text_acc = String::new();
         for block in &message.content {
-            match block {
-                ContentBlock::Text(t) => {
-                    text_acc.push_str(&t.text);
-                    text_acc.push('\n');
-                }
-                ContentBlock::ToolCall(tc) => {
-                    Self::record_tool_call(&tc.name, &tc.arguments, files_touched_map);
-                }
-                _ => {}
+            if let ContentBlock::Text(t) = block {
+                text_acc.push_str(&t.text);
+                text_acc.push('\n');
             }
         }
         screen_secrets(&text_acc)
@@ -350,14 +386,13 @@ impl HandoffGenerator {
         base: &EntryBase,
         turn_index: usize,
         goal: &mut String,
-        last_assistant_text: &mut String,
+        latest_state_text: &mut String,
         decisions: &mut Vec<Decision>,
         blockers: &mut Vec<String>,
         open_threads: &mut Vec<String>,
         next_steps: &mut Vec<String>,
         lessons: &mut Vec<String>,
         failed_approaches: &mut Vec<FailedApproach>,
-        files_touched_map: &mut BTreeMap<String, (String, BTreeSet<String>)>,
     ) {
         let ref_str = base
             .id
@@ -372,7 +407,7 @@ impl HandoffGenerator {
                 }
             }
             SessionMessage::Assistant { message } => {
-                let screened = Self::extract_assistant_text_and_tools(message, files_touched_map);
+                let screened = Self::extract_assistant_text(message);
                 if !screened.trim().is_empty() {
                     Self::extract_structured_notes(
                         &screened,
@@ -383,7 +418,7 @@ impl HandoffGenerator {
                         next_steps,
                         lessons,
                     );
-                    *last_assistant_text = screened;
+                    *latest_state_text = screened;
                 }
             }
             SessionMessage::ToolResult {
@@ -394,7 +429,9 @@ impl HandoffGenerator {
             } => {
                 let tool_output = Self::extract_tool_result_text(content);
 
-                if *is_error || tool_output.contains("Error:") || tool_output.contains("FAILED") {
+                // Reading source or logs containing "Error:"/"FAILED" does
+                // not itself mean the read failed. Trust the recorded outcome.
+                if *is_error {
                     let screened = screen_secrets(&tool_output);
                     let first_err = screened
                         .lines()
@@ -451,15 +488,24 @@ impl HandoffGenerator {
         }
     }
 
-    /// Generate a structured handoff document from a list of `SessionEntry` records.
+    /// Generate a handoff from an explicitly selected chronological record list.
+    /// Use [`Self::generate_from_session`] when the session's active leaf should
+    /// select the branch; this lower-level entrypoint analyzes every supplied row.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn generate_from_entries(session_id: &str, entries: &[SessionEntry]) -> HandoffDocument {
+        Self::generate_from_entry_refs(session_id, entries)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn generate_from_entry_refs<'a>(
+        session_id: &str,
+        entries: impl IntoIterator<Item = &'a SessionEntry>,
+    ) -> HandoffDocument {
+        let entries = entries.into_iter().collect::<Vec<_>>();
         let mut goal = String::new();
-        let mut current_state = String::new();
         let mut decisions = Vec::new();
         let mut failed_approaches = Vec::new();
-        let mut files_touched_map: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
+        let mut files_touched_map = Self::collect_file_observations(&entries);
         let mut blockers = Vec::new();
         let mut open_threads = Vec::new();
         let mut next_steps = Vec::new();
@@ -467,7 +513,7 @@ impl HandoffGenerator {
         let mut compaction_count = 0;
 
         let mut turn_index = 0usize;
-        let mut last_assistant_text = String::new();
+        let mut latest_state_text = String::new();
 
         for entry in entries {
             match entry {
@@ -488,20 +534,20 @@ impl HandoffGenerator {
                         base,
                         turn_index,
                         &mut goal,
-                        &mut last_assistant_text,
+                        &mut latest_state_text,
                         &mut decisions,
                         &mut blockers,
                         &mut open_threads,
                         &mut next_steps,
                         &mut lessons,
                         &mut failed_approaches,
-                        &mut files_touched_map,
                     );
                 }
                 SessionEntry::BranchSummary(bs) => {
                     let screened = screen_secrets(&bs.summary);
-                    current_state.push_str(&screened);
-                    current_state.push('\n');
+                    if !screened.trim().is_empty() {
+                        latest_state_text = screened;
+                    }
                 }
                 _ => {}
             }
@@ -511,24 +557,23 @@ impl HandoffGenerator {
             goal = "No explicit initial goal detected in session history.".to_string();
         }
 
-        if current_state.is_empty() {
-            if last_assistant_text.is_empty() {
-                current_state = "Session active, awaiting next instructions.".to_string();
-            } else {
-                // Take the last few lines or first paragraph of last assistant message
-                current_state = last_assistant_text
-                    .lines()
-                    .take(6)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-        }
+        // A branch summary is state at its position, not an override for all
+        // later assistant replies. Empty replies leave the last useful state.
+        let current_state = if latest_state_text.is_empty() {
+            "Session active, awaiting next instructions.".to_string()
+        } else {
+            latest_state_text
+                .lines()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
         let files_touched = files_touched_map
             .into_iter()
-            .map(|(path, (role, line_refs))| FileTouched {
-                path,
-                role,
+            .map(|(path, (roles, line_refs))| FileTouched {
+                path: screen_secrets(&path),
+                role: screen_secrets(&roles.into_iter().collect::<Vec<_>>().join("; ")),
                 line_refs: line_refs.into_iter().collect(),
             })
             .collect();
@@ -568,10 +613,66 @@ impl HandoffGenerator {
         }
     }
 
+    fn collect_file_observations(entries: &[&SessionEntry]) -> FileObservations {
+        let mut evidence: HashMap<&str, ToolEvidence<'_>> = HashMap::new();
+        for (index, entry) in entries.iter().copied().enumerate() {
+            let SessionEntry::Message(entry) = entry else {
+                continue;
+            };
+            match &entry.message {
+                SessionMessage::Assistant { message } => {
+                    for block in &message.content {
+                        if let ContentBlock::ToolCall(call) = block
+                            && !call.id.trim().is_empty()
+                        {
+                            let observed = evidence.entry(&call.id).or_default();
+                            observed.ambiguous |=
+                                observed.call.replace((index, call.name.as_str())).is_some();
+                        }
+                    }
+                }
+                SessionMessage::ToolResult {
+                    tool_call_id,
+                    tool_name,
+                    is_error,
+                    ..
+                } if !tool_call_id.trim().is_empty() => {
+                    let observed = evidence.entry(tool_call_id).or_default();
+                    observed.ambiguous |= observed
+                        .result
+                        .replace((index, tool_name.as_str(), *is_error))
+                        .is_some();
+                }
+                _ => {}
+            }
+        }
+
+        let mut files = FileObservations::new();
+        for entry in entries.iter().copied() {
+            let SessionEntry::Message(MessageEntry {
+                message: SessionMessage::Assistant { message },
+                ..
+            }) = entry
+            else {
+                continue;
+            };
+            for block in &message.content {
+                if let ContentBlock::ToolCall(call) = block {
+                    let outcome = evidence
+                        .get(call.id.as_str())
+                        .map_or(ToolOutcome::Unconfirmed, ToolEvidence::outcome);
+                    Self::record_tool_call(&call.name, &call.arguments, outcome, &mut files);
+                }
+            }
+        }
+        files
+    }
+
     fn record_tool_call(
         tool_name: &str,
         arguments: &serde_json::Value,
-        files_touched: &mut BTreeMap<String, (String, BTreeSet<String>)>,
+        outcome: ToolOutcome,
+        files_touched: &mut FileObservations,
     ) {
         let path = arguments
             .get("path")
@@ -589,14 +690,19 @@ impl HandoffGenerator {
                 _ => "accessed",
             };
 
-            let entry = files_touched
-                .entry(path)
-                .or_insert_with(|| (role.to_string(), BTreeSet::new()));
-
-            // Update role to higher mutation level if modified
-            if role == "modified" || role == "created/overwritten" {
-                entry.0 = role.to_string();
-            }
+            let observation = match outcome {
+                ToolOutcome::Succeeded => role.to_string(),
+                ToolOutcome::Failed => {
+                    format!("{tool_name} attempted (tool reported failure; effects may be partial)")
+                }
+                ToolOutcome::Unconfirmed => {
+                    format!("{tool_name} attempted (outcome unconfirmed)")
+                }
+            };
+            // Retain both successful effects and subsequent failed attempts:
+            // neither can erase the other from the successor's evidence.
+            let entry = files_touched.entry(path).or_default();
+            entry.0.insert(observation);
 
             if let Some(start_line) = arguments
                 .get("StartLine")
@@ -612,6 +718,57 @@ impl HandoffGenerator {
         }
     }
 
+    /// Recognize a Markdown task marker without stripping markers from the
+    /// task's own text. Completion retires an earlier pending item; a later
+    /// unchecked occurrence explicitly reopens it.
+    fn task_status(trimmed: &str) -> Option<(bool, &str)> {
+        let mut chars = trimmed.chars();
+        if !matches!(chars.next()?, '-' | '*' | '+') {
+            return None;
+        }
+        let rest = chars.as_str();
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let rest = rest.trim_start();
+        let (complete, item) = if let Some(item) = rest.strip_prefix("[ ]") {
+            (false, item)
+        } else {
+            let item = rest
+                .strip_prefix("[x]")
+                .or_else(|| rest.strip_prefix("[X]"))?;
+            (true, item)
+        };
+        if !item.is_empty() && !item.starts_with(char::is_whitespace) {
+            return None;
+        }
+        Some((complete, item.trim()))
+    }
+
+    /// Examples inside fenced code are not handoff directives. Match both the
+    /// delimiter and its width so an inner triple fence cannot close a longer
+    /// enclosing fence, and keep unterminated code excluded through EOF.
+    fn unfenced_lines(text: &str) -> impl Iterator<Item = &str> {
+        let mut fence: Option<(char, usize)> = None;
+        text.lines().filter(move |line| {
+            let trimmed = line.trim();
+            if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
+                let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+                if let Some((opening, minimum)) = fence {
+                    if marker == opening && width >= minimum && trimmed[width..].trim().is_empty() {
+                        fence = None;
+                    }
+                    return false;
+                }
+                if width >= 3 {
+                    fence = Some((marker, width));
+                    return false;
+                }
+            }
+            fence.is_none()
+        })
+    }
+
     fn parse_structured_line(
         trimmed: &str,
         ref_str: &str,
@@ -621,12 +778,10 @@ impl HandoffGenerator {
         next_steps: &mut Vec<String>,
         lessons: &mut Vec<String>,
     ) {
-        if trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]") {
-            let item = trimmed
-                .trim_start_matches("- [ ]")
-                .trim_start_matches("- [x]")
-                .trim();
-            if !item.is_empty() && !next_steps.iter().any(|s| s == item) {
+        if let Some((complete, item)) = Self::task_status(trimmed) {
+            if complete {
+                next_steps.retain(|pending| pending != item);
+            } else if !item.is_empty() && !next_steps.iter().any(|s| s == item) {
                 next_steps.push(item.to_string());
             }
         } else if let Some(rest) = trimmed.strip_prefix("Decision:") {
@@ -665,7 +820,7 @@ impl HandoffGenerator {
         next_steps: &mut Vec<String>,
         lessons: &mut Vec<String>,
     ) {
-        for line in text.lines() {
+        for line in Self::unfenced_lines(text) {
             Self::parse_structured_line(
                 line.trim(),
                 ref_str,
@@ -682,7 +837,7 @@ impl HandoffGenerator {
         trimmed: &str,
         decisions: &mut Vec<Decision>,
         failed_approaches: &mut Vec<FailedApproach>,
-        files_touched: &mut BTreeMap<String, (String, BTreeSet<String>)>,
+        files_touched: &mut FileObservations,
         lessons: &mut Vec<String>,
     ) {
         if let Some(rest) = trimmed.strip_prefix("Decision:") {
@@ -702,7 +857,9 @@ impl HandoffGenerator {
             if !path.is_empty() {
                 files_touched
                     .entry(path.to_string())
-                    .or_insert_with(|| ("compacted session access".to_string(), BTreeSet::new()));
+                    .or_default()
+                    .0
+                    .insert("compacted session access".to_string());
             }
         } else if let Some(rest) = trimmed.strip_prefix("Lesson:") {
             let lesson_text = rest.trim();
@@ -716,10 +873,10 @@ impl HandoffGenerator {
         summary: &str,
         decisions: &mut Vec<Decision>,
         failed_approaches: &mut Vec<FailedApproach>,
-        files_touched: &mut BTreeMap<String, (String, BTreeSet<String>)>,
+        files_touched: &mut FileObservations,
         lessons: &mut Vec<String>,
     ) {
-        for line in summary.lines() {
+        for line in Self::unfenced_lines(summary) {
             Self::parse_compaction_line(
                 line.trim(),
                 decisions,
@@ -855,6 +1012,447 @@ mod tests {
     use crate::model::{AssistantMessage, ContentBlock, TextContent, ToolCall, UserContent};
     use crate::session::{CompactionEntry, EntryBase, MessageEntry, SessionEntry, SessionMessage};
 
+    fn handoff_tool_call(entry: &str, id: &str, name: &str, path: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: EntryBase::new(None, entry.to_string()),
+            message: SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments: serde_json::json!({"path": path}),
+                        thought_signature: None,
+                    })],
+                    ..AssistantMessage::default()
+                },
+            },
+        })
+    }
+
+    fn handoff_tool_result(
+        entry: &str,
+        id: &str,
+        name: &str,
+        is_error: bool,
+        text: &str,
+    ) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: EntryBase::new(None, entry.to_string()),
+            message: SessionMessage::ToolResult {
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                details: None,
+                is_error,
+                timestamp: Some(0),
+            },
+        })
+    }
+
+    #[test]
+    fn file_roles_require_a_matching_recorded_outcome() {
+        for (result, expected) in [
+            (None, "write attempted (outcome unconfirmed)"),
+            (Some(false), "created/overwritten"),
+            (
+                Some(true),
+                "write attempted (tool reported failure; effects may be partial)",
+            ),
+        ] {
+            let mut entries = vec![handoff_tool_call("call", "write-id", "write", "target.rs")];
+            if let Some(is_error) = result {
+                entries.push(handoff_tool_result(
+                    "result",
+                    "write-id",
+                    "write",
+                    is_error,
+                    "recorded outcome",
+                ));
+            }
+            let original = serde_json::to_value(&entries).unwrap();
+            let document = HandoffGenerator::generate_from_entries("effects", &entries);
+            assert_eq!(document.files_touched.len(), 1);
+            assert_eq!(document.files_touched[0].role, expected);
+            assert_eq!(
+                document.failed_approaches.len(),
+                usize::from(result == Some(true))
+            );
+            assert_eq!(serde_json::to_value(&entries).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn ambiguous_reordered_and_conflicting_outputs_cannot_prove_a_mutation() {
+        let call = || handoff_tool_call("call", "id", "write", "target.rs");
+        let success = || handoff_tool_result("result", "id", "write", false, "ok");
+        for entries in [
+            vec![success(), call()],
+            vec![
+                call(),
+                success(),
+                handoff_tool_result("duplicate", "id", "write", true, "failed"),
+            ],
+            vec![
+                call(),
+                handoff_tool_call("duplicate", "id", "write", "other.rs"),
+                success(),
+            ],
+            vec![
+                call(),
+                handoff_tool_result("result", "id", "read", false, "ok"),
+            ],
+            vec![
+                call(),
+                handoff_tool_result("result", "other-id", "write", false, "ok"),
+            ],
+            vec![
+                handoff_tool_call("call", "", "write", "target.rs"),
+                handoff_tool_result("result", "", "write", false, "ok"),
+            ],
+            vec![
+                handoff_tool_call("call", "id", " ", "target.rs"),
+                handoff_tool_result("result", "id", " ", false, "ok"),
+            ],
+        ] {
+            let document = HandoffGenerator::generate_from_entries("ambiguous", &entries);
+            assert!(!document.files_touched.is_empty());
+            for file in &document.files_touched {
+                assert!(
+                    file.role.contains("outcome unconfirmed"),
+                    "{}: {}",
+                    file.path,
+                    file.role
+                );
+                assert!(!file.role.contains("created/overwritten"));
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_results_match_ids_instead_of_arrival_order() {
+        let entries = [
+            handoff_tool_call("write", "write-id", "write", "a.rs"),
+            handoff_tool_call("edit", "edit-id", "edit", "b.rs"),
+            handoff_tool_call("read", "read-id", "read", "c.rs"),
+            handoff_tool_result("read-result", "read-id", "read", false, "contents"),
+            handoff_tool_result("edit-result", "edit-id", "edit", true, "edit failed"),
+            // An omitted foreign name can be filled from a unique matching ID.
+            handoff_tool_result("write-result", "write-id", "", false, "ok"),
+        ];
+        let document = HandoffGenerator::generate_from_entries("parallel", &entries);
+        let files = &document.files_touched;
+        assert_eq!(files.len(), 3);
+        assert_eq!(
+            (files[0].path.as_str(), files[0].role.as_str()),
+            ("a.rs", "created/overwritten")
+        );
+        assert_eq!(files[1].path, "b.rs");
+        assert!(files[1].role.contains("tool reported failure"));
+        assert_eq!(
+            (files[2].path.as_str(), files[2].role.as_str()),
+            ("c.rs", "read")
+        );
+        assert_eq!(document.failed_approaches.len(), 1);
+    }
+
+    #[test]
+    fn failed_and_unfinished_attempts_do_not_erase_completed_file_effects() {
+        let entries = [
+            handoff_tool_call("created", "one", "write", "target.rs"),
+            handoff_tool_result("created-result", "one", "write", false, "ok"),
+            handoff_tool_call("failed", "two", "edit", "target.rs"),
+            handoff_tool_result("failed-result", "two", "edit", true, "edit failed"),
+            handoff_tool_call("unfinished", "three", "write", "target.rs"),
+        ];
+        let document = HandoffGenerator::generate_from_entries("mixed", &entries);
+        assert_eq!(document.files_touched.len(), 1);
+        assert_eq!(
+            document.files_touched[0].role,
+            "created/overwritten; edit attempted (tool reported failure; effects may be partial); write attempted (outcome unconfirmed)"
+        );
+    }
+
+    #[test]
+    fn reading_error_examples_is_not_itself_a_failed_approach() {
+        let entries = [
+            handoff_tool_call("read", "id", "read", "error_examples.rs"),
+            handoff_tool_result(
+                "result",
+                "id",
+                "read",
+                false,
+                "Error: documented example\nFAILED is a fixture literal",
+            ),
+        ];
+        let document = HandoffGenerator::generate_from_entries("source", &entries);
+        assert!(document.failed_approaches.is_empty());
+        assert_eq!(document.files_touched[0].role, "read");
+    }
+
+    #[test]
+    fn exported_file_observations_screen_credential_paths_and_tool_names() {
+        let secret = "ghp_12345678901234567890";
+        let path = format!("output/{secret}/file.rs");
+        let entries = [
+            handoff_tool_call("call", "id", secret, &path),
+            handoff_tool_result("result", "id", secret, true, "failed"),
+        ];
+        let document = HandoffGenerator::generate_from_entries("private", &entries);
+        for rendered in [document.to_markdown(), document.to_json().unwrap()] {
+            assert!(!rendered.contains(secret));
+            assert!(rendered.contains("[REDACTED_GITHUB_PAT]"));
+        }
+    }
+
+    fn handoff_note_entry(id: &str, text: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: EntryBase::new(None, id.to_string()),
+            message: SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    ..AssistantMessage::default()
+                },
+            },
+        })
+    }
+
+    fn handoff_notes(notes: &[&str]) -> HandoffDocument {
+        let entries = notes
+            .iter()
+            .enumerate()
+            .map(|(index, text)| handoff_note_entry(&format!("note-{index}"), text))
+            .collect::<Vec<_>>();
+        HandoffGenerator::generate_from_entries("task-state", &entries)
+    }
+
+    #[test]
+    fn completed_work_is_not_reissued_as_a_next_step() {
+        let document = handoff_notes(&[
+            "- [ ] Apply migration\n- [ ] Validate service\n- [ ] Apply migration",
+            "- [x] Apply migration\n* [X] Validate service\n+ [x] Already completed",
+        ]);
+        assert!(document.next_steps.is_empty());
+        assert!(!document.to_markdown().contains("- [ ] Apply migration"));
+    }
+
+    #[test]
+    fn reopened_tasks_preserve_order_and_do_not_close_similarly_named_work() {
+        let document = handoff_notes(&[
+            "- [ ] Test\n- [ ] Test deployment\n- [x] Test",
+            "+ [ ] Test\n* [ ] Test deployment\n- [ ] - [x] literal task text",
+        ]);
+        assert_eq!(
+            document.next_steps,
+            ["Test deployment", "Test", "- [x] literal task text"]
+        );
+    }
+
+    #[test]
+    fn task_markers_require_a_markdown_boundary_and_keep_unicode_text() {
+        let document = handoff_notes(&[
+            "-[ ] Not a list\n- [ ]not a task\n- [x]not a task\n- [ ]\n- [ ] 验证 🦀\n*\t[ ]\tDeploy safely",
+            "- [X] 验证 🦀",
+        ]);
+        assert_eq!(document.next_steps, ["Deploy safely"]);
+    }
+
+    #[test]
+    fn fenced_examples_cannot_add_or_complete_handoff_work() {
+        let document = handoff_notes(&[
+            "- [ ] Keep real work\n````markdown\n- [x] Keep real work\n```\n- [ ] Still code\n~~~~\nDecision: still code\n````\n~~~text\nBlocker: sample blocker\nQuestion: sample question\nLesson: sample lesson\n~~~\nDecision: Real decision\n- [ ] Real next step\n```unclosed\n- [ ] Incomplete example",
+        ]);
+        assert_eq!(document.next_steps, ["Keep real work", "Real next step"]);
+        assert_eq!(document.decisions.len(), 1);
+        assert_eq!(document.decisions[0].decision, "Real decision");
+        assert!(document.blockers.is_empty());
+        assert!(document.open_threads.is_empty());
+        assert!(document.lessons.is_empty());
+    }
+
+    #[test]
+    fn latest_nonempty_branch_or_assistant_state_wins_in_chronological_order() {
+        let summary = |id: &str, text: &str| {
+            SessionEntry::BranchSummary(crate::session::BranchSummaryEntry {
+                base: EntryBase::new(None, id.to_string()),
+                from_id: "other-branch".to_string(),
+                summary: text.to_string(),
+                details: None,
+                from_hook: None,
+            })
+        };
+        let mut entries = vec![
+            summary("branch", "Old branch context"),
+            handoff_note_entry("latest", "Implementation finished\nReady for verification"),
+            handoff_note_entry("empty", "  \n"),
+        ];
+        let document = HandoffGenerator::generate_from_entries("state", &entries);
+        assert_eq!(
+            document.current_state,
+            "Implementation finished\nReady for verification"
+        );
+        entries.push(summary("new-branch", "New branch context"));
+        assert_eq!(
+            HandoffGenerator::generate_from_entries("state", &entries).current_state,
+            "New branch context"
+        );
+    }
+
+    #[test]
+    fn compaction_code_examples_do_not_become_historical_decisions_or_files() {
+        let entries = [SessionEntry::Compaction(CompactionEntry {
+            base: EntryBase::new(None, "summary".to_string()),
+            summary: "```text\nDecision: sample decision\nFile touched: sample.rs\nFailed approach: sample failure\nLesson: sample lesson\n```\nDecision: actual decision\nFile touched: actual.rs".to_string(),
+            first_kept_entry_id: "retained".to_string(),
+            tokens_before: 100,
+            details: None,
+            from_hook: None,
+        })];
+        let document = HandoffGenerator::generate_from_entries("summary", &entries);
+        assert_eq!(document.decisions.len(), 1);
+        assert_eq!(document.decisions[0].decision, "actual decision");
+        assert_eq!(document.files_touched.len(), 1);
+        assert_eq!(document.files_touched[0].path, "actual.rs");
+        assert!(document.failed_approaches.is_empty());
+        assert!(document.lessons.is_empty());
+    }
+
+    fn append_handoff_branch(session: &mut Session, marker: &str) -> String {
+        let user = session.append_message(SessionMessage::User {
+            content: UserContent::Text(format!("Continue {marker}")),
+            timestamp: Some(0),
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new(format!(
+                        "Decision: {marker} design\nBlocker: {marker} blocker\nQuestion: {marker} question\nLesson: {marker} lesson\n- [ ] {marker} next step"
+                    ))),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: format!("call-{marker}"),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": format!("{marker}.rs")}),
+                        thought_signature: None,
+                    }),
+                ],
+                ..AssistantMessage::default()
+            },
+        });
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: format!("call-{marker}"),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Error: {marker} read failed"
+            )))],
+            details: None,
+            is_error: true,
+            timestamp: Some(0),
+        });
+        session.append_compaction(
+            format!("Decision: {marker} checkpoint"),
+            user,
+            100,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn session_handoff_excludes_sibling_notes_files_failures_and_checkpoints() {
+        let mut session = Session::in_memory();
+        let root = session.append_message(SessionMessage::User {
+            content: UserContent::Text("Shared objective".to_string()),
+            timestamp: Some(0),
+        });
+        let left = append_handoff_branch(&mut session, "left-branch");
+        assert!(session.navigate_to(&root));
+        let right = append_handoff_branch(&mut session, "right-branch");
+        let original = serde_json::to_value(&session.entries).expect("original entries");
+
+        for (leaf, included, excluded) in [
+            (&left, "left-branch", "right-branch"),
+            (&right, "right-branch", "left-branch"),
+        ] {
+            assert!(session.navigate_to(leaf));
+            let document = HandoffGenerator::generate_from_session(&session);
+            assert_eq!(document.goal, "Shared objective");
+            assert_eq!(document.compaction_summaries_count, 1);
+            assert_eq!(document.decisions.len(), 2);
+            assert_eq!(document.failed_approaches.len(), 1);
+            assert_eq!(document.files_touched.len(), 1);
+            assert_eq!(document.files_touched[0].path, format!("{included}.rs"));
+            assert!(document.current_state.contains(included));
+            for rendered in [document.to_markdown(), document.to_json().expect("JSON")] {
+                assert!(rendered.contains(included));
+                assert!(
+                    !rendered.contains(excluded),
+                    "sibling history leaked: {rendered}"
+                );
+            }
+            assert_eq!(serde_json::to_value(&session.entries).unwrap(), original);
+        }
+
+        // Explicit record-list callers retain their deliberately selected input.
+        let all = HandoffGenerator::generate_from_entries(&session.header.id, &session.entries);
+        assert_eq!(all.compaction_summaries_count, 2);
+    }
+
+    #[test]
+    fn root_selection_does_not_handoff_abandoned_history() {
+        let mut session = Session::in_memory();
+        let abandoned = append_handoff_branch(&mut session, "abandoned-branch");
+        session.reset_leaf();
+        let document = HandoffGenerator::generate_from_session(&session);
+        assert_eq!(document.compaction_summaries_count, 0);
+        assert!(document.decisions.is_empty());
+        assert!(document.failed_approaches.is_empty());
+        assert!(document.files_touched.is_empty());
+        assert!(document.next_steps.is_empty());
+        assert!(!document.to_json().unwrap().contains("abandoned-branch"));
+        assert!(
+            session.get_entry(&abandoned).is_some(),
+            "tree history is preserved"
+        );
+    }
+
+    #[test]
+    fn persisted_non_tip_selection_remains_the_handoff_branch_after_reopen() {
+        let directory = tempfile::tempdir().expect("session directory");
+        let path = directory.path().join("handoff.jsonl");
+        let mut session = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        session.path = Some(path.clone());
+        let root = session.append_message(SessionMessage::User {
+            content: UserContent::Text("Persisted objective".to_string()),
+            timestamp: Some(0),
+        });
+        let selected = append_handoff_branch(&mut session, "selected-branch");
+        assert!(session.navigate_to(&root));
+        let abandoned = append_handoff_branch(&mut session, "newer-abandoned-branch");
+        assert!(session.navigate_to(&selected));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let reopened = runtime.block_on(async {
+            session.save().await.expect("save selected branch");
+            Session::open(path.to_str().expect("UTF-8 fixture path"))
+                .await
+                .expect("reopen selected branch")
+        });
+        assert_eq!(reopened.leaf_id(), Some(selected.as_str()));
+        assert!(reopened.get_entry(&abandoned).is_some());
+        let before = fs::read(&path).expect("saved session bytes");
+        let document = HandoffGenerator::generate_from_session(&reopened);
+        assert_eq!(document.goal, "Persisted objective");
+        let rendered = document.to_json().expect("handoff JSON");
+        assert!(rendered.contains("selected-branch"));
+        assert!(!rendered.contains("newer-abandoned-branch"));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "handoff must be read-only"
+        );
+    }
+
     #[test]
     fn test_handoff_target_parsing() {
         assert_eq!(HandoffTarget::parse("human"), HandoffTarget::Human);
@@ -975,7 +1573,10 @@ mod tests {
         // Check files touched
         assert_eq!(doc.files_touched.len(), 1);
         assert_eq!(doc.files_touched[0].path, "src/main.rs");
-        assert_eq!(doc.files_touched[0].role, "created/overwritten");
+        assert_eq!(
+            doc.files_touched[0].role,
+            "write attempted (tool reported failure; effects may be partial)"
+        );
         assert!(
             doc.files_touched[0]
                 .line_refs

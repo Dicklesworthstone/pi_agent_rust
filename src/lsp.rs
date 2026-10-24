@@ -12,6 +12,7 @@ mod diagnostics_tests;
 pub mod edits;
 mod hierarchy;
 pub mod jsonrpc;
+mod project_diagnostics;
 mod refactor_preview;
 pub mod registry;
 mod semantic;
@@ -128,12 +129,40 @@ impl LspTool {
     }
 
     async fn synced(&self, path: &Path) -> Result<(String, Arc<ServerEntry>)> {
+        self.synced_with_timeout(path, self.registry.request_timeout())
+            .await
+    }
+
+    async fn synced_with_timeout(
+        &self,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<(String, Arc<ServerEntry>)> {
         let entry = self.client_for(path).await?;
         let spec = self.registry.spec_for_file(path).ok_or_else(|| {
             tool_err("LSP_NO_SERVER", format!("no server for {}", path.display()))
         })?;
         let language_id = Self::language_id_for(path, spec);
-        let uri = entry.client.ensure_synced(path, &language_id)?;
+        let uri = entry
+            .client
+            .ensure_synced_with_timeout(path, &language_id, timeout)
+            .await?;
+        Ok((uri, entry))
+    }
+
+    async fn synced_for_spec_with_timeout(
+        &self,
+        path: &Path,
+        spec: &registry::ServerSpec,
+        timeout: Duration,
+    ) -> Result<(String, Arc<ServerEntry>)> {
+        let entry = self.registry.client_for_spec(path, spec).await?;
+        actions::install_apply_edit_handler(&entry, Arc::clone(&self.actions));
+        let language_id = Self::language_id_for(path, spec);
+        let uri = entry
+            .client
+            .ensure_synced_with_timeout(path, &language_id, timeout)
+            .await?;
         Ok((uri, entry))
     }
 
@@ -240,7 +269,9 @@ impl LspTool {
             return Ok(text_output(payload.to_string(), payload));
         }
         let path = resolve_tool_path(file, &self.cwd);
-        let (uri, entry) = self.synced(&path).await?;
+        let (uri, entry) = self
+            .synced_with_timeout(&path, self.request_timeout(input))
+            .await?;
         let wait = input
             .timeout
             .filter(|secs| *secs > 0)
@@ -262,30 +293,7 @@ impl LspTool {
                 "symbol resolution requires a workspace query",
             ));
         }
-        match (input.file.as_deref(), input.query.as_deref()) {
-            (Some(file), _) => {
-                let path = resolve_tool_path(file, &self.cwd);
-                let (uri, entry) = self.synced(&path).await?;
-                let result = entry
-                    .client
-                    .call(
-                        "textDocument/documentSymbol",
-                        json!({"textDocument":{"uri":uri}}),
-                        self.request_timeout(input),
-                    )
-                    .await?;
-                let (payload, truncated) = cap_payload(
-                    json!({"action":"symbols","file":display_path(&path,&self.cwd),"server":entry.spec_name,"symbols":result}),
-                );
-                Ok(text_output(
-                    payload.to_string(),
-                    json!({"truncated":truncated,"payload":payload}),
-                ))
-            }
-            (None, _) => Ok(usage_error(
-                "lsp symbols requires `file` (document symbols) or `query` (workspace symbols)",
-            )),
-        }
+        self.run_document_symbols(input).await
     }
 
     fn code_action_range(input: &LspInput, path: &Path) -> Result<Value> {
@@ -377,6 +385,131 @@ impl LspTool {
         let caps = entry.client.capabilities();
         let payload = json!({"action":"capabilities","server":entry.spec_name,"serverName":caps.server_name,
             "willRenameFiles":caps.raw.pointer("/workspace/fileOperations/willRename").is_some_and(Value::is_object),"textDocumentSyncKind":caps.sync_kind,"capabilities":caps.raw});
+        Ok(text_output(payload.to_string(), payload))
+    }
+
+    /// Explicit, connection-local analysis settings. This is not an agent
+    /// settings-file edit and does not reuse initializationOptions as settings.
+    async fn run_configuration(&self, input: &LspInput) -> Result<ToolOutput> {
+        let file = input
+            .file
+            .as_deref()
+            .filter(|file| !file.is_empty() && file.len() <= 8192)
+            .ok_or_else(|| tool_err("LSP_USAGE", "configure requires an anchor file"))?;
+        if input.position.is_some()
+            || input.line.is_some()
+            || input.symbol.is_some()
+            || input.query.is_some()
+            || input.range.is_some()
+            || input.limit.is_some()
+            || input.resolve.is_some()
+            || input.action_id.is_some()
+            || input.refactor_id.is_some()
+            || input.completion_id.is_some()
+            || input.snippet_values.is_some()
+            || input.hierarchy_id.is_some()
+            || input.only.is_some()
+            || input.after.is_some()
+            || input.new_name.is_some()
+            || input.new_file.is_some()
+            || input.format_options.is_some()
+            || input.method.is_some()
+            || (input.payload.is_none() && input.apply.is_some())
+        {
+            return Err(tool_err(
+                "LSP_USAGE",
+                "configure accepts file, timeout, and optional settings payload; apply requires payload",
+            ));
+        }
+        let proposed = input
+            .payload
+            .as_ref()
+            .map(client::workspace::Settings::parse)
+            .transpose()?;
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        let started = std::time::Instant::now();
+        let timeout = self.request_timeout(input);
+        let remaining = || -> Result<Duration> {
+            refactor_preview::check_owner(&owner)?;
+            timeout
+                .checked_sub(started.elapsed())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| tool_err("LSP_TIMEOUT", "configuration request budget expired"))
+        };
+        remaining()?;
+        let requested = resolve_tool_path(file, &self.cwd);
+        let metadata = std::fs::symlink_metadata(&requested)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(tool_err(
+                "LSP_FILE_UNREADABLE",
+                "configuration anchor must be a regular nonsymlink file",
+            ));
+        }
+        let path = requested.canonicalize()?;
+        let now = owner
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let entry = asupersync::time::timeout(now, remaining()?, self.client_for(&path))
+            .await
+            .map_err(|_| tool_err("LSP_TIMEOUT", "configuration server startup timed out"))??;
+        remaining()?;
+        if !entry.client.is_alive() {
+            return Err(tool_err(
+                "LSP_TRANSPORT_CLOSED",
+                "configuration connection closed",
+            ));
+        }
+        if !path.starts_with(entry.client.root()) {
+            return Err(tool_err(
+                "LSP_CONFIGURATION_SCOPE",
+                "configuration anchor is outside the server workspace",
+            ));
+        }
+        let (previous, revision) = entry.client.workspace_settings();
+        let changed = proposed
+            .as_ref()
+            .is_some_and(|settings| revision == 0 || settings.value() != previous.as_ref());
+        let mut payload = json!({
+            "action":"configure","file":display_path(&path,&self.cwd),
+            "server":entry.spec_name,"workspace":display_path(entry.client.root(),&self.cwd),
+            "settings":proposed.as_ref().map_or(previous.as_ref(), client::workspace::Settings::value),
+            "previousRevision":revision,"revision":u64::MAX,
+            "configured":revision != 0,"changed":changed,"applied":false,
+            "preview":proposed.is_some() && input.apply != Some(true),
+            "notificationQueued":false,"persisted":false,
+            "note":"Connection-local replacement, not merged or persisted. Repeat the payload with apply:true to update. Queue acceptance does not prove server adoption; reload restores this server's configured settings."
+        });
+        // Bound the complete response before any update. Reserve the widest
+        // possible revision number, then replace it with the actual revision.
+        if serde_json::to_vec(&payload)?.len() > MAX_PAYLOAD_BYTES {
+            return Err(tool_err(
+                "LSP_CONFIGURATION_INVALID",
+                "configuration output exceeds its byte budget",
+            ));
+        }
+        remaining()?;
+        let (applied, current_revision) = if input.apply == Some(true) {
+            let settings = proposed.as_ref().expect("validated configuration payload");
+            let outcome = entry
+                .client
+                .set_workspace_settings_with_timeout(settings, remaining()?)
+                .await?;
+            if outcome.0 {
+                // The client already retired document incarnations; retire
+                // tool handles too. Never grant a command/applyEdit window.
+                self.invalidate_refactor(&entry);
+            }
+            outcome
+        } else {
+            (false, revision)
+        };
+        payload["revision"] = json!(current_revision);
+        payload["configured"] = json!(current_revision != 0);
+        payload["applied"] = json!(applied);
+        payload["notificationQueued"] = json!(applied);
+        // After admission, report the effect rather than turning a subsequent
+        // cancellation into an error that implies nothing was sent.
         Ok(text_output(payload.to_string(), payload))
     }
 
@@ -512,25 +645,28 @@ impl Tool for LspTool {
     }
     fn description(&self) -> &str {
         concat!(
-            "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then select actionId or a fresh title/index query to resolve and preview an edit-only action; approve the returned refactorId with apply:true. Direct apply:true with actionId or query retains edit-then-command execution; command-backed actions cannot be statically previewed. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16.",
+            "IDE-grade code intelligence via language servers: diagnostics, definition, references, hover, symbols, incoming_calls, outgoing_calls, supertypes, subtypes, rename, rename_file, code_actions, format, type_definition, implementation, status, reload, capabilities, request, workspace_diagnostics and completion. completion lists semantic suggestions at file + exact position; query optionally filters by case-sensitive prefix. Select completionId to resolve and preview, then apply:true to insert with auto-import edits. Numeric snippet placeholders accept literal snippetValues; repeat the values when applying. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Commands, snippet variables and transforms are unsupported. Completion range is an explicit replacement fallback for servers omitting textEdit. workspace_diagnostics actively checks a workspace-relative file glob, lazily starting servers; inspect complete and all per-file errors. diagnostics globs remain a server-free cached view. Call/type hierarchy queries start at file + symbol, then follow returned hierarchyId handles within the same hierarchy kind. code_actions accepts a selected range and only kinds such as refactor.extract, refactor.inline or source.organizeImports. List first, then select actionId or a fresh title/index query to resolve and preview an edit-only action; approve the returned refactorId with apply:true. Direct apply:true with actionId or query retains edit-then-command execution; command-backed actions cannot be statically previewed. Cached actionId already identifies its selection; do not combine it with range, only, symbol, line or query. format previews document or range formatting; apply:true writes the changes. Position addressing uses file + 1-indexed line + symbol substring; symbol#N selects an occurrence. All range positions are zero-based UTF-16.",
             " signature_help inspects callable overloads and the active parameter at file + exact position. inlay_hints inspects inferred types and argument labels over file + optional exact range; resolve:true obtains lazy tooltips and label locations. Both actions are read-only and never accept hint edits or run commands.",
-            " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. Omitting apply on a fresh rename preserves immediate application.",
+            " rename and rename_file with apply:false stage a reviewable workspace edit without writes. Then use the same action with refactorId and apply:true to commit that exact plan without another server request. rename_file consults all configured servers matching the original file or directory members; coordinated servers must share one workspace and conflicting import edits are rejected. Omitting apply on a fresh rename preserves immediate application.",
             " prepare_rename inspects the server-confirmed symbol range and placeholder without computing edits. It and rename accept file + exact position instead of symbol/line. Fresh rename automatically prepares when supported; a refusal stops before computing edits. Preparation is not an approval handle.",
-            " symbols with query searches the workspace selected by an anchor file (file or symbol, not both); file without query lists document symbols. resolve:true fills missing symbol location ranges when supported. Inspect truncated and unresolvedIndices; returned URIs are metadata, never opened or executed.",
+            " symbols with query searches the workspace selected by an anchor file (file or symbol, not both). resolve:true fills missing workspace symbol location ranges when supported. File without query returns a source-checked document outline, including streamed nested symbols, exact ranges and explicit parentIndex/depth. Inspect total, count, truncated and responseComplete; limits shorten only the display, not validation. Document outlines never resolve symbols, open returned URIs or authorize edits.",
             " format previews retain an exact plan too. Approve with action:format, refactorId and apply:true without file or formatting options; no second formatter request is made. The full workspaceEdit must fit the preview budget, even when its edits overview is shortened. A fresh format with file and apply:true computes and applies immediately.",
-            " definition, references, type_definition, implementation and hover also accept file + exact position instead of symbol/line. Navigation preserves complete target ranges and location-link metadata; inspect total, truncated and responseComplete. Target URIs are never opened. Source changes during the request invalidate the result."
+            " definition, references, type_definition, implementation and hover also accept file + exact position instead of symbol/line. Navigation preserves complete target ranges and location-link metadata; inspect total, truncated and responseComplete. Target URIs are never opened. Source changes during the request invalidate the result.",
+            " project_diagnostics uses an existing anchor file to select one server and requests its native whole-workspace diagnostic report, including unopened and virtual documents, without walking or opening them. Requires workspace diagnostic support; errors never fall back to cached success. Only file, timeout and limit are accepted. Totals cover the full server response even when displayed reports are truncated; omitted files are not proven checked.",
+            " selection_ranges asks the server for enclosing selections at file + exact position (or symbol/line), ordered from inner to outer with exact ranges and bounded source previews. Pass a chosen range to code_actions for extraction or other refactors. This is read-only inspection, not an approval handle; no extraction is guaranteed. Inspect total, count, truncated and each textTruncated flag.",
+            " configure with file inspects this server connection's workspace settings. Add a nested settings payload to preview a complete replacement; repeat it with apply:true to queue didChangeConfiguration and answer future workspace/configuration requests from that snapshot. Updates retire old diagnostic/refactor evidence. Settings are not persisted and reset on server restart; notificationQueued is not acknowledgement of server adoption. No command or edit permission is granted."
         )
     }
     fn parameters(&self) -> Value {
         json!({
             "type":"object","required":["action"],
             "properties": {
-                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints","prepare_rename"]},
+                "action":{"type":"string","enum":["diagnostics","definition","references","hover","symbols","incoming_calls","outgoing_calls","supertypes","subtypes","rename","rename_file","code_actions","format","type_definition","implementation","status","reload","capabilities","request","workspace_diagnostics","completion","signature_help","inlay_hints","prepare_rename","project_diagnostics","selection_ranges","configure"]},
                 "resolve":{"type":"boolean","description":"inlay_hints: resolve retained hints for tooltips and label locations. symbols with query: resolve retained symbols missing location ranges. Requires server resolve support; omit or false for inline results. Uses the same request budget and never opens returned URIs, applies edits or executes commands."},
-                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for navigation (definition, references, type_definition, implementation, hover), completion, signature_help or rename targeting; requires file. Use instead of symbol/line. Put signature_help's cursor inside the call. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
+                "position":{"type":"object","description":"Exact zero-based UTF-16 cursor for navigation (definition, references, type_definition, implementation, hover, selection_ranges), completion, signature_help or rename targeting; requires file. Use instead of symbol/line. Put signature_help's cursor inside the call. Completion may also use an explicit replacement range.","required":["line","character"],"properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}}},
                 "completionId":{"type":"string","description":"Opaque completion from the latest listing. Select without apply to resolve and preview, or apply:true to insert it with its auto-import edits. Do not combine with other selectors. Expires on source changes, server replacement, reload or another completion listing."},
                 "snippetValues":{"type":"object","maxProperties":64,"additionalProperties":{"type":"string","maxLength":16384},"description":"Selected snippet completion only: literal replacements keyed by canonical numeric placeholder index (0..65535), e.g. {\"1\":\"argument\"}. Values are not evaluated or reparsed. Defaults and first choices apply otherwise; unbound positive tabstops require a value. Repeat the map with apply:true; preview substitutions are not cached."},
-                "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers."},
+                "file":{"type":"string","description":"Path relative to cwd or absolute; diagnostics globs inspect cached reports. workspace_diagnostics uses a positive workspace-relative glob to actively check matching nonignored regular files; it may start language servers. project_diagnostics instead requires an existing anchor file to select one server for its native whole-workspace report."},
                 "line":{"type":"integer","minimum":1,"description":"1-indexed line narrowing symbol search"},
                 "symbol":{"type":"string","description":"Symbol substring; append #N for the Nth occurrence"},
                 "query":{"type":"string","description":"symbols: workspace query (up to 1024 UTF-8 bytes; empty requests all symbols), with file or symbol as its anchor file. Also fresh nonempty code-action title/index selection (preview unless apply:true), or case-sensitive completion filterText/label prefix (at most 128 bytes)."},
@@ -552,10 +688,10 @@ impl Tool for LspTool {
                     "insertFinalNewline":{"type":"boolean"},
                     "trimFinalNewlines":{"type":"boolean"}
                 }},
-                "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). format and symbol rename share a budget across startup, requests and staging after acquiring the workflow lane. workspace_diagnostics budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible."},
+                "timeout":{"type":"integer","description":"Per-request timeout in seconds (0 = registry default). format and symbol rename share a budget across startup, requests and staging after acquiring the workflow lane. workspace_diagnostics budgets the whole scan (default 30 seconds, capped at 120); synchronous filesystem operations are not preemptible. project_diagnostics includes server startup and full response processing, capped at 120 seconds."},
                 "method":{"type":"string","description":"Raw LSP method; executeCommand requires code_actions"},
-                "payload":{"description":"Raw JSON params for request"},
-                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion, inlay_hints and workspace symbols default to 50, capped at 128. signature_help defaults to 16, capped at 128, retaining the active overload. workspace_diagnostics checks at most this many files (default 100, capped at 256)."},
+                "payload":{"description":"Raw JSON params for request. For configure, a complete nested settings object (at most 64 KiB) for this server connection; preview by default, repeat with apply:true to replace and notify. Not merged, not initializationOptions, and not saved to disk."},
+                "limit":{"type":"integer","description":"Max returned locations, capped at 1000; hierarchy items are capped at 128. completion, inlay_hints and workspace symbols default to 50, capped at 128. Document symbols default to 100, capped at 1000 and the structured output byte budget; totals include omitted nested symbols. signature_help defaults to 16, capped at 128, retaining the active overload. workspace_diagnostics checks at most this many files (default 100, capped at 256). project_diagnostics displays at most this many complete document reports (default 100, capped at 1000); totals include omitted reports. selection_ranges returns this many enclosing levels (default 16, capped at 64), validating omitted levels too."},
                 "after":{"type":"string","maxLength":4096,"description":"workspace_diagnostics only: resume strictly after the workspace-relative path returned as nextAfter. Use the same glob. This is a stateless path cursor, not a snapshot; complete is false for continuation pages. Inspect pageComplete, hasMore and all per-file failures."}
             }
         })
@@ -572,6 +708,16 @@ impl Tool for LspTool {
         input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        // Option<Value> maps JSON null to None. A supplied null replacement
+        // is invalid configuration, not an instruction to inspect settings.
+        if input["action"] == "configure"
+            && input.get("payload").is_some_and(|value| !value.is_object())
+        {
+            return Err(tool_err(
+                "LSP_CONFIGURATION_INVALID",
+                "configuration payload must be an object",
+            ));
+        }
         let input: LspInput = serde_json::from_value(input)
             .map_err(|err| tool_err("LSP_USAGE", format!("invalid input: {err}")))?;
         if input.line == Some(0) {
@@ -604,6 +750,7 @@ impl Tool for LspTool {
                     | "type_definition"
                     | "implementation"
                     | "hover"
+                    | "selection_ranges"
             )
         {
             return Err(tool_err(
@@ -645,6 +792,17 @@ impl Tool for LspTool {
                     )
                 })?;
                 self.run_workspace_diagnostics(&input, pattern).await
+            }
+            "project_diagnostics" => self.run_project_diagnostics(&input).await,
+            "configure" => self.run_configuration(&input).await,
+            "selection_ranges" => {
+                self.run_position_request(
+                    &input,
+                    "selection_ranges",
+                    "textDocument/selectionRange",
+                    json!({}),
+                )
+                .await
             }
             "definition" => {
                 self.run_position_request(
@@ -700,7 +858,7 @@ impl Tool for LspTool {
             "capabilities" => self.run_capabilities(&input).await,
             "request" => self.run_raw_request(&input).await,
             other => Ok(usage_error(format!(
-                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|prepare_rename|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints"
+                "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|prepare_rename|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints|project_diagnostics|selection_ranges|configure"
             ))),
         }
     }

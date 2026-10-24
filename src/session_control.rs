@@ -265,6 +265,9 @@ impl SessionControlHandle {
 struct TurnGuard {
     active: ActiveRun,
     run: Arc<Run>,
+    /// Keeps this turn's Agent-side message readers registered. Dropping the
+    /// guard retires the lease; the Agent prunes the readers before polling.
+    fetcher_lifetime: Arc<()>,
 }
 
 impl Drop for TurnGuard {
@@ -317,8 +320,10 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for ControlledTurn<F> 
 
 /// In-process SDK driver with live input and cancellation.
 ///
-/// The two additive fetchers are installed once, not once per prompt. Idle session management
-/// stays available through `session_mut`; Rust prevents access during a turn.
+/// Each turn registers scoped steering/follow-up readers on the current agent.
+/// Idle session management stays available through `session_mut`; Rust prevents
+/// access during a turn. Text and native-content prompts share the SDK's
+/// validation, retry, failover, hooks and persistence boundaries.
 /// Each turn retains its initiating scoped context across polls. With no scoped
 /// context at construction it binds once on first poll, allowing construction
 /// outside a runtime. Owner cancellation wakes the turn, seals live input and
@@ -332,15 +337,10 @@ impl AgentSessionHandle {
     /// Add live, bounded, turn-scoped control without changing providers,
     /// listeners, retry/failover policy, tools, or session persistence.
     #[must_use]
-    pub fn into_controllable(mut self) -> ControllableSession {
-        let active = Arc::new(Mutex::new(Weak::new()));
-        self.session_mut().agent.register_message_fetchers(
-            Some(fetcher(&active, InputKind::Steering)),
-            Some(fetcher(&active, InputKind::FollowUp)),
-        );
+    pub fn into_controllable(self) -> ControllableSession {
         ControllableSession {
             session: self,
-            active,
+            active: Arc::new(Mutex::new(Weak::new())),
         }
     }
 }
@@ -369,23 +369,64 @@ impl AgentSessionHandle {
         images: Vec<crate::model::ImageContent>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
+        let content = if images.is_empty() {
+            UserContent::Text(input)
+        } else {
+            let mut blocks = Vec::with_capacity(images.len() + 1);
+            if !input.is_empty() {
+                blocks.push(crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(input),
+                ));
+            }
+            blocks.extend(images.into_iter().map(crate::model::ContentBlock::Image));
+            UserContent::Blocks(blocks)
+        };
+        self.prompt_controlled_input(content, on_event)
+    }
+
+    /// Run ordered native text, image, audio and video input with the same
+    /// turn-scoped steering, cancellation, persistence and retry behavior.
+    pub fn prompt_controlled_with_content(
+        &mut self,
+        content: Vec<crate::model::ContentBlock>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
+        self.prompt_controlled_input(UserContent::Blocks(content), on_event)
+    }
+
+    pub(crate) fn prompt_controlled_input(
+        &mut self,
+        content: UserContent,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
         let active: ActiveRun = Arc::new(Mutex::new(Weak::new()));
-        self.session_mut().agent.register_message_fetchers(
+        let (run, signal) = Run::new();
+        *lock(&active) = Arc::downgrade(&run);
+        let fetcher_lifetime = Arc::new(());
+        self.session_mut().agent.register_scoped_message_fetchers(
+            &fetcher_lifetime,
             Some(fetcher(&active, InputKind::Steering)),
             Some(fetcher(&active, InputKind::FollowUp)),
         );
-        let (run, signal) = Run::new();
-        *lock(&active) = Arc::downgrade(&run);
-        let guard = TurnGuard { active, run };
+        let guard = TurnGuard {
+            active,
+            run,
+            fetcher_lifetime,
+        };
         let control = SessionControlHandle {
             run: Arc::clone(&guard.run),
         };
         let session = self;
         let future = async move {
             let _guard = guard;
-            session
-                .prompt_with_images_with_abort(input, images, signal, on_event)
-                .await
+            match content {
+                UserContent::Text(text) => session.prompt_with_abort(text, signal, on_event).await,
+                UserContent::Blocks(blocks) => {
+                    session
+                        .prompt_with_content_with_abort(blocks, signal, on_event)
+                        .await
+                }
+            }
         };
         ControlledTurn {
             future: Box::pin(execution::OwnedTurn::new(future, control.clone())),
@@ -400,7 +441,7 @@ impl ControllableSession {
         &mut self.session
     }
 
-    fn begin(&self) -> Result<(TurnGuard, AbortSignal)> {
+    fn begin(&mut self) -> Result<(TurnGuard, AbortSignal)> {
         let mut active = lock(&self.active);
         if active.upgrade().is_some() {
             return Err(control_error(
@@ -411,10 +452,20 @@ impl ControllableSession {
         let (run, signal) = Run::new();
         *active = Arc::downgrade(&run);
         drop(active);
+        let fetcher_lifetime = Arc::new(());
+        self.session
+            .session_mut()
+            .agent
+            .register_scoped_message_fetchers(
+                &fetcher_lifetime,
+                Some(fetcher(&self.active, InputKind::Steering)),
+                Some(fetcher(&self.active, InputKind::FollowUp)),
+            );
         Ok((
             TurnGuard {
                 active: Arc::clone(&self.active),
                 run,
+                fetcher_lifetime,
             },
             signal,
         ))
@@ -438,6 +489,50 @@ impl ControllableSession {
         input: String,
         on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
     ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        self.prompt_input_with_control(UserContent::Text(input), on_event)
+    }
+
+    /// Build a live-controlled prompt with ordered native text, image, audio
+    /// and video blocks. Obtain `turn.control()` before awaiting the result.
+    ///
+    /// Payloads are moved intact into the ordinary SDK content path, not
+    /// flattened or queued as follow-ups. The SDK validates user blocks before
+    /// provider admission; model capability filtering, input hooks, recovery
+    /// and persistence remain authoritative. This API does not read files or
+    /// fetch URLs, and makes no new claim about a provider's media support.
+    ///
+    /// As with text turns, cancellation before the first poll dispatches no
+    /// prompt. Await an admitted turn to finish native cleanup; dropping it
+    /// cannot promise completed persistence. Unclaimed control input remains
+    /// recoverable from the turn's control handle.
+    pub fn prompt_with_content(
+        &mut self,
+        content: Vec<crate::model::ContentBlock>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        self.prompt_with_content_with_control(content, move |_, event| on_event(event))
+    }
+
+    /// Native-content counterpart of [`Self::prompt_with_control`]. Each
+    /// callback receives this turn's control handle, allowing a host to steer,
+    /// queue a follow-up or abort in response to provider/tool events without
+    /// borrowing the session or publishing the handle through a separate slot.
+    pub fn prompt_with_content_with_control(
+        &mut self,
+        content: Vec<crate::model::ContentBlock>,
+        on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
+    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        self.prompt_input_with_control(UserContent::Blocks(content), on_event)
+    }
+
+    fn prompt_input_with_control(
+        &mut self,
+        content: UserContent,
+        on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
+    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        // Text, native blocks and image helpers share this one constructor.
+        // begin registers scoped fetchers on the current agent for this turn;
+        // the guard retires them when the turn finishes or is dropped.
         let (guard, signal) = self.begin()?;
         let control = SessionControlHandle {
             run: Arc::clone(&guard.run),
@@ -448,11 +543,15 @@ impl ControllableSession {
             // Capture the guard in the future so cancellation before its first
             // poll is just as safe as dropping it during a provider request.
             let _guard = guard;
-            session
-                .prompt_with_abort(input, signal, move |event| {
-                    on_event(&callback_control, event);
-                })
-                .await
+            let callback = move |event| on_event(&callback_control, event);
+            match content {
+                UserContent::Text(text) => session.prompt_with_abort(text, signal, callback).await,
+                UserContent::Blocks(blocks) => {
+                    session
+                        .prompt_with_content_with_abort(blocks, signal, callback)
+                        .await
+                }
+            }
         };
         Ok(ControlledTurn {
             future: Box::pin(execution::OwnedTurn::new(future, control.clone())),
@@ -495,7 +594,11 @@ mod tests {
             SessionControlHandle {
                 run: Arc::clone(&run),
             },
-            TurnGuard { active, run },
+            TurnGuard {
+                active,
+                run,
+                fetcher_lifetime: Arc::new(()),
+            },
             signal,
         )
     }

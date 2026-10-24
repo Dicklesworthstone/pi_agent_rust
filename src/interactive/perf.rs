@@ -913,13 +913,8 @@ impl PiApp {
             return None;
         };
         let provider = agent_guard.provider();
-        // Keyless providers (replay/test/local) summarize fine without a
-        // key; credentialed ones carry theirs.
-        let api_key = agent_guard
-            .stream_options()
-            .api_key
-            .clone()
-            .unwrap_or_default();
+        let stream_options = agent_guard.stream_options().clone();
+        let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
         let name = args.trim().to_string();
@@ -995,13 +990,17 @@ impl PiApp {
                 enabled: true,
                 ..Default::default()
             };
-            let summary = crate::checkpoint::summarize_span(&span, provider, &api_key, &settings)
-                .await
-                .unwrap_or_else(|err| {
-                    format!(
-                        "(summarization failed: {err}; the span was collapsed without a report)"
-                    )
-                });
+            let summary = crate::checkpoint::summarize_span(
+                &span,
+                provider,
+                &stream_options,
+                &settings,
+                &privacy,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                format!("(summarization failed: {err}; the span was collapsed without a report)")
+            });
 
             let outcome = {
                 let Ok(mut agent_guard) = OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await
@@ -1121,10 +1120,11 @@ impl PiApp {
     pub(super) fn handle_slash_usage(&mut self, args: &str) -> Option<Cmd> {
         let refresh = args.trim().eq_ignore_ascii_case("refresh");
         let cx = asupersync::Cx::for_request();
+        let cwd = self.cwd.clone();
         let event_tx = self.event_tx.clone();
         self.status_message = Some("Fetching provider usage...".to_string());
         self.runtime_handle.spawn(async move {
-            let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+            let message = match super::commands::load_runtime_auth(&cwd) {
                 Ok(auth) => {
                     let rows = crate::usage::gather_usage(&auth, refresh).await;
                     crate::usage::render_usage_text(&rows)
@@ -1325,7 +1325,8 @@ impl PiApp {
             return None;
         };
         let provider = agent_guard.provider();
-        let api_key_opt = agent_guard.stream_options().api_key.clone();
+        let stream_options = agent_guard.stream_options().clone();
+        let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
         // Mode selection (bd-cv653.3.18): a leading `shake` drops bulky tool
@@ -1344,11 +1345,6 @@ impl PiApp {
         } else {
             trimmed_args
         };
-
-        if !shake_mode && api_key_opt.is_none() {
-            self.status_message = Some("No API key configured; cannot run compaction".to_string());
-            return None;
-        }
 
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
@@ -1467,13 +1463,14 @@ impl PiApp {
                     )
                 } else {
                     let compact_outcome = if shake_mode {
-                        Ok(crate::compaction::compact_shake(prep))
+                        Ok(crate::compaction::compact_shake(prep, &privacy))
                     } else {
                         crate::compaction::compact(
                             prep,
                             Arc::clone(&provider),
-                            api_key_opt.as_deref().unwrap_or_default(),
+                            &stream_options,
                             custom_instructions.as_deref(),
+                            &privacy,
                         )
                         .await
                     };

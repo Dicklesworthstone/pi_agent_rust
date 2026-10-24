@@ -34,6 +34,25 @@ const RELEASES_DOWNLOAD_BASE: &str =
 /// URL); a renamed repository adds one more.
 const MAX_REDIRECTS: usize = 5;
 
+/// Largest release binary the updater downloads. The whole body is held in
+/// memory and checksummed before it replaces the executable, so this bounds
+/// memory. v0.8.0's raw binaries are 52 to 78 MB; the earlier 64 MiB limit
+/// refused the Linux x86_64, macOS Intel and Windows ones, so `pi self-update`
+/// could not install them.
+const MAX_RELEASE_BINARY_BYTES: usize = 256 * 1024 * 1024;
+
+/// True when the response declares a `Content-Length` above `limit`, so an
+/// oversized binary is refused before any of it is read.
+fn declared_length_exceeds(headers: &[(String, String)], limit: usize) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-length")
+            && value
+                .trim()
+                .parse::<u64>()
+                .is_ok_and(|length| length > limit as u64)
+    })
+}
+
 /// Resolve a redirect `Location` against the URL that returned it.
 ///
 /// Accepts absolute `http(s)://` URLs, scheme-relative `//host/...`,
@@ -461,7 +480,11 @@ impl SelfUpdater {
             return Ok(None);
         }
 
-        let Ok(bytes) = res.bytes_limited(64 * 1024 * 1024).await else {
+        if declared_length_exceeds(res.headers(), MAX_RELEASE_BINARY_BYTES) {
+            return Ok(None);
+        }
+
+        let Ok(bytes) = res.bytes_limited(MAX_RELEASE_BINARY_BYTES).await else {
             return Ok(None);
         };
 
@@ -739,6 +762,95 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
             resolve_redirect(from, "https://objects.githubusercontent.com/z?s=1#frag").unwrap(),
             "https://objects.githubusercontent.com/z?s=1"
         );
+    }
+
+    /// Serve one HTTP response on a loopback port: `head` (status line and
+    /// headers, without the blank line) followed by `body`.
+    fn serve_once(
+        head: String,
+        body: std::sync::Arc<Vec<u8>>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if std::io::Read::read(&mut socket, &mut byte).unwrap_or(0) == 0 {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            let _ = socket.write_all(format!("{head}\r\n\r\n").as_bytes());
+            let _ = socket.write_all(&body);
+        });
+        (address, thread)
+    }
+
+    fn download_candidate(
+        address: std::net::SocketAddr,
+        checksums: &ChecksumMap,
+    ) -> Option<Vec<u8>> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            SelfUpdater::new()
+                .try_download_candidate(
+                    &format!("http://{address}"),
+                    "v9.9.9",
+                    "pi_linux_amd64",
+                    checksums,
+                )
+                .await
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn release_binary_limit_admits_the_largest_published_binary() {
+        // pi_linux_amd64 of v0.8.0 is 77,855,560 bytes, above the old 64 MiB.
+        const LARGEST_V0_8_0_BINARY: usize = 77_855_560;
+        assert!(LARGEST_V0_8_0_BINARY > 64 * 1024 * 1024);
+        assert!(MAX_RELEASE_BINARY_BYTES >= 3 * LARGEST_V0_8_0_BINARY);
+    }
+
+    #[test]
+    fn download_candidate_accepts_a_binary_over_64_mib() {
+        let body = std::sync::Arc::new(vec![0x5a_u8; 65 * 1024 * 1024]);
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(body.as_slice()));
+        let checksums = ChecksumMap::parse(&format!("{digest}  pi_linux_amd64\n"));
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close",
+            body.len()
+        );
+        let (address, server) = serve_once(head, std::sync::Arc::clone(&body));
+        let downloaded = download_candidate(address, &checksums);
+        server.join().unwrap();
+        assert_eq!(downloaded.map(|bytes| bytes.len()), Some(body.len()));
+    }
+
+    #[test]
+    fn download_candidate_refuses_a_declared_length_over_the_limit() {
+        let checksums = ChecksumMap::parse(&format!("{}  pi_linux_amd64\n", "0".repeat(64)));
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close",
+            MAX_RELEASE_BINARY_BYTES + 1
+        );
+        let (address, server) = serve_once(head, std::sync::Arc::new(vec![0_u8; 4096]));
+        assert_eq!(download_candidate(address, &checksums), None);
+        server.join().unwrap();
+        assert!(!declared_length_exceeds(
+            &[(
+                "content-length".to_string(),
+                MAX_RELEASE_BINARY_BYTES.to_string()
+            )],
+            MAX_RELEASE_BINARY_BYTES
+        ));
     }
 
     #[test]

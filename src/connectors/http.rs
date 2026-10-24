@@ -1,7 +1,7 @@
 //! HTTP connector for extension hostcalls (pi.http).
 //!
 //! This adapter validates request payloads, enforces TLS policy, executes
-//! a simple GET/POST request via the internal HTTP client, and returns a
+//! a bounded set of HTTP methods via the internal HTTP client, and returns a
 //! normalized response shape.
 
 use crate::connectors::{
@@ -9,7 +9,7 @@ use crate::connectors::{
     host_result_err_with_details, host_result_ok,
 };
 use crate::error::{Error, Result};
-use crate::http::client::Client;
+use crate::http::client::{Client, RequestBuilder};
 use asupersync::http::h1::http_client::Scheme;
 use asupersync::http::h1::{ClientError, ParsedUrl};
 use async_trait::async_trait;
@@ -122,6 +122,11 @@ impl HttpConnector {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(HttpConnectorConfig::default())
+    }
+
+    #[must_use]
+    pub(crate) const fn max_response_bytes(&self) -> usize {
+        self.config.max_response_bytes
     }
 }
 
@@ -296,12 +301,65 @@ fn is_timeout_io(err: &std::io::Error) -> bool {
         || err.to_string().to_ascii_lowercase().contains("timed out")
 }
 
+/// Keep validation and dispatch exhaustive. Accepting a new method must never
+/// silently send it as POST, or expose CONNECT/TRACE and arbitrary wire tokens.
+#[derive(Clone, Copy)]
+enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl HttpMethod {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "GET" => Some(Self::Get),
+            "POST" => Some(Self::Post),
+            "PUT" => Some(Self::Put),
+            "PATCH" => Some(Self::Patch),
+            "DELETE" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    fn request<'a>(self, client: &'a Client, url: &str) -> RequestBuilder<'a> {
+        match self {
+            Self::Get => client.get(url),
+            Self::Post => client.post(url),
+            Self::Put => client.put(url),
+            Self::Patch => client.patch(url),
+            Self::Delete => client.delete(url),
+        }
+    }
+}
+
 struct PreparedRequest {
     url: String,
-    method: String,
+    method: HttpMethod,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
     timeout_ms: Option<u64>,
+}
+
+/// Request hints can shorten a hostcall budget, never extend it. Zero remains
+/// "unset" for all existing timeout spellings. Resolve aliases independently:
+/// a zero or longer `timeout` must not mask a shorter `timeoutMs`/`timeout_ms`.
+/// The connector default is a fallback, not a maximum; otherwise Freeflow's
+/// explicit five-minute requests would still be truncated to thirty seconds.
+fn effective_timeout_ms(
+    params: &serde_json::Map<String, Value>,
+    call_timeout_ms: Option<u64>,
+    default_timeout_ms: u64,
+) -> Option<u64> {
+    ["timeout", "timeoutMs", "timeout_ms"]
+        .into_iter()
+        .filter_map(|key| params.get(key).and_then(Value::as_u64))
+        .chain(call_timeout_ms)
+        .filter(|value| *value > 0)
+        .min()
+        .or_else(|| (default_timeout_ms > 0).then_some(default_timeout_ms))
 }
 
 impl HttpConnector {
@@ -412,12 +470,12 @@ impl HttpConnector {
             .trim()
             .to_ascii_uppercase();
 
-        if method != "GET" && method != "POST" {
+        let Some(method) = HttpMethod::parse(&method) else {
             return Err(Box::new(invalid_request(
                 &call.call_id,
                 format!("Unsupported HTTP method: {method}"),
             )));
-        }
+        };
 
         let body_val = params.get("body");
         let body_bytes_val = params.get("body_bytes").or_else(|| params.get("bodyBytes"));
@@ -429,7 +487,7 @@ impl HttpConnector {
             )));
         }
 
-        if method == "GET" && (body_val.is_some() || body_bytes_val.is_some()) {
+        if matches!(method, HttpMethod::Get) && (body_val.is_some() || body_bytes_val.is_some()) {
             return Err(Box::new(invalid_request(
                 &call.call_id,
                 "GET requests must not include a body",
@@ -505,22 +563,8 @@ impl HttpConnector {
             )));
         }
 
-        let timeout_ms_param = params
-            .get("timeout")
-            .and_then(Value::as_u64)
-            .or_else(|| params.get("timeoutMs").and_then(Value::as_u64))
-            .or_else(|| params.get("timeout_ms").and_then(Value::as_u64))
-            .filter(|value| *value > 0);
-
-        let timeout_ms_call = call.timeout_ms.filter(|value| *value > 0);
-
-        let timeout_ms = timeout_ms_param.or(timeout_ms_call).or({
-            if self.config.default_timeout_ms > 0 {
-                Some(self.config.default_timeout_ms)
-            } else {
-                None
-            }
-        });
+        let timeout_ms =
+            effective_timeout_ms(params, call.timeout_ms, self.config.default_timeout_ms);
 
         Ok(PreparedRequest {
             url,
@@ -544,11 +588,7 @@ impl Connector for HttpConnector {
             Err(payload) => return Ok(*payload),
         };
 
-        let mut builder = if prepared.method == "GET" {
-            self.client.get(&prepared.url)
-        } else {
-            self.client.post(&prepared.url)
-        };
+        let mut builder = prepared.method.request(&self.client, &prepared.url);
 
         for (key, value) in prepared.headers {
             builder = builder.header(&key, value);
@@ -642,11 +682,7 @@ impl HttpConnector {
             Err(payload) => return Err(*payload),
         };
 
-        let mut builder = if prepared.method == "GET" {
-            self.client.get(&prepared.url)
-        } else {
-            self.client.post(&prepared.url)
-        };
+        let mut builder = prepared.method.request(&self.client, &prepared.url);
 
         for (key, value) in prepared.headers {
             builder = builder.header(&key, value);
@@ -672,5 +708,376 @@ impl HttpConnector {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod deployment_method_tests {
+    use super::*;
+    use crate::http::client::{HttpTransport, TransportResponse};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct RecordedCall {
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingTransport {
+        calls: Mutex<Vec<RecordedCall>>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for RecordingTransport {
+        async fn send(
+            &self,
+            method: &str,
+            url: &str,
+            headers: &[(String, String)],
+            body: &[u8],
+        ) -> Result<TransportResponse> {
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .push(RecordedCall {
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    headers: headers.to_vec(),
+                    body: body.to_vec(),
+                });
+            Ok((
+                201,
+                vec![(
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string(),
+                )],
+                futures::stream::iter(vec![Ok(vec![0, 255, 65]), Ok(vec![66])]).boxed(),
+            ))
+        }
+    }
+
+    fn connector(config: HttpConnectorConfig) -> (HttpConnector, Arc<RecordingTransport>) {
+        let recording = Arc::new(RecordingTransport::default());
+        let mut connector = HttpConnector::new(config);
+        connector.client = connector.client.with_transport(recording.clone());
+        (connector, recording)
+    }
+
+    fn call(method: &str) -> HostCallPayload {
+        HostCallPayload {
+            call_id: "freeflow-deployment".to_string(),
+            capability: "http".to_string(),
+            method: "http".to_string(),
+            params: json!({
+                "url": "https://relay.example/v1/deployments/fixture?scope=test",
+                "method": method,
+                "timeout": 300_000,
+                "headers": {"Authorization": "Bearer fixture-only"},
+            }),
+            timeout_ms: Some(25),
+            cancel_token: None,
+            context: None,
+        }
+    }
+
+    /// Uses the real connector and native client, replacing only the I/O
+    /// boundary. No DNS, cloud resources, sockets, or platform skips are needed.
+    #[test]
+    fn deployment_methods_preserve_verb_body_headers_and_response_bytes() {
+        futures::executor::block_on(async {
+            for (input, expected_method) in [
+                ("GET", "GET"),
+                ("post", "POST"),
+                (" put ", "PUT"),
+                ("patch", "PATCH"),
+                ("DELETE", "DELETE"),
+            ] {
+                for streaming in [false, true] {
+                    for (field, value, expected_body) in [
+                        (None, Value::Null, Vec::new()),
+                        (
+                            Some("body"),
+                            json!("{\"enabled\":true}"),
+                            b"{\"enabled\":true}".to_vec(),
+                        ),
+                        (Some("body_bytes"), json!("AP9B"), vec![0, 255, 65]),
+                    ] {
+                        if expected_method == "GET" && field.is_some() {
+                            continue;
+                        }
+                        let (connector, recording) = connector(HttpConnectorConfig {
+                            allowlist: vec!["relay.example".to_string()],
+                            ..HttpConnectorConfig::default()
+                        });
+                        let mut request = call(input);
+                        if let Some(field) = field {
+                            request.params[field] = value;
+                        }
+                        assert_eq!(
+                            connector
+                                .prepare_request(&request)
+                                .expect("valid request")
+                                .timeout_ms,
+                            Some(25),
+                            "new methods must retain the outer hostcall budget"
+                        );
+                        if streaming {
+                            let response = connector
+                                .dispatch_streaming(&request)
+                                .await
+                                .expect("stream");
+                            assert_eq!(response.status(), 201);
+                            assert_eq!(
+                                response.bytes_limited(4).await.expect("bytes"),
+                                [0, 255, 65, 66]
+                            );
+                        } else {
+                            let response = connector.dispatch(&request).await.expect("dispatch");
+                            assert!(!response.is_error, "{:?}", response.error);
+                            assert_eq!(response.output["status"], 201);
+                            assert_eq!(
+                                response.output["body_bytes"],
+                                BASE64_STANDARD.encode([0, 255, 65, 66])
+                            );
+                        }
+                        let calls = recording.calls.lock().expect("recorded calls");
+                        assert_eq!(
+                            calls.len(),
+                            1,
+                            "exactly one dispatch, never a POST fallback"
+                        );
+                        let sent = calls.first().expect("sent request");
+                        assert_eq!(sent.method, expected_method);
+                        assert_eq!(sent.url, request.params["url"].as_str().expect("URL"));
+                        assert_eq!(sent.body, expected_body);
+                        assert!(sent.headers.iter().any(|(key, value)| {
+                            key.eq_ignore_ascii_case("authorization")
+                                && value == "Bearer fixture-only"
+                        }));
+                        assert!(sent.headers.iter().any(|(key, value)| {
+                            key.eq_ignore_ascii_case("content-length")
+                                && value == &sent.body.len().to_string()
+                        }));
+                    }
+                }
+            }
+        });
+    }
+
+    async fn assert_rejected_before_transport(
+        connector: &HttpConnector,
+        recording: &RecordingTransport,
+        request: &HostCallPayload,
+        expected: HostCallErrorCode,
+    ) {
+        let buffered = connector.dispatch(request).await.expect("dispatch");
+        assert!(buffered.is_error);
+        assert_eq!(buffered.error.expect("buffered error").code, expected);
+        let streamed = connector
+            .dispatch_streaming(request)
+            .await
+            .err()
+            .expect("stream error");
+        assert_eq!(streamed.error.expect("streamed error").code, expected);
+        assert!(recording.calls.lock().expect("recorded calls").is_empty());
+    }
+
+    #[test]
+    fn deployment_mutations_keep_tls_host_and_body_restrictions() {
+        futures::executor::block_on(async {
+            for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                for case in 0..6 {
+                    let mut config = HttpConnectorConfig {
+                        allow_loopback_http: false,
+                        allowlist: vec!["relay.example".to_string()],
+                        ..HttpConnectorConfig::default()
+                    };
+                    let mut request = call(method);
+                    let expected = match case {
+                        0 => {
+                            request.params["url"] = json!("http://relay.example/deploy");
+                            HostCallErrorCode::Denied
+                        }
+                        1 => {
+                            request.params["url"] = json!("https://unlisted.example/deploy");
+                            HostCallErrorCode::Denied
+                        }
+                        2 => {
+                            config.denylist = vec!["relay.example".to_string()];
+                            HostCallErrorCode::Denied
+                        }
+                        3 => {
+                            config.allowlist.clear();
+                            config.enforce_allowlist = true;
+                            HostCallErrorCode::Denied
+                        }
+                        4 => {
+                            config.max_request_bytes = 2;
+                            request.params["body_bytes"] = json!("AP9B");
+                            HostCallErrorCode::InvalidRequest
+                        }
+                        _ => {
+                            request.params["body"] = json!("text");
+                            request.params["body_bytes"] = json!("AP9B");
+                            HostCallErrorCode::InvalidRequest
+                        }
+                    };
+                    let (connector, recording) = connector(config);
+                    assert_rejected_before_transport(&connector, &recording, &request, expected)
+                        .await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn unsupported_methods_and_get_bodies_never_dispatch() {
+        futures::executor::block_on(async {
+            let (connector, recording) = connector(HttpConnectorConfig::default());
+            for method in [
+                "CONNECT",
+                "TRACE",
+                "HEAD",
+                "OPTIONS",
+                "CUSTOM",
+                "DELETE\r\nPOST",
+                "",
+            ] {
+                assert_rejected_before_transport(
+                    &connector,
+                    &recording,
+                    &call(method),
+                    HostCallErrorCode::InvalidRequest,
+                )
+                .await;
+            }
+            for field in ["body", "body_bytes", "bodyBytes"] {
+                let mut request = call("GET");
+                request.params[field] = json!("");
+                assert_rejected_before_transport(
+                    &connector,
+                    &recording,
+                    &request,
+                    HostCallErrorCode::InvalidRequest,
+                )
+                .await;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod timeout_budget_tests {
+    use super::*;
+
+    fn prepared_timeout(
+        params: Value,
+        call_timeout_ms: Option<u64>,
+        default_ms: u64,
+    ) -> Option<u64> {
+        let connector = HttpConnector::new(HttpConnectorConfig {
+            default_timeout_ms: default_ms,
+            allowlist: vec!["relay.example".to_string()],
+            ..HttpConnectorConfig::default()
+        });
+        let mut call = HostCallPayload {
+            call_id: "freeflow-timeout".to_string(),
+            capability: "http".to_string(),
+            method: "http".to_string(),
+            params,
+            timeout_ms: call_timeout_ms,
+            cancel_token: None,
+            context: None,
+        };
+        call.params["url"] = json!("https://relay.example/relay");
+        call.params["method"] = json!("POST");
+        // Both dispatch paths use this preparation, before any network I/O.
+        connector
+            .prepare_request(&call)
+            .expect("valid request")
+            .timeout_ms
+    }
+
+    #[test]
+    fn every_timeout_alias_respects_the_hostcall_budget() {
+        for alias in ["timeout", "timeoutMs", "timeout_ms"] {
+            let mut params = json!({});
+            params[alias] = json!(300_000);
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(5_000), 30_000),
+                Some(5_000)
+            );
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(600_000), 30_000),
+                Some(300_000)
+            );
+            assert_eq!(prepared_timeout(params, None, 30_000), Some(300_000));
+        }
+    }
+
+    #[test]
+    fn conflicting_aliases_use_the_shortest_positive_budget() {
+        let aliases = ["timeout", "timeoutMs", "timeout_ms"];
+        for short_alias in aliases {
+            let mut params = json!({
+                "timeout": 300_000, "timeoutMs": 600_000, "timeout_ms": 900_000
+            });
+            params[short_alias] = json!(25);
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(1_000), 30_000),
+                Some(25)
+            );
+            assert_eq!(prepared_timeout(params, Some(10), 30_000), Some(10));
+
+            for unset_alias in aliases {
+                if unset_alias != short_alias {
+                    let mut masked = json!({});
+                    masked[unset_alias] = json!(0);
+                    masked[short_alias] = json!(25);
+                    assert_eq!(prepared_timeout(masked, None, 30_000), Some(25));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_zero_and_invalid_hints_keep_existing_fallback_semantics() {
+        for value in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("25"),
+            json!(false),
+        ] {
+            let params = json!({"timeout": value, "timeoutMs": value, "timeout_ms": value});
+            assert_eq!(prepared_timeout(params.clone(), Some(75), 30_000), Some(75));
+            assert_eq!(
+                prepared_timeout(params.clone(), Some(0), 30_000),
+                Some(30_000)
+            );
+            assert_eq!(prepared_timeout(params, None, 0), None);
+        }
+        assert_eq!(prepared_timeout(json!({}), None, 30_000), Some(30_000));
+        assert_eq!(prepared_timeout(json!({}), Some(0), 0), None);
+    }
+
+    #[test]
+    fn extreme_request_hint_cannot_remove_or_overflow_a_host_budget() {
+        assert_eq!(
+            prepared_timeout(json!({"timeout": u64::MAX}), Some(1), 0),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_timeout(json!({"timeout": 1}), Some(u64::MAX), 0),
+            Some(1)
+        );
+        assert_eq!(
+            prepared_timeout(json!({"timeout": u64::MAX}), None, 0),
+            Some(u64::MAX)
+        );
     }
 }

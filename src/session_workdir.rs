@@ -6,7 +6,11 @@
 //! These helpers do not change the process cwd or move/delete session files.
 //!
 //! Bindings are session-wide custom entries, not model messages. The original
-//! header cwd remains immutable. Callers must supply a fully hydrated session.
+//! header cwd remains immutable. In-memory helpers require a fully hydrated
+//! session; `inspect_saved_session_workdir` also supports lazily loaded stores.
+
+mod persisted;
+pub use persisted::{SavedSessionWorkdir, inspect_saved_session_workdir, open_session_for_runtime};
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,11 +18,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::session::{Session, SessionEntry, ensure_session_directory_readable};
+use crate::session::{Session, SessionEntry, SessionHeader, ensure_session_directory_readable};
 
 /// Reserved custom-entry type for an explicit workdir attachment.
 pub const WORKDIR_BINDING_TYPE: &str = "pi.session.workdir.v1";
-const WORKDIR_BINDING_PREFIX: &str = "pi.session.workdir.";
+pub(crate) const WORKDIR_BINDING_PREFIX: &str = "pi.session.workdir.";
 
 /// Filesystem health is separate from the user's decision to attach a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -62,6 +66,7 @@ impl WorkdirHealth {
         }
     }
 
+    #[allow(clippy::unnecessary_debug_formatting)]
     fn into_directory(self, path: &Path) -> Result<PathBuf> {
         match self {
             Self::Available { canonical_path } => Ok(canonical_path),
@@ -91,14 +96,21 @@ pub struct SessionWorkdir {
     pub health: WorkdirHealth,
 }
 
-fn binding_path(session: &Session) -> Result<PathBuf> {
-    for entry in session.entries.iter().rev() {
-        let SessionEntry::Custom(custom) = entry else {
-            continue;
-        };
-        if !custom.custom_type.starts_with(WORKDIR_BINDING_PREFIX) {
-            continue;
-        }
+pub(crate) fn latest_workdir_binding(entries: &[SessionEntry]) -> Option<&SessionEntry> {
+    entries.iter().rev().find(|entry| {
+        matches!(entry, SessionEntry::Custom(custom)
+            if custom.custom_type.starts_with(WORKDIR_BINDING_PREFIX))
+    })
+}
+
+/// Resolve metadata without requiring the directory to remain available. The
+/// index groups sessions by their current binding while the original header
+/// and persistence location remain provenance.
+pub(crate) fn binding_path_from_entries(
+    header: &SessionHeader,
+    entries: &[SessionEntry],
+) -> Result<PathBuf> {
+    if let Some(SessionEntry::Custom(custom)) = latest_workdir_binding(entries) {
         if custom.custom_type != WORKDIR_BINDING_TYPE {
             return Err(Error::session(
                 "PI_SESSION_WORKDIR_BINDING_UNSUPPORTED: unknown workdir attachment version; \
@@ -114,18 +126,18 @@ fn binding_path(session: &Session) -> Result<PathBuf> {
         let binding: WorkdirBinding =
             serde_json::from_value(custom.data.clone().ok_or_else(invalid)?)
                 .map_err(|_| invalid())?;
-        if binding.original_cwd != session.header.cwd || !Path::new(&binding.cwd).is_absolute() {
+        if binding.original_cwd != header.cwd || !Path::new(&binding.cwd).is_absolute() {
             return Err(invalid());
         }
         return Ok(PathBuf::from(binding.cwd));
     }
-    Ok(PathBuf::from(&session.header.cwd))
+    Ok(PathBuf::from(&header.cwd))
 }
 
 /// Inspect the latest session-wide attachment, falling back only when no
 /// attachment exists. An invalid latest record never revives an older binding.
 pub fn inspect_session_workdir(session: &Session) -> Result<SessionWorkdir> {
-    let bound_cwd = binding_path(session)?;
+    let bound_cwd = binding_path_from_entries(&session.header, &session.entries)?;
     let health = WorkdirHealth::inspect(&bound_cwd);
     Ok(SessionWorkdir {
         original_cwd: PathBuf::from(&session.header.cwd),
@@ -143,6 +155,7 @@ pub fn require_session_workdir(session: &Session) -> Result<PathBuf> {
 
 /// Guard a runtime which has already selected its workspace. Never change cwd
 /// after configuration or trust decisions have been constructed.
+#[allow(clippy::unnecessary_debug_formatting)]
 pub fn check_session_workdir(session: &Session, runtime_cwd: &Path) -> Result<()> {
     let expected = require_session_workdir(session)?;
     let actual = WorkdirHealth::inspect(runtime_cwd).into_directory(runtime_cwd)?;
@@ -162,6 +175,8 @@ pub fn check_session_workdir(session: &Session, runtime_cwd: &Path) -> Result<()
 /// before launching a runtime. A rejected target leaves the session untouched;
 /// attaching to an equivalent symlink alias is a no-op. Neither session ID,
 /// original cwd, parent-session provenance nor persistence path is rewritten.
+/// Lazily loaded stores are hydrated before resolving the previous attachment,
+/// which may belong to another branch.
 pub fn attach_session_workdir(session: &mut Session, target: &Path) -> Result<bool> {
     let canonical = WorkdirHealth::inspect(target).into_directory(target)?;
     let cwd = canonical
@@ -170,7 +185,8 @@ pub fn attach_session_workdir(session: &mut Session, target: &Path) -> Result<bo
             Error::session("PI_SESSION_WORKDIR_INVALID_ENCODING: attachment requires a UTF-8 path")
         })?
         .to_owned();
-    let previous = binding_path(session)?;
+    session.ensure_full_v2_hydration_before_save()?;
+    let previous = binding_path_from_entries(&session.header, &session.entries)?;
     if let WorkdirHealth::Available { canonical_path } = WorkdirHealth::inspect(&previous)
         && canonical_path == canonical
     {
@@ -244,7 +260,10 @@ mod tests {
         assert!(attach_session_workdir(&mut session, replacement.path()).expect("attach"));
         check_session_workdir(&session, replacement.path()).expect("attached workspace");
         assert!(check_session_workdir(&session, original.path()).is_err());
-        assert_eq!(serde_json::to_value(&session.header).expect("header"), header);
+        assert_eq!(
+            serde_json::to_value(&session.header).expect("header"),
+            header
+        );
         assert!(!attach_session_workdir(&mut session, replacement.path()).expect("no-op"));
         assert_eq!(session.entries.len(), 1);
     }
@@ -276,7 +295,10 @@ mod tests {
         let header = serde_json::to_value(&session.header).expect("header");
         assert!(attach_session_workdir(&mut session, &root.path().join("missing")).is_err());
         assert!(session.entries.is_empty());
-        assert_eq!(serde_json::to_value(&session.header).expect("header"), header);
+        assert_eq!(
+            serde_json::to_value(&session.header).expect("header"),
+            header
+        );
     }
 
     #[test]
@@ -308,7 +330,11 @@ mod tests {
             Some(serde_json::json!({"cwd": "/"})),
         );
         let error = require_session_workdir(&session).expect_err("invalid metadata");
-        assert!(error.to_string().contains("PI_SESSION_WORKDIR_BINDING_INVALID"));
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_WORKDIR_BINDING_INVALID")
+        );
     }
 
     #[test]
@@ -319,7 +345,11 @@ mod tests {
         attach_session_workdir(&mut session, second.path()).expect("known attachment");
         session.append_custom_entry("pi.session.workdir.v2".to_owned(), None);
         let error = require_session_workdir(&session).expect_err("unsupported version");
-        assert!(error.to_string().contains("PI_SESSION_WORKDIR_BINDING_UNSUPPORTED"));
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_WORKDIR_BINDING_UNSUPPORTED")
+        );
         let count = session.entries.len();
         assert!(attach_session_workdir(&mut session, first.path()).is_err());
         assert_eq!(session.entries.len(), count);

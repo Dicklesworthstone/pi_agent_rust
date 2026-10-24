@@ -3,9 +3,11 @@
 //! Only the first attempt may append user input. Recovery goes through the
 //! session's persisted continuation/transition APIs, never the bare Agent loop.
 
+mod ownership;
+
 use super::{
-    AbortHandle, AbortSignal, AgentEvent, AgentSessionHandle, AssistantMessage, ContentBlock,
-    Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
+    AbortHandle, AbortSignal, AgentEvent, AgentSession, AgentSessionHandle, AssistantMessage,
+    ContentBlock, Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
     RpcExtensionUiResponse, SessionPromptResult, SessionTransport, SessionTransportEvent,
     StopReason, TextContent, UserContent,
 };
@@ -316,6 +318,9 @@ impl AgentSessionHandle {
     /// fan-out. With no retry policy the first outcome is returned unchanged.
     /// A session-persistence error fences this handle: start a new or resumed
     /// session before issuing another prompt, even after repairing the save path.
+    /// Dropping an admitted prompt future also fences the handle: it cannot run
+    /// its final save. To cancel and keep using the handle, signal its abort and
+    /// await the outcome so completed tool work can be persisted.
     pub async fn prompt(
         &mut self,
         input: impl Into<String>,
@@ -389,6 +394,35 @@ impl AgentSessionHandle {
             .await
     }
 
+    /// Send native text, image, audio and video blocks as one recoverable prompt.
+    ///
+    /// Blocks retain their order and payloads. Input hooks can transform text
+    /// and images while audio/video blocks remain attached. This method does
+    /// not read paths or fetch URLs; provider-specific media transport and
+    /// unsupported-media degradation use the ordinary Agent/provider boundary.
+    /// The accepted user message is persisted once and reused on recovery.
+    pub async fn prompt_with_content(
+        &mut self,
+        content: Vec<ContentBlock>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let (_handle, signal) = AbortHandle::new();
+        self.prompt_with_content_with_abort(content, signal, on_event)
+            .await
+    }
+
+    /// Send native content with explicit cancellation and this handle's
+    /// configured retry/failover policy. Assistant-only blocks are rejected.
+    pub async fn prompt_with_content_with_abort(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.run_recoverable_turn(Some(UserContent::Blocks(content)), abort_signal, on_event)
+            .await
+    }
+
     /// Continue without synthesizing a user message, with the same recovery,
     /// persistence and provider-admission rules as [`Self::prompt`].
     pub async fn continue_turn(
@@ -409,7 +443,7 @@ impl AgentSessionHandle {
             .await
     }
 
-    async fn run_recoverable_turn(
+    pub(crate) async fn run_recoverable_turn(
         &mut self,
         input: Option<UserContent>,
         abort_signal: AbortSignal,
@@ -417,6 +451,14 @@ impl AgentSessionHandle {
     ) -> Result<AssistantMessage> {
         ensure_not_aborted(&abort_signal)?;
         self.session.ensure_provider_reentry_allowed()?;
+        if let Some(UserContent::Blocks(blocks)) = &input
+            && let Err(error) = AgentSession::validate_user_content_blocks(blocks)
+        {
+            // Rejected input consumes its one-shot keyword provenance just
+            // like the AgentSession validation boundary below.
+            self.session.agent.set_magic_keyword_scan_override(None);
+            return Err(error);
+        }
         self.sync_extension_mcp_registrations().await;
         ensure_not_aborted(&abort_signal)?;
         self.session.ensure_provider_reentry_allowed()?;
@@ -428,41 +470,65 @@ impl AgentSessionHandle {
         self.maybe_restore_primary(&shared).await?;
         ensure_not_aborted(&abort_signal)?;
         let turn = LogicalTurn::new(shared);
+        let _ownership = ownership::TurnGuard::new(&turn, self.session.provider_admission_gate());
         let shared = turn.callback();
         let forwarded = Arc::clone(&shared);
+        // Hooks run only for the first prompt. Keep their effective base in
+        // this logical turn so retries and provider swaps reuse it after the
+        // individual attempt has restored the session's ordinary prompt.
+        let mut turn_system_prompt = self.session.agent.system_prompt().map(str::to_string);
+        let prewalk_turn = self.session.begin_prewalk_turn();
         let first = match input {
             Some(UserContent::Text(input)) => {
                 self.session
-                    .run_text_with_abort(input, Some(abort_signal.clone()), move |event| {
-                        forwarded(event);
-                    })
+                    .run_text_with_abort_capturing_prompt(
+                        input,
+                        Some(abort_signal.clone()),
+                        &mut turn_system_prompt,
+                        move |event| forwarded(event),
+                    )
                     .await
             }
             Some(UserContent::Blocks(content)) => {
                 self.session
-                    .run_with_content_with_abort(
+                    .run_with_content_with_abort_capturing_prompt(
                         content,
                         Some(abort_signal.clone()),
+                        &mut turn_system_prompt,
                         move |event| forwarded(event),
                     )
                     .await
             }
             None => {
                 self.session
-                    .run_continue_with_abort(Some(abort_signal.clone()), move |event| {
-                        forwarded(event);
-                    })
+                    .run_continue_with_abort_and_system_prompt(
+                        Some(abort_signal.clone()),
+                        turn_system_prompt.as_deref(),
+                        move |event| forwarded(event),
+                    )
                     .await
             }
         };
         let admission = self.session.provider_admission_gate();
         let first = fence_session_persistence(&admission, first);
         let result = self
-            .apply_retry_policy(first, &abort_signal, &shared, &turn)
+            .apply_retry_policy(
+                first,
+                &abort_signal,
+                turn_system_prompt.as_deref(),
+                &shared,
+                &turn,
+                &prewalk_turn,
+            )
             .await;
         // Also cover failures while preparing a retry/failover. Install the
         // fence before observers receive the logical turn's terminal event.
         let result = fence_session_persistence(&admission, result);
+        let interrupted = match &result {
+            Ok(message) => matches!(message.stop_reason, StopReason::Error | StopReason::Aborted),
+            Err(_) => true,
+        };
+        self.session.finish_prewalk_turn(interrupted);
         turn.finish(&result);
         result
     }
@@ -475,7 +541,10 @@ impl AgentSessionHandle {
             .map_or_else(crate::failover::FailoverState::new_empty, |options| {
                 crate::failover::FailoverState::with_cooldown_secs(options.cooldown_secs)
             });
-        self.failover = options.map(Arc::new);
+        self.failover = options.map(|mut options| {
+            self.session.scope_auth_storage(&mut options.auth);
+            Arc::new(options)
+        });
         self
     }
 
@@ -496,6 +565,7 @@ impl AgentSessionHandle {
     async fn reconcile_failover_state(
         &mut self,
         configured_cooldown_secs: u64,
+        available_models: &[crate::models::ModelEntry],
         cx: &crate::agent_cx::AgentCx,
     ) -> Result<bool> {
         let session = self
@@ -505,12 +575,20 @@ impl AgentSessionHandle {
             .await
             .map_err(|err| Error::session(format!("failover provenance lock failed: {err}")))?;
         let runtime = self.session.agent.provider();
-        let runtime_matches_session = session.effective_model_for_current_path().is_none_or(
-            |(provider, model)| {
-                crate::provider_metadata::provider_ids_match(runtime.name(), &provider)
-                    && runtime.model_id().eq_ignore_ascii_case(&model)
-            },
-        );
+        let runtime_matches_session =
+            session
+                .effective_model_for_current_path()
+                .is_none_or(|(provider, model)| {
+                    crate::models::model_identities_match(
+                        self.session
+                            .model_registry()
+                            .map_or(available_models, crate::models::ModelRegistry::models),
+                        runtime.name(),
+                        runtime.model_id(),
+                        &provider,
+                        &model,
+                    )
+                });
         self.failover_state.reconcile_from_session(
             &session,
             configured_cooldown_secs,
@@ -554,7 +632,7 @@ impl AgentSessionHandle {
         let session_actions = self.session.session_action_admission_gate();
         let session_action_permit = session_actions.acquire(cx.cx()).await?;
         if !self
-            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .reconcile_failover_state(options.cooldown_secs, &options.available_models, &cx)
             .await?
         {
             return Ok(false);
@@ -578,6 +656,10 @@ impl AgentSessionHandle {
             "default",
             &primary.provider,
             &primary.model_id,
+            self.session.model_registry().map_or(
+                options.available_models.as_slice(),
+                crate::models::ModelRegistry::models,
+            ),
         ) else {
             return Ok(false);
         };
@@ -666,7 +748,7 @@ impl AgentSessionHandle {
         let session_actions = self.session.session_action_admission_gate();
         let session_action_permit = session_actions.acquire(cx.cx()).await?;
         if !self
-            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .reconcile_failover_state(options.cooldown_secs, &options.available_models, &cx)
             .await?
         {
             return Ok(());
@@ -756,13 +838,18 @@ impl AgentSessionHandle {
     async fn resume_recovery_attempt(
         &mut self,
         abort_signal: &AbortSignal,
+        turn_system_prompt: Option<&str>,
         shared: &EventCallback,
     ) -> Result<AssistantMessage> {
         ensure_not_aborted(abort_signal)?;
         let forwarded = Arc::clone(shared);
         let result = self
             .session
-            .run_continue_with_abort(Some(abort_signal.clone()), move |event| forwarded(event))
+            .run_continue_with_abort_and_system_prompt(
+                Some(abort_signal.clone()),
+                turn_system_prompt,
+                move |event| forwarded(event),
+            )
             .await;
         // A continuation can finish its provider work but fail its own save.
         // Fence before retry/failover terminal callbacks are dispatched, not
@@ -775,20 +862,58 @@ impl AgentSessionHandle {
         &mut self,
         first: Result<AssistantMessage>,
         abort_signal: &AbortSignal,
+        turn_system_prompt: Option<&str>,
         shared: &EventCallback,
         turn: &LogicalTurn,
+        prewalk_turn: &crate::prewalk::PrewalkTurn,
     ) -> Result<AssistantMessage> {
-        let Some(policy) = self.retry else {
-            return first;
-        };
         let mut progress = TurnProgress {
             retry_count: 0,
             failovers_this_turn: 0,
             stream_can_retry: true,
         };
+        // Compaction changes the request and has its own enablement. It must
+        // remain available even when transient retries are disabled, and may
+        // happen only once across all retries/fallbacks of this logical turn.
+        let mut overflow_compaction_attempted = false;
         let mut failed_over = false;
         let mut current = first;
         loop {
+            // The native turn has already saved every result in the triggering
+            // tool batch. Continue that transcript exactly once, without the
+            // retry rewind or a second user message.
+            if current.is_ok() && self.session.prewalk_handoff_pending() {
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                progress.retry_count = 0;
+                failed_over = false;
+                ensure_not_aborted(abort_signal)?;
+                // An extension's explicit model selection outranks an armed
+                // automatic handoff. Check and commit under the same provider
+                // and session-action authority; native continuation installs
+                // a newer explicit choice without overwriting it.
+                if let Some(target) = self
+                    .session
+                    .complete_prewalk_handoff(prewalk_turn, Some(abort_signal))
+                    .await?
+                {
+                    self.failover_state.clear();
+                    shared(AgentEvent::PrewalkSwitched {
+                        provider: target.provider,
+                        model: target.model,
+                        thinking: self
+                            .session
+                            .agent
+                            .stream_options()
+                            .thinking_level
+                            .unwrap_or_default(),
+                    });
+                }
+                ensure_not_aborted(abort_signal)?;
+                current = self
+                    .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                    .await;
+                continue;
+            }
             // Re-resolve after every committed swap. Compaction settings may
             // be overridden by an embedder and are not model-capacity evidence.
             let window = self
@@ -799,6 +924,31 @@ impl AgentSessionHandle {
             let outcome = match &current {
                 Ok(message) => TurnOutcome::Completed(message),
                 Err(error) => TurnOutcome::Failed(error),
+            };
+            if !overflow_compaction_attempted
+                && self.session.compaction_settings().enabled
+                && crate::failover::needs_context_compaction(outcome, window)
+            {
+                overflow_compaction_attempted = true;
+                let recovered = self
+                    .prepare_context_overflow_recovery(&current, abort_signal, shared, turn)
+                    .await;
+                match recovered {
+                    Ok(true) => {
+                        current = self
+                            .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                            .await;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => current = Err(error),
+                }
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                return current;
+            }
+            let Some(policy) = self.retry else {
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                return current;
             };
             let decision = crate::failover::decide(outcome, &progress, &policy, window);
             if matches!(
@@ -827,7 +977,9 @@ impl AgentSessionHandle {
                         failed_over = true;
                         progress.failovers_this_turn += 1;
                         progress.retry_count = 0;
-                        current = self.resume_recovery_attempt(abort_signal, shared).await;
+                        current = self
+                            .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                            .await;
                         continue;
                     }
                     Ok(false) => {}
@@ -859,8 +1011,41 @@ impl AgentSessionHandle {
                 return Err(error);
             }
             progress.retry_count = attempt;
-            current = self.resume_recovery_attempt(abort_signal, shared).await;
+            current = self
+                .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                .await;
         }
+    }
+
+    async fn prepare_context_overflow_recovery(
+        &mut self,
+        current: &Result<AssistantMessage>,
+        abort_signal: &AbortSignal,
+        shared: &EventCallback,
+        turn: &LogicalTurn,
+    ) -> Result<bool> {
+        ensure_not_aborted(abort_signal)?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        admission.ensure_allowed()?;
+        // Rewind only the incomplete assistant response. Accepted user/media
+        // input and every completed tool result stay in the durable transcript.
+        self.session
+            .restore_retry_tail_with_admission(&cx, current.is_ok(), Some(&admission))
+            .await?;
+        admission.ensure_allowed()?;
+        turn.restored_tail();
+        ensure_not_aborted(abort_signal)?;
+        let forwarded = Arc::clone(shared);
+        let compacted = self
+            .session
+            .compact_after_context_overflow(abort_signal, move |event| forwarded(event))
+            .await?;
+        // Never race cancellation against the compaction save. Its durable
+        // transaction settles first; cancellation then forbids continuation.
+        admission.ensure_allowed()?;
+        ensure_not_aborted(abort_signal)?;
+        Ok(compacted)
     }
 
     async fn prepare_same_provider_retry(
@@ -908,6 +1093,40 @@ impl AgentSessionHandle {
 }
 
 impl SessionTransport {
+    /// Send ordered native text, image, audio, and video content over either
+    /// session transport.
+    ///
+    /// In-process sessions use [`AgentSessionHandle::prompt_with_content`],
+    /// including its durable retry and failover behavior. Subprocess sessions
+    /// send the RPC `content` field without flattening or regrouping blocks and
+    /// deliver acknowledged events live through the same callback contract as
+    /// [`Self::prompt_with_images`]. Empty or assistant-only input is rejected
+    /// before the session is advanced or a subprocess request is dispatched.
+    pub async fn prompt_with_content(
+        &mut self,
+        content: Vec<ContentBlock>,
+        on_event: impl Fn(SessionTransportEvent) + Send + Sync + 'static,
+    ) -> Result<SessionPromptResult> {
+        match self {
+            Self::InProcess(handle) => {
+                let assistant = handle
+                    .prompt_with_content(content, move |event| {
+                        on_event(SessionTransportEvent::InProcess(Box::new(event)));
+                    })
+                    .await?;
+                Ok(SessionPromptResult::InProcess(Box::new(assistant)))
+            }
+            Self::RpcSubprocess(client) => {
+                let events = client
+                    .prompt_with_content_streaming(content, None, move |event| {
+                        on_event(SessionTransportEvent::Rpc(event));
+                    })
+                    .await?;
+                Ok(SessionPromptResult::RpcEvents(events))
+            }
+        }
+    }
+
     /// Send text and image attachments over either session transport.
     ///
     /// In-process sessions use the same durable, recoverable path as
@@ -1098,6 +1317,7 @@ mod persistence_fence_tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)]
     fn terminal_observers_see_the_fence_before_the_logical_turn_ends() {
         let admission = ProviderAdmissionGate::default();
         let observed = admission.clone();
@@ -1283,7 +1503,10 @@ mod stream_terminal_tests {
         let captured = Arc::clone(&generic_events);
         let output: EventCallback = Arc::new(move |event| {
             generic_order.lock().unwrap().push("generic");
-            captured.lock().unwrap().push(serde_json::to_value(event).unwrap());
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
         });
         let typed_order = Arc::clone(&order);
         let hook: super::super::OnStreamEvent = Arc::new(move |event| {

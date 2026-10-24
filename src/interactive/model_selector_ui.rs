@@ -1,4 +1,6 @@
-use super::commands::{model_entry_matches, resolve_model_key_from_default_auth};
+use super::commands::{
+    create_runtime_provider, model_entry_matches, resolve_model_key_from_default_auth,
+};
 use super::*;
 use crate::models::model_requires_configured_credential;
 
@@ -22,7 +24,7 @@ impl PiApp {
     }
 
     fn available_models_with_credentials(&self) -> Vec<ModelEntry> {
-        let auth = crate::auth::AuthStorage::load(crate::config::Config::auth_path()).ok();
+        let auth = super::commands::load_runtime_auth(&self.cwd).ok();
         let mut provider_has_credential: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
         let mut filtered = Vec::new();
@@ -149,7 +151,7 @@ impl PiApp {
             return;
         }
 
-        let resolved_key_opt = resolve_model_key_from_default_auth(&next);
+        let resolved_key_opt = resolve_model_key_from_default_auth(&next, &self.cwd);
         if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
             self.status_message = Some(format!(
                 "Missing credentials for provider {}. Run /login {}.",
@@ -158,13 +160,14 @@ impl PiApp {
             return;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
-            Ok(p) => p,
-            Err(err) => {
-                self.status_message = Some(err.to_string());
-                return;
-            }
-        };
+        let provider_impl =
+            match create_runtime_provider(&next, self.extensions.as_ref(), &self.cwd) {
+                Ok(p) => p,
+                Err(err) => {
+                    self.status_message = Some(err.to_string());
+                    return;
+                }
+            };
 
         if let Err(message) = self.switch_active_model(
             &next,

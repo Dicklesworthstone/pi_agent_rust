@@ -85,6 +85,635 @@ fn proc_state(pid: u32) -> Option<char> {
         .and_then(|stat| stat.rsplit(')').next()?.trim().chars().next())
 }
 
+#[cfg(unix)]
+fn assert_reaped(pid: u32) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits i32"))
+        .expect("positive child pid");
+    assert!(
+        // ubs:ignore[rust.panic.assert-macros] -- The fixture requires actual process absence after successful stop.
+        rustix::process::test_kill_process(pid).is_err(),
+        "service must be reaped before successful settlement, including on platforms without /proc"
+    );
+}
+
+#[cfg(unix)]
+struct ServiceCleanup(&'static str);
+
+#[cfg(unix)]
+impl Drop for ServiceCleanup {
+    fn drop(&mut self) {
+        let _ = pi::hub::send_signal(self.0, sysinfo::Signal::Kill);
+        let _ = pi::hub::stop(self.0);
+    }
+}
+
+#[cfg(unix)]
+async fn with_hub_owner<F: std::future::Future>(
+    owner: &pi::agent_cx::AgentCx,
+    future: F,
+) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|task_cx| {
+        let _guard = owner.cx().clone().set_current_restricted();
+        std::future::Future::poll(future.as_mut(), task_cx)
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn wait_for_service_pid(name: &str) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(snapshot) = pi::hub::describe(name)
+            && let Some(pid) = snapshot.pid
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service must publish its actual process before cancellation"
+        );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_readiness_yields_the_executor_and_reaps_before_returning() {
+    let _guard = hub_test_guard();
+    let case = "cancelling_readiness_yields_the_executor_and_reaps_before_returning";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-cancel-readiness";
+    let _cleanup = ServiceCleanup(name);
+    let tool = pi::tools::HubTool::new(&root);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let (output, pid) = block_on_local(async {
+        let mut call = Box::pin(with_hub_owner(
+            &owner,
+            tool.execute(
+                "cancel-readiness",
+                json!({
+                    "op": "start", "name": name, "application": "python3",
+                    "args": ["-u", "-c", "import time; print('waiting-for-ready', flush=True); time.sleep(60)"],
+                    "ready": {"log": "never-ready", "timeoutSecs": 4}
+                }),
+                None,
+            ),
+        ));
+        std::future::poll_fn(|task_cx| {
+            assert!(
+                std::future::Future::poll(call.as_mut(), task_cx).is_pending(),
+                "readiness must yield before its timeout, including without a context blocking pool"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let cancel = async {
+            let pid = wait_for_service_pid(name).await;
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel readiness fixture"),
+            );
+            pid
+        };
+        futures::join!(call, cancel)
+    });
+    let output = output.expect("hub cancellation is a domain result");
+    assert!(output.is_error);
+    assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
+    let settled = pi::hub::describe(name).expect("settled startup");
+    assert_eq!(settled.status, "killed");
+    assert!(settled.pid.is_none());
+    assert_reaped(pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_a_readiness_future_stops_its_unaccepted_service() {
+    let _guard = hub_test_guard();
+    let case = "dropping_a_readiness_future_stops_its_unaccepted_service";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-dropped-readiness";
+    let _cleanup = ServiceCleanup(name);
+    let tool = pi::tools::HubTool::new(&root);
+    let pid = block_on_local(async {
+        let mut call = Box::pin(tool.execute(
+            "drop-readiness",
+            json!({
+                "op": "start", "name": name, "application": "python3",
+                "args": ["-u", "-c", "import time; print('waiting-for-ready', flush=True); time.sleep(60)"],
+                "ready": {"log": "never-ready", "timeoutSecs": 60}
+            }),
+            None,
+        ));
+        let pid = match futures::future::select(call.as_mut(), Box::pin(wait_for_service_pid(name)))
+            .await
+        {
+            futures::future::Either::Left((result, _)) => {
+                panic!("startup returned before the caller could abandon it: {result:?}")
+            }
+            futures::future::Either::Right((pid, _)) => pid,
+        };
+        drop(call);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = pi::hub::describe(name).expect("abandoned service stays observable");
+            if snapshot.pid.is_none() && snapshot.status == "killed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropping startup must request cleanup without waiting for readiness timeout"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+        pid
+    });
+    assert_reaped(pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn abandoning_a_completed_start_never_stops_a_replacement_incarnation() {
+    let _guard = hub_test_guard();
+    let case = "abandoning_a_completed_start_never_stops_a_replacement_incarnation";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-unaccepted-result";
+    let _cleanup = ServiceCleanup(name);
+    let tool = pi::tools::HubTool::new(&root);
+    let script = r"import pathlib, time
+while not pathlib.Path('release-ready').exists():
+    time.sleep(0.01)
+print('old-fixture-ready', flush=True)
+time.sleep(60)
+";
+    block_on_local(async {
+        let mut first = Box::pin(tool.execute(
+            "unaccepted-start",
+            json!({
+                "op": "start", "name": name, "application": "python3",
+                "args": ["-u", "-c", script],
+                "ready": {"log": "old-fixture-ready", "timeoutSecs": 30}
+            }),
+            None,
+        ));
+        std::future::poll_fn(|task_cx| {
+            assert!(
+                std::future::Future::poll(first.as_mut(), task_cx).is_pending(),
+                "startup must yield while its output gate is held"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let old_pid = wait_for_service_pid(name).await;
+        std::fs::write(root.join("release-ready"), "ready").expect("release readiness");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pi::hub::describe(name).expect("first service").status != "running" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker must complete readiness before the name is reused"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+        // The original tool future is deliberately not polled again. Its
+        // startup has completed, but that result has not reached its caller.
+        let stopped = tool
+            .execute("stop-old", json!({"op": "stop", "name": name}), None)
+            .await
+            .expect("stop old service");
+        assert!(!stopped.is_error, "{}", first_text(&stopped));
+        assert_reaped(old_pid);
+        let replacement = tool
+            .execute(
+                "replacement",
+                json!({
+                    "op": "start", "name": name, "application": "python3",
+                    "args": ["-u", "-c", "import time; print('replacement-ready', flush=True); time.sleep(60)"],
+                    "ready": {"log": "replacement-ready", "timeoutSecs": 10}
+                }),
+                None,
+            )
+            .await
+            .expect("start replacement");
+        assert!(!replacement.is_error, "{}", first_text(&replacement));
+        let before = pi::hub::describe(name).expect("replacement is running");
+        assert_eq!(before.status, "running");
+        assert!(before.pid.is_some());
+        drop(first);
+        let after = pi::hub::describe(name).expect("replacement survives old result abandonment");
+        assert_eq!(after.status, "running");
+        assert_eq!(after.pid, before.pid);
+    });
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_a_log_wait_preserves_the_running_service() {
+    let _guard = hub_test_guard();
+    let case = "cancelling_a_log_wait_preserves_the_running_service";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-cancel-log-wait";
+    let _cleanup = ServiceCleanup(name);
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", "import time; print('log-fixture-ready', flush=True); time.sleep(60)"],
+            "ready": {"log": "log-fixture-ready", "timeoutSecs": 10}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let before = pi::hub::describe(name).expect("running service");
+    let tool = pi::tools::HubTool::new(&root);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let output = block_on_local(async {
+        let mut call = Box::pin(with_hub_owner(
+            &owner,
+            tool.execute(
+                "cancel-log-wait",
+                json!({"op": "logs", "name": name, "grep": "missing-line", "waitMs": 1000}),
+                None,
+            ),
+        ));
+        std::future::poll_fn(|task_cx| {
+            assert!(
+                std::future::Future::poll(call.as_mut(), task_cx).is_pending(),
+                "waiting for logs must yield the executor"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel log wait fixture"),
+        );
+        call.await
+    })
+    .expect("hub cancellation is a domain result");
+    assert!(output.is_error);
+    assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
+    let after = pi::hub::describe(name).expect("service is not owned by the log request");
+    assert_eq!(after.status, "running");
+    assert_eq!(after.pid, before.pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn noisy_service_caps_raw_artifact_without_losing_readiness_or_later_input() {
+    let _guard = hub_test_guard();
+    let case = "noisy_service_caps_raw_artifact_without_losing_readiness_or_later_input";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-artifact-cap";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import os, sys
+block = b'x' * 8191 + b'\n'
+for _ in range(2176):
+    remaining = memoryview(block)
+    while remaining:
+        remaining = remaining[os.write(1, remaining):]
+print('hub-ready-after-cap', flush=True)
+line = sys.stdin.readline().strip()
+print('hub-ack:' + line, flush=True)
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "(?m)^hub-ready-after-cap$", "timeoutSecs": 30}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    assert!(first_text(&started).contains("Raw service log is incomplete"));
+    let start_details = started.details.as_ref().expect("start details");
+    let pid = u32::try_from(start_details["pid"].as_u64().expect("live child pid"))
+        .expect("pid fits u32");
+    let capture = &start_details["logCapture"];
+    assert_eq!(capture["byteLimit"], 16 * 1024 * 1024);
+    assert_eq!(capture["retainedBytes"], 16 * 1024 * 1024);
+    assert!(capture["observedBytes"].as_u64().expect("observed") > 16 * 1024 * 1024);
+    assert!(capture["droppedBytes"].as_u64().expect("dropped") > 0);
+    assert_eq!(capture["truncated"], true);
+    assert_eq!(capture["drainState"], "streaming");
+    assert!(capture.get("writeError").is_none());
+    assert!(capture.get("readError").is_none());
+    let log_path = start_details["logPath"].as_str().expect("raw log path");
+    let artifact = std::fs::read(log_path).expect("raw artifact");
+    assert_eq!(artifact.len(), 16 * 1024 * 1024);
+    assert!(artifact.starts_with(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+    assert!(
+        !std::str::from_utf8(&artifact)
+            .expect("ASCII output")
+            .contains("hub-ready-after-cap"),
+        "readiness must observe bytes that are not retained in the raw artifact"
+    );
+    let logs = hub_exec(
+        &root,
+        json!({"op": "logs", "name": name, "cursor": 0, "grep": "hub-ready-after-cap"}),
+    );
+    assert!(!logs.is_error, "{}", first_text(&logs));
+    assert!(first_text(&logs).contains("hub-ready-after-cap"));
+    assert!(first_text(&logs).contains("requested log lines were evicted"));
+    assert!(first_text(&logs).contains("Raw service log is incomplete"));
+    let page = logs.details.as_ref().expect("log details");
+    assert_eq!(page["logPath"], log_path);
+    assert!(page["lostLines"].as_u64().expect("lost lines") > 0);
+    assert_eq!(page["lostLines"], page["oldestCursor"]);
+    let cursor = page["cursor"].as_u64().expect("cursor");
+
+    let described = hub_exec(&root, json!({"op": "describe", "name": name}));
+    assert!(!described.is_error, "{}", first_text(&described));
+    assert_eq!(
+        described.details.as_ref().expect("descriptor")["logCapture"],
+        *capture
+    );
+    let roster = hub_exec(&root, json!({"op": "ps"}));
+    assert!(!roster.is_error, "{}", first_text(&roster));
+    let service = roster.details.as_ref().expect("roster")["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .find(|service| service["name"] == name)
+        .expect("service in roster");
+    assert_eq!(service["logCapture"], *capture);
+
+    let sent = hub_exec(
+        &root,
+        json!({"op": "send", "name": name, "text": "input-after-cap"}),
+    );
+    assert!(!sent.is_error, "{}", first_text(&sent));
+    let acknowledged = hub_exec(
+        &root,
+        json!({
+            "op": "logs", "name": name, "cursor": cursor,
+            "grep": "hub-ack:input-after-cap", "waitMs": 5000
+        }),
+    );
+    assert!(!acknowledged.is_error, "{}", first_text(&acknowledged));
+    assert!(first_text(&acknowledged).contains("hub-ack:input-after-cap"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let finished = loop {
+        let snapshot = pi::hub::describe(name).expect("finished service");
+        if snapshot.status == "exited"
+            && snapshot.log_capture.drain_state == pi::hub::LogDrainState::Complete
+        {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service must drain and exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_reaped(pid);
+    assert_eq!(finished.log_capture.retained_bytes, 16 * 1024 * 1024);
+    assert_eq!(
+        finished.log_capture.dropped_bytes,
+        finished.log_capture.observed_bytes - finished.log_capture.retained_bytes
+    );
+    assert!(finished.log_capture.read_error.is_none());
+    assert!(finished.log_capture.write_error.is_none());
+    assert_eq!(
+        std::fs::metadata(log_path).expect("capped log").len(),
+        16 * 1024 * 1024
+    );
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn short_service_output_is_complete_and_unchanged() {
+    let _guard = hub_test_guard();
+    let case = "short_service_output_is_complete_and_unchanged";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-short-complete-log";
+    let _cleanup = ServiceCleanup(name);
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", "print('ordinary service output')"]
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = pi::hub::describe(name).expect("service");
+        if snapshot.status == "exited"
+            && snapshot.log_capture.drain_state == pi::hub::LogDrainState::Complete
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "short service must drain and exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let logs = hub_exec(&root, json!({"op": "logs", "name": name}));
+    assert!(!logs.is_error, "{}", first_text(&logs));
+    assert_eq!(first_text(&logs), "ordinary service output");
+    let page = logs.details.as_ref().expect("log details");
+    let capture = &page["logCapture"];
+    assert_eq!(capture["drainState"], "complete");
+    assert_eq!(capture["truncated"], false);
+    assert_eq!(capture["droppedBytes"], 0);
+    assert_eq!(page["lostLines"], 0);
+    assert!(capture.get("readError").is_none());
+    assert!(capture.get("writeError").is_none());
+    let artifact =
+        std::fs::read(page["logPath"].as_str().expect("log path")).expect("complete raw artifact");
+    assert_eq!(capture["observedBytes"], artifact.len() as u64);
+    assert_eq!(capture["retainedBytes"], artifact.len() as u64);
+    assert_eq!(
+        std::str::from_utf8(&artifact).expect("raw text").trim_end(),
+        "ordinary service output"
+    );
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_restart_finishes_the_old_process_without_launching_a_replacement() {
+    let _guard = hub_test_guard();
+    let case = "cancelling_restart_finishes_the_old_process_without_launching_a_replacement";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-cancel-restart";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import pathlib, signal, sys, time
+counter = pathlib.Path('launch-count')
+counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')
+def terminate(*_):
+    pathlib.Path('stop-begun').write_text('stopping')
+    while not pathlib.Path('release-stop').exists():
+        time.sleep(0.01)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, terminate)
+print('restart-fixture-ready', flush=True)
+while True:
+    time.sleep(60)
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "restart-fixture-ready", "timeoutSecs": 10}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let before = pi::hub::describe(name).expect("initial service");
+    let tool = pi::tools::HubTool::new(&root);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let output = block_on_local(async {
+        let call = with_hub_owner(
+            &owner,
+            tool.execute(
+                "cancel-restart",
+                json!({"op": "restart", "name": name}),
+                None,
+            ),
+        );
+        let cancel = async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !root.join("stop-begun").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restart must reach the old service's graceful shutdown"
+                );
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10))
+                    .await;
+            }
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel during restart cleanup"),
+            );
+            std::fs::write(root.join("release-stop"), "finish").expect("release graceful stop");
+        };
+        let (output, ()) = futures::join!(call, cancel);
+        output
+    })
+    .expect("hub cancellation is a domain result");
+    assert!(output.is_error);
+    assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("launch-count")).unwrap(),
+        "1"
+    );
+    let settled = pi::hub::describe(name).expect("old service settles");
+    assert_eq!(settled.status, "killed");
+    assert_eq!(settled.exit_code, Some(0));
+    assert!(settled.pid.is_none());
+    assert_reaped(before.pid.expect("old process id"));
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn graceful_stop_preserves_cleanup_and_returns_reaped_exit_metadata() {
+    let _guard = hub_test_guard();
+    let case = "graceful_stop_preserves_cleanup_and_returns_reaped_exit_metadata";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-graceful-cleanup";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import pathlib, signal, sys, time
+def terminate(*_):
+    time.sleep(1)
+    pathlib.Path('grace-completed').write_text('clean shutdown')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, terminate)
+print('graceful-ready', flush=True)
+while True:
+    time.sleep(60)
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "graceful-ready", "timeoutSecs": 20}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started)); // ubs:ignore[rust.panic.assert-macros] -- Real service startup must succeed before exercising cleanup.
+    let pid = u32::try_from(
+        started.details.as_ref().expect("start details")["pid"] // ubs:ignore[rust.panic.direct-indexing] -- Successful service descriptor must carry its child PID.
+            .as_u64()
+            .expect("child pid"),
+    )
+    .expect("pid fits u32");
+    let stopped = hub_exec(&root, json!({"op": "stop", "name": name}));
+    assert!(!stopped.is_error, "{}", first_text(&stopped)); // ubs:ignore[rust.panic.assert-macros] -- Stop must finish the real child lifecycle.
+    let details = stopped.details.as_ref().expect("stop details");
+    assert_eq!(details["status"], "killed"); // ubs:ignore[rust.panic.assert-macros] -- Requested termination must have settled.
+    assert_eq!(details["exitCode"], 0); // ubs:ignore[rust.panic.assert-macros] -- Graceful handler exited successfully.
+    assert!(details["pid"].is_null()); // ubs:ignore[rust.panic.assert-macros] -- Reaped children no longer publish a PID.
+    assert_eq!(
+        // ubs:ignore[rust.panic.assert-macros] -- The grace window must preserve the child's cleanup work.
+        std::fs::read_to_string(root.join("grace-completed")).expect("graceful cleanup ran"),
+        "clean shutdown"
+    );
+    assert_reaped(pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn restart_escalates_term_ignoring_service_before_rebinding_its_port() {
+    let _guard = hub_test_guard();
+    let case = "restart_escalates_term_ignoring_service_before_rebinding_its_port";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-stubborn-restart";
+    let _cleanup = ServiceCleanup(name);
+    let port = free_port();
+    let script = r"import signal, socket, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('127.0.0.1', int(sys.argv[1])))
+server.listen()
+print('stubborn-ready', flush=True)
+while True:
+    time.sleep(60)
+";
+    let first = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script, port.to_string()],
+            "ready": {"log": "stubborn-ready", "port": port, "timeoutSecs": 20}
+        }),
+    );
+    assert!(!first.is_error, "{}", first_text(&first)); // ubs:ignore[rust.panic.assert-macros] -- Real listening service is the restart precondition.
+    let first_details = first.details.as_ref().expect("first details");
+    let old_pid = u32::try_from(first_details["pid"].as_u64().expect("first pid")) // ubs:ignore[rust.panic.direct-indexing] -- Capture the actual first incarnation before restart.
+        .expect("pid fits u32");
+    let restart_started = std::time::Instant::now();
+    let restarted = hub_exec(&root, json!({"op": "restart", "name": name}));
+    assert!(!restarted.is_error, "{}", first_text(&restarted)); // ubs:ignore[rust.panic.assert-macros] -- Replacement must bind after the previous process is gone.
+    assert!(restart_started.elapsed() >= Duration::from_secs(3)); // ubs:ignore[rust.panic.assert-macros] -- TERM-ignoring child must receive the full grace window.
+    let details = restarted.details.as_ref().expect("restart details");
+    assert_eq!(details["status"], "running"); // ubs:ignore[rust.panic.assert-macros] -- New service reached readiness.
+    assert_eq!(details["ready"], true); // ubs:ignore[rust.panic.assert-macros] -- Both readiness gates passed.
+    assert_ne!(first_details["pid"], details["pid"]); // ubs:ignore[rust.panic.assert-macros] -- Restart created a distinct process.
+    assert_ne!(first_details["logPath"], details["logPath"]); // ubs:ignore[rust.panic.assert-macros] -- Incarnations retain separate logs.
+    assert_reaped(old_pid);
+    finish_case(&harness, case);
+}
+
 #[test]
 fn fixture_server_readiness_conjunction_and_lifecycle() {
     let _guard = hub_test_guard();
@@ -341,9 +970,17 @@ fn session_exit_kills_non_detached_services() {
         .info("verify", format!("service pids: {pid_a}, {pid_b}"));
 
     pi::hub::kill_session_services();
-    std::thread::sleep(Duration::from_millis(500));
+
+    for name in ["svc-a", "svc-b"] {
+        let settled = pi::hub::describe(name).expect("settled service");
+        assert_eq!(settled.status, "killed"); // ubs:ignore[rust.panic.assert-macros] -- Session cleanup must settle every service.
+        assert!(settled.pid.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Cleanup returns only after reap.
+        assert!(settled.exit_code.is_some()); // ubs:ignore[rust.panic.assert-macros] -- Terminal exit metadata is already available.
+    }
 
     for pid in [pid_a, pid_b] {
+        #[cfg(unix)]
+        assert_reaped(pid);
         let state = proc_state(pid);
         harness.log().info(
             "verify",

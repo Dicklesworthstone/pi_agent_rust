@@ -21,14 +21,14 @@ const CHUNKS_PER_DRAIN: usize = 32;
 const PIPE_TIMEOUT: &str =
     "PI_SUBAGENT_PIPE_TIMEOUT: child pipes did not close after process termination";
 
-struct FramedPipe<R> {
+pub(super) struct FramedPipe<R> {
     reader: Option<BufReader<R>>,
     partial: Vec<u8>,
     frame_limit: usize,
 }
 
 impl<R: Read + AsFd> FramedPipe<R> {
-    fn new(pipe: R, frame_limit: usize) -> io::Result<Self> {
+    pub(super) fn new(pipe: R, frame_limit: usize) -> io::Result<Self> {
         // Preserve all unrelated flags. The descriptors are private to this
         // transport; nothing else reads or switches them back to blocking mode.
         let flags = rustix::fs::fcntl_getfl(&pipe).map_err(io::Error::from)?;
@@ -46,7 +46,10 @@ impl<R: Read> FramedPipe<R> {
     /// `None` means no complete frame this slice, not necessarily EOF. Retain
     /// partial bytes across WouldBlock, including a split multibyte character.
     /// CRLF, empty lines and a final unterminated frame match `read_frame`.
-    fn next_frame(&mut self, chunks_left: &mut usize) -> Result<Option<Vec<u8>>, &'static str> {
+    pub(super) fn next_frame(
+        &mut self,
+        chunks_left: &mut usize,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
         while *chunks_left > 0 {
             let Some(reader) = self.reader.as_mut() else {
                 return Ok(None);
@@ -83,6 +86,10 @@ impl<R: Read> FramedPipe<R> {
             }
         }
         Ok(None)
+    }
+
+    pub(super) const fn is_closed(&self) -> bool {
+        self.reader.is_none()
     }
 }
 

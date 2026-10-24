@@ -1,0 +1,398 @@
+# Goal-driven SDK sessions
+
+Pi's in-process SDK can retain an objective across several native prompts,
+stop for review, and resume with its remaining prompt/token budget. This is an
+OMP-inspired workflow. The default FrankenTUI exposes `/goal` lifecycle controls
+and bounded execution described below. There is no model-facing `goal` tool.
+The separate RPC lifecycle adapter is not the in-process execution driver.
+The types currently live in `pi::goal`, an unstable module under the library's
+public API policy; the lifecycle methods are on `AgentSessionHandle`.
+
+## Default terminal: inspect and control a saved objective
+
+In the default FrankenTUI, run `/goal` or `/goal status` while idle. It displays
+the current branch's objective, state, prompt/token accounting, interruption
+status and a `Review: g1-...` revision receipt. No goal is also a reviewable
+state, so creation cannot be silently redirected to another queued session.
+Copy the actual receipt into the command; `<review>` below is a placeholder:
+
+```text
+/goal status
+/goal create <review> --tokens 50000 --prompts 8 -- Implement and verify the parser
+```
+
+The command records the objective in the native session journal and displays
+its new receipt. It does not start a provider request. Creation defaults to
+100,000 tokens and 16 goal prompts; repeated or unknown flags, invalid budgets,
+missing `--`, blank text and oversized input are errors. Text after `--` is
+literal, preserving interior whitespace, case and Unicode; it is not expanded
+as a shell command, prompt template or `@file` reference.
+
+Use the receipt of the state you actually reviewed for subsequent changes:
+
+```text
+/goal pause <review>
+/goal resume <review>
+/goal budget <review> --tokens 150000 --prompts 24 -- Reviewed the remaining work
+/goal drop <review> -- This objective is no longer needed
+/goal complete <review> -- Inspected the deliverables and checked the results
+/goal save <review>
+```
+
+Every successful transition displays a fresh receipt. Pause/resume preserve
+spent counters; an exhausted goal cannot be resumed with reset counters.
+An explicit `/goal budget` revision changes both total allowances while keeping
+the same goal, usage and history. Both totals and a nonblank reason are required;
+the revised goal stays paused or budget-limited until explicitly resumed.
+Interrupted work remains interrupted. See [budget revisions](goal-budget-revisions.md)
+for the SDK setter, terminal workflow and atomic RPC pause-and-revise request.
+Completion is an explicit user attestation and requires nonblank evidence, not
+an assistant's completion claim or a proof independently checked by Pi. An
+unfinished intent must be reconciled before completion; a redundant pause
+cannot clear its interrupted marker. Drop retains history;
+it does not delete the session or undo tools. Create/resume refuse both live
+and replayed plan mode until it is off. Other lifecycle controls remain usable
+for stopping, revising budgets or saving an existing objective.
+
+The SHA-256 receipt binds session identity, branch leaf, the full latest goal
+record including accumulated usage, plan state and persistence mode. Validation
+and append share the same owned journal lock. Another branch, intervening input,
+replacement goal or differently identified session yields `GOAL_STALE` with no
+mutation; run `/goal status` again. Receipts identify logical state, not secret
+authority, authentication or proof that somebody read it. Reopening the exact
+unchanged saved state, or returning to the exact unchanged branch, preserves
+the receipt. This differs deliberately from the SDK's in-memory `GoalSnapshot`
+incarnation checks. It is not a cross-process execution lease or filesystem
+transaction, and does not coordinate independent writers to the same session.
+
+Saved, memory-only and unconfirmed persistence are reported separately. A save
+failure keeps the live change and its new receipt; use `/goal save` to retry
+the native save without appending/replaying the decision. A malformed latest
+goal checkpoint is an error, not permission to resurrect an older objective.
+Displayed objective/evidence lines are quoted; control characters, non-ASCII
+scalars and backslashes are visibly escaped, while the journal retains the
+original text. Persistence diagnostics are bounded and explicitly labelled
+when truncated.
+
+**Lifecycle commands do not imply autonomous completion.** The terminal now has
+two bounded execution commands:
+
+```text
+/goal step <review>
+/goal run <review> --steps 4
+```
+
+`step` runs at most one native goal prompt. `run` authorizes an upper bound of
+1–32 prompts in one terminal invocation, still bounded by the goal's remaining
+prompt and token allowances. The shared progress policy can pause earlier when
+successful tool progress is absent or repeats. Continued progress can receive a
+host-side **Continue** verdict; the selected upper bound ends with **Pause**.
+Assistant prose can never mark the goal complete or extend the selected run.
+
+Both commands use the existing SDK driver, tool permissions, approvals,
+persistence, retries, compaction and native cancellation path. Their absolute
+execution budget is 15 minutes, still subject to stricter native turn limits.
+A failure, cancellation, exhausted goal budget, or unconfirmed persistence can
+stop earlier. Review the fresh receipt and result before another `resume`/run,
+budget revision, drop, or explicit completion attestation.
+
+Terminal `run` is deliberately **not** a completion verifier: it never returns
+`GoalDecision::Complete`. Hosts that need evidence-based automatic completion
+must use the SDK runner with a real verifier. Ordinary terminal prompts do not
+invoke the bounded goal driver, consume its prompt counter, or become governed
+by its token budget; active-interval assistant usage is still accounted by the
+journal.
+The classic terminal is unchanged. Regression coverage uses native sessions in
+`src/goal/terminal/tests.rs` and the default routing/driver in
+`src/interactive_ftui/workspace_commands.rs`; authored tests still require DSR.
+
+## Create an objective and drive it
+
+Call `AgentSessionHandle::run_goal` on a borrowed handle, or convert it once with
+`handle.into_goal_session()` for an owned convenience wrapper. Both use the same
+driver and existing session rather than constructing a second agent. The handle
+remains exclusively borrowed until the run is finished or dropped, then ordinary
+session operations are available again. Provider selection, authentication, tools and their approval policies,
+input hooks, retry/failover, compaction and native session persistence remain
+owned by that session. Goal mode grants no additional tool permissions.
+
+This helper accepts a host-owned result verifier. Call it inside the same
+asupersync runtime used by the SDK:
+
+```rust
+use std::time::Duration;
+use pi::agent_cx::AgentCx;
+use pi::goal::{
+    GoalBudget, GoalDecision, GoalRunReport, GoalSession, GoalSnapshot,
+};
+use pi::sdk::{AssistantMessage, Error, Result};
+
+async fn execute_objective(
+    session: &mut GoalSession,
+    objective: &str,
+    verify: impl FnMut(&GoalSnapshot, &AssistantMessage) -> GoalDecision + Send,
+) -> Result<GoalRunReport> {
+    let owner = AgentCx::for_current_or_request();
+    let created = session.session_mut().create_goal(
+        &owner,
+        objective,
+        GoalBudget { max_prompts: 8, token_budget: 50_000 },
+    ).await?;
+    if !created.persistence.allows_continuation() {
+        return Err(Error::session(
+            "Goal exists in memory, but its save is unconfirmed; inspect and flush it",
+        ));
+    }
+    let run = session.run_goal(
+        &owner,
+        &created.goal,
+        Duration::from_secs(15 * 60),
+        |_control, _event| {},
+        verify,
+    )?;
+    // Clone run.control() here for a UI or another thread before awaiting.
+    Ok(run.await)
+}
+```
+
+The verifier explicitly returns one of:
+
+- `GoalDecision::Continue { instruction }`: journal the next bounded instruction
+  and start another prompt only after persistence and budget checks.
+- `GoalDecision::Pause { reason }`: retain the objective for explicit review.
+- `GoalDecision::Complete { evidence }`: record the host's completion attestation.
+
+Neither a normal assistant stop nor text such as “goal complete” supplies a host
+verdict. Errors, refusal, truncated/aborted output, empty final answers and
+unresolved tool calls do not reach this verifier. Evidence is an explanation
+provided by the host, **not a proof independently verified by Pi**. The host
+should inspect the actual deliverables and verification results. The callback
+is synchronous; it cannot be preempted. The driver rechecks cancellation and
+time after the callback and again before publishing its decision.
+
+## Await real host verification
+
+`run_goal_with_verifier` is available on both `AgentSessionHandle` and
+`GoalSession`. Its host-supplied callback returns a future with output
+`Result<GoalDecision>`, so it can await an external validator or other evidence
+instead of blocking the executor or accepting an assistant's completion claim.
+For a reviewed, active goal, an embedding can use:
+
+```rust
+use std::future::Future;
+use std::time::Duration;
+use pi::agent_cx::AgentCx;
+use pi::goal::{GoalDecision, GoalRunReport, GoalSnapshot};
+use pi::sdk::{AgentSessionHandle, AssistantMessage, Result};
+
+async fn run_checked<F>(
+    session: &mut AgentSessionHandle,
+    expected: &GoalSnapshot,
+    verify: impl FnMut(GoalSnapshot, AssistantMessage) -> F + Send,
+) -> Result<GoalRunReport>
+where
+    F: Future<Output = Result<GoalDecision>> + Send,
+{
+    let owner = AgentCx::for_current_or_request();
+    let run = session.run_goal_with_verifier(
+        &owner,
+        expected,
+        Duration::from_secs(15 * 60),
+        |_control, _event| {},
+        verify,
+    )?;
+    // Publish run.control() to the host UI before awaiting as needed.
+    Ok(run.await)
+}
+```
+
+Each callback receives owned snapshots of the exact current goal and last
+successful native response, not the whole history, mutable session, credentials,
+or additional tool authority. The callback decides what constitutes acceptable
+evidence. Pi does not independently certify that evidence. The synchronous
+`run_goal` API remains available and uses the same verification/commit path.
+
+Verification shares the absolute deadline constructed at run creation, including
+time already spent on provider requests, retries and previous checks. Waiting
+does not pause or restart that clock. `GoalControl::pause()` wakes even a silent
+verifier with no native prompt running. Owner cancellation and timer expiry also
+wake it without a polling task. A late success, including one returned by a poll
+which itself paused the run or crossed the deadline, cannot authorize another
+prompt or complete the goal. The final journal transition rechecks the exact
+snapshot, pause state and deadline as well.
+
+An ordinary verifier error stops with `GoalRunStop::Failed` and pauses the goal;
+the error is reported separately from the preserved native `completion`. A later
+goal-journal error can take precedence in `error`; inspect persistence and obtain
+a fresh snapshot before acting. Invalid empty/oversized evidence fails closed.
+Native errors, refusal, incomplete answers, unclaimed user inputs, observed token
+exhaustion and native run-time-cap messages do not construct a verifier future.
+A native time cap pauses instead of starting another prompt with a fresh cap.
+
+The host must own cancellation-safe cleanup for its verifier's resources.
+Pause, expiry or cancellation drops the pending verifier under its initiating
+context and removes its timer/control registrations. This does not join detached
+host tasks, forcibly terminate arbitrary processes, roll back side effects, or
+preempt a blocking callback/poll. Native agent turns still use their existing
+abort-and-drain path. A cancelled owner may be unable to persist the goal's pause;
+the interrupted intent remains visible and is not permission to replay work.
+
+Dropping during verification leaves the prior unfinished intent interrupted,
+even if the native prompt already returned successfully. An unused unpolled run
+constructs neither a verifier nor a provider request. Verification has no live
+native input mailbox: `steer`/`follow_up` reject input there instead of silently
+queueing it for another prompt. Keep pending host input separately until the
+next explicit run. No autonomous verifier selection or model-facing completion
+tool is introduced by these SDK methods.
+
+## Limits and accounting
+
+Both budgets are mandatory: `max_prompts` is 1–1024 and `token_budget` is positive.
+Defaults are 16 prompts and 100,000 tokens. Objectives, instructions and evidence
+are each capped at 16 KiB. Each admitted prompt consumes one prompt allowance
+before dispatch, even if execution is later interrupted or saving its intent
+cannot be confirmed. Resume does not refund attempts or reset spent tokens.
+
+A “prompt” here includes its native tool-iteration loop, retries and live
+follow-ups. It is not a single provider request. Continue configuring the
+session's own maximum tool iterations. Token enforcement now also observes
+**completed assistant messages inside that native loop**, instead of waiting
+until the entire goal prompt returns. Each prompt starts with only the goal's
+remaining allowance, after usage already recorded on its selected branch.
+For every terminal assistant message, the observer uses the same normalization
+as the journal: the larger of `total_tokens` and the saturating sum of input,
+output and cache buckets. Cumulative streaming previews, user/tool messages and
+repeated message lists in turn/agent lifecycle events are not counted again.
+
+When observed usage reaches the remaining allowance, the goal seals live input
+and requests native abort before returning from that event callback. The native
+executor retains ownership of cancellation, pending tool-call results, cleanup
+and persistence. This stops further native tool/provider continuation, including
+queued follow-ups and server `pause_turn` rounds, through its existing admission
+checks. Work already performed is not undone. The goal report distinguishes
+`BudgetLimited` from an ordinary user pause and keeps the native post-drain
+completion and unclaimed inputs. No automatic verifier or completion verdict is
+requested after this boundary; even a prepared verdict cannot override the
+latched token stop. An earlier explicit user pause retains its own cause.
+
+This is **not a hard billing ceiling**. The response that reports the usage can
+already have overshot, unknown provider usage cannot be invented, cache buckets
+can overlap, and blocking work cannot be forcibly preempted. The observer does
+not count unseen auxiliary requests or estimate tokens from text. Reported usage
+observed before native retries is not refunded by restarting a provider attempt
+inside the same prompt. The ordinary native deadline still bounds the run.
+
+The persisted `tokens_spent` remains selected-branch assistant accounting, not a
+second event ledger. A discarded retry can therefore make observed usage exceed
+what remains on that branch. The final checkpoint retains the `BudgetLimited`
+status and an observed-budget explanation without fabricating a higher recorded
+token count. Inspect the native result and history before revising allowances.
+Save failures retain their existing unconfirmed/interrupted behavior.
+
+The timeout starts when `run_goal` or `run_goal_with_verifier` constructs its
+future, not at its first poll.
+All prompts in that invocation share the same absolute runtime deadline,
+including retries, follow-ups and host verification. An inherited deadline can only shorten it.
+A new explicit invocation gets a new time allowance, but retains the goal's
+spent prompt/token budgets. Expiry requests native abort and drains that same
+future; cooperative cleanup may outlive the timeout. Blocking native work and
+host callbacks are not forcibly preempted.
+
+Exhaustion is `BudgetLimited`, never automatic completion. A successful final
+prompt may still be explicitly verified complete at the **prompt-count** boundary
+when no token stop or other interruption occurred. After a token stop, review
+the retained result; explicit lifecycle completion remains an attestation, not
+an automatic consequence of the assistant's final text. An exhausted goal cannot
+be resumed by resetting its counters. A host can explicitly revise its total
+allowances with `set_goal_budget` (or `/goal budget`) while retaining spent work,
+then review and resume the paused goal. Replacing the objective instead requires
+explicitly dropping the old goal and creating a new one. See
+[budget revisions](goal-budget-revisions.md) for limits and recovery.
+
+## Pause, input and interruption
+
+`run.control()` returns a handle tied to that run only. `pause()` latches even
+between prompts and aborts a currently running prompt. A pause that wins the
+verdict-publication lock prevents an already prepared completion from replacing
+it. Finished or dropped run handles cannot steer, pause or queue input into a
+later run.
+
+`steer()` and `follow_up()` use the native turn-scoped mailboxes. They reject
+input when no prompt is accepting it. Input already handed to the agent follows
+native history/persistence rules. Still-unclaimed inputs are returned in
+`GoalRunReport::pending`, and the driver pauses instead of replaying them into
+another goal prompt. `GoalControl::take_pending()` also permits explicit
+retraction and recovery after dropping the run. Each input transfers at most
+once; manually reclaimed input will not also appear in the report.
+
+An unpolled dropped run changes no goal/session state and dispatches nothing.
+Pausing before the first poll also dispatches nothing and leaves the untouched
+goal active. Dropping after an intent was appended leaves the goal interrupted;
+awaiting cancellation is necessary to observe native cleanup and its outcome.
+The driver does not pretend that dropping undoes tool side effects.
+
+## Persistence and reopening
+
+Every lifecycle change uses a bounded `goal_checkpoint` custom entry in the
+existing session format. Queries walk the current branch, not global disk
+order. Recorded assistant usage since the newest active checkpoint is added
+without mutating state; the next checkpoint incorporates it once. Work during
+paused/terminal intervals does not charge that goal. Malformed newest goal
+records are rejected rather than falling back to an older active objective.
+
+The public methods `current_goal`, `create_goal`, `pause_goal`, `resume_goal`,
+`set_goal_budget`, `complete_goal`, `drop_goal` and `flush_goal` never start provider work by
+themselves. Mutations require a snapshot of the exact storage incarnation,
+session identity, current branch leaf and goal revision. A stale UI decision
+cannot complete a replacement objective. After reopening, obtain a fresh
+snapshot even if the session and goal IDs are unchanged.
+
+Before each goal prompt, the driver appends `inFlight: true`, increments its
+prompt count, and saves that intent when the session is persistent. Only a
+confirmed save (or an explicitly memory-only session) permits dispatch. If
+execution is abandoned, the saved unfinished intent reports interrupted/paused
+(or budget-limited when exhausted). Inspect history and side effects before
+calling `resume_goal`; work is never replayed automatically on startup.
+Explicit resume keeps the objective and spent counters, then continues from the
+existing conversation rather than resubmitting the original prompt as a retry.
+
+A live transition and its durable acknowledgement are distinct:
+`GoalPersistence::Saved` confirms `Session::save`, `MemoryOnly` identifies an
+ephemeral session, and `Unconfirmed` preserves the live change but stops further
+work. Retry `flush_goal`, not the already-applied create/complete decision.
+Native save guarantees and limitations still apply; this is not a new database,
+a crash-atomic transaction spanning tools and session files, or a cross-process
+execution lease.
+
+Always inspect the run report. `completion` retains the last native result,
+including typed deadline/provider/persistence failures and partial completion.
+`error` independently describes a goal-journal or validation failure. A later
+journal failure does not erase the original native outcome. `goal` can be stale
+when an error prevented a fresh read; get a new snapshot before acting on it.
+Objective/evidence and message contents are excluded from the report's Debug
+output but remain available through explicit fields and persisted session data;
+those files are not a secrets-redaction boundary.
+
+## Validation status
+
+The goal lifecycle and runner include regression tests over native sessions,
+local HTTP/SSE requests, saved-session reopening, pause races, budget exhaustion,
+input recovery and failed persistence. They were authored but not executed in
+the implementation environment because `dsr quality --tool pi_agent_rust` could
+not start (`dsr` absent, exit 127). Compilation, tests, rustfmt and Clippy still
+require the repository's DSR quality lane. No quality gate was substituted.
+
+Borrowed-session and asynchronous-verification workflows are covered in
+`tests/goal_borrowed.rs`; timer/cancellation registration probes are in
+`src/goal/driver/verification.rs`. These tests were also authored but not run in
+the implementation environment. Source inspection is not runtime acceptance.
+
+Eight additional regressions in `src/goal/driver/budget.rs` cover terminal-only
+usage normalization, saturation and first-stop precedence, native file-tool
+rounds, retained attachment-bearing follow-ups, server continuations, normal
+under-budget completion, remaining allowances after resume/revision, and a late
+verdict losing without invented journal usage. Provider responses are controlled;
+Agent, goal/session control, tool execution and filesystem operations are native.
+These tests are authored, not executed. DSR was attempted again and was absent
+(exit 127). Compilation, Rust tests, formatting and Clippy remain unverified.
+This change does not complete the terminal goal keyboard-control integration.

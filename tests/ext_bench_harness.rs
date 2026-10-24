@@ -183,7 +183,7 @@ fn collect_env_fingerprint() -> EnvFingerprint {
         "{os}|{arch}|{cpu_model}|{cpu_cores}|{mem_total_mb}|{build_profile}|{git_commit}|{}",
         features.join(",")
     );
-    let config_hash = format!("{:x}", Sha256::digest(hash_input.as_bytes()));
+    let config_hash = pi::package_manager::hex_encode(&Sha256::digest(hash_input.as_bytes()));
 
     EnvFingerprint {
         os,

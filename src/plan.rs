@@ -17,6 +17,35 @@ use std::sync::{Arc, RwLock};
 mod session;
 pub use session::{PlanChange, PlanPersistence, SessionPlanReview};
 
+/// Replay the saved plan-mode transitions on the active Session branch.
+/// The caller resets the live PlanState, which keeps approved/pending plans
+/// read-only when their memory-only proposal cannot be reconstructed.
+pub(crate) fn replayed_plan_mode(session: &crate::session::Session) -> PlanMode {
+    session
+        .entries_for_current_path()
+        .iter()
+        .filter_map(|entry| {
+            let crate::session::SessionEntry::Custom(custom) = entry else {
+                return None;
+            };
+            if custom.custom_type != "plan_mode" {
+                return None;
+            }
+            custom
+                .data
+                .as_ref()
+                .and_then(|data| data.get("mode"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .fold(PlanMode::Off, |current, mode| match mode {
+            "off" => PlanMode::Off,
+            "planning" | "rejected" => PlanMode::Planning,
+            "pending_approval" => PlanMode::PendingApproval,
+            "approved" => PlanMode::Approved,
+            _ => current,
+        })
+}
+
 /// Maximum UTF-8 bytes retained for one submitted plan. The tool checks this
 /// before copying model input; direct state callers use the same bound.
 pub const MAX_PLAN_BYTES: usize = 256 * 1024;

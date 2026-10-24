@@ -10,14 +10,22 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{ConfiguredServer, McpDiscovery, Provenance};
-use super::transport::{DEFAULT_MCP_TIMEOUT, MCP_PROTOCOL_VERSION, McpTransport};
+use super::config::{ConfiguredServer, McpDiscovery, McpOAuthConfig, Provenance};
+#[cfg(test)]
+use super::transport::MCP_PROTOCOL_VERSION;
+use super::transport::{DEFAULT_MCP_TIMEOUT, McpTransport};
 use super::trust::{TrustDecision, TrustStore, TrustWriteGuard};
 use crate::error::{Error, Result};
 
+#[cfg(test)]
+mod auth_tests;
 mod calls;
 mod catalog;
+#[cfg(test)]
+mod config_tests;
 mod connection;
+#[cfg(test)]
+mod live_catalog_tests;
 mod output_schema;
 
 pub use output_schema::McpOutputSchema;
@@ -207,6 +215,8 @@ pub enum ServerHealth {
     NotStarted,
     /// Connected and tool list cached.
     Ready { tools: usize },
+    /// Credentials are missing, expired, rejected, or explicitly removed.
+    AuthenticationRequired { reason: String },
     /// Crashed; will retry after the backoff elapses.
     Unhealthy { reason: String, retries: u32 },
     /// Exceeded restart budget; manual `/mcp test` revives.
@@ -218,6 +228,9 @@ impl ServerHealth {
         match self {
             Self::NotStarted => "not started".to_string(),
             Self::Ready { tools } => format!("ready ({tools} tools)"),
+            Self::AuthenticationRequired { reason } => {
+                format!("authentication required: {reason}")
+            }
             Self::Unhealthy { reason, retries } => {
                 format!("unhealthy (retry {retries}/{MAX_RESTARTS}): {reason}")
             }
@@ -253,7 +266,27 @@ impl ServerEntry {
     fn effective_cwd(&self, manager_default: &Path) -> PathBuf {
         self.cwd_override
             .clone()
-            .unwrap_or_else(|| manager_default.to_path_buf())
+            .unwrap_or_else(|| self.config.effective_cwd(manager_default))
+    }
+
+    fn timeout(&self) -> Duration {
+        self.config
+            .timeout_ms
+            .map_or(DEFAULT_MCP_TIMEOUT, Duration::from_millis)
+    }
+
+    fn check_enabled(&self) -> Result<()> {
+        if self.config.enabled {
+            Ok(())
+        } else {
+            Err(tool_err(
+                "MCP_SERVER_DISABLED",
+                format!(
+                    "server {:?} is disabled by configuration; enable it in its source or native user settings and restart the session before trusting or using it",
+                    self.config.name
+                ),
+            ))
+        }
     }
 }
 
@@ -336,6 +369,7 @@ pub struct McpManager {
 
 struct McpManagerInner {
     cwd: PathBuf,
+    global_dir: PathBuf,
     servers: Mutex<HashMap<String, Arc<ServerEntry>>>,
     trust_path: PathBuf,
     trust_lock: Mutex<()>,
@@ -369,7 +403,8 @@ impl McpManager {
             .collect();
         Self {
             inner: Arc::new(McpManagerInner {
-                cwd: cwd.to_path_buf(),
+                cwd: super::config::canonical_cwd(cwd),
+                global_dir: global_dir.to_path_buf(),
                 servers: Mutex::new(servers),
                 trust_path: global_dir.join("mcp-trust.json"),
                 trust_lock: Mutex::new(()),
@@ -414,7 +449,7 @@ impl McpManager {
     }
 
     fn trust_fingerprint(&self, config: &ConfiguredServer) -> String {
-        config.fingerprint(&self.inner.cwd)
+        config.fingerprint_for_workspace(&self.inner.cwd, &self.inner.cwd)
     }
 
     /// bd-hyik7: fingerprint honoring a per-entry cwd override (extension
@@ -424,7 +459,7 @@ impl McpManager {
     fn trust_fingerprint_for(&self, entry: &Arc<ServerEntry>) -> String {
         entry
             .config
-            .fingerprint(&entry.effective_cwd(&self.inner.cwd))
+            .fingerprint_for_workspace(&entry.effective_cwd(&self.inner.cwd), &self.inner.cwd)
     }
 
     fn check_running(&self) -> Result<()> {
@@ -483,7 +518,11 @@ impl McpManager {
                     target,
                     provenance: config.provenance.label().to_string(),
                     trust: trust.to_string(),
-                    health: health.label(),
+                    health: if config.enabled {
+                        health.label()
+                    } else {
+                        "disabled".to_string()
+                    },
                     tools,
                     source_file: config.source_file.clone(),
                 }
@@ -502,6 +541,7 @@ impl McpManager {
     /// the eager connect fails (the trust decision still stands).
     pub async fn trust(&self, name: &str) -> Result<Vec<McpToolMeta>> {
         let entry = self.entry(name)?;
+        entry.check_enabled()?;
         let fingerprint = self.trust_fingerprint_for(&entry);
         {
             let _guard = Self::lock(&self.inner.trust_lock);
@@ -564,6 +604,238 @@ impl McpManager {
         *Self::lock(&entry.health) = ServerHealth::NotStarted;
         Self::lock(&entry.tools_cache).take();
         Ok(())
+    }
+
+    fn authentication_binding(&self, entry: &Arc<ServerEntry>) -> Result<super::auth::AuthBinding> {
+        if !entry.config.is_http() {
+            return Err(tool_err(
+                "MCP_AUTH_UNSUPPORTED",
+                "OAuth authentication is available for HTTP MCP servers only",
+            ));
+        }
+        if entry
+            .config
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(tool_err(
+                "MCP_AUTH_STATIC_HEADER",
+                "this server has an explicit Authorization header; remove it from the source configuration before using managed OAuth",
+            ));
+        }
+        let url =
+            entry.config.url.as_deref().ok_or_else(|| {
+                tool_err("MCP_CONFIG_INVALID", "HTTP MCP server has no endpoint URL")
+            })?;
+        super::auth::AuthBinding::new(
+            &self.inner.global_dir,
+            &self.trust_fingerprint_for(entry),
+            url,
+        )
+    }
+
+    fn check_authentication_entry(&self, entry: &Arc<ServerEntry>) -> Result<()> {
+        self.check_running()?;
+        if !Arc::ptr_eq(&self.entry(&entry.config.name)?, entry) {
+            return Err(tool_err(
+                "MCP_AUTH_SUPERSEDED",
+                "the MCP server definition changed while authentication was pending",
+            ));
+        }
+        self.check_trust(entry)
+    }
+
+    /// Sign in to a trusted HTTP server using discovery, PKCE, and a loopback
+    /// callback, then replace its live connection and refresh the tool catalog.
+    /// The URL observer is operator output; it must not invoke a model or tool.
+    ///
+    /// Cancelling the browser wait does not clear an existing login. Once new
+    /// credentials are saved, reconnect failure or cancellation cannot undo them.
+    /// Authentication never grants trust or rewrites a server's source config.
+    /// Configured OAuth settings apply to every operator surface. Supplying a
+    /// public client ID overrides the configured client and discards its secret.
+    ///
+    /// # Errors
+    /// Returns admission, discovery, authorization, persistence, or reconnect
+    /// failures. A reconnect failure explicitly identifies already-saved login.
+    pub async fn reauthenticate(
+        &self,
+        name: &str,
+        client_id: Option<String>,
+        on_url: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Result<()> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        catalog::check_request_owner(&owner)?;
+        let entry = self.entry(name)?;
+        self.check_authentication_entry(&entry)?;
+        let binding = self.authentication_binding(&entry)?;
+        if entry.config.headers.len() > 95 {
+            return Err(tool_err(
+                "MCP_CONFIG_INVALID",
+                "managed OAuth requires room for its Authorization header; at most 95 custom headers are supported",
+            ));
+        }
+        let check_manager = Self {
+            inner: Arc::clone(&self.inner),
+        };
+        let check_entry = Arc::clone(&entry);
+        let check_owner = owner.clone();
+        let check: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
+            catalog::check_request_owner(&check_owner)?;
+            check_manager.check_authentication_entry(&check_entry)
+        });
+        catalog::operation_with_owner(
+            &owner,
+            async {
+                // Do not hold the connection lane during browser interaction:
+                // unauth/deny/shutdown must be able to revoke a pending flow.
+                let configuration = self
+                    .resolve_authentication_configuration(&entry, client_id)
+                    .await?;
+                binding.reauthenticate(configuration, on_url, check).await?;
+                let _lane = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&entry.connect_lane),
+                    owner.cx(),
+                )
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled after saving MCP login"))?;
+                self.check_authentication_entry(&entry)?;
+                Self::retire_authenticated_connection(&entry);
+                self.ensure_ready_in_lane(&entry).await.map_err(|error| {
+                    tool_err(
+                        "MCP_AUTH_RECONNECT_FAILED",
+                        format!("login saved, but the MCP server is still disconnected: {error}"),
+                    )
+                })?;
+                self.list_and_cache_tools_in_lane(&entry)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        tool_err(
+                            "MCP_AUTH_RECONNECT_FAILED",
+                            format!(
+                                "login saved, but the MCP tool catalog could not be loaded: {error}"
+                            ),
+                        )
+                    })
+            },
+            Duration::from_secs(300),
+        )
+        .await?
+    }
+
+    /// Resolve authored credentials under the same trust lock used by transport
+    /// construction. Cancellation can withdraw queued blocking work before a
+    /// credential helper executes, and no lock spans browser interaction.
+    async fn resolve_authentication_configuration(
+        &self,
+        entry: &Arc<ServerEntry>,
+        public_client_id: Option<String>,
+    ) -> Result<McpOAuthConfig> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        catalog::check_request_owner(&owner)?;
+        self.check_authentication_entry(entry)?;
+        let config = entry.config.clone();
+        let cwd = entry.effective_cwd(&self.inner.cwd);
+        let workspace = self.inner.cwd.clone();
+        let trust_path = self.inner.trust_path.clone();
+        let manager = Self {
+            inner: Arc::clone(&self.inner),
+        };
+        let entry = Arc::clone(entry);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandoned_worker = Arc::clone(&abandoned);
+        let mut attempt = TransportConstructionAttempt::new(abandoned);
+        let result = asupersync::runtime::spawn_blocking(move || {
+            let _owner_guard = owner.cx().clone().set_current_restricted();
+            let ensure_active = || {
+                catalog::check_request_owner(&owner)?;
+                manager.check_running()?;
+                if abandoned_worker.load(Ordering::Acquire) {
+                    return Err(tool_err(
+                        "MCP_CANCELLED",
+                        "MCP credential resolution was cancelled",
+                    ));
+                }
+                if !Arc::ptr_eq(&manager.entry(&config.name)?, &entry) {
+                    return Err(tool_err(
+                        "MCP_AUTH_SUPERSEDED",
+                        "the MCP server definition changed while resolving credentials",
+                    ));
+                }
+                Ok(())
+            };
+            ensure_active()?;
+            let _trust_execution_guard =
+                Self::lock_trust_for_execution(&config, &cwd, &workspace, &trust_path)?;
+            ensure_active()?;
+            resolve_oauth_settings(
+                &config,
+                public_client_id,
+                &cwd,
+                &workspace,
+                owner.capabilities().spawn,
+                &ensure_active,
+            )
+        })
+        .await;
+        attempt.disarm();
+        result
+    }
+
+    /// Remove managed credentials and retire the live connection and catalog.
+    /// Trust is unchanged. This local operation also works after a server has
+    /// been denied or disabled, and never sends a request using removed tokens.
+    ///
+    /// # Errors
+    /// Returns unknown-server, static-header, cancellation, or storage errors.
+    pub async fn unauthenticate(&self, name: &str) -> Result<()> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        catalog::check_request_owner(&owner)?;
+        let entry = self.entry(name)?;
+        let binding = self.authentication_binding(&entry)?;
+        catalog::operation_with_owner(
+            &owner,
+            async {
+                // Persist the tombstone before waiting for a connection lane.
+                // Refresh and browser callbacks cannot resurrect this login.
+                binding.forget().await?;
+                Self::retire_authenticated_connection(&entry);
+                let _lane = asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&entry.connect_lane),
+                    owner.cx(),
+                )
+                .await
+                .map_err(|_| {
+                    tool_err(
+                        "MCP_CANCELLED",
+                        "login removed; connection retirement was cancelled",
+                    )
+                })?;
+                // A constructor already inside the lane can only have used a
+                // pre-removal generation. Retire any publication it completed.
+                Self::retire_authenticated_connection(&entry);
+                *Self::lock(&entry.health) = ServerHealth::AuthenticationRequired {
+                    reason: "managed login removed; use /mcp reauth to sign in".to_string(),
+                };
+                Ok(())
+            },
+            entry.timeout(),
+        )
+        .await?
+    }
+
+    fn retire_authenticated_connection(entry: &Arc<ServerEntry>) {
+        let mut current = Self::lock(&entry.transport);
+        if let Some(transport) = current.take() {
+            // The old session belongs to the old login. Never send a DELETE
+            // with newly replaced or revoked credentials for that session.
+            transport.abort();
+        }
+        Self::lock(&entry.tools_cache).take();
+        *Self::lock(&entry.restarts) = RestartState::default();
+        *Self::lock(&entry.health) = ServerHealth::NotStarted;
     }
 
     /// bd-vjfol: tear down every live transport and await child exit.
@@ -706,24 +978,41 @@ impl McpManager {
                 "connection changed before tools/list dispatch",
             ));
         }
-        // A server's catalog may span several opaque cursor pages. Retain
-        // the connection lane and publish only the complete validated set.
-        let tools = self.collect_tool_catalog(entry, &transport).await?;
-        self.check_running()?;
-        // Narrow the final cross-process revocation window immediately before
-        // publishing schemas, then bind publication to this exact connection.
-        if let Err(err) = self.check_trust(entry) {
-            Self::close_revoked_transport(entry, &transport).await;
-            return Err(err);
+        // Clear any notification that predates this refresh. A notification
+        // arriving while tools/list is in flight means the returned catalog
+        // may already be stale, so repeat once under the same connection lane.
+        let _ = transport.take_tools_list_changed();
+        for attempt in 0..2 {
+            // A server's catalog may span several opaque cursor pages. Retain
+            // the connection lane and publish only a complete validated set.
+            let tools = self.collect_tool_catalog(entry, &transport).await?;
+            if transport.take_tools_list_changed() {
+                Self::lock(&entry.tools_cache).take();
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(tool_err(
+                    "MCP_CATALOG_CHURN",
+                    "server changed its tool catalog repeatedly during refresh; retry at the next request boundary",
+                ));
+            }
+            self.check_running()?;
+            // Narrow the final cross-process revocation window immediately before
+            // publishing schemas, then bind publication to this exact connection.
+            if let Err(err) = self.check_trust(entry) {
+                Self::close_revoked_transport(entry, &transport).await;
+                return Err(err);
+            }
+            if !self.publish_tools_if_current(entry, &transport, &tools) {
+                transport.abort();
+                return Err(tool_err(
+                    "MCP_TRANSPORT_SUPERSEDED",
+                    "connection changed before tools/list publication",
+                ));
+            }
+            return Ok(tools);
         }
-        if !self.publish_tools_if_current(entry, &transport, &tools) {
-            transport.abort();
-            return Err(tool_err(
-                "MCP_TRANSPORT_SUPERSEDED",
-                "connection changed before tools/list publication",
-            ));
-        }
-        Ok(tools)
+        unreachable!("two catalog refresh attempts either publish or return")
     }
 
     // Guard scope is deliberate; tightening drops would change lock-hold semantics.
@@ -778,7 +1067,11 @@ impl McpManager {
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
             {
                 let removed = current.take();
-                Self::record_failure(entry, failure);
+                if transport.authentication_required() {
+                    Self::record_failure(entry, &authentication_transport_error());
+                } else {
+                    Self::record_failure(entry, failure);
+                }
                 removed
             } else {
                 None
@@ -799,6 +1092,7 @@ impl McpManager {
     /// failures mark the server `Failed` until `/mcp test` revives it.
     /// Trust gate (fail-closed with a named remedy).
     fn check_trust(&self, entry: &Arc<ServerEntry>) -> Result<()> {
+        entry.check_enabled()?;
         let decision = self
             .trust_store()?
             .decision(&entry.config.name, &self.trust_fingerprint_for(entry));
@@ -824,9 +1118,16 @@ impl McpManager {
     fn lock_trust_for_execution(
         config: &ConfiguredServer,
         cwd: &Path,
+        workspace: &Path,
         trust_path: &Path,
     ) -> Result<TrustWriteGuard> {
-        let fingerprint = config.fingerprint(cwd);
+        if !config.enabled {
+            return Err(tool_err(
+                "MCP_SERVER_DISABLED",
+                "server is disabled by configuration",
+            ));
+        }
+        let fingerprint = config.fingerprint_for_workspace(cwd, workspace);
         let mut store = TrustStore::load(trust_path)?;
         let (decision, guard) = store.locked_decision(&config.name, &fingerprint)?;
 
@@ -968,13 +1269,17 @@ impl McpManager {
             return Ok(());
         }
         if let Some(dead) = existing {
-            let failure = tool_err(
-                "MCP_TRANSPORT_CLOSED",
-                format!(
-                    "server {:?} exited before the next request",
-                    entry.config.name
-                ),
-            );
+            let failure = if dead.authentication_required() {
+                authentication_transport_error()
+            } else {
+                tool_err(
+                    "MCP_TRANSPORT_CLOSED",
+                    format!(
+                        "server {:?} exited before the next request",
+                        entry.config.name
+                    ),
+                )
+            };
             Self::detach_failed_call_transport(entry, &dead, &failure);
         }
         Self::check_restart_budget(entry)?;
@@ -1013,16 +1318,17 @@ impl McpManager {
             .request(
                 "initialize",
                 serde_json::json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
+                    "protocolVersion": transport.preferred_protocol_version(),
+                    "capabilities": transport.client_capabilities(),
                     "clientInfo": {
                         "name": "pi_agent_rust",
                         "version": crate::platform::VERSION,
                     },
                 }),
-                DEFAULT_MCP_TIMEOUT,
+                entry.timeout(),
             )
             .await
+            .and_then(|result| super::transport::validate_initialize_result(&result).map(|_| ()))
         {
             transport.close().await;
             Self::record_failure(entry, &err);
@@ -1052,13 +1358,17 @@ impl McpManager {
             return Err(err);
         }
         if !transport.is_alive() {
-            let err = tool_err(
-                "MCP_TRANSPORT_CLOSED",
-                format!(
-                    "server {:?} failed while activating its receive channel",
-                    entry.config.name
-                ),
-            );
+            let err = if transport.authentication_required() {
+                authentication_transport_error()
+            } else {
+                tool_err(
+                    "MCP_TRANSPORT_CLOSED",
+                    format!(
+                        "server {:?} failed while activating its receive channel",
+                        entry.config.name
+                    ),
+                )
+            };
             transport.close().await;
             Self::record_failure(entry, &err);
             return Err(err);
@@ -1114,6 +1424,12 @@ impl McpManager {
     /// exponential backoff.
     fn record_failure(entry: &Arc<ServerEntry>, err: &Error) {
         Self::lock(&entry.tools_cache).take();
+        if is_authentication_error(err) {
+            *Self::lock(&entry.health) = ServerHealth::AuthenticationRequired {
+                reason: err.to_string(),
+            };
+            return;
+        }
         let mut restarts = Self::lock(&entry.restarts);
         restarts.count = restarts.count.saturating_add(1);
         let backoff = Duration::from_secs(1 << restarts.count.min(3));
@@ -1135,7 +1451,9 @@ impl McpManager {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         connection::check_transport_owner(&owner, &config)?;
         let cwd = entry.effective_cwd(&self.inner.cwd);
+        let workspace = self.inner.cwd.clone();
         let trust_path = self.inner.trust_path.clone();
+        let global_dir = self.inner.global_dir.clone();
         #[cfg(test)]
         let factory = Self::lock(&self.inner.transport_factory).clone();
         let abandoned = Arc::new(AtomicBool::new(false));
@@ -1167,12 +1485,13 @@ impl McpManager {
             // A concurrent deny/reset either linearizes before this guard and
             // blocks execution, or waits and linearizes after it.
             let _trust_execution_guard =
-                Self::lock_trust_for_execution(&config, &cwd, &trust_path)?;
+                Self::lock_trust_for_execution(&config, &cwd, &workspace, &trust_path)?;
             ensure_active()?;
 
             #[cfg(test)]
             if let Some(factory) = factory {
                 let transport = factory();
+                transport.configure_workspace_root(&workspace)?;
                 if let Err(error) = ensure_active() {
                     transport.abort();
                     return Err(error);
@@ -1190,12 +1509,42 @@ impl McpManager {
                     &config.headers,
                     config.provenance,
                     super::config::validate_http_header_value,
+                    &cwd,
+                    &workspace,
                 )?;
                 ensure_active()?;
-                return Ok(
-                    Box::new(super::transport::HttpTransport::new(&url, headers)?)
-                        as Box<dyn McpTransport>,
-                );
+                let has_static_auth = headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+                let authentication = if has_static_auth {
+                    None
+                } else {
+                    Some(super::auth::AuthBinding::new(
+                        &global_dir,
+                        &config.fingerprint_for_workspace(&cwd, &workspace),
+                        &url,
+                    )?)
+                };
+                let transport: Box<dyn McpTransport> =
+                    if config.transport_hint.as_deref().map(str::trim) == Some("sse") {
+                        let mut transport = super::transport::SseTransport::new(&url, headers)?;
+                        if let Some(binding) = authentication {
+                            transport = transport.with_authentication(binding)?;
+                        }
+                        Box::new(transport)
+                    } else {
+                        let mut transport = super::transport::HttpTransport::new(&url, headers)?;
+                        if let Some(binding) = authentication {
+                            transport = transport.with_authentication(binding)?;
+                        }
+                        Box::new(transport)
+                    };
+                transport.configure_workspace_root(&workspace)?;
+                if let Err(error) = ensure_active() {
+                    transport.abort();
+                    return Err(error);
+                }
+                return Ok(transport);
             }
             let command = config.command.clone().ok_or_else(|| {
                 tool_err(
@@ -1207,10 +1556,13 @@ impl McpManager {
                 &config.env,
                 config.provenance,
                 super::config::validate_env_value,
+                &cwd,
+                &workspace,
             )?;
             ensure_active()?;
             let transport =
                 super::transport::StdioTransport::spawn(&command, &config.args, &env, &cwd)?;
+            transport.configure_workspace_root(&workspace)?;
             if let Err(error) = ensure_active() {
                 transport.abort();
                 return Err(error);
@@ -1270,7 +1622,11 @@ impl McpManager {
                 // generation-checked critical section. Otherwise a replacement
                 // could publish between `take` and `mark_unhealthy` and then be
                 // poisoned by the stale failure.
-                Self::mark_unhealthy(entry, failure);
+                if failed_transport.authentication_required() {
+                    Self::mark_unhealthy(entry, &authentication_transport_error());
+                } else {
+                    Self::mark_unhealthy(entry, failure);
+                }
                 removed
             } else {
                 None
@@ -1314,6 +1670,12 @@ impl McpManager {
     /// successful tool call arms backoff and consumes the remaining budget.
     fn mark_unhealthy(entry: &Arc<ServerEntry>, err: &Error) {
         Self::lock(&entry.tools_cache).take();
+        if is_authentication_error(err) {
+            *Self::lock(&entry.health) = ServerHealth::AuthenticationRequired {
+                reason: err.to_string(),
+            };
+            return;
+        }
         let mut restarts = Self::lock(&entry.restarts);
         restarts.count = restarts.count.saturating_add(1);
         // Preserve one immediate recovery for an isolated runtime crash. A
@@ -1364,23 +1726,18 @@ impl McpManager {
         servers
             .values()
             .filter_map(|entry| {
+                if !entry.config.enabled {
+                    return None;
+                }
                 if store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
                     != TrustDecision::Acknowledged
                 {
                     return None;
                 }
-                if !matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. }) {
+                if !Self::catalog_is_fresh(entry) {
                     return None;
                 }
-                let transport = Self::lock(&entry.transport).clone()?;
-                if !transport.is_alive() {
-                    return None;
-                }
-                let tools = Self::lock(&entry.tools_cache).clone()?;
-                let (cached_at, tools) = tools;
-                if cached_at.elapsed() > TOOL_CACHE_TTL {
-                    return None;
-                }
+                let tools = Self::lock(&entry.tools_cache).clone()?.1;
                 Some((entry.config.name.clone(), tools))
             })
             .collect()
@@ -1448,6 +1805,52 @@ impl McpManager {
     // Guard scope is deliberate; tightening drops would change lock-hold semantics.
     #[allow(clippy::significant_drop_in_scrutinee)]
     async fn connect_trusted_with_budget(&self, budget: Duration) {
+        self.connect_trusted_with_policy(budget, false).await;
+    }
+
+    /// Reuse the bounded, trust-gated connection owner at a request boundary.
+    /// Fresh catalogs are left untouched; failed or expired discovery cannot
+    /// keep advertising the prior catalog as current.
+    pub(crate) async fn refresh_stale_tools(&self) {
+        self.connect_trusted_with_policy(STARTUP_CONNECT_BUDGET, true)
+            .await;
+    }
+
+    fn invalidate_notified_catalog(entry: &ServerEntry, transport: &Arc<dyn McpTransport>) -> bool {
+        if !transport.take_tools_list_changed() {
+            return false;
+        }
+        let current = Self::lock(&entry.transport);
+        if !current
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
+        {
+            return false;
+        }
+        Self::lock(&entry.tools_cache).take();
+        if matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. }) {
+            *Self::lock(&entry.health) = ServerHealth::Ready { tools: 0 };
+        }
+        true
+    }
+
+    fn catalog_is_fresh(entry: &ServerEntry) -> bool {
+        let Some(transport) = Self::lock(&entry.transport).clone() else {
+            return false;
+        };
+        if !transport.is_alive() {
+            return false;
+        }
+        Self::invalidate_notified_catalog(entry, &transport);
+        matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. })
+            && Self::lock(&entry.tools_cache)
+                .as_ref()
+                .is_some_and(|(at, _)| at.elapsed() <= TOOL_CACHE_TTL)
+    }
+
+    // Generation capture and catalog publication retain the connection lane.
+    #[allow(clippy::significant_drop_in_scrutinee)]
+    async fn connect_trusted_with_policy(&self, budget: Duration, stale_only: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let Ok(store) = self.trust_store() else {
@@ -1457,8 +1860,10 @@ impl McpManager {
         let mut tracked = Vec::new();
         let mut pending = Vec::new();
         for entry in servers.values().filter(|entry| {
-            store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
-                == TrustDecision::Acknowledged
+            entry.config.enabled
+                && store.decision(&entry.config.name, &self.trust_fingerprint_for(entry))
+                    == TrustDecision::Acknowledged
+                && (!stale_only || !Self::catalog_is_fresh(entry))
         }) {
             let entry = Arc::clone(entry);
             let completed = Arc::new(AtomicBool::new(false));
@@ -1476,7 +1881,9 @@ impl McpManager {
                 )
                 .await;
                 if let Ok(connect_guard) = connect_guard {
-                    if self.ensure_ready_in_lane(&entry).await.is_ok() {
+                    if (!stale_only || !Self::catalog_is_fresh(&entry))
+                        && self.ensure_ready_in_lane(&entry).await.is_ok()
+                    {
                         // Capture and list one exact generation while retaining
                         // the same lane. Timeout cleanup can then safely compare
                         // this snapshot with the transport whose request hung.
@@ -1586,7 +1993,14 @@ impl McpManager {
                 env: optional_string_map(spec, "env")?,
                 url: optional_string(spec, "url")?,
                 headers: optional_string_map(spec, "headers")?,
+                oauth: spec
+                    .get("oauth")
+                    .map(super::config::parse_oauth_config)
+                    .transpose()?,
                 transport_hint,
+                enabled: super::config::configured_enabled(spec)?,
+                cwd: None,
+                timeout_ms: super::config::configured_timeout(spec)?,
                 provenance: Provenance::Extension,
                 source_file: extension_id.map_or_else(
                     || PathBuf::from("<extension>"),
@@ -1678,6 +2092,20 @@ impl McpManager {
     }
 }
 
+/// Only native typed auth errors qualify; server text is nested under the
+/// server-error code and cannot impersonate this classification.
+pub(super) fn is_authentication_error(err: &Error) -> bool {
+    matches!(err, Error::Tool { tool, message }
+        if tool == "mcp" && message.starts_with("[MCP_AUTH_"))
+}
+
+fn authentication_transport_error() -> Error {
+    tool_err(
+        "MCP_AUTH_REQUIRED",
+        "the HTTP connection requires authentication; use /mcp reauth for managed OAuth or update the configured Authorization header",
+    )
+}
+
 /// Whether a `tools/call` failure happened after request delivery may have
 /// occurred. These failures must never trigger an automatic replay.
 fn is_indeterminate_call_delivery(err: &Error) -> bool {
@@ -1696,6 +2124,92 @@ fn is_indeterminate_call_delivery(err: &Error) -> bool {
     )
 }
 
+/// Keep authored OAuth definitions intact and resolve only the selected client.
+/// The caller holds the trust-execution guard for the entire resolution.
+fn resolve_oauth_settings(
+    config: &ConfiguredServer,
+    public_client_id: Option<String>,
+    cwd: &Path,
+    workspace: &Path,
+    allow_commands: bool,
+    check: &impl Fn() -> Result<()>,
+) -> Result<McpOAuthConfig> {
+    let mut oauth = config.oauth.clone().unwrap_or_default();
+    let public_override = public_client_id.is_some();
+    if let Some(client_id) = public_client_id {
+        // RPC's override denotes a public client. Neither configured helper
+        // may run, and a secret must never be paired with another client ID.
+        oauth.client_id = Some(client_id);
+        oauth.client_secret = None;
+    }
+    oauth
+        .validate_raw()
+        .map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
+    check()?;
+    if !public_override {
+        for (name, field) in [
+            ("clientId", &mut oauth.client_id),
+            ("clientSecret", &mut oauth.client_secret),
+        ] {
+            let Some(raw) = field.as_ref() else {
+                continue;
+            };
+            check()?;
+            if config.provenance != Provenance::Acp
+                && raw.trim().starts_with("$CMD:")
+                && !allow_commands
+            {
+                return Err(tool_err(
+                    "MCP_CAPABILITY_DENIED",
+                    "configured OAuth credential helpers require the owner's process-spawn capability",
+                ));
+            }
+            let mut resolved = resolve_server_secrets(
+                &[(name.to_string(), raw.clone())],
+                config.provenance,
+                super::config::validate_env_value,
+                cwd,
+                workspace,
+            )
+            .map_err(|_| tool_err(
+                "MCP_SECRET_UNRESOLVED",
+                format!("cannot resolve oauth.{name}; credential values and helper output are redacted"),
+            ))?;
+            let (_, value) = resolved.pop().ok_or_else(|| {
+                tool_err(
+                    "MCP_SECRET_UNRESOLVED",
+                    format!("oauth.{name} did not resolve to a value"),
+                )
+            })?;
+            *field = Some(value);
+        }
+    }
+    for (name, field) in [
+        ("scope", &mut oauth.scope),
+        ("redirectUri", &mut oauth.redirect_uri),
+        ("callbackPath", &mut oauth.callback_path),
+        ("prompt", &mut oauth.prompt),
+    ] {
+        check()?;
+        if let Some(raw) = field.as_ref()
+            && config.provenance != Provenance::Acp
+        {
+            // Ordinary OAuth options support variable interpolation only.
+            // Expanded values never acquire command-execution semantics.
+            *field = Some(
+                super::config::expand_config_value(raw, workspace).map_err(|_| {
+                    tool_err("MCP_CONFIG_INVALID", format!("cannot expand oauth.{name}"))
+                })?,
+            );
+        }
+    }
+    oauth
+        .validate_resolved()
+        .map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
+    check()?;
+    Ok(oauth)
+}
+
 /// ACP values are already literal values, not pi's configuration language.
 /// Keep this decision at the actual transport-construction seam: a literal
 /// `$CMD:` header must not gain process-execution semantics after trust.
@@ -1703,9 +2217,11 @@ fn resolve_server_secrets(
     entries: &[(String, String)],
     provenance: Provenance,
     validate_value: fn(&str) -> std::result::Result<(), String>,
+    cwd: &Path,
+    workspace: &Path,
 ) -> Result<Vec<(String, String)>> {
     if provenance != Provenance::Acp {
-        return resolve_secrets(entries, validate_value);
+        return resolve_secrets(entries, validate_value, cwd, workspace);
     }
     entries
         .iter()
@@ -1725,19 +2241,75 @@ mod acp_literal_tests {
     #[test]
     fn acp_transport_construction_never_resolves_references_or_trims_literals() {
         let entries = vec![
-            ("A".to_string(), "$ENV:PI_ACP_SHOULD_NOT_RESOLVE".to_string()),
+            (
+                "A".to_string(),
+                "$ENV:PI_ACP_SHOULD_NOT_RESOLVE".to_string(),
+            ),
             ("B".to_string(), "$CMD:exit 97".to_string()),
             ("C".to_string(), "  literal spaces  ".to_string()),
         ];
         let resolved = resolve_server_secrets(
-            &entries, Provenance::Acp, super::super::config::validate_env_value,
-        ).expect("literal ACP values");
-        assert_eq!(resolved, entries);
-        assert!(resolve_server_secrets(
-            &[("TOKEN".into(), "bad\r\nvalue".into())],
+            &entries,
             Provenance::Acp,
+            super::super::config::validate_env_value,
+            Path::new("."),
+            Path::new("."),
+        )
+        .expect("literal ACP values");
+        assert_eq!(resolved, entries);
+        assert!(
+            resolve_server_secrets(
+                &[("TOKEN".into(), "bad\r\nvalue".into())],
+                Provenance::Acp,
+                super::super::config::validate_http_header_value,
+                Path::new("."),
+                Path::new("."),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_commands_read_from_the_server_workspace_without_changing_process_cwd() {
+        let project = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other project");
+        std::fs::write(
+            project.path().join("credential.txt"),
+            "selected-workspace-token",
+        )
+        .expect("project credential fixture");
+        std::fs::write(
+            other.path().join("credential.txt"),
+            "different-workspace-token",
+        )
+        .expect("other credential fixture");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        let entries = vec![("TOKEN".to_string(), "$CMD:cat credential.txt".to_string())];
+        for validate in [
+            super::super::config::validate_env_value as fn(&str) -> std::result::Result<(), String>,
             super::super::config::validate_http_header_value,
-        ).is_err());
+        ] {
+            let resolved = resolve_server_secrets(
+                &entries,
+                Provenance::GlobalPi,
+                validate,
+                project.path(),
+                project.path(),
+            )
+            .expect("resolve in selected workspace");
+            assert_eq!(resolved[0].1, "selected-workspace-token");
+            let resolved = resolve_server_secrets(
+                &entries,
+                Provenance::GlobalPi,
+                validate,
+                other.path(),
+                other.path(),
+            )
+            .expect("resolve in another selected workspace");
+            assert_eq!(resolved[0].1, "different-workspace-token");
+        }
+        assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
     }
 }
 
@@ -1745,9 +2317,16 @@ mod acp_literal_tests {
 fn resolve_secrets(
     entries: &[(String, String)],
     validate_value: fn(&str) -> std::result::Result<(), String>,
+    cwd: &Path,
+    workspace: &Path,
 ) -> Result<Vec<(String, String)>> {
     resolve_secrets_with(entries, validate_value, |raw| {
-        crate::auth::resolve_secret_reference(raw)
+        // Expand literal templates directly. Never feed expanded data back
+        // through $CMD/$ENV parsing: an environment value is data, not code.
+        if raw.contains("${") && !raw.trim().starts_with("$CMD:") {
+            return super::config::expand_config_value(raw, workspace).map(Some);
+        }
+        crate::auth::resolve_secret_reference(raw, cwd)
     })
 }
 
@@ -2006,7 +2585,11 @@ mod tests {
     impl McpTransport for FlappingCallTransport {
         async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             match method {
-                "initialize" => Ok(serde_json::json!({})),
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "serverInfo": {"name": "fixture", "version": "1"}
+                })),
                 "tools/list" => Ok(serde_json::json!({
                     "tools": [{
                         "name": "echo",
@@ -2086,7 +2669,11 @@ mod tests {
     impl McpTransport for SuccessfulTransport {
         async fn request(&self, method: &str, _params: Value, _timeout: Duration) -> Result<Value> {
             match method {
-                "initialize" => Ok(serde_json::json!({})),
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "serverInfo": {"name": "fixture", "version": "1"}
+                })),
                 "tools/list" => Ok(serde_json::json!({"tools": []})),
                 "tools/call" => Ok(serde_json::json!({"content": []})),
                 other => Err(tool_err(
@@ -2151,7 +2738,9 @@ mod tests {
             .expect("acknowledge fixture execution");
     }
 
-    fn trusted_fixture_manager(temp: &tempfile::TempDir) -> (McpManager, Arc<ServerEntry>) {
+    pub(super) fn trusted_fixture_manager(
+        temp: &tempfile::TempDir,
+    ) -> (McpManager, Arc<ServerEntry>) {
         let cwd = temp.path().join("project");
         let global = temp.path().join("global");
         std::fs::create_dir_all(&cwd).expect("project directory");
@@ -2163,7 +2752,11 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2196,7 +2789,11 @@ mod tests {
                 env: Vec::new(),
                 url: None,
                 headers: Vec::new(),
+                oauth: None,
                 transport_hint: Some("stdio".to_string()),
+                enabled: true,
+                cwd: None,
+                timeout_ms: None,
                 provenance: Provenance::ProjectPi,
                 source_file: cwd.join(".pi/mcp.json"),
             })
@@ -2276,7 +2873,11 @@ mod tests {
                 Box::new(HeldRequestTransport {
                     started: Mutex::new(Some(started_tx.clone())),
                     release: Arc::clone(&factory_release),
-                    response: serde_json::json!({}),
+                    response: serde_json::json!({
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "serverInfo": {"name": "held-fixture", "version": "1"}
+                    }),
                     closed: Arc::clone(&factory_closed),
                 })
             }));
@@ -2390,7 +2991,11 @@ mod tests {
             env: Vec::new(),
             url: Some("https://fixture.invalid/mcp".to_string()),
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("http".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2644,7 +3249,11 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2702,7 +3311,11 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -2939,7 +3552,11 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: temp.path().join("mcp.json"),
         };
@@ -3051,7 +3668,11 @@ mod tests {
             env: Vec::new(),
             url: Some("http://127.0.0.1:1/mcp".to_string()),
             headers: vec![("Authorization".to_string(), command)],
+            oauth: None,
             transport_hint: Some("http".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -3169,7 +3790,11 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };
@@ -3287,7 +3912,11 @@ mod tests {
             env: Vec::new(),
             url: None,
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("stdio".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: cwd.join(".pi/mcp.json"),
         };

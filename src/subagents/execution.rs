@@ -10,19 +10,21 @@
 
 use super::deadline::Deadline;
 use super::{
-    AgentDefinition, SchemaMode, SubagentResult, SubagentStatus, SubagentTask, UpdateCallback,
-    append_bounded_line, child_args, child_depth, compile_output_schema, corrective_retry_task,
-    emit_progress, protocol, validate_child_output,
+    AgentDefinition, LaunchAdmission, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus,
+    SubagentTask, UpdateCallback, append_bounded_line, child_args, child_depth,
+    compile_output_schema, corrective_retry_task, emit_progress, protocol, validate_child_output,
 };
 use crate::agent_cx::AgentCx;
 use crate::agent_hub::ChildKind;
-use crate::worktree_iso::{IsoApplyMode, IsoHandle, IsoOutcome};
+use crate::worktree_iso::{IsoApplyMode, IsoBaseline, IsoHandle, IsoOutcome};
+use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(not(unix))]
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 #[cfg(any(not(unix), test))]
 use std::sync::mpsc::{self, Receiver};
 #[cfg(any(not(unix), test))]
@@ -34,19 +36,33 @@ use std::time::Instant;
 mod ownership;
 #[cfg(unix)]
 mod pipes;
-use ownership::HubLease;
+pub(super) mod worker;
+use ownership::{HubLease, ProcessLease};
 
 const DRAIN_BATCH: usize = 32;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCELLED: &str = "Parent cancellation propagated to child process.";
+
+#[derive(Clone)]
+struct TaskBaseline {
+    workspace: Arc<IsoBaseline>,
+    relative_cwd: PathBuf,
+}
+
+type BaselineCapture = Result<TaskBaseline, String>;
 
 pub(super) struct ChildRunner {
     cwd: PathBuf,
     global_dir: PathBuf,
     child_binary: PathBuf,
     role_model_spec: Option<String>,
+    parent_model: Option<crate::tools::ToolModelSelection>,
     hub_kind: ChildKind,
     deadline: Deadline,
+    revival: Option<(String, RevivalSpec)>,
+    public_task: Option<String>,
+    launch_admission: Option<LaunchAdmission>,
+    foreground: bool,
 }
 
 impl ChildRunner {
@@ -63,15 +79,168 @@ impl ChildRunner {
             global_dir,
             child_binary,
             role_model_spec,
+            parent_model: None,
             hub_kind,
             deadline,
+            revival: None,
+            public_task: None,
+            launch_admission: None,
+            foreground: true,
         }
     }
 
-    /// At most one fresh corrective run. The first attempt's isolated edits
-    /// are retained, never applied as input to that retry. The original
-    /// deadline is retained too, including time spent waiting in the queue.
-    #[allow(clippy::too_many_lines)] // Keep acceptance, retry and disposition together.
+    pub(super) const fn into_background(mut self) -> Self {
+        self.foreground = false;
+        self
+    }
+
+    pub(super) fn with_public_task(mut self, task: Option<String>) -> Self {
+        self.public_task = task;
+        self
+    }
+
+    pub(super) fn with_launch_admission(mut self, admission: Option<LaunchAdmission>) -> Self {
+        self.launch_admission = admission;
+        self
+    }
+
+    fn public_result(&self, mut result: SubagentResult) -> SubagentResult {
+        let task = self
+            .revival
+            .as_ref()
+            .map_or(self.public_task.as_deref(), |(_, launch)| {
+                launch.public_task()
+            });
+        if let Some(task) = task {
+            result.task = task.to_string();
+        }
+        result
+    }
+
+    pub(super) fn with_revival(mut self, source: String, launch: RevivalSpec) -> Self {
+        self.revival = Some((source, launch));
+        self
+    }
+
+    pub(super) fn with_parent_model(
+        mut self,
+        model: Option<crate::tools::ToolModelSelection>,
+    ) -> Self {
+        self.parent_model = model;
+        self
+    }
+
+    /// Parallel execution never mutates the parent through isolated writeback.
+    /// Every source checkout is captured before launch, including tasks waiting
+    /// for a concurrency slot. Accepted patches are installed only after all
+    /// children finish, in authored task order. A pending attempt keeps its hub
+    /// lease so cancellation can still reject it before application.
+    pub(super) async fn run_parallel(
+        &self,
+        agents: &BTreeMap<String, AgentDefinition>,
+        tasks: Vec<SubagentTask>,
+        concurrency: usize,
+        on_update: Option<UpdateCallback>,
+    ) -> Vec<SubagentResult> {
+        let baselines = self.capture_baselines(agents, &tasks);
+        let update = on_update.as_ref();
+        let mut completed = stream::iter(tasks.into_iter().zip(baselines).enumerate())
+            .map(|(index, (task, baseline))| async move {
+                (
+                    index,
+                    self.run_pending(agents, task, None, update, baseline.as_ref())
+                        .await,
+                )
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        completed.sort_by_key(|(index, _)| *index);
+        completed
+            .into_iter()
+            .map(|(_, pending)| self.public_result(pending.finish(update)))
+            .collect()
+    }
+
+    fn task_cwd(&self, task: &SubagentTask) -> PathBuf {
+        task.cwd.as_ref().map_or_else(
+            || self.cwd.clone(),
+            |path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    self.cwd.join(path)
+                }
+            },
+        )
+    }
+
+    /// Invalid or unauthorized tasks must not cause snapshot I/O. Preparation
+    /// failures stay attached to their task; unrelated repositories can run.
+    /// Reusing a captured failure also avoids quietly giving a later sibling a
+    /// different baseline after the source changes during preparation.
+    fn capture_baselines(
+        &self,
+        agents: &BTreeMap<String, AgentDefinition>,
+        tasks: &[SubagentTask],
+    ) -> Vec<Option<BaselineCapture>> {
+        let owner = AgentCx::for_current_or_request();
+        let capabilities = owner.capabilities();
+        if !capabilities.io || !capabilities.spawn || !capabilities.time {
+            return vec![None; tasks.len()];
+        }
+        let mut roots = BTreeMap::<PathBuf, Result<Arc<IsoBaseline>, String>>::new();
+        tasks
+            .iter()
+            .map(|task| {
+                let agent = agents.get(&task.agent)?;
+                if !isolation_policy(task).ok()?.0
+                    || owner.checkpoint().is_err()
+                    || self.deadline.check().is_err()
+                {
+                    return None;
+                }
+                let schema = task.output_schema.as_ref().or(agent.output_schema.as_ref());
+                if schema.is_some_and(|schema| compile_output_schema(schema).is_err()) {
+                    return None;
+                }
+                let cwd = self.task_cwd(task);
+                if !cwd.is_dir() {
+                    return Some(Err(format!(
+                        "PI_ISO_CWD: working directory does not exist: {}",
+                        cwd.display()
+                    )));
+                }
+                let root = match crate::worktree_iso::isolation_root(&cwd) {
+                    Ok(root) => root,
+                    Err(error) => return Some(Err(error.to_string())),
+                };
+                let relative_cwd =
+                    match crate::worktree_iso::relative_working_directory(&root, &cwd) {
+                        Ok(relative) => relative,
+                        Err(error) => return Some(Err(error.to_string())),
+                    };
+                if owner.checkpoint().is_err() || self.deadline.check().is_err() {
+                    return None;
+                }
+                Some(
+                    roots
+                        .entry(root.clone())
+                        .or_insert_with(|| {
+                            IsoBaseline::capture(root)
+                                .map(Arc::new)
+                                .map_err(|error| error.to_string())
+                        })
+                        .clone()
+                        .map(|workspace| TaskBaseline {
+                            workspace,
+                            relative_cwd,
+                        }),
+                )
+            })
+            .collect()
+    }
+
     pub(super) async fn run_one(
         &self,
         agents: &BTreeMap<String, AgentDefinition>,
@@ -79,11 +248,36 @@ impl ChildRunner {
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
     ) -> SubagentResult {
+        let update = on_update.as_ref();
+        let result = self
+            .run_pending(agents, task, step, update, None)
+            .await
+            .finish(update);
+        self.public_result(result)
+    }
+
+    /// At most one fresh corrective run. The first attempt's isolated edits
+    /// are retained, never applied as input to that retry. The original
+    /// deadline is retained too, including time spent waiting in the queue.
+    #[allow(clippy::too_many_lines)] // Keep acceptance, retry and disposition together.
+    async fn run_pending(
+        &self,
+        agents: &BTreeMap<String, AgentDefinition>,
+        task: SubagentTask,
+        step: Option<usize>,
+        update: Option<&UpdateCallback>,
+        baseline: Option<&BaselineCapture>,
+    ) -> PendingRun {
         let Some(agent) = agents.get(&task.agent) else {
-            return SubagentResult::unknown(task, step);
+            return PendingRun::Settled(SubagentResult::unknown(task, step));
         };
         if let Err(error) = self.deadline.check() {
-            return SubagentResult::failed(agent, task, step, error.to_string());
+            return PendingRun::Settled(SubagentResult::failed(
+                agent,
+                task,
+                step,
+                error.to_string(),
+            ));
         }
         let schema = task
             .output_schema
@@ -92,20 +286,61 @@ impl ChildRunner {
         if let Some(schema) = &schema
             && let Err(error) = compile_output_schema(schema)
         {
-            return SubagentResult::failed(
+            return PendingRun::Settled(SubagentResult::failed(
                 agent,
                 task,
                 step,
                 format!("Invalid outputSchema: {error}"),
-            );
+            ));
         }
         let owner = AgentCx::for_current_or_request();
-        let update = on_update.as_ref();
+        // Capture before execution spends the budget. A later explicit
+        // revival must not inherit a zero budget from a timed-out settlement.
+        // Schema retries share this authored task and launch policy instead
+        // of retaining their generated corrective prompt as a new assignment.
+        let launch = self.revival.as_ref().map_or_else(
+            || RevivalSpec {
+                agent: agent.clone(),
+                task: task.clone(),
+                step,
+                cwd: self.cwd.clone(),
+                global_dir: self.global_dir.clone(),
+                child_binary: self.child_binary.clone(),
+                role_model_spec: self.role_model_spec.clone(),
+                parent_model: self.parent_model.clone(),
+                timeout: self.deadline.remaining(),
+                depth: child_depth(),
+                public_task: self.public_task.clone(),
+                launch_admission: self.launch_admission.clone(),
+            },
+            |(_, launch)| launch.clone(),
+        );
+        // Serial tasks also capture once before launch. Their corrective retry
+        // must inherit the same package and files, even if a callback or another
+        // writer changes the parent directory after the first attempt.
+        let captured = if baseline.is_none() {
+            self.capture_baselines(agents, std::slice::from_ref(&task))
+                .pop()
+                .flatten()
+        } else {
+            None
+        };
+        let baseline = baseline.or(captured.as_ref());
         let mut attempt = self
-            .run_child_process(agent, task.clone(), step, update, schema.as_ref(), &owner)
+            .run_child_process(
+                agent,
+                task.clone(),
+                step,
+                update,
+                schema.as_ref(),
+                &owner,
+                &launch,
+                self.revival.as_ref().map(|(id, _)| id.as_str()),
+                baseline,
+            )
             .await;
         if attempt.result.is_error || schema.is_none() {
-            return attempt.finish(&owner, true, update);
+            return attempt.defer(owner, true, update);
         }
         let schema = schema.as_ref().expect("schema checked above");
         attempt.result.schema_retries = Some(0);
@@ -113,7 +348,7 @@ impl ChildRunner {
             Ok(data) => {
                 attempt.result.data = Some(data);
                 attempt.result.schema_valid = Some(true);
-                return attempt.finish(&owner, true, update);
+                return attempt.defer(owner, true, update);
             }
             Err(errors) => {
                 attempt.result.schema_valid = Some(false);
@@ -127,38 +362,48 @@ impl ChildRunner {
         // A hub kill during validation/settlement is not a schema failure to
         // repair by launching a replacement child behind the operator's back.
         if matches!(previous.status, SubagentStatus::Cancelled) {
-            return previous;
+            return PendingRun::Settled(previous);
         }
         // Finishing an attempt can perform a snapshot or invoke a host callback.
         // Never spend a new launch after either cancellation or budget expiry.
         if owner.checkpoint().is_err() {
             cancel(&mut previous, CANCELLED);
             emit_progress(update, &previous);
-            return previous;
+            return PendingRun::Settled(previous);
         }
         if let Err(error) = self.deadline.check() {
             previous.fail(error.to_string());
             emit_progress(update, &previous);
-            return previous;
+            return PendingRun::Settled(previous);
         }
         let corrective = SubagentTask {
             task: corrective_retry_task(&task.task, &errors),
             ..task.clone()
         };
         let mut retry = self
-            .run_child_process(agent, corrective, step, update, Some(schema), &owner)
+            .run_child_process(
+                agent,
+                corrective,
+                step,
+                update,
+                Some(schema),
+                &owner,
+                &launch,
+                previous.hub_id.as_deref(),
+                baseline,
+            )
             .await;
         retry.result.schema_retries = Some(1);
         // Keep the public assignment stable; corrective prompt text is a
         // transport detail, not a replacement for the user's original task.
-        retry.result.task.clone_from(&task.task);
+        retry.result.task = launch.display_task().to_string();
         if let Some(iso) = previous.iso {
             retry.result.preserved_worktrees.push(iso);
         }
         if retry.result.is_error {
             retry.result.schema_valid = Some(false);
             retry.result.validation_errors = Some(errors);
-            return retry.finish(&owner, false, update);
+            return retry.defer(owner, false, update);
         }
         match validate_child_output(&retry.result.output, schema) {
             Ok(data) => {
@@ -176,7 +421,7 @@ impl ChildRunner {
         // Permissive mode permits returning an invalid answer with a warning,
         // not installing edits that failed the requested acceptance contract.
         let accepted = retry.result.schema_valid == Some(true);
-        retry.finish(&owner, accepted, update)
+        retry.defer(owner, accepted, update)
     }
 
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -188,23 +433,24 @@ impl ChildRunner {
         update: Option<&UpdateCallback>,
         schema: Option<&Value>,
         owner: &AgentCx,
+        launch: &RevivalSpec,
+        revived_from: Option<&str>,
+        baseline: Option<&BaselineCapture>,
     ) -> Attempt {
-        let cwd = task.cwd.as_ref().map_or_else(
-            || self.cwd.clone(),
-            |path| {
-                if path.is_absolute() {
-                    path.clone()
-                } else {
-                    self.cwd.join(path)
-                }
-            },
+        let cwd = self.task_cwd(&task);
+        let args = child_args(
+            agent,
+            &task.task,
+            self.role_model_spec.as_deref(),
+            launch.parent_model.as_ref(),
+            schema,
         );
-        let args = child_args(agent, &task.task, self.role_model_spec.as_deref(), schema);
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
             self.deadline,
         );
+        attempt.result.task = launch.display_task().to_string();
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
@@ -223,7 +469,9 @@ impl ChildRunner {
                 return attempt;
             }
         };
-        if !cwd.is_dir() {
+        // Isolated tasks use the captured directory, which may no longer exist
+        // in the live parent after a queued sibling has run.
+        if !isolated && !cwd.is_dir() {
             attempt.result.fail(format!(
                 "Working directory does not exist: {}",
                 cwd.display()
@@ -232,10 +480,13 @@ impl ChildRunner {
         }
         // Tracking is a launch prerequisite, not optional telemetry. A failed
         // registration must never leave an unsteerable/uncontrollable child.
-        let hub_entry = match attempt
-            .hub
-            .register(&agent.name, &attempt.result.task, self.hub_kind)
-        {
+        let hub_entry = match attempt.hub.register(
+            &agent.name,
+            &launch.task.task,
+            self.hub_kind,
+            launch.clone(),
+            revived_from,
+        ) {
             Ok(entry) => entry,
             Err(error) => {
                 attempt.result.fail(error.to_string());
@@ -243,15 +494,54 @@ impl ChildRunner {
             }
         };
         attempt.result.hub_id = Some(hub_entry.id.clone());
+        if self.foreground {
+            let hold = crate::agent_hub::registry()
+                .lock()
+                .map_err(|_| {
+                    crate::error::Error::tool("subagent", "PI_SUBAGENT_HUB: registry is poisoned")
+                })
+                .and_then(|mut hub| {
+                    hub.hold_child_result(&hub_entry.id, self.deadline.remaining())
+                });
+            match hold {
+                Ok(hold) => attempt.parent_wait = Some(hold),
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
+            }
+        }
         emit_progress(update, &attempt.result);
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
         if isolated {
-            match crate::worktree_iso::isolate(&cwd, &attempt.result.task) {
+            let baseline = match baseline {
+                Some(Ok(baseline)) => baseline,
+                Some(Err(error)) => {
+                    attempt.result.fail(error.clone());
+                    return attempt;
+                }
+                None => {
+                    attempt.result.fail(
+                        "PI_ISO_CWD: isolated task has no captured launch directory".to_string(),
+                    );
+                    return attempt;
+                }
+            };
+            match baseline.workspace.isolate(&attempt.result.task) {
                 Ok(handle) => {
-                    attempt.result.cwd.clone_from(&handle.path);
+                    let working_directory = handle.working_directory(&baseline.relative_cwd);
+                    // Retain the checkout even when its requested directory is
+                    // missing. The rejected task must never launch at its root.
                     attempt.isolation = Some((handle, mode));
+                    match working_directory {
+                        Ok(cwd) => attempt.result.cwd = cwd,
+                        Err(error) => {
+                            attempt.result.fail(error.to_string());
+                            return attempt;
+                        }
+                    }
                 }
                 Err(error) => {
                     attempt.result.fail(error.to_string());
@@ -262,7 +552,23 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
+        let hub_channel = if attempt.result.tools.iter().any(|tool| tool == "hub") {
+            match crate::agent_hub::ipc::ChildChannel::bind(
+                &hub_entry.id,
+                owner,
+                self.deadline.remaining(),
+            ) {
+                Ok(channel) => Some(channel),
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
+            }
+        } else {
+            None
+        };
         let mut command = Command::new(&self.child_binary);
+        crate::agent_hub::ipc::ChildChannel::configure_child(&mut command, hub_channel.as_ref());
         if let Err(error) = self.deadline.configure_child(&mut command) {
             attempt.result.fail(error.to_string());
             return attempt;
@@ -275,7 +581,10 @@ impl ChildRunner {
             .stderr(Stdio::piped())
             .env("PI_CODING_AGENT_DIR", &self.global_dir)
             .env("PI_SUBAGENT_PARENT_PID", std::process::id().to_string())
-            .env("PI_SUBAGENT_DEPTH", child_depth().to_string())
+            .env(
+                "PI_SUBAGENT_DEPTH",
+                launch.depth.max(child_depth()).to_string(),
+            )
             .env("PI_SUBAGENT_STEER_FILE", &hub_entry.steer_path)
             .env("PI_SUBAGENT_RUN_ID", &hub_entry.id);
         #[cfg(unix)]
@@ -287,8 +596,23 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        let child = match owner.process().spawn_checked(&mut command) {
-            Ok(child) => child,
+        // Scope can change during host progress callbacks. Retain this policy
+        // on the private launch so schema retries and revival check it too.
+        if launch.launch_admission.is_some() {
+            if let Err(error) = launch.check_launch_admission() {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+            if !check_budget(owner, self.deadline, &mut attempt.result) {
+                return attempt;
+            }
+        }
+        let mut child = match ChildProcessGuard::spawn(owner, &mut command) {
+            // Bind process authority before activation. The same guard then
+            // serializes reaping and retirement even when this future drops.
+            Ok(child) => child
+                .with_process_lifetime(attempt.hub.process_lifetime())
+                .with_hub_channel(hub_channel),
             Err(error) => {
                 attempt.result.fail(format!(
                     "Failed to launch {}: {error}",
@@ -297,17 +621,7 @@ impl ChildRunner {
                 return attempt;
             }
         };
-        // Guard ownership precedes platform attachment, which may itself fail
-        // or unwind. Every successfully spawned child already has a reaper.
-        let mut child = ChildProcessGuard::new(child);
         attempt.result.pid = Some(child.id());
-        if !crate::tools::attach_child_job_discipline(child.child.as_ref().expect("owned child")) {
-            attempt.result.fail(
-                "PI_SUBAGENT_CONTAINMENT: failed to attach child process cleanup discipline"
-                    .to_string(),
-            );
-            return attempt;
-        }
         // Close the registration-to-spawn race. A kill observed after OS spawn
         // still owns a reaper and must not be announced as a new running task.
         if !check_budget(owner, self.deadline, &mut attempt.result) {
@@ -356,6 +670,9 @@ impl ChildRunner {
                 child.terminate();
                 break;
             }
+            // Bounded nonblocking work keeps messaging inside the process
+            // lifetime and leaves every tick a cancellation checkpoint.
+            child.poll_hub();
             #[cfg(unix)]
             pipes.drain(&mut protocol, &mut attempt.result, update);
             #[cfg(not(unix))]
@@ -366,7 +683,7 @@ impl ChildRunner {
                 child.terminate();
                 break;
             }
-            match child.child.as_mut().expect("owned child").try_wait() {
+            match child.try_wait() {
                 Ok(Some(status)) => {
                     attempt.result.exit_code = status.code();
                     break;
@@ -465,11 +782,35 @@ fn check_budget(owner: &AgentCx, deadline: Deadline, result: &mut SubagentResult
     !result.is_error
 }
 
+#[allow(clippy::large_enum_variant)]
+enum PendingRun {
+    Settled(SubagentResult),
+    AwaitingWriteback {
+        attempt: Attempt,
+        accepted: bool,
+        owner: AgentCx,
+    },
+}
+
+impl PendingRun {
+    fn finish(self, update: Option<&UpdateCallback>) -> SubagentResult {
+        match self {
+            Self::Settled(result) => result,
+            Self::AwaitingWriteback {
+                attempt,
+                accepted,
+                owner,
+            } => attempt.finish(&owner, accepted, update),
+        }
+    }
+}
+
 struct Attempt {
     result: SubagentResult,
     isolation: Option<(IsoHandle, IsoApplyMode)>,
     hub: HubLease,
     deadline: Deadline,
+    parent_wait: Option<Arc<crate::agent_hub::DependencyHold>>,
 }
 
 impl Attempt {
@@ -479,6 +820,27 @@ impl Attempt {
             isolation: None,
             hub: HubLease::empty(),
             deadline,
+            parent_wait: None,
+        }
+    }
+
+    fn defer(self, owner: AgentCx, accepted: bool, update: Option<&UpdateCallback>) -> PendingRun {
+        if accepted
+            && !self.result.is_error
+            && matches!(self.result.status, SubagentStatus::Completed)
+            && matches!(self.isolation.as_ref(), Some((_, IsoApplyMode::Apply)))
+        {
+            // Keep ownership until ordered writeback. Dropping this value
+            // cancels its hub lease and leaves the worktree inspectable.
+            PendingRun::AwaitingWriteback {
+                attempt: self,
+                accepted,
+                owner,
+            }
+        } else {
+            // Non-isolated work and explicit keep/drop do not mutate the
+            // parent. Preserve their immediate completion and retry behavior.
+            PendingRun::Settled(self.finish(&owner, accepted, update))
         }
     }
 
@@ -553,6 +915,7 @@ impl Attempt {
             self.result.iso = Some(outcome);
         }
         self.hub.settle(&self.result);
+        drop(self.parent_wait.take());
         emit_progress(update, &self.result);
         self.result
     }
@@ -561,17 +924,55 @@ impl Attempt {
 struct ChildProcessGuard {
     child: Option<std::process::Child>,
     descendants_stopped: bool,
+    process_lease: Option<ProcessLease>,
+    hub_channel: Option<crate::agent_hub::ipc::ChildChannel>,
 }
 
 impl ChildProcessGuard {
+    fn spawn(owner: &AgentCx, command: &mut Command) -> std::io::Result<Self> {
+        // Capability-checked dispatch establishes Windows Job membership
+        // before the child can run. Retain its reaper immediately, without a
+        // second attachment that would close the Job already owning the tree.
+        let child = owner.process().spawn_checked(command)?;
+        Ok(Self::new(child))
+    }
     const fn new(child: std::process::Child) -> Self {
         Self {
             child: Some(child),
             descendants_stopped: false,
+            process_lease: None,
+            hub_channel: None,
+        }
+    }
+    fn with_process_lifetime(mut self, lease: ProcessLease) -> Self {
+        self.process_lease = Some(lease);
+        self
+    }
+    fn with_hub_channel(mut self, channel: Option<crate::agent_hub::ipc::ChildChannel>) -> Self {
+        self.hub_channel = channel;
+        self
+    }
+    fn poll_hub(&mut self) {
+        if let Some(channel) = self.hub_channel.as_mut() {
+            channel.poll();
         }
     }
     fn id(&self) -> u32 {
         self.child.as_ref().map_or(0, std::process::Child::id)
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let child = self.child.as_mut().expect("owned child");
+        let status = if let Some(lease) = &self.process_lease {
+            lease.try_wait(child)
+        } else {
+            child.try_wait()
+        };
+        if matches!(&status, Ok(Some(_))) {
+            // No listener or credential survives OS reaping, including while
+            // output acceptance or ordered writeback remains pending.
+            self.hub_channel = None;
+        }
+        status
     }
     fn stop_descendants(&mut self) {
         if self.descendants_stopped {
@@ -593,6 +994,18 @@ impl ChildProcessGuard {
         crate::tools::kill_process_tree(Some(pid));
     }
     fn terminate(&mut self) {
+        // Revoke peer authority before any blocking termination or reaping.
+        self.hub_channel = None;
+        if let Some(lease) = self.process_lease.take() {
+            // The lease holds the hub lock while terminating and retiring the
+            // PID. A separate destructor would leave a reused PID signalable
+            // between child.wait() and retirement when a future is dropped.
+            lease.terminate(self);
+        } else {
+            self.terminate_untracked();
+        }
+    }
+    fn terminate_untracked(&mut self) {
         self.stop_descendants();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -600,6 +1013,7 @@ impl ChildProcessGuard {
         }
     }
     fn disarm(&mut self) {
+        self.hub_channel = None;
         let _ = self.child.take();
     }
 }
@@ -754,6 +1168,177 @@ async fn drain_until_reader_exit(
             return;
         }
         poll_pause(owner).await;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::path::Path;
+    use win32job::{ExtendedLimitInfo, Job};
+
+    const FIXTURE: &str = "subagents::execution::windows_process_tests::subagent_process_fixture";
+    const ROLE_ENV: &str = "PI_TEST_SUBAGENT_PROCESS_ROLE";
+    const DIRECTORY_ENV: &str = "PI_TEST_SUBAGENT_PROCESS_DIRECTORY";
+
+    fn fixture_command(role: &str, directory: &Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", FIXTURE, "--nocapture"])
+            .env(ROLE_ENV, role)
+            .env(DIRECTORY_ENV, directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    #[test]
+    fn subagent_process_fixture() {
+        let Ok(role) = std::env::var(ROLE_ENV) else {
+            return;
+        };
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY_ENV).unwrap());
+        if role == "descendant" {
+            std::fs::write(directory.join("descendant.ready"), "ready").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        assert_eq!(role, "root");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("start").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not start the fixture"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut descendant = fixture_command("descendant", &directory).spawn().unwrap();
+        std::fs::write(
+            directory.join("descendant.pid"),
+            descendant.id().to_string(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if directory.join("exit-root").exists() {
+                // Deliberately leave a live descendant to exercise cleanup
+                // after the root is reaped. The observer Job owns fallback
+                // cleanup if the parent's assertion fails.
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = descendant.kill();
+        let _ = descendant.wait();
+    }
+
+    struct Fixture {
+        child: ChildProcessGuard,
+        observer: Job,
+        directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn start() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = AgentCx::for_request();
+            // This is the exact dispatch and ownership transfer used by
+            // ChildRunner. Do not attach a Job after this call: doing so
+            // would hide the regression in spawn_checked.
+            let child =
+                ChildProcessGuard::spawn(&owner, &mut fixture_command("root", directory.path()))
+                    .unwrap();
+            let mut limits = ExtendedLimitInfo::new();
+            limits.limit_kill_on_job_close();
+            let observer = Job::create_with_limit_info(&limits).unwrap();
+            observer
+                .assign_process(child.child.as_ref().unwrap().as_raw_handle() as isize)
+                .unwrap();
+            // This separate nested Job only observes liveness and provides
+            // panic cleanup. It is never registered in Pi's Job registry.
+            std::fs::write(directory.path().join("start"), "start").unwrap();
+            let fixture = Self {
+                child,
+                observer,
+                directory,
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let descendant = loop {
+                if fixture.directory.path().join("descendant.ready").exists()
+                    && let Ok(text) =
+                        std::fs::read_to_string(fixture.directory.path().join("descendant.pid"))
+                    && let Ok(pid) = text.parse::<usize>()
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "descendant did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let members = fixture.observer.query_process_id_list().unwrap();
+            assert!(members.contains(&usize::try_from(fixture.child.id()).unwrap()));
+            assert!(members.contains(&descendant));
+            fixture
+        }
+
+        fn reap_root(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self
+                .child
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+            {
+                assert!(Instant::now() < deadline, "subagent root did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn assert_tree_stopped(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.observer.query_process_id_list().unwrap().is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "subagent descendants survived cleanup"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn checked_dispatch_returns_a_subagent_tree_already_owned_by_its_job() {
+        let mut fixture = Fixture::start();
+        // Use registry-only termination before invoking the guard's fallback
+        // process walk. A raw spawn cannot pass by killing the same PIDs later.
+        crate::tools::terminate_reaped_child_discipline(fixture.child.id());
+        fixture.reap_root();
+        fixture.assert_tree_stopped();
+        fixture.child.disarm();
+    }
+
+    #[test]
+    fn subagent_guard_stops_the_tree_after_cancellation_and_natural_root_exit() {
+        for root_exits in [false, true] {
+            let mut fixture = Fixture::start();
+            if root_exits {
+                std::fs::write(fixture.directory.path().join("exit-root"), "exit").unwrap();
+                fixture.reap_root();
+                assert!(
+                    !fixture.observer.query_process_id_list().unwrap().is_empty(),
+                    "the fixture must leave a live descendant after root exit"
+                );
+                fixture.child.stop_descendants();
+                fixture.child.disarm();
+            } else {
+                fixture.child.terminate();
+            }
+            fixture.assert_tree_stopped();
+        }
     }
 }
 

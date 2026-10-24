@@ -8,11 +8,48 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::agent::AgentEvent;
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
-use crate::model::AssistantMessage;
+use crate::model::{AssistantMessage, ContentBlock, ImageContent, TextContent, UserContent};
 
-use super::{SessionControlHandle, control_error};
+use super::{ControllableSession, ControlledTurn, SessionControlHandle, control_error};
+
+impl ControllableSession {
+    /// Send text and images through the same live-control and recovery boundary.
+    /// Empty text with images is image-only input; no images uses the ordinary
+    /// text path, without manufacturing an empty block or changing input hooks.
+    pub fn prompt_with_images(
+        &mut self,
+        input: String,
+        images: Vec<ImageContent>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        self.prompt_with_images_with_control(input, images, move |_, event| on_event(event))
+    }
+
+    /// Image-bearing counterpart of [`Self::prompt_with_control`]. The handle
+    /// remains bound to one turn even when the session is reused for later
+    /// prompts. Unclaimed queued input is recoverable, never replayed silently.
+    pub fn prompt_with_images_with_control(
+        &mut self,
+        input: String,
+        images: Vec<ImageContent>,
+        on_event: impl Fn(&SessionControlHandle, AgentEvent) + Send + Sync + 'static,
+    ) -> Result<ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_>> {
+        let content = if images.is_empty() {
+            UserContent::Text(input)
+        } else {
+            let mut blocks = Vec::with_capacity(images.len().saturating_add(1));
+            if !input.is_empty() {
+                blocks.push(ContentBlock::Text(TextContent::new(input)));
+            }
+            blocks.extend(images.into_iter().map(ContentBlock::Image));
+            UserContent::Blocks(blocks)
+        };
+        self.prompt_input_with_control(content, on_event)
+    }
+}
 
 pub(super) type CancelWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -125,3 +162,6 @@ impl<F> Drop for OwnedTurn<F> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod native_input_tests;

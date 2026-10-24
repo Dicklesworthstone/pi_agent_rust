@@ -4,8 +4,8 @@
 //! for various LLM APIs.
 
 use crate::error::{Error, Result};
-use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
-use crate::http::client::{Client, RequestBuilder};
+use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle, JsExtensionRuntimeHandle};
+use crate::http::client::{Client, HttpTransport, RequestBuilder, TransportResponse};
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason, TextContent, Usage,
 };
@@ -16,7 +16,9 @@ use crate::provider_metadata::{
 };
 use crate::vcr::{VCR_ENV_MODE, VcrRecorder};
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::Utc;
+use futures::StreamExt;
 use futures::stream;
 use futures::stream::Stream;
 use serde_json::Value;
@@ -181,6 +183,251 @@ fn vcr_client_if_enabled(base_url: &str) -> Result<Option<Client>> {
     let test_name = env::var("PI_VCR_TEST_NAME").unwrap_or_else(|_| "pi_runtime".to_string());
     let recorder = VcrRecorder::new(&test_name)?;
     Ok(Some(Client::new().with_vcr(recorder)))
+}
+
+/// Canonical origin accepted by the extension-owned in-memory HTTP bridge.
+/// It cannot be used for arbitrary URLs, real loopback listeners, or TLS.
+fn extension_http_origin(value: &str) -> Result<String> {
+    let url = Url::parse(value)
+        .map_err(|error| Error::config(format!("Invalid virtual HTTP provider URL: {error}")))?;
+    let loopback = matches!(
+        url.host_str(),
+        Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+    );
+    if url.scheme() != "http"
+        || !loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() == Some(0)
+    {
+        return Err(Error::config(
+            "Virtual HTTP providers require a loopback HTTP origin without URL credentials",
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn extension_http_provider_binding(
+    manager: &ExtensionManager,
+    entry: &ModelEntry,
+) -> Result<Option<(String, String)>> {
+    let specs = manager.extension_providers();
+    extension_provider_bindings(&specs)?;
+    let requested = extension_provider_key(&entry.model.provider);
+    let Some(spec) = specs.iter().find(|spec| {
+        spec.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| extension_provider_key(id) == requested)
+    }) else {
+        return Ok(None);
+    };
+    if !spec
+        .get("virtualHttpServer")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return Ok(None);
+    }
+    // The manager stamps this owner from the actual JS runtime snapshot.
+    // The runtime will independently verify the provider's live server binding
+    // when each request starts; this marker alone never grants dispatch rights.
+    if !spec
+        .get("extension_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return Err(Error::config("Virtual HTTP provider has no runtime owner"));
+    }
+    let base_url = spec
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::config("Virtual HTTP provider has no registered base URL"))?;
+    let origin = extension_http_origin(base_url)?;
+    if extension_http_origin(&entry.model.base_url)? != origin {
+        return Err(Error::config(
+            "Model URL does not match its extension-owned virtual HTTP provider origin",
+        ));
+    }
+    let provider_id = spec
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::config("Virtual HTTP provider has no registered identity"))?;
+    Ok(Some((provider_id.trim().to_string(), origin)))
+}
+
+struct ExtensionHttpTransport {
+    runtime: JsExtensionRuntimeHandle,
+    provider_id: String,
+    origin: String,
+}
+
+impl std::fmt::Debug for ExtensionHttpTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExtensionHttpTransport")
+            .field("provider_id", &self.provider_id)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ExtensionHttpStream {
+    runtime: JsExtensionRuntimeHandle,
+    stream_id: Option<String>,
+}
+
+impl Drop for ExtensionHttpStream {
+    fn drop(&mut self) {
+        if let Some(stream_id) = self.stream_id.take() {
+            self.runtime
+                .provider_stream_simple_cancel_best_effort(stream_id);
+        }
+    }
+}
+
+impl ExtensionHttpStream {
+    const COMMAND_TIMEOUT_MS: u64 = 600_000;
+
+    async fn next_frame(&mut self) -> Result<Option<Value>> {
+        loop {
+            let Some(stream_id) = self.stream_id.clone() else {
+                return Ok(None);
+            };
+            let frame = self
+                .runtime
+                .provider_stream_simple_next(stream_id, Self::COMMAND_TIMEOUT_MS)
+                .await?;
+            let Some(frame) = frame else {
+                self.stream_id = None;
+                return Ok(None);
+            };
+            if frame.get("pending").and_then(Value::as_bool) == Some(true) {
+                // Polling leaves the JS actor free to process upstream HTTP,
+                // timers, and cancellation while a local handler awaits data.
+                let now = asupersync::Cx::current()
+                    .and_then(|cx| cx.timer_driver())
+                    .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+                asupersync::time::sleep(now, std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+            return Ok(Some(frame));
+        }
+    }
+}
+
+#[async_trait]
+impl HttpTransport for ExtensionHttpTransport {
+    #[allow(clippy::too_many_lines)]
+    async fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<TransportResponse> {
+        if extension_http_origin(url)? != self.origin {
+            return Err(Error::api(
+                "Virtual HTTP provider request escaped its registered origin",
+            ));
+        }
+        if body.len() > 10 * 1024 * 1024 {
+            return Err(Error::api("Virtual HTTP request exceeds 10 MiB"));
+        }
+        let header_map: serde_json::Map<String, Value> = headers
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .collect();
+        let request = serde_json::json!({
+            "url": url,
+            "method": method,
+            "headers": header_map,
+            "body_bytes": base64::engine::general_purpose::STANDARD.encode(body),
+        });
+        let stream_id = self
+            .runtime
+            .provider_http_stream_start(
+                &self.provider_id,
+                request,
+                ExtensionHttpStream::COMMAND_TIMEOUT_MS,
+            )
+            .await?;
+        // The guard covers errors and cancellation before headers as well as
+        // an abandoned response body. No fallback to a real socket is allowed.
+        let mut state = ExtensionHttpStream {
+            runtime: self.runtime.clone(),
+            stream_id: Some(stream_id),
+        };
+        let head = state
+            .next_frame()
+            .await?
+            .ok_or_else(|| Error::api("Virtual HTTP response ended before headers"))?;
+        let status = head
+            .get("status")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+            .filter(|status| (100..=599).contains(status))
+            .ok_or_else(|| Error::api("Invalid virtual HTTP response status"))?;
+        let response_header_map = head
+            .get("headers")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::api("Invalid virtual HTTP response headers"))?;
+        if response_header_map.len() > 100 {
+            return Err(Error::api("Virtual HTTP response exceeds 100 headers"));
+        }
+        let response_headers = response_header_map
+            .iter()
+            .map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|value| (name.clone(), value.to_string()))
+                    .ok_or_else(|| Error::api("Invalid virtual HTTP response header value"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if response_headers
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum::<usize>()
+            > 64 * 1024
+        {
+            return Err(Error::api("Virtual HTTP response headers exceed 64 KiB"));
+        }
+        let stream = stream::try_unfold(state, |mut state| async move {
+            loop {
+                let Some(frame) = state.next_frame().await.map_err(std::io::Error::other)? else {
+                    return Ok(None);
+                };
+                let encoded = frame
+                    .get("body_bytes")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid virtual HTTP body frame",
+                        )
+                    })?;
+                if encoded.len() > (1024_usize * 1024).div_ceil(3) * 4 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Virtual HTTP body frame exceeds 1 MiB",
+                    ));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                if bytes.len() > 1024 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Virtual HTTP body frame exceeds 1 MiB",
+                    ));
+                }
+                if !bytes.is_empty() {
+                    return Ok(Some((bytes, state)));
+                }
+            }
+        })
+        .boxed();
+        Ok((status, response_headers, stream))
+    }
 }
 
 struct ExtensionStreamSimpleProvider {
@@ -962,7 +1209,21 @@ pub fn create_provider(
     entry: &ModelEntry,
     extensions: Option<&ExtensionManager>,
 ) -> Result<Arc<dyn Provider>> {
-    let provider = create_transport_provider(entry, extensions)?;
+    create_provider_with_auth(entry, extensions, None)
+}
+
+/// Create a provider bound to the runtime's credential file and command workspace.
+///
+/// Bedrock retains an immutable source binding, not the store's credential
+/// entries. This keeps reused provider instances (including compaction and
+/// other auxiliary requests) in the same workspace while allowing on-disk
+/// credentials to change between requests. Other providers are unchanged.
+pub fn create_provider_with_auth(
+    entry: &ModelEntry,
+    extensions: Option<&ExtensionManager>,
+    auth: Option<&crate::auth::AuthStorage>,
+) -> Result<Arc<dyn Provider>> {
+    let provider = create_transport_provider(entry, extensions, auth)?;
     if entry.model.cost.is_priced() {
         Ok(Arc::new(PricedProvider {
             inner: provider,
@@ -977,6 +1238,7 @@ pub fn create_provider(
 fn create_transport_provider(
     entry: &ModelEntry,
     extensions: Option<&ExtensionManager>,
+    auth: Option<&crate::auth::AuthStorage>,
 ) -> Result<Arc<dyn Provider>> {
     if let Some(manager) = extensions
         && let Some(provider_id) =
@@ -995,7 +1257,22 @@ fn create_transport_provider(
 
     let (route, canonical_provider, effective_api) = resolve_provider_route(entry)?;
     let vcr_client = vcr_client_if_enabled(&entry.model.base_url)?;
-    let client = vcr_client.unwrap_or_else(Client::new);
+    let mut client = vcr_client.unwrap_or_else(Client::new);
+    if let Some(manager) = extensions
+        && let Some((provider_id, origin)) = extension_http_provider_binding(manager, entry)?
+    {
+        let runtime = manager.js_runtime().ok_or_else(|| {
+            Error::provider(
+                &provider_id,
+                "JS runtime unavailable for virtual HTTP provider",
+            )
+        })?;
+        client = client.with_transport(Arc::new(ExtensionHttpTransport {
+            runtime,
+            provider_id,
+            origin,
+        }));
+    }
     tracing::debug!(
         event = "pi.provider.factory.select",
         provider = %entry.model.provider,
@@ -1093,13 +1370,17 @@ fn create_transport_provider(
                     .with_client(client),
             ))
         }
-        ProviderRouteKind::NativeBedrock => Ok(Arc::new(
-            bedrock::BedrockProvider::new(&entry.model.id)
+        ProviderRouteKind::NativeBedrock => {
+            let provider = bedrock::BedrockProvider::new(&entry.model.id)
                 .with_provider_name(&entry.model.provider)
                 .with_base_url(&entry.model.base_url)
                 .with_compat(entry.compat.clone())
-                .with_client(client),
-        )),
+                .with_client(client);
+            Ok(Arc::new(match auth {
+                Some(auth) => provider.with_auth_storage(auth)?,
+                None => provider,
+            }))
+        }
         ProviderRouteKind::NativeAzure => {
             let runtime = resolve_azure_provider_runtime(entry)?;
             Ok(Arc::new(
@@ -1692,6 +1973,271 @@ export default function init(pi) {
             api_key: Some("sk-test".to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn virtual_http_origin_rejects_network_and_credentials() {
+        assert_eq!(
+            extension_http_origin("http://127.0.0.1:28180/v1").expect("loopback"),
+            "http://127.0.0.1:28180"
+        );
+        assert_eq!(
+            extension_http_origin("http://[::1]:28180/v1").expect("IPv6 loopback"),
+            "http://[::1]:28180"
+        );
+        for url in [
+            "https://127.0.0.1:28180/v1",
+            "http://127.0.0.2:28180/v1",
+            "http://0.0.0.0:28180/v1",
+            "http://example.com/v1",
+            "http://user:secret@127.0.0.1:28180/v1",
+            "http://localhost:0/v1",
+        ] {
+            assert!(extension_http_origin(url).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn virtual_http_binding_requires_owned_identity_and_same_origin() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "freeflow", "extension_id": "owned-extension",
+            "baseUrl": "http://127.0.0.1:28180/v1",
+            "virtualHttpServer": "virtual-http-server-1"
+        }));
+        let entry = model_entry(
+            "freeflow",
+            "openai-completions",
+            "fixture",
+            "http://127.0.0.1:28180/v1",
+        );
+        assert_eq!(
+            extension_http_provider_binding(&manager, &entry).expect("binding"),
+            Some(("freeflow".to_string(), "http://127.0.0.1:28180".to_string()))
+        );
+        let mut changed = entry.clone();
+        changed.model.base_url = "http://127.0.0.1:28181/v1".to_string();
+        assert!(extension_http_provider_binding(&manager, &changed).is_err());
+        changed.model.provider = "another-provider".to_string();
+        assert!(
+            extension_http_provider_binding(&manager, &changed)
+                .expect("different identity")
+                .is_none()
+        );
+
+        let unowned = ExtensionManager::new();
+        unowned.register_provider(serde_json::json!({
+            "id": "freeflow", "baseUrl": "http://127.0.0.1:28180/v1",
+            "virtualHttpServer": "forged-marker"
+        }));
+        assert!(extension_http_provider_binding(&unowned, &entry).is_err());
+        assert!(
+            create_provider(&entry, Some(&manager)).is_err(),
+            "missing JS runtime must fail closed"
+        );
+    }
+
+    #[test]
+    fn extension_virtual_http_provider_streams_through_native_openai_parser() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let source = r#"
+import http from 'node:http';
+export default function activate(pi) {
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      const parsed = JSON.parse(body);
+      if (req.method !== 'POST' || req.url !== '/v1/chat/completions' ||
+          req.headers.authorization !== 'Bearer sk-test' || parsed.model !== 'fixture-model') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'incorrect virtual provider request' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: ' + JSON.stringify({ id: 'fixture', choices: [{ index: 0, delta: { role: 'assistant', content: 'isolated proxy' }, finish_reason: null }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ id: 'fixture', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  });
+  server.listen(28180, '127.0.0.1');
+  pi.registerProvider('virtual-freeflow', {
+    api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+    models: [{ id: 'fixture-model', name: 'Fixture', contextWindow: 100, maxTokens: 10, input: ['text'] }]
+  });
+}
+"#;
+            let (_dir, manager) = load_extension(source, false).await;
+            let entries = manager.extension_model_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.model.provider == "virtual-freeflow")
+                .expect("registered model");
+            assert!(
+                extension_http_provider_binding(&manager, entry)
+                    .expect("binding")
+                    .is_some()
+            );
+            let provider = create_provider(entry, Some(&manager)).expect("provider");
+            let context = basic_context();
+            let options = basic_options();
+            let mut events = provider
+                .stream(&context, &options)
+                .await
+                .expect("start stream");
+            let mut text = String::new();
+            let mut done = false;
+            while let Some(event) = events.next().await {
+                match event.expect("provider event") {
+                    StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                    StreamEvent::Done { .. } => {
+                        done = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(text, "isolated proxy");
+            assert!(
+                done,
+                "native parser must produce a completed assistant response"
+            );
+            drop(events);
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
+    fn extension_model_reasoning_settings_reach_the_virtual_proxy_request() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let source = r#"
+import http from 'node:http';
+export default function activate(pi) {
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      const parsed = JSON.parse(body);
+      const correct = parsed.model === 'plain' ? parsed.reasoning_effort === 'high' && !parsed.reasoning
+        : parsed.model === 'gateway' ? parsed.reasoning?.effort === 'xhigh' && !parsed.reasoning_effort
+        : parsed.model === 'disabled' && !parsed.reasoning_effort && !parsed.reasoning;
+      if (!correct || parsed.thinking) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'model reasoning contract was lost' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: parsed.model }, finish_reason: null }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  }).listen(28180, '127.0.0.1');
+  pi.registerProvider('freeflow-contract', {
+    api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
+    models: [
+      { id: 'plain', reasoning: true, thinkingLevelMap: { xhigh: 'high', max: null } },
+      { id: 'gateway', reasoning: true, compat: { thinkingFormat: 'openrouter' }, thinkingLevelMap: { xhigh: 'xhigh', max: null } },
+      { id: 'disabled', reasoning: true, compat: { supportsReasoningEffort: false } }
+    ]
+  });
+}
+"#;
+            let (_dir, manager) = load_extension(source, false).await;
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 3);
+            for entry in &entries {
+                let compat = entry.compat.as_ref().expect("registered compatibility");
+                assert_eq!(compat.supports_developer_role, Some(false));
+                assert!(!entry.supports_max());
+                let provider = create_provider(entry, Some(&manager)).expect("provider");
+                let context = basic_context();
+                let options = StreamOptions {
+                    thinking_level: Some(entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)),
+                    ..basic_options()
+                };
+                let mut events = provider.stream(&context, &options).await.expect("stream");
+                let mut text = String::new();
+                let mut done = false;
+                while let Some(event) = events.next().await {
+                    match event.expect("provider event") {
+                        StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                        StreamEvent::Done { .. } => {
+                            done = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(text, entry.model.id);
+                assert!(done);
+            }
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
+    fn extension_virtual_http_response_drop_cancels_its_handler() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let source = r#"
+import http from 'node:http';
+export default function activate(pi) {
+  let cancelled = false;
+  http.createServer((req, res) => {
+    req.once('close', () => { cancelled = true; });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('first chunk');
+  }).listen(28180, '127.0.0.1');
+  pi.registerProvider('virtual-freeflow', {
+    api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+    models: [{ id: 'fixture-model', name: 'Fixture', contextWindow: 100, maxTokens: 10, input: ['text'] }]
+  });
+  pi.on('agent_start', () => ({ cancelled }));
+}
+"#;
+            let (_dir, manager) = load_extension(source, false).await;
+            let entry = manager.extension_model_entries().remove(0);
+            let (provider_id, origin) = extension_http_provider_binding(&manager, &entry)
+                .expect("binding")
+                .expect("virtual route");
+            let client = Client::new().with_transport(Arc::new(ExtensionHttpTransport {
+                runtime: manager.js_runtime().expect("JS runtime"),
+                provider_id,
+                origin,
+            }));
+            let response = client
+                .get("http://127.0.0.1:28180/v1/models")
+                .send()
+                .await
+                .expect("response headers");
+            assert_eq!(response.status(), 200);
+            let mut bytes = response.bytes_stream();
+            assert_eq!(
+                bytes.next().await.expect("body frame").expect("body bytes"),
+                b"first chunk"
+            );
+            drop(bytes);
+            let result = manager
+                .dispatch_event_with_response(
+                    crate::extensions::ExtensionEventName::AgentStart,
+                    None,
+                    10_000,
+                )
+                .await
+                .expect("cancellation observation")
+                .expect("hook result");
+            assert_eq!(result["cancelled"], true);
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        });
     }
 
     #[test]

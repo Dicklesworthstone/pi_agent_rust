@@ -14,8 +14,8 @@ use crate::memory::screen_secrets;
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::{
     ProcessCleanupMode, ProcessGuard, Tool, ToolEffects, ToolOutput, ToolUpdate,
-    attach_child_job_discipline, command_with_default_sigpipe_in_dir,
-    isolate_command_process_group, kill_process_group_tree, read_to_end_capped_and_drain,
+    command_with_default_sigpipe_in_dir, isolate_command_process_group,
+    read_to_end_capped_and_drain,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -83,17 +83,11 @@ struct BoundedProcessOutput {
 /// isolated tree and reaps the root before its drop returns.
 struct GithubProcessGuard {
     process: ProcessGuard,
-    pid: u32,
-    active: bool,
 }
 
 impl GithubProcessGuard {
-    const fn new(process: ProcessGuard, pid: u32) -> Self {
-        Self {
-            process,
-            pid,
-            active: true,
-        }
+    const fn new(process: ProcessGuard) -> Self {
+        Self { process }
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
@@ -101,29 +95,20 @@ impl GithubProcessGuard {
     }
 
     fn finish_exited(&mut self) -> std::io::Result<ExitStatus> {
-        let status = self.process.wait();
         // A subprocess can exit after leaving a descendant holding one of its
-        // pipe descriptors. Always close the isolated group before joining the
-        // pipe pumps so successful completion is bounded too.
-        kill_process_group_tree(Some(self.pid));
-        self.active = false;
-        status
+        // pipe descriptors. Release its retained Job/isolated group before
+        // joining the pumps, without walking an already-reaped root PID.
+        self.process.terminate_and_wait()
     }
 
     fn kill_and_reap(&mut self) -> std::io::Result<ExitStatus> {
-        kill_process_group_tree(Some(self.pid));
-        let status = self.process.wait();
-        self.active = false;
-        status
+        self.process.terminate_and_wait()
     }
 }
 
 impl Drop for GithubProcessGuard {
     fn drop(&mut self) {
-        if self.active {
-            kill_process_group_tree(Some(self.pid));
-            let _ = self.process.wait();
-        }
+        let _ = self.process.terminate_and_wait();
     }
 }
 
@@ -154,21 +139,17 @@ async fn run_bounded_process(
         .stderr(Stdio::piped());
     isolate_command_process_group(&mut command);
 
-    let mut child = command.spawn()?;
-    attach_child_job_discipline(&child);
-    let pid = child.id();
-    let stdout = child.stdout.take().ok_or_else(|| {
-        kill_process_group_tree(Some(pid));
-        let _ = child.wait();
-        std::io::Error::other("missing stdout pipe")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        kill_process_group_tree(Some(pid));
-        let _ = child.wait();
-        std::io::Error::other("missing stderr pipe")
-    })?;
+    let child = cx.process().spawn_checked(&mut command)?;
     let process = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
-    let mut guard = GithubProcessGuard::new(process, pid);
+    let mut guard = GithubProcessGuard::new(process);
+    let stdout = guard
+        .process
+        .take_stdout()
+        .ok_or_else(|| std::io::Error::other("missing stdout pipe"))?;
+    let stderr = guard
+        .process
+        .take_stderr()
+        .ok_or_else(|| std::io::Error::other("missing stderr pipe"))?;
 
     let stdout_thread = spawn_pipe_capture("github-stdout", stdout, stdout_limit)?;
     let stderr_thread = spawn_pipe_capture("github-stderr", stderr, MAX_GH_STDERR_BYTES)?;
@@ -1281,7 +1262,7 @@ mod tests {
         assert!(out.contains("#7 [open] Broken"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
         let pid = sysinfo::Pid::from_u32(pid);
         let started = Instant::now();
@@ -1296,6 +1277,93 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_child_fixture() {
+        let directory = std::env::current_dir().unwrap();
+        if !directory.join("github-capture.fixture").exists() {
+            return;
+        }
+        let pid_file = directory.join("descendant.pid");
+        if std::env::var_os("PI_TEST_GITHUB_CAPTURE_DESCENDANT").is_some() {
+            std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+            // Keep both inherited output handles open. Correct containment
+            // stops us as soon as the root exits; this bound limits a failing
+            // regression even if its Job cleanup has been removed.
+            std::thread::sleep(Duration::from_secs(12));
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "github::tests::windows_capture_child_fixture",
+                "--nocapture",
+            ])
+            .env("PI_TEST_GITHUB_CAPTURE_DESCENDANT", "1")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("descendant did not confirm inherited pipe ownership");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!("github-root-output");
+        eprintln!("github-root-error");
+        // Deliberately leave the descendant alive: the production caller
+        // owns its inherited Job and must finish its pipes before returning.
+        std::process::exit(7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_stops_descendants_after_root_exit_and_preserves_status() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("github-capture.fixture"), "active").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let output = runtime
+            .block_on(run_bounded_process(
+                executable.as_os_str(),
+                &[
+                    "--exact",
+                    "github::tests::windows_capture_child_fixture",
+                    "--nocapture",
+                ],
+                directory.path(),
+                Duration::from_secs(8),
+                8192,
+            ))
+            .expect("capture the contained Windows subprocess");
+        assert!(matches!(
+            output.termination,
+            ProcessTermination::Exited(status) if status.code() == Some(7)
+        ));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("github-root-output"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("github-root-error"));
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "capture waited for an escaped descendant to close inherited pipes"
+        );
+        let pid = std::fs::read_to_string(directory.path().join("descendant.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            wait_for_pid_exit(pid, Duration::from_secs(1)),
+            "the descendant outlived the returned GitHub process result"
+        );
     }
 
     #[cfg(unix)]

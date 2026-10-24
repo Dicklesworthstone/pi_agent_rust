@@ -74,6 +74,101 @@ Resulting behavior:
 - `default_thinking_level` (string)
 - `enabled_models` (array of model patterns)
 
+`default_model` accepts either a bare model ID or `provider/model`. Pi first
+tries to resolve the complete provider/model pair. When it exists, that
+provider takes precedence over `default_provider`. For example:
+
+```json
+{
+  "default_provider": "polza",
+  "default_model": "routerAI/deepseek/deepseek-v4.1-flash-1017",
+  "enabled_models": ["polza/*", "routerAI/*"]
+}
+```
+
+This selects `routerAI` and its exact `deepseek/deepseek-v4.1-flash-1017`
+model, regardless of the order of the two enabled-model patterns, provided
+the model is available in that scope.
+
+If the qualified pair does not exist, Pi checks whether the entire value is
+a registered bare ID under `default_provider`, or across providers when no
+default provider is set. This preserves namespaced IDs such as
+`deepseek/deepseek-v4.1-flash-1017`. If both interpretations exist, the
+qualified pair wins. Use the full `routerAI/deepseek/...` form to pin the
+destination when model IDs contain a provider-like namespace.
+
+An unresolved configured default stops startup with the requested provider
+and model in the error. Use `pi --list-models` to inspect registered IDs and
+correct the settings, or override them with `--provider`/`--model`.
+Explicit CLI choices and restored sessions retain their precedence;
+`model_roles.default` (also spelled `modelRoles.default`) outranks the
+legacy `default_provider`/`default_model` settings.
+
+An explicit `--provider` selects the declared provider before checking model
+credentials. Separately declared extension providers remain distinct even if
+their names are built-in aliases. Undeclared aliases still resolve normally.
+With `--model` alone, a matching `default_provider` is preferred; if that
+provider does not supply the requested model, Pi warns before using another
+provider that does.
+
+The same declared-provider lookup applies to extension model switches, RPC
+`set_model`, the classic `/model` command, and saved-model restoration. Pi
+resolves explicit destinations against the complete runtime catalog before
+checking credentials. A provider omitted from the ready-model picker still
+owns its name, so its missing credentials cannot redirect an explicit request
+to another declared provider with an alias-like name.
+
+Unlisted native model IDs can still use the native provider's routing defaults.
+If a separately declared provider owns a built-in alias such as `open-router`
+or `gemini`, its missing models do not inherit the built-in route. Register the
+requested model under that provider, or select a registered pair shown by
+`pi --list-models` (or `/model` in the classic UI). Rejected explicit runtime
+switches preserve the current model and session history. Native aliases that
+are not separately declared continue to select the registered native provider.
+
+Per-model `retry.fallbackChains` keys use the same complete catalog to identify
+their provider. A separately declared provider cannot borrow another provider's
+chain merely because their names are built-in aliases, even when one is absent
+from the ready-model list. Role keys still take precedence over per-model keys;
+native aliases continue to share a chain when they resolve to the same provider.
+If an extension selects a different declared provider after a request fails,
+recovery leaves that selection in place for the next request.
+
+An active model scope still controls automatic selection. If a valid
+configured default or default role is outside that scope, Pi uses the first
+allowed scoped model and warns with both destinations. Check
+`enabled_models`, `--models`, `disabled_providers`, workspace scope overrides,
+and credentials when this happens. Missing defaults never take this fallback.
+Without a configured default, the normal scope-order and automatic selection
+behavior is unchanged.
+
+A nonempty `enabled_models`, `--models`, or workspace model scope that leaves
+no usable allowed models stops automatic startup. Check the patterns,
+credentials, and disabled providers with the diagnostic and `pi --list-models`.
+Explicit CLI selections and valid restored sessions retain their existing
+precedence. An explicitly empty list still clears the inherited scope.
+
+With `--provider` alone, Pi may use that provider's ready default when the
+configured model is incompatible, unavailable, or lacks credentials; it
+reports the substitution. A nonblank `--api-key` lets Pi retain a matching
+configured model that has no stored credentials. Without a provider override
+or scope exclusion, Pi keeps the configured destination for credential setup
+instead of switching providers.
+
+Editor sessions started through ACP follow the same configured-model and scope
+rules. When no explicit, saved, role, configured-model, or scoped choice applies,
+ACP uses its available-model list in order, preferring `default_provider` when
+that provider is available. This automatic fallback stays within that list.
+Permitted substitutions are reported on stderr, and an unresolved configured
+model returns an error to the editor.
+
+Startup records a switch between separately declared providers even when they
+share the same model ID or their names are built-in aliases. Continuing the
+session therefore restores the selected provider. Runtime model switches also
+retain those identities in selection, cycling, and session history. Reopening
+an ACP session preserves its selected branch's saved model and thinking level
+ahead of new launch defaults.
+
 Example:
 
 ```json
@@ -84,6 +179,58 @@ Example:
   "enabled_models": ["claude-*", "gpt-*"]
 }
 ```
+
+### Advisor
+
+Assign an advisor model through `modelRoles.advisor` to review substantial completed
+turns. The advisor uses its own provider and compact context.
+
+```json
+{
+  "modelRoles": { "advisor": "provider/model" },
+  "advisor": {
+    "enabled": true,
+    "timeoutSecs": 15,
+    "continueSeverity": "concern"
+  }
+}
+```
+
+- `advisor.enabled` defaults to `true` when an advisor model is configured.
+- `advisor.timeout_secs` (alias `timeoutSecs`) defaults to `15` seconds per review.
+  A configured main-turn time limit also bounds the review's remaining time.
+- `advisor.continue_severity` (alias `continueSeverity`) is the lowest verdict
+  that automatically resumes a completed main-agent turn. The default is
+  `concern`, matching OMP 18.12.1. Use `blocker` to continue only for blockers,
+  or `nit` to include notes; `note` is accepted as an alias for `nit`.
+
+A qualifying verdict reaches the main agent through its ordinary steering queue,
+and the original request returns the resulting corrected answer. Completed tools
+and the authored prompt are retained in history. Lower-severity notes remain
+queued for a later turn.
+
+Both native interactive interfaces display each note as soon as it is recorded
+and any required session save succeeds, including notes held below the continuation
+threshold. Delivering the queued note into a later model request does not display
+it again.
+
+Each authored request permits at most **two automatic advisor continuations**.
+The reservation and advisor note are saved before the additional provider request,
+so retrying or reopening the same session cannot reset the limit. A new authored
+prompt starts a fresh budget. Further notes remain queued when the limit is reached.
+
+Advisor reviews and automatic continuations use the main turn's remaining
+wall-clock allowance; a continuation does not grant another full time allowance.
+`max_tool_iterations` remains the native limit for each core pass, including
+each of the at most two advisor continuations. Reaching that
+limit, a length limit, an error, cancellation, or a plan pause does not restart the
+main agent. Extension-generated text and custom messages do not renew the advisor
+continuation budget.
+
+Automatic continuation respects cancellation, the remaining time budget, paused
+queue lanes, and plan review. Advisor provider failures are isolated from the main
+turn; a session save failure retains the existing provider-admission fence.
+Advisor settings merge field by field across global and project configuration.
 
 ### Message delivery (queue modes)
 
@@ -138,7 +285,10 @@ Accessor defaults:
 ### Retry (defaults)
 
 Accessor defaults:
-- `retry.enabled`: `true`
+
+- `retry.enabled`: `true` (master switch for automatic recovery)
+- `retry.model_fallback`: `true` (allow recovery to switch models)
+- `retry.fallback_on`: `"any"` (which eligible failures may switch models)
 - `retry.max_retries`: `3`
 - `retry.base_delay_ms`: `2000`
 - `retry.max_delay_ms`: `60000`
@@ -147,12 +297,36 @@ Accessor defaults:
 {
   "retry": {
     "enabled": true,
+    "model_fallback": true,
+    "fallback_on": "any",
     "max_retries": 3,
     "base_delay_ms": 2000,
     "max_delay_ms": 60000
   }
 }
 ```
+
+Set `model_fallback` to `false` to retain same-model retries while preventing
+automatic model changes. A configured `fallbackChains` entry is still required
+before any model can be selected as a fallback.
+
+`fallback_on` accepts three values:
+
+| Value | Eligible failures that may switch models |
+|---|---|
+| `any` | All failures admitted by the recovery classifier |
+| `usage-limit` | Account quota, subscription window, or credit exhaustion |
+| `except-usage-limit` | Transient failures other than account usage exhaustion |
+
+Explicit per-minute, per-second, and concurrency throttles are distinguished
+from account exhaustion. A bare HTTP 402 or 429 without finer diagnostic
+evidence is treated as a usage limit. These filters do not permit recovery from
+authentication failures, context overflow, cancellation, or session-persistence
+failures, and they do not change the same-model retry budget.
+
+Camel-case aliases `modelFallback` and `fallbackOn` are accepted. The default
+interactive `/settings` panel can change both preferences live and persist them.
+Editing them while automatic recovery is off keeps recovery off.
 
 ### Search
 
@@ -186,13 +360,101 @@ Accessor defaults:
 - `shell_path` (string): Shell binary path. Default `/bin/bash`.
 - `shell_command_prefix` (string): Default `set -e`.
 - `gh_path` (string): Override path to `gh` for `/share`. Alias: `ghPath`.
+- `bash.persistent` (bool): Retain native Bash variables, arrays, functions,
+  aliases, options, umask, and working directory between foreground calls on
+  Unix. Default `true`; explicit background jobs remain isolated. State is
+  saved after normal completion, including an ordinary nonzero result.
+  `exit`, shell abort, timeout, and cancellation retain the previous state.
+  Overlapping calls use temporary shells and report that their changes will
+  not persist. See [Bash shell state](tools/bash.md#persistent-shell-state).
+- `bash.auto_background.enabled` (bool): Automatically promote eligible
+  non-PTY Bash commands to managed background jobs. Default `true`.
+  Alias for the object: `autoBackground`.
+- `bash.auto_background.threshold_ms` (integer): Foreground wait before
+  promotion, in milliseconds. Default `60000`; values above `600000` are
+  clamped. `0` promotes immediately. Alias: `thresholdMs`.
 
 ```json
 {
   "shell_path": "/bin/bash",
-  "shell_command_prefix": "set -e"
+  "shell_command_prefix": "set -e",
+  "bash": {
+    "persistent": true,
+    "autoBackground": {
+      "enabled": true,
+      "thresholdMs": 60000
+    }
+  }
 }
 ```
+
+Promotion keeps the same process and execution deadline. A call whose timeout
+expires at or before the threshold uses the direct foreground runner. Explicit
+`background: true` starts immediately; `background: false` keeps the direct
+foreground runner for that call. Automatic promotion is disabled for PTY calls.
+
+Automatic mode uses managed-job storage, including a **16 MiB artifact cap**
+even when the command finishes before promotion. Set `enabled` to `false`, or
+pass `background: false`, to retain the direct runner's larger spill limit.
+Project settings merge the enabled flag and threshold independently, so setting
+one does not discard the other. See [Bash execution and background jobs](tools/bash.md)
+for timeouts, cancellation, output limits, and examples.
+
+### Project memory
+
+`memory.backend` is `"off"` by default. Set it to `"local"` to enable the
+project-scoped SQLite memory bank, its `retain`, `recall`, `reflect`,
+`memory_edit`, and `learn` tools, and a budget-capped startup memory block.
+
+```json
+{
+  "memory": { "backend": "local" },
+  "secrets": { "extra_patterns": ["ACME-[A-Za-z0-9]{24}"] }
+}
+```
+
+Set it to `"cass"` to keep those same local features and also search the
+project's historical agent sessions during `recall`:
+
+```json
+{
+  "memory": { "backend": "cass" }
+}
+```
+
+CASS history is optional and currently supported on Unix. It uses the
+installed `cass` executable with lexical search and index maintenance
+disabled. A recent CASS version supporting `--no-maintenance` is required.
+Pi does not install CASS or build, repair, or refresh its index. Missing,
+incompatible, busy, or unavailable archives leave local memory usable;
+the recall result distinguishes unavailable history from an empty search.
+
+History search stays within the canonical project workspace and adds up to
+20 excerpts with source paths, line numbers, agent names, and provenance.
+These appear separately from durable memory IDs in the tool's `history`
+details and use `[cass:N]` citations in its text. Archive hits are not
+automatically retained or injected at startup. `/memory` continues to show
+the local bank, and `scope: "session"` reads never query CASS.
+For project recall, `includeHistory: false` requests only the local bank.
+This option and exact session reads remain available in plan mode; history
+search requires the usual process permission.
+
+Pi screens complete archived messages before making 2 KiB excerpts. It
+rejects partial archive content, limits combined subprocess output to
+256 KiB and accepted history text to 64 KiB, and uses a five-second process
+deadline. Queries over 4 KiB, excessive output, and timeouts produce a
+history status while preserving local results. Cancellation aborts recall.
+
+Project facts, tags, edited memories, and learned skills use the shared
+credential detector, including `secrets.extra_patterns`. Detected values
+are replaced with irreversible `[REDACTED_*]` markers before storage and
+before a learned skill's filename or description is derived. This memory
+privacy floor applies even when `secrets.mode` is `"off"`. Reads also screen
+older records before recall or startup injection; existing database rows
+are not rewritten by reading them.
+
+Shared `scope: "session"` keys retain their separate exact-text contract.
+They remain outside project recall, reflection, and startup memory.
 
 ### Subagents
 
@@ -261,6 +523,12 @@ Accessor defaults:
 - `computer.enable_computer` (bool): Default `false`. When `true`, activates `computer` tool.
 - `computer.require_approval` (bool): Default `true`. Requires operator approval for mouse/keyboard inputs.
 - `computer.screenshot_dir` (string): Destination directory for captured screen artifacts.
+
+Native backends:
+
+- **macOS**: a bundled Swift helper run with `/usr/bin/swift` (Xcode Command Line Tools). Screen Recording permission is needed for screenshots and for actions that list or select windows; Accessibility permission is needed for mouse, keyboard, scroll, window focus and `ax_tree`. Grant both to the terminal or application that runs pi.
+- **Linux on X11**: `xrandr`, `wmctrl`, `xprop`, `scrot`, `xdotool` and `xclip` on `PATH`, plus `python3` with PyGObject and AT-SPI 2 (`gi.repository.Atspi`) for `ax_tree`. `DISPLAY` must be set. A Wayland session is refused rather than driven through XWayland.
+- **Windows**: not implemented yet; every action fails with an error.
 
 ### Browser (headless Chromium automation)
 

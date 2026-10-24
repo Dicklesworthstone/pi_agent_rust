@@ -10,7 +10,7 @@ use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::{safe_canonicalize, strip_unc_prefix};
-use crate::model::{ContentBlock, ImageContent, TextContent};
+use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent};
 use crate::platform::{
     EffectiveModeAccessContext, UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, UNIX_ACCESS_WRITE,
     ensure_effective_mode_access,
@@ -33,6 +33,30 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
+
+pub(crate) mod bash_session;
+mod structured_json;
+mod structured_sqlite;
+
+/// Run an internal, resource-bounded data query before normal Pi startup.
+/// The worker receives admitted bytes and never loads project configuration,
+/// extensions, credentials, or another agent session.
+#[doc(hidden)]
+pub fn run_structured_read_worker_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os().skip(1);
+    let mode = args.next()?;
+    let worker: fn() -> i32 = if mode == "--internal-json-query" {
+        structured_json::run_json_worker
+    } else if mode == "--internal-sqlite-query" {
+        structured_sqlite::run_sqlite_worker
+    } else {
+        return None;
+    };
+    if args.next().is_some() {
+        return Some(2);
+    }
+    Some(worker())
+}
 
 // ============================================================================
 // Tool Trait
@@ -159,6 +183,76 @@ impl ToolEffects {
     }
 }
 
+/// Non-secret identity of the model currently serving the owning agent.
+///
+/// Keep provider and model separate: model identifiers can contain slashes,
+/// and child processes must not reinterpret them as a provider-qualified spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolModelSelection {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Live model affinity shared by one registry and its delegating tools.
+///
+/// The host publishes changes only when it installs a provider. A delegation
+/// captures [`Self::current`] once so queued children and retries retain the
+/// model selected for that request. Credentials are never stored here.
+#[derive(Clone, Default)]
+pub struct ToolModelScope {
+    current: Arc<Mutex<Option<ToolModelSelection>>>,
+}
+
+impl ToolModelScope {
+    /// Capture the active model, or `None` for an unattached tool registry.
+    #[must_use]
+    pub fn current(&self) -> Option<ToolModelSelection> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set(&self, provider: &str, model: &str) {
+        let selection =
+            (!provider.trim().is_empty() && !model.trim().is_empty()).then(|| ToolModelSelection {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            });
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = selection;
+    }
+}
+
+/// Borrowed authority to call tools through the owning Agent's execution path.
+///
+/// Implementations must enforce the live registry, approval, plan, cancellation
+/// and privacy policies. A tool receives this only for the current invocation;
+/// it must never retain it in an interpreter, registry snapshot or background
+/// task. Standalone tools do not acquire this authority implicitly.
+#[async_trait]
+pub trait ToolInvocationHost: Send + Sync {
+    /// `expected_session` is captured by the native caller before admission,
+    /// never supplied by guest code or resolved afresh at the first tool call.
+    async fn call_tool(
+        &self,
+        call: crate::model::ToolCall,
+        expected_session: &str,
+    ) -> Result<ToolOutput>;
+}
+
+/// Authority borrowed for one native invocation. A background-capable tool
+/// may ask for an owned privacy projection, but cannot retain this context or
+/// use it to extend the lifetime of Agent tool-call authority.
+pub struct ToolInvocationContext<'a> {
+    pub protect: &'a (dyn for<'p, 's> Fn(&'p [&'s str]) -> Result<Vec<String>> + Send + Sync),
+    pub host: Option<&'a dyn ToolInvocationHost>,
+    pub snapshot_privacy:
+        &'a (dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot + Send + Sync),
+}
+
 /// A tool that can be executed by the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -186,6 +280,61 @@ pub trait Tool: Send + Sync {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput>;
 
+    /// Execute with this invocation's live auxiliary-provider privacy policy.
+    /// Tools making a second model request use `protect` on complete source
+    /// fields before formatting or truncation. Ordinary tools retain their
+    /// normal execution path and do not capture session state in the registry.
+    ///
+    /// `protect` names its lifetimes with `for<'a, 'b>` because `#[async_trait]`
+    /// replaces elided lifetimes inside `Fn(..)` with method lifetimes, which
+    /// would make the callback accept only one caller-chosen borrow.
+    async fn execute_with_auxiliary_privacy(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+    ) -> Result<ToolOutput> {
+        let _ = protect;
+        self.execute(tool_call_id, input, on_update).await
+    }
+
+    /// Execute with an invocation-scoped host for policy-checked tool re-entry.
+    /// Ordinary tools keep their existing privacy-aware execution path. Eval
+    /// borrows the host while servicing its kernel's tool requests; the kernel
+    /// receives only serialized results, never a host or credential handle.
+    async fn execute_with_host(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+        host: &dyn ToolInvocationHost,
+    ) -> Result<ToolOutput> {
+        let _ = host;
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, protect)
+            .await
+    }
+
+    /// Execute with the current Agent's scoped authority and a lazy privacy
+    /// snapshot for explicitly backgrounded work. The default preserves the
+    /// existing host/auxiliary dispatch without cloning the secrets vault.
+    async fn execute_with_invocation(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        context: ToolInvocationContext<'_>,
+    ) -> Result<ToolOutput> {
+        if let Some(host) = context.host {
+            self.execute_with_host(tool_call_id, input, on_update, context.protect, host)
+                .await
+        } else {
+            self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
+                .await
+        }
+    }
+
     /// Declare the coarse side effects used by the agent scheduler.
     ///
     /// Defaults to local write effects so undeclared tools are serialized fail-closed.
@@ -194,15 +343,35 @@ pub trait Tool: Send + Sync {
         ToolEffects::write()
     }
 
+    /// Declare the effects of this invocation for execution and approval gates.
+    ///
+    /// Input-aware tools may narrow their coarse declaration only for branches
+    /// that cannot perform the stronger effects. Malformed inputs must retain
+    /// a conservative declaration. Ordinary tools keep their existing effects.
+    #[must_use]
+    fn effects_for_input(&self, _input: &serde_json::Value) -> ToolEffects {
+        self.effects()
+    }
+
     /// Attach the owning registry's live background-job session scope.
     /// Non-job tools intentionally ignore it.
     fn bind_job_session_scope(&mut self, _scope: crate::jobs::JobSessionScope) {}
+
+    /// Attach the owning registry's live provider/model identity.
+    /// Tools that do not delegate model work intentionally ignore it.
+    fn bind_model_scope(&mut self, _scope: ToolModelScope) {}
 
     /// Where the tool comes from. Extension-registered tools answer
     /// [`ToolOrigin::Extension`] so `setActiveTools` can shelve and restore
     /// them without touching built-in or MCP tools.
     fn origin(&self) -> ToolOrigin {
         ToolOrigin::BuiltIn
+    }
+
+    /// Exact owner of a mounted MCP wrapper. Names alone cannot establish
+    /// ownership: an extension or caller may deliberately use the same name.
+    fn mcp_manager(&self) -> Option<&Arc<crate::mcp::McpManager>> {
+        None
     }
 }
 
@@ -4185,7 +4354,7 @@ async fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
 /// symlinks before the prefix check, so e.g. `~/.pi/agent/skills/foo/SKILL.md`
 /// pointing at `/etc/passwd` resolves to `/etc/passwd` and fails the prefix
 /// test against both cwd and agent dir.
-fn enforce_read_scope_with_roots(
+pub(crate) fn enforce_read_scope_with_roots(
     path: &Path,
     cwd: &Path,
     agent_dir: &Path,
@@ -4232,7 +4401,8 @@ fn enforce_read_scope(path: &Path, cwd: &Path, workspace: &WorkspaceHandle) -> R
 #[derive(Debug, Clone, Default)]
 pub struct ProcessedFiles {
     pub text: String,
-    pub images: Vec<ImageContent>,
+    /// Image and media blocks in the order of their source file arguments.
+    pub attachments: Vec<ContentBlock>,
 }
 
 fn normalize_dot_segments(path: &Path) -> PathBuf {
@@ -4905,7 +5075,7 @@ fn append_file_notice_block(out: &mut String, path: &Path, notice: &str) {
     let _ = writeln!(out, "<file name=\"{path_str}\">\n{notice}\n</file>");
 }
 
-fn append_image_file_ref(out: &mut String, path: &Path, note: Option<&str>) {
+fn append_attachment_file_ref(out: &mut String, path: &Path, note: Option<&str>) {
     let path_str = escaped_file_tag_name(path);
     match note {
         Some(text) => {
@@ -4977,10 +5147,10 @@ fn maybe_append_image_argument(
 
     let base64_data =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
-    out.images.push(ImageContent {
+    out.attachments.push(ContentBlock::Image(ImageContent {
         data: base64_data,
         mime_type: resized.mime_type.to_string(),
-    });
+    }));
 
     let note = if resized.resized {
         if let (Some(ow), Some(oh), Some(w), Some(h)) = (
@@ -5005,16 +5175,40 @@ fn maybe_append_image_argument(
     } else {
         None
     };
-    append_image_file_ref(&mut out.text, absolute_path, note.as_deref());
+    append_attachment_file_ref(&mut out.text, absolute_path, note.as_deref());
     Ok(true)
 }
 
-/// Process `@file` arguments into a single text prefix and image attachments.
+fn append_media_argument(
+    out: &mut ProcessedFiles,
+    absolute_path: &Path,
+    bytes: &[u8],
+    mime_type: &str,
+) {
+    let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let name = absolute_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(crate::model::sanitize_media_name);
+    out.attachments.push(ContentBlock::Media(MediaContent {
+        data,
+        mime_type: mime_type.to_string(),
+        name,
+    }));
+    let note = format!(
+        "[Media: {mime_type}, {}]",
+        crate::model::format_media_size(bytes.len() as u64)
+    );
+    append_attachment_file_ref(&mut out.text, absolute_path, Some(&note));
+}
+
+/// Process `@file` arguments into a single text prefix and ordered attachments.
 ///
-/// Matches the legacy TypeScript behavior:
 /// - Resolves paths (including `~` expansion + macOS screenshot variants)
 /// - Skips empty files
 /// - For images: attaches image blocks and appends `<file name="...">...</file>` references
+/// - For supported video/audio extensions: attaches the unchanged bytes as media,
+///   bounded by the default inline media byte cap
 /// - For text: embeds the file contents inside `<file>` tags
 pub fn process_file_arguments(
     file_args: &[String],
@@ -5022,10 +5216,6 @@ pub fn process_file_arguments(
     auto_resize_images: bool,
     workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<ProcessedFiles> {
-    // bd-cv653.3.12: the workspace handle is threaded through for
-    // multi-root confinement; file args are read-only today (reads confine
-    // through the tool layer), so the handle is accepted and unused here.
-    let _ = workspace;
     let mut out = ProcessedFiles::default();
 
     for file_arg in file_args {
@@ -5061,34 +5251,52 @@ pub fn process_file_arguments(
             continue;
         }
 
-        if meta.len() > READ_TOOL_MAX_BYTES {
+        let media_mime_type = absolute_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(crate::media_tools::media_mime_type_for_extension);
+        let max_bytes = if media_mime_type.is_some() {
+            crate::media_tools::DEFAULT_MEDIA_MAX_BYTES
+        } else {
+            READ_TOOL_MAX_BYTES
+        };
+        if meta.len() > max_bytes {
             append_file_notice_block(
                 &mut out.text,
                 &absolute_path,
                 &format!(
                     "[File is too large ({} bytes). Max allowed is {} bytes.]",
                     meta.len(),
-                    READ_TOOL_MAX_BYTES
+                    max_bytes
                 ),
             );
             continue;
         }
 
-        let allowed_roots = [cwd.to_path_buf(), Config::global_dir()];
-        let bytes =
-            read_file_capped_within_roots_sync(&absolute_path, &allowed_roots, READ_TOOL_MAX_BYTES)
-                .map_err(|e| {
-                    Error::tool(
-                        "read",
-                        format!("Could not read file {}: {e}", absolute_path.display()),
-                    )
-                })?;
+        // Snapshot immediately before the confined open so additions and
+        // revocations on shared workspace handles apply to the actual read.
+        let mut allowed_roots = workspace.snapshot_or(cwd).all();
+        allowed_roots.push(Config::global_dir());
+        let bytes = read_file_capped_within_roots_sync(&absolute_path, &allowed_roots, max_bytes)
+            .map_err(|e| {
+            Error::tool(
+                "read",
+                format!("Could not read file {}: {e}", absolute_path.display()),
+            )
+        })?;
+        if bytes.is_empty() {
+            continue;
+        }
 
         if maybe_append_image_argument(&mut out, &absolute_path, &bytes, auto_resize_images)? {
             continue;
         }
 
-        append_text_file_block(&mut out.text, &absolute_path, &bytes);
+        if let Some(mime_type) = media_mime_type {
+            append_media_argument(&mut out, &absolute_path, &bytes, mime_type);
+        } else {
+            append_text_file_block(&mut out.text, &absolute_path, &bytes);
+        }
     }
 
     Ok(out)
@@ -5371,6 +5579,8 @@ pub struct ToolRegistry {
     /// Shared by bash/jobs/hub and rebound by [`crate::agent::AgentSession`]
     /// to the live session handle.
     job_session_scope: crate::jobs::JobSessionScope,
+    /// Shared by delegating tools and updated on every host provider switch.
+    model_scope: ToolModelScope,
     /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
     /// schema until promoted via `xdev promote`. Everything not in this set
     /// is in the schema (essential tier).
@@ -5383,13 +5593,16 @@ pub struct ToolRegistry {
     /// the model schema: host authorization must not disappear merely because
     /// the model cannot ask arbitrary questions.
     host_ask: crate::ask::AskTool,
+    /// Invocation policy retained when extension/MCP mounts publish a snapshot.
+    /// Set only when the host explicitly disables its built-in tool set.
+    builtins_disabled: bool,
     /// Back-pointer to the [`SharedToolRegistry`] this snapshot belongs to,
     /// so a hostcall holding only a snapshot can publish an update.
     shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
 }
 
 /// How the memory-bank tools are turned on, quoted in the `--tools` warning.
-const MEMORY_BANK_HOW: &str = "set memory.backend to \"local\" in settings.json";
+const MEMORY_BANK_HOW: &str = "set memory.backend to \"local\" or \"cass\" in settings.json";
 
 /// The requested tool names pi does not provide at all.
 ///
@@ -5436,6 +5649,24 @@ impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
         Self::with_mutation_recorder(enabled, cwd, config, None, None)
+    }
+
+    /// Construct an empty built-in set while retaining the host's picker policy.
+    /// Extensions and MCP tools may still be mounted afterward.
+    pub fn without_builtins(config: Option<&Config>) -> Self {
+        let mut registry = Self::from_tools(Vec::new());
+        registry.builtins_disabled = true;
+        registry.host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.and_then(|config| config.ask_policy.as_deref()),
+        ));
+        registry
+    }
+
+    /// Whether this invocation explicitly disabled host-provided built-in tools.
+    /// Extension and MCP mounts do not change this policy.
+    #[must_use]
+    pub const fn builtins_disabled(&self) -> bool {
+        self.builtins_disabled
     }
 
     /// The undo recorder attached at construction, if any.
@@ -5539,6 +5770,7 @@ impl ToolRegistry {
         ));
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let job_session_scope = crate::jobs::JobSessionScope::default();
+        let model_scope = ToolModelScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
         let image_auto_resize = config.is_none_or(Config::image_auto_resize);
@@ -5574,6 +5806,12 @@ impl ToolRegistry {
                 )),
                 "grep" => tools.push(Box::new(
                     GrepTool::with_backend(cwd, search_backend_from_config(config))
+                        .with_url_policy(
+                            config
+                                .and_then(|c| c.read.as_ref())
+                                .and_then(|r| r.url_allow_private_targets)
+                                .unwrap_or(false),
+                        )
                         .with_workspace(workspace.clone()),
                 )),
                 "find" => tools.push(Box::new(
@@ -5682,6 +5920,10 @@ impl ToolRegistry {
                     tools.push(Box::new(
                         crate::subagents::SubagentTool::new(cwd)
                             .with_structured_results(structured_results)
+                            .with_workspace(workspace.clone())
+                            .with_secrets_settings(
+                                config.and_then(|config| config.secrets.as_ref()),
+                            )
                             .with_role_model_spec(role_model_spec),
                     ));
                 }
@@ -5696,21 +5938,25 @@ impl ToolRegistry {
         }
 
         // Memory bank (bd-cv653.4.1): retain/recall/reflect/memory_edit join
-        // the active set only when `memory.backend: local`; off (default)
-        // keeps them absent from the model's tool list entirely.
-        if config.is_some_and(|cfg| cfg.memory_backend() == "local")
+        // the active set with local or cass; cass adds read-only history to
+        // recall while retaining the local bank. Off keeps these tools absent.
+        if config.is_some_and(|cfg| matches!(cfg.memory_backend(), "local" | "cass"))
             && let Ok(store) = crate::memory::MemoryStore::open(cwd)
         {
-            let store = std::sync::Arc::new(store);
+            let store = std::sync::Arc::new(
+                store.with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
+            );
             tools.push(Box::new(crate::memory::RetainTool::new(
                 std::sync::Arc::clone(&store),
             )));
-            tools.push(Box::new(crate::memory::RecallTool::new(
-                std::sync::Arc::clone(&store),
-            )));
-            tools.push(Box::new(crate::memory::ReflectTool::new(
-                std::sync::Arc::clone(&store),
-            )));
+            tools.push(Box::new(
+                crate::memory::RecallTool::new(std::sync::Arc::clone(&store))
+                    .with_cass_history(config.is_some_and(|cfg| cfg.memory_backend() == "cass")),
+            ));
+            tools.push(Box::new(
+                crate::memory::ReflectTool::new(std::sync::Arc::clone(&store))
+                    .with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
+            ));
             tools.push(Box::new(crate::memory::MemoryEditTool::new(
                 std::sync::Arc::clone(&store),
             )));
@@ -5820,15 +6066,18 @@ impl ToolRegistry {
 
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
+            tool.bind_model_scope(model_scope.clone());
         }
 
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
             inactive: Vec::new(),
             job_session_scope,
+            model_scope,
             discoverable: discoverable_names,
             mutation_recorder,
             host_ask,
+            builtins_disabled: false,
             shared: None,
         }
     }
@@ -5846,22 +6095,26 @@ impl ToolRegistry {
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
         let job_session_scope = crate::jobs::JobSessionScope::default();
+        let model_scope = ToolModelScope::default();
         let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
+            tool.bind_model_scope(model_scope.clone());
         }
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
             inactive: Vec::new(),
             job_session_scope,
+            model_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
             host_ask,
+            builtins_disabled: false,
             shared: None,
         }
     }
 
-    /// Shallow copy: the same tool handles, job scope, discoverability set,
+    /// Shallow copy: the same tool handles, job/model scopes, discoverability set,
     /// and undo recorder. [`SharedToolRegistry::update`] publishes a new
     /// snapshot from it without disturbing readers of the previous one.
     #[must_use]
@@ -5870,9 +6123,11 @@ impl ToolRegistry {
             tools: self.tools.clone(),
             inactive: self.inactive.clone(),
             job_session_scope: self.job_session_scope.clone(),
+            model_scope: self.model_scope.clone(),
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
             host_ask: self.host_ask.clone(),
+            builtins_disabled: self.builtins_disabled,
             shared: self.shared.clone(),
         }
     }
@@ -5950,6 +6205,7 @@ impl ToolRegistry {
     /// Append a tool.
     pub fn push(&mut self, mut tool: Box<dyn Tool>) {
         tool.bind_job_session_scope(self.job_session_scope.clone());
+        tool.bind_model_scope(self.model_scope.clone());
         let name = tool.name();
         if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
             self.tools[pos] = Arc::from(tool);
@@ -5965,6 +6221,7 @@ impl ToolRegistry {
     {
         for mut tool in tools {
             tool.bind_job_session_scope(self.job_session_scope.clone());
+            tool.bind_model_scope(self.model_scope.clone());
             let name = tool.name();
             if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
                 self.tools[pos] = Arc::from(tool);
@@ -5972,6 +6229,56 @@ impl ToolRegistry {
                 self.tools.push(Arc::from(tool));
             }
         }
+    }
+
+    /// Reconcile one manager's authoritative catalog without replacing any
+    /// unrelated tool, including a currently shelved extension registration.
+    /// Old snapshots retain their Arc handles for calls already in flight.
+    pub(crate) fn reconcile_mcp_tools(
+        &mut self,
+        manager: &Arc<crate::mcp::McpManager>,
+        mut replacements: Vec<Box<dyn Tool>>,
+    ) -> usize {
+        let owned = |tool: &dyn Tool| {
+            tool.mcp_manager()
+                .is_some_and(|owner| Arc::ptr_eq(owner, manager))
+        };
+        let mut changed = 0usize;
+        self.tools.retain_mut(|tool| {
+            if !owned(tool.as_ref()) {
+                return true;
+            }
+            let Some(index) = replacements
+                .iter()
+                .position(|next| next.name() == tool.name())
+            else {
+                changed += 1;
+                return false;
+            };
+            let mut next = replacements.remove(index);
+            if next.description() != tool.description() || next.parameters() != tool.parameters() {
+                next.bind_job_session_scope(self.job_session_scope.clone());
+                next.bind_model_scope(self.model_scope.clone());
+                *tool = Arc::from(next);
+                changed += 1;
+            }
+            true
+        });
+        for mut next in replacements {
+            if self
+                .tools
+                .iter()
+                .chain(&self.inactive)
+                .any(|tool| tool.name() == next.name())
+            {
+                continue;
+            }
+            next.bind_job_session_scope(self.job_session_scope.clone());
+            next.bind_model_scope(self.model_scope.clone());
+            self.tools.push(Arc::from(next));
+            changed += 1;
+        }
+        changed
     }
 
     /// The shared scope captured by the job completion fetcher.
@@ -5983,6 +6290,12 @@ impl ToolRegistry {
     /// Rebind every job-aware tool and fetcher to a live session resolver.
     pub fn bind_job_session_resolver(&self, resolver: crate::jobs::JobSessionIdResolver) {
         self.job_session_scope.bind(resolver);
+    }
+
+    /// The live host model shared by every snapshot and delegating tool.
+    #[must_use]
+    pub fn model_scope(&self) -> ToolModelScope {
+        self.model_scope.clone()
     }
 
     /// Get all tools.
@@ -6017,6 +6330,9 @@ pub struct SharedToolRegistry {
 /// rebuilt from a snapshot observes and bumps the same version.
 pub struct SharedToolRegistryInner {
     registry: std::sync::RwLock<Arc<ToolRegistry>>,
+    /// Retained independently of wrappers, including an empty or denied
+    /// catalog, so a later successful refresh can mount newly added tools.
+    mcp_managers: std::sync::Mutex<Vec<Arc<crate::mcp::McpManager>>>,
     /// Bumped on every published update; the agent folds it into its tool
     /// schema cache key so a swap made from a hostcall (for example
     /// `setActiveTools`) reaches the next provider request without any
@@ -6027,10 +6343,21 @@ pub struct SharedToolRegistryInner {
 impl SharedToolRegistry {
     #[must_use]
     pub fn new(mut registry: ToolRegistry) -> Self {
+        let mut mcp_managers = registry
+            .shared_handle()
+            .map_or_else(Vec::new, |shared| shared.mcp_managers());
+        for tool in registry.tools() {
+            if let Some(manager) = tool.mcp_manager()
+                && !mcp_managers.iter().any(|bound| Arc::ptr_eq(bound, manager))
+            {
+                mcp_managers.push(Arc::clone(manager));
+            }
+        }
         let inner = Arc::new_cyclic(|weak| {
             registry.shared = Some(weak.clone());
             SharedToolRegistryInner {
                 registry: std::sync::RwLock::new(Arc::new(registry)),
+                mcp_managers: std::sync::Mutex::new(mcp_managers),
                 version: std::sync::atomic::AtomicU64::new(0),
             }
         });
@@ -6057,6 +6384,50 @@ impl SharedToolRegistry {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.inner.version.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn bind_mcp_manager(&self, manager: &Arc<crate::mcp::McpManager>) {
+        let mut managers = self
+            .inner
+            .mcp_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !managers.iter().any(|bound| Arc::ptr_eq(bound, manager)) {
+            managers.push(Arc::clone(manager));
+        }
+    }
+
+    pub(crate) fn mcp_managers(&self) -> Vec<Arc<crate::mcp::McpManager>> {
+        self.inner
+            .mcp_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    // The write guard spans the whole read-modify-write and the version bump:
+    // releasing it after the swap would let a reader pair the new snapshot
+    // with the old version.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn reconcile_mcp_tools(
+        &self,
+        manager: &Arc<crate::mcp::McpManager>,
+        replacements: Vec<Box<dyn Tool>>,
+    ) -> usize {
+        let mut guard = self
+            .inner
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.clone_shallow();
+        let changed = next.reconcile_mcp_tools(manager, replacements);
+        if changed > 0 {
+            *guard = Arc::new(next);
+            self.inner
+                .version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        changed
     }
 
     /// Publish a modified registry: shallow-copy the current snapshot, apply
@@ -6112,6 +6483,8 @@ struct ReadInput {
     limit: Option<i64>,
     #[serde(default)]
     hashline: bool,
+    #[serde(default)]
+    raw: bool,
 }
 
 pub struct ReadTool {
@@ -6219,6 +6592,79 @@ where
 }
 
 impl ReadTool {
+    async fn execute_json_query(
+        &self,
+        input: &ReadInput,
+        request: structured_json::QueryRequest,
+    ) -> Result<ToolOutput> {
+        if input.hashline {
+            return Err(Error::tool(
+                "read",
+                "[JSON_QUERY_HASHLINE] Query results are not source edit anchors; read the source path without q for hashline edits",
+            ));
+        }
+        let source = request.source_path.clone();
+        let bytes = if source.starts_with("http://") || source.starts_with("https://") {
+            let policy = if self.allow_private_urls {
+                crate::url_read::SsrfPolicy::AllowPrivateTargets
+            } else {
+                crate::url_read::SsrfPolicy::BlockPrivateTargets
+            };
+            let outcome =
+                crate::url_read::fetch(&source, policy, crate::url_read::UrlReadMode::SourceUtf8)
+                    .await?;
+            if outcome.download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[JSON_QUERY_INCOMPLETE] Cannot query a truncated download",
+                ));
+            }
+            outcome.content.into_bytes()
+        } else if crate::url_router::has_scheme(&source) {
+            crate::url_router::resolve(&source, &self.cwd)?
+                .content
+                .into_bytes()
+        } else {
+            let archive = crate::archive_read::parse_path(&source)?;
+            let source_path = archive
+                .as_ref()
+                .map_or(source.as_str(), |archive| archive.archive_path.as_str());
+            let path = resolve_read_path(source_path, &self.cwd);
+            let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
+            let mut roots = self.workspace.snapshot_or(&self.cwd).all();
+            roots.push(Config::global_dir());
+            asupersync::runtime::spawn_blocking(move || -> Result<Vec<u8>> {
+                let file = open_regular_file_within_roots_with(&path, &roots, || {})
+                    .map_err(|error| Error::tool("read", error.to_string()))?;
+                if let Some(archive) = archive {
+                    let outcome = crate::archive_read::read_open_file(file, &archive.member)?;
+                    if outcome.is_directory {
+                        return Err(Error::tool(
+                            "read",
+                            "[JSON_QUERY_SOURCE] Select a JSON archive member, not a directory",
+                        ));
+                    }
+                    Ok(outcome.content.into_bytes())
+                } else {
+                    read_open_file_capped_at(&file, structured_json::MAX_INPUT_BYTES as u64)
+                        .map_err(|error| {
+                            Error::tool(
+                                "read",
+                                format!("[JSON_QUERY_SOURCE] Cannot read JSON within the 10 MiB input limit: {error}"),
+                            )
+                        })
+                }
+            })
+            .await?
+        };
+        let mut outcome = structured_json::execute(request, bytes).await?;
+        outcome.metadata["source"] = serde_json::json!(source);
+        outcome.metadata["rendered"] = serde_json::json!(true);
+        let mut output = document_read_output(input, &outcome.content, outcome.metadata, true)?;
+        output.is_error = outcome.is_error;
+        Ok(output)
+    }
+
     /// Internal-scheme reads (bd-cv653.6.3): resolve via the URL router,
     /// then apply the same line-window/truncation contract as text files.
     async fn execute_scheme_read(&self, input: &ReadInput) -> Result<ToolOutput> {
@@ -6319,11 +6765,17 @@ impl ReadTool {
         } else {
             crate::url_read::SsrfPolicy::BlockPrivateTargets
         };
-        let mode = if raw {
+        let mode = if raw || input.raw {
             crate::url_read::UrlReadMode::Raw
         } else {
             crate::url_read::UrlReadMode::Reader
         };
+        if input.hashline && mode == crate::url_read::UrlReadMode::Reader {
+            return Err(Error::tool(
+                "read",
+                "[DOCUMENT_HASHLINE] Rendered URL lines are not source edit locations; save source text locally before using hashline edits",
+            ));
+        }
         let mut outcome = crate::url_read::fetch(&url, policy, mode).await?;
         if outcome.download_truncated {
             outcome.content.push_str(
@@ -6331,55 +6783,106 @@ impl ReadTool {
             );
         }
 
-        let lines: Vec<&str> = outcome.content.lines().collect();
-        let total_lines = lines.len();
-        let start_line = usize::try_from(input.offset.unwrap_or(1))
-            .unwrap_or(1)
-            .max(1);
-        if start_line > total_lines && total_lines > 0 {
-            return Err(Error::validation(format!(
-                "Offset {start_line} is beyond end of URL content ({total_lines} lines total)"
-            )));
-        }
-        let limit = usize::try_from(input.limit.unwrap_or(2000))
-            .unwrap_or(2000)
-            .max(1);
-        let end_line = start_line
-            .saturating_add(limit)
-            .saturating_sub(1)
-            .min(total_lines);
-        let window = if total_lines == 0 {
-            String::new()
-        } else {
-            lines[(start_line - 1)..end_line].join("\n")
-        };
-
-        let mut output_text = window;
-        if end_line < total_lines {
-            let next_offset = end_line + 1;
-            let _ = std::fmt::Write::write_fmt(
-                &mut output_text,
-                format_args!(
-                    "\n\n[Showing lines {start_line}-{end_line} of {total_lines}. Use offset={next_offset} to continue.]"
-                ),
-            );
-        }
-
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(output_text))],
-            details: Some(serde_json::json!({
+        document_read_output(
+            input,
+            &outcome.content,
+            serde_json::json!({
                 "url": outcome.final_url,
                 "contentType": outcome.kind.as_str(),
                 "wireContentType": outcome.wire_content_type,
                 "extractor": outcome.extractor,
-                "totalLines": total_lines,
-                "offset": start_line,
-                "limit": limit,
-                "truncated": end_line < total_lines || outcome.download_truncated,
-            })),
-            is_error: false,
-        })
+                "downloadTruncated": outcome.download_truncated,
+            }),
+            false,
+        )
     }
+}
+
+/// Window rendered documents without returning their full text a second time
+/// in `details`. Offsets address the projection, never the source's edit lines.
+fn document_read_output(
+    input: &ReadInput,
+    content: &str,
+    mut details: serde_json::Value,
+    numbered: bool,
+) -> Result<ToolOutput> {
+    let total_lines = content.lines().count();
+    let start = usize::try_from(input.offset.unwrap_or(1))
+        .unwrap_or(1)
+        .max(1);
+    if start > total_lines && total_lines > 0 {
+        return Err(Error::tool(
+            "read",
+            format!("Offset {start} is beyond end of document ({total_lines} lines total)"),
+        ));
+    }
+    let limit = usize::try_from(input.limit.unwrap_or(DEFAULT_MAX_LINES as i64))
+        .unwrap_or(DEFAULT_MAX_LINES)
+        .clamp(1, DEFAULT_MAX_LINES);
+    let width = start
+        .saturating_add(limit)
+        .saturating_sub(1)
+        .min(total_lines)
+        .to_string()
+        .len()
+        .max(5);
+    let mut output_text = String::new();
+    let mut shown = 0usize;
+    let mut byte_limited = false;
+    for (index, line) in content.lines().skip(start - 1).take(limit).enumerate() {
+        let prefix = if numbered {
+            format!("{:>width$}→", start + index)
+        } else {
+            String::new()
+        };
+        let additional = line
+            .len()
+            .saturating_add(prefix.len())
+            .saturating_add(usize::from(shown > 0));
+        if additional > DEFAULT_MAX_BYTES.saturating_sub(output_text.len()) {
+            if shown == 0 {
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "[DOCUMENT_LINE_LIMIT] Rendered line {start} exceeds the {} byte output limit; read the source with raw=true or inspect it with a format-specific tool",
+                        DEFAULT_MAX_BYTES
+                    ),
+                ));
+            }
+            byte_limited = true;
+            break;
+        }
+        if shown > 0 {
+            output_text.push('\n');
+        }
+        output_text.push_str(&prefix);
+        output_text.push_str(line);
+        shown += 1;
+    }
+    let end = start.saturating_sub(1).saturating_add(shown);
+    let remaining = end < total_lines;
+    if remaining {
+        let next = end + 1;
+        let _ = write!(
+            output_text,
+            "\n\n[Showing lines {start}-{end} of {total_lines}. Use offset={next} to continue.]"
+        );
+    }
+    let source_truncated = details["downloadTruncated"].as_bool().unwrap_or(false);
+    details["totalLines"] = serde_json::json!(total_lines);
+    details["offset"] = serde_json::json!(start);
+    details["limit"] = serde_json::json!(limit);
+    details["outputLines"] = serde_json::json!(shown);
+    details["truncated"] = serde_json::json!(remaining || source_truncated);
+    details["byteLimited"] = serde_json::json!(byte_limited);
+    if remaining {
+        details["nextOffset"] = serde_json::json!(end + 1);
+    }
+    Ok(ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(output_text))],
+        details: Some(details),
+        is_error: false,
+    })
 }
 
 #[async_trait]
@@ -6392,7 +6895,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 1MB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+        "Read local files, document URLs, ZIP archive members, images (jpg, png, gif, webp), and video frames. Local videos return metadata and a contact sheet; clip.mp4:42 selects a zero-based frame, and clip.mp4:1m2s or :00:01:02 selects a timestamp. Video decoding requires ffmpeg/ffprobe with the fd protocol and does not support hashline or line windows. Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Browse local SQLite with data.sqlite, data.sqlite:table, :table:key, :table?where=...&order=column:desc&limit=N&offset=N, or data.sqlite?q=SELECT...; queries are read-only and include committed WAL data. Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, EPUB renders chapters, and notebooks render saved cells and outputs. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -6401,7 +6904,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read (relative or absolute)"
+                    "description": "File path, video.mp4[:frame-index|timestamp], archive.zip:member/path, http(s) URL, internal resource URL, JSON source?q=<jq filter>, or SQLite path[:table[:key]][?q=<SQL>|where=<predicate>&order=column:asc&limit=N&offset=N]. Video timestamps include 1m2s and 00:01:02; a bare integer is a zero-based frame. Encode literal query ampersands as %26; + remains arithmetic."
                 },
                 "offset": {
                     "type": "integer",
@@ -6414,6 +6917,10 @@ impl Tool for ReadTool {
                 "hashline": {
                     "type": "boolean",
                     "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Read original source text instead of converting a document or querying data. Use the source path without query selectors, with hashline=true for editing JSON. This differs from &raw=true in a JSON query, which prints returned strings without quotes."
                 }
             },
             "required": ["path"]
@@ -6446,6 +6953,12 @@ impl Tool for ReadTool {
             ));
         }
 
+        if !input.raw
+            && let Some(request) = structured_json::parse_path(&input.path)?
+        {
+            return self.execute_json_query(&input, request).await;
+        }
+
         // URL reads (bd-cv653.2.2): http(s) paths fetch + convert to
         // reader-mode markdown; pagination/truncation shapes match file reads.
         if input.path.starts_with("http://") || input.path.starts_with("https://") {
@@ -6461,15 +6974,48 @@ impl Tool for ReadTool {
             return self.execute_scheme_read(&input).await;
         }
 
-        let path = resolve_read_path(&input.path, &self.cwd);
+        let sqlite_request = if input.raw {
+            None
+        } else {
+            structured_sqlite::parse_path(&input.path)?
+        };
+        let file_path = sqlite_request
+            .as_ref()
+            .map_or(input.path.as_str(), |request| request.source_path.as_str());
+        let archive_path = crate::archive_read::parse_path(file_path)?
+            .filter(|archive| !input.raw || !archive.member.is_empty());
+        // Preserve literal colon filenames before interpreting a video frame
+        // selector. Even that existence probe stays within the read scope.
+        // Archive members and SQLite selectors keep their own routing rules.
+        let video_target = if input.raw || sqlite_request.is_some() || archive_path.is_some() {
+            None
+        } else {
+            let literal_exists = if input.path.contains(':') {
+                let literal_path = resolve_read_path(&input.path, &self.cwd);
+                enforce_read_scope(&literal_path, &self.cwd, &self.workspace)?.is_file()
+            } else {
+                false
+            };
+            crate::media_tools::video::parse_target(&input.path, literal_exists)?
+        };
+        let source_path = archive_path.as_ref().map_or_else(
+            || {
+                video_target
+                    .as_ref()
+                    .map_or(file_path, |video| video.path.as_str())
+            },
+            |archive| archive.archive_path.as_str(),
+        );
+        let path = resolve_read_path(source_path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
 
         let path_for_open = path.clone();
         let mut allowed_roots = self.workspace.snapshot_or(&self.cwd).all();
         allowed_roots.push(Config::global_dir());
+        let sqlite_roots = allowed_roots.clone();
         #[cfg(test)]
         let after_open_hook = self.after_open_hook.clone();
-        let (std_file, cache_file, meta, cache_deps) =
+        let (std_file, cache_file, meta, cache_deps, sqlite_magic) =
             asupersync::runtime::spawn_blocking_io(move || -> std::io::Result<_> {
                 let file =
                     open_regular_file_within_roots_with(&path_for_open, &allowed_roots, || {})?;
@@ -6482,10 +7028,69 @@ impl Tool for ReadTool {
                 let cache_deps = cache_file.as_ref().and_then(|cache_file| {
                     cache_dependency_for_open_file(&path_for_open, cache_file)
                 });
-                Ok((file, cache_file, metadata, cache_deps))
+                let mut prefix = [0_u8; 16];
+                let mut prefix_len = 0;
+                while prefix_len < prefix.len() {
+                    let read =
+                        positioned_file_read(&file, &mut prefix[prefix_len..], prefix_len as u64)?;
+                    if read == 0 {
+                        break;
+                    }
+                    prefix_len += read;
+                }
+                let sqlite_magic = structured_sqlite::is_sqlite(&prefix[..prefix_len]);
+                Ok((file, cache_file, metadata, cache_deps, sqlite_magic))
             })
             .await
             .map_err(|err| Error::tool("read", err.to_string()))?;
+
+        // WAL commits can change results without modifying the main file.
+        // Query the admitted immutable snapshot before the ordinary file cache.
+        if !input.raw && archive_path.is_none() && sqlite_magic {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[SQLITE_HASHLINE] Database rows are read-only projections, not source edit anchors",
+                ));
+            }
+            let request = sqlite_request
+                .unwrap_or_else(|| structured_sqlite::QueryRequest::plain(input.path.clone()));
+            let mut outcome =
+                structured_sqlite::execute(request, std_file, path.clone(), sqlite_roots).await?;
+            outcome.metadata["path"] = serde_json::json!(path.to_string_lossy());
+            return document_read_output(&input, &outcome.content, outcome.metadata, true);
+        }
+        if sqlite_request
+            .as_ref()
+            .is_some_and(structured_sqlite::QueryRequest::has_selectors)
+        {
+            return Err(Error::tool(
+                "read",
+                "[SQLITE_READ] Table and SQL selectors require a SQLite format 3 database",
+            ));
+        }
+
+        if let Some(video) = video_target {
+            // Visual reads do not have source-line edit anchors or line
+            // windows. Check policy before looking up or spawning a decoder;
+            // video results never bypass it through the text result cache.
+            if self.block_images {
+                return Err(Error::tool("read", "Images are blocked by configuration"));
+            }
+            if input.hashline || input.offset.is_some() || input.limit.is_some() {
+                return Err(Error::tool(
+                    "read",
+                    "[VIDEO_READ_OPTIONS] Video frames do not support hashline, offset, or limit; use a frame or timestamp suffix on the path",
+                ));
+            }
+            return crate::media_tools::video::render_open_file(
+                std_file,
+                PathBuf::from(video.path),
+                video.selector,
+                crate::agent_cx::AgentCx::for_current_or_request(),
+            )
+            .await;
+        }
 
         let cache_key = tool_cache_key("read", &self.cwd, &input_value);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
@@ -6497,6 +7102,44 @@ impl Tool for ReadTool {
             if stable_deps.is_some() {
                 return Ok(output);
             }
+        }
+
+        if let Some(archive) = archive_path {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[ARCHIVE_HASHLINE] Archive members are read-only views and cannot provide source edit anchors",
+                ));
+            }
+            let outcome = asupersync::runtime::spawn_blocking(move || {
+                crate::archive_read::read_open_file(std_file, &archive.member)
+            })
+            .await?;
+            let output = document_read_output(
+                &input,
+                &outcome.content,
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "contentType": "archive",
+                    "extractor": "zip",
+                    "member": outcome.member,
+                    "isDirectory": outcome.is_directory,
+                    "entryCount": outcome.entry_count,
+                    "sourceBytes": meta.len(),
+                    "rendered": true,
+                }),
+                true,
+            )?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
         }
 
         let mut file = asupersync::fs::File::from_std(std_file);
@@ -6618,6 +7261,97 @@ impl Tool for ReadTool {
                 details: None,
                 is_error: false,
             });
+        }
+
+        // Documents are decoded from the admitted descriptor, never reopened
+        // by pathname after the scope check. Ordinary HTML remains source text
+        // for coding workflows; document reads expose useful saved content.
+        let document_mime = if input.raw {
+            None
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb"))
+        {
+            Some("application/x-ipynb+json")
+        } else if initial_bytes.starts_with(b"%PDF")
+            || path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            Some("application/pdf")
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            Some("application/epub+zip")
+        } else {
+            crate::document_read::recognize(&path.to_string_lossy(), "").map(|kind| match kind {
+                crate::document_read::DocumentKind::Docx => {
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                }
+                crate::document_read::DocumentKind::Pptx => {
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                }
+                crate::document_read::DocumentKind::Xlsx => {
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                }
+            })
+        };
+        if let Some(document_mime) = document_mime {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_HASHLINE] Rendered document lines are not source edit locations; use raw=true with hashline=true to read the original source",
+                ));
+            }
+            let bound = crate::url_read::MAX_DOWNLOAD_BYTES;
+            if meta.len() > bound as u64 {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_TOO_LARGE] Document input exceeds the 10 MiB conversion limit; use raw=true to inspect source text",
+                ));
+            }
+            let mut bytes = initial_bytes.to_vec();
+            let remaining = bound.saturating_sub(bytes.len());
+            file.take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| {
+                    Error::tool("read", format!("Failed to read document: {error}"))
+                })?;
+            if bytes.len() > bound {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_TOO_LARGE] Document grew beyond the 10 MiB conversion limit",
+                ));
+            }
+            let source = path.to_string_lossy().into_owned();
+            let outcome = asupersync::runtime::spawn_blocking(move || {
+                crate::url_read::convert_bytes(&source, document_mime, &bytes, false)
+            })
+            .await?;
+            let output = document_read_output(
+                &input,
+                &outcome.content,
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "contentType": outcome.kind.as_str(),
+                    "extractor": outcome.extractor,
+                    "sourceBytes": meta.len(),
+                    "rendered": true,
+                }),
+                true,
+            )?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
         }
 
         // Text path: optimized streaming read.
@@ -6980,6 +7714,7 @@ fn bash_cancellation_details(
 
 /// Dispatch to the pipe or PTY spawn path (bd-cv653.1.7) with an identical
 /// call shape, so the mediation gate's arms don't duplicate the branch.
+#[allow(clippy::too_many_arguments)]
 async fn execute_bash_spawn(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -6988,6 +7723,7 @@ async fn execute_bash_spawn(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     use_pty: bool,
+    shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
     if use_pty {
         run_bash_command_pty(
@@ -6997,16 +7733,18 @@ async fn execute_bash_spawn(
             command,
             timeout_secs,
             on_update,
+            shell_state,
         )
         .await
     } else {
-        run_bash_command(
+        run_bash_command_with_state(
             cwd,
             shell_path,
             command_prefix,
             command,
             timeout_secs,
             on_update,
+            shell_state,
         )
         .await
     }
@@ -7133,6 +7871,82 @@ fn absolute_path_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The `%PATHEXT%` extensions a program can be launched with, lowercase and
+/// without the dot: `com` and `exe` start through `CreateProcess`, `bat` and
+/// `cmd` through `cmd.exe` (the standard library does that, with its argument
+/// escaping). Scripts such as `.js` or `.vbs` need a host and are skipped.
+#[cfg(any(windows, test))]
+const LAUNCHABLE_WINDOWS_EXTENSIONS: [&str; 4] = ["com", "exe", "bat", "cmd"];
+
+/// Find the program a Windows shell would run for `name` (GH #182): each
+/// directory of `path_dirs` in order, trying the launchable extensions of
+/// `pathext` (`%PATHEXT%`, default `.COM;.EXE;.BAT;.CMD`) in their order.
+///
+/// The standard library's own `PATH` search only adds `.exe`, so a bare
+/// `npm` misses the Node.js installer's `npm.cmd`, while a hard-coded
+/// `npm.cmd` misses an `npm.exe` shim such as pnpm's. A `name` that already ends in a launchable
+/// extension is looked up as written. An extensionless file is never
+/// returned: Node.js installs a POSIX `npm` script next to `npm.cmd`, and
+/// Windows cannot start it. `None` for a name with a directory part.
+///
+/// Callers pass absolute directories only (see [`absolute_path_dirs`]), so a
+/// program in the current directory is never picked up through `PATH`.
+#[cfg(any(windows, test))]
+pub(crate) fn find_windows_program(
+    name: &str,
+    path_dirs: &[PathBuf],
+    pathext: Option<&std::ffi::OsStr>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\', ':']) {
+        return None;
+    }
+    let launchable = |ext: &str| {
+        LAUNCHABLE_WINDOWS_EXTENSIONS
+            .into_iter()
+            .find(|known| known.eq_ignore_ascii_case(ext))
+    };
+    let has_launchable_extension = name
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| launchable(ext).is_some());
+    let file_names: Vec<String> = if has_launchable_extension {
+        vec![name.to_string()]
+    } else {
+        let pathext = pathext.map(|value| value.to_string_lossy().into_owned());
+        let mut extensions: Vec<&str> = pathext
+            .as_deref()
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|ext| launchable(ext.trim().trim_start_matches('.')))
+            .collect();
+        if extensions.is_empty() {
+            extensions = LAUNCHABLE_WINDOWS_EXTENSIONS.to_vec();
+        }
+        extensions
+            .into_iter()
+            .map(|ext| format!("{name}.{ext}"))
+            .collect()
+    };
+    path_dirs
+        .iter()
+        .flat_map(|dir| file_names.iter().map(move |file| dir.join(file)))
+        .find(|candidate| is_file(candidate))
+}
+
+/// [`find_windows_program`] on this process's `PATH` and `PATHEXT`.
+#[cfg(any(windows, test))]
+pub(crate) fn find_windows_program_on_path(name: &str) -> Option<PathBuf> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| absolute_path_dirs(&path))
+        .unwrap_or_default();
+    find_windows_program(
+        name,
+        &path_dirs,
+        std::env::var_os("PATHEXT").as_deref(),
+        Path::is_file,
+    )
+}
+
 /// Whether `path` is WSL's `bash.exe` launcher (`System32\bash.exe`, or the
 /// Store app alias under `WindowsApps`), which runs the command inside the
 /// default Linux distro rather than on Windows.
@@ -7191,7 +8005,6 @@ fn find_windows_bash(env: &WindowsShellEnv, is_file: impl Fn(&Path) -> bool) -> 
         .find(|candidate| is_wsl_bash_launcher(candidate) && is_file(candidate))
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_bash_command(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -7199,6 +8012,28 @@ pub(crate) async fn run_bash_command(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+) -> Result<BashRunResult> {
+    run_bash_command_with_state(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
+        on_update,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_bash_command_with_state(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
@@ -7244,22 +8079,21 @@ pub(crate) async fn run_bash_command(
     // can be killed reliably even if the shell exits first.
     isolate_command_process_group(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
+    let child = spawn_command_with_job_discipline(&mut cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
-    attach_child_job_discipline(&child);
+    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree)
+        .with_shell_state(shell_state);
 
-    let stdout = child
-        .stdout
-        .take()
+    let stdout = guard
+        .child
+        .as_mut()
+        .and_then(|child| child.stdout.take())
         .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
+    let stderr = guard
+        .child
+        .as_mut()
+        .and_then(|child| child.stderr.take())
         .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
-
-    // Wrap in ProcessGuard for cleanup (including tree kill)
-    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
 
     // We use a bounded channel to provide backpressure. If the child process
     // produces output faster than the async loop can drain it (and spill to disk),
@@ -7478,9 +8312,16 @@ fn assemble_bash_run_result(
             .saturating_add(1);
         let end_line = truncation.total_lines;
 
-        let display_path = full_output_path.as_deref().unwrap_or("undefined");
+        let display_path = bash_output
+            .partial_output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| full_output_path.clone())
+            .unwrap_or_else(|| "unavailable".to_string());
         let file_limit_hit = bash_output.total_bytes > BASH_FILE_LIMIT_BYTES;
-        let output_qualifier = if file_limit_hit {
+        let output_qualifier = if bash_output.partial_output_path.is_some() {
+            "Partial output artifact".to_string()
+        } else if file_limit_hit {
             format!(
                 "Partial output (capped at {})",
                 format_size(BASH_FILE_LIMIT_BYTES)
@@ -7560,6 +8401,7 @@ pub(crate) async fn run_bash_command_pty(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -7609,10 +8451,11 @@ pub(crate) async fn run_bash_command_pty(
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work
     // exactly as they do for the pipe path's isolated process group.
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(pty_cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
+    let mut child = PtyProcessGuard::new(child, shell_state);
     // Drop our handle to the slave side so the master sees EOF when the child
     // exits; otherwise the pump thread would block forever.
     drop(pair.slave);
@@ -7657,7 +8500,7 @@ pub(crate) async fn run_bash_command_pty(
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(-1));
+                exit_code = Some(pty_exit_status_code(&status));
                 break;
             }
             Ok(None) => {}
@@ -7673,7 +8516,7 @@ pub(crate) async fn run_bash_command_pty(
             if now >= deadline {
                 let _ = child.kill();
                 if let Ok(status) = child.wait() {
-                    exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(-1));
+                    exit_code = Some(pty_exit_status_code(&status));
                 }
                 break;
             }
@@ -7742,7 +8585,7 @@ pub(crate) async fn run_bash_command_pty(
 
     // Reap the child to avoid zombies (belt-and-suspenders with try_wait).
     if let Ok(status) = child.wait() {
-        exit_code.get_or_insert_with(|| i32::try_from(status.exit_code()).unwrap_or(-1));
+        exit_code.get_or_insert_with(|| pty_exit_status_code(&status));
     }
 
     Ok(assemble_bash_run_result(
@@ -7789,292 +8632,230 @@ impl BashTool {
         self
     }
 
-    #[cfg(test)]
-    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-            shell_path: None,
-            command_prefix: None,
-            artifact_root: Some(artifact_root.to_path_buf()),
-            job_session_scope: crate::jobs::JobSessionScope::default(),
-            mediation: None,
+    async fn still_owns_foreground(&self, owner: &AgentCx, session_id: &str) -> Result<bool> {
+        if owner.checkpoint().is_err() {
+            return Ok(false);
         }
-    }
-}
-
-#[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
-impl Tool for BashTool {
-    fn name(&self) -> &str {
-        "bash"
-    }
-    fn label(&self) -> &str {
-        "bash"
-    }
-    fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable."
+        let current_session = self.job_session_scope.session_id().await?;
+        // Resolution may suspend while cancellation arrives. The caller must
+        // observe that cancellation before transferring process ownership.
+        Ok(owner.checkpoint().is_ok() && current_session == session_id)
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Bash command to execute"
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds (default 120; set 0 to disable)"
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "Run detached as a background job: returns a job id immediately; output streams to an artifact file and a completion notice arrives as a follow-up message. Manage with the jobs tool (list/wait/cancel)."
-                }
-            },
-            "required": ["command"]
-        })
-    }
-
-    fn effects(&self) -> ToolEffects {
-        ToolEffects::process().union(ToolEffects::write())
-    }
-
-    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
-        self.job_session_scope = scope;
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn execute(
+    /// Wait on the managed process itself; promotion transfers ownership and
+    /// never spawns or replays the user's command.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn execute_auto_background(
         &self,
         tool_call_id: &str,
-        input: serde_json::Value,
-        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
-        let input: BashInput =
-            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        let background_session_id = if input.background.unwrap_or(false) {
-            Some(self.job_session_scope.session_id().await?)
-        } else {
-            None
-        };
-
-        // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
-        // real pseudo-terminal when `bash.pty` is auto/always; the tool
-        // contract is identical either way.
-        let use_pty = match crate::bash_mediation::PtyMode::from_setting(
-            self.mediation.as_ref().and_then(|s| s.pty.as_deref()),
-        ) {
-            crate::bash_mediation::PtyMode::Off => false,
-            crate::bash_mediation::PtyMode::Always => true,
-            crate::bash_mediation::PtyMode::Auto => {
-                crate::bash_mediation::pty_required(&input.command)
-            }
-        };
-
-        // Mediation gate (bd-cv653.1.7): classify before spawn against
-        // `bash.mediation`. This runs on the execution path, so it applies
-        // whatever the approval mode said — including yolo — and `off` is
-        // byte-identical to the pre-mediation path. (`bash.mediationForced`
-        // was meant to select this; it turned out to be the only behaviour,
-        // and nothing reads the field. See `config::BashSettings`.)
-        if let Some(mediation) = &self.mediation {
-            let mode =
-                crate::bash_mediation::MediationMode::from_setting(mediation.mediation.as_deref());
-            if mode != crate::bash_mediation::MediationMode::Off {
-                // DCG policy bridge: imported allow_patterns from .dcg.toml
-                // (project + global) win over every classifier hit — users
-                // maintain ONE rule set.
-                let allows = crate::bash_mediation::import_dcg_overrides(
-                    &self.cwd,
-                    &crate::config::Config::global_dir(),
-                );
-                if crate::bash_mediation::covered_by_allow(&input.command, &allows) {
-                    let verdict = crate::bash_mediation::MediationVerdict::Allow { hits: vec![] };
-                    let _ = verdict;
-                } else {
-                    let verdict =
-                        crate::bash_mediation::assess(&input.command, mediation, mode, &self.cwd);
-                    match verdict {
-                        crate::bash_mediation::MediationVerdict::Allow { hits } => {
-                            if !hits.is_empty() {
-                                let payload =
-                                    crate::bash_mediation::MediationVerdict::Allow { hits }
-                                        .audit_payload(mode, &input.command);
-                                tracing::info!(
-                                    event = "pi.bash.mediation",
-                                    payload = %payload,
-                                    "bash mediation allow with hits"
-                                );
-                            }
-                        }
-                        crate::bash_mediation::MediationVerdict::Warn { hits } => {
-                            let payload = crate::bash_mediation::MediationVerdict::Warn { hits }
-                                .audit_payload(mode, &input.command);
-                            tracing::info!(
-                                event = "pi.bash.mediation",
-                                payload = %payload,
-                                "bash mediation warn"
-                            );
-                            let rules = payload["hits"]
-                                .as_array()
-                                .map(|hits| {
-                                    hits.iter()
-                                        .filter_map(|hit| hit["ruleId"].as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_default();
-                            if input.background.unwrap_or(false) {
-                                // Warn + background: annotate the job-start
-                                // result instead of blocking on foreground
-                                // output.
-                                let job = crate::jobs::spawn_background(
-                                    background_session_id.as_deref().ok_or_else(|| {
-                                        Error::tool(
-                                            "bash",
-                                            "background job session scope was not resolved"
-                                                .to_string(),
-                                        )
-                                    })?,
-                                    &self.cwd,
-                                    self.shell_path.as_deref(),
-                                    self.command_prefix.as_deref(),
-                                    &input.command,
-                                    input.timeout,
-                                    self.artifact_root.as_deref(),
-                                )?;
-                                let mut details = serde_json::to_value(&job)?;
-                                details["mediation"] = payload;
-                                return Ok(ToolOutput {
-                                    content: vec![ContentBlock::Text(TextContent::new(format!(
-                                        "[MEDIATION WARN: {rules}]\n\nBackground job {} started \
-                                         (pid {}). Output streams to {}. A completion notice \
-                                         will arrive as a follow-up message.",
-                                        job.id,
-                                        job.pid.map_or_else(
-                                            || "unknown".to_string(),
-                                            |pid| pid.to_string()
-                                        ),
-                                        job.artifact_path
-                                    )))],
-                                    details: Some(details),
-                                    is_error: false,
-                                });
-                            }
-                            let mut result = execute_bash_spawn(
-                                &self.cwd,
-                                self.shell_path.as_deref(),
-                                self.command_prefix.as_deref(),
-                                &input.command,
-                                input.timeout,
-                                on_update.as_deref(),
-                                use_pty,
-                            )
-                            .await?;
-                            result.output =
-                                format!("[MEDIATION WARN: {rules}]\n\n{}", result.output);
-                            return Ok(ToolOutput {
-                                content: vec![ContentBlock::Text(TextContent::new(result.output))],
-                                details: Some(payload),
-                                is_error: false,
-                            });
-                        }
-                        crate::bash_mediation::MediationVerdict::Block { hits } => {
-                            let payload = crate::bash_mediation::MediationVerdict::Block { hits }
-                                .audit_payload(mode, &input.command);
-                            tracing::info!(
-                                event = "pi.bash.mediation",
-                                payload = %payload,
-                                "bash mediation block"
-                            );
-                            let reasons = payload["hits"]
-                                .as_array()
-                                .map(|hits| {
-                                    hits.iter()
-                                        .map(|hit| {
-                                            format!(
-                                                "- {} [{}]: {}",
-                                                hit["ruleId"].as_str().unwrap_or("?"),
-                                                hit["tier"].as_str().unwrap_or("?"),
-                                                hit["reason"].as_str().unwrap_or("?"),
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                })
-                                .unwrap_or_default();
-                            return Ok(ToolOutput {
-                                content: vec![ContentBlock::Text(TextContent::new(format!(
-                                    "[MEDIATION BLOCK] command refused by bash.mediation mode '{}':\n{reasons}\n\nCommand: {}",
-                                    mode.as_str(),
-                                    input.command
-                                )))],
-                                details: Some(payload),
-                                is_error: true,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Background dispatch (bd-cv653.3.10): the mediation gate above has
-        // already classified the command; detached jobs run under the same
-        // timeout/tree-kill discipline via the jobs registry.
-        if input.background.unwrap_or(false) {
-            let job = match crate::jobs::spawn_background(
-                background_session_id.as_deref().ok_or_else(|| {
-                    Error::tool(
-                        "bash",
-                        "background job session scope was not resolved".to_string(),
-                    )
-                })?,
-                &self.cwd,
-                self.shell_path.as_deref(),
-                self.command_prefix.as_deref(),
-                &input.command,
-                input.timeout,
-                self.artifact_root.as_deref(),
-            ) {
-                Ok(job) => job,
-                Err(err) => {
-                    // Named refusals (PI_JOBS_AT_CAPACITY, …) surface as a
-                    // tool result the model can read, not a transport error.
-                    return Ok(ToolOutput {
-                        content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
-                        details: None,
-                        is_error: true,
-                    });
-                }
-            };
-            let details = serde_json::to_value(&job)?;
-            return Ok(ToolOutput {
-                content: vec![ContentBlock::Text(TextContent::new(format!(
-                    "Background job {} started (pid {}). Output streams to {}. \
-                     A completion notice will arrive as a follow-up message; \
-                     manage it with the jobs tool (list/wait/cancel).",
-                    job.id,
-                    job.pid
-                        .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
-                    job.artifact_path
-                )))],
-                details: Some(details),
-                is_error: false,
-            });
-        }
-
-        let result = execute_bash_spawn(
-            &self.cwd,
+        session_id: &str,
+        input: &BashInput,
+        threshold_ms: u64,
+        on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+        shell_state: Option<&bash_session::ShellTransaction>,
+    ) -> Result<Option<ToolOutput>> {
+        let owner = AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
+        let job = match crate::jobs::spawn_foreground(
+            session_id,
+            shell_state.map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd),
             self.shell_path.as_deref(),
             self.command_prefix.as_deref(),
             &input.command,
             input.timeout,
-            on_update.as_deref(),
-            use_pty,
-        )
-        .await?;
+            self.artifact_root.as_deref(),
+            shell_state,
+        ) {
+            Ok(job) => job,
+            // This named refusal precedes OS spawn, so falling back cannot
+            // execute the command twice. Other failures are never replayed.
+            Err(Error::Tool { message, .. }) if message.starts_with("PI_JOBS_AT_CAPACITY:") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let started = std::time::Instant::now();
+        let threshold = Duration::from_millis(threshold_ms);
+        let mut last_bytes = None;
+        loop {
+            let snapshot = job.snapshot()?;
+            // Preserve a completed exit even if cancellation arrives while
+            // the caller is observing the already settled output.
+            if snapshot.status != "running" {
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if !self.still_owns_foreground(&owner, session_id).await? {
+                let snapshot = job.cancel().await?;
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if last_bytes != Some(snapshot.output_bytes) {
+                if let Some(callback) = on_update {
+                    let preview =
+                        truncate_tail(snapshot.output_tail, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+                    callback(ToolUpdate {
+                        content: vec![ContentBlock::Text(TextContent::new(preview.content))],
+                        details: Some(serde_json::json!({
+                            "progress": {
+                                "elapsedMs": started.elapsed().as_millis(),
+                                "lineCount": snapshot.output_lines,
+                                "byteCount": snapshot.output_bytes,
+                            }
+                        })),
+                    });
+                }
+                last_bytes = Some(snapshot.output_bytes);
+            }
+            // An update callback or the session resolver can cancel the
+            // turn. Recheck after its await, immediately before promotion.
+            if !self.still_owns_foreground(&owner, session_id).await? {
+                let snapshot = job.cancel().await?;
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if started.elapsed() >= threshold {
+                return match job.promote()? {
+                    crate::jobs::ForegroundPromotion::Completed(snapshot) => self
+                        .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                        .map(Some),
+                    crate::jobs::ForegroundPromotion::Background(snapshot) => {
+                        Self::background_start_output(snapshot, true).map(Some)
+                    }
+                };
+            }
+            job.wait(
+                threshold
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(50)),
+            )
+            .await?;
+        }
+    }
 
+    fn background_start_output(
+        mut job: crate::jobs::JobSnapshot,
+        automatic: bool,
+    ) -> Result<ToolOutput> {
+        let preview = truncate_tail(job.output_tail, DEFAULT_MAX_LINES, 64 * 1024);
+        job.tail_truncated |= preview.truncated;
+        job.output_tail = preview.content;
+        let mut details = serde_json::to_value(&job)?;
+        details["autoBackgrounded"] = serde_json::json!(automatic);
+        let preview = truncate_tail(job.output_tail, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).content;
+        let mut text = if preview.is_empty() {
+            String::new()
+        } else {
+            format!("{preview}\n\n")
+        };
+        let reason = if automatic {
+            "Command continues in the background"
+        } else {
+            "Background job started"
+        };
+        let _ = write!(
+            text,
+            "{reason}: {} (pid {}). Output streams to {}. \
+             A completion notice will arrive as a follow-up message; \
+             manage it with the jobs tool (list/wait/cancel).",
+            job.id,
+            job.pid
+                .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+            job.artifact_path,
+        );
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    fn managed_bash_output(
+        &self,
+        tool_call_id: &str,
+        snapshot: crate::jobs::JobSnapshot,
+        timeout_secs: Option<u64>,
+    ) -> Result<ToolOutput> {
+        if snapshot.tail_truncated && snapshot.output_bytes == 0 {
+            return Err(Error::tool(
+                "bash",
+                "PI_JOBS_OUTPUT_UNAVAILABLE: command settled but its output snapshot is unavailable",
+            ));
+        }
+        let capture_complete = snapshot.output_complete
+            && !snapshot.artifact_truncated
+            && snapshot.artifact_error.is_none();
+        let mut state = BashOutputState::new(DEFAULT_MAX_BYTES.saturating_mul(2));
+        state.total_bytes = snapshot.output_bytes;
+        state.last_byte_was_newline = snapshot.output_tail.ends_with('\n');
+        state.line_count = snapshot.output_lines.saturating_sub(usize::from(
+            snapshot.output_bytes > 0 && !state.last_byte_was_newline,
+        ));
+        state.chunks_bytes = snapshot.output_tail.len();
+        state.chunks.push_back(snapshot.output_tail.into_bytes());
+        if capture_complete {
+            state.temp_file_path = Some(PathBuf::from(&snapshot.artifact_path));
+        } else {
+            state.partial_output_path = Some(PathBuf::from(&snapshot.artifact_path));
+        }
+        let timed_out = snapshot.status == "timedOut";
+        let cancelled = snapshot.status == "killed" || timed_out;
+        let cancellation_reason = if timed_out {
+            Some(BashCancellationReason::Timeout)
+        } else if cancelled {
+            Some(BashCancellationReason::AmbientCancellation)
+        } else {
+            None
+        };
+        let result = assemble_bash_run_result(
+            state,
+            snapshot.exit_code,
+            timed_out,
+            cancelled,
+            cancellation_reason,
+            match timeout_secs {
+                Some(0) => None,
+                Some(value) => Some(value),
+                None => Some(DEFAULT_BASH_TIMEOUT_SECS),
+            },
+        );
+        let mut output = self.bash_result_output(tool_call_id, result)?;
+        if cancelled
+            && !timed_out
+            && let Some(ContentBlock::Text(text)) = output.content.first_mut()
+        {
+            text.text.push_str("\n\nCommand cancelled");
+        }
+        if !capture_complete {
+            let warning = format!(
+                "\n\n[Command capture: outputComplete={}, artifactTruncated={}, artifactError={}. \
+                 Retained artifact: {}]",
+                snapshot.output_complete,
+                snapshot.artifact_truncated,
+                snapshot.artifact_error.as_deref().unwrap_or("none"),
+                snapshot.artifact_path,
+            );
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                text.text.push_str(&warning);
+            }
+            output.is_error |= !snapshot.output_complete;
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            details["capture"] = serde_json::json!({
+                "outputComplete": snapshot.output_complete,
+                "artifactTruncated": snapshot.artifact_truncated,
+                "artifactError": snapshot.artifact_error,
+                "artifactPath": snapshot.artifact_path,
+            });
+        }
+        Ok(output)
+    }
+
+    fn bash_result_output(&self, tool_call_id: &str, result: BashRunResult) -> Result<ToolOutput> {
         let mut details_map = serde_json::Map::new();
         if let Some(truncation) = result.truncation.as_ref() {
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
@@ -8118,6 +8899,387 @@ impl Tool for BashTool {
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error,
+        })
+    }
+
+    fn annotate_bash_mediation(
+        mut output: ToolOutput,
+        warning: &Option<(String, serde_json::Value)>,
+    ) -> ToolOutput {
+        if let Some((rules, payload)) = warning {
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                text.text = format!("[MEDIATION WARN: {rules}]\n\n{}", text.text);
+            }
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            // Foreground warnings historically exposed their audit fields
+            // at the top level. Keep that contract alongside execution
+            // metadata, without replacing a background job's own schema.
+            if details.get("schema").and_then(serde_json::Value::as_str)
+                != Some(crate::jobs::JOB_SCHEMA)
+                && let (Some(fields), Some(audit)) = (details.as_object_mut(), payload.as_object())
+            {
+                for (key, value) in audit {
+                    fields.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            details["mediation"] = payload.clone();
+        }
+        output
+    }
+
+    fn annotate_shell_state(mut output: ToolOutput, notice: Option<&str>) -> ToolOutput {
+        if let Some(notice) = notice {
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                let _ = write!(text.text, "\n\n[Shell state] {notice}");
+            }
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            details["shellState"] = serde_json::json!({
+                "mode": "temporary",
+                "notice": notice,
+            });
+        }
+        output
+    }
+
+    #[cfg(test)]
+    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            shell_path: None,
+            command_prefix: None,
+            artifact_root: Some(artifact_root.to_path_buf()),
+            job_session_scope: crate::jobs::JobSessionScope::default(),
+            mediation: None,
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+    fn label(&self) -> &str {
+        "bash"
+    }
+    fn description(&self) -> &str {
+        "Execute a bash command. On Unix, foreground calls retain Bash variables, arrays, functions, aliases, options, and working directory within this session, including after automatic promotion. State is saved when a command returns normally; exit, shell abort, timeout, or cancellation retain the previously saved state. Overlapping calls use a temporary shell and report that their state will not persist; explicit background jobs are isolated. Returns stdout and stderr, limited to the last 2000 lines or 1MB. Non-PTY calls automatically continue as background jobs after 60 seconds unless configured otherwise; manage them with jobs (list/wait/cancel). Automatic mode retains an artifact capped at 16MiB even when the command finishes inline. background:true starts immediately; background:false stays in the foreground with the larger direct-runner spill limit. Foreground/automatic timeout defaults to 120 seconds and still applies after promotion; explicit background defaults to 1800 seconds. Set timeout:0 to disable."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Bash command to execute"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (foreground/automatic default 120; explicit background default 1800; set 0 to disable). Automatic promotion preserves this deadline."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "true: start a background job immediately; false: keep this call in the foreground with the direct runner. If omitted, long-running non-PTY calls automatically background according to bash.autoBackground (default after 60 seconds). Automatic mode uses the 16MiB job artifact cap even before promotion. A completion notice arrives later; manage with jobs (list/wait/cancel)."
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::process().union(ToolEffects::write())
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: BashInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
+        // real pseudo-terminal when `bash.pty` is auto/always; the tool
+        // contract is identical either way.
+        let use_pty = match crate::bash_mediation::PtyMode::from_setting(
+            self.mediation.as_ref().and_then(|s| s.pty.as_deref()),
+        ) {
+            crate::bash_mediation::PtyMode::Off => false,
+            crate::bash_mediation::PtyMode::Always => true,
+            crate::bash_mediation::PtyMode::Auto => {
+                crate::bash_mediation::pty_required(&input.command)
+            }
+        };
+
+        let auto_settings = self
+            .mediation
+            .as_ref()
+            .and_then(|settings| settings.auto_background.as_ref());
+        let threshold_ms = auto_settings
+            .and_then(|settings| settings.threshold_ms)
+            .unwrap_or(60_000)
+            .min(600_000);
+        let timeout_secs = input.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        // A deadline that comes before promotion uses the ordinary foreground
+        // runner, avoiding a pointless job transition just before it expires.
+        let auto_background = input.background.is_none()
+            && !use_pty
+            && auto_settings
+                .and_then(|settings| settings.enabled)
+                .unwrap_or(true)
+            && (timeout_secs == 0 || timeout_secs.saturating_mul(1000) > threshold_ms);
+        let persistent = cfg!(unix)
+            && input.background != Some(true)
+            && self
+                .mediation
+                .as_ref()
+                .and_then(|settings| settings.persistent)
+                .unwrap_or(true);
+        let background_session_id =
+            if input.background == Some(true) || auto_background || persistent {
+                Some(self.job_session_scope.session_id().await?)
+            } else {
+                None
+            };
+        let mut shell_state = None;
+        let mut shell_notice = None;
+        if persistent {
+            let shell = self
+                .shell_path
+                .clone()
+                .map_or_else(default_bash_shell, Ok)?;
+            // Shell snapshots use native Bash declarations. An explicitly
+            // selected non-Bash shell continues using its existing runner.
+            if Path::new(&shell)
+                .file_name()
+                .is_some_and(|name| name == "bash")
+            {
+                match bash_session::acquire(
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "session shell scope was not resolved")
+                    })?,
+                    &self.cwd,
+                    &shell,
+                    self.command_prefix.as_deref(),
+                    &input.command,
+                )? {
+                    bash_session::Acquisition::Persistent(transaction) => {
+                        shell_state = Some(transaction)
+                    }
+                    bash_session::Acquisition::Temporary(notice) => shell_notice = Some(notice),
+                }
+            }
+        }
+        let execution_cwd = shell_state
+            .as_ref()
+            .map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd);
+        let mut mediation_warning = None;
+
+        // Mediation gate (bd-cv653.1.7): classify before spawn against
+        // `bash.mediation`. This runs on the execution path, so it applies
+        // whatever the approval mode said — including yolo — and `off` is
+        // byte-identical to the pre-mediation path. (`bash.mediationForced`
+        // was meant to select this; it turned out to be the only behaviour,
+        // and nothing reads the field. See `config::BashSettings`.)
+        if let Some(mediation) = &self.mediation {
+            let mode =
+                crate::bash_mediation::MediationMode::from_setting(mediation.mediation.as_deref());
+            if mode != crate::bash_mediation::MediationMode::Off {
+                // DCG policy bridge: imported allow_patterns from .dcg.toml
+                // (project + global) win over every classifier hit — users
+                // maintain ONE rule set.
+                let allows = crate::bash_mediation::import_dcg_overrides(
+                    execution_cwd,
+                    &crate::config::Config::global_dir(),
+                );
+                if crate::bash_mediation::covered_by_allow(&input.command, &allows) {
+                    let verdict = crate::bash_mediation::MediationVerdict::Allow { hits: vec![] };
+                    let _ = verdict;
+                } else {
+                    let verdict = crate::bash_mediation::assess(
+                        &input.command,
+                        mediation,
+                        mode,
+                        execution_cwd,
+                    );
+                    match verdict {
+                        crate::bash_mediation::MediationVerdict::Allow { hits } => {
+                            if !hits.is_empty() {
+                                let payload =
+                                    crate::bash_mediation::MediationVerdict::Allow { hits }
+                                        .audit_payload(mode, &input.command);
+                                tracing::info!(
+                                    event = "pi.bash.mediation",
+                                    payload = %payload,
+                                    "bash mediation allow with hits"
+                                );
+                            }
+                        }
+                        crate::bash_mediation::MediationVerdict::Warn { hits } => {
+                            let payload = crate::bash_mediation::MediationVerdict::Warn { hits }
+                                .audit_payload(mode, &input.command);
+                            tracing::info!(
+                                event = "pi.bash.mediation",
+                                payload = %payload,
+                                "bash mediation warn"
+                            );
+                            let rules = payload["hits"]
+                                .as_array()
+                                .map(|hits| {
+                                    hits.iter()
+                                        .filter_map(|hit| hit["ruleId"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            mediation_warning = Some((rules, payload));
+                        }
+                        crate::bash_mediation::MediationVerdict::Block { hits } => {
+                            let payload = crate::bash_mediation::MediationVerdict::Block { hits }
+                                .audit_payload(mode, &input.command);
+                            tracing::info!(
+                                event = "pi.bash.mediation",
+                                payload = %payload,
+                                "bash mediation block"
+                            );
+                            let reasons = payload["hits"]
+                                .as_array()
+                                .map(|hits| {
+                                    hits.iter()
+                                        .map(|hit| {
+                                            format!(
+                                                "- {} [{}]: {}",
+                                                hit["ruleId"].as_str().unwrap_or("?"),
+                                                hit["tier"].as_str().unwrap_or("?"),
+                                                hit["reason"].as_str().unwrap_or("?"),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default();
+                            return Ok(ToolOutput {
+                                content: vec![ContentBlock::Text(TextContent::new(format!(
+                                    "[MEDIATION BLOCK] command refused by bash.mediation mode '{}':\n{reasons}\n\nCommand: {}",
+                                    mode.as_str(),
+                                    input.command
+                                )))],
+                                details: Some(payload),
+                                is_error: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Every execution route passes the same mediation gate above.
+        if input.background == Some(true) {
+            let job = match crate::jobs::spawn_background(
+                background_session_id.as_deref().ok_or_else(|| {
+                    Error::tool("bash", "background job session scope was not resolved")
+                })?,
+                &self.cwd,
+                self.shell_path.as_deref(),
+                self.command_prefix.as_deref(),
+                &input.command,
+                input.timeout,
+                self.artifact_root.as_deref(),
+            ) {
+                Ok(job) => job,
+                Err(error) => {
+                    return Ok(Self::annotate_bash_mediation(
+                        ToolOutput {
+                            content: vec![ContentBlock::Text(TextContent::new(error.to_string()))],
+                            details: None,
+                            is_error: true,
+                        },
+                        &mediation_warning,
+                    ));
+                }
+            };
+            return Self::background_start_output(job, false)
+                .map(|output| Self::annotate_bash_mediation(output, &mediation_warning));
+        }
+
+        if shell_state.is_some()
+            && !self
+                .still_owns_foreground(
+                    &AgentCx::for_current_or_request(),
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "session shell scope was not resolved")
+                    })?,
+                )
+                .await?
+        {
+            return Err(Error::tool(
+                "bash",
+                "Command cancelled before the session shell could start",
+            ));
+        }
+
+        if auto_background
+            && let Some(output) = self
+                .execute_auto_background(
+                    tool_call_id,
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "managed job session scope was not resolved")
+                    })?,
+                    &input,
+                    threshold_ms,
+                    on_update.as_deref(),
+                    shell_state.as_ref(),
+                )
+                .await?
+        {
+            return Ok(Self::annotate_bash_mediation(
+                Self::annotate_shell_state(output, shell_notice),
+                &mediation_warning,
+            ));
+        }
+
+        let result = execute_bash_spawn(
+            execution_cwd,
+            self.shell_path.as_deref(),
+            if shell_state.is_some() {
+                None
+            } else {
+                self.command_prefix.as_deref()
+            },
+            shell_state.as_ref().map_or(
+                input.command.as_str(),
+                bash_session::ShellTransaction::command,
+            ),
+            input.timeout,
+            on_update.as_deref(),
+            use_pty,
+            shell_state.as_ref(),
+        )
+        .await?;
+
+        if let Some(shell_state) = &shell_state {
+            let owns_session = self
+                .still_owns_foreground(
+                    &AgentCx::for_current_or_request(),
+                    background_session_id.as_deref().unwrap_or_default(),
+                )
+                .await
+                .unwrap_or(false);
+            shell_state.finish(!result.cancelled && result.exit_code >= 0 && owns_session);
+        }
+
+        self.bash_result_output(tool_call_id, result).map(|output| {
+            Self::annotate_bash_mediation(
+                Self::annotate_shell_state(output, shell_notice),
+                &mediation_warning,
+            )
         })
     }
 }
@@ -8173,11 +9335,13 @@ impl Tool for JobsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage background bash jobs started with `bash {background: true}`. \
-         Actions: `list` (every job with status/pid/artifact), `wait` (block \
-         until the job settles, bounded), `cancel` (kill the whole process \
-         tree). Completion notices also arrive automatically as follow-up \
-         messages."
+        "Manage this session's background bash jobs, async subagent tasks and \
+         retained eval model requests. \
+         Actions: `list` (jobs with status/pid/artifact), `wait` (wait until a job \
+         settles, bounded; timeoutMs:0 polls), `cancel` (stop owned work and its \
+         child process tree). Native task snapshots include their complete \
+         protected ToolOutput in result after settlement. Completion notices \
+         also arrive automatically as follow-up messages."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -8265,9 +9429,21 @@ impl Tool for JobsTool {
                             jobs.iter()
                                 .map(|job| {
                                     format!(
-                                        "{}: {} (pid {}, exit {}, artifact {})",
+                                        "{}: {}{} (pid {}, exit {}, artifact {})",
                                         job["id"].as_str().unwrap_or("?"),
                                         job["status"].as_str().unwrap_or("?"),
+                                        if job.get("schema").and_then(serde_json::Value::as_str)
+                                            == Some("pi.host_job.v1")
+                                        {
+                                            format!(
+                                                " [{}]",
+                                                job.get("command")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or("native task")
+                                            )
+                                        } else {
+                                            String::new()
+                                        },
                                         job["pid"].as_i64().map_or_else(
                                             || "n/a".to_string(),
                                             |pid| pid.to_string()
@@ -8415,9 +9591,18 @@ impl Tool for LearnTool {
                 "learn requires a non-empty lesson".to_string(),
             ));
         }
-        let content = input.context.as_deref().map_or_else(
-            || input.lesson.clone(),
-            |ctx| format!("{}\n\nContext: {ctx}", input.lesson),
+        // Screen each source before composing the memory, and before
+        // truncating a description or slugifying a filename. Those operations
+        // can otherwise cut a key into an unrecognizable but still sensitive
+        // fragment, or defeat an anchored user credential pattern.
+        let lesson = self.store.screen_text(&input.lesson);
+        let context = input
+            .context
+            .as_deref()
+            .map(|context| self.store.screen_text(context));
+        let content = context.as_deref().map_or_else(
+            || lesson.clone(),
+            |context| format!("{lesson}\n\nContext: {context}"),
         );
         let memory = self.store.retain(
             crate::memory::MemoryKind::Lesson,
@@ -8428,14 +9613,17 @@ impl Tool for LearnTool {
         let mut lines = vec![format!("Lesson captured [{}].", memory.id)];
         let mut promoted: Option<serde_json::Value> = None;
         if input.promote.unwrap_or(false) {
-            let name = input
+            let requested_name = input
                 .skill_name
+                .as_deref()
+                .map(|name| self.store.screen_text(name));
+            let name = requested_name
                 .as_deref()
                 .map(slugify)
                 .filter(|slug| slug != "lesson")
-                .unwrap_or_else(|| slugify(&input.lesson));
-            let description: String = input.lesson.chars().take(200).collect();
-            match crate::skills_managed::create(&name, &description, &content) {
+                .unwrap_or_else(|| slugify(&lesson));
+            let description: String = lesson.chars().take(200).collect();
+            match crate::skills_managed::create(&name, &description, &memory.content) {
                 Ok(info) => {
                     lines.push(format!(
                         "Promoted to managed skill '{name}' ({}).",
@@ -8640,13 +9828,13 @@ struct HubInput {
     ready: Option<HubReadyInput>,
     /// Survive session exit (state file re-discovery).
     detached: Option<bool>,
-    /// `logs`: opaque cursor from a previous page (incremental read).
+    /// `logs`, `agent inbox`, or `agent wait`: cursor from a previous page.
     cursor: Option<u64>,
     /// `logs`: last N lines (snapshot read).
     tail: Option<usize>,
     /// `logs`: substring filter.
     grep: Option<String>,
-    /// `logs`: bounded wait for matching/new lines in milliseconds.
+    /// `logs` or `agent wait`: bounded wait in milliseconds.
     wait_ms: Option<u64>,
     /// `send`: literal text to write to the service's PTY stdin.
     text: Option<String>,
@@ -8657,11 +9845,11 @@ struct HubInput {
     /// `send`: signal name (SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGKILL).
     signal: Option<String>,
     /// `jobs`: list | wait | cancel.
-    /// `agent`: roster | transcript | steer | kill | revive | send | inbox.
+    /// `agent`: roster | transcript | steer | kill | revive | send | inbox | wait.
     action: Option<String>,
     /// `jobs`: job id for wait/cancel.
     job_id: Option<String>,
-    /// `agent steer|send`: sender label recorded on the bus message.
+    /// `agent steer|send`: parent label, or the authenticated child's own run id.
     from: Option<String>,
     /// `jobs`: wait budget in milliseconds.
     timeout_ms: Option<u64>,
@@ -8710,11 +9898,25 @@ impl Tool for HubTool {
          gates: ready.log regex AND ready.port TCP accept, both must pass \
          within ready.timeoutSecs — start returns only after readiness is \
          observed), `ps` (list services), `logs` (tail/grep/incremental \
-         cursor reads with bounded wait), `send` (PTY stdin: text, named \
+         cursor reads with bounded wait; raw logs retain the first 16 MiB \
+         per run, live tails keep streaming, and logCapture reports loss \
+         and I/O errors), `send` (PTY stdin: text, named \
          keys, signals), `stop` (graceful tree termination), `restart` \
          (retained launch spec), `describe` (full descriptor), `jobs` \
          (background bash jobs: list/wait/cancel), `agent` (subagent children: \
-         roster/transcript/steer/kill/revive/send/inbox)."
+         roster/transcript/steer/kill/revive/send/inbox/wait; revive executes a \
+         settled native child's original assignment with its retained launch \
+         policy and transcript context, and waits for the replacement result). \
+         Native children use agent roster/send/inbox to reach their parent's hub; \
+         roster returns selfId, send accepts a live sibling id or parent, and inbox \
+         defaults to the caller. Agent wait reads the caller's own inbox for replies \
+         from name (peer run id or parent), after cursor (a sent seq or prior wait \
+         nextCursor). Omit name to await any reply to your outstanding sends; \
+         automatic waits use the previous inbox/wait cursor, or omit it initially. \
+         unrelated running agents do not keep this wait open. It returns on \
+         messages, peer exit, a dependency cycle, no pending replies, retention loss, or waitMs \
+         (default 30000, range 1..60000). It does not send or consume messages. \
+         Include hub in a child's declared tools to enable messaging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -8726,7 +9928,7 @@ impl Tool for HubTool {
                     "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs", "agent"],
                     "description": "Operation"
                 },
-                "name": { "type": "string", "description": "Service name (unique per project)" },
+                "name": { "type": "string", "description": "Service name, child run id, or parent for agent send/inbox/wait; omit for agent wait to await outstanding replies automatically; a child inbox defaults to itself" },
                 "application": { "type": "string", "description": "Program to spawn (start)" },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Program arguments (start)" },
                 "cwd": { "type": "string", "description": "Working directory (start; default: session cwd)" },
@@ -8740,17 +9942,17 @@ impl Tool for HubTool {
                     },
                     "description": "Readiness gates; all supplied gates must pass"
                 },
-                "detached": { "type": "boolean", "description": "Survive session exit (default false)" },
-                "cursor": { "type": "integer", "description": "logs: opaque cursor for incremental reads" },
+                "detached": { "type": "boolean", "description": "Skip session-exit cleanup (default false); PTY ownership remains in this Pi process, with no cross-process reattachment" },
+                "cursor": { "type": "integer", "minimum": 0, "description": "logs/agent inbox: nextCursor; named agent wait: sent seq or prior nextCursor for the same peer; automatic wait: prior inbox/automatic wait nextCursor, or omit initially" },
                 "tail": { "type": "integer", "description": "logs: last N lines" },
                 "grep": { "type": "string", "description": "logs: substring filter" },
-                "waitMs": { "type": "integer", "description": "logs: bounded wait in ms (max 60000)" },
+                "waitMs": { "type": "integer", "description": "logs or agent wait: bounded wait in ms (max 60000); agent wait defaults to 30000 and requires at least 1" },
                 "text": { "type": "string", "description": "send: text for PTY stdin" },
                 "enter": { "type": "boolean", "description": "send: append ENTER after text (default true)" },
                 "keys": { "type": "array", "items": { "type": "string" }, "description": "send: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT)" },
                 "signal": { "type": "string", "description": "send: SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL" },
-                "action": { "type": "string", "enum": ["list", "wait", "cancel", "roster", "transcript", "steer", "kill", "revive", "send", "inbox"], "description": "jobs: list/wait/cancel; agent: roster/transcript/steer/kill/revive/send/inbox" },
-                "from": { "type": "string", "description": "agent steer/send: sender label recorded on the bus message" },
+                "action": { "type": "string", "enum": ["list", "wait", "cancel", "roster", "transcript", "steer", "kill", "revive", "send", "inbox"], "description": "jobs: list/wait/cancel; agent: roster/transcript/steer/kill/revive/send/inbox/wait" },
+                "from": { "type": "string", "description": "agent steer/send: parent sender label; native children may only identify themselves" },
                 "jobId": { "type": "string", "description": "jobs: job id for wait/cancel" },
                 "timeoutMs": { "type": "integer", "description": "jobs: wait budget in ms" }
             },
@@ -8771,33 +9973,273 @@ impl Tool for HubTool {
         &self,
         _tool_call_id: &str,
         input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let input: HubInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
-        let dispatched = self.dispatch(&op, &input).await;
-        let (text, details, is_error) = match dispatched {
-            Ok((text, details)) => (text, details, false),
+        let dispatched = if op == "agent"
+            && input
+                .action
+                .as_deref()
+                .is_some_and(|action| action.trim().eq_ignore_ascii_case("wait"))
+        {
+            Self::dispatch_agent_wait(&input).await
+        } else if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
+            Self::dispatch_inherited_agent(&input).await
+        } else if op == "agent"
+            && input
+                .action
+                .as_deref()
+                .is_some_and(|action| action.eq_ignore_ascii_case("revive"))
+        {
+            match input.name.as_deref().filter(|id| !id.trim().is_empty()) {
+                Some(id) => crate::subagents::revive_child(id, on_update).await,
+                None => Err(Error::validation(
+                    "hub agent revive requires name (child run id)",
+                )),
+            }
+        } else {
+            self.dispatch(&op, &input)
+                .await
+                .map(|(text, details)| ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    details: Some(details),
+                    is_error: false,
+                })
+        };
+        Ok(match dispatched {
+            Ok(output) => output,
             Err(err) => {
                 // Domain refusals (PI_HUB_*) surface as tool results the
                 // model can read, matching the jobs capacity contract.
-                (
-                    err.to_string(),
-                    serde_json::json!({ "error": err.to_string() }),
-                    true,
-                )
+                ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
+                    details: Some(serde_json::json!({ "error": err.to_string() })),
+                    is_error: true,
+                }
             }
-        };
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(text))],
-            details: Some(details),
-            is_error,
         })
     }
 }
 
 impl HubTool {
+    async fn dispatch_agent_wait(input: &HubInput) -> Result<ToolOutput> {
+        let result = crate::agent_hub::wait_for_replies(
+            input.name.as_deref(),
+            input.cursor,
+            input.wait_ms.unwrap_or(30_000),
+            input.from.as_deref(),
+        )
+        .await?;
+        let (text, details) =
+            Self::format_agent_reply(crate::agent_hub::ipc::Reply::Wait { result });
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    async fn dispatch_inherited_agent(input: &HubInput) -> Result<ToolOutput> {
+        use crate::agent_hub::ipc::{Action, Request, call_from_env};
+
+        let action = input.action.as_deref().unwrap_or("roster").trim();
+        let action = if action.eq_ignore_ascii_case("roster") {
+            Action::Roster
+        } else if action.eq_ignore_ascii_case("send") {
+            Action::Send
+        } else if action.eq_ignore_ascii_case("inbox") {
+            Action::Inbox
+        } else {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_IPC_ACTION: a native child may only use agent roster, send, or inbox",
+            ));
+        };
+        let reply = call_from_env(Request {
+            action,
+            name: input.name.clone(),
+            text: input.text.clone(),
+            claimed_from: input.from.clone(),
+            cursor: input.cursor,
+        })
+        .await?
+        .ok_or_else(|| Error::tool("hub", "PI_HUB_IPC_CONFIG: inherited channel is unavailable"))?;
+        let (text, details) = Self::format_agent_reply(reply);
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    fn format_agent_reply(reply: crate::agent_hub::ipc::Reply) -> (String, serde_json::Value) {
+        use crate::agent_hub::ipc::Reply;
+
+        match reply {
+            Reply::Roster {
+                self_id,
+                children,
+                truncated,
+            } => {
+                let lines = children
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{} [{} kind={}] {}",
+                            entry.id,
+                            entry.status.as_str(),
+                            entry.kind.as_str(),
+                            entry.task,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut text = format!(
+                    "You are {self_id}. {} child run(s):\n{}",
+                    children.len(),
+                    lines.join("\n"),
+                );
+                if truncated {
+                    text.push_str(
+                        "\n[Roster exceeds the response limit; showing a bounded prefix.]",
+                    );
+                }
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.roster/v1",
+                    "selfId": self_id,
+                    "children": children,
+                    "truncated": truncated,
+                });
+                (text, details)
+            }
+            Reply::Sent { message } => {
+                let text = format!("Message queued for {} (seq {}).", message.to, message.seq);
+                (text, serde_json::json!(message))
+            }
+            Reply::Inbox {
+                id,
+                messages,
+                next_cursor,
+                has_more,
+                oldest_cursor,
+            } => {
+                let text = if messages.is_empty() {
+                    format!("{id}: inbox empty.")
+                } else {
+                    let lines = messages
+                        .iter()
+                        .map(|message| {
+                            format!("#{} from {}: {}", message.seq, message.from, message.body)
+                        })
+                        .collect::<Vec<_>>();
+                    format!("{id}: {} message(s):\n{}", messages.len(), lines.join("\n"))
+                };
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.inbox/v1",
+                    "id": id,
+                    "messages": messages,
+                    "nextCursor": next_cursor,
+                    "hasMore": has_more,
+                    "oldestCursor": oldest_cursor,
+                });
+                (text, details)
+            }
+            Reply::Wait { result } => Self::format_wait_reply(&result),
+        }
+    }
+
+    fn format_wait_reply(
+        result: &crate::agent_hub::InboxWaitResult,
+    ) -> (String, serde_json::Value) {
+        use crate::agent_hub::InboxWaitStatus;
+
+        let mut text = match result.status {
+            InboxWaitStatus::Messages => result
+                .messages
+                .iter()
+                .map(|message| format!("#{} from {}: {}", message.seq, message.from, message.body))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            InboxWaitStatus::PeerStopped => format!(
+                "{} finished without a newer reply. Read its result or continue without the answer.",
+                result.peer.as_deref().unwrap_or("All messaged agents")
+            ),
+            InboxWaitStatus::PeerBlocked => format!(
+                "{} cannot reply before you finish: the wait depends on your result. Continue without the answer to break the dependency cycle.",
+                result.blocked_peers.join(", ")
+            ),
+            InboxWaitStatus::HistoryLost => format!(
+                "{}: inbox or pending-reply history after the requested cursor was evicted; inspect the reported gaps before continuing.",
+                result.id
+            ),
+            InboxWaitStatus::TimedOut => format!(
+                "Reply wait timed out; {} may still be working. Messages remain in the inbox.",
+                result.peer.as_deref().unwrap_or("an agent you messaged")
+            ),
+            InboxWaitStatus::Pending => "No newer reply yet.".to_string(),
+            InboxWaitStatus::NothingPending =>
+                "Nothing to wait for: no unanswered sends remain. Unrelated agents do not owe a reply.".to_string(),
+        };
+        if result.dropped_through_cursor != 0 && result.status != InboxWaitStatus::HistoryLost {
+            let _ = write!(
+                text,
+                "\n[Inbox history was evicted through sequence {}; earlier replies may be missing.]",
+                result.dropped_through_cursor
+            );
+        }
+        if result.dropped_tracking_through_cursor != 0 {
+            let _ = write!(
+                text,
+                "\n[Pending-reply tracking was evicted through sequence {}; older unanswered sends may be missing.]",
+                result.dropped_tracking_through_cursor
+            );
+        }
+        for reply in &result.pending_replies {
+            let _ = write!(
+                text,
+                "\n{}: sent at sequence {}, {}.",
+                reply.peer,
+                reply.sent_cursor,
+                if reply.blocked_on_caller {
+                    "waiting on your result"
+                } else if reply.can_reply {
+                    "reply still pending"
+                } else {
+                    "cannot reply in this run"
+                }
+            );
+        }
+        if result.has_more {
+            text.push_str(
+                "\n[More replies are available; continue with nextCursor and the same name selection.]",
+            );
+        }
+        let mut details = serde_json::json!(result);
+        details["schema"] = serde_json::json!("pi.agent-hub.wait/v1");
+        (text, details)
+    }
+
+    fn append_log_capture_notice(text: &mut String, capture: &crate::hub::LogCapture) {
+        if capture.truncated {
+            let _ = write!(
+                text,
+                "\n[Raw service log is incomplete: {} of {} bytes retained, {} omitted; \
+                 per-artifact limit {} bytes. Live tails are retained separately.]",
+                capture.retained_bytes,
+                capture.observed_bytes,
+                capture.dropped_bytes,
+                capture.byte_limit
+            );
+        }
+        if let Some(error) = &capture.write_error {
+            let _ = write!(text, "\n[Service log artifact error: {error}]");
+        }
+        if let Some(error) = &capture.read_error {
+            let _ = write!(text, "\n[Service output capture error: {error}]");
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch(&self, op: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
         let name_required = |op: &str| -> Result<String> {
@@ -8835,19 +10277,23 @@ impl HubTool {
                     ready,
                     detached: input.detached.unwrap_or(false),
                 };
-                let snapshot = crate::hub::start(&spec)?;
+                let snapshot = crate::hub::run_service_request(move |request| {
+                    crate::hub::start_for_request(&spec, request)
+                })
+                .await?;
                 let details = serde_json::to_value(&snapshot)?;
-                let text = format!(
+                let mut text = format!(
                     "Service '{name}' is running (pid {}, log: {}).",
                     snapshot
                         .pid
                         .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
                     snapshot.log_path
                 );
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
                 (text, details)
             }
             "ps" => {
-                let services = crate::hub::ps()?;
+                let services = crate::hub::run_service_request(|_| crate::hub::ps()).await?;
                 let details = serde_json::json!({
                     "schema": crate::hub::SERVICE_SCHEMA,
                     "services": services,
@@ -8858,7 +10304,7 @@ impl HubTool {
                     let lines: Vec<String> = services
                         .iter()
                         .map(|svc| {
-                            format!(
+                            let mut text = format!(
                                 "{}: {} (pid {}, command `{}`, log {})",
                                 svc.name,
                                 svc.status,
@@ -8866,7 +10312,9 @@ impl HubTool {
                                     .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
                                 svc.command,
                                 svc.log_path
-                            )
+                            );
+                            Self::append_log_capture_notice(&mut text, &svc.log_capture);
+                            text
                         })
                         .collect();
                     format!("{} service(s):\n{}", services.len(), lines.join("\n"))
@@ -8875,41 +10323,62 @@ impl HubTool {
             }
             "logs" => {
                 let name = name_required("logs")?;
-                let page = crate::hub::logs(
-                    &name,
-                    input.cursor,
-                    input.tail,
-                    input.grep.as_deref(),
-                    input.wait_ms.unwrap_or(0),
-                )?;
+                let cursor = input.cursor;
+                let tail = input.tail;
+                let grep = input.grep.clone();
+                let wait_ms = input.wait_ms.unwrap_or(0);
+                let page = crate::hub::run_service_request(move |request| {
+                    crate::hub::logs_for_request(
+                        &name,
+                        cursor,
+                        tail,
+                        grep.as_deref(),
+                        wait_ms,
+                        request,
+                    )
+                })
+                .await?;
                 let details = serde_json::to_value(&page)?;
                 let mut text = page.lines.join("\n");
                 if text.is_empty() {
                     text = "(no new lines)".to_string();
                 }
+                if page.lost_lines != 0 {
+                    let _ = write!(
+                        text,
+                        "\n[{} requested log lines were evicted; oldest available cursor: {}.]",
+                        page.lost_lines, page.oldest_cursor
+                    );
+                }
+                Self::append_log_capture_notice(&mut text, &page.log_capture);
                 (text, details)
             }
             "stop" => {
                 let name = name_required("stop")?;
-                let snapshot = crate::hub::stop(&name)?;
+                let stop_name = name.clone();
+                let snapshot =
+                    crate::hub::run_service_request(move |_| crate::hub::stop(&stop_name)).await?;
                 let details = serde_json::to_value(&snapshot)?;
-                (
-                    format!("Service '{name}' stopped (status: {}).", snapshot.status),
-                    details,
-                )
+                let mut text = format!("Service '{name}' stopped (status: {}).", snapshot.status);
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
+                (text, details)
             }
             "restart" => {
                 let name = name_required("restart")?;
-                let snapshot = crate::hub::restart(&name)?;
+                let restart_name = name.clone();
+                let snapshot = crate::hub::run_service_request(move |request| {
+                    crate::hub::restart_for_request(&restart_name, request)
+                })
+                .await?;
                 let details = serde_json::to_value(&snapshot)?;
-                (
-                    format!("Service '{name}' restarted (status: {}).", snapshot.status),
-                    details,
-                )
+                let mut text = format!("Service '{name}' restarted (status: {}).", snapshot.status);
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
+                (text, details)
             }
             "describe" => {
                 let name = name_required("describe")?;
-                let snapshot = crate::hub::describe(&name)?;
+                let snapshot =
+                    crate::hub::run_service_request(move |_| crate::hub::describe(&name)).await?;
                 let details = serde_json::to_value(&snapshot)?;
                 (
                     serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
@@ -8918,45 +10387,55 @@ impl HubTool {
             }
             "send" => {
                 let name = name_required("send")?;
-                let mut actions = Vec::new();
-                if let Some(text) = input.text.as_deref() {
-                    crate::hub::send_text(&name, text, input.enter.unwrap_or(true))?;
-                    actions.push(format!("sent {} byte(s) of text", text.len()));
-                }
-                if let Some(keys) = input.keys.as_ref()
-                    && !keys.is_empty()
-                {
-                    crate::hub::send_keys(&name, keys)?;
-                    actions.push(format!("sent keys: {}", keys.join(", ")));
-                }
-                if let Some(signal) = input.signal.as_deref() {
-                    let mapped = match signal.to_ascii_uppercase().as_str() {
-                        "SIGINT" => sysinfo::Signal::Interrupt,
-                        "SIGTERM" => sysinfo::Signal::Term,
-                        "SIGHUP" => sysinfo::Signal::Hangup,
-                        "SIGQUIT" => sysinfo::Signal::Quit,
-                        "SIGKILL" => sysinfo::Signal::Kill,
-                        other => {
-                            return Err(Error::validation(format!(
-                                "Unknown signal '{other}'; expected SIGINT, SIGTERM, SIGHUP, \
-                                 SIGQUIT, or SIGKILL"
-                            )));
-                        }
-                    };
-                    crate::hub::send_signal(&name, mapped)?;
-                    actions.push(format!("sent {}", signal.to_ascii_uppercase()));
-                }
-                if actions.is_empty() {
-                    return Err(Error::validation(
-                        "hub send requires text, keys, or signal".to_string(),
-                    ));
-                }
-                let details = serde_json::json!({
-                    "schema": "pi.hub.send.v1",
-                    "name": name,
-                    "actions": actions,
-                });
-                (format!("To '{name}': {}", actions.join("; ")), details)
+                let text = input.text.clone();
+                let enter = input.enter.unwrap_or(true);
+                let keys = input.keys.clone();
+                let signal = input.signal.clone();
+                crate::hub::run_service_request(move |request| {
+                    let mut actions = Vec::new();
+                    if let Some(text) = text.as_deref() {
+                        request.check()?;
+                        crate::hub::send_text(&name, text, enter)?;
+                        actions.push(format!("sent {} byte(s) of text", text.len()));
+                    }
+                    if let Some(keys) = keys.as_ref()
+                        && !keys.is_empty()
+                    {
+                        request.check()?;
+                        crate::hub::send_keys(&name, keys)?;
+                        actions.push(format!("sent keys: {}", keys.join(", ")));
+                    }
+                    if let Some(signal) = signal.as_deref() {
+                        let mapped = match signal.to_ascii_uppercase().as_str() {
+                            "SIGINT" => sysinfo::Signal::Interrupt,
+                            "SIGTERM" => sysinfo::Signal::Term,
+                            "SIGHUP" => sysinfo::Signal::Hangup,
+                            "SIGQUIT" => sysinfo::Signal::Quit,
+                            "SIGKILL" => sysinfo::Signal::Kill,
+                            other => {
+                                return Err(Error::validation(format!(
+                                    "Unknown signal '{other}'; expected SIGINT, SIGTERM, SIGHUP, \
+                                     SIGQUIT, or SIGKILL"
+                                )));
+                            }
+                        };
+                        request.check()?;
+                        crate::hub::send_signal(&name, mapped)?;
+                        actions.push(format!("sent {}", signal.to_ascii_uppercase()));
+                    }
+                    if actions.is_empty() {
+                        return Err(Error::validation(
+                            "hub send requires text, keys, or signal".to_string(),
+                        ));
+                    }
+                    let details = serde_json::json!({
+                        "schema": "pi.hub.send.v1",
+                        "name": name,
+                        "actions": actions,
+                    });
+                    Ok((format!("To '{name}': {}", actions.join("; ")), details))
+                })
+                .await?
             }
             "jobs" => {
                 let owner_session_id = self.job_session_scope.session_id().await?;
@@ -9124,39 +10603,50 @@ impl HubTool {
                     .ok_or_else(|| {
                         Error::validation(format!("hub agent {action} requires text"))
                     })?;
-                let message = crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .steer(&id, &from, &body)?;
-                let details = serde_json::to_value(&message)?;
-                (
-                    format!("Steering queued for {id} (seq {}).", message.seq),
-                    details,
-                )
+                let message = {
+                    let mut registry = crate::agent_hub::registry()
+                        .lock()
+                        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
+                    if action == "send" {
+                        registry.bus_send(&id, &from, &body)?
+                    } else {
+                        registry.steer(&id, &from, &body)?
+                    }
+                };
+                if action == "send" {
+                    Self::format_agent_reply(crate::agent_hub::ipc::Reply::Sent { message })
+                } else {
+                    let details = serde_json::to_value(&message)?;
+                    (
+                        format!("Steering queued for {id} (seq {}).", message.seq),
+                        details,
+                    )
+                }
             }
             "kill" => {
                 let id = id_required("kill")?;
-                let entry = {
-                    let reg = crate::agent_hub::registry()
+                {
+                    let mut reg = crate::agent_hub::registry()
                         .lock()
                         .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
-                    reg.get(&id)
-                        .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?
-                };
-                if entry.status.settled() {
-                    return Err(Error::validation(format!(
-                        "hub: cannot kill '{id}' — already {}",
-                        entry.status.as_str()
-                    )));
+                    let entry = reg
+                        .get(&id)
+                        .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?;
+                    if entry.status.settled() {
+                        return Err(Error::validation(format!(
+                            "hub: cannot kill '{id}' — already {}",
+                            entry.status.as_str()
+                        )));
+                    }
+                    if let Some(pid) = reg.control_pid(&id) {
+                        // Historical PIDs remain in the roster after reaping.
+                        // Only a live process grants authority to signal it.
+                        crate::tools::kill_process_group_tree(Some(pid));
+                    }
+                    // A reaped child may still be awaiting ordered writeback.
+                    // Revoking it must prevent application even without a PID.
+                    reg.mark_killed(&id);
                 }
-                if let Some(pid) = entry.pid {
-                    // Process-tree kill so the child's bash descendants die too.
-                    crate::tools::kill_process_group_tree(Some(pid));
-                }
-                crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .mark_killed(&id);
                 let details = serde_json::json!({
                     "schema": "pi.agent-hub.kill/v1",
                     "id": id,
@@ -9164,45 +10654,13 @@ impl HubTool {
                 });
                 (format!("Child {id} killed by operator."), details)
             }
-            "revive" => {
-                let id = id_required("revive")?;
-                let (entry, _task) = crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .revive(&id)?;
-                // The revived task is queued as a steering continuation: the
-                // next subagent tool call can launch it; the registry entry
-                // already records the lineage so the roster shows it.
-                let details = serde_json::to_value(&entry)?;
-                (
-                    format!(
-                        "Revival registered as {} (continues {id}); relaunch via the subagent tool with the recorded task.",
-                        entry.id
-                    ),
-                    details,
-                )
-            }
             "inbox" => {
                 let id = id_required("inbox")?;
-                let messages = crate::agent_hub::registry()
+                let page = crate::agent_hub::registry()
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .inbox(&id);
-                let details = serde_json::json!({
-                    "schema": "pi.agent-hub.inbox/v1",
-                    "id": id,
-                    "messages": messages,
-                });
-                let text = if messages.is_empty() {
-                    format!("{id}: inbox empty.")
-                } else {
-                    let lines: Vec<String> = messages
-                        .iter()
-                        .map(|m| format!("#{} from {}: {}", m.seq, m.from, m.body))
-                        .collect();
-                    format!("{id}: {} message(s):\n{}", messages.len(), lines.join("\n"))
-                };
-                (text, details)
+                    .inbox_page(&id, input.cursor)?;
+                Self::format_agent_reply(page)
             }
             other => {
                 return Err(Error::validation(format!(
@@ -10230,7 +11688,7 @@ impl EditTool {
     /// `edit` over `ssh://host/path` (bd-cv653.6.5): fetch the FULL remote
     /// content (never truncated — an editor on a truncated view would
     /// overwrite real data), run the same replacement core as local edits,
-    /// then stage + rename atomically on the remote host.
+    /// then stage and check the original bytes before remote replacement.
     async fn execute_ssh_edit(&self, input: &EditInput) -> Result<ToolOutput> {
         let url = input.path.clone();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
@@ -10249,7 +11707,7 @@ impl EditTool {
         let write_url = input.path.clone();
         let payload = outcome.final_content.clone();
         let write_details = asupersync::runtime::spawn_blocking_io(move || {
-            crate::url_router::ssh_write_document(&write_url, &payload)
+            crate::url_router::ssh_replace_document(&write_url, &raw, &payload)
                 .map_err(std::io::Error::other)
         })
         .await
@@ -10285,7 +11743,7 @@ impl EditTool {
 impl HashlineEditTool {
     /// `hashline_edit` over `ssh://host/path` (bd-cv653.6.5): full remote
     /// fetch, the same anchor-validation/splice core as local hashline
-    /// edits (stale anchors rejected), atomic remote staging.
+    /// edits (stale anchors rejected), and a remote original-content guard.
     async fn execute_ssh_hashline_edit(&self, input: &HashlineEditInput) -> Result<ToolOutput> {
         let url = input.path.clone();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
@@ -10312,7 +11770,7 @@ impl HashlineEditTool {
         let write_url = input.path.clone();
         let payload = outcome.final_content.clone();
         let write_details = asupersync::runtime::spawn_blocking_io(move || {
-            crate::url_router::ssh_write_document(&write_url, &payload)
+            crate::url_router::ssh_replace_document(&write_url, raw_content.as_bytes(), &payload)
                 .map_err(std::io::Error::other)
         })
         .await
@@ -10616,6 +12074,71 @@ impl WriteTool {
         self
     }
 
+    async fn execute_conflict_write(
+        &self,
+        tool_call_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<ToolOutput> {
+        let prepared = crate::url_router::prepare_conflict_write(&self.cwd, input)?;
+        let paths = prepared.paths();
+        for path in &paths {
+            enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
+            let metadata = std_metadata_async(path).await.map_err(|error| {
+                Error::tool("write", format!("Cannot inspect conflict file: {error}"))
+            })?;
+            if !metadata.is_file() {
+                return Err(Error::tool(
+                    "write",
+                    "A conflict target is not a regular file",
+                ));
+            }
+            ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_WRITE, "conflict resolution")
+                .map_err(|error| {
+                    Error::tool("write", format!("Cannot write conflict file: {error}"))
+                })?;
+        }
+        if let Some(hook) = &self.before_persist_hook {
+            hook();
+        }
+        // Recheck the live root set after preparation and any awaited I/O.
+        // The transaction separately checks exact preimages and path identity.
+        for path in &paths {
+            enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
+        }
+        if let Some(recorder) = &self.mutation_recorder {
+            for path in &paths {
+                recorder.begin_file(tool_call_id, "write", path);
+            }
+        }
+        let resolved = prepared.apply();
+        if let Some(recorder) = &self.mutation_recorder {
+            if resolved.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        let resolved = resolved?;
+        let regions: Vec<_> = resolved
+            .iter()
+            .map(|region| serde_json::json!({"index": region.index, "file": region.file}))
+            .collect();
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Resolved {} conflict region(s) in {} file(s). Re-read conflict://* before resolving more regions.",
+                regions.len(),
+                paths.len()
+            )))],
+            details: Some(serde_json::json!({
+                "schema": "pi.conflict.write.v1",
+                "regions": regions,
+                "paths": paths,
+                "gitIndexUpdated": false
+            })),
+            is_error: false,
+        })
+    }
+
     #[cfg(test)]
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
@@ -10637,23 +12160,98 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
+        "Write content to a file, creating parent directories as needed. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::write()
+            .union(ToolEffects::process())
+            .union(ToolEffects::network())
+    }
+
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
+            return self.effects();
+        };
+        if path.starts_with("conflict://") {
+            // Git inventory uses a process even though publication is local.
+            ToolEffects::write().union(ToolEffects::process())
+        } else if crate::url_router::has_scheme(path)
+            || input
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || input.get("conflicts").is_some()
+        {
+            self.effects()
+        } else {
+            ToolEffects::write()
+        }
     }
 
     fn parameters(&self) -> serde_json::Value {
+        // Gemini's legacy parameters field accepts its OpenAPI subset.
+        // Exact envelopes and unknown-field rejection remain native checks.
+        let content = serde_json::json!({
+            "type": "string",
+            "description": "Exact content to write; always literal, including @ours or @theirs. Required except with path conflict://*; omit for a conflict batch."
+        });
+        let conflicts = serde_json::json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "description": "Choices from one fresh conflict://* read. Valid only with path conflict://* and no content.",
+            "items": {
+                "type": "object",
+                "required": ["index", "token", "resolution"],
+                "properties": {
+                    "index": {"type": "integer", "minimum": 0},
+                    "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "resolution": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["ours", "theirs", "base"]}
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "required": ["kind", "value"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["text"]},
+                                    "value": {"type": "string"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write (relative or absolute)"
+                    "description": "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
                 },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
+                "content": content,
+                "conflicts": conflicts
             },
-            "required": ["path", "content"]
+            "required": ["path"],
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {"content": content},
+                    "required": ["content"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"conflicts": conflicts},
+                    "required": ["conflicts"]
+                }
+            ]
         })
     }
 
@@ -10664,6 +12262,16 @@ impl Tool for WriteTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| path.starts_with("conflict://"))
+        {
+            return self.execute_conflict_write(tool_call_id, &input).await;
+        }
+        if input.get("conflicts").is_some() {
+            return Err(Error::validation("conflicts requires path conflict://*"));
+        }
         let input: WriteInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
@@ -10819,10 +12427,57 @@ struct GrepInput {
     hashline: bool,
 }
 
+const MAX_GREP_RESOURCE_PATHS: usize = 16;
+const MAX_GREP_RESOURCE_PATH_BYTES: usize = 64 * 1024;
+const MAX_GREP_RESOURCE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_GREP_RESOURCE_MATCHES: usize = 10_000;
+
+/// Only internal URL operands use semicolon lists. A semicolon in an HTTP
+/// URL or an ordinary filename keeps its normal meaning. Validate list syntax
+/// before resolving anything, so a malformed suffix cannot be skipped.
+fn grep_resource_paths(path: Option<&str>) -> Result<Option<Vec<&str>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !crate::url_router::has_scheme(path) {
+        return Ok(None);
+    }
+    if path.len() > MAX_GREP_RESOURCE_PATH_BYTES {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_RESOURCE_PATH_LIMIT] Resource paths exceed 64 KiB",
+        ));
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Ok(Some(vec![path]));
+    }
+    let paths: Vec<_> = path.split(';').map(str::trim).collect();
+    if paths.len() > MAX_GREP_RESOURCE_PATHS {
+        return Err(Error::tool(
+            "grep",
+            format!(
+                "[GREP_RESOURCE_COUNT] Search at most {MAX_GREP_RESOURCE_PATHS} internal URLs per call"
+            ),
+        ));
+    }
+    if paths.iter().any(|path| {
+        !crate::url_router::has_scheme(path)
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+    }) {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_RESOURCE_LIST] Separate internal URLs with semicolons; search HTTP URLs and filesystem paths in separate calls",
+        ));
+    }
+    Ok(Some(paths))
+}
+
 pub struct GrepTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
     backend: SearchBackend,
+    allow_private_urls: bool,
     workspace: WorkspaceHandle,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -10840,11 +12495,19 @@ impl GrepTool {
         self
     }
 
+    /// Apply the same explicit private-target override used by URL reads.
+    #[must_use]
+    pub const fn with_url_policy(mut self, allow_private_urls: bool) -> Self {
+        self.allow_private_urls = allow_private_urls;
+        self
+    }
+
     pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend,
+            allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
             #[cfg(test)]
             after_scope_hook: None,
@@ -10857,6 +12520,7 @@ impl GrepTool {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
             backend: SearchBackend::default(),
+            allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
             after_scope_hook: None,
         }
@@ -10871,10 +12535,352 @@ impl GrepTool {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend: SearchBackend::default(),
+            allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
+
+    /// Resolve through the same admitted document surfaces as ReadTool. The
+    /// worker retains the caller's restricted context and cancellation budget;
+    /// agent results still use the authenticated immediate-parent resolver.
+    async fn resolve_grep_resource(&self, path: &str) -> Result<GrepResource> {
+        let owner = AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        let process_backed = matches!(
+            path.split_once("://").map(|(scheme, _)| scheme),
+            Some("pr" | "issue" | "ssh" | "conflict")
+        );
+        let capabilities = owner.capabilities();
+        if !capabilities.io || (process_backed && !capabilities.spawn) {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_RESOURCE_PERMISSION] Resource searches require I/O authority; process-backed documents also require spawn authority",
+            ));
+        }
+        if path.starts_with("http://") || path.starts_with("https://") {
+            let (url, mode) = path
+                .strip_suffix(":raw")
+                .map_or((path, crate::url_read::UrlReadMode::Reader), |url| {
+                    (url, crate::url_read::UrlReadMode::Raw)
+                });
+            let policy = if self.allow_private_urls {
+                crate::url_read::SsrfPolicy::AllowPrivateTargets
+            } else {
+                crate::url_read::SsrfPolicy::BlockPrivateTargets
+            };
+            let outcome = crate::url_read::fetch(url, policy, mode).await?;
+            return Ok(GrepResource {
+                content: outcome.content,
+                details: serde_json::json!({
+                    "path": path,
+                    "url": outcome.final_url,
+                    "contentType": outcome.kind.as_str(),
+                    "extractor": outcome.extractor,
+                    "sourceTruncated": outcome.download_truncated,
+                }),
+                source_truncated: outcome.download_truncated,
+            });
+        }
+        let path_owned = path.to_string();
+        let cwd = self.cwd.clone();
+        let resolved = asupersync::runtime::spawn_blocking(move || {
+            let _guard = owner.cx().clone().set_current_restricted();
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+            crate::url_router::resolve(&path_owned, &cwd)
+        })
+        .await?;
+        let source_truncated = resolved
+            .metadata
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || resolved
+                .metadata
+                .get("cappedAt")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|cap| resolved.content.len() as u64 >= cap);
+        Ok(GrepResource {
+            content: resolved.content,
+            details: serde_json::json!({
+                "path": path,
+                "scheme": resolved.scheme,
+                "reference": resolved.reference,
+                "contentType": resolved.content_type,
+                "sourceTruncated": source_truncated,
+            }),
+            source_truncated,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_resource_grep(
+        &self,
+        tool_call_id: &str,
+        input: &GrepInput,
+        paths: &[&str],
+    ) -> Result<ToolOutput> {
+        if input.hashline {
+            return Err(Error::tool(
+                "grep",
+                "[DOCUMENT_HASHLINE] Virtual document lines are search locations, not source edit anchors; save source text locally before using hashline edits",
+            ));
+        }
+        if input.glob.is_some() {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_RESOURCE_GLOB] glob applies to filesystem searches; select the internal document or URL directly",
+            ));
+        }
+        let effective_limit = input.limit.unwrap_or(DEFAULT_GREP_LIMIT);
+        if effective_limit > MAX_GREP_RESOURCE_MATCHES {
+            return Err(Error::tool(
+                "grep",
+                format!(
+                    "[GREP_RESOURCE_MATCH_LIMIT] Resource searches support at most {MAX_GREP_RESOURCE_MATCHES} matches; narrow the pattern or resource list"
+                ),
+            ));
+        }
+        let pattern = if input.literal.unwrap_or(false) {
+            regex::escape(&input.pattern)
+        } else {
+            input.pattern.clone()
+        };
+        // Compile before doing network or subprocess work.
+        let matcher = Arc::new(
+            grep_regex::RegexMatcherBuilder::new()
+                .case_insensitive(input.ignore_case.unwrap_or(false))
+                .build(&pattern)
+                .map_err(|error| Error::tool("grep", format!("regex parse error: {error}")))?,
+        );
+        let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
+        let mut artifact_source = String::new();
+        let mut resources = Vec::new();
+        let mut match_count = 0usize;
+        let mut match_limit_reached = false;
+        let mut lines_truncated = false;
+        let mut source_truncated = false;
+        let owner = AgentCx::for_current_or_request();
+
+        for path in paths {
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+            let mut resource = self.resolve_grep_resource(path).await?;
+            if resource.content.len() > MAX_GREP_RESOURCE_BYTES {
+                return Err(Error::tool(
+                    "grep",
+                    "[GREP_RESOURCE_BYTES] A resource exceeds the 10 MiB search limit; select a smaller document or agent JSON field",
+                ));
+            }
+            source_truncated |= resource.source_truncated;
+            let scan_limit = effective_limit
+                .saturating_sub(match_count)
+                .saturating_add(1);
+            let scan_matcher = Arc::clone(&matcher);
+            let scan_owner = owner.clone();
+            let (content, mut match_lines) = asupersync::runtime::spawn_blocking(move || {
+                grep_resource_match_lines(resource.content, &scan_matcher, scan_limit, &scan_owner)
+            })
+            .await?;
+            let remaining = effective_limit.saturating_sub(match_count);
+            if match_lines.len() > remaining {
+                match_limit_reached = true;
+                match_lines.truncate(remaining);
+            }
+            match_count += match_lines.len();
+            let total_lines = content.lines().count();
+            resource.details["totalLines"] = serde_json::json!(total_lines);
+            resource.details["matches"] = serde_json::json!(match_lines.len());
+            resources.push(resource.details);
+            lines_truncated |= render_grep_resource(
+                path,
+                &content,
+                &match_lines,
+                input.context.unwrap_or(0),
+                total_lines,
+                &owner,
+                &mut output_builder,
+                &mut artifact_source,
+            )?;
+            if match_limit_reached {
+                break;
+            }
+        }
+
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        let mut truncation = output_builder.finish();
+        let mut output = if match_count == 0 {
+            "No matches found".to_string()
+        } else {
+            std::mem::take(&mut truncation.content)
+        };
+        let skipped = paths.len().saturating_sub(resources.len());
+        let mut details = serde_json::json!({
+            "resources": resources,
+            "matches": match_count,
+            "resourcesSkipped": skipped,
+        });
+        let mut notices = Vec::new();
+        if match_limit_reached {
+            details["matchLimitReached"] = serde_json::json!(effective_limit);
+            notices.push(format!(
+                "{effective_limit} matches limit reached. Increase limit or refine pattern"
+            ));
+        }
+        if skipped > 0 {
+            notices.push(format!(
+                "{skipped} remaining resources were not searched after the match limit"
+            ));
+        }
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details["truncation"] = serde_json::to_value(truncation)?;
+        }
+        if lines_truncated {
+            details["linesTruncated"] = serde_json::json!(true);
+            notices.push(format!(
+                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+            ));
+        }
+        if source_truncated {
+            notices.push("A source document was truncated by its resolver; unreturned source content was not searched".to_string());
+        }
+        if !notices.is_empty() {
+            let _ = write!(output, "\n\n[{}]", notices.join(". "));
+        }
+        let mut details = Some(details);
+        attach_text_artifact_if_needed_with_root(
+            self.artifact_root.as_deref(),
+            &mut output,
+            &mut details,
+            "grep",
+            tool_call_id,
+            "searchResults",
+            &artifact_source,
+        );
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(output))],
+            details,
+            is_error: false,
+        })
+    }
+}
+
+struct GrepResource {
+    content: String,
+    details: serde_json::Value,
+    source_truncated: bool,
+}
+
+fn grep_resource_match_lines(
+    content: String,
+    matcher: &grep_regex::RegexMatcher,
+    scan_limit: usize,
+    owner: &AgentCx,
+) -> Result<(String, Vec<usize>)> {
+    use grep_searcher::{BinaryDetection, SearcherBuilder, sinks};
+
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+    let mut matches = Vec::new();
+    SearcherBuilder::new()
+        .line_number(true)
+        // These are already decoded, size-bounded documents. Binary file
+        // heuristics must not hide later matches in a JSON string or raw URL.
+        .binary_detection(BinaryDetection::none())
+        .bom_sniffing(false)
+        .build()
+        .search_reader(
+            matcher,
+            content.as_bytes(),
+            sinks::UTF8(|line_number, _| {
+                if owner.checkpoint().is_err() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "scan cancelled",
+                    ));
+                }
+                let line_number = usize::try_from(line_number)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                matches.push(line_number);
+                Ok(matches.len() < scan_limit)
+            }),
+        )
+        .map_err(|error| Error::tool("grep", error_for_line_output(&error)))?;
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+    Ok((content, matches))
+}
+
+/// Render context by walking the document once. Do not allocate a reference
+/// per source line: small newline-only documents can contain millions of them.
+#[allow(clippy::too_many_arguments)]
+fn render_grep_resource(
+    path: &str,
+    content: &str,
+    matches: &[usize],
+    context: usize,
+    total_lines: usize,
+    owner: &AgentCx,
+    output: &mut HeadTruncatingLineWriter,
+    artifact: &mut String,
+) -> Result<bool> {
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    for &line in matches {
+        let start = line.saturating_sub(context).max(1);
+        let end = line.saturating_add(context).min(total_lines);
+        if let Some(last) = blocks.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            blocks.push((start, end));
+        }
+    }
+    let path = escape_bytes_for_line_output(path.as_bytes());
+    let mut block = 0;
+    let mut lines_truncated = false;
+    for (index, line) in content.lines().enumerate() {
+        if index % 1024 == 0 {
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        }
+        let current = index + 1;
+        while blocks.get(block).is_some_and(|(_, end)| current > *end) {
+            block += 1;
+        }
+        let Some(&(start, _)) = blocks.get(block) else {
+            break;
+        };
+        if current < start {
+            continue;
+        }
+        if block > 0 && current == start {
+            output.push_line("--");
+            append_artifact_source_line(artifact, "--");
+        }
+        let sanitized = line.replace('\r', "");
+        let truncated = truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
+        lines_truncated |= truncated.was_truncated;
+        let line = if matches.binary_search(&current).is_ok() {
+            format!("{path}:{current}: {}", truncated.text)
+        } else {
+            format!("{path}-{current}- {}", truncated.text)
+        };
+        output.push_line(&line);
+        append_artifact_source_line(artifact, &line);
+    }
+    Ok(lines_truncated)
 }
 
 /// Result of truncating a single grep output line.
@@ -11360,7 +13366,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 1MB (whichever is hit first). Long lines are truncated to 500 chars. Use hashline=true to get N#AB content-hash tags for use with hashline_edit."
+        "Search files, internal documents (agent://, skill://, local://, pr://, and other read URLs), or an HTTP(S) URL for a pattern. Separate up to 16 internal URLs with semicolons. HTTP URLs use reader text; append :raw for source. Returns matching lines with source paths and line numbers. Filesystem searches respect .gitignore. Output defaults to 100 matches or 1MB; long lines are truncated to 500 chars. Use hashline=true for filesystem edit anchors only."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -11373,7 +13379,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search (default: current directory)"
+                    "description": "Directory/file (default: current directory), internal document URL, semicolon-separated internal URLs, or one HTTP(S) URL (optional :raw suffix)"
                 },
                 "glob": {
                     "type": "string",
@@ -11393,7 +13399,7 @@ impl Tool for GrepTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of matches to return (default: 100)"
+                    "description": "Maximum number of matches to return across all sources (default: 100; at most 10000 for resource URLs)"
                 },
                 "hashline": {
                     "type": "boolean",
@@ -11406,6 +13412,41 @@ impl Tool for GrepTool {
 
     fn effects(&self) -> ToolEffects {
         ToolEffects::read()
+            .union(ToolEffects::network())
+            .union(ToolEffects::process())
+    }
+
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Ok(input) = serde_json::from_value::<GrepInput>(input.clone()) else {
+            return self.effects();
+        };
+        let paths = match grep_resource_paths(input.path.as_deref()) {
+            Ok(Some(paths)) => paths,
+            Ok(None) => {
+                return if self.backend == SearchBackend::External {
+                    ToolEffects::read().union(ToolEffects::process())
+                } else {
+                    ToolEffects::read()
+                };
+            }
+            Err(_) => return self.effects(),
+        };
+        paths
+            .into_iter()
+            .fold(ToolEffects::read(), |effects, path| {
+                let scheme = path.split_once("://").map_or("", |(scheme, _)| scheme);
+                let resource_effects = match scheme {
+                    "http" | "https" => ToolEffects::network(),
+                    "pr" | "issue" | "ssh" => ToolEffects::process().union(ToolEffects::network()),
+                    "conflict" => ToolEffects::process(),
+                    "agent" if crate::agent_hub::ipc::inherited_channel_present() => {
+                        ToolEffects::network()
+                    }
+                    "agent" | "skill" | "prompt" | "local" => ToolEffects::read(),
+                    _ => self.effects(),
+                };
+                effects.union(resource_effects)
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11423,6 +13464,12 @@ impl Tool for GrepTool {
             return Err(Error::validation(
                 "`limit` must be greater than 0".to_string(),
             ));
+        }
+
+        if let Some(paths) = grep_resource_paths(input.path.as_deref())? {
+            return self
+                .execute_resource_grep(tool_call_id, &input, &paths)
+                .await;
         }
 
         if self.backend == SearchBackend::External && !rg_available() {
@@ -13402,6 +15449,9 @@ struct BashOutputState {
     start_time: std::time::Instant,
     timeout_ms: Option<u64>,
     temp_file_path: Option<PathBuf>,
+    // Managed jobs may retain a bounded prefix without a complete artifact.
+    // Render that path honestly without publishing it as fullOutputPath.
+    partial_output_path: Option<PathBuf>,
     temp_file: Option<asupersync::fs::File>,
     chunks: VecDeque<Vec<u8>>,
     chunks_bytes: usize,
@@ -13418,6 +15468,7 @@ impl BashOutputState {
             start_time: std::time::Instant::now(),
             timeout_ms: None,
             temp_file_path: None,
+            partial_output_path: None,
             temp_file: None,
             chunks: VecDeque::new(),
             chunks_bytes: 0,
@@ -13671,6 +15722,7 @@ fn emit_bash_update(
 pub(crate) struct ProcessGuard {
     child: Option<std::process::Child>,
     cleanup_mode: ProcessCleanupMode,
+    shell_process: Option<bash_session::ShellProcessLease>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13684,74 +15736,306 @@ impl ProcessGuard {
         Self {
             child: Some(child),
             cleanup_mode,
+            shell_process: None,
         }
     }
 
+    fn with_shell_state(mut self, state: Option<&bash_session::ShellTransaction>) -> Self {
+        self.shell_process = state.map(bash_session::ShellTransaction::retain_process);
+        self
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.as_mut().and_then(|child| child.stdin.take())
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut().and_then(|child| child.stdout.take())
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut().and_then(|child| child.stderr.take())
+    }
+
     pub(crate) fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child
+        let status = self
+            .child
             .as_mut()
-            .map_or(Ok(None), std::process::Child::try_wait)
+            .map_or(Ok(None), std::process::Child::try_wait)?;
+        if status.is_some()
+            && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            && (cfg!(windows) || self.shell_process.is_some())
+            && let Some(child) = &self.child
+        {
+            // Descendants can retain stdout after their root exits. Close the
+            // retained Job before the output-drain phase waits for pipe EOF.
+            terminate_reaped_child_discipline(child.id());
+            self.cleanup_mode = ProcessCleanupMode::ChildOnly;
+        }
+        if status.is_some() {
+            drop(self.shell_process.take());
+        }
+        Ok(status)
     }
 
     pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
-            cleanup_child(Some(child.id()), self.cleanup_mode);
-            let _ = child.kill();
-            std::thread::spawn(move || {
+            let shell_process = self.shell_process.take();
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                        // A previous poll may already have released the Job.
+                        // Never fall back to walking an exited root's PID.
+                        terminate_reaped_child_discipline(child.id());
+                    }
+                    return Some(status);
+                }
+                Ok(None) => {
+                    cleanup_child(Some(child.id()), self.cleanup_mode);
+                    let _ = child.kill();
+                }
+                Err(_) => {
+                    // An ambiguous wait error does not establish ownership
+                    // of a live PID. Release only our retained Windows Job;
+                    // the reaper below still owns the actual child handle.
+                    #[cfg(windows)]
+                    if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                        let _ = win_job::terminate(child.id());
+                    }
+                }
+            }
+            dispatch_process_cleanup(move || {
                 let _ = child.wait();
+                drop(shell_process);
             });
-            // We cannot return the exit status synchronously without blocking,
-            // so we return None to indicate the process was forcefully killed.
+            // A live or unconfirmed child is reaped without blocking callers.
             return None;
         }
         None
     }
 
-    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if let Some(mut child) = self.child.take() {
-            return child.wait();
+    /// Stop an owned process tree and reap its root before returning. Blocking
+    /// subprocess workers use this path when their terminal result requires an
+    /// exit status; async callers can retain the nonblocking `kill` path.
+    pub(crate) fn terminate_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let reaped = self.try_wait_child()?.is_some();
+        if let Some(child) = self.child.as_mut() {
+            if reaped {
+                if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                    // Retire only the owned group/Job. The root PID may have
+                    // been reused since try_wait, so never walk its children.
+                    terminate_reaped_child_discipline(child.id());
+                }
+            } else {
+                cleanup_child(Some(child.id()), self.cleanup_mode);
+                // The tree kill can already have ended the root. Still wait
+                // for its actual status if the direct kill races that exit.
+                let _ = child.kill();
+            }
         }
-        Err(std::io::Error::other("Already waited"))
+        // A wait error leaves this guard armed for a later cleanup attempt.
+        self.wait()
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Already waited"))?;
+        // Keep ownership on wait errors so a later retry or Drop still has
+        // the child handle and its registered Windows Job available.
+        let status = child.wait()?;
+        if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            && (cfg!(windows) || self.shell_process.is_some())
+        {
+            terminate_reaped_child_discipline(child.id());
+            self.cleanup_mode = ProcessCleanupMode::ChildOnly;
+        }
+        drop(self.child.take());
+        drop(self.shell_process.take());
+        Ok(status)
     }
 }
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            match child.try_wait() {
-                Ok(None) => {}
-                Ok(Some(_)) | Err(_) => return,
+            let status = child.try_wait();
+            #[cfg(windows)]
+            if !matches!(status, Ok(None))
+                && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            {
+                // Even an ambiguous wait error must release our owned Job.
+                // Do not infer that the root was reaped or walk its PID.
+                let _ = win_job::terminate(child.id());
+            }
+            if matches!(status, Ok(Some(_))) {
+                if !cfg!(windows)
+                    && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+                    && self.shell_process.is_some()
+                {
+                    terminate_reaped_child_discipline(child.id());
+                }
+                return;
             }
             let cleanup_mode = self.cleanup_mode;
-            std::thread::spawn(move || {
-                cleanup_child(Some(child.id()), cleanup_mode);
-                let _ = child.kill();
+            let shell_process = self.shell_process.take();
+            dispatch_process_cleanup(move || {
+                if matches!(status, Ok(None)) {
+                    cleanup_child(Some(child.id()), cleanup_mode);
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
+                drop(shell_process);
             });
         }
     }
 }
 
-/// Attach a freshly-spawned child to platform tree-discipline bookkeeping.
-///
-/// Windows assigns the child to a kill-on-close Job object so later
-/// `kill_process_group_tree` / `terminate_process_group_tree` calls reap the
-/// whole descendant tree, including processes spawned between the kill-time
-/// snapshot and the kill (bd-9jgrt item 1). Unix needs nothing here: the
-/// child already leads its own process group. Hub PTY services are out of
-/// scope (portable-pty children keep the walk-based discipline).
-// Const only on unix where the body degenerates to `let _`; the windows
-// branch calls non-const job registration, so the lint cannot hold for both
-// targets at once.
-#[allow(clippy::missing_const_for_fn)]
-pub(crate) fn attach_child_job_discipline(child: &std::process::Child) -> bool {
-    #[cfg(windows)]
-    return win_job::attach(child);
-    #[cfg(not(windows))]
+/// The caller retains ownership until a cleanup thread takes its task. If the
+/// OS refuses another thread, reap synchronously instead of dropping a live
+/// child and releasing its shell lease through a failed spawn closure.
+fn dispatch_process_cleanup(cleanup: impl FnOnce() + Send + 'static) {
+    let pending = Arc::new(std::sync::Mutex::new(Some(cleanup)));
+    let worker = Arc::clone(&pending);
+    if thread::Builder::new()
+        .name("pi-process-reaper".to_string())
+        .spawn(move || {
+            let cleanup = worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(cleanup) = cleanup {
+                cleanup();
+            }
+        })
+        .is_err()
     {
-        let _ = child;
-        true
+        let cleanup = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
     }
+}
+
+fn pty_exit_status_code(status: &portable_pty::ExitStatus) -> i32 {
+    if status.signal().is_some() {
+        -1
+    } else {
+        i32::try_from(status.exit_code()).unwrap_or(-1)
+    }
+}
+
+/// PTY children need the same ownership as piped children: dropping a tool
+/// future must kill and reap its process tree before releasing session state.
+struct PtyProcessGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    process_id: Option<u32>,
+    group_active: bool,
+    shell_process: Option<bash_session::ShellProcessLease>,
+}
+
+impl PtyProcessGuard {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        shell_state: Option<&bash_session::ShellTransaction>,
+    ) -> Self {
+        Self {
+            process_id: child.process_id(),
+            child: Some(child),
+            group_active: true,
+            shell_process: shell_state.map(bash_session::ShellTransaction::retain_process),
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    fn retire_reaped_group(&mut self) {
+        if self.group_active {
+            if let Some(pid) = self.process_id {
+                terminate_reaped_child_discipline(pid);
+            }
+            self.group_active = false;
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        let status = self
+            .child
+            .as_mut()
+            .map_or(Ok(None), |child| child.try_wait())?;
+        if status.is_some() {
+            self.retire_reaped_group();
+            drop(self.shell_process.take());
+        }
+        Ok(status)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if self.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if let Some(child) = self.child.as_mut() {
+            cleanup_child(self.process_id, ProcessCleanupMode::ProcessGroupTree);
+            child.kill()?;
+        }
+        Ok(())
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Already waited"))?;
+        let status = child.wait()?;
+        self.retire_reaped_group();
+        drop(self.child.take());
+        drop(self.shell_process.take());
+        Ok(status)
+    }
+}
+
+impl Drop for PtyProcessGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let status = child.try_wait();
+            if matches!(status, Ok(Some(_))) {
+                self.retire_reaped_group();
+                return;
+            }
+            let process_id = self.process_id;
+            let shell_process = self.shell_process.take();
+            dispatch_process_cleanup(move || {
+                if matches!(status, Ok(None)) {
+                    cleanup_child(process_id, ProcessCleanupMode::ProcessGroupTree);
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+                drop(shell_process);
+            });
+        }
+    }
+}
+
+/// Spawn with Windows Job membership established before any child code runs.
+///
+/// Unix callers configure their process group on `command` before calling.
+/// A returned child owns exactly one registered Job on Windows. The caller
+/// must immediately retain its cleanup guard and release the discipline when
+/// the root is reaped. There is deliberately no post-spawn attachment API:
+/// replacing an owned kill-on-close Job can terminate a live child.
+pub(crate) fn spawn_command_with_job_discipline(
+    command: &mut Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    return win_job::spawn(command);
+    #[cfg(not(windows))]
+    command.spawn()
 }
 
 /// Terminate descendants still covered by an already-reaped root's platform
@@ -13782,50 +16066,71 @@ mod win_job {
     //! job's handle terminates every current member in one shot.
 
     use std::collections::HashMap;
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
+    use std::os::windows::process::{CommandExt as _, ProcThreadAttributeList};
+    use std::process::{Child, Command};
     use std::sync::{LazyLock, Mutex};
 
     use win32job::{ExtendedLimitInfo, Job};
 
     static REGISTRY: LazyLock<Mutex<HashMap<u32, Job>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000d;
 
-    /// Assign `child` to a fresh kill-on-close job and remember it by pid.
-    ///
-    /// Returns whether the child is now covered by a registered Job. Most
-    /// callers can retain the walk-based fallback on failure; subprocess
-    /// surfaces that cannot safely tolerate inherited handles can fail closed.
-    // `win_job` is a private module, so `pub` here is already crate-limited.
-    pub fn attach(child: &Child) -> bool {
-        let Ok(mut map) = REGISTRY.lock() else {
-            return false;
-        };
+    pub fn spawn(command: &mut Command) -> std::io::Result<Child> {
+        spawn_in_registry(command, &REGISTRY, |_, _| Ok(()))
+    }
+
+    fn spawn_in_registry(
+        command: &mut Command,
+        registry: &Mutex<HashMap<u32, Job>>,
+        before_registration: impl FnOnce(&Child, &Job) -> std::io::Result<()>,
+    ) -> std::io::Result<Child> {
+        let mut map = registry
+            .lock()
+            .map_err(|_| std::io::Error::other("Windows Job registry is poisoned"))?;
         prune_dead_entries(&mut map);
-        let mut info = ExtendedLimitInfo::new();
-        info.limit_kill_on_job_close();
-        let Ok(job) = Job::create_with_limit_info(&info) else {
-            return false;
-        };
-        // RawHandle is *mut c_void; win32job takes the isize numeric handle.
-        if job.assign_process(child.as_raw_handle() as isize).is_err() {
-            // Never assigned, so closing harms nothing.
+        // Nothing fallible remains in registry publication after OS spawn.
+        map.try_reserve(1).map_err(std::io::Error::other)?;
+        let mut limits = ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close();
+        let job = Job::create_with_limit_info(&limits).map_err(std::io::Error::other)?;
+
+        // Windows 10 / Server 2016+: PROC_THREAD_ATTRIBUTE_JOB_LIST assigns
+        // membership inside CreateProcess, before the first thread can run.
+        // The owned Job and this actual HANDLE-sized array both outlive the
+        // attribute list and spawn. Passing the array itself (not a slice or
+        // pointer to a temporary) supplies the exact documented value size.
+        let job_handles = [job.handle()];
+        let attributes = ProcThreadAttributeList::build()
+            .attribute(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)
+            .finish()?;
+        let mut child = command.spawn_with_attributes(&attributes)?;
+        drop(attributes);
+        if let Err(error) = before_registration(&child, &job) {
             drop(job);
-            return false;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
         map.insert(child.id(), job);
-        true
+        Ok(child)
     }
 
     /// Kill the tree rooted at `pid` via its job, returning whether one
     /// existed. Dropping the stored `Job` closes the handle, and
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
     pub fn terminate(pid: u32) -> bool {
-        REGISTRY
+        terminate_in_registry(pid, &REGISTRY)
+    }
+
+    fn terminate_in_registry(pid: u32, registry: &Mutex<HashMap<u32, Job>>) -> bool {
+        // Refuse new spawns after a registry panic, but preserve cleanup of
+        // Jobs already owned by callers. Keep the mutex poisoned afterward.
+        let job = registry
             .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&pid))
-            .is_some()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pid);
+        job.is_some()
     }
 
     /// Drop entries whose root process no longer exists so the map (and its
@@ -13846,6 +16151,248 @@ mod win_job {
         for pid in dead {
             // Jobs whose root died are empty; dropping just reclaims the handle.
             map.remove(&pid);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::windows::io::AsRawHandle;
+        use std::path::Path;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        const FIXTURE: &str = "tools::win_job::tests::atomic_job_child_fixture";
+        const ROLE_ENV: &str = "PI_TEST_ATOMIC_JOB_ROLE";
+        const PID_FILE_ENV: &str = "PI_TEST_ATOMIC_JOB_PID_FILE";
+
+        fn fixture_command(role: &str, pid_file: &Path) -> Command {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", FIXTURE, "--nocapture"])
+                .env(ROLE_ENV, role)
+                .env(PID_FILE_ENV, pid_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        }
+
+        #[test]
+        fn atomic_job_child_fixture() {
+            let Ok(role) = std::env::var(ROLE_ENV) else {
+                return;
+            };
+            let pid_file = std::env::var_os(PID_FILE_ENV).unwrap();
+            if role == "root" || role == "root-exit" {
+                // Deliberately spawn before any parent-side registration can
+                // run. This descendant must inherit containment at birth.
+                let mut descendant = fixture_command("descendant", Path::new(&pid_file))
+                    .spawn()
+                    .unwrap();
+                std::fs::write(&pid_file, descendant.id().to_string()).unwrap();
+                if role == "root-exit" {
+                    let exit_gate = Path::new(&pid_file).with_extension("exit");
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !exit_gate.exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(30));
+                let _ = descendant.kill();
+                let _ = descendant.wait();
+            } else {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+
+        fn descendant_pid(path: &Path) -> u32 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && let Ok(pid) = text.parse()
+                {
+                    return pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not publish its descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_exit(child: &mut Child) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("contained process did not exit after its Job closed");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn child_and_first_descendant_are_contained_before_registration() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            let mut child = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(
+                        members.contains(&usize::try_from(descendant).unwrap()),
+                        "the first descendant escaped before parent-side registration"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let job = registry.lock().unwrap().remove(&child.id()).unwrap();
+            drop(job);
+            wait_for_exit(&mut child);
+            assert!(registry.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn poisoned_registry_refuses_before_the_child_is_created() {
+            let registry = Mutex::new(HashMap::new());
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = registry.lock().unwrap();
+                panic!("injected registry poison");
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("must-not-run.pid");
+            let mut spawned = false;
+            let error = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |_, _| {
+                    spawned = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("registry is poisoned"));
+            assert!(!spawned);
+            assert!(!pid_file.exists());
+        }
+
+        #[test]
+        fn poisoned_registry_still_releases_an_owned_job() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            let mut child = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(members.contains(&usize::try_from(descendant).unwrap()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = registry.lock().unwrap();
+                panic!("injected poison after owned spawn");
+            });
+            assert!(terminate_in_registry(child.id(), &registry));
+            wait_for_exit(&mut child);
+            assert!(!terminate_in_registry(child.id(), &registry));
+            assert!(registry.is_poisoned());
+            assert!(
+                registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn failed_publication_reaps_the_child_and_does_not_register_a_job() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            // A separate nested Job keeps a queryable observer after the
+            // production Job closes, without relying on a recycled PID probe.
+            let observer = Job::create().unwrap();
+            let mut observed_spawn = false;
+            let error = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(members.contains(&usize::try_from(descendant).unwrap()));
+                    observer
+                        .assign_process(child.as_raw_handle() as isize)
+                        .unwrap();
+                    observed_spawn = true;
+                    Err(std::io::Error::other("injected publication refusal"))
+                },
+            )
+            .unwrap_err();
+            assert!(observed_spawn);
+            assert_eq!(error.to_string(), "injected publication refusal");
+            assert!(registry.lock().unwrap().is_empty());
+            assert!(
+                observer.query_process_id_list().unwrap().is_empty(),
+                "the failed spawn must finish reaping before returning its error"
+            );
+        }
+
+        #[test]
+        fn process_guard_releases_the_job_when_its_root_exits() {
+            for completion in [
+                "try_wait",
+                "wait",
+                "terminate_and_wait",
+                "kill",
+                "try_wait_then_kill",
+                "drop",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let pid_file = directory.path().join("descendant.pid");
+                let mut child = spawn(&mut fixture_command("root-exit", &pid_file)).unwrap();
+                let pid = child.id();
+                let descendant = descendant_pid(&pid_file);
+                assert!(
+                    REGISTRY.lock().unwrap()[&pid]
+                        .query_process_id_list()
+                        .unwrap()
+                        .contains(&usize::try_from(descendant).unwrap())
+                );
+                std::fs::write(pid_file.with_extension("exit"), "exit").unwrap();
+                wait_for_exit(&mut child);
+                let mut guard = super::super::ProcessGuard::new(
+                    child,
+                    super::super::ProcessCleanupMode::ProcessGroupTree,
+                );
+                match completion {
+                    "try_wait" => assert!(guard.try_wait_child().unwrap().is_some()),
+                    "wait" => assert!(guard.wait().unwrap().success()),
+                    "terminate_and_wait" => assert!(guard.terminate_and_wait().unwrap().success()),
+                    "kill" => assert!(guard.kill().unwrap().success()),
+                    "try_wait_then_kill" => {
+                        assert!(guard.try_wait_child().unwrap().is_some());
+                        assert!(guard.kill().unwrap().success());
+                        assert!(guard.kill().is_none());
+                    }
+                    _ => drop(guard),
+                }
+                assert!(!REGISTRY.lock().unwrap().contains_key(&pid));
+            }
         }
     }
 }
@@ -13873,7 +16420,7 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
     };
 
     // Windows fast path: children spawned through
-    // `attach_child_job_discipline` carry a Job object containing their whole
+    // `spawn_command_with_job_discipline` carry a Job object containing their whole
     // descendant tree, so dropping the job kills everyone in one shot —
     // including grandchildren that appeared after this function would
     // otherwise have taken its snapshot (bd-9jgrt item 1). Pids without a
@@ -14012,14 +16559,13 @@ impl JobGatedChildLaunch {
     }
 }
 
-/// Prepare a command whose Windows target cannot spawn before Job attachment.
+/// Prepare a command whose Windows target waits for its owner's launch gate.
 ///
 /// Unix already creates a new process-group leader before the target image
-/// runs. Windows has no equivalent `Command` API for atomic Job assignment, so
-/// a copy of Pi waits on a private file gate using only in-process operations.
-/// Once the parent attaches that wrapper to the Job and opens the gate, the
-/// real target is spawned as a Job member and all of its descendants inherit
-/// the same kill-on-close discipline.
+/// runs. On Windows, a copy of Pi waits on a private file gate using only
+/// in-process operations. Spawn that wrapper with atomic Job membership,
+/// retain its owner and check cancellation before opening the gate. The real
+/// target then inherits the same kill-on-close discipline as the wrapper.
 pub(crate) fn command_with_job_gate_in_dir(
     program: impl AsRef<OsStr>,
     args: &[OsString],
@@ -14064,10 +16610,10 @@ pub(crate) fn command_with_job_gate_in_dir(
     }
 }
 
-/// Run the Windows half of the private pre-Job launch gate, if requested.
+/// Run the Windows half of the private target launch gate, if requested.
 ///
 /// This is called before normal CLI initialization. The wait itself never
-/// spawns a process, which is the property that closes the spawn-to-Job race.
+/// spawns a process, so cancellation can still prevent the target launch.
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn run_windows_share_job_child_if_requested() -> Option<i32> {
@@ -15221,6 +17767,165 @@ mod tests {
         let env = WindowsShellEnv::from_process();
         assert!(!env.path_dirs.is_empty());
         let _ = find_windows_bash(&env, Path::is_file);
+    }
+
+    fn find_program(
+        name: &str,
+        path_dirs: &[PathBuf],
+        pathext: Option<&str>,
+        existing: &[PathBuf],
+    ) -> Option<PathBuf> {
+        find_windows_program(name, path_dirs, pathext.map(OsStr::new), |path| {
+            existing.iter().any(|file| file == path)
+        })
+    }
+
+    const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
+    fn nodejs_dir() -> PathBuf {
+        PathBuf::from("C:").join("Program Files").join("nodejs")
+    }
+
+    fn pnpm_dir() -> PathBuf {
+        PathBuf::from("C:")
+            .join("Users")
+            .join("me")
+            .join("AppData")
+            .join("Local")
+            .join("pnpm")
+            .join("bin")
+    }
+
+    /// GH #182: pnpm puts an `npm.exe` shim on `PATH` and no `npm.cmd`.
+    #[test]
+    fn find_windows_program_finds_an_npm_exe_shim() {
+        let dirs = [system32(), pnpm_dir()];
+        let shim = pnpm_dir().join("npm.exe");
+        assert_eq!(
+            find_program(
+                "npm",
+                &dirs,
+                Some(DEFAULT_PATHEXT),
+                std::slice::from_ref(&shim)
+            ),
+            Some(shim)
+        );
+    }
+
+    /// The Node.js installer puts a POSIX `npm` script, `npm.cmd` and
+    /// `npm.ps1` side by side; only the batch wrapper can be started.
+    #[test]
+    fn find_windows_program_takes_the_batch_wrapper_over_the_posix_script() {
+        let existing = [
+            nodejs_dir().join("npm"),
+            nodejs_dir().join("npm.ps1"),
+            nodejs_dir().join("npm.cmd"),
+        ];
+        assert_eq!(
+            find_program("npm", &[nodejs_dir()], Some(DEFAULT_PATHEXT), &existing),
+            Some(nodejs_dir().join("npm.cmd"))
+        );
+        assert_eq!(
+            find_program(
+                "npm",
+                &[nodejs_dir()],
+                Some(DEFAULT_PATHEXT),
+                &existing[..2]
+            ),
+            None,
+            "an extensionless script or a .ps1 is never launched"
+        );
+    }
+
+    /// Like `cmd.exe`, an earlier `PATH` directory wins over a preferred
+    /// extension in a later one, and `PATHEXT` orders extensions within one
+    /// directory (case-insensitively).
+    #[test]
+    fn find_windows_program_honours_path_then_pathext_order() {
+        let existing = [
+            nodejs_dir().join("npm.cmd"),
+            pnpm_dir().join("npm.exe"),
+            pnpm_dir().join("npm.cmd"),
+        ];
+        assert_eq!(
+            find_program(
+                "npm",
+                &[nodejs_dir(), pnpm_dir()],
+                Some(DEFAULT_PATHEXT),
+                &existing
+            ),
+            Some(nodejs_dir().join("npm.cmd"))
+        );
+        assert_eq!(
+            find_program("npm", &[pnpm_dir()], Some(DEFAULT_PATHEXT), &existing),
+            Some(pnpm_dir().join("npm.exe"))
+        );
+        assert_eq!(
+            find_program("npm", &[pnpm_dir()], Some(".Cmd;.exe"), &existing),
+            Some(pnpm_dir().join("npm.cmd"))
+        );
+    }
+
+    /// Script extensions in `PATHEXT` need a host and are skipped; an unset,
+    /// empty or script-only `PATHEXT` falls back to `.COM;.EXE;.BAT;.CMD`.
+    #[test]
+    fn find_windows_program_skips_unlaunchable_pathext_entries() {
+        let js = pnpm_dir().join("npm.js");
+        let cmd = pnpm_dir().join("npm.cmd");
+        let dirs = [pnpm_dir()];
+        assert_eq!(
+            find_program("npm", &dirs, Some(".JS;.CMD"), &[js.clone(), cmd.clone()]),
+            Some(cmd.clone())
+        );
+        assert_eq!(
+            find_program("npm", &dirs, Some(".JS"), std::slice::from_ref(&js)),
+            None
+        );
+        for pathext in [None, Some(""), Some(";;"), Some(".JS;.VBS")] {
+            assert_eq!(
+                find_program("npm", &dirs, pathext, std::slice::from_ref(&cmd)),
+                Some(cmd.clone()),
+                "PATHEXT {pathext:?}"
+            );
+        }
+    }
+
+    /// A name that already carries a launchable extension is looked up as
+    /// written; a name with a directory part is not searched for at all.
+    #[test]
+    fn find_windows_program_takes_explicit_extensions_and_rejects_paths() {
+        let dirs = [pnpm_dir()];
+        let exe = pnpm_dir().join("npm.exe");
+        let cmd = pnpm_dir().join("npm.cmd");
+        assert_eq!(
+            find_program("npm.cmd", &dirs, None, std::slice::from_ref(&exe)),
+            None
+        );
+        let upper = pnpm_dir().join("NPM.CMD");
+        assert_eq!(
+            find_program("NPM.CMD", &dirs, None, &[exe.clone(), upper.clone()]),
+            Some(upper)
+        );
+        assert_eq!(
+            find_program("npm.cmd", &dirs, None, &[exe.clone(), cmd.clone()]),
+            Some(cmd)
+        );
+        for name in ["", "bin\\npm", "bin/npm", "C:npm"] {
+            assert_eq!(
+                find_program(name, &dirs, None, std::slice::from_ref(&exe)),
+                None,
+                "{name:?}"
+            );
+        }
+    }
+
+    /// The process-environment variant runs on every OS.
+    #[test]
+    fn find_windows_program_on_path_reads_the_process_environment() {
+        assert_eq!(
+            find_windows_program_on_path("pi-no-such-program-gh182"),
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -16472,6 +19177,157 @@ mod tests {
         });
     }
 
+    fn office_read_fixture(presentation: bool, text: &str) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let office_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let package_rel = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let main = if presentation {
+            "ppt/presentation.xml"
+        } else {
+            "word/document.xml"
+        };
+        let relationships = format!(
+            "<Relationships xmlns='{package_rel}'><Relationship Id='main' Type='{office_rel}/officeDocument' Target='{main}'/></Relationships>"
+        );
+        let mut entries = vec![("_rels/.rels", relationships)];
+        if presentation {
+            let presentation_ns = "http://schemas.openxmlformats.org/presentationml/2006/main";
+            let drawing_ns = "http://schemas.openxmlformats.org/drawingml/2006/main";
+            entries.push((main, format!(
+                "<p:presentation xmlns:p='{presentation_ns}' xmlns:r='{office_rel}'><p:sldIdLst><p:sldId id='256' r:id='slide'/></p:sldIdLst></p:presentation>"
+            )));
+            entries.push(("ppt/_rels/presentation.xml.rels", format!(
+                "<Relationships xmlns='{package_rel}'><Relationship Id='slide' Type='{office_rel}/slide' Target='slides/slide1.xml'/></Relationships>"
+            )));
+            entries.push(("ppt/slides/slide1.xml", format!(
+                "<p:sld xmlns:p='{presentation_ns}' xmlns:a='{drawing_ns}'><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+            )));
+        } else {
+            entries.push((main, format!(
+                "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p><w:r><w:t>Document heading</w:t></w:r></w:p><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+            )));
+        }
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer
+                .start_file(name, options)
+                .expect("start Office fixture member");
+            writer
+                .write_all(content.as_bytes())
+                .expect("write Office fixture XML");
+        }
+        writer
+            .finish()
+            .expect("finish Office fixture ZIP")
+            .into_inner()
+    }
+
+    #[test]
+    fn read_office_documents_render_local_and_downloaded_bytes_consistently() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("Office read fixtures");
+            let tool = ReadTool::new(tmp.path());
+            for (name, presentation, kind) in [
+                ("report.DOCX", false, "docx"),
+                ("slides.pptx", true, "pptx"),
+            ] {
+                let bytes = office_read_fixture(presentation, "Saved text 世界");
+                let path = tmp.path().join(name);
+                std::fs::write(&path, &bytes).unwrap();
+                let output = tool
+                    .execute(name, serde_json::json!({"path": name}), None)
+                    .await
+                    .expect("read native document");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], kind);
+                assert_eq!(details["extractor"], kind);
+                assert_eq!(details["rendered"], true);
+                assert_eq!(details["totalLines"], 3);
+                assert!(first_text(&output).contains("Saved text 世界"));
+
+                let downloaded = crate::url_read::convert_bytes(
+                    &format!("https://example.test/{name}?download=1"),
+                    "application/octet-stream",
+                    &bytes,
+                    false,
+                )
+                .expect("convert downloaded Office bytes");
+                let numbered: Vec<_> = first_text(&output)
+                    .lines()
+                    .map(|line| line.split_once('→').unwrap().1)
+                    .collect();
+                assert_eq!(numbered, downloaded.content.lines().collect::<Vec<_>>());
+
+                let page = tool
+                    .execute(
+                        "office-page",
+                        serde_json::json!({"path": name, "offset": 3, "limit": 1}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(first_text(&page), "    3→Saved text 世界");
+                assert_eq!(page.details.as_ref().unwrap()["truncated"], false);
+                let error = tool
+                    .execute(
+                        "office-edit-anchor",
+                        serde_json::json!({"path": name, "hashline": true}),
+                        None,
+                    )
+                    .await
+                    .expect_err("rendered lines are not binary edit locations");
+                assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "read must not rewrite the package"
+                );
+            }
+            let error = tool.execute(
+                "url-edit-anchor",
+                serde_json::json!({"path": "https://example.invalid/report.docx", "hashline": true}),
+                None,
+            ).await.expect_err("invalid anchor request must fail before a network lookup");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_office_document_uses_admitted_inode_and_does_not_cache_replacement() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("Office descriptor fixture");
+            let target = tmp.path().join("report.docx");
+            let retained = tmp.path().join("opened-report.docx");
+            std::fs::write(&target, office_read_fixture(false, "admitted content")).unwrap();
+            let swapped_path = target.clone();
+            let tool = ReadTool::with_after_open_hook(tmp.path(), move || {
+                std::fs::rename(&swapped_path, &retained).unwrap();
+                std::fs::write(
+                    &swapped_path,
+                    office_read_fixture(false, "replacement content"),
+                )
+                .unwrap();
+            });
+            let input = serde_json::json!({"path": "report.docx"});
+            let opened = tool
+                .execute("office-opened", input.clone(), None)
+                .await
+                .unwrap();
+            assert!(first_text(&opened).contains("admitted content"));
+            assert!(!first_text(&opened).contains("replacement content"));
+            let replacement = ReadTool::new(tmp.path())
+                .execute("office-replacement", input, None)
+                .await
+                .unwrap();
+            assert!(first_text(&replacement).contains("replacement content"));
+            assert!(!first_text(&replacement).contains("admitted content"));
+        });
+    }
+
     async fn assert_read_cache_hit_and_stale(tmp: &Path) {
         let note = tmp.join("note.txt");
         std::fs::write(&note, "alpha\n").expect("write note");
@@ -17696,6 +20552,116 @@ mod tests {
     // ========================================================================
     // Read Tool Tests
     // ========================================================================
+
+    #[test]
+    fn read_video_respects_image_policy_before_decoder_dispatch() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), b"not decoded")
+                .expect("video placeholder");
+            let tool = ReadTool::with_settings(workspace.path(), true, true);
+            for path in ["clip.mp4", "clip.mp4:42", "clip.mp4:00:00:01"] {
+                let error = tool
+                    .execute("blocked-video", serde_json::json!({"path": path}), None)
+                    .await
+                    .expect_err("blocked images must not invoke a decoder");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Images are blocked by configuration"),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn read_video_rejects_text_windows_and_edit_anchors() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), b"not decoded")
+                .expect("video placeholder");
+            let tool = ReadTool::new(workspace.path());
+            for args in [
+                serde_json::json!({"path": "clip.mp4", "hashline": true}),
+                serde_json::json!({"path": "clip.mp4:1m2s", "offset": 1}),
+                serde_json::json!({"path": "clip.mp4:42", "limit": 10}),
+            ] {
+                let error = tool
+                    .execute("video-text-options", args, None)
+                    .await
+                    .expect_err("visual results do not have source lines");
+                assert!(error.to_string().contains("VIDEO_READ_OPTIONS"), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn read_video_raw_mode_preserves_source_text_behavior() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), "literal source\n")
+                .expect("source placeholder");
+            let output = ReadTool::new(workspace.path())
+                .execute(
+                    "video-raw",
+                    serde_json::json!({"path": "clip.mp4", "raw": true, "hashline": true}),
+                    None,
+                )
+                .await
+                .expect("raw source read");
+            let text = get_text(&output.content);
+            assert!(text.contains("literal source"), "{text}");
+            assert!(text.starts_with("1#"), "{text}");
+            assert!(
+                output
+                    .content
+                    .iter()
+                    .all(|part| matches!(part, ContentBlock::Text(_)))
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_video_preserves_existing_literal_colon_filenames() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            for name in ["clip.mp4:42", "clip.mp4:not-a-selector"] {
+                std::fs::write(workspace.path().join(name), "literal colon file\n")
+                    .expect("colon filename");
+                let output = ReadTool::new(workspace.path())
+                    .execute("literal-colon", serde_json::json!({"path": name}), None)
+                    .await
+                    .expect("literal file takes precedence over selector parsing");
+                assert!(get_text(&output.content).contains("literal colon file"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_video_selector_cannot_escape_workspace_through_symlink() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let outside = tempfile::tempdir().expect("outside workspace");
+            let secret = outside.path().join("secret.mp4");
+            std::fs::write(&secret, b"must not reach a decoder").expect("outside video");
+            std::os::unix::fs::symlink(&secret, workspace.path().join("clip.mp4"))
+                .expect("video symlink");
+            let tool = ReadTool::new(workspace.path());
+            for path in ["clip.mp4", "clip.mp4:42", "clip.mp4:00:00:01"] {
+                let error = tool
+                    .execute("video-scope", serde_json::json!({"path": path}), None)
+                    .await
+                    .expect_err("video source must pass the ordinary read scope");
+                assert!(
+                    error.to_string().contains("outside the working directory"),
+                    "{error}"
+                );
+            }
+        });
+    }
 
     #[test]
     fn test_read_valid_file() {
@@ -18923,6 +21889,42 @@ mod tests {
     }
 
     #[test]
+    fn automatic_bash_rechecks_cancellation_after_session_resolution() {
+        let root = tempfile::tempdir().expect("workspace");
+        let owner = AgentCx::for_request();
+        let resolver_owner = owner.clone();
+        let scope = crate::jobs::JobSessionScope::fixed("resolver-owner");
+        scope.bind(Arc::new(move || {
+            let owner = resolver_owner.clone();
+            let mut suspended = false;
+            Box::pin(std::future::poll_fn(move |task| {
+                if !suspended {
+                    suspended = true;
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancelled while resolving the session"),
+                    );
+                    std::task::Poll::Ready(Some("resolver-owner".to_string()))
+                }
+            }))
+        }));
+        let mut tool = BashTool::new(root.path());
+        tool.bind_job_session_scope(scope);
+        let mut check = Box::pin(tool.still_owns_foreground(&owner, "resolver-owner"));
+        let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(check.as_mut().poll(&mut task).is_pending());
+        assert!(!owner.is_cancel_requested());
+        assert!(matches!(
+            check.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Ok(false))
+        ));
+        assert!(owner.is_cancel_requested());
+    }
+
+    #[test]
     fn test_bash_simple_command() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
@@ -19350,6 +22352,154 @@ mod tests {
     // ========================================================================
     // Grep Tool Tests
     // ========================================================================
+
+    #[test]
+    fn grep_agent_resources_use_accepted_results_and_reject_provisional_output() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent_hub::ChildStatus;
+
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = format!("grep-agent-{}", uuid::Uuid::new_v4());
+            let (accepted, pending, rejected) = {
+                let mut hub = crate::agent_hub::registry().lock().unwrap();
+                let accepted = hub
+                    .register(&format!("{prefix}-accepted"), "accepted fixture")
+                    .unwrap();
+                let pending = hub
+                    .register(&format!("{prefix}-pending"), "pending fixture")
+                    .unwrap();
+                let rejected = hub
+                    .register(&format!("{prefix}-rejected"), "cancelled fixture")
+                    .unwrap();
+                hub.settle(&accepted.id, ChildStatus::Done);
+                hub.settle(&rejected.id, ChildStatus::Cancelled);
+                (
+                    hub.get(&accepted.id).unwrap(),
+                    pending,
+                    hub.get(&rejected.id).unwrap(),
+                )
+            };
+            crate::url_router::agent::publish(
+                &accepted,
+                "accepted prose",
+                Some(&serde_json::json!({"findings":[{"path":"src/needle.rs"}]})),
+                Some(true),
+                None,
+            );
+            crate::url_router::agent::publish(
+                &rejected,
+                "provisional src/needle.rs",
+                None,
+                None,
+                Some("cancelled"),
+            );
+            let tool = GrepTool::new(temp.path());
+            let path = format!("agent://{}/findings/0/path", accepted.id);
+            let output = tool
+                .execute(
+                    "accepted-result",
+                    serde_json::json!({
+                        "pattern":"src/needle.rs", "literal":true, "path":path,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                get_text(&output.content),
+                format!("{path}:1: src/needle.rs")
+            );
+            for (entry, code) in [
+                (pending, "PI_URL_AGENT_OUTPUT_PENDING"),
+                (rejected, "PI_URL_AGENT_OUTPUT_REJECTED"),
+            ] {
+                let error = tool.execute("unaccepted-result", serde_json::json!({
+                    "pattern":"needle", "path":format!("agent://{}/findings/0/path", entry.id),
+                }), None).await.unwrap_err();
+                assert!(error.to_string().contains(code), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_virtual_search_is_native_even_when_the_filesystem_backend_is_external() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let name = format!("grep-external-{}", uuid::Uuid::new_v4());
+            crate::url_router::write_local(&name, "prefix\0is still text\nneedle\n").unwrap();
+            let output = GrepTool::with_backend(temp.path(), SearchBackend::External)
+                .execute(
+                    "virtual-native",
+                    serde_json::json!({
+                        "pattern":"needle", "path":format!("local://{name}"),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                get_text(&output.content),
+                format!("local://{name}:2: needle")
+            );
+        });
+    }
+
+    #[test]
+    fn grep_resource_cancellation_is_checked_before_resolution() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let owner = AgentCx::for_request();
+            owner.cx().set_cancel_requested(true);
+            let tool = GrepTool::new(temp.path());
+            let error = owner
+                .with_current(tool.execute(
+                    "cancelled-resource",
+                    serde_json::json!({
+                        "pattern":"needle", "path":"local://must-not-resolve-after-cancel",
+                    }),
+                    None,
+                ))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("cancelled"), "{error}");
+            assert!(!error.to_string().contains("PI_URL_UNRESOLVABLE"));
+        });
+    }
+
+    #[test]
+    fn grep_remote_resources_cannot_use_the_polling_callers_spawn_authority() {
+        asupersync::test_utils::run_test(|| async {
+            type WithoutSpawn = asupersync::cx::cap::CapSet<false, true, true, true, true>;
+            let temp = tempfile::tempdir().unwrap();
+            let tool = GrepTool::new(temp.path());
+            let owner = {
+                let restricted = asupersync::Cx::for_request().restrict::<WithoutSpawn>();
+                let _guard = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            assert!(owner.capabilities().io);
+            assert!(!owner.capabilities().spawn);
+            for path in [
+                "pr://1/diff",
+                "issue://owner/repo/1",
+                "ssh://must-not-connect/tmp/file",
+                "conflict://*",
+            ] {
+                let error = owner
+                    .with_current(tool.execute(
+                        "spawn-denied",
+                        serde_json::json!({"pattern":"needle","path":path}),
+                        None,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("GREP_RESOURCE_PERMISSION"),
+                    "{path}: {error}"
+                );
+            }
+        });
+    }
 
     /// bd-cv653.1.5: the in-process and external search backends must render
     /// byte-identical tool output for the same corpus. Skips silently when
@@ -22042,6 +25192,37 @@ mod tests {
             let content = std::fs::read_to_string(&file).unwrap();
             assert_eq!(content, "line1\nchanged\n");
         });
+    }
+
+    #[test]
+    fn hub_wait_dependency_result_explains_the_cycle_and_preserves_details() {
+        let result: crate::agent_hub::InboxWaitResult = serde_json::from_value(serde_json::json!({
+            "id": "worker-1",
+            "status": "peerBlocked",
+            "messages": [],
+            "nextCursor": 17,
+            "hasMore": false,
+            "oldestCursor": 0,
+            "droppedThroughCursor": 0,
+            "peerStatus": null,
+            "pendingReplies": [{
+                "peer": "parent",
+                "sentCursor": 17,
+                "peerStatus": null,
+                "canReply": false,
+                "blockedOnCaller": true
+            }],
+            "blockedPeers": ["parent"]
+        }))
+        .unwrap();
+        let (text, details) = HubTool::format_wait_reply(&result);
+        assert!(text.contains("dependency cycle"));
+        assert!(text.contains("waiting on your result"));
+        assert_eq!(details["schema"], "pi.agent-hub.wait/v1");
+        assert_eq!(details["status"], "peerBlocked");
+        assert_eq!(details["nextCursor"], 17);
+        assert_eq!(details["blockedPeers"], serde_json::json!(["parent"]));
+        assert_eq!(details["pendingReplies"][0]["blockedOnCaller"], true);
     }
 
     #[test]

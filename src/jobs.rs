@@ -1,4 +1,4 @@
-//! Background bash jobs (bd-cv653.3.10).
+//! Session-owned background shell jobs and native tasks (bd-cv653.3.10).
 //!
 //! `bash {background: true}` returns immediately with a job id; the process
 //! runs detached under the same timeout/tree-kill discipline as the
@@ -15,6 +15,8 @@
 //! management operation, and completion notice carries its originating
 //! session id. Cross-session ids fail exactly like unknown ids. `kill_all`
 //! remains the final process-shutdown chokepoint so no child survives exit.
+//! Native tasks share the same admission, cancellation and retention fences;
+//! their complete privacy-protected tool results are available in `result`.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -34,6 +36,12 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::file_identity::FileIdentity;
 use crate::model::{Message, UserContent, UserMessage};
+
+mod host_task;
+pub(crate) use host_task::{
+    admit_owned_task, clear_owned_task_progress, publish_owned_task_progress, spawn_owned_task,
+    with_owned_task_progress,
+};
 
 /// Future returned by the live session-identity resolver shared by the jobs
 /// tools and their completion-notice fetcher.
@@ -142,7 +150,7 @@ const MIN_RETAINED_ARTIFACT_FILES: usize = 8;
 /// from blocking terminal publication forever.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Unix job pipes are nonblocking so a sealed pump observes cancellation
+/// Job pipes are nonblocking on Unix and Windows so a sealed pump observes cancellation
 /// within this interval even when an escaped process retains the write end.
 const OUTPUT_PUMP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -215,7 +223,11 @@ impl JobStatus {
 
 /// Live registry entry. The output tail is shared with the pump threads.
 struct JobEntry {
+    schema: &'static str,
+    result: Option<crate::tools::ToolOutput>,
+    result_bytes: usize,
     owner_session_id: String,
+    delivery: JobDelivery,
     id: String,
     command: String,
     started_at_ms: i64,
@@ -236,6 +248,16 @@ struct JobEntry {
     cancel_deadline: Arc<CancelDeadline>,
 }
 
+/// A managed command remains an ordinary foreground call until its owner
+/// transfers it to background delivery. Dropping that owner cancels the
+/// command and suppresses a late completion notice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobDelivery {
+    Foreground,
+    Background,
+    Abandoned,
+}
+
 /// Serializable snapshot handed to tool results and notices.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -250,9 +272,15 @@ pub struct JobSnapshot {
     pub artifact_path: String,
     pub artifact_cleanup: ArtifactCleanupOutcome,
     pub output_tail: String,
+    pub output_bytes: usize,
+    pub output_lines: usize,
+    pub tail_truncated: bool,
     pub artifact_truncated: bool,
     pub artifact_error: Option<String>,
     pub output_complete: bool,
+    /// Protected native result of a host task; shell jobs omit this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<crate::tools::ToolOutput>,
 }
 
 /// Cleanup performed before this job reserved its artifact file.
@@ -274,12 +302,30 @@ impl ArtifactCleanupOutcome {
 }
 
 impl JobSnapshot {
+    fn limit_output_tail(&mut self, max_bytes: usize) {
+        if self.output_tail.len() > max_bytes {
+            let mut start = self.output_tail.len() - max_bytes;
+            while !self.output_tail.is_char_boundary(start) {
+                start += 1;
+            }
+            self.output_tail.drain(..start);
+            self.tail_truncated = true;
+        }
+    }
+
     fn from_source_best_effort(source: &JobSnapshotSource) -> Self {
-        let output_tail = source
+        let (output_tail, output_bytes, output_lines, tail_truncated) = source
             .tail
             .try_lock()
-            .map(|tail| tail.text())
-            .unwrap_or_default();
+            .map(|tail| {
+                (
+                    tail.text(),
+                    tail.total_bytes,
+                    tail.line_count(),
+                    tail.total_bytes > tail.buf.len(),
+                )
+            })
+            .unwrap_or_else(|_| (String::new(), 0, 0, true));
         let (artifact_truncated, artifact_error) = source.artifact.try_lock().map_or_else(
             |_| {
                 (
@@ -289,7 +335,15 @@ impl JobSnapshot {
             },
             |artifact| (artifact.truncated, artifact.write_error.clone()),
         );
-        Self::from_source_fields(source, output_tail, artifact_truncated, artifact_error)
+        let mut snapshot =
+            Self::from_source_fields(source, output_tail, artifact_truncated, artifact_error);
+        snapshot.output_bytes = output_bytes;
+        snapshot.output_lines = output_lines;
+        snapshot.tail_truncated = tail_truncated;
+        if source.delivery == JobDelivery::Background {
+            snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
+        }
+        snapshot
     }
 
     fn from_source_fields(
@@ -299,7 +353,7 @@ impl JobSnapshot {
         artifact_error: Option<String>,
     ) -> Self {
         Self {
-            schema: JOB_SCHEMA.to_string(),
+            schema: source.schema.to_string(),
             id: source.id.clone(),
             command: source.command.clone(),
             started_at_ms: source.started_at_ms,
@@ -309,15 +363,22 @@ impl JobSnapshot {
             artifact_path: source.artifact_path.display().to_string(),
             artifact_cleanup: source.artifact_cleanup.clone(),
             output_tail,
+            output_bytes: 0,
+            output_lines: 0,
+            tail_truncated: false,
             artifact_truncated,
             artifact_error,
             output_complete: source.output_complete,
+            result: source.result.clone(),
         }
     }
 }
 
 #[derive(Clone)]
 struct JobSnapshotSource {
+    schema: &'static str,
+    result: Option<crate::tools::ToolOutput>,
+    delivery: JobDelivery,
     id: String,
     command: String,
     started_at_ms: i64,
@@ -334,6 +395,9 @@ struct JobSnapshotSource {
 impl JobSnapshotSource {
     fn from_entry(entry: &JobEntry) -> Self {
         Self {
+            schema: entry.schema,
+            result: entry.result.clone(),
+            delivery: entry.delivery,
             id: entry.id.clone(),
             command: entry.command.clone(),
             started_at_ms: entry.started_at_ms,
@@ -495,6 +559,9 @@ struct TailBuffer {
     buf: std::collections::VecDeque<u8>,
     cap: usize,
     sealed: bool,
+    total_bytes: usize,
+    newlines: usize,
+    last_byte_was_newline: bool,
 }
 
 impl TailBuffer {
@@ -503,12 +570,22 @@ impl TailBuffer {
             buf: std::collections::VecDeque::with_capacity(cap.min(8192)),
             cap,
             sealed: false,
+            total_bytes: 0,
+            newlines: 0,
+            last_byte_was_newline: false,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
         if self.sealed {
             return;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        self.newlines = self
+            .newlines
+            .saturating_add(chunk.iter().filter(|byte| **byte == b'\n').count());
+        if let Some(last) = chunk.last() {
+            self.last_byte_was_newline = *last == b'\n';
         }
         if chunk.len() >= self.cap {
             self.buf.clear();
@@ -532,6 +609,15 @@ impl TailBuffer {
 
     const fn seal(&mut self) {
         self.sealed = true;
+    }
+
+    fn line_count(&self) -> usize {
+        if self.total_bytes == 0 {
+            0
+        } else {
+            self.newlines
+                .saturating_add(usize::from(!self.last_byte_was_newline))
+        }
     }
 }
 
@@ -1452,8 +1538,6 @@ impl Drop for BackgroundChild {
 /// Named `PI_JOBS_AT_CAPACITY` when 8 jobs are already running,
 /// `PI_JOBS_SESSION_CLOSING` when owner teardown has started, or tool errors
 /// for spawn/artifact failures.
-// Guard scope is deliberate; tightening drops would change lock-hold semantics.
-#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 pub fn spawn_background(
     owner_session_id: &str,
     cwd: &Path,
@@ -1463,6 +1547,187 @@ pub fn spawn_background(
     timeout_secs: Option<u64>,
     artifact_root: Option<&Path>,
 ) -> Result<JobSnapshot> {
+    spawn_managed(
+        owner_session_id,
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
+        artifact_root,
+        JobDelivery::Background,
+        None,
+    )
+    .map(|(snapshot, _)| snapshot)
+}
+
+/// Own a command while the bash tool waits in the foreground. A dropped tool
+/// future requests cancellation; only explicit promotion lets the job outlive
+/// that future. The process monitor remains the sole owner through reap.
+pub(crate) struct ForegroundJob {
+    handle: JobWaitHandle,
+    armed: bool,
+}
+
+pub(crate) enum ForegroundPromotion {
+    Completed(JobSnapshot),
+    Background(JobSnapshot),
+}
+
+impl ForegroundJob {
+    pub(crate) fn snapshot(&self) -> Result<JobSnapshot> {
+        snapshot_now_best_effort(&self.handle)
+    }
+
+    pub(crate) async fn wait(&self, timeout: Duration) -> Result<JobSnapshot> {
+        wait_async_with_handle(&self.handle, timeout, MAX_ASYNC_WAIT_SLICE).await
+    }
+
+    pub(crate) async fn cancel(&self) -> Result<JobSnapshot> {
+        if let Some(snapshot) = settled_snapshot(&self.handle) {
+            return Ok(snapshot);
+        }
+        if let Err(error) = request_cancel(&self.handle.owner_session_id, &self.handle.id) {
+            if let Some(snapshot) = settled_snapshot(&self.handle) {
+                return Ok(snapshot);
+            }
+            if !matches!(&error, Error::Tool { message, .. }
+                if message.starts_with("PI_JOBS_NOT_RUNNING:"))
+            {
+                return Err(error);
+            }
+            // The child may have exited while its output is still draining.
+            // Await that real terminal result instead of relabelling it as
+            // cancellation or returning an unconfirmed cleanup result.
+        }
+        let snapshot = wait_for_settlement_wall(&self.handle, Duration::from_secs(10)).await?;
+        if snapshot.status == JobStatus::Running.as_str() {
+            return Err(Error::tool(
+                "bash",
+                "PI_JOBS_CANCEL_TIMEOUT: foreground command did not settle after cancellation",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    /// Decide under the same registry lock used for terminal publication.
+    /// Completion that won the race stays inline and cannot emit a duplicate
+    /// follow-up; promotion that won receives the monitor's one later notice.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn promote(mut self) -> Result<ForegroundPromotion> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        let job = reg
+            .jobs
+            .get_mut(&self.handle.id)
+            .filter(|job| {
+                job.owner_session_id == self.handle.owner_session_id
+                    && job.delivery == JobDelivery::Foreground
+            })
+            .ok_or_else(|| unknown_job_error(&self.handle.id))?;
+        if job.status.settled() {
+            let snapshot = settled_snapshot(&self.handle)
+                .ok_or_else(|| Error::tool("jobs", "foreground settlement snapshot missing"))?;
+            reg.jobs.remove(&self.handle.id);
+            self.armed = false;
+            return Ok(ForegroundPromotion::Completed(snapshot));
+        }
+        job.delivery = JobDelivery::Background;
+        // Tail mutation is memory-only. The pumps release artifact I/O
+        // before acquiring this mutex and never acquire the registry with
+        // the tail held, so promotion cannot inherit a filesystem stall.
+        {
+            let mut tail = job
+                .tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tail.cap = OUTPUT_TAIL_BYTES;
+            let overflow = tail.buf.len().saturating_sub(OUTPUT_TAIL_BYTES);
+            tail.buf.drain(..overflow);
+            tail.buf.shrink_to(OUTPUT_TAIL_BYTES);
+        }
+        let source = JobSnapshotSource::from_entry(job);
+        self.armed = false;
+        drop(reg);
+        let mut snapshot = JobSnapshot::from_source_best_effort(&source);
+        snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
+        Ok(ForegroundPromotion::Background(snapshot))
+    }
+}
+
+impl Drop for ForegroundJob {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(job) = reg.jobs.get_mut(&self.handle.id).filter(|job| {
+            job.owner_session_id == self.handle.owner_session_id
+                && job.delivery == JobDelivery::Foreground
+        }) else {
+            return;
+        };
+        if job.status.settled() {
+            reg.jobs.remove(&self.handle.id);
+        } else {
+            job.delivery = JobDelivery::Abandoned;
+            job.cancel_requested = true;
+        }
+    }
+}
+
+// The optional state transaction travels with the same execution description
+// used by explicit jobs, without changing their public spawn contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_foreground(
+    owner_session_id: &str,
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    artifact_root: Option<&Path>,
+    shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
+) -> Result<ForegroundJob> {
+    let (_, handle) = spawn_managed(
+        owner_session_id,
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        // Automatic backgrounding never silently extends the foreground
+        // command's deadline to the explicit-background default.
+        Some(timeout_secs.unwrap_or(crate::tools::DEFAULT_BASH_TIMEOUT_SECS)),
+        artifact_root,
+        JobDelivery::Foreground,
+        shell_state,
+    )?;
+    Ok(ForegroundJob {
+        handle,
+        armed: true,
+    })
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::significant_drop_tightening
+)]
+fn spawn_managed(
+    owner_session_id: &str,
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    artifact_root: Option<&Path>,
+    delivery: JobDelivery,
+    shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
+) -> Result<(JobSnapshot, JobWaitHandle)> {
     if owner_session_id.trim().is_empty() {
         return Err(Error::tool(
             "jobs",
@@ -1500,9 +1765,14 @@ pub fn spawn_background(
     };
 
     let retained_command = truncate_utf8_bytes(command, MAX_RETAINED_COMMAND_BYTES);
-    let shell_command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
-        || command.to_string(),
-        |prefix| format!("{prefix}\n{command}"),
+    let shell_command = shell_state.map_or_else(
+        || {
+            command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+                || command.to_string(),
+                |prefix| format!("{prefix}\n{command}"),
+            )
+        },
+        |state| state.command().to_owned(),
     );
     let shell_command = format!("trap 'code=$?; wait; exit $code' EXIT\n{shell_command}");
 
@@ -1518,9 +1788,15 @@ pub fn spawn_background(
     cmd.arg("-c")
         .arg(&shell_command)
         .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+    #[cfg(not(windows))]
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Keep configured proxy routing identical to the direct foreground
+    // runner for both managed foreground and explicit background commands.
+    for (key, value) in crate::http::proxy::child_process_env() {
+        cmd.env(key, value);
+    }
     crate::tools::isolate_command_process_group(&mut cmd);
 
     let artifact_dir = artifact_root.map_or_else(
@@ -1550,11 +1826,27 @@ pub fn spawn_background(
     })?;
     drop(artifact_budget_lock);
     let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact, MAX_ARTIFACT_BYTES)));
-    let tail = Arc::new(Mutex::new(TailBuffer::new(OUTPUT_TAIL_BYTES)));
+    let tail_cap = if delivery == JobDelivery::Foreground {
+        crate::tools::DEFAULT_MAX_BYTES.saturating_mul(2)
+    } else {
+        OUTPUT_TAIL_BYTES
+    };
+    let tail = Arc::new(Mutex::new(TailBuffer::new(tail_cap)));
     let output_sealed = Arc::new(AtomicBool::new(false));
     let settled_snapshot = Arc::new(Mutex::new(None));
     let settled_notify = Arc::new(Notify::new());
     let cancel_deadline = Arc::new(CancelDeadline::new());
+
+    // Reserve the job slot before allocating either pipe. Windows children
+    // receive synchronous writers while their parent readers use overlapped
+    // I/O; using std's anonymous pipes would leave their reads uncancellable.
+    #[cfg(windows)]
+    let (stdout, stderr) = windows_job_pipe::configure(&mut cmd).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to prepare job output pipes: {err}{cleanup_failure_context}"),
+        )
+    })?;
 
     let started_at = Instant::now();
     let started_at_ms = now_ms();
@@ -1565,41 +1857,37 @@ pub fn spawn_background(
     invoke_before_os_spawn_hook(owner_session_id);
     ensure_session_spawn_generation(owner_session_id, spawn_generation)
         .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
-    let mut child = cmd.spawn().map_err(|e| {
+    let child = crate::tools::spawn_command_with_job_discipline(&mut cmd).map_err(|e| {
         Error::tool(
             "bash",
             format!("Failed to spawn shell {shell}: {e}{cleanup_failure_context}"),
         )
     })?;
-    if !crate::tools::attach_child_job_discipline(&child) {
-        crate::tools::kill_process_group_tree(Some(child.id()));
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(Error::tool(
-            "bash",
-            format!(
-                "Failed to attach background shell to platform process-tree discipline{cleanup_failure_context}"
-            ),
-        ));
-    }
+    // Command retains caller-supplied Stdio handles after spawn. Close those
+    // parent copies immediately so only the child owns the pipe writers.
+    drop(cmd);
     let pid = child.id();
     let mut child = BackgroundChild::new(child);
+    #[cfg(not(windows))]
     let stdout = child
         .child
         .as_mut()
         .and_then(|child| child.stdout.take())
         .ok_or_else(|| Error::tool("bash", format!("Missing stdout{cleanup_failure_context}")))?;
+    #[cfg(not(windows))]
     let stderr = child
         .child
         .as_mut()
         .and_then(|child| child.stderr.take())
         .ok_or_else(|| Error::tool("bash", format!("Missing stderr{cleanup_failure_context}")))?;
+    #[cfg(not(windows))]
     prepare_job_stream(&stdout).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to prepare job stdout: {err}{cleanup_failure_context}"),
         )
     })?;
+    #[cfg(not(windows))]
     prepare_job_stream(&stderr).map_err(|err| {
         Error::tool(
             "bash",
@@ -1607,9 +1895,8 @@ pub fn spawn_background(
         )
     })?;
 
-    // Pump threads: dedicated OS threads for the same reason as the
-    // foreground path (unbounded blocking reads must not starve the
-    // runtime's blocking pool).
+    // Dedicated threads isolate artifact filesystem I/O from the runtime's
+    // blocking pool. Pipe reads themselves are nonblocking on Unix/Windows.
     let stdout_tail = Arc::clone(&tail);
     let stdout_artifact = Arc::clone(&artifact);
     let stdout_sealed = Arc::clone(&output_sealed);
@@ -1644,7 +1931,7 @@ pub fn spawn_background(
 
     #[cfg(test)]
     invoke_before_registry_publication_hook(owner_session_id, pid);
-    let snapshot_source = {
+    let (snapshot_source, handle) = {
         let mut reg = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1673,7 +1960,11 @@ pub fn spawn_background(
             ));
         }
         let entry = JobEntry {
+            schema: JOB_SCHEMA,
+            result: None,
+            result_bytes: 0,
             owner_session_id: owner_session_id.to_string(),
+            delivery,
             id: id.clone(),
             command: retained_command,
             started_at_ms,
@@ -1694,9 +1985,16 @@ pub fn spawn_background(
             cancel_deadline,
         };
         let snapshot_source = JobSnapshotSource::from_entry(&entry);
+        let handle = JobWaitHandle {
+            owner_session_id: owner_session_id.to_string(),
+            id: id.clone(),
+            settled_snapshot: Arc::clone(&entry.settled_snapshot),
+            settled_notify: Arc::clone(&entry.settled_notify),
+            cancel_deadline: Arc::clone(&entry.cancel_deadline),
+        };
         reg.jobs.insert(id.clone(), entry);
         slot.commit(&mut reg);
-        snapshot_source
+        (snapshot_source, handle)
     };
     #[cfg(test)]
     invoke_after_registry_publication_hook(owner_session_id, &id);
@@ -1716,6 +2014,7 @@ pub fn spawn_background(
         tail: Arc::clone(&tail),
         monitor_started: false,
         settlement_published: false,
+        shell_state: shell_state.cloned(),
     })));
     let thread_resources = Arc::clone(&monitor_resources);
     #[cfg(test)]
@@ -1761,7 +2060,246 @@ pub fn spawn_background(
     // Ownership has reached the monitor before inspecting I/O-owned state.
     // A pump stalled in filesystem I/O must not strand the child, lifecycle
     // lock, and cancellation path inside this spawn call.
-    Ok(JobSnapshot::from_source_best_effort(&snapshot_source))
+    Ok((
+        JobSnapshot::from_source_best_effort(&snapshot_source),
+        handle,
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) mod windows_job_pipe {
+    use mio::windows::NamedPipe;
+    use mio::{Events, Interest, Poll, Registry, Token};
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const REACTOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
+    const REACTOR_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Mio retains an Arc for every submitted read until Poll consumes its
+    /// completion, including cancellation. A per-job Poll cannot safely retire
+    /// on a deadline: its last callback may arrive afterward. This one reactor
+    /// lives until process exit and never owns job writers, pumps, or artifacts.
+    struct Reactor {
+        registry: Registry,
+        state: Arc<ReactorState>,
+    }
+
+    struct ReactorState {
+        failed: AtomicBool,
+        progress: Mutex<()>,
+        ready: Condvar,
+    }
+
+    impl ReactorState {
+        fn notify(&self) {
+            let _progress = self
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.ready.notify_all();
+        }
+    }
+
+    struct ReactorExit(Arc<ReactorState>);
+
+    impl Drop for ReactorExit {
+        fn drop(&mut self) {
+            self.0.failed.store(true, Ordering::Release);
+            self.0.notify();
+        }
+    }
+
+    impl Reactor {
+        fn start() -> io::Result<Self> {
+            let mut poll = Poll::new()?;
+            let registry = poll.registry().try_clone()?;
+            let state = Arc::new(ReactorState {
+                failed: AtomicBool::new(false),
+                progress: Mutex::new(()),
+                ready: Condvar::new(),
+            });
+            let worker_state = Arc::clone(&state);
+            let _worker = std::thread::Builder::new()
+                .name("pi-job-pipe-reactor".to_string())
+                .spawn(move || {
+                    let _exit = ReactorExit(Arc::clone(&worker_state));
+                    let mut events = Events::with_capacity(128);
+                    loop {
+                        // Poll runs the IOCP callbacks that release cancelled
+                        // I/O. Wake the bounded set of readers together after
+                        // callbacks finish; each consumes its own Mio buffer.
+                        match poll.poll(&mut events, Some(REACTOR_POLL_INTERVAL)) {
+                            Ok(()) => {
+                                if !events.is_empty() {
+                                    worker_state.notify();
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => {
+                                if !worker_state.failed.swap(true, Ordering::AcqRel) {
+                                    tracing::error!(
+                                        event = "pi.jobs.pipe_reactor_failed",
+                                        error = %error,
+                                        "Windows job pipe reactor failed; refusing new jobs"
+                                    );
+                                }
+                                worker_state.notify();
+                                // Do not drop Poll with outstanding cancelled
+                                // reads. Keep trying to reclaim their callbacks
+                                // even though admission stays permanently shut.
+                                std::thread::sleep(REACTOR_RETRY_INTERVAL);
+                            }
+                        }
+                    }
+                })?;
+            Ok(Self { registry, state })
+        }
+
+        fn check(&self) -> io::Result<()> {
+            if self.state.failed.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "PI_JOBS_PIPE_REACTOR: Windows job output reactor is unavailable",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn reactor() -> io::Result<&'static Reactor> {
+        static REACTOR: OnceLock<Result<Reactor, String>> = OnceLock::new();
+        match REACTOR.get_or_init(|| Reactor::start().map_err(|error| error.to_string())) {
+            Ok(reactor) => {
+                reactor.check()?;
+                Ok(reactor)
+            }
+            Err(error) => Err(io::Error::other(format!(
+                "PI_JOBS_PIPE_REACTOR: failed to start Windows job output reactor: {error}"
+            ))),
+        }
+    }
+
+    pub(crate) struct Reader {
+        pipe: NamedPipe,
+        reactor: &'static Reactor,
+    }
+
+    impl Reader {
+        /// Poll buffered output without waiting for a readiness notification.
+        /// Async helper runners retain their own byte, work and time budgets;
+        /// an idle pipe returns WouldBlock and must never block their executor.
+        ///
+        /// # Errors
+        ///
+        /// Returns WouldBlock while idle, or an I/O error when the shared
+        /// reactor or pipe fails. With a nonempty buffer, only a closed writer
+        /// produces an empty read.
+        pub(crate) fn try_read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reactor.check()?;
+            self.pipe.read(buffer)
+        }
+    }
+
+    impl Read for Reader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let deadline = Instant::now() + super::OUTPUT_PUMP_POLL_INTERVAL;
+            let state = &self.reactor.state;
+            // Lock before checking the pipe, then atomically unlock to wait.
+            // A completion between read and wait cannot lose its notification.
+            // Poll releases Mio's internal locks before acquiring this mutex.
+            let mut progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                self.reactor.check()?;
+                match self.pipe.read(buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                        else {
+                            return Err(error);
+                        };
+                        progress = state
+                            .ready
+                            .wait_timeout(progress, remaining)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            // Suppress new readiness notifications before NamedPipe's Drop
+            // cancels its pending read. The shared Poll remains alive to reap
+            // the completion-held Arc and close the actual server handle.
+            let _ = self.reactor.registry.deregister(&mut self.pipe);
+        }
+    }
+
+    pub(crate) fn pair() -> io::Result<(Reader, File)> {
+        let reactor = reactor()?;
+        let name = format!(r"\\.\pipe\pi-job-{}", uuid::Uuid::new_v4().simple());
+        let mut pipe = NamedPipe::new(&name)?;
+        // The client must stay synchronous for child stdout/stderr. Opening it
+        // first establishes the connection, so connect below takes the immediate
+        // ERROR_PIPE_CONNECTED path instead of owning a pending connect whose
+        // callback could submit a fresh read after the server has been dropped.
+        let writer = OpenOptions::new().write(true).open(&name)?;
+        reactor
+            .registry
+            .register(&mut pipe, Token(0), Interest::READABLE)?;
+        pipe.connect()?;
+        reactor.check()?;
+        Ok((Reader { pipe, reactor }, writer))
+    }
+
+    pub(super) fn configure(command: &mut Command) -> io::Result<(Reader, Reader)> {
+        let (stdout, stdout_writer) = pair()?;
+        let (stderr, stderr_writer) = pair()?;
+        command
+            .stdout(Stdio::from(stdout_writer))
+            .stderr(Stdio::from(stderr_writer));
+        Ok((stdout, stderr))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn try_read_does_not_wait_for_the_readiness_notification_lock() {
+            let _guard = super::super::process_test_guard();
+            let (mut reader, writer) = pair().expect("Windows helper pipe");
+            let state = Arc::clone(&reader.reactor.state);
+            let progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = reader.try_read(&mut [0]).map_err(|error| error.kind());
+                let _ = sent.send(result);
+                reader
+            });
+            // A blocking Read would wait for the mutex above. Always release
+            // it before joining, including when this regression is detected,
+            // so a failure leaves neither a blocked worker nor a locked reactor.
+            let result = received.recv_timeout(Duration::from_secs(2));
+            drop(progress);
+            let reader = worker.join().expect("helper pipe poll worker");
+            assert_eq!(result, Ok(Err(io::ErrorKind::WouldBlock)));
+            drop(reader);
+            drop(writer);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1774,7 +2312,7 @@ fn prepare_job_stream(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
 }
 
 // Mirrors the Unix arm's fallible signature, which really can fail.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn prepare_job_stream<R>(_reader: &R) -> std::io::Result<()> {
     Ok(())
@@ -1811,10 +2349,19 @@ fn pump_job_stream<R: Read>(
         if output_sealed.load(Ordering::Acquire) {
             return Ok(());
         }
+        #[cfg(windows)]
+        let read_started = Instant::now();
         match reader.read(&mut chunk) {
             Ok(0) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(windows)]
+                // Windows waits for readiness inside Read. Do not add another
+                // full idle delay after that bounded wait has already elapsed.
+                std::thread::sleep(
+                    OUTPUT_PUMP_POLL_INTERVAL.saturating_sub(read_started.elapsed()),
+                );
+                #[cfg(not(windows))]
                 std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
             }
             Err(err) => return Err(err),
@@ -1862,6 +2409,7 @@ struct MonitorResources {
     tail: Arc<Mutex<TailBuffer>>,
     monitor_started: bool,
     settlement_published: bool,
+    shell_state: Option<crate::tools::bash_session::ShellTransaction>,
 }
 
 impl MonitorResources {
@@ -1891,6 +2439,9 @@ impl Drop for MonitorResources {
         let _ = self.stop_pumps(deadline);
         self.seal_output_best_effort();
         if !self.settlement_published {
+            if let Some(shell_state) = &self.shell_state {
+                shell_state.finish(false);
+            }
             if self.monitor_started {
                 settle_job_and_enqueue_notice(&self.id, JobStatus::Failed, None, false);
             } else {
@@ -2058,6 +2609,9 @@ fn monitor_job(
             exit_code,
         ),
     };
+    if let Some(shell_state) = &resources.shell_state {
+        shell_state.finish(termination_status.is_none() && exit_code.is_some_and(|code| code >= 0));
+    }
     settle_job_and_enqueue_notice(id, status, code, output_complete);
     resources.settlement_published = true;
 }
@@ -2143,20 +2697,25 @@ fn settle_job(
         let Some(job) = reg.jobs.get_mut(id) else {
             return;
         };
-        job.status = status;
-        job.exit_code = exit_code;
-        job.pid = None;
-        job.process_live = false;
-        job.output_complete = output_complete;
-        job.settled_sequence = Some(settled_sequence);
-        *job.settled_snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        record_job_settlement(
+            job,
+            status,
+            exit_code,
+            output_complete,
+            settled_sequence,
+            snapshot,
+        );
         let notify = Arc::clone(&job.settled_notify);
         let owner_session_id = job.owner_session_id.clone();
+        let delivery = job.delivery;
         job.cancel_deadline.finish();
-        if let Some(notice) = notice {
+        if delivery == JobDelivery::Background
+            && let Some(notice) = notice
+        {
             enqueue_completion_notice(&mut reg, &owner_session_id, &notice);
+        }
+        if delivery == JobDelivery::Abandoned {
+            reg.jobs.remove(id);
         }
         prune_settled_jobs(&mut reg);
         notify
@@ -2164,9 +2723,66 @@ fn settle_job(
     notify.notify_waiters();
 }
 
+/// Publish a prepared terminal snapshot while the caller holds the registry
+/// lock. Keeping this boundary explicit also makes the prepare/promote/publish
+/// race reproducible without relying on OS scheduler timing in tests.
+fn record_job_settlement(
+    job: &mut JobEntry,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    output_complete: bool,
+    settled_sequence: u64,
+    mut snapshot: JobSnapshot,
+) {
+    job.status = status;
+    job.exit_code = exit_code;
+    job.pid = None;
+    job.process_live = false;
+    job.output_complete = output_complete;
+    job.settled_sequence = Some(settled_sequence);
+    // The monitor may have captured a foreground-sized snapshot before
+    // promotion won the registry lock. The final delivery mode is decisive.
+    if job.delivery == JobDelivery::Background {
+        snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
+    }
+    *job.settled_snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+}
+
 fn prune_settled_jobs(reg: &mut JobRegistry) {
+    // Native task results can contain structured data beyond the shell tail.
+    // Bound their aggregate retention independently from descriptor count.
+    const MAX_RETAINED_TASK_RESULT_BYTES: usize = 32 * 1024 * 1024;
+    let mut task_results: Vec<_> = reg
+        .jobs
+        .values()
+        .filter(|job| job.status.settled() && job.result_bytes > 0)
+        .filter_map(|job| {
+            job.settled_sequence
+                .map(|sequence| (sequence, job.id.clone(), job.result_bytes))
+        })
+        .collect();
+    task_results.sort();
+    // Live progress shares this budget. Only older settled entries are evicted;
+    // a live task's latest observation must remain available to its owner.
+    let mut retained_bytes = reg
+        .jobs
+        .values()
+        .fold(0usize, |total, job| total.saturating_add(job.result_bytes));
+    for (_, id, bytes) in task_results {
+        if retained_bytes <= MAX_RETAINED_TASK_RESULT_BYTES {
+            break;
+        }
+        reg.jobs.remove(&id);
+        retained_bytes = retained_bytes.saturating_sub(bytes);
+    }
     let mut settled_by_owner: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-    for job in reg.jobs.values().filter(|job| job.status.settled()) {
+    for job in reg
+        .jobs
+        .values()
+        .filter(|job| job.status.settled() && job.delivery == JobDelivery::Background)
+    {
         if let Some(sequence) = job.settled_sequence {
             settled_by_owner
                 .entry(job.owner_session_id.clone())
@@ -2190,7 +2806,7 @@ fn prune_settled_jobs(reg: &mut JobRegistry) {
     let mut settled: Vec<_> = reg
         .jobs
         .values()
-        .filter(|job| job.status.settled())
+        .filter(|job| job.status.settled() && job.delivery == JobDelivery::Background)
         .filter_map(|job| {
             job.settled_sequence
                 .map(|sequence| (sequence, job.id.clone()))
@@ -2216,7 +2832,9 @@ pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
     let mut sources: Vec<_> = reg
         .jobs
         .values()
-        .filter(|job| job.owner_session_id == owner_session_id)
+        .filter(|job| {
+            job.owner_session_id == owner_session_id && job.delivery == JobDelivery::Background
+        })
         .map(|job| {
             let settled = job
                 .settled_snapshot
@@ -2353,9 +2971,17 @@ async fn wait_async_with_slice(
     timeout: Duration,
     max_wait_slice: Duration,
 ) -> Result<JobSnapshot> {
-    /// Time-based variant of [`remaining_wait_slice`] for timer-driver
-    /// deadlines (bd-9zmyf wave fix-forward): asupersync `Time` has no
-    /// `checked_add`, and `duration_since` yields nanoseconds directly.
+    let handle = wait_handle(owner_session_id, id)?;
+    wait_async_with_handle(&handle, timeout, max_wait_slice).await
+}
+
+#[allow(clippy::cast_possible_truncation)]
+async fn wait_async_with_handle(
+    handle: &JobWaitHandle,
+    timeout: Duration,
+    max_wait_slice: Duration,
+) -> Result<JobSnapshot> {
+    /// Timer-driver variant of remaining_wait_slice.
     fn remaining_wait_slice_at(now: Time, deadline: Option<Time>) -> Option<Duration> {
         match deadline {
             Some(deadline) if now >= deadline => None,
@@ -2366,7 +2992,6 @@ async fn wait_async_with_slice(
         }
     }
 
-    let handle = wait_handle(owner_session_id, id)?;
     let cx = crate::agent_cx::AgentCx::for_current_or_request();
     let now = cx
         .cx()
@@ -2374,7 +2999,7 @@ async fn wait_async_with_slice(
         .map_or_else(asupersync::time::wall_now, |timer| timer.now());
     let deadline = now.saturating_add_nanos(timeout.as_nanos() as u64);
     loop {
-        if let Some(snapshot) = settled_snapshot(&handle) {
+        if let Some(snapshot) = settled_snapshot(handle) {
             return Ok(snapshot);
         }
         let now = cx
@@ -2384,18 +3009,18 @@ async fn wait_async_with_slice(
         let Some(sleep_for) = remaining_wait_slice_at(now, Some(deadline))
             .map(|sleep_for| sleep_for.min(max_wait_slice))
         else {
-            return snapshot_now_best_effort(&handle);
+            return snapshot_now_best_effort(handle);
         };
         let notified = handle
             .settled_notify
-            .wait_until(|| settled_snapshot(&handle).is_some())
+            .wait_until(|| settled_snapshot(handle).is_some())
             .fuse();
         let deadline_sleep = asupersync::time::sleep(now, sleep_for).fuse();
         futures::pin_mut!(notified, deadline_sleep);
         match futures::future::select(notified, deadline_sleep).await {
             futures::future::Either::Left(((), _)) => {}
             futures::future::Either::Right(((), _)) => {
-                if let Some(snapshot) = settled_snapshot(&handle) {
+                if let Some(snapshot) = settled_snapshot(handle) {
                     return Ok(snapshot);
                 }
             }
@@ -2445,7 +3070,7 @@ fn request_cancel(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
         return Err(Error::tool(
             "jobs",
             format!(
-                "PI_JOBS_NOT_RUNNING: job '{id}' no longer owns a live process ({})",
+                "PI_JOBS_NOT_RUNNING: job '{id}' no longer owns running work ({})",
                 job.status.as_str()
             ),
         ));
@@ -2900,17 +3525,18 @@ pub fn kill_all() {
 }
 
 #[cfg(test)]
+pub(crate) fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     const TEST_SESSION_ID: &str = "jobs-test-session";
-
-    fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static TEST_LOCK: Mutex<()> = Mutex::new(());
-        TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     struct SpawnBackgroundTestHookGuard;
 
@@ -3148,7 +3774,7 @@ mod tests {
         dir
     }
 
-    fn synthetic_entry(
+    pub(super) fn synthetic_entry(
         id: &str,
         artifact_path: PathBuf,
         sequence: u64,
@@ -3156,7 +3782,11 @@ mod tests {
     ) -> JobEntry {
         let file = std::fs::File::create(&artifact_path).expect("synthetic artifact");
         JobEntry {
+            schema: JOB_SCHEMA,
+            result: None,
+            result_bytes: 0,
             owner_session_id: TEST_SESSION_ID.to_string(),
+            delivery: JobDelivery::Background,
             id: id.to_string(),
             command: "true".to_string(),
             started_at_ms: 1,
@@ -3296,6 +3926,243 @@ mod tests {
             "sealing must stop and join the reader even while the writer remains open"
         );
         assert!(pump.is_none());
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_pipe_bytes(reader: &mut windows_job_pipe::Reader, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received = vec![0; expected.len()];
+        let mut count = 0;
+        while count < received.len() && Instant::now() < deadline {
+            match reader.read(&mut received[count..]) {
+                Ok(0) => panic!("an open writer must not produce EOF"),
+                Ok(bytes) => count += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read Windows job pipe: {error}"),
+            }
+        }
+        assert_eq!(&received[..count], expected);
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_pipe_writer_closed(writer: &mut std::fs::File) {
+        // Every probe fits in the pipe's 64 KiB buffer even if a cancelled
+        // read leaked its completion-owned Arc. Only server-handle retirement
+        // makes this retained client observe a broken pipe.
+        for _ in 0..64 {
+            match writer.write(b"x") {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return,
+                Ok(1) => std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL),
+                result => panic!("unexpected pipe retirement probe: {result:?}"),
+            }
+        }
+        panic!("cancelled reader retained its Windows server handle");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_pipe_distinguishes_idle_data_and_eof() {
+        let _guard = process_test_guard();
+        let (mut reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+        let mut byte = [0];
+        assert_eq!(
+            reader.read(&mut byte).expect_err("idle pipe").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        writer.write_all(b"first").expect("first output");
+        assert_windows_pipe_bytes(&mut reader, b"first");
+        assert_eq!(
+            reader.read(&mut byte).expect_err("idle gap").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        writer.write_all(b"second").expect("second output");
+        assert_windows_pipe_bytes(&mut reader, b"second");
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "closed writer must produce EOF");
+                }
+                result => panic!("unexpected result after writer closed: {result:?}"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sealed_pipe_pump_joins_and_closes_server_with_writer_held() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("pump.log");
+        let file = std::fs::File::create(&path).expect("pump artifact");
+        let artifact = Arc::new(Mutex::new(ArtifactSink::new(file, 64)));
+        let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let (reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+        let pump_artifact = Arc::clone(&artifact);
+        let pump_tail = Arc::clone(&tail);
+        let pump_sealed = Arc::clone(&sealed);
+        let mut pump = Some(std::thread::spawn(move || {
+            pump_job_stream(reader, &pump_artifact, &pump_tail, &pump_sealed)
+        }));
+        writer
+            .write_all(&[b'b'; 128])
+            .expect("output beyond artifact cap");
+        writer.write_all(b"before-seal").expect("final output");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !tail.lock().expect("tail").text().ends_with("before-seal") {
+            assert!(Instant::now() < deadline, "pump must consume output");
+            std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+        }
+        assert!(
+            !pump.as_ref().expect("live pump").is_finished(),
+            "an open writer must leave an unsealed pump pending"
+        );
+        let tail_before = tail.lock().expect("tail").text();
+        let bytes_before = std::fs::read(&path).expect("artifact bytes");
+        assert_eq!(bytes_before.len(), 64);
+        assert!(artifact.lock().expect("artifact").truncated);
+
+        sealed.store(true, Ordering::Release);
+        assert!(
+            finish_pump(&mut pump, Instant::now() + OUTPUT_DRAIN_GRACE),
+            "sealing must join the pump while its writer remains open"
+        );
+        assert!(pump.is_none());
+        assert_windows_pipe_writer_closed(&mut writer);
+        assert_eq!(tail.lock().expect("tail").text(), tail_before);
+        assert_eq!(
+            std::fs::read(&path).expect("settled artifact"),
+            bytes_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_repeated_pipe_cancellation_retires_handles_with_writers_held() {
+        let _guard = process_test_guard();
+        let mut writers = Vec::new();
+        for attempt in 0..32 {
+            let (mut reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+            let result = if attempt % 2 == 0 {
+                reader.try_read(&mut [0])
+            } else {
+                reader.read(&mut [0])
+            };
+            assert_eq!(
+                result.expect_err("pending read").kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(reader);
+            assert_windows_pipe_writer_closed(&mut writer);
+            writers.push(writer);
+        }
+        assert_eq!(
+            writers.len(),
+            32,
+            "writers stayed open across every retirement"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_pipe_output_child() {
+        if std::env::var_os("PI_JOBS_WINDOWS_PIPE_CHILD").is_none() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&[b'o'; 32 * 1024])
+            .expect("child stdout burst");
+        stdout
+            .write_all(b"stdout-finished\n")
+            .expect("stdout marker");
+        stdout.flush().expect("flush stdout");
+        let mut stderr = std::io::stderr().lock();
+        stderr
+            .write_all(&[b'e'; 32 * 1024])
+            .expect("child stderr burst");
+        stderr
+            .write_all(b"stderr-finished\n")
+            .expect("stderr marker");
+        stderr.flush().expect("flush stderr");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_configured_child_pipes_drain_both_streams_to_eof() {
+        let _guard = process_test_guard();
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args([
+                "--exact",
+                "jobs::tests::windows_job_pipe_output_child",
+                "--nocapture",
+            ])
+            .env("PI_JOBS_WINDOWS_PIPE_CHILD", "1")
+            .stdin(std::process::Stdio::null());
+        let (mut stdout, mut stderr) =
+            windows_job_pipe::configure(&mut command).expect("configure child output");
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+            .expect("spawn child with Windows Job discipline");
+        // Command retains the parent writer copies for reuse. Match the
+        // production handoff so EOF proves that these copies were disposed.
+        drop(command);
+        let pid = child.id();
+        let mut child = BackgroundChild::new(child);
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        let mut buffer = [0; 8192];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(stdout_eof && stderr_eof) && Instant::now() < deadline {
+            for (reader, bytes, eof) in [
+                (&mut stdout, &mut stdout_bytes, &mut stdout_eof),
+                (&mut stderr, &mut stderr_bytes, &mut stderr_eof),
+            ] {
+                if *eof {
+                    continue;
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => *eof = true,
+                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("read configured child output: {error}"),
+                }
+            }
+        }
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("reap output child") {
+                crate::tools::terminate_reaped_child_discipline(pid);
+                child.disarm();
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill_and_wait();
+                break None;
+            }
+            std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+        };
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "child must exit successfully"
+        );
+        assert!(
+            stdout_eof && stderr_eof,
+            "both child streams must reach actual EOF"
+        );
+        let stdout_text = String::from_utf8(stdout_bytes).expect("stdout UTF-8");
+        let stderr_text = String::from_utf8(stderr_bytes).expect("stderr UTF-8");
+        assert!(stdout_text.contains(&format!("{}stdout-finished\n", "o".repeat(32 * 1024))));
+        assert!(!stdout_text.contains("stderr-finished"));
+        assert_eq!(
+            stderr_text,
+            format!("{}stderr-finished\n", "e".repeat(32 * 1024))
+        );
     }
 
     #[cfg(unix)]
@@ -4430,7 +5297,11 @@ mod tests {
             reg.jobs.insert(
                 id.clone(),
                 JobEntry {
+                    schema: JOB_SCHEMA,
+                    result: None,
+                    result_bytes: 0,
                     owner_session_id: TEST_SESSION_ID.to_string(),
+                    delivery: JobDelivery::Background,
                     id,
                     command: "true".to_string(),
                     started_at_ms: i64::try_from(index).expect("index fits"),
@@ -5406,6 +6277,118 @@ mod tests {
             "escaped descriptor fixture {descendant_pid} survived explicit cleanup"
         );
         let _ = take_completion_notices(TEST_SESSION_ID);
+    }
+
+    #[test]
+    fn promotion_bounds_a_terminal_snapshot_prepared_while_foreground() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("snapshot-race-{}", uuid::Uuid::new_v4().simple());
+        let id = format!("prepared-{}", uuid::Uuid::new_v4().simple());
+        let mut entry = synthetic_entry(&id, root.join("prepared.log"), 0, false);
+        entry.owner_session_id.clone_from(&owner);
+        entry.delivery = JobDelivery::Foreground;
+        entry.tail = Arc::new(Mutex::new(TailBuffer::new(
+            crate::tools::DEFAULT_MAX_BYTES.saturating_mul(2),
+        )));
+        entry
+            .tail
+            .lock()
+            .expect("foreground tail")
+            .push(&vec![b'x'; 100_000]);
+        let mut source = JobSnapshotSource::from_entry(&entry);
+        source.status = JobStatus::Exited;
+        source.exit_code = Some(0);
+        source.pid = None;
+        source.output_complete = true;
+        // This is the monitor's already-prepared snapshot. It must retain
+        // the inline tail until publication observes the final delivery mode.
+        let prepared = JobSnapshot::from_source_best_effort(&source);
+        assert_eq!(prepared.output_tail.len(), 100_000);
+        registry()
+            .lock()
+            .expect("insert synthetic command")
+            .jobs
+            .insert(id.clone(), entry);
+        let foreground = ForegroundJob {
+            handle: wait_handle(&owner, &id).expect("foreground handle"),
+            armed: true,
+        };
+        let promoted = match foreground.promote().expect("promote prepared command") {
+            ForegroundPromotion::Background(snapshot) => snapshot,
+            ForegroundPromotion::Completed(_) => panic!("terminal publication has not happened"),
+        };
+        assert_eq!(promoted.output_tail.len(), OUTPUT_TAIL_BYTES);
+        assert_eq!(promoted.output_bytes, 100_000);
+        assert!(promoted.tail_truncated);
+        {
+            let mut reg = registry().lock().expect("publish prepared snapshot");
+            let job = reg.jobs.get_mut(&id).expect("promoted command");
+            assert_eq!(
+                job.tail.lock().expect("promoted tail").cap,
+                OUTPUT_TAIL_BYTES
+            );
+            // Force the exact interleaving: prepare foreground snapshot,
+            // promote, then use the production terminal-publication function.
+            record_job_settlement(job, JobStatus::Exited, Some(0), true, 0, prepared);
+        }
+        let waited = wait(&owner, &id, Duration::ZERO).expect("stable wait snapshot");
+        let listed = list(&owner).expect("stable list snapshot");
+        assert_eq!(listed.len(), 1);
+        for snapshot in [&waited, &listed[0]] {
+            assert_eq!(snapshot.status, "exited");
+            assert_eq!(snapshot.output_tail.len(), OUTPUT_TAIL_BYTES);
+            assert_eq!(snapshot.output_bytes, 100_000);
+            assert_eq!(snapshot.output_lines, 1);
+            assert!(snapshot.tail_truncated);
+        }
+        registry()
+            .lock()
+            .expect("release synthetic command")
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn completed_foreground_command_wins_promotion_without_a_notice() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("completed-foreground-{}", uuid::Uuid::new_v4().simple());
+        let foreground = spawn_foreground(
+            &owner,
+            &root,
+            None,
+            None,
+            "printf done",
+            Some(10),
+            Some(&root),
+            None,
+        )
+        .expect("spawn foreground command");
+        let id = foreground.handle.id.clone();
+        let settled = wait_with_handle(&foreground.handle, Duration::from_secs(10))
+            .expect("foreground completion");
+        assert_eq!(settled.status, "exited");
+        assert_eq!(settled.output_tail, "done");
+        assert_eq!(settled.output_bytes, 4);
+        assert_eq!(settled.output_lines, 1);
+        assert!(!settled.tail_truncated);
+        assert!(list(&owner).expect("hidden foreground list").is_empty());
+        assert!(take_completion_notices(&owner).is_empty());
+        match foreground.promote().expect("resolve completion race") {
+            ForegroundPromotion::Completed(snapshot) => {
+                assert_eq!(snapshot.id, id);
+                assert_eq!(snapshot.exit_code, Some(0));
+            }
+            ForegroundPromotion::Background(_) => {
+                panic!("an already settled foreground command must remain inline");
+            }
+        }
+        assert!(
+            !registry().lock().expect("registry").jobs.contains_key(&id),
+            "consuming inline completion releases its registry metadata"
+        );
+        assert!(take_completion_notices(&owner).is_empty());
     }
 
     #[test]

@@ -118,8 +118,10 @@ pub fn hermetic_interactive_config(mut config: pi::config::Config) -> pi::config
 ///
 /// Note that `ASUPERSYNC_THREAD_STACK_SIZE` does NOT reach this: the env
 /// overrides are applied on a different construction path, and setting it
-/// against this builder changes nothing. It has to be set here.
-const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// against this builder changes nothing. It has to be set here, and on every
+/// multi-thread runtime a suite builds for itself (see `tests/e2e_rpc.rs`).
+#[allow(dead_code)]
+pub const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Runs an async future to completion on an asupersync runtime.
 ///

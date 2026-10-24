@@ -16,6 +16,7 @@ mod artifact;
 mod generation;
 mod speech;
 mod transport;
+pub(crate) mod video;
 mod vision;
 pub use generation::GenerateImageTool;
 pub use speech::TtsTool;

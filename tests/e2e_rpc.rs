@@ -291,6 +291,7 @@ fn build_options(
     let auth = AuthStorage::load(auth_path).expect("load auth storage");
     RpcOptions {
         config: Config::default(),
+        working_directory: None,
         resources: ResourceLoader::empty(false),
         available_models,
         scoped_models,
@@ -467,6 +468,35 @@ async fn send_recv_after_abort(
     }
 }
 
+/// Wait until the provider stream of the current turn is open.
+///
+/// `isStreaming` turns true when a prompt is admitted, before its turn has
+/// reached the provider. An abort that lands in that window ends the turn with
+/// "Retry aborted" and no messages, which is the correct outcome there (pinned
+/// by `rpc_abort_before_first_turn_poll_never_enters_provider`) and is not the
+/// mid-stream abort a test means when it says the turn is streaming. Which
+/// side wins that window depends on the scheduler, so wait it out.
+async fn wait_for_assistant_stream_start(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) {
+    let start = Instant::now();
+    loop {
+        let line = require_line(recv_line(out_rx, label).await);
+        let value = parse_response(&line);
+        if value.get("type").and_then(Value::as_str) == Some("message_start")
+            && value.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+        {
+            return;
+        }
+        assert!(
+            !is_agent_end_type(&value),
+            "{label}: the turn ended before its provider stream opened: {value}"
+        );
+        assert!(
+            start.elapsed() <= RPC_E2E_WAIT_TIMEOUT,
+            "{label}: timed out waiting for the provider stream to open"
+        );
+    }
+}
+
 async fn wait_for_streaming_state(
     in_tx: &asupersync::channel::mpsc::Sender<String>,
     out_rx: &Arc<Mutex<Receiver<String>>>,
@@ -639,6 +669,7 @@ async fn run_rpc_swarm_session(
     .to_string();
     let prompt_resp = send_recv(&in_tx, &out_rx, &prompt, "prompt(start keyless replay)").await;
     assert_ok(&prompt_resp, "prompt");
+    wait_for_assistant_stream_start(&out_rx, "prompt(provider stream open)").await;
 
     let streaming_state = wait_for_streaming_state(&in_tx, &out_rx, session_idx).await;
     assert!(
@@ -731,6 +762,7 @@ fn rpc_concurrent_keyless_swarm_e2e_preserves_session_index_and_filesystem_state
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 8)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build test runtime");
     let handle = runtime.handle();
@@ -1354,6 +1386,7 @@ fn run_crash_interrupt_recovery_active_worker(
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 4)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build active worker runtime");
     let handle = runtime.handle();
@@ -1516,6 +1549,7 @@ fn run_crash_interrupt_recovery_restart_worker(
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 4)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build restart worker runtime");
     let handle = runtime.handle();
@@ -3012,9 +3046,21 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
             "the failed flush must not claim durable success"
         );
 
+        // A returned save failure fences the session (555f79bb2), and the RPC
+        // loop then ends with that failure instead of a clean exit
+        // (2ed244381): the client was told the command ran and was not saved.
         drop(in_tx);
-        let result = server.await;
-        assert!(result.is_ok(), "rpc server error: {result:?}");
+        let error = server
+            .await
+            .expect_err("a server holding an unsaved backlog must not exit cleanly");
+        assert!(
+            error.is_session_persistence(),
+            "the exit error must keep its persistence classification: {error}"
+        );
+        assert!(
+            error.to_string().contains("quarantined"),
+            "the exit error must name the quarantine: {error}"
+        );
     });
 }
 
@@ -5326,6 +5372,7 @@ fn rpc_checkpoint_rewind_fresh_retry_cycle() {
     let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
         .blocking_threads(1, 8)
         .enable_parking(false)
+        .thread_stack_size(common::WORKER_STACK_BYTES)
         .build()
         .expect("build test runtime");
     let handle = runtime.handle();

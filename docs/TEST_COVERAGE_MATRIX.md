@@ -36,6 +36,11 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | Source file | Area | Coverage evidence / status |
 |---|---|---|
 | `src/acp.rs` | ACP protocol | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
+| `src/acp/content.rs` | ACP content conversion at the editor/agent boundary: bounded prompt blocks, embedded resources kept as labeled reference content | Unit (18 in-module tests). |
+| `src/acp/history.rs` | ACP session recovery and transcript replay from the configured session directory, without running an agent turn | Unit (18 in-module tests). |
+| `src/acp/mcp.rs` | Session-owned MCP tools for ACP: inert setup, with trust admission and connection inside the reserved prompt task | Unit (9 in-module tests); `src/acp/mcp/integration_tests.rs`. |
+| `src/acp/mcp/integration_tests.rs` | ACP MCP integration test suite | Test module; loopback MCP transports and a local scripted provider through the production permission callback (4 tests). |
+| `src/acp/recovery_tests.rs` | ACP turn recovery test suite | Test module; real configured session, loopback provider HTTP/SSE transport, durable recovery driver and editor notifications (18 tests). |
 | `src/advisor.rs` | Advisor turns | `tests/e2e_advisor.rs` (concern injection, failure isolation). |
 | `src/agent.rs` | Agent loop | Unit; `tests/agent_loop_vcr.rs`, `tests/agent_loop_reliability.rs`, `tests/e2e_agent_loop.rs`, `tests/rpc_mode.rs`. |
 | `src/agent_cx.rs` | Agent context | Unit; covered through agent/RPC suites. |
@@ -43,6 +48,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/agent_cx/process.rs` | Agent context process execution | Unit; covered through agent/RPC suites. |
 | `src/agent_cx/process/capture.rs` | Agent context process output capture | Unit; in-module tests. |
 | `src/agent_hub.rs` | Agent hub registry (bd-cv653.5.3): session-scoped roster of spawned child agents | Unit (7 tests); `tests/agent_hub.rs`. |
+| `src/agent_hub/ipc.rs` | Bounded, authenticated local channel from one native child agent to its parent hub: roster, own inbox, parent and peer messages | Unit (8 in-module tests). |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
 | `src/approval.rs` | Tool approval flow | `tests/e2e_plan_mode.rs`, `tests/e2e_rpc.rs` approval paths. |
 | `src/approval/scope.rs` | Approval plan file scoping | Unit; in-module unit tests; `tests/e2e_plan_mode.rs`. |
@@ -63,7 +69,11 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/browser/download.rs` | Browser download lifecycle and management | Unit; `tests/e2e_browser.rs`. |
 | `src/browser/exports.rs` | Browser module exports and public surface | Waived glue; re-exports for browser submodules. |
 | `src/browser/frames.rs` | Explicit, per-operation frame selection for the native browser backend | Unit (8 in-module tests); `tests/browser_frames.rs` (preflight; live Chromium lane is opt-in). |
+| `src/browser/frames/pointer.rs` | Projection of renderer-local pointer candidates through the selected iframe chain, with parent hit-testing before native input | Unit (6 in-module tests); `tests/browser_remote_pointer.rs` (live Chromium lane, opt-in). |
+| `src/browser/frames/targets.rs` | Per-operation ownership of flattened CDP iframe sessions, admitted only by attach events from the selected page | Unit (4 in-module tests). |
+| `src/browser/frames/tests_transport.rs` | Browser frame transport test suite | Test module; public browser tool over a loopback HTTP/WebSocket CDP peer (8 tests; validates CDP routing, not Chromium rendering or native input). |
 | `src/browser/interaction.rs` | Browser interaction and navigation | Unit; `tests/e2e_browser.rs`. |
+| `src/browser/interaction/forms.rs` | Structured, verified form operations (option selection, checked state) on one pinned DOM node | Unit (9 in-module tests); `tests/browser_forms.rs` (preflight and loopback CDP wire cases; live Chromium lane is opt-in). |
 | `src/browser/interaction/frame_input.rs` | Frame-local DOM lookup and verified page-viewport input coordinates | Unit (5 in-module tests); `tests/browser_frames.rs` live lane. |
 | `src/browser/interaction/upload.rs` | Browser file upload interaction | Unit; `tests/e2e_browser.rs`. |
 | `src/browser/launch.rs` | Browser process launch and attach | Unit; `tests/e2e_browser.rs`. |
@@ -83,7 +93,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/computer/native.rs` | Computer tool native platform backend | Unit; `tests/computer_tool.rs`. |
 | `src/computer/native/accessibility.rs` | Computer tool native accessibility tree | Unit; `tests/computer_tool.rs`. |
 | `src/computer/native/input.rs` | Computer tool native input simulation | Unit; `tests/computer_tool.rs`. |
+| `src/computer/native/macos.rs` | macOS desktop operations through a bundled literal Swift helper, with host-owned approval, capability, timeout and publication | Unit (18 in-module tests, one macOS-only). |
 | `src/computer/process.rs` | Computer tool process supervision | Unit; `tests/computer_tool.rs`. |
+| `src/computer/process/input.rs` | Owned desktop input transport: a single writer holds stdin as a lease and closes it before process teardown | Unit (4 in-module tests). |
 | `src/config.rs` | Config loading | Unit; `tests/config_precedence.rs`, `tests/config_edge_cases.rs`. |
 | `src/conformance.rs` | Conformance runner | Unit; `tests/conformance_*.rs`, `tests/tools_conformance.rs`. |
 | `src/conformance_shapes.rs` | Conformance schemas | Unit; `tests/ext_conformance_shapes.rs`. |
@@ -208,6 +220,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/interactive_ftui/plan_commands.rs` | Default-FTUI access to the SDK's session-bound plan lifecycle | Unit; `src/interactive_ftui/plan_commands/tests.rs`. |
 | `src/interactive_ftui/plan_commands/tests.rs` | FTUI plan command test suite | Test module; plan command tests. |
 | `src/interactive_ftui/session_pins.rs` | Sessions pinned to the top of the `/resume` list (OMP `/pin`) | Unit (1 in-module test). |
+| `src/interactive_ftui/settings.rs` | Settings on the default interactive stack: one validated choice is saved before the live session is updated | Unit (5 in-module tests). |
 | `src/interactive_ftui/workspace_commands.rs` | OMP workspace commands on the default stack | Unit (1 in-module test). |
 | `src/jobs.rs` | Background jobs | `tests/jobs.rs`. |
 | `src/keybindings.rs` | Keybinding config | Unit; interactive/TUI tests. |
@@ -239,7 +252,11 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/client/pull_diagnostics.rs` | LSP client pull diagnostics | Unit; `src/lsp/client/pull_diagnostics/tests.rs`. |
 | `src/lsp/client/pull_diagnostics/tests.rs` | LSP pull diagnostics test suite | Test module; pull diagnostics tests. |
 | `src/lsp/client/request.rs` | LSP client request dispatch and deadline management | Unit; `src/lsp/client/request/tests.rs`. |
+| `src/lsp/client/request/array_results.rs` | Bounded streamed array results for read-only symbol and navigation requests | Unit (5 in-module tests); `src/lsp/semantic/streamed_reads.rs`. |
+| `src/lsp/client/request/partial_results.rs` | Request-owned LSP partial-result collection, delivered only after an observed successful response | Unit (3 in-module tests); `src/lsp/client/request/partial_results/wire_tests.rs`. |
+| `src/lsp/client/request/partial_results/wire_tests.rs` | LSP partial-result wire test suite | Test module; held `workspace/diagnostic` requests over the real framed-stdio transport (6 tests). |
 | `src/lsp/client/request/tests.rs` | LSP request dispatch test suite | Test module; request tests. |
+| `src/lsp/client/request/workspace_diagnostics.rs` | Whole-workspace pull diagnostics with optional request-owned partial results and no reuse of previous result IDs | Unit (9 in-module tests); `src/lsp/client/request/partial_results/wire_tests.rs`. |
 | `src/lsp/client/test_server.rs` | LSP test server fixture | Test support module; exercises client tests. |
 | `src/lsp/completion.rs` | LSP native completion engine and handle manager | Unit; `src/lsp/completion/tests.rs`, `src/lsp/completion/tests/protocol.rs`. |
 | `src/lsp/completion/item.rs` | LSP completion item normalization, resolution, and text edits | Unit; `src/lsp/completion/item/tests.rs`. |
@@ -252,6 +269,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/completion/tests/protocol.rs` | LSP completion protocol scenario tests | Test module; protocol scenarios. |
 | `src/lsp/diagnostics_tests.rs` | LSP model-facing diagnostics test suite | Test module; diagnostics tool tests. |
 | `src/lsp/edits.rs` | LSP edits | `tests/lsp.rs`. |
+| `src/lsp/edits/annotations.rs` | LSP change annotations retained with a workspace edit, and the reviewed-confirmation requirement | Unit (`annotations/tests.rs`). |
+| `src/lsp/edits/annotations/tests.rs` | LSP change annotation test suite | Test module; annotation retention and confirmation tests. |
+| `src/lsp/edits/annotations/tests/protocol.rs` | LSP change annotation protocol tests against a scripted language-server fixture | Test module; negotiation and reviewed-approval scenarios (`server.py` fixture). |
 | `src/lsp/edits/sequence.rs` | LSP workspace edit sequence parser and validator | Unit; in-module tests. |
 | `src/lsp/edits/sequence/tests.rs` | LSP workspace edit sequence test suite | Test module; sequence tests. |
 | `src/lsp/edits/transaction.rs` | LSP atomic workspace edit transaction engine | Unit; in-module tests. |
@@ -263,6 +283,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
 | `src/lsp/jsonrpc/completion.rs` | LSP request waits that retain their owner and retire abandoned requests on drop | Unit (6 in-module tests). |
 | `src/lsp/jsonrpc/outbound.rs` | Bounded, non-blocking admission to the single child-stdin pump | Unit (6 in-module tests). |
+| `src/lsp/project_diagnostics.rs` | Agent-visible native project diagnostics for one anchored server and workspace, distinct from a bounded file scan | Unit (7 in-module tests). |
 | `src/lsp/refactor_preview.rs` | LSP refactor preview and approval staging | Unit; `src/lsp/refactor_preview/tests.rs`, `src/lsp/refactor_preview/tests/protocol.rs`. |
 | `src/lsp/refactor_preview/tests.rs` | LSP refactor preview test suite | Test module; refactor preview tests. |
 | `src/lsp/refactor_preview/tests/protocol.rs` | LSP refactor preview protocol test cases | Test support module; refactor protocol scenarios. |
@@ -275,6 +296,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/semantic/navigation/tests.rs` | LSP source-bound navigation test suite | Test module; navigation tests. |
 | `src/lsp/semantic/signatures.rs` | LSP signature help, parameter doc extraction, and overload resolution | Unit; `src/lsp/semantic/signatures/tests.rs`. |
 | `src/lsp/semantic/signatures/tests.rs` | LSP signature help parsing and formatting test suite | Test module; signature help tests. |
+| `src/lsp/semantic/streamed_reads.rs` | LSP streamed symbol and source-navigation read test suite | Test module; tool-to-wire coverage of streamed results, retries, timeouts and the source-drift fence (9 tests). |
 | `src/lsp/semantic/symbols.rs` | LSP workspace symbol search and lazy location resolution | Unit; `src/lsp/semantic/symbols/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/semantic/symbols/tests.rs` | LSP workspace symbol test suite | Test module; workspace symbol tests. |
 | `src/lsp/semantic/symbols/tests/protocol.rs` | LSP workspace symbol protocol test cases | Test support module; exercises symbol protocol. |
@@ -288,12 +310,14 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/markdown_rich.rs` | Markdown, math, mermaid, and visual rendering (OMP-ADOPT / bd-cv653.9.7) | Unit (9 tests); `tests/markdown_rich.rs`, `tests/chrome_tui_integration.rs`. |
 | `src/mcp.rs` | MCP facade | `tests/mcp.rs`. |
 | `src/mcp/config.rs` | MCP config | `tests/mcp.rs`. |
+| `src/mcp/config/acp.rs` | Decoding of ACP session-scoped MCP server lists with a distinct trust provenance and no execution grant | Unit (6 in-module tests). |
 | `src/mcp/content.rs` | MCP content block shaper and serialization | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/manager.rs` | MCP manager | `tests/mcp.rs`. |
 | `src/mcp/manager/calls.rs` | MCP tool call execution and cancellation | Unit; `tests/mcp.rs`. |
 | `src/mcp/manager/catalog.rs` | MCP tool catalog discovery and pagination | Unit; `tests/mcp_conformance.rs`. |
 | `src/mcp/manager/catalog/context.rs` | MCP resource catalog and context discovery | Unit; in-module tests. |
 | `src/mcp/manager/connection.rs` | MCP server connection setup, lifecycle, and owner tracking | Unit; `tests/mcp.rs`. |
+| `src/mcp/manager/live_catalog_tests.rs` | MCP live catalog refresh test suite | Test module; live-agent catalog refresh, withdrawal, abort and owner reconciliation (5 tests). |
 | `src/mcp/manager/output_schema.rs` | MCP tool call structured-output contract validation | Unit; `src/mcp/manager/calls.rs`, `tests/mcp.rs`. |
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
 | `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
@@ -306,6 +330,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/media_tools/transport.rs` | Media tools shared HTTP transport and auth | Unit; `tests/media_tools.rs`. |
 | `src/media_tools/vision.rs` | Vision image analysis tool | Unit; `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
 | `src/memory.rs` | Project memory bank and atomic supersession | Unit; `tests/memory.rs` exercises the public tools, registry gate and startup injection. Mutation tests are also in `src/memory/transactions.rs`. New coverage added, not executed on the editing host. |
+| `src/memory/cass.rs` | Optional read-only project-history recall from the owner's installed CASS archive, screened with the memory privacy rules | Unit (12 in-module tests); `tests/memory.rs` (CASS backend registry cases). |
 | `src/memory/reflection.rs` | Authenticated bounded memory synthesis and citation identity checks | Unit (10 tests); `tests/memory.rs` uses the public tool and Gemini over loopback HTTP for successful synthesis, terminal failures, unknown citations and credential redaction. Added, not executed: DSR unavailable. |
 | `src/memory/shared.rs` | Shared cross-session memory bank | Unit; `tests/memory.rs`. |
 | `src/memory/shared/delegation.rs` | Shared memory agent delegation and filtering | Unit; `tests/memory.rs`. |
@@ -314,6 +339,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/memory/transactions.rs` | Atomic primary/FTS/audit writes and supersession | Unit (11 real-SQLite tests), including late audit failure, rollback after reopening, competing writers, stale supersession, index repair and the retain tool. Added, not executed: DSR unavailable. |
 | `src/migrations.rs` | Migrations | Unit; SQLite/session migration coverage through `tests/session_sqlite.rs`. |
 | `src/model.rs` | Message/content model | Unit; `tests/model_serialization.rs`. |
+| `src/model/media_duration.rs` | Bounded container-header inspection that supplies media duration hints for context accounting | Unit (12 in-module tests). |
 | `src/model_routing.rs` | Model-routing policy and evidence | Unit; model-routing tests in this module plus `tests/model_selector_cycling.rs`. |
 | `src/model_selector.rs` | Model selector | Unit; `tests/model_selector_cycling.rs`. |
 | `src/models.rs` | Model registry | Unit; `tests/model_registry.rs`. |
@@ -363,17 +389,27 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/resources.rs` | Resource loading | Unit; `tests/resource_loader.rs`, `tests/resource_edge_cases.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/review.rs` | Review workflow | `tests/review.rs`. |
 | `src/rpc.rs` | RPC/stdin mode | Unit; `tests/rpc_mode.rs`, `tests/rpc_protocol.rs`, `tests/rpc_edge_cases.rs`, `tests/e2e_rpc.rs`. |
+| `src/rpc/attachments.rs` | Borrowed RPC media projection and bounded attachment retrieval for negotiated references | Unit (9 in-module tests). |
 | `src/scheduler.rs` | Scheduler/admission | Unit; `tests/scheduler_repro.rs`, `tests/cargo_headroom_admission.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/sdk.rs` | SDK API | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
 | `src/sdk/extension_bootstrap.rs` | SDK session extension model resolution and runtime bootstrap | Unit; `tests/sdk_integration.rs`. |
 | `src/sdk/extension_bootstrap_tests.rs` | SDK extension bootstrap regression test suite | Test module; extension model resolution tests. |
 | `src/sdk/recovery.rs` | Retry and failover recovery for every SDK turn entry point | Unit; `src/sdk/tests/recovery.rs`, `tests/sdk_multimodal.rs`. |
+| `src/sdk/recovery/ownership.rs` | Abandoned-turn quarantine: a dropped SDK turn future keeps provider re-entry closed until the session is reconstructed | Unit (9 in-module tests). |
 | `src/sdk/tests/recovery.rs` | SDK entry-point recovery regression suite | Test module; retry, failover, abort and persistence-quarantine tests. |
 | `src/secrets.rs` | Secret handling | `tests/secrets.rs`. |
 | `src/secrets/structured.rs` | Transactional secret screening for structured outbound values | Unit (14 in-module tests); `tests/secrets.rs`. |
 | `src/security_scan.rs` | Agent-facing security scanner tool: plan/run/disposition/compare (bd-cv653.2.6) | Unit (6 tests); `tests/security_scan.rs`. |
 | `src/security_scan/dependencies.rs` | Cargo dependency security analysis | Unit; `tests/security_scan.rs`. |
 | `src/security_scan/dependencies/tests.rs` | Dependency security scanning tests | Test support module; exercises dependency scanner. |
+| `src/security_scan/dependencies/python.rs` | Offline `uv.lock` and `poetry.lock` inventory for `dependency_plan` | Unit (`python/tests.rs`). |
+| `src/security_scan/dependencies/python/tests.rs` | Python lockfile inventory tests | Test support module; parser schemas, normalization, variants, privacy, limits, discovery, confinement. |
+| `src/security_scan/dependency_review.rs` | Offline comparison and review of native dependency-audit artifacts | Unit; `src/security_scan/dependency_review/tests.rs`, `src/security_scan/dependency_review/tests/wire.rs`. |
+| `src/security_scan/dependency_review/disposition.rs` | Explicit, version-bound dependency triage written as a new SARIF artifact | Unit; `src/security_scan/dependency_review/disposition/tests.rs`. |
+| `src/security_scan/dependency_review/disposition/tests.rs` | Dependency disposition test suite | Test module; disposition tests (8 tests). |
+| `src/security_scan/dependency_review/snapshot.rs` | Validation of native dependency-audit SARIF before it is used as a baseline | No in-file tests; exercised by `src/security_scan/dependency_review/tests.rs` and `src/security_scan/dependency_review/disposition/tests.rs`. |
+| `src/security_scan/dependency_review/tests.rs` | Dependency review test suite and audit fixture builder | Test module; comparison, tampering and confined-reader tests (9 tests). |
+| `src/security_scan/dependency_review/tests/wire.rs` | Dependency review wire test cases | Test module; real audit exporter against a loopback OSV peer through the public comparison operation (2 tests, Unix only). |
 | `src/security_scan/osv.rs` | OSV vulnerability database client | Unit; `tests/security_scan.rs`. |
 | `src/security_scan/osv/artifact.rs` | OSV vulnerability report artifact serialization | Unit; `tests/security_scan.rs`. |
 | `src/security_scan/osv/tests.rs` | OSV client test cases | Test support module; exercises OSV integration. |
@@ -381,6 +417,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/self_update.rs` | Self-update | `tests/self_update.rs`. |
 | `src/semantic_workspace_graph.rs` | Semantic workspace graph and context bundles | Unit; `tests/semantic_workspace_graph_contract.rs`, `tests/semantic_workspace_graph_builder.rs`, and agent integration tests. |
 | `src/session.rs` | Session JSONL/tree | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/session/attachments.rs` | Immutable image and media attachment blobs for JSONL sessions and their V2 index | Unit (25 in-module tests). |
+| `src/session/fork_tests.rs` | Session fork workspace-provenance test suite and shared fixtures for the SDK, RPC and classic/FTUI fork entrypoints | Test module; fork tests (4 tests). |
 | `src/session_control.rs` | Session control, live steering, follow-up, and input retraction | Unit; `src/session_control/agent_tests.rs`. |
 | `src/session_control/agent_tests.rs` | Session control agent integration test suite | Test module; session control agent tests. |
 | `src/session_control/agent_tests/deadline_recovery.rs` | Session control turn deadline recovery test cases | Test support module; exercises turn timeout recovery. |
@@ -404,6 +442,10 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_sqlite/entry_io.rs` | SQLite session entry serialization, paging, and batch insertion | Unit; `tests/session_sqlite.rs`. |
 | `src/session_store_v2.rs` | Session store v2 | Unit; `tests/session_store_v2.rs`, `tests/session_store_v2_contract.rs`. |
 | `src/session_test.rs` | Session test helpers | Waived test-support module; compiled by session tests. |
+| `src/session_title.rs` | Best-effort session names from a bounded, private auxiliary completion | Unit; `src/session_title/tests.rs`. |
+| `src/session_title/tests.rs` | Session title test suite | Test module; scripted provider replies with production privacy, admission and durable session writes (17 tests). |
+| `src/session_workdir.rs` | Explicit, provenance-preserving session workdir recovery and attachment | Unit (11 in-module tests); `tests/session_workdir_recovery.rs`, `tests/session_index_tests.rs`. |
+| `src/session_workdir/persisted.rs` | Saved-session workdir discovery, including lazily loaded V2 stores | Unit (8 in-module tests); `tests/session_workdir_recovery.rs`, `tests/provider_bedrock_streaming.rs`. |
 | `src/skills_managed.rs` | Managed skills | `tests/skills_managed.rs`. |
 | `src/sse.rs` | SSE parser | Unit; `tests/sse_strict_compliance.rs`, `tests/repro_sse_flush.rs`, `tests/repro_sse_newline.rs`. |
 | `src/stats.rs` | Local usage statistics over session files (`pi stats`, bd-cv653.7.7) | Unit (8 tests); no dedicated integration test. |

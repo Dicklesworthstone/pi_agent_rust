@@ -62,7 +62,7 @@ be breaking for Rust consumers.
 | `pi::sdk::{Error, Result}` | Stable | SDK error/result exports. |
 | `pi::sdk::{AbortHandle, AbortSignal}` | Stable | Prompt cancellation handles. |
 | `pi::sdk::{Agent, AgentConfig, AgentEvent, AgentSession, QueueMode}` | Stable | In-process agent/session integration exports. |
-| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
+| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, MediaContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
 | `pi::sdk::{Config, ExtensionManager, ExtensionPolicy, ExtensionRegion, Session, ThinkingLevel}` | Stable | Configuration, extension, session, and thinking-control exports. |
 | `pi::sdk::{InputType, Model, ModelCost, Provider, ProviderContext, ProviderThinkingBudgets, StreamOptions, ToolDef}` | Stable | Provider integration exports. |
 | `pi::sdk::{ModelEntry, ModelRegistry}` | Stable | Model registry exports. |
@@ -88,6 +88,7 @@ be breaking for Rust consumers.
 | `session.setModel(provider, model)` | `AgentSessionHandle::set_model(provider, model)` |
 | `session.setThinkingLevel(level)` | `AgentSessionHandle::set_thinking_level(level)` |
 | `session.compact()` | `AgentSessionHandle::compact(on_event)` |
+| In-place context handoff | `AgentSessionHandle::handoff(focus, abort, on_event)` / `RpcTransportClient::handoff(focus)` |
 | `session.abort()` | `AgentSessionHandle::new_abort_handle()` + `prompt_with_abort(...)` |
 | `session.steer(...)`, `session.followUp(...)` | `RpcTransportClient::steer(...)`, `RpcTransportClient::follow_up(...)` |
 | RPC bridge client | `RpcTransportClient` / `SessionTransport::RpcSubprocess` |
@@ -115,6 +116,166 @@ fn main() -> pi::sdk::Result<()> {
     Ok(())
 }
 ```
+
+### Native image, audio, and video prompts
+
+Use `prompt_with_content` when the prompt contains ordered text and native
+attachments. `ImageContent` carries images; `MediaContent` carries audio or
+video with a MIME type and optional display name. The `data` field contains
+base64 payload bytes, not a path or URL. Pi does not fetch input sources from
+this method.
+
+```rust
+use pi::sdk::{AgentSessionHandle, ContentBlock, MediaContent, TextContent};
+
+async fn summarize_clip(
+    session: &mut AgentSessionHandle,
+    clip_base64: String,
+) -> pi::sdk::Result<()> {
+    let response = session
+        .prompt_with_content(
+            vec![
+                ContentBlock::Text(TextContent::new("Summarize this clip.")),
+                ContentBlock::Media(MediaContent {
+                    data: clip_base64,
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                }),
+            ],
+            |_| {},
+        )
+        .await?;
+    println!("{response:#?}");
+    Ok(())
+}
+```
+
+`prompt_with_content_with_abort` accepts an `AbortSignal` for the same input.
+Both methods use the handle's normal persistence, retry, failover, and event
+subscriptions. Recovery reuses the accepted user message, without appending
+the media again or repeating input hooks. Media-only prompts are supported;
+an empty block list or an assistant-only block is rejected before appending
+the user message.
+
+In-process turns can also recover once from a provider context-window overflow
+when session compaction is enabled. The SDK removes the failed response, compacts
+and saves the active context, then continues with the accepted input and completed
+tool results. It only summarizes older history: the current request's native media
+and all completed tool pairs remain intact even when they exceed the usual
+keep-recent budget. With no safely older prefix, recovery stops. This maintenance
+path remains enabled when transient retries are disabled. It emits
+`auto_compaction_start` with reason `overflow` and a successful
+`auto_compaction_end` with `willRetry: true`. Cancellation, failed persistence,
+an ineffective summary, or a second overflow ends recovery without replaying tools.
+
+`SessionTransport::prompt_with_content(content, on_event)` provides this input
+over either backend. `RpcTransportClient::prompt_with_content(content)` and
+`prompt_with_content_streaming(content, streaming_behavior, on_event)` send
+the ordered RPC `content` array. The subprocess path validates before assigning
+a request ID or writing input, including a 256-block limit, at most 32 audio/video
+blocks, and a 64 MiB serialized content limit that counts JSON escaping and
+metadata. The server also enforces its configured per-media limit (5 MiB by
+default). RPC native text is literal; use the ordinary text API when you want
+server-side template, extension-command, or magic-keyword processing.
+
+For an explicit retry, `prepare_retry_content().await` returns the abandoned
+turn as `UserContent::Text` or `UserContent::Blocks`. Submit it through `prompt`
+or `prompt_with_content` respectively. The abandoned branch remains in the
+session tree, and the parent leaf is persisted before the live context moves.
+Failed persistence preserves the live branch and fences further provider calls
+until recovery. The existing `prepare_retry()` accepts text-only stored input;
+it refuses structured input before mutation and directs callers to the native API.
+
+Input hooks retain their existing text/image interface. When a hook leaves
+those fields unchanged, the complete original block order is preserved. When
+it edits them, replacement text occupies the first original text position,
+replacement images occupy image positions, and extra images append at the
+end. Audio/video blocks remain in the prompt. Providers use their existing
+native media transport where supported; unsupported media becomes a visible
+omission placeholder. The local transcript retains the native content.
+
+Media names respect the configured secret-screening policy. A MIME type that
+contains secret material is refused when screening is enabled because replacing
+part of that identifier could change how the provider handles the attachment.
+Encoded payload bytes remain opaque to the text secret detector.
+
+### In-place handoff
+
+`AgentSessionHandle::handoff(focus, &abort_signal, on_event).await` generates a
+continuation brief and replaces an older safe prefix in the current session.
+It uses the native handoff transaction: configured privacy screening, extension
+hooks, exact-source validation, and persistence before installation. Session ID,
+path, and the latest complete authored turn remain intact, including native
+image/media blocks and completed tool work. The configured keep-recent budget
+still applies. Automatic compaction enablement, thresholds, and modes do not
+disable or change this explicit operation.
+
+The focus is literal text with a limit of 4096 UTF-8 bytes and no NUL. Empty
+focus is valid. If there is no older safe prefix, synthesis fails, an extension
+cancels, or the source changes during generation, the method returns an error.
+It never installs an empty or local fallback summary. A failed save preserves
+the live context and retains the native persistence fence.
+
+Session subscribers and `on_event` receive `AutoCompactionStart` with reason
+`handoff`, followed by `AutoCompactionEnd`. This operation has no user prompt
+and emits no `AgentEnd`. On successful return, both the durable Session and the
+handle's live Agent messages contain the installed projection.
+
+Create an `AbortHandle`/`AbortSignal` pair before admitting the operation.
+`abort_handle.signal()` can derive another signal later without losing an
+earlier abort. Signal cancellation through the handle and keep polling the
+handoff future until it returns; dropping a future cannot promise asynchronous
+persistence cleanup.
+
+For a subprocess, `RpcTransportClient::handoff(Some(focus)).await` returns a
+`RpcCompactionResult`. `handoff(None)` uses empty focus, and
+`handoff_with_events(focus, callback)` forwards live native lifecycle and
+extension UI frames. A cloned `control_handle()` can send `abort` or extension
+UI replies while the client is borrowed by the pending handoff. Keep awaiting
+the terminal `handoff` response after cancellation. The server rejects a
+handoff during another turn, maintenance operation, or foreground bash command.
+
+`RpcSessionState::context_tokens` estimates the selected branch's active model
+context, excluding archived and sibling history. `context_window` is the
+resolved model capacity or `None` when unknown. Read these values at an idle
+boundary for scheduling; they are estimates, not cumulative provider usage.
+The fields default to zero/`None` when connecting to an older server.
+
+### Checkpoints and branch rewinds
+
+`mark_checkpoint(name, note).await` records the current conversation boundary.
+`rewind_to_checkpoint(Some(name)).await` summarizes the active span after that
+marker and replaces the span with its report. The original entries remain in
+the session tree. The boundary is resolved from the current tree projection,
+so a retained checkpoint still works after compaction changes message counts.
+A checkpoint that compaction removed from the active context is refused;
+restore its original branch or mark a new checkpoint.
+
+`rewind_to_user_message(entry_id).await` moves to the parent of a selected user
+message and returns its editor preparation. Sending the next prompt creates a
+sibling branch. Both rewind methods save a private candidate before changing
+the live conversation. Checkpoint creation uses the same persistence ordering.
+An interrupted or failed save preserves the live view and blocks further
+provider requests until persistence is recovered. Ephemeral sessions apply
+the change in memory without writing a file.
+
+Checkpoint summarization respects provider admission and the configured secret
+policy. A summary error or privacy refusal leaves the span intact. If an
+extension changes the session during summarization, the stale report is
+rejected without overwriting that change.
+
+### Stream rules
+
+SDK sessions load global stream rules from the configured agent directory and
+project rules when `SessionOptions.workspace_trusted` is true. Ambient rules
+are omitted when context-file loading is disabled. The shared agent enforces
+the rules across provider streams, cancels a matching draft before its tools
+execute, and records a bounded corrective retry in the transcript. The newest
+active-branch correction per rule survives compaction.
+
+Hosts constructing `Agent` directly can use `set_stream_rules` for an explicit
+validated set, or `set_stream_rule_source` for refreshable project/global files.
+See [Live stream rules](stream-rules.md) for limits, trust, and retry behavior.
 
 ## Recipe 2: Session-Level Subscribers and Typed Hooks
 
@@ -305,6 +466,8 @@ fn main() -> pi::sdk::Result<()> {
 ## Compatibility Notes for Migrating Integrators
 
 - `SessionOptions::default().no_session` is `true` (ephemeral by default).
+- `SessionOptions::model_scope` accepts the ordered patterns and optional `:thinking` suffixes used by `--models`. Explicit provider/model and thinking choices take precedence; reopening retains the saved model when no explicit provider/model is supplied. With no scope override, the session uses its workspace's model scope before global enabled models.
+- `SessionOptions::max_time` sets the wall-clock run limit (`None` by default). The agent checks it at turn boundaries, allows admitted tools to finish, and saves its time-cap marker with the conversation. The default TUI forwards `--max-time` to this option.
 - In-process `AgentSessionHandle` currently exposes prompt/state/model/thinking/compaction flows; queue controls like `steer`/`follow_up` are on `RpcTransportClient`.
 - `SessionTransport::prompt` returns `SessionPromptResult`, which is `InProcess(Box<AssistantMessage>)` or `RpcEvents(Vec<Value>)` depending on backend.
 - Extension loading is opt-in via `extension_paths`, with `extension_policy`/`repair_policy` controls.
@@ -331,7 +494,9 @@ A server event that races ahead of the matching prompt acknowledgement is retain
 under explicit count and byte bounds, then delivered in order after a successful
 acknowledgement. A failed acknowledgement does not expose those speculative events.
 Prompt acknowledgements must match both request id and command. Individual
-line-delimited JSON frames are capped at 8 MiB; oversized or truncated frames fail
+line-delimited JSON frames are capped at 128 MiB; the pre-acknowledgement buffer
+is bounded to 256 events and 256 MiB, including room for native user-message
+echoes. Oversized or truncated frames fail
 the transport rather than allocating without bound. Public generic RPC requests
 cannot override the SDK-generated `type` or `id` fields.
 
@@ -339,17 +504,54 @@ The returned `RpcEvents` vector still contains the delivered events for callers
 that need the completed transcript. Live callbacks are therefore additive, not a
 change to the completion payload.
 
+### Cancellation and subprocess ownership
+
+The ordinary `RpcTransportClient` request and prompt methods await pipe I/O
+without blocking the caller's executor. A slow reader, a partial JSON response,
+or a quiet provider stream leaves other futures on the same executor able to run.
+Each connection owns a stdin worker and a stdout worker. The stdin queue holds
+one pending frame; the stdout pump retains at most one queued frame and one
+additional frame it is preparing or delivering. The existing 128 MiB per-frame
+and pre-acknowledgement limits still apply. The completed event vector remains a
+caller-visible transcript and is not covered by the pump's queue bound.
+
+Dropping an in-flight request or prompt future closes the entire connection,
+revokes retained control handles, and starts owned process-tree cleanup. This is
+also the response to malformed acknowledgements, duplicate prompt acknowledgements,
+truncated frames, or transport failure. Reconnect before making another request;
+an interrupted exchange cannot safely donate its delayed response or terminal
+events to the next operation. The SDK does not replay interrupted operations,
+whose tool effects may already have happened. A well-formed server refusal
+completes that request and leaves the connection usable.
+
+To abort a turn while keeping its session and connection, keep polling the prompt
+future and send `RpcControlHandle::abort()` instead. Continue consuming through
+its terminal `agent_end`; the control method confirms dispatch, while the prompt
+stream reports the completed turn.
+
+`shutdown()` and client destruction stop the owned subprocess and join its pipe
+workers and reaper, including a reap started by earlier future cancellation.
+Unix subprocesses get a private process group; Windows subprocesses enter the
+existing Job discipline before running. Unix pipe workers also observe connection
+closure while polling, so an inherited descriptor held outside the owned process
+group does not keep a worker blocked on pipe EOF. If operating-system termination
+fails, explicit shutdown reports the error and retains cleanup ownership for a
+retry instead of waiting on pipe workers that may still be blocked.
+
 
 ### Mid-turn RPC control
 
 Call `RpcTransportClient::control_handle()` before starting a subprocess prompt
 when another thread, event loop, or the prompt's live callback may need to steer
-or abort it. The cloned `RpcControlHandle` shares only the serialized stdin
-writer and request-id allocator. The prompt remains the **only stdout reader**,
-so concurrent control never races a second parser over the RPC event stream.
+or abort it. The cloned `RpcControlHandle` shares the serialized stdin writer,
+request-id allocator, and connection lifetime. The prompt remains the **only
+consumer of parsed response frames**, so concurrent control never races a
+second consumer over the RPC event stream.
 
-`RpcControlHandle::steer`, `follow_up`, and `abort` synchronously write and
-flush a command and return its SDK-owned request id. A successful return means
+`RpcControlHandle::steer`, `follow_up`, and `abort` synchronously write a complete
+command to the pipe and return its SDK-owned request id. These control methods
+can wait on pipe backpressure; the async request and prompt methods use the I/O
+workers described above. A successful control return means
 the command was dispatched to the subprocess pipe; it does not claim the RPC
 server accepted or completed the operation. Its acknowledgement is consumed by
 the prompt's single reader. Use the ordinary `RpcTransportClient` methods when
@@ -357,5 +559,5 @@ you need an acknowledgement and no prompt currently owns the read lane.
 
 The control lane and ordinary requests use one atomic id sequence and one mutexed
 writer, preventing duplicate IDs or interleaved JSON lines. Holding a control
-handle does not keep the child process alive after the owning client shuts down;
-subsequent writes then fail.
+handle does not keep the child process alive after the owning client shuts down
+or an in-flight exchange is dropped; subsequent writes then fail.

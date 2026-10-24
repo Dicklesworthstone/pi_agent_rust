@@ -7950,6 +7950,28 @@ fn read_proc_uid_gid() -> Option<(u32, u32)> {
 fn default_virtual_modules() -> HashMap<String, String> {
     let mut modules = HashMap::new();
 
+    // Some extensions import Agent unconditionally but feature-detect native
+    // Undici before using it. Keep that import resolvable without advertising
+    // a socket/dispatcher implementation or loading arbitrary npm packages.
+    modules.insert(
+        "undici".to_string(),
+        compressed_js_literal!(r"
+export class Agent {
+  constructor() {
+    const error = new Error('Custom Undici dispatchers are not available in PiJS; use global fetch through the host HTTP capability');
+    error.code = 'ERR_PIJS_UNSUPPORTED_DISPATCHER';
+    throw error;
+  }
+}
+export const fetch = globalThis.fetch;
+export const Headers = globalThis.Headers;
+export const Response = globalThis.Response;
+export default { Agent, fetch, Headers, Response };
+")
+        .trim()
+        .to_string(),
+    );
+
     modules.insert(
         "@sinclair/typebox".to_string(),
         compressed_js_literal!(r#"
@@ -9830,55 +9852,76 @@ export function rawKeyHint(key, description = "") {
   return keyLabel && label ? `${keyLabel} ${label}` : keyLabel || label;
 }
 
-// compact performs conversation compaction host-side via pi's native
-// compaction engine (gh #167 / bd-i28yz). The model / apiKey /
-// customInstructions arguments are DELIBERATELY ignored: the host always
-// compacts with the SESSION's own provider, model, and credentials, so a
-// sandboxed extension can neither choose the endpoint nor supply (or
-// observe) a credential. On malformed preparation or provider failure the
-// returned Promise rejects -- pi's fail-open session_before_compact
-// handling then continues normal compaction; no placeholder summary is
-// ever fabricated.
-// When the second argument is an options object carrying a string
-// `strategy` (gh #167: `compact(preparation, { strategy:
-// "openai-responses-native", request })`), the strategy and the
-// extension-composed request cross the bridge for host-side sanitization
-// and a host-credentialed POST to the provider's native compact endpoint.
-// A legacy Model object in that position (no `strategy` key) keeps the
-// original summary-compaction path.
+// Summary compaction accepts public model identity, custom instructions and
+// thinking level. The host resolves registered models and credentials;
+// caller-supplied credentials, headers, endpoints and custom stream functions
+// never control the request. The positional form follows the current exported
+// compact(preparation, model, apiKey, headers, customInstructions, signal,
+// thinkingLevel, streamFn, env) signature. Host-owned arguments must be absent.
+// ctx.compact uses this same implementation with an options object.
 //
-// Cancellation (gh #178): a signal (`options.signal`, or the legacy fifth
+// Cancellation (gh #178): a signal (`options.signal`, or the sixth
 // argument) that has already aborted rejects before any host work starts.
 // An abort that fires mid-call is NOT propagated: hostcalls are serialized on
 // the extension runtime thread, so no JS abort handler can run until the
 // compact hostcall returns. The host's dedicated compact event budget bounds
 // that round-trip instead.
-export async function compact(preparation, modelOrOptions, _apiKey, _customInstructions, _signal) {
-  const signal =
-    (modelOrOptions && typeof modelOrOptions === "object" && modelOrOptions.signal) || _signal;
-  if (signal && signal.aborted) {
-    if (signal.reason !== undefined) {
-      throw signal.reason;
+export async function compact(preparation, modelOrOptions, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn, env) {
+  const supplied = modelOrOptions ?? {};
+  if (typeof supplied !== "object" || Array.isArray(supplied)) {
+    throw new TypeError("compact: model/options must be an object");
+  }
+  const positionalModel = "provider" in supplied || "id" in supplied;
+  const positional = positionalModel || (modelOrOptions == null && arguments.length > 2);
+  const options = positional
+    ? { model: positionalModel ? supplied : undefined, customInstructions, signal, thinkingLevel }
+    : supplied;
+  const abortSignal = options.signal ?? signal;
+  if (abortSignal && abortSignal.aborted) {
+    if (abortSignal.reason !== undefined) {
+      throw abortSignal.reason;
     }
     const aborted = new Error("This operation was aborted");
     aborted.name = "AbortError";
     throw aborted;
   }
+  if ([apiKey, headers, streamFn, env].some((value) => value !== undefined && value !== null)) {
+    throw new TypeError("compact: credentials, headers, streamFn and env are host-owned; pass only a public model identity and summary options");
+  }
+  if (!positional && [customInstructions, thinkingLevel].some((value) => value !== undefined && value !== null)) {
+    throw new TypeError("compact: use customInstructions and thinkingLevel inside the options object");
+  }
+  const allowed = new Set(["model", "customInstructions", "thinkingLevel", "signal", "strategy", "request"]);
+  for (const key of Object.keys(options)) {
+    if (!allowed.has(key)) throw new TypeError(`compact: unsupported option ${key}`);
+  }
+  const summaryOptions = {};
+  if (options.model !== undefined && options.model !== null) {
+    const model = options.model;
+    if (typeof model !== "object" || Array.isArray(model) || typeof model.provider !== "string" || !model.provider.trim() || typeof model.id !== "string" || !model.id.trim()) {
+      throw new TypeError("compact: model provider and id must be non-empty strings");
+    }
+    summaryOptions.model = { provider: model.provider, id: model.id };
+  }
+  if (options.customInstructions !== undefined && options.customInstructions !== null) {
+    if (typeof options.customInstructions !== "string") throw new TypeError("compact: customInstructions must be a string");
+    summaryOptions.customInstructions = options.customInstructions;
+  }
+  if (options.thinkingLevel !== undefined && options.thinkingLevel !== null) {
+    if (typeof options.thinkingLevel !== "string") throw new TypeError("compact: thinkingLevel must be a string");
+    summaryOptions.thinkingLevel = options.thinkingLevel;
+  }
   if (!globalThis.pi || typeof globalThis.pi.events !== "function") {
     throw new Error("compact() host bridge is unavailable in this runtime");
   }
-  if (
-    modelOrOptions &&
-    typeof modelOrOptions === "object" &&
-    typeof modelOrOptions.strategy === "string"
-  ) {
-    return await globalThis.pi.events("compact", {
-      preparation: preparation ?? null,
-      strategy: modelOrOptions.strategy,
-      request: modelOrOptions.request ?? null,
-    });
+  const payload = { preparation: preparation ?? null, options: summaryOptions };
+  if (options.strategy !== undefined && options.strategy !== null) {
+    payload.strategy = options.strategy;
+    payload.request = options.request ?? null;
+  } else if (options.request !== undefined && options.request !== null) {
+    throw new TypeError("compact: request requires a native strategy");
   }
-  return await globalThis.pi.events("compact", { preparation: preparation ?? null });
+  return await globalThis.pi.events("compact", payload);
 }
 
 /// Stub: AssistantMessageComponent for rendering assistant messages
@@ -10843,17 +10886,18 @@ export default { config, parse };
     modules.insert(
         "node:path".to_string(),
         compressed_js_literal!(r#"
+function buildPosixPath() {
 function __pi_is_abs(s) {
   return s.startsWith("/") || (s.length >= 3 && s[1] === ":" && s[2] === "/");
 }
 
-export function join(...parts) {
+function join(...parts) {
   const cleaned = parts.map((p) => String(p ?? "").replace(/\\/g, "/")).filter((p) => p.length > 0);
   if (cleaned.length === 0) return ".";
   return normalize(cleaned.join("/"));
 }
 
-export function dirname(p) {
+function dirname(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const idx = s.lastIndexOf("/");
   if (idx <= 0) return s.startsWith("/") ? "/" : ".";
@@ -10863,7 +10907,7 @@ export function dirname(p) {
   return dir;
 }
 
-export function resolve(...parts) {
+function resolve(...parts) {
   const base =
     globalThis.pi && globalThis.pi.process && typeof globalThis.pi.process.cwd === "string"
       ? globalThis.pi.process.cwd
@@ -10886,7 +10930,7 @@ export function resolve(...parts) {
   return normalize(out);
 }
 
-export function basename(p, ext) {
+function basename(p, ext) {
   const s = String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
   const idx = s.lastIndexOf("/");
   const name = idx === -1 ? s : s.slice(idx + 1);
@@ -10896,7 +10940,7 @@ export function basename(p, ext) {
   return name;
 }
 
-export function relative(from, to) {
+function relative(from, to) {
   const fromParts = String(from ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
   const toParts = String(to ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
 
@@ -10911,12 +10955,12 @@ export function relative(from, to) {
   return result.join("/") || ".";
 }
 
-export function isAbsolute(p) {
+function isAbsolute(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   return __pi_is_abs(s);
 }
 
-export function extname(p) {
+function extname(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const b = s.lastIndexOf("/");
   const name = b === -1 ? s : s.slice(b + 1);
@@ -10925,7 +10969,7 @@ export function extname(p) {
   return name.slice(dot);
 }
 
-export function normalize(p) {
+function normalize(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const isAbs = __pi_is_abs(s);
   const parts = s.split("/").filter(Boolean);
@@ -10939,7 +10983,7 @@ export function normalize(p) {
   return isAbs ? "/" + result : result || ".";
 }
 
-export function parse(p) {
+function parse(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const isAbs = s.startsWith("/");
   const lastSlash = s.lastIndexOf("/");
@@ -10951,21 +10995,224 @@ export function parse(p) {
   return { root, dir, base, ext, name };
 }
 
-export function format(pathObj) {
+function format(pathObj) {
   const dir = pathObj.dir || pathObj.root || "";
   const base = pathObj.base || (pathObj.name || "") + (pathObj.ext || "");
   if (!dir) return base;
   return dir === pathObj.root ? dir + base : dir + "/" + base;
 }
 
-export const sep = "/";
-export const delimiter = ":";
-export const posix = { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter };
+return { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format,
+  sep: "/", delimiter: ":", toNamespacedPath: (p) => p };
+}
 
-const win32Stub = new Proxy({}, { get(_, prop) { throw new Error("path.win32." + String(prop) + " is not supported (Pi runs on POSIX only)"); } });
-export const win32 = win32Stub;
+function buildWindowsPath() {
+  const separator = (ch) => ch === "\\" || ch === "/";
+  function stringPath(p) {
+    if (typeof p !== "string") throw new TypeError("Path must be a string");
+    return p;
+  }
+  // Keep the root separate from lexical components: '..' must never remove a
+  // drive, UNC server or share. Preserve original separators for parse/dirname.
+  function rootOf(p, lexical = false) {
+    // Device namespaces resolve components after their prefix; parse/dirname
+    // retain the original device component in the returned root instead.
+    if (lexical && separator(p[0]) && separator(p[1]) && (p[2] === "?" || p[2] === ".") && separator(p[3])) {
+      return { device: "\\\\" + p[2], absolute: true, end: 4 };
+    }
+    if (/^[A-Za-z]:/.test(p)) {
+      const absolute = separator(p[2]);
+      return { device: p.slice(0, 2), absolute, end: absolute ? 3 : 2 };
+    }
+    if (!separator(p[0])) return { device: "", absolute: false, end: 0 };
+    if (separator(p[1]) && p.length > 2 && !separator(p[2])) {
+      let end = 2;
+      while (end < p.length && !separator(p[end])) end++;
+      const server = p.slice(2, end);
+      while (end < p.length && separator(p[end])) end++;
+      const shareStart = end;
+      while (end < p.length && !separator(p[end])) end++;
+      if (end > shareStart) {
+        return {
+          device: "\\\\" + server + "\\" + p.slice(shareStart, end),
+          absolute: true,
+          end: end < p.length ? end + 1 : end,
+        };
+      }
+    }
+    return { device: "", absolute: true, end: 1 };
+  }
+  function components(tail, absolute) {
+    const result = [];
+    for (const part of tail.split(/[\\/]+/)) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        if (result.length && result[result.length - 1] !== "..") result.pop();
+        else if (!absolute) result.push(part);
+      } else result.push(part);
+    }
+    return result.join("\\");
+  }
+  function normalize(p) {
+    stringPath(p);
+    if (!p) return ".";
+    const root = rootOf(p, true);
+    let tail = components(p.slice(root.end), root.absolute);
+    if (!tail && !root.absolute) tail = ".";
+    if (tail && separator(p[p.length - 1])) tail += "\\";
+    // Normalization may expose a drive-looking component after removing '..'.
+    // Keep a relative input relative instead of turning it into another drive.
+    if (!root.device && !root.absolute && (/^[A-Za-z]:/.test(tail) || /:(?:$|[\\/])/.test(p))) tail = ".\\" + tail;
+    return root.device + (root.absolute ? "\\" : "") + tail;
+  }
+  function cwd() {
+    // Only the runtime's configured process snapshot is consulted; path
+    // operations never inspect the host filesystem or ambient environment.
+    const process = globalThis.pi && globalThis.pi.process;
+    return process && typeof process.cwd === "string" ? process.cwd : "/";
+  }
+  function driveCwd(device) {
+    // The process env proxy reads the configured snapshot under its normal
+    // capability policy. An unavailable per-drive directory falls back safely.
+    const process = globalThis.process;
+    const saved = process && process.env && process.env["=" + device.toUpperCase()];
+    if (typeof saved === "string") {
+      const root = rootOf(saved);
+      if (root.absolute && root.device.toLowerCase() === device.toLowerCase()) return saved;
+    }
+    const current = cwd();
+    const root = rootOf(current);
+    if (root.device && root.device.toLowerCase() !== device.toLowerCase()) return device + "\\";
+    return current;
+  }
+  function resolve(...paths) {
+    // Validate even ignored left-hand segments, before interpreting any path.
+    paths.forEach(stringPath);
+    let device = "";
+    let absolute = false;
+    let tail = "";
+    for (let index = paths.length - 1; index >= -1; index--) {
+      const p = index >= 0 ? paths[index] : device ? driveCwd(device) : cwd();
+      if (!p) continue;
+      const root = rootOf(p, true);
+      if (root.device) {
+        if (device && root.device.toLowerCase() !== device.toLowerCase()) continue;
+        if (!device) device = root.device;
+      }
+      if (!absolute) {
+        tail = p.slice(root.end) + "\\" + tail;
+        absolute = root.absolute;
+      }
+      if (absolute && device) break;
+    }
+    tail = components(tail, absolute);
+    return device + (absolute ? "\\" : "") + tail || ".";
+  }
+  function join(...paths) {
+    paths.forEach(stringPath);
+    const parts = paths.filter((p) => p.length > 0);
+    if (!parts.length) return ".";
+    let joined = parts.join("\\");
+    const first = parts[0];
+    // Joining ordinary rooted segments must not accidentally invent a UNC
+    // share. A UNC prefix must already be present in the first segment.
+    if (!(separator(first[0]) && separator(first[1]) && first.length > 2 && !separator(first[2]))) {
+      joined = joined.replace(/^[\\/]{2,}/, "\\");
+    }
+    return normalize(joined);
+  }
+  function basename(p, suffix) {
+    stringPath(p);
+    if (suffix !== undefined) stringPath(suffix);
+    if (p === suffix) return "";
+    const floor = /^[A-Za-z]:/.test(p) ? 2 : 0;
+    let end = p.length;
+    while (end > floor && separator(p[end - 1])) end--;
+    let start = end;
+    while (start > floor && !separator(p[start - 1])) start--;
+    let base = p.slice(start, end);
+    if (suffix && suffix.length < base.length && base.endsWith(suffix)) base = base.slice(0, -suffix.length);
+    return base;
+  }
+  function extension(base) {
+    const dot = base.lastIndexOf(".");
+    return dot <= 0 || base === ".." ? "" : base.slice(dot);
+  }
+  function extname(p) {
+    return extension(basename(p));
+  }
+  function parse(p) {
+    stringPath(p);
+    const root = rootOf(p);
+    let end = p.length;
+    while (end > root.end && separator(p[end - 1])) end--;
+    let start = end;
+    while (start > root.end && !separator(p[start - 1])) start--;
+    const base = p.slice(start, end);
+    const ext = extension(base);
+    return {
+      root: p.slice(0, root.end),
+      dir: p.slice(0, start > root.end ? start - 1 : root.end),
+      base, ext, name: ext ? base.slice(0, -ext.length) : base,
+    };
+  }
+  function dirname(p) {
+    return parse(p).dir || ".";
+  }
+  function relative(from, to) {
+    const origin = resolve(stringPath(from));
+    const destination = resolve(stringPath(to));
+    if (origin.toLowerCase() === destination.toLowerCase()) return "";
+    const left = origin.split("\\").filter(Boolean);
+    const right = destination.split("\\").filter(Boolean);
+    let common = 0;
+    while (common < left.length && common < right.length && left[common].toLowerCase() === right[common].toLowerCase()) common++;
+    // Distinct drives or UNC hosts have no relative filesystem path.
+    if (!common || origin.startsWith("\\\\") !== destination.startsWith("\\\\")) return destination;
+    return [...Array(left.length - common).fill(".."), ...right.slice(common)].join("\\");
+  }
+  function isAbsolute(p) {
+    return rootOf(stringPath(p)).absolute;
+  }
+  function format(pathObj) {
+    if (!pathObj || typeof pathObj !== "object" || Array.isArray(pathObj)) throw new TypeError("Path object must be an object");
+    const dir = pathObj.dir || pathObj.root || "";
+    const ext = pathObj.ext || "";
+    const base = pathObj.base || (pathObj.name || "") + (ext && !ext.startsWith(".") ? "." + ext : ext);
+    if (!dir) return base;
+    return dir === pathObj.root ? dir + base : dir + "\\" + base;
+  }
+  function toNamespacedPath(p) {
+    if (typeof p !== "string" || !p) return p;
+    const full = resolve(p);
+    if (full.length <= 2) return p;
+    if (full.startsWith("\\\\") && full[2] !== "?" && full[2] !== ".") return "\\\\?\\UNC\\" + full.slice(2);
+    if (/^[A-Za-z]:\\/.test(full)) return "\\\\?\\" + full;
+    return full;
+  }
+  return { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format,
+    sep: "\\", delimiter: ";", toNamespacedPath };
+}
 
-export default { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter, posix, win32 };
+export const posix = buildPosixPath();
+export const win32 = buildWindowsPath();
+posix.posix = win32.posix = posix;
+posix.win32 = win32.win32 = win32;
+const nativePath = globalThis.process && globalThis.process.platform === "win32" ? win32 : posix;
+export const join = nativePath.join;
+export const dirname = nativePath.dirname;
+export const resolve = nativePath.resolve;
+export const basename = nativePath.basename;
+export const relative = nativePath.relative;
+export const isAbsolute = nativePath.isAbsolute;
+export const extname = nativePath.extname;
+export const normalize = nativePath.normalize;
+export const parse = nativePath.parse;
+export const format = nativePath.format;
+export const sep = nativePath.sep;
+export const delimiter = nativePath.delimiter;
+export const toNamespacedPath = nativePath.toNamespacedPath;
+export default nativePath;
 "#)
         .trim()
         .to_string(),
@@ -11929,6 +12176,18 @@ const __pi_vfs = (() => {
     nextFd: 100,
   };
   const extensionTmpRoot = "/__pi_extension_tmp";
+  const windowsPaths = globalThis.process && globalThis.process.platform === "win32";
+
+  function childPrefix(path) {
+    return path.endsWith("/") ? path : `${path}/`;
+  }
+
+  function toHostPath(path) {
+    // Windows verbatim/device prefixes do not accept '/' separators. Keep
+    // slash-separated VFS keys, but preserve the native namespace at every
+    // authorization and host-I/O boundary.
+    return windowsPaths && /^\/\/[?.]\//.test(path) ? path.replace(/\//g, "\\") : path;
+  }
 
   function checkWriteAccess(resolved) {
     const normalized = normalizePath(resolved);
@@ -11936,7 +12195,7 @@ const __pi_vfs = (() => {
       return;
     }
     if (typeof globalThis.__pi_host_check_write_access === "function") {
-      globalThis.__pi_host_check_write_access(normalized);
+      globalThis.__pi_host_check_write_access(toHostPath(normalized));
     }
   }
 
@@ -11946,7 +12205,7 @@ const __pi_vfs = (() => {
       return;
     }
     if (typeof globalThis.__pi_host_check_read_access === "function") {
-      globalThis.__pi_host_check_read_access(normalized);
+      globalThis.__pi_host_check_read_access(toHostPath(normalized));
     }
   }
 
@@ -11960,7 +12219,7 @@ const __pi_vfs = (() => {
         ? globalThis.process.cwd()
         : "/"
     );
-    if (normalized !== cwd && !normalized.startsWith(`${cwd}/`)) {
+    if (normalized !== cwd && !normalized.startsWith(childPrefix(cwd))) {
       throw new Error("host write denied: path outside extension root");
     }
     checkWriteAccess(normalized);
@@ -12015,7 +12274,7 @@ const __pi_vfs = (() => {
   function pathIsWithin(path, root) {
     const candidate = comparablePath(path);
     const base = comparablePath(root);
-    return candidate === base || candidate.startsWith(`${base}/`);
+    return candidate === base || candidate.startsWith(childPrefix(base));
   }
 
   function isAbsolutePathInput(input) {
@@ -12037,12 +12296,13 @@ const __pi_vfs = (() => {
     }
     if (
       typeof globalThis.__pi_host_is_registered_fs_path === "function" &&
-      globalThis.__pi_host_is_registered_fs_path(normalized)
+      globalThis.__pi_host_is_registered_fs_path(toHostPath(normalized))
     ) {
       return normalized;
     }
     const root = currentExtensionTempRoot(tempBase);
-    return `${root}${normalized.slice(tempBase.length)}`;
+    const relative = normalized.slice(tempBase.length).replace(/^\/+/, "");
+    return relative ? `${childPrefix(root)}${relative}` : root;
   }
 
   function unmapExtensionTempPath(normalized) {
@@ -12055,7 +12315,7 @@ const __pi_vfs = (() => {
         return tempBase;
       }
       if (normalized.startsWith(`${root}/`)) {
-        return `${tempBase}${normalized.slice(root.length)}`;
+        return `${childPrefix(tempBase)}${normalized.slice(root.length + 1)}`;
       }
     }
     return normalized;
@@ -12068,21 +12328,39 @@ const __pi_vfs = (() => {
     });
   }
 
-  function normalizePath(input) {
-    let raw = String(input ?? "").replace(/\\/g, "/");
-    // Strip Windows UNC verbatim prefix that canonicalize() produces.
-    // \\?\C:\... becomes /?/C:/... after separator normalization.
-    if (raw.startsWith("/?/") && raw.length > 5 && /^[A-Za-z]:/.test(raw.substring(3, 5))) {
-      raw = raw.slice(3);
+  function splitRoot(path) {
+    const drive = /^[A-Za-z]:\//.exec(path);
+    if (drive) return { root: drive[0], tail: path.slice(3) };
+    if (windowsPaths) {
+      // A UNC share is one filesystem root. A verbatim UNC path additionally
+      // carries its namespace prefix; neither may be consumed by '..'.
+      const unc = /^\/\/([?.]\/UNC\/)?([^/]+)\/+([^/]+)(?=\/|$)/i.exec(path);
+      if (unc && (!/^\/\/[?.]\//.test(path) || unc[1])) {
+        return { root: `//${unc[1] || ""}${unc[2]}/${unc[3]}`, tail: path.slice(unc[0].length) };
+      }
+      const device = /^\/\/([?.])\/([^/]+)(?=\/|$)/.exec(path);
+      if (device) {
+        const root = `//${device[1]}/${device[2]}`;
+        return {
+          root: /^[A-Za-z]:$/.test(device[2]) ? `${root}/` : root,
+          tail: path.slice(device[0].length),
+        };
+      }
     }
+    return { root: path.startsWith("/") ? "/" : "", tail: path.startsWith("/") ? path.slice(1) : path };
+  }
+
+  function normalizePath(input) {
+    const raw = String(input ?? "").replace(/\\/g, "/");
     // Detect Windows drive-letter absolute paths (e.g. "C:/Users/...")
     const hasDriveLetter = raw.length >= 3 && /^[A-Za-z]:\//.test(raw);
     const isAbsolute = raw.startsWith("/") || hasDriveLetter;
     const base = isAbsolute
       ? raw
       : `${(globalThis.process && typeof globalThis.process.cwd === "function" ? globalThis.process.cwd() : "/").replace(/\\/g, "/")}/${raw}`;
+    const { root, tail } = splitRoot(base);
     const parts = [];
-    for (const part of base.split("/")) {
+    for (const part of tail.split("/")) {
       if (!part || part === ".") continue;
       if (part === "..") {
         if (parts.length > 0) parts.pop();
@@ -12090,31 +12368,25 @@ const __pi_vfs = (() => {
       }
       parts.push(part);
     }
-    // Preserve drive letter prefix on Windows (D:/...) instead of /D:/...
-    if (parts.length > 0 && /^[A-Za-z]:$/.test(parts[0])) {
-      return `${parts[0]}/${parts.slice(1).join("/")}`;
-    }
-    return `/${parts.join("/")}`;
+    return parts.length ? `${childPrefix(root || "/")}${parts.join("/")}` : root || "/";
   }
 
   function dirname(path) {
     const normalized = normalizePath(path);
-    if (normalized === "/") return "/";
-    if (/^[A-Za-z]:\/$/.test(normalized)) return normalized;
+    const { root } = splitRoot(normalized);
+    if (normalized === root) return root;
     const idx = normalized.lastIndexOf("/");
-    if (idx === 2 && /^[A-Za-z]:/.test(normalized)) return `${normalized.slice(0, 2)}/`;
-    return idx <= 0 ? "/" : normalized.slice(0, idx);
+    return idx < root.length ? root : normalized.slice(0, idx);
   }
 
   function ensureDir(path) {
     const normalized = normalizePath(path);
-    if (normalized === "/") return "/";
-    const driveRoot = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(0, 3) : "";
-    const parts = (driveRoot ? normalized.slice(3) : normalized.slice(1)).split("/").filter(Boolean);
-    let current = driveRoot ? driveRoot.slice(0, 2) : "";
-    if (driveRoot) state.dirs.add(driveRoot);
+    const { root, tail } = splitRoot(normalized);
+    const parts = tail.split("/").filter(Boolean);
+    let current = root;
+    state.dirs.add(root);
     for (const part of parts) {
-      current = current ? `${current}/${part}` : `/${part}`;
+      current = `${childPrefix(current)}${part}`;
       if (state.files.has(current) || state.symlinks.has(current)) {
         throw new Error(`ENOTDIR: not a directory, mkdir '${String(path ?? "")}'`);
       }
@@ -12245,7 +12517,7 @@ const __pi_vfs = (() => {
       return { bytes: undefined, error: "" };
     }
     try {
-      const content = globalThis.__pi_host_read_file_sync(resolved);
+      const content = globalThis.__pi_host_read_file_sync(toHostPath(resolved));
       return { bytes: toBytes(content, "base64"), error: "" };
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
@@ -12268,7 +12540,7 @@ const __pi_vfs = (() => {
       return undefined;
     }
     try {
-      return JSON.parse(globalThis.__pi_host_stat_sync(resolved, !!followSymlinks));
+      return JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(resolved), !!followSymlinks));
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
       // Standalone harness realms have no extension identity. Their virtual
@@ -12290,11 +12562,11 @@ const __pi_vfs = (() => {
   }
 
   function firstSymlinkComponent(path) {
-    const driveRoot = /^[A-Za-z]:\//.test(path) ? path.slice(0, 3) : "";
-    const parts = (driveRoot ? path.slice(3) : path.slice(1)).split("/").filter(Boolean);
-    let candidate = driveRoot ? driveRoot.slice(0, 2) : "";
+    const { root, tail } = splitRoot(path);
+    const parts = tail.split("/").filter(Boolean);
+    let candidate = root;
     for (let index = 0; index < parts.length; index += 1) {
-      candidate = candidate ? `${candidate}/${parts[index]}` : `/${parts[index]}`;
+      candidate = `${childPrefix(candidate)}${parts[index]}`;
       if (state.symlinks.has(candidate)) {
         return { linkPath: candidate, remaining: parts.slice(index + 1) };
       }
@@ -12447,7 +12719,7 @@ const __pi_vfs = (() => {
 
   function listChildren(path, withFileTypes) {
     const normalized = normalizePath(path);
-    const prefix = normalized === "/" ? "/" : `${normalized}/`;
+    const prefix = childPrefix(normalized);
     const children = new Map();
 
     for (const dir of state.dirs) {
@@ -12525,7 +12797,7 @@ const __pi_vfs = (() => {
     let hostStat = null;
     if (!isDir && bytes === undefined && !isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_stat_sync === "function") {
       try {
-        hostStat = JSON.parse(globalThis.__pi_host_stat_sync(normalized, !!followSymlinks));
+        hostStat = JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(normalized), !!followSymlinks));
       } catch (e) {
         /* not on host FS */
       }
@@ -12595,15 +12867,16 @@ const __pi_vfs = (() => {
 
   function authorizeTreeWrite(path) {
     const normalized = normalizePath(path);
+    const prefix = childPrefix(normalized);
     const descendants = [normalized];
     for (const candidate of state.files.keys()) {
-      if (candidate.startsWith(`${normalized}/`)) descendants.push(candidate);
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
     }
     for (const candidate of state.dirs) {
-      if (candidate.startsWith(`${normalized}/`)) descendants.push(candidate);
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
     }
     for (const candidate of state.symlinks.keys()) {
-      if (candidate.startsWith(`${normalized}/`)) descendants.push(candidate);
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
     }
     for (const candidate of new Set(descendants)) {
       authorizeWriteResolution(resolvePathDetails(candidate, false));
@@ -12629,6 +12902,8 @@ const __pi_vfs = (() => {
   }
 
   state.normalizePath = normalizePath;
+  state.toHostPath = toHostPath;
+  state.childPrefix = childPrefix;
   state.dirname = dirname;
   state.ensureDir = ensureDir;
   state.toBytes = toBytes;
@@ -12770,7 +13045,7 @@ export function readdirSync(path, opts) {
   let hostError;
   if (!__pi_vfs.isCurrentExtensionTempPath(resolved) && typeof globalThis.__pi_host_read_dir_sync === "function") {
     try {
-      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(resolved));
+      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(__pi_vfs.toHostPath(resolved)));
       foundDir = true;
       for (const entry of hostEntries) {
         if (!entry || typeof entry.name !== "string") continue;
@@ -12838,6 +13113,7 @@ export function unlinkSync(path) {
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  const prefix = __pi_vfs.childPrefix(normalized);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
   }
@@ -12846,17 +13122,17 @@ export function rmdirSync(path, _opts) {
   }
   __pi_vfs.authorizeTreeWrite(normalized);
   for (const filePath of __pi_vfs.files.keys()) {
-    if (filePath.startsWith(`${normalized}/`)) {
+    if (filePath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const dirPath of __pi_vfs.dirs) {
-    if (dirPath.startsWith(`${normalized}/`)) {
+    if (dirPath !== normalized && dirPath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const linkPath of __pi_vfs.symlinks.keys()) {
-    if (linkPath.startsWith(`${normalized}/`)) {
+    if (linkPath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
@@ -12866,6 +13142,7 @@ export function rmdirSync(path, _opts) {
 }
 export function rmSync(path, opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  const prefix = __pi_vfs.childPrefix(normalized);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
     return;
@@ -12882,17 +13159,17 @@ export function rmSync(path, opts) {
     }
     __pi_vfs.authorizeTreeWrite(normalized);
     for (const filePath of Array.from(__pi_vfs.files.keys())) {
-      if (filePath === normalized || filePath.startsWith(`${normalized}/`)) {
+      if (filePath === normalized || filePath.startsWith(prefix)) {
         __pi_vfs.files.delete(filePath);
       }
     }
     for (const dirPath of Array.from(__pi_vfs.dirs)) {
-      if (dirPath === normalized || dirPath.startsWith(`${normalized}/`)) {
+      if (dirPath === normalized || dirPath.startsWith(prefix)) {
         __pi_vfs.dirs.delete(dirPath);
       }
     }
     for (const linkPath of Array.from(__pi_vfs.symlinks.keys())) {
-      if (linkPath === normalized || linkPath.startsWith(`${normalized}/`)) {
+      if (linkPath === normalized || linkPath.startsWith(prefix)) {
         __pi_vfs.symlinks.delete(linkPath);
       }
     }
@@ -14771,50 +15048,85 @@ class Readable extends Stream {
     const stream = this;
     const queue = [];
     const waiters = [];
-    let done = false;
+    let queuedBytes = 0;
+    let done = stream.destroyed || stream._readableState.ended;
     let failure = null;
 
     const settleDone = () => {
       done = true;
+      cleanup();
       while (waiters.length > 0) {
         waiters.shift().resolve({ value: undefined, done: true });
       }
     };
     const settleError = (err) => {
       failure = __streamToError(err);
+      done = true;
+      queue.length = 0;
+      queuedBytes = 0;
+      cleanup();
       while (waiters.length > 0) {
         waiters.shift().reject(failure);
       }
     };
     const onData = (value) => {
+      if (done) return;
       if (waiters.length > 0) {
         waiters.shift().resolve({ value, done: false });
       } else {
-        queue.push(value);
+        const size = typeof value === 'string' ? value.length * 2 : (value && value.byteLength) || 1;
+        if (queue.length >= 1024 || queuedBytes + size > 1024 * 1024) {
+          settleError(new Error('Readable async iterator buffer exceeds its limit'));
+          stream.destroy();
+          return;
+        }
+        queue.push({ value, size });
+        queuedBytes += size;
       }
+      if (waiters.length === 0 && typeof stream.pause === 'function') stream.pause();
     };
     const onEnd = () => settleDone();
-    const onError = (err) => settleError(err);
+    const onError = (err) => {
+      settleError(err);
+      if (!stream.destroyed) stream.destroy();
+    };
+    const onClose = () => settleDone();
     const cleanup = () => {
       stream.removeListener("data", onData);
       stream.removeListener("end", onEnd);
       stream.removeListener("error", onError);
+      stream.removeListener("close", onClose);
     };
 
-    stream.on("data", onData);
-    stream.on("end", onEnd);
-    stream.on("error", onError);
+    if (!done) {
+      stream.on("data", onData);
+      stream.on("end", onEnd);
+      stream.on("error", onError);
+      stream.on("close", onClose);
+      if (typeof stream.pause === 'function') stream.pause();
+    }
 
     return {
       async next() {
-        if (queue.length > 0) return { value: queue.shift(), done: false };
         if (failure) throw failure;
+        if (queue.length > 0) {
+          const item = queue.shift();
+          queuedBytes -= item.size;
+          if (queue.length === 0 && !done && typeof stream.resume === 'function') stream.resume();
+          return { value: item.value, done: false };
+        }
         if (done) return { value: undefined, done: true };
-        return await new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        const pending = new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        if (typeof stream.resume === 'function') stream.resume();
+        return await pending;
       },
       async return() {
-        cleanup();
+        queue.length = 0;
+        queuedBytes = 0;
         settleDone();
+        // Node's default iterator owns the stream. A for-await break must
+        // cancel a live Web reader instead of leaving its HTTP request running.
+        if (!stream.destroyed) stream.destroy();
         return { value: undefined, done: true };
       },
       [Symbol.asyncIterator]() { return this; },
@@ -14842,16 +15154,52 @@ class Readable extends Stream {
     }
     const reader = webReadable.getReader();
     const readable = new Readable(opts);
+    let resumeRead = null;
+    const originalDestroy = readable.destroy.bind(readable);
+    readable.pause = () => {
+      readable._readableState.flowing = false;
+      return readable;
+    };
+    readable.resume = () => {
+      readable._readableState.flowing = true;
+      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
+      return readable;
+    };
+    readable.destroy = (error) => {
+      if (readable.destroyed) return readable;
+      try { Promise.resolve(reader.cancel(error)).catch(() => {}); } catch (_) {}
+      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
+      return originalDestroy(error);
+    };
     (async () => {
       try {
-        while (true) {
+        while (!readable.destroyed) {
+          if (readable._readableState.flowing === false) {
+            await new Promise((resolve) => { resumeRead = resolve; });
+          }
+          if (readable.destroyed) break;
           const { done, value } = await reader.read();
-          if (done) break;
-          readable.push(value);
+          if (done || readable.destroyed) break;
+          const normalized = __normalizeChunk(value, readable._readableState.encoding);
+          const chunk = !opts.objectMode && typeof normalized !== 'string' &&
+              typeof Buffer !== 'undefined' && !Buffer.isBuffer(normalized)
+            ? Buffer.from(normalized)
+            : normalized;
+          // Event consumers already receive the bytes. Retaining another copy
+          // in Readable._queue leaks an entire long-lived SSE response.
+          if (readable.listenerCount('data') > 0) {
+            readable.emit('data', chunk);
+          } else {
+            const retained = readable._queue.reduce((size, part) => size + (part.byteLength || part.length || 0), 0);
+            if (retained + (chunk.byteLength || chunk.length || 0) > 1024 * 1024) {
+              throw new Error('Readable.fromWeb buffer exceeds 1 MiB without a consumer');
+            }
+            readable._queue.push(chunk);
+          }
         }
-        readable.push(null);
+        if (!readable.destroyed) readable.push(null);
       } catch (err) {
-        readable.emit("error", __streamToError(err));
+        if (!readable.destroyed) readable.destroy(__streamToError(err));
       } finally {
         try { reader.releaseLock(); } catch (_) {}
       }
@@ -15439,10 +15787,48 @@ export default {
     modules.insert(
         "node:string_decoder".to_string(),
         r"
+import { Buffer } from 'node:buffer';
+
 export class StringDecoder {
-  constructor(encoding) { this.encoding = encoding || 'utf8'; }
-  write(buf) { return typeof buf === 'string' ? buf : String(buf ?? ''); }
-  end(buf) { return buf ? this.write(buf) : ''; }
+  constructor(encoding = 'utf8') {
+    const name = String(encoding).toLowerCase().replace(/[-_]/g, '');
+    this.encoding = name === 'ucs2' ? 'utf16le' : name === 'binary' ? 'latin1' : name;
+    if (!['utf8', 'utf16le', 'latin1', 'ascii', 'hex', 'base64', 'base64url'].includes(this.encoding)) {
+      throw new TypeError('Unknown encoding: ' + String(encoding));
+    }
+    this._pending = Buffer.alloc(0);
+  }
+  write(buf) {
+    if (typeof buf === 'string') return buf;
+    if (buf === undefined || buf === null) return '';
+    const input = ArrayBuffer.isView(buf)
+      ? Buffer.from(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength))
+      : Buffer.from(buf);
+    const bytes = this._pending.length ? Buffer.concat([this._pending, input]) : input;
+    let end = bytes.length;
+    if (this.encoding === 'utf8' && end > 0) {
+      let lead = end - 1;
+      while (lead > 0 && (bytes[lead] & 0xc0) === 0x80 && end - lead < 4) lead--;
+      const first = bytes[lead];
+      const needed = first >= 0xc2 && first <= 0xdf ? 2
+        : first >= 0xe0 && first <= 0xef ? 3
+        : first >= 0xf0 && first <= 0xf4 ? 4 : 1;
+      if (end - lead < needed) end = lead;
+    } else if (this.encoding === 'utf16le') {
+      end -= end % 2;
+      if (end >= 2 && bytes[end - 1] >= 0xd8 && bytes[end - 1] <= 0xdb) end -= 2;
+    } else if (this.encoding === 'base64' || this.encoding === 'base64url') {
+      end -= end % 3;
+    }
+    this._pending = Buffer.from(bytes.subarray(end));
+    return Buffer.from(bytes.subarray(0, end)).toString(this.encoding);
+  }
+  end(buf) {
+    const head = buf === undefined ? '' : this.write(buf);
+    const tail = this._pending.toString(this.encoding);
+    this._pending = Buffer.alloc(0);
+    return head + tail;
+  }
 }
 export default { StringDecoder };
 "
@@ -17123,6 +17509,30 @@ pub fn available_virtual_module_names() -> std::collections::BTreeSet<String> {
 /// while avoiding per-tick full-heap scans.
 const UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS: u64 = 32;
 
+struct DeferredHostcall {
+    stream: futures::stream::LocalBoxStream<'static, HostcallOutcome>,
+    credit: bool,
+    deadline: Option<std::time::Instant>,
+    finalizer: Option<Box<dyn FnOnce(&HostcallOutcome)>>,
+}
+
+impl DeferredHostcall {
+    fn finish(&mut self, outcome: &HostcallOutcome) {
+        if let Some(finalizer) = self.finalizer.take() {
+            finalizer(outcome);
+        }
+    }
+}
+
+impl Drop for DeferredHostcall {
+    fn drop(&mut self) {
+        self.finish(&HostcallOutcome::Error {
+            code: "cancelled".to_string(),
+            message: "HTTP stream cancelled before completion".to_string(),
+        });
+    }
+}
+
 /// Integrated PiJS runtime combining QuickJS, scheduler, and Promise bridge.
 ///
 /// This is the main entry point for running JavaScript extensions with
@@ -17164,6 +17574,9 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     hostcall_queue: HostcallQueue,
     trace_seq: Arc<AtomicU64>,
     hostcall_tracker: Rc<RefCell<HostcallTracker>>,
+    // Poll owned network futures between JS turns. One credit permits one
+    // response frame, keeping timers, cancellation, and slow consumers live.
+    deferred_hostcalls: Rc<RefCell<HashMap<String, DeferredHostcall>>>,
     active_session_action_origin: Rc<RefCell<Option<SessionActionOrigin>>>,
     user_timer_origins: Rc<RefCell<HashMap<u64, SessionActionOrigin>>>,
     hostcalls_total: Arc<AtomicU64>,
@@ -17213,6 +17626,8 @@ struct JsRuntimeRegistrySnapshot {
     pending_event_listener_lists: u64,
     event_batch_contexts: u64,
     provider_streams: u64,
+    virtual_http_servers: u64,
+    virtual_http_requests: u64,
     api_providers: u64,
     child_processes: u64,
     vfs_files: u64,
@@ -17421,6 +17836,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             hostcall_queue,
             trace_seq,
             hostcall_tracker,
+            deferred_hostcalls: Rc::new(RefCell::new(HashMap::new())),
             active_session_action_origin,
             user_timer_origins,
             hostcalls_total,
@@ -17567,6 +17983,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.pending_event_listener_lists
             + reset_payload.after.event_batch_contexts
             + reset_payload.after.provider_streams
+            + reset_payload.after.virtual_http_servers
+            + reset_payload.after.virtual_http_requests
             + reset_payload.after.api_providers
             + reset_payload.after.child_processes
             + reset_payload.after.vfs_files
@@ -17576,6 +17994,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         report.residual_entries_after = residual_after;
 
         self.hostcall_queue.borrow_mut().clear();
+        self.deferred_hostcalls.borrow_mut().clear();
         *self.hostcall_tracker.borrow_mut() = HostcallTracker::default();
         self.active_session_action_origin.replace(None);
         self.user_timer_origins.borrow_mut().clear();
@@ -17943,6 +18362,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Cancel a pending hostcall and enqueue a final sentinel stream chunk if applicable.
     pub fn cancel_hostcall(&self, call_id: &str) -> bool {
+        self.deferred_hostcalls.borrow_mut().remove(call_id);
         let (timer_id, next_seq) = {
             let mut tracker = self.hostcall_tracker.borrow_mut();
             let Some(cancelled) = tracker.cancel(call_id) else {
@@ -17965,6 +18385,119 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             );
         }
         true
+    }
+
+    pub(crate) fn defer_hostcall_stream(
+        &self,
+        call_id: &str,
+        stream: futures::stream::LocalBoxStream<'static, HostcallOutcome>,
+    ) -> Result<()> {
+        let mut pending = self.deferred_hostcalls.borrow_mut();
+        if pending.len() >= 64 || pending.contains_key(call_id) {
+            return Err(Error::extension("Too many pending HTTP streams"));
+        }
+        pending.insert(
+            call_id.to_string(),
+            DeferredHostcall {
+                stream,
+                credit: true,
+                deadline: None,
+                finalizer: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn has_deferred_hostcall(&self, call_id: &str) -> bool {
+        self.deferred_hostcalls.borrow().contains_key(call_id)
+    }
+
+    pub(crate) fn set_deferred_hostcall_finalizer(
+        &self,
+        call_id: &str,
+        finalizer: Box<dyn FnOnce(&HostcallOutcome)>,
+    ) {
+        if let Some(pending) = self.deferred_hostcalls.borrow_mut().get_mut(call_id) {
+            pending.finalizer = Some(finalizer);
+        }
+    }
+
+    fn finish_deferred_hostcall(&self, call_id: &str, outcome: &HostcallOutcome) {
+        let pending = self.deferred_hostcalls.borrow_mut().remove(call_id);
+        if let Some(mut pending) = pending {
+            pending.finish(outcome);
+        }
+    }
+
+    pub(crate) fn set_deferred_hostcall_deadline(
+        &self,
+        call_id: &str,
+        deadline: Option<std::time::Instant>,
+    ) {
+        if let Some(pending) = self.deferred_hostcalls.borrow_mut().get_mut(call_id) {
+            pending.deadline = deadline;
+        }
+    }
+
+    async fn poll_deferred_hostcalls(&self) {
+        use std::task::Poll;
+        let completions = futures::future::poll_fn(|cx| {
+            let mut completions = Vec::new();
+            self.deferred_hostcalls
+                .borrow_mut()
+                .retain(|call_id, pending| {
+                    if !self.is_hostcall_active(call_id) {
+                        return false;
+                    }
+                    if pending
+                        .deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        let outcome = HostcallOutcome::Error {
+                            code: "timeout".to_string(),
+                            message: "Root JavaScript task deadline elapsed during HTTP stream"
+                                .to_string(),
+                        };
+                        pending.finish(&outcome);
+                        completions.push((call_id.clone(), outcome));
+                        return false;
+                    }
+                    if !pending.credit {
+                        return true;
+                    }
+                    match pending.stream.as_mut().poll_next(cx) {
+                        Poll::Pending => true,
+                        Poll::Ready(None) => {
+                            let outcome = HostcallOutcome::Error {
+                                code: "io".to_string(),
+                                message: "HTTP stream ended without a terminal response frame"
+                                    .to_string(),
+                            };
+                            pending.finish(&outcome);
+                            completions.push((call_id.clone(), outcome));
+                            false
+                        }
+                        Poll::Ready(Some(outcome)) => {
+                            let finished = !matches!(
+                                &outcome,
+                                HostcallOutcome::StreamChunk {
+                                    is_final: false,
+                                    ..
+                                }
+                            );
+                            if finished {
+                                pending.finish(&outcome);
+                            }
+                            pending.credit = false;
+                            completions.push((call_id.clone(), outcome));
+                            !finished
+                        }
+                    }
+                });
+            Poll::Ready(completions)
+        })
+        .await;
+        self.complete_hostcalls_batch(completions);
     }
 
     /// Enter a causal Session-action origin for synchronous JS work and all
@@ -18054,6 +18587,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     ///
     /// Returns statistics about what was executed.
     pub async fn tick(&self) -> Result<PiJsTickStats> {
+        self.poll_deferred_hostcalls().await;
         // Get the next macrotask from scheduler
         let macrotask = self.scheduler.borrow_mut().tick();
 
@@ -18194,6 +18728,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }
                 } else {
                     // Final chunk or non-stream outcome: complete the hostcall.
+                    // Drop a deferred request now, even if this completion was
+                    // injected externally and the actor has no later tick.
+                    self.finish_deferred_hostcall(call_id, outcome);
                     let completion = self.hostcall_tracker.borrow_mut().on_complete(call_id);
                     let timer_id = match completion {
                         HostcallCompletion::Delivered { timer_id } => timer_id,
@@ -18239,6 +18776,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         code: "timeout".to_string(),
                         message: "Hostcall timed out".to_string(),
                     };
+                    // A watchdog can be the last pending actor task. Finish
+                    // accounting and release the network future in this tick.
+                    self.finish_deferred_hostcall(&call_id, &outcome);
                     self.deliver_hostcall_completion(ctx, &call_id, &outcome)?;
                     return Ok(());
                 }
@@ -18482,6 +19022,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let hostcall_queue = self.hostcall_queue.clone();
         let scheduler = Rc::clone(&self.scheduler);
         let hostcall_tracker = Rc::clone(&self.hostcall_tracker);
+        let deferred_hostcalls = Rc::clone(&self.deferred_hostcalls);
         let active_session_action_origin = Rc::clone(&self.active_session_action_origin);
         let user_timer_origins = Rc::clone(&self.user_timer_origins);
         let hostcalls_total = Arc::clone(&self.hostcalls_total);
@@ -18489,6 +19030,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let default_hostcall_timeout_ms = self.config.limits.hostcall_timeout_ms;
         let process_cwd = self.config.cwd.clone();
         let process_args = self.config.args.clone();
+        // Platform is runtime metadata, independent of permission to read env.
+        // PI_PLATFORM was supplied by the host at runtime construction above.
+        let process_platform = self
+            .config
+            .env
+            .get("PI_PLATFORM")
+            .cloned()
+            .unwrap_or_else(|| std::env::consts::OS.to_string());
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
@@ -18924,11 +19473,25 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                 // __pi_cancel_hostcall_native(call_id) -> bool
                 global.set(
+                    "__pi_http_stream_pull_native",
+                    Func::from({
+                        let pending = Rc::clone(&deferred_hostcalls);
+                        move |call_id: String| {
+                            if let Some(stream) = pending.borrow_mut().get_mut(&call_id) {
+                                stream.credit = true;
+                            }
+                        }
+                    }),
+                )?;
+
+                global.set(
                     "__pi_cancel_hostcall_native",
                     Func::from({
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let pending = Rc::clone(&deferred_hostcalls);
                         move |_ctx: Ctx<'_>, call_id: String| -> rquickjs::Result<bool> {
+                            pending.borrow_mut().remove(&call_id);
                             let (timer_id, next_seq) = {
                                 let mut tracker = tracker.borrow_mut();
                                 let Some(cancelled) = tracker.cancel(&call_id) else {
@@ -18971,6 +19534,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         move |_ctx: Ctx<'_>| -> rquickjs::Result<String> { Ok(process_cwd.clone()) }
                     }),
+                )?;
+
+                global.set(
+                    "__pi_process_platform_native",
+                    Func::from(move || process_platform.clone()),
                 )?;
 
                 // __pi_process_args_native() -> string[]
@@ -19105,6 +19673,49 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             );
                             random_bytes(len)
                                 .map_err(|err| map_crypto_entropy_error("randomBytes", err))
+                        },
+                    ),
+                )?;
+
+                // URL parsing is pure: it shares the host's WHATWG parser,
+                // without granting any filesystem or network capability.
+                global.set(
+                    "__pi_url_parse_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>, input: String, base: Option<String>| -> Option<String> {
+                            let parsed = match base {
+                                Some(base) => url::Url::parse(&base).ok()?.join(&input).ok()?,
+                                None => url::Url::parse(&input).ok()?,
+                            };
+                            let protocol = format!("{}:", parsed.scheme());
+                            let has_authority = parsed
+                                .as_str()
+                                .strip_prefix(&protocol)
+                                .is_some_and(|rest| rest.starts_with("//"));
+                            let hostname = parsed.host_str().unwrap_or_default();
+                            let port = parsed
+                                .port()
+                                .map_or_else(String::new, |port| port.to_string());
+                            let host = if port.is_empty() {
+                                hostname.to_string()
+                            } else {
+                                format!("{hostname}:{port}")
+                            };
+                            let parts = serde_json::json!({
+                                "href": parsed.as_str(),
+                                "protocol": protocol,
+                                "hasAuthority": has_authority,
+                                "hostname": hostname,
+                                "host": host,
+                                "port": port,
+                                "username": parsed.username(),
+                                "password": parsed.password().unwrap_or_default(),
+                                "pathname": parsed.path(),
+                                "search": parsed.query().map_or_else(String::new, |query| format!("?{query}")),
+                                "hash": parsed.fragment().map_or_else(String::new, |fragment| format!("#{fragment}")),
+                                "origin": parsed.origin().ascii_serialization(),
+                            });
+                            Some(parts.to_string())
                         },
                     ),
                 )?;
@@ -20002,14 +20613,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     .stderr(Stdio::piped());
                                 crate::tools::isolate_command_process_group(&mut command);
 
-                                let mut child = command.spawn().map_err(|e| e.to_string())?;
-                                crate::tools::attach_child_job_discipline(&child);
+                                let child =
+                                    crate::tools::spawn_command_with_job_discipline(&mut command)
+                                        .map_err(|e| e.to_string())?;
                                 let pid = child.id();
+                                let mut child = crate::tools::ProcessGuard::new(
+                                    child,
+                                    crate::tools::ProcessCleanupMode::ProcessGroupTree,
+                                );
 
                                 let stdout_pipe =
-                                    child.stdout.take().ok_or("Missing stdout pipe")?;
+                                    child.take_stdout().ok_or("Missing stdout pipe")?;
                                 let stderr_pipe =
-                                    child.stderr.take().ok_or("Missing stderr pipe")?;
+                                    child.take_stderr().ok_or("Missing stderr pipe")?;
 
                                 let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
                                 let tx_stdout = tx.clone();
@@ -20058,23 +20674,25 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         ingest_chunk!(chunk.kind, chunk.bytes);
                                     }
 
-                                    if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                                    if let Some(st) =
+                                        child.try_wait_child().map_err(|e| e.to_string())?
+                                    {
                                         break st;
                                     }
                                     if !killed && limit_exceeded {
                                         killed = true;
-                                        crate::tools::kill_process_group_tree(Some(pid));
-                                        let _ = child.kill();
-                                        break child.wait().map_err(|e| e.to_string())?;
+                                        break child
+                                            .terminate_and_wait()
+                                            .map_err(|e| e.to_string())?;
                                     }
                                     if let Some(t) = timeout
                                         && !killed
                                         && start.elapsed() >= t
                                     {
                                         killed = true;
-                                        crate::tools::kill_process_group_tree(Some(pid));
-                                        let _ = child.kill();
-                                        break child.wait().map_err(|e| e.to_string())?;
+                                        break child
+                                            .terminate_and_wait()
+                                            .map_err(|e| e.to_string())?;
                                     }
                                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(5)) {
                                         ingest_chunk!(chunk.kind, chunk.bytes);
@@ -20656,6 +21274,8 @@ function __pi_runtime_registry_snapshot() {
             __pi_provider_streams
                 ? optionalCount(() => __pi_map_size_primordial(__pi_provider_streams))
                 : 0,
+        virtualHttpServers: __pi_map_size_primordial(__pi_virtual_http_servers),
+        virtualHttpRequests: __pi_set_size_primordial(__pi_virtual_http_requests),
         apiProviders: optionalCount(globalThis.__pi_api_provider_registry_size),
         childProcesses: optionalCount(globalThis.__pi_child_process_registry_size),
         vfsFiles: Number(vfsCounts.files) || 0,
@@ -20668,6 +21288,12 @@ function __pi_runtime_registry_snapshot() {
 
 function __pi_reset_extension_runtime_state(bridge_secret) {
     const before = __pi_runtime_registry_snapshot();
+
+    for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
+        __pi_virtual_http_close(server);
+    }
+    __pi_map_clear_primordial(__pi_virtual_http_servers);
+    __pi_set_clear_primordial(__pi_virtual_http_requests);
 
     if (
         typeof __pi_provider_streams !== 'undefined' &&
@@ -20746,6 +21372,8 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.pendingEventListenerLists === 0 &&
         after.eventBatchContexts === 0 &&
         after.providerStreams === 0 &&
+        after.virtualHttpServers === 0 &&
+        after.virtualHttpRequests === 0 &&
         after.apiProviders === 0 &&
         after.childProcesses === 0 &&
         after.vfsFiles === 0 &&
@@ -21023,6 +21651,8 @@ function __pi_register_provider(provider_id, spec) {
         if (m && m.contextWindow !== undefined) out.contextWindow = m.contextWindow;
         if (m && m.maxTokens !== undefined) out.maxTokens = m.maxTokens;
         if (m && m.headers && typeof m.headers === 'object') out.headers = Object.assign({}, m.headers);
+        if (m && m.compat && typeof m.compat === 'object' && !Array.isArray(m.compat)) out.compat = Object.assign({}, m.compat);
+        if (m && m.thinkingLevelMap && typeof m.thinkingLevelMap === 'object' && !Array.isArray(m.thinkingLevelMap)) out.thinkingLevelMap = Object.assign({}, m.thinkingLevelMap);
         return out;
     }) : [];
 
@@ -21063,8 +21693,15 @@ function __pi_register_provider(provider_id, spec) {
         models: models,
         hasStreamSimple: effectiveHasStreamSimple,
     };
+    // This transport capability comes only from an owned in-memory listener.
+    // An extension-supplied virtualHttpServer field never grants authority.
+    const virtualServer = __pi_virtual_http_find(ext.id, providerSpec.baseUrl);
+    if (virtualServer) providerSpec.virtualHttpServer = virtualServer.id;
     if (spec.headers && typeof spec.headers === 'object') {
         providerSpec.headers = Object.assign({}, spec.headers);
+    }
+    if (spec.compat && typeof spec.compat === 'object' && !Array.isArray(spec.compat)) {
+        providerSpec.compat = Object.assign({}, spec.compat);
     }
     if (spec.oauth && typeof spec.oauth === 'object') {
         const oauth = {};
@@ -21101,6 +21738,9 @@ function __pi_register_provider(provider_id, spec) {
         extensionId: ext.id,
         spec: providerSpec,
         streamSimple: streamSimple,
+        // Preserve the granted origin across a same-owner listener restart.
+        // Providers registered without a listener gain no future authority.
+        virtualHttpOrigin: virtualServer ? virtualServer.origin : null,
     };
     ext.providers.set(id, record);
     __pi_provider_index.set(id, record);
@@ -21206,34 +21846,205 @@ function __pi_register_mcp_server_for_extension(extension_id, name, spec) {
 // Provider Streaming (streamSimple bridge)
 // ============================================================================
 
+// Virtual loopback HTTP routes live entirely inside this realm. They expose no
+// listener to the OS or other extensions. Native providers capture an owned
+// route at registration; all actual egress continues through pi.http policy.
+const __pi_virtual_http_servers = new __pi_original_Map();
+const __pi_virtual_http_requests = new __pi_original_Set();
+const __pi_virtual_http_server_set = Function.prototype.call.bind(__pi_original_Map.prototype.set);
+const __pi_virtual_http_server_delete = Function.prototype.call.bind(__pi_original_Map.prototype.delete);
+const __pi_virtual_http_server_values = Function.prototype.call.bind(__pi_original_Map.prototype.values);
+const __pi_virtual_http_request_values = Function.prototype.call.bind(__pi_original_Set.prototype.values);
+const __pi_virtual_http_request_delete = Function.prototype.call.bind(__pi_original_Set.prototype.delete);
+let __pi_virtual_http_server_seq = 0;
+const __pi_virtual_http_parse_url = __pi_url_parse_native;
+const __pi_virtual_http_parse_json = JSON.parse;
+
+function __pi_virtual_http_origin(value) {
+    try {
+        if (typeof value !== 'string') return null;
+        const parsed = __pi_virtual_http_parse_url(value, null);
+        if (typeof parsed !== 'string') return null;
+        const url = __pi_virtual_http_parse_json(parsed);
+        if (url.protocol !== 'http:' || url.username || url.password) return null;
+        const host = url.hostname;
+        if (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]') return null;
+        // The native parser canonicalizes hosts and bounds ports to u16.
+        if (url.port === '0') return null;
+        return 'http://' + host + ':' + (url.port || '80');
+    } catch (_) { return null; }
+}
+
+function __pi_virtual_http_find(extensionId, url) {
+    const origin = __pi_virtual_http_origin(url);
+    if (!origin) return null;
+    for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
+        if (server.extensionId === extensionId && server.origin === origin) return server;
+    }
+    return null;
+}
+
+function __pi_virtual_http_close(server) {
+    if (!__pi_virtual_http_server_delete(__pi_virtual_http_servers, server.id)) return;
+    for (const request of __pi_virtual_http_request_values(__pi_virtual_http_requests)) {
+        if (request.server === server) request.cancel(new Error('Virtual HTTP server closed'));
+    }
+    try { server.closed(); } catch (_) {}
+}
+
+globalThis.__pi_virtual_http_listen = (host, port, dispatch, closed) => {
+    const owner = __pi_current_extension_or_throw().id;
+    const address = typeof host === 'string' ? host.toLowerCase() : '';
+    const number = Number(port);
+    if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(address) ||
+        !Number.isInteger(number) || number < 1 || number > 65535) {
+        throw new Error('PiJS virtual HTTP servers require an explicit loopback host and port (1-65535)');
+    }
+    if (typeof dispatch !== 'function' || typeof closed !== 'function') {
+        throw new TypeError('Virtual HTTP server requires request and close handlers');
+    }
+    const origin = __pi_virtual_http_origin('http://' + (address === '::1' ? '[::1]' : address) + ':' + String(number));
+    if (__pi_virtual_http_find(owner, origin)) {
+        const error = new Error('Virtual HTTP address is already in use by this extension');
+        error.code = 'EADDRINUSE';
+        throw error;
+    }
+    if (__pi_map_size_primordial(__pi_virtual_http_servers) >= 16) {
+        throw new Error('PiJS virtual HTTP server limit reached');
+    }
+    const id = 'virtual-http-server-' + String(++__pi_virtual_http_server_seq);
+    const server = { id, extensionId: owner, origin, dispatch, closed };
+    __pi_virtual_http_server_set(__pi_virtual_http_servers, id, server);
+    const requireOwner = () => {
+        if (__pi_current_extension_or_throw().id !== owner) {
+            throw new Error('Virtual HTTP server belongs to another extension');
+        }
+    };
+    return {
+        host: address === '[::1]' ? '::1' : address,
+        port: number,
+        close() { requireOwner(); __pi_virtual_http_close(server); },
+        cancelRequests() {
+            requireOwner();
+            for (const request of __pi_virtual_http_request_values(__pi_virtual_http_requests)) {
+                if (request.server === server) request.cancel(new Error('Virtual HTTP connections closed'));
+            }
+        },
+    };
+};
+
+function __pi_virtual_http_open(server, request) {
+    if (__pi_set_size_primordial(__pi_virtual_http_requests) >= 64) {
+        throw new Error('PiJS virtual HTTP request limit reached');
+    }
+    if (__pi_virtual_http_origin(request && request.url) !== server.origin) {
+        throw new Error('Virtual HTTP request origin does not match the registered listener');
+    }
+    let channel = null;
+    let failure = null;
+    let cancelled = false;
+    let reading = false;
+    let readyResolve;
+    const ready = new Promise((resolve) => { readyResolve = resolve; });
+    const active = {
+        server,
+        cancel(reason) {
+            if (cancelled) return;
+            cancelled = true;
+            try { if (channel) channel.cancel(reason); } catch (_) {}
+            __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+            readyResolve();
+        },
+    };
+    __pi_set_add_primordial(__pi_virtual_http_requests, active);
+    const task = __pi_with_extension_async(server.extensionId, async () => {
+        try {
+            channel = server.dispatch(request);
+            if (!channel || typeof channel.poll !== 'function' ||
+                typeof channel.next !== 'function' || typeof channel.cancel !== 'function') {
+                throw new Error('Invalid virtual HTTP response channel');
+            }
+            if (cancelled) channel.cancel();
+            readyResolve();
+            await channel.finished;
+        } catch (error) {
+            failure = error;
+            readyResolve();
+        } finally {
+            // Completed producers no longer need cancellation bookkeeping.
+            // A caller that discards a completed Response must not leave its
+            // body retained by the runtime's global request set.
+            __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+        }
+    });
+    Promise.resolve(task).catch((error) => { failure = error; readyResolve(); });
+    const finish = (result) => {
+        if (result && result.done) __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+        return result;
+    };
+    const poll = () => {
+        if (cancelled) return { done: true };
+        if (failure) { active.cancel(failure); throw failure; }
+        if (!channel) return { done: false, value: { pending: true } };
+        try { return finish(channel.poll()); }
+        catch (error) { active.cancel(error); throw error; }
+    };
+    return {
+        poll,
+        async next() {
+            if (reading) throw new Error('Concurrent virtual HTTP reads are not supported');
+            reading = true;
+            try {
+                await ready;
+                if (cancelled) return { done: true };
+                if (failure) throw failure;
+                return finish(await channel.next());
+            } catch (error) { active.cancel(error); throw error; }
+            finally { reading = false; }
+        },
+        return() { active.cancel(); return { done: true }; },
+        [Symbol.asyncIterator]() { return this; },
+    };
+}
+
+// Safe extension-facing entrypoint: there is deliberately no server-id argument.
+// An unavailable owned route is distinguishable from a failed owned request;
+// callers must never retry a failed in-memory request against a real listener.
+globalThis.__pi_virtual_http_dispatch = (request) => {
+    // Embedders can use ordinary fetch outside an extension activation. Such
+    // calls have no authority to dispatch an extension-owned in-memory route.
+    if (!__pi_current_extension_id) return null;
+    const owner = __pi_current_extension_id;
+    const server = __pi_virtual_http_find(owner, request && request.url);
+    return server ? __pi_virtual_http_open(server, request) : null;
+};
+
+function __pi_virtual_http_start(provider_id, request) {
+    const provider = __pi_provider_index.get(String(provider_id));
+    const origin = provider && provider.virtualHttpOrigin;
+    const server = origin ? __pi_virtual_http_find(provider.extensionId, origin) : null;
+    if (!server) {
+        throw new Error('Provider has no active owned virtual HTTP server');
+    }
+    const stream = __pi_virtual_http_open(server, request);
+    const controller = __pi_make_abort_controller();
+    const streamId = 'provider-stream-' + String(++__pi_provider_stream_seq);
+    // Native callers poll this iterator instead of holding the runtime actor
+    // inside an HTTP await. Cancellation can therefore run before headers too.
+    __pi_provider_streams.set(streamId, {
+        iterator: { next: stream.poll, return: stream.return },
+        controller,
+    });
+    return streamId;
+}
+
 let __pi_provider_stream_seq = 0;
 const __pi_provider_streams = new Map(); // stream_id -> { iterator, controller }
 
 function __pi_make_abort_controller() {
-    const listeners = new Set();
-    const signal = {
-        aborted: false,
-        addEventListener: (type, cb) => {
-            if (type !== 'abort') return;
-            if (typeof cb === 'function') listeners.add(cb);
-        },
-        removeEventListener: (type, cb) => {
-            if (type !== 'abort') return;
-            listeners.delete(cb);
-        },
-    };
-    return {
-        signal,
-        abort: () => {
-            if (signal.aborted) return;
-            signal.aborted = true;
-            for (const cb of listeners) {
-                try {
-                    cb();
-                } catch (_) {}
-            }
-        },
-    };
+    // Provider cancellation must compose with the same branded signals used
+    // by fetch and AbortSignal.any; a signal-shaped object cannot do so.
+    return new globalThis.AbortController();
 }
 
 async function __pi_provider_stream_simple_start(provider_id, model, context, options) {
@@ -22185,22 +22996,13 @@ function __pi_make_extension_ctx(ctx_payload) {
             // pi-better-compaction feature-detects the absence and fails
             // open to normal compaction.
         },
-        // Host-side compaction bridge (gh #167 / bd-i28yz): summarizes the
-        // given preparation with the SESSION's own provider, model, and
-        // credentials. Rejects on malformed preparation or provider failure;
-        // no fabricated summary is ever returned. With an options object
-        // ({ strategy: 'openai-responses-native', request }) the host runs
-        // the provider's native compact endpoint instead and returns
-        // details.compactedWindow (still host-credentialed; the request is
-        // sanitized host-side and the model pinned to the session's own).
-        compact: async (preparation, options) =>
-            options && typeof options === 'object' && typeof options.strategy === 'string'
-                ? pi.events('compact', {
-                      preparation: preparation ?? null,
-                      strategy: options.strategy,
-                      request: options.request ?? null,
-                  })
-                : pi.events('compact', { preparation: preparation ?? null }),
+        // Share the public summary options, credential checks and pre-abort
+        // behavior with the exported API. Native strategy requests remain
+        // host-sanitized and pinned to the current session model.
+        compact: async (preparation, options) => {
+            const codingAgent = await import('@mariozechner/pi-coding-agent');
+            return codingAgent.compact(preparation, options);
+        },
     };
 }
 
@@ -22706,6 +23508,9 @@ class __pi_HostcallStream {
         }
     }
     next() {
+        if (!this.done && typeof __pi_http_stream_pull_native === 'function') {
+            __pi_http_stream_pull_native(this.callId);
+        }
         if (this.buffer.length > 0) {
             const entry = this.buffer.shift();
             if (!this.done) {
@@ -22809,6 +23614,14 @@ function __pi_complete_hostcall_impl(call_id, outcome) {
         const error = new Error(outcome.message);
         error.code = outcome.code;
         pending.stream.pushError(error);
+        __pi_pending_hostcalls.delete(call_id);
+        return;
+    }
+
+    if (outcome.ok && pending.stream) {
+        // Embedders may complete a streamed request with one buffered result.
+        // Its iterator must receive that result and then finish normally.
+        pending.stream.pushChunk(outcome.value, true);
         __pi_pending_hostcalls.delete(call_id);
         return;
     }
@@ -23406,45 +24219,25 @@ if (typeof globalThis.URLSearchParams === 'undefined') {
 }
 
 if (typeof globalThis.URL === 'undefined') {
+    const parseURL = __pi_url_parse_native;
     class URL {
         constructor(input, base) {
-            const s = base ? new URL(base).href.replace(/\/[^/]*$/, '/') + String(input ?? '') : String(input ?? '');
-            const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
-            if (m) {
-                this.protocol = m[1] + ':';
-                const auth = m[2];
-                const atIdx = auth.lastIndexOf('@');
-                if (atIdx !== -1) {
-                    const userinfo = auth.slice(0, atIdx);
-                    const ci = userinfo.indexOf(':');
-                    this.username = ci === -1 ? userinfo : userinfo.slice(0, ci);
-                    this._pw = ci === -1 ? String() : userinfo.slice(ci + 1);
-                    this.host = auth.slice(atIdx + 1);
-                } else {
-                    this.username = '';
-                    this._pw = String();
-                    this.host = auth;
-                }
-                const hi = this.host.indexOf(':');
-                this.hostname = hi === -1 ? this.host : this.host.slice(0, hi);
-                this.port = hi === -1 ? '' : this.host.slice(hi + 1);
-                this.pathname = m[3] || '/';
-                this.search = m[4] || '';
-                this.hash = m[5] || '';
-            } else {
-                this.protocol = '';
-                this.username = '';
-                this._pw = String();
-                this.host = '';
-                this.hostname = '';
-                this.port = '';
-                this.pathname = s;
-                this.search = '';
-                this.hash = '';
-            }
+            const parsed = parseURL(String(input), base === undefined ? null : String(base));
+            if (typeof parsed !== 'string') throw new TypeError('Invalid URL');
+            const parts = JSON.parse(parsed);
+            this.protocol = parts.protocol;
+            this.username = parts.username;
+            this._pw = parts.password;
+            this.host = parts.host;
+            this.hostname = parts.hostname;
+            this.port = parts.port;
+            this.pathname = parts.pathname;
+            this.search = parts.search;
+            this.hash = parts.hash;
+            this._hasAuthority = parts.hasAuthority;
             this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
-            this.origin = this.protocol ? `${this.protocol}//${this.host}` : '';
-            this.href = this.toString();
+            this.origin = parts.origin;
+            this.href = parts.href;
         }
         get password() {
             return this._pw;
@@ -23453,8 +24246,9 @@ if (typeof globalThis.URL === 'undefined') {
             this._pw = value == null ? String() : String(value);
         }
         toString() {
-            const auth = this.username ? `${this.username}${this.password ? ':' + this.password : ''}@` : '';
-            return this.protocol ? `${this.protocol}//${auth}${this.host}${this.pathname}${this.search}${this.hash}` : this.pathname;
+            const auth = this.username || this.password ? `${this.username}${this.password ? ':' + this.password : ''}@` : '';
+            const authority = this._hasAuthority ? `//${auth}${this.host}` : '';
+            return `${this.protocol}${authority}${this.pathname}${this.search}${this.hash}`;
         }
         toJSON() { return this.toString(); }
     }
@@ -24237,17 +25031,14 @@ if (typeof globalThis.crypto.randomUUID !== 'function') {
 }
 
 if (typeof globalThis.process === 'undefined') {
-    const rawPlatform =
-        __pi_env_get_native('PI_PLATFORM') ||
-        __pi_env_get_native('OSTYPE') ||
-        __pi_env_get_native('OS') ||
-        'linux';
+    const rawPlatform = __pi_process_platform_native();
     // Normalize to Node.js conventions: strip version suffix from OSTYPE
     // (e.g. darwin24.0 -> darwin, linux-gnu -> linux, msys -> win32)
     const platform = (() => {
-        const s = String(rawPlatform).replace(/[0-9].*$/, '').split('-')[0].toLowerCase();
+        const raw = String(rawPlatform).toLowerCase();
+        if (raw === 'win32' || raw === 'windows' || raw === 'windows_nt' || raw === 'msys' || raw === 'cygwin') return 'win32';
+        const s = raw.replace(/[0-9].*$/, '').split('-')[0];
         if (s === 'darwin') return 'darwin';
-        if (s === 'msys' || s === 'cygwin' || s === 'windows_nt') return 'win32';
         return s || 'linux';
     })();
     const detHome = __pi_env_get_native('PI_DETERMINISTIC_HOME');
@@ -25013,7 +25804,7 @@ if (typeof globalThis.fetch !== 'function') {
 
     class Headers {
         constructor(init) {
-            this._map = {};
+            this._map = Object.create(null);
             if (init && typeof init === 'object') {
                 if (Array.isArray(init)) {
                     for (const pair of init) {
@@ -25039,48 +25830,240 @@ if (typeof globalThis.fetch !== 'function') {
             this._map[key] = String(value === undefined || value === null ? '' : value);
         }
 
-        entries() {
-            return Object.entries(this._map);
+        append(name, value) {
+            const previous = this.get(name);
+            this.set(name, previous === null ? value : previous + ', ' + value);
         }
+
+        has(name) { return this.get(name) !== null; }
+        delete(name) { delete this._map[String(name || '').toLowerCase()]; }
+        forEach(callback, thisArg) {
+            for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this);
+        }
+        keys() { return Object.keys(this._map)[Symbol.iterator](); }
+        values() { return Object.values(this._map)[Symbol.iterator](); }
+        entries() {
+            return Object.entries(this._map)[Symbol.iterator]();
+        }
+        [Symbol.iterator]() { return this.entries(); }
     }
 
+    // A pull-driven byte stream for fetch and Node's Readable.fromWeb bridge.
+    // It never owns a socket: cancellation is delegated to the hostcall source.
+    if (typeof globalThis.ReadableStream !== 'function') {
+        class ReadableStream {
+            constructor(source = {}) {
+                this._queue = [];
+                this._pending = [];
+                this._closed = false;
+                this._errored = false;
+                this._error = undefined;
+                this._locked = false;
+                this._disturbed = false;
+                this._pulling = false;
+                this._pullAgain = false;
+                this._started = false;
+                this._source = source;
+                this._controller = {
+                    enqueue: (value) => {
+                        if (this._closed || this._errored) throw new TypeError('ReadableStream is closed');
+                        const pending = this._pending.shift();
+                        if (pending) pending.resolve({ value, done: false });
+                        else this._queue.push(value);
+                        this._pull();
+                    },
+                    close: () => {
+                        if (this._closed || this._errored) return;
+                        this._closed = true;
+                        for (const pending of this._pending.splice(0)) pending.resolve({ value: undefined, done: true });
+                    },
+                    error: (error) => {
+                        if (this._closed || this._errored) return;
+                        this._errored = true;
+                        this._error = error;
+                        this._queue = [];
+                        for (const pending of this._pending.splice(0)) pending.reject(error);
+                    },
+                };
+                Object.defineProperty(this._controller, 'desiredSize', {
+                    get: () => this._errored ? null : (this._closed ? 0 : 1 - this._queue.length),
+                });
+                Promise.resolve(typeof source.start === 'function' ? source.start(this._controller) : undefined)
+                    .then(() => { this._started = true; this._pull(); }, (error) => this._controller.error(error));
+            }
+            get locked() { return this._locked; }
+            _pull() {
+                if (!this._started || this._closed || this._errored || this._pending.length === 0) return;
+                if (this._pulling) { this._pullAgain = true; return; }
+                if (typeof this._source.pull !== 'function') return;
+                this._pulling = true;
+                this._pullAgain = false;
+                const count = this._pending.length;
+                Promise.resolve().then(() => this._source.pull(this._controller)).then(() => {
+                    this._pulling = false;
+                    if (this._pullAgain || this._pending.length < count) this._pull();
+                }, (error) => { this._pulling = false; this._controller.error(error); });
+            }
+            _read() {
+                this._disturbed = true;
+                if (this._errored) return Promise.reject(this._error);
+                if (this._queue.length > 0) return Promise.resolve({ value: this._queue.shift(), done: false });
+                if (this._closed) return Promise.resolve({ value: undefined, done: true });
+                return new Promise((resolve, reject) => { this._pending.push({ resolve, reject }); this._pull(); });
+            }
+            _cancel(reason) {
+                this._disturbed = true;
+                if (this._errored) return Promise.reject(this._error);
+                this._queue = [];
+                if (this._closed) return Promise.resolve();
+                this._controller.close();
+                return Promise.resolve().then(() => {
+                    if (typeof this._source.cancel === 'function') return this._source.cancel(reason);
+                });
+            }
+            cancel(reason) {
+                return this._locked ? Promise.reject(new TypeError('ReadableStream is locked')) : this._cancel(reason);
+            }
+            getReader() {
+                if (this._locked) throw new TypeError('ReadableStream is locked');
+                this._locked = true;
+                let released = false;
+                return {
+                    read: () => released ? Promise.reject(new TypeError('Reader lock was released')) : this._read(),
+                    cancel: (reason) => released ? Promise.reject(new TypeError('Reader lock was released')) : this._cancel(reason),
+                    releaseLock: () => {
+                        if (released) return;
+                        if (this._pending.length > 0) throw new TypeError('Reader has pending reads');
+                        released = true;
+                        this._locked = false;
+                    },
+                };
+            }
+            tee() {
+                const reader = this.getReader();
+                const controllers = [];
+                const cancelled = [false, false];
+                const reasons = [];
+                let pending = null;
+                let ended = false;
+                const pull = () => {
+                    if (ended) return;
+                    if (!pending) {
+                        pending = reader.read().then((result) => {
+                            pending = null;
+                            if (result.done) {
+                                ended = true;
+                                for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].close();
+                                reader.releaseLock();
+                            } else {
+                                for (let i = 0; i < 2; i++) {
+                                    if (!cancelled[i]) controllers[i].enqueue(result.value instanceof Uint8Array ? result.value.slice() : result.value);
+                                }
+                            }
+                        }, (error) => {
+                            ended = true;
+                            for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].error(error);
+                            reader.releaseLock();
+                        });
+                    }
+                    return pending;
+                };
+                return [0, 1].map((index) => new ReadableStream({
+                    start(controller) { controllers[index] = controller; },
+                    pull,
+                    cancel(reason) {
+                        cancelled[index] = true;
+                        reasons[index] = reason;
+                        if (cancelled[0] && cancelled[1] && !ended) {
+                            ended = true;
+                            return reader.cancel(reasons).finally(() => reader.releaseLock());
+                        }
+                    },
+                }));
+            }
+            values(options = {}) {
+                const reader = this.getReader();
+                let ended = false;
+                return {
+                    async next() {
+                        if (ended) return { value: undefined, done: true };
+                        try {
+                            const result = await reader.read();
+                            if (result.done) { ended = true; reader.releaseLock(); }
+                            return result;
+                        } catch (error) { ended = true; reader.releaseLock(); throw error; }
+                    },
+                    async return() {
+                        if (!ended) {
+                            ended = true;
+                            try { if (!options.preventCancel) await reader.cancel(); }
+                            finally { reader.releaseLock(); }
+                        }
+                        return { value: undefined, done: true };
+                    },
+                    [Symbol.asyncIterator]() { return this; },
+                };
+            }
+            [Symbol.asyncIterator]() { return this.values(); }
+        }
+        globalThis.ReadableStream = ReadableStream;
+    }
+
+    const __pi_fetch_bytes = (value) => {
+        if (value instanceof Uint8Array) return value;
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView && ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        return new TextEncoder().encode(String(value));
+    };
+
     class Response {
-        constructor(bodyBytes, init) {
+        constructor(body, init) {
             const options = init && typeof init === 'object' ? init : {};
-            this.status = Number(options.status || 0);
+            this.status = Number(options.status === undefined ? 200 : options.status);
+            this.statusText = String(options.statusText || '');
             this.ok = this.status >= 200 && this.status < 300;
             this.headers = new Headers(options.headers || {});
-            this._bytes = bodyBytes || new Uint8Array();
-            this.body = {
-                getReader: () => {
-                    let done = false;
-                    return {
-                        read: async () => {
-                            if (done) return { done: true, value: undefined };
-                            done = true;
-                            return { done: false, value: this._bytes };
-                        },
-                        cancel: async () => {
-                            done = true;
-                        },
-                        releaseLock: () => {},
-                    };
-                },
-            };
+            this.url = String(options.url || '');
+            this.redirected = !!options.redirected;
+            this._bodyUsed = false;
+            this.body = body === undefined || body === null ? null
+                : typeof body.getReader === 'function' ? body
+                : new globalThis.ReadableStream({ start(controller) { controller.enqueue(__pi_fetch_bytes(body)); controller.close(); } });
         }
-
-        async text() {
-            return new TextDecoder().decode(this._bytes);
+        get bodyUsed() { return this._bodyUsed || !!(this.body && this.body._disturbed); }
+        async _consume() {
+            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
+            if (!this.body) return new Uint8Array();
+            this._bodyUsed = true;
+            const reader = this.body.getReader();
+            const chunks = [];
+            let size = 0;
+            try {
+                while (true) {
+                    const result = await reader.read();
+                    if (result.done) break;
+                    const bytes = __pi_fetch_bytes(result.value);
+                    chunks.push(bytes);
+                    size += bytes.byteLength;
+                }
+            } finally { reader.releaseLock(); }
+            const bytes = new Uint8Array(size);
+            let offset = 0;
+            for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+            return bytes;
         }
-
-        async json() {
-            return JSON.parse(await this.text());
-        }
-
-        async arrayBuffer() {
-            const copy = new Uint8Array(this._bytes.length);
-            copy.set(this._bytes);
-            return copy.buffer;
+        async text() { return new TextDecoder().decode(await this._consume()); }
+        async json() { return JSON.parse(await this.text()); }
+        async arrayBuffer() { return (await this._consume()).buffer; }
+        clone() {
+            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
+            let body = null;
+            if (this.body) {
+                const branches = this.body.tee();
+                this.body = branches[0];
+                body = branches[1];
+            }
+            return new Response(body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected });
         }
     }
 
@@ -25199,78 +26182,260 @@ if (typeof globalThis.fetch !== 'function') {
         globalThis.TransformStream = TransformStream;
     }
 
-    // AbortController / AbortSignal polyfill — many npm packages check for these
+    const __pi_fetch_abort_error = () => {
+        const error = new Error('This operation was aborted');
+        error.name = 'AbortError';
+        return error;
+    };
+
+    // Abort state is private, immutable after the first abort, and shared by
+    // any() without letting a cancelled hedge abort its siblings.
     if (typeof globalThis.AbortController === 'undefined') {
-        class AbortSignal {
-            constructor() { this.aborted = false; this._listeners = []; }
-            get reason() { return this.aborted ? (this._reason !== undefined ? this._reason : new Error('This operation was aborted')) : undefined; }
-            addEventListener(type, fn) { if (type === 'abort') this._listeners.push(fn); }
-            removeEventListener(type, fn) { if (type === 'abort') this._listeners = this._listeners.filter(f => f !== fn); }
+        const states = new WeakMap();
+        const token = {};
+        const abort = (signal, reason) => {
+            const state = states.get(signal);
+            if (state.aborted) return;
+            state.aborted = true;
+            state.reason = reason === undefined ? __pi_fetch_abort_error() : reason;
+            if (state.cleanup) { state.cleanup(); state.cleanup = null; }
+            for (const dependent of Array.from(state.dependents)) dependent(state.reason);
+            state.dependents.clear();
+            signal.dispatchEvent(new Event('abort'));
+        };
+        class AbortSignal extends globalThis.EventTarget {
+            constructor(key) {
+                super();
+                if (key !== token) throw new TypeError('Illegal AbortSignal constructor');
+                states.set(this, { aborted: false, reason: undefined, listeners: [], dependents: new Set(), cleanup: null });
+                this.onabort = null;
+            }
+            get aborted() { return states.get(this).aborted; }
+            get reason() { return states.get(this).reason; }
+            addEventListener(type, listener, options) {
+                if (type !== 'abort' || !listener) return;
+                const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+                const state = states.get(this);
+                if (state.listeners.some((entry) => entry.listener === listener && entry.capture === capture)) return;
+                state.listeners.push({ listener, capture, once: !!(options && options.once) });
+            }
+            removeEventListener(type, listener, options) {
+                if (type !== 'abort') return;
+                const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+                const state = states.get(this);
+                state.listeners = state.listeners.filter((entry) => entry.listener !== listener || entry.capture !== capture);
+            }
+            dispatchEvent(event) {
+                if (!event || event.type !== 'abort') return true;
+                const state = states.get(this);
+                try { event.target = this; event.currentTarget = this; } catch (_) {}
+                for (const entry of state.listeners.slice()) {
+                    if (!state.listeners.includes(entry)) continue;
+                    if (entry.once) this.removeEventListener('abort', entry.listener, entry.capture);
+                    try {
+                        if (typeof entry.listener === 'function') entry.listener.call(this, event);
+                        else if (typeof entry.listener.handleEvent === 'function') entry.listener.handleEvent(event);
+                    } catch (_) {}
+                }
+                if (typeof this.onabort === 'function') { try { this.onabort.call(this, event); } catch (_) {} }
+                return !event.defaultPrevented;
+            }
             throwIfAborted() { if (this.aborted) throw this.reason; }
-            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason !== undefined ? reason : new Error('This operation was aborted'); return s; }
-            static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s._reason = new Error('The operation was aborted due to timeout'); s._listeners.forEach(fn => fn()); }, ms); return s; }
+            static abort(reason) {
+                const signal = new AbortSignal(token);
+                abort(signal, reason);
+                return signal;
+            }
+            static timeout(ms) {
+                const delay = Number(ms);
+                if (!Number.isSafeInteger(delay) || delay < 0) throw new RangeError('AbortSignal.timeout requires a non-negative safe integer');
+                const signal = new AbortSignal(token);
+                const timer = setTimeout(() => {
+                    const error = new Error('The operation was aborted due to timeout');
+                    error.name = 'TimeoutError';
+                    abort(signal, error);
+                }, delay);
+                states.get(signal).cleanup = () => clearTimeout(timer);
+                return signal;
+            }
+            static any(signals) {
+                if (signals === null || signals === undefined || typeof signals[Symbol.iterator] !== 'function') throw new TypeError('AbortSignal.any requires an iterable');
+                const sources = Array.from(signals);
+                for (const source of sources) if (!states.has(source)) throw new TypeError('AbortSignal.any requires AbortSignals');
+                const signal = new AbortSignal(token);
+                for (const source of sources) {
+                    const state = states.get(source);
+                    if (state.aborted) { abort(signal, state.reason); return signal; }
+                }
+                const links = [];
+                states.get(signal).cleanup = () => {
+                    for (const [source, listener] of links) states.get(source).dependents.delete(listener);
+                    links.length = 0;
+                };
+                for (const source of new Set(sources)) {
+                    const listener = (reason) => abort(signal, reason);
+                    links.push([source, listener]);
+                    // Internal abort algorithms cannot be triggered by a
+                    // synthetic dispatchEvent or hidden by a user listener.
+                    states.get(source).dependents.add(listener);
+                }
+                return signal;
+            }
         }
         class AbortController {
-            constructor() { this.signal = new AbortSignal(); }
-            abort(reason) { this.signal.aborted = true; this.signal._reason = reason; this.signal._listeners.forEach(fn => fn()); }
+            constructor() { Object.defineProperty(this, 'signal', { value: new AbortSignal(token), enumerable: true }); }
+            abort(reason) { abort(this.signal, reason); }
         }
         globalThis.AbortController = AbortController;
         globalThis.AbortSignal = AbortSignal;
     }
 
-    globalThis.fetch = async (input, init) => {
+    const __pi_fetch = async (input, init, nodeResponse = false) => {
         const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input);
         const options = init && typeof init === 'object' ? init : {};
-        const method = options.method ? String(options.method) : 'GET';
-
-        const headers = {};
-        if (options.headers && typeof options.headers === 'object') {
-            if (options.headers instanceof Headers) {
-                for (const [k, v] of options.headers.entries()) headers[k] = v;
-            } else if (Array.isArray(options.headers)) {
-                for (const pair of options.headers) {
-                    if (pair && pair.length >= 2) headers[String(pair[0])] = String(pair[1]);
-                }
-            } else {
-                for (const k of Object.keys(options.headers)) {
-                    headers[k] = String(options.headers[k]);
-                }
-            }
+        const inputRequest = input && typeof input === 'object' && typeof input.url === 'string' ? input : null;
+        const option = (name) => options[name] === undefined && inputRequest ? inputRequest[name] : options[name];
+        const method = option('method') === undefined ? 'GET' : String(option('method'));
+        const signal = option('signal');
+        const abortReason = () => signal.reason === undefined ? __pi_fetch_abort_error() : signal.reason;
+        if (signal !== undefined && signal !== null) {
+            if (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function') throw new TypeError('fetch signal must be an AbortSignal');
+            if (signal.aborted) throw abortReason();
         }
+        if (option('dispatcher') !== undefined && option('dispatcher') !== null) throw new TypeError('Custom fetch dispatchers are not available in PiJS; use the capability-gated fetch transport');
+        if (inputRequest && inputRequest.bodyUsed) throw new TypeError('Request body is already used');
+        const headers = Object.create(null);
+        for (const [key, value] of new Headers(option('headers'))) headers[key] = value;
 
         let body = undefined;
         let body_bytes = undefined;
-        if (options.body !== undefined && options.body !== null) {
-            const encoded = __pi_fetch_body_bytes_to_base64(options.body);
+        const requestBody = option('body');
+        if (requestBody !== undefined && requestBody !== null) {
+            if (typeof requestBody.getReader === 'function') throw new TypeError('Streaming request bodies are not available in PiJS');
+            const encoded = __pi_fetch_body_bytes_to_base64(requestBody);
             if (encoded !== null) {
                 body_bytes = encoded;
             } else {
-                body = typeof options.body === 'string' ? options.body : String(options.body);
+                body = typeof requestBody === 'string' ? requestBody : String(requestBody);
             }
         }
 
-        const request = { url, method, headers };
+        const request = { url, method, headers, stream: true };
         if (body !== undefined) request.body = body;
         if (body_bytes !== undefined) request.body_bytes = body_bytes;
-
-        const resp = await pi.http(request);
-        const status = resp && resp.status !== undefined ? Number(resp.status) : 0;
-        const respHeaders = resp && resp.headers && typeof resp.headers === 'object' ? resp.headers : {};
-
-        let bytes = new Uint8Array();
-        if (resp && resp.body_bytes) {
-            const bin = __pi_base64_decode_native(String(resp.body_bytes));
-            const out = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) {
-                out[i] = bin.charCodeAt(i) & 0xff;
+        // node:http already supports a host-enforced timeout. Keep that
+        // option on the same capability-gated transport and native deadline.
+        if (nodeResponse && options.timeout !== undefined) request.timeout = options.timeout;
+        const chunkBytes = (chunk) => {
+            if (chunk && chunk.body_bytes !== undefined) {
+                const binary = __pi_base64_decode_native(String(chunk.body_bytes));
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+                return bytes;
             }
-            bytes = out;
-        } else if (resp && resp.body !== undefined && resp.body !== null) {
-            bytes = new TextEncoder().encode(String(resp.body));
-        }
+            return chunk && chunk.body !== undefined && chunk.body !== null ? new TextEncoder().encode(String(chunk.body)) : null;
+        };
 
-        return new Response(bytes, { status, headers: respHeaders });
+        let iterator = null;
+        let controller = null;
+        let stopped = false;
+        let ended = false;
+        let cancellation = null;
+        let stopReason;
+        let rejectStopped;
+        const interrupted = new Promise((_, reject) => { rejectStopped = reject; });
+        // Abort can occur after headers but before the consumer asks for a byte.
+        interrupted.catch(() => {});
+        const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
+        const cancelHost = () => {
+            if (cancellation) return cancellation;
+            if (!iterator) return Promise.resolve();
+            try { cancellation = Promise.resolve(typeof iterator.return === 'function' ? iterator.return() : undefined).catch(() => {}); }
+            catch (_) { cancellation = Promise.resolve(); }
+            return cancellation;
+        };
+        const stop = (reason) => {
+            if (stopped || ended) return;
+            stopped = true;
+            stopReason = reason;
+            cleanup();
+            rejectStopped(reason);
+            if (controller) controller.error(reason);
+            void cancelHost();
+        };
+        const onAbort = () => { if (signal.aborted) stop(abortReason()); };
+        const next = async () => {
+            if (stopped) throw stopReason;
+            const result = await Promise.race([iterator.next(), interrupted]);
+            if (stopped) throw stopReason;
+            return result;
+        };
+
+        try {
+            // A synthetic abort event must neither cancel a request nor remove
+            // the listener that will observe the controller's genuine abort.
+            if (signal) signal.addEventListener('abort', onAbort);
+            // Input/header getters can themselves abort during normalization.
+            if (signal && signal.aborted) onAbort();
+            if (stopped) throw stopReason;
+            const virtual = typeof globalThis.__pi_virtual_http_dispatch === 'function' ? globalThis.__pi_virtual_http_dispatch(request) : null;
+            const stream = virtual === null ? pi.http(request) : virtual;
+            if (stream && typeof stream.next === 'function') iterator = stream;
+            else {
+                // Keep embedding/test hosts that return one buffered response
+                // usable. The production bridge always returns a host iterator.
+                let delivered = false;
+                iterator = {
+                    async next() {
+                        if (delivered) return { value: undefined, done: true };
+                        delivered = true;
+                        return { value: await stream, done: false };
+                    },
+                    async return() { delivered = true; return { value: undefined, done: true }; },
+                };
+            }
+            if (stopped) { await cancelHost(); throw stopReason; }
+            const first = await next();
+            let head = first.value;
+            if (nodeResponse) {
+                if (first.done || !head || typeof head !== 'object') throw new TypeError('Invalid HTTP response from hostcall');
+                // Buffered embedding hosts historically accept statusCode,
+                // a missing status (200), and data as the text-body alias.
+                head = { ...head, status: head.status || head.statusCode || 200 };
+                if (head.body === undefined && head.data !== undefined) head.body = head.data;
+            }
+            if (first.done || !head || !Number.isFinite(Number(head.status))) throw new TypeError('HTTP stream ended before response headers');
+            let initialBytes = chunkBytes(head);
+            const responseBody = new globalThis.ReadableStream({
+                start(value) { controller = value; },
+                async pull(value) {
+                    try {
+                        if (initialBytes !== null) {
+                            const bytes = initialBytes;
+                            initialBytes = null;
+                            if (bytes.byteLength > 0) { value.enqueue(bytes); return; }
+                        }
+                        while (true) {
+                            const result = await next();
+                            if (result.done) { ended = true; cleanup(); value.close(); return; }
+                            const bytes = chunkBytes(result.value);
+                            if (bytes !== null && bytes.byteLength > 0) { value.enqueue(bytes); return; }
+                        }
+                    } catch (error) { stop(error); value.error(error); }
+                },
+                cancel(reason) {
+                    stop(reason === undefined ? __pi_fetch_abort_error() : reason);
+                    return cancelHost();
+                },
+            });
+            return new Response(responseBody, { status: Number(head.status), headers: head.headers || {}, url });
+        } catch (error) {
+            stop(error);
+            throw error;
+        }
     };
+    globalThis.fetch = (input, init) => __pi_fetch(input, init);
+    globalThis.__pi_fetch_for_node_http = (input, init) => __pi_fetch(input, init, true);
 }
 
 const __pi_export_privileged = (name, fn, forwardSecret = false) => {
@@ -25315,6 +26480,7 @@ for (const [name, fn] of Object.entries({
     __pi_execute_command,
     __pi_execute_shortcut,
     __pi_provider_stream_simple_start,
+    __pi_virtual_http_start,
     __pi_provider_stream_simple_next,
     __pi_provider_stream_simple_cancel,
     // These controls are exclusively for host-side lifecycle orchestration and
@@ -25462,16 +26628,33 @@ mod tests {
     /// sha `f74b473e…` -> `61463384…`), from adding the `DefaultPackageManager`
     /// shim export that gh #223 hits. Re-pinned in the same commit as the edit,
     /// which is what this table exists to force.
+    ///
+    /// Re-pinned 2026-10-12 (bridge): only `<bridge>` moved, 204_644 ->
+    /// 204_796 (+152 bytes, sha `604f528a…` -> `68c0c0e6…`). The
+    /// `AbortSignal` polyfill now gives a reasonless abort an `AbortError`
+    /// (Web semantics), which `ctx.compact()` pre-abort rejection relies on.
+    ///
+    /// Re-pinned 2026-10-20 for gh #270: the bridge adds cancellation-aware
+    /// streaming fetch and owned virtual HTTP routes (+30_379 bytes), and
+    /// node:stream adds bounded Web-reader backpressure and iterator cleanup
+    /// (+3_271 bytes). These are deliberate source edits, covered by the
+    /// fetch, deferred HTTP, and virtual_http_server regression cases.
+    /// Follow-up for gh #270: only `<bridge>` moved, 235_175 -> 235_066
+    /// (-109 bytes). URL construction now delegates to the pure host parser,
+    /// provider routes retain their owned origin across listener restarts,
+    /// and provider/model compatibility and thinking metadata are preserved.
+    /// URL resolution, route ownership, and native provider regressions cover
+    /// these changes; every virtual-module receipt remains unchanged.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            205_300,
-            "0da93a4217162f652a4f99960a7393c241112a4f230a63feb354ac030cd6f9bb",
+            235_066,
+            "c97b4c4e52986f21a09c1a6aeda6e3f0364430328b0c74bf75e75e284cd1f8f6",
         ),
         (
             "node:fs",
-            56_916,
-            "5007b4eba74659801fff93fdb60da9b6b83457049459cdb9882ee93550b0be48",
+            57_930,
+            "9180ce100adb7cf8e951b1f4d2e712a6ae3b72bd2720f9ad65e7eb1d5250cdb0",
         ),
         (
             "@mariozechner/pi-ai",
@@ -25485,14 +26668,14 @@ mod tests {
         ),
         (
             "node:stream",
-            17_837,
-            "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
+            21_108,
+            "b35c1978b8bb6c50571e4b4c31f12582380a1b024d3dfe0ac918681ee65e882a",
         ),
-        // Re-pinned for 99c07f823 (gh #178): compact() rejects a pre-aborted signal.
+        // Re-pinned with public compaction options and the nine-argument API.
         (
             "@mariozechner/pi-coding-agent",
-            27_870,
-            "cec3aa92f03004f4e4ed5ddcecaec0da0061dc53569214a5f15d8f9c28a03f48",
+            29_603,
+            "90cd8ffeb6ad50922ad4e5923efe2ede8e5d68f8d8507655fdc3ae989704968e",
         ),
         (
             "@mariozechner/pi-tui",
@@ -25916,7 +27099,7 @@ mod tests {
     }
 
     /// gh #178: a signal that has already aborted, in either the options form
-    /// or the legacy fifth argument, rejects `compact()` with the abort reason
+    /// or the current sixth argument, rejects `compact()` with the abort reason
     /// before any host compaction is requested.
     #[test]
     fn pi_coding_agent_compact_rejects_a_pre_aborted_signal_without_host_work() {
@@ -25944,7 +27127,7 @@ mod tests {
                             { strategy: 'openai-responses-native', request: {}, signal: controller.signal }));
                         record(mod.compact(
                             { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
-                            undefined, undefined, undefined, AbortSignal.abort()));
+                            undefined, undefined, undefined, undefined, AbortSignal.abort()));
                     });
                     ",
                 )
@@ -25972,10 +27155,8 @@ mod tests {
         });
     }
 
-    /// gh #167 / bd-i28yz: the pi-coding-agent `compact()` export bridges to
-    /// the host `compact` events op with only the preparation (extension-
-    /// supplied model/apiKey are dropped host-side by design) and resolves
-    /// with the bridged compaction result shape.
+    /// The current positional API forwards public model identity, guidance
+    /// and thinking level without trusting model endpoint/header metadata.
     #[test]
     fn pi_coding_agent_compact_bridges_to_host_compaction_op() {
         futures::executor::block_on(async {
@@ -25991,8 +27172,12 @@ mod tests {
                     import('@mariozechner/pi-coding-agent')
                         .then((mod) => mod.compact(
                             { firstKeptEntryId: 'entry-9', tokensBefore: 4200 },
-                            { id: 'attacker-model' },
-                            'attacker-key',
+                            { provider: 'summary-provider', id: 'summary-model', baseUrl: 'https://untrusted.invalid', headers: { authorization: 'untrusted' } },
+                            undefined,
+                            undefined,
+                            'Preserve decisions',
+                            undefined,
+                            'low',
                             undefined,
                             undefined))
                         .then((value) => { globalThis.compactProbe.value = value; })
@@ -26017,8 +27202,6 @@ mod tests {
                         panic!("expected events hostcall, got {:?}", request.kind);
                     };
                     assert_eq!(op.as_str(), "compact", "unexpected events op");
-                    // Only the preparation crosses the bridge; the
-                    // extension-chosen model/apiKey never do.
                     assert_eq!(
                         request.payload["preparation"]["firstKeptEntryId"],
                         json!("entry-9")
@@ -26026,6 +27209,14 @@ mod tests {
                     assert_eq!(request.payload["preparation"]["tokensBefore"], json!(4200));
                     assert_eq!(request.payload.get("model"), None);
                     assert_eq!(request.payload.get("apiKey"), None);
+                    assert_eq!(
+                        request.payload["options"],
+                        json!({
+                            "model": { "provider": "summary-provider", "id": "summary-model" },
+                            "customInstructions": "Preserve decisions",
+                            "thinkingLevel": "low"
+                        })
+                    );
                     runtime.complete_hostcall(
                         request.call_id,
                         HostcallOutcome::Success(json!({
@@ -26047,6 +27238,127 @@ mod tests {
             assert_eq!(probe["value"]["summary"], json!("bridged summary"));
             assert_eq!(probe["value"]["firstKeptEntryId"], json!("entry-9"));
             assert_eq!(probe["value"]["tokensBefore"], json!(4200));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_compact_rejects_credentials_and_invalid_options_before_host_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("runtime");
+            runtime
+                .eval(
+                    r"
+                globalThis.compactInvalid = { done: false, errors: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    const preparation = { firstKeptEntryId: 'keep' };
+                    const model = { provider: 'p', id: 'm' };
+                    const calls = [
+                        () => mod.compact(preparation, model, 'caller-key'),
+                        () => mod.compact(preparation, model, undefined, { authorization: 'caller-header' }),
+                        () => mod.compact(preparation, model, undefined, undefined, undefined, undefined, undefined, () => {}),
+                        () => mod.compact(preparation, model, undefined, undefined, undefined, undefined, undefined, undefined, { TOKEN: 'caller-env' }),
+                        () => mod.compact(preparation, { model, headers: {} }),
+                        () => mod.compact(preparation, { model: { id: 'missing-provider' } }),
+                    ];
+                    for (const call of calls) {
+                        try { await call(); compactInvalid.errors.push('resolved'); }
+                        catch (error) { compactInvalid.errors.push(error.name); }
+                    }
+                    compactInvalid.done = true;
+                });
+                    ",
+                )
+                .await
+                .expect("invoke invalid compactions");
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                assert!(runtime.drain_hostcall_requests().is_empty());
+                if get_global_json(&runtime, "compactInvalid").await["done"] == json!(true) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "compactInvalid").await;
+            assert_eq!(probe["done"], json!(true), "probe: {probe}");
+            assert_eq!(
+                probe["errors"],
+                json!([
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError"
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn extension_context_compact_forwards_options_and_checks_pre_abort() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                __pi_begin_extension(__pi_test_secret, 'ext.compact-options', { name: 'ext.compact-options' });
+                globalThis.ctxCompactProbe = { done: false };
+                pi.on('session_before_compact', async (event, ctx) => {
+                    try { await ctx.compact(event.preparation, { signal: AbortSignal.abort() }); }
+                    catch (error) { ctxCompactProbe.aborted = error.name; }
+                    ctxCompactProbe.result = await ctx.compact(event.preparation, {
+                        model: { provider: 'p', id: 'm' },
+                        customInstructions: 'Keep open blockers',
+                        thinkingLevel: 'medium',
+                    });
+                });
+                __pi_end_extension(__pi_test_secret);
+                __pi_dispatch_extension_event(__pi_test_secret, 'session_before_compact', {
+                    preparation: { firstKeptEntryId: 'keep', tokensBefore: 1234 },
+                }, { hasUI: false, cwd: '/workspace' })
+                    .catch((error) => { ctxCompactProbe.error = String(error); })
+                    .finally(() => { ctxCompactProbe.done = true; });
+                    ",
+                ))
+                .await
+                .expect("dispatch compaction extension");
+            let mut calls = 0;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                for request in runtime.drain_hostcall_requests() {
+                    assert!(
+                        matches!(&request.kind, HostcallKind::Events { op } if op == "compact")
+                    );
+                    calls += 1;
+                    assert_eq!(
+                        request.payload["options"],
+                        json!({
+                            "model": { "provider": "p", "id": "m" },
+                            "customInstructions": "Keep open blockers",
+                            "thinkingLevel": "medium"
+                        })
+                    );
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(json!({ "summary": "ctx summary" })),
+                    );
+                }
+                if get_global_json(&runtime, "ctxCompactProbe").await["done"] == json!(true) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "ctxCompactProbe").await;
+            assert_eq!(calls, 1, "pre-aborted context call must not reach the host");
+            assert_eq!(probe["done"], json!(true), "probe: {probe}");
+            assert_eq!(probe["aborted"], json!("AbortError"));
+            assert_eq!(probe["result"]["summary"], json!("ctx summary"));
+            assert_eq!(probe["error"], serde_json::Value::Null);
         });
     }
 
@@ -26163,7 +27475,7 @@ mod tests {
                     r"
                     globalThis.compactProbe = { done: false };
                     import('@mariozechner/pi-coding-agent')
-                        .then((mod) => mod.compact({}, {}, 'api-key', undefined, undefined))
+                        .then((mod) => mod.compact({}, {}))
                         .then((value) => { globalThis.compactProbe.value = value; })
                         .catch((error) => {
                             globalThis.compactProbe.error = String((error && error.message) || error);
@@ -26174,6 +27486,7 @@ mod tests {
                 .await
                 .expect("invoke compact bridge");
 
+            let mut dispatched = 0;
             for _ in 0..32 {
                 drain_until_idle(&runtime, &clock).await;
                 let state = get_global_json(&runtime, "compactProbe").await;
@@ -26185,6 +27498,7 @@ mod tests {
                         panic!("expected events hostcall, got {:?}", request.kind);
                     };
                     assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    dispatched += 1;
                     runtime.complete_hostcall(
                         request.call_id,
                         HostcallOutcome::Error {
@@ -26197,6 +27511,7 @@ mod tests {
                 }
             }
 
+            assert_eq!(dispatched, 1, "rejection must come from the host bridge");
             drain_until_idle(&runtime, &clock).await;
             let probe = get_global_json(&runtime, "compactProbe").await;
             assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
@@ -29922,6 +31237,346 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    struct DeferredHttpTestStream {
+        frames: std::collections::VecDeque<HostcallOutcome>,
+        pending_after_frames: bool,
+        polls: Rc<std::cell::Cell<usize>>,
+        drops: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl DeferredHttpTestStream {
+        fn new(frames: Vec<HostcallOutcome>, pending_after_frames: bool) -> Self {
+            Self {
+                frames: frames.into(),
+                pending_after_frames,
+                polls: Rc::new(std::cell::Cell::new(0)),
+                drops: Rc::new(std::cell::Cell::new(0)),
+            }
+        }
+    }
+
+    impl futures::Stream for DeferredHttpTestStream {
+        type Item = HostcallOutcome;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            this.polls.set(this.polls.get() + 1);
+            if let Some(frame) = this.frames.pop_front() {
+                std::task::Poll::Ready(Some(frame))
+            } else if this.pending_after_frames {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Drop for DeferredHttpTestStream {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn pijs_deferred_http_waits_for_consumer_credit_between_frames() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue streaming request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(
+                vec![
+                    HostcallOutcome::StreamChunk {
+                        sequence: 0,
+                        chunk: json!({"status": 200, "headers": {}}),
+                        is_final: false,
+                    },
+                    HostcallOutcome::StreamChunk {
+                        sequence: 1,
+                        chunk: json!({"body_bytes": "aGVsbG8="}),
+                        is_final: false,
+                    },
+                    HostcallOutcome::StreamChunk {
+                        sequence: 2,
+                        chunk: serde_json::Value::Null,
+                        is_final: true,
+                    },
+                ],
+                false,
+            );
+            let polls = Rc::clone(&producer.polls);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("initial header credit");
+            runtime.tick().await.expect("idle without a consumer");
+            assert_eq!(polls.get(), 1, "body must remain unpolled");
+            runtime
+                .eval("response.next().then(frame => { globalThis.head = frame.value; });")
+                .await
+                .expect("consume header");
+            runtime.tick().await.expect("one body credit");
+            runtime.tick().await.expect("idle without more demand");
+            assert_eq!(polls.get(), 2);
+            assert_eq!(get_global_json(&runtime, "head").await["status"], 200);
+            runtime
+                .eval("response.next().then(frame => { globalThis.body = frame.value; });")
+                .await
+                .expect("consume body");
+            runtime.tick().await.expect("terminal credit");
+            assert_eq!(polls.get(), 3);
+            assert_eq!(drops.get(), 1);
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            assert_eq!(
+                get_global_json(&runtime, "body").await["body_bytes"],
+                "aGVsbG8="
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_cancel_drops_pending_future_immediately() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(Vec::new(), true);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("poll pending headers");
+            assert_eq!(drops.get(), 0);
+            runtime
+                .eval("response.return(); response.return();")
+                .await
+                .expect("cancel twice");
+            assert_eq!(drops.get(), 1, "cancel must drop without a later tick");
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime.tick().await.expect("deliver cancellation sentinel");
+            assert_eq!(runtime.pending_hostcall_count(), 0);
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_watchdog_drops_idle_stream_in_same_tick() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let mut config = PiJsRuntimeConfig::default();
+            config.limits.hostcall_timeout_ms = Some(25);
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(Vec::new(), true);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            clock.set(25);
+            runtime.tick().await.expect("fire host watchdog");
+            assert_eq!(
+                drops.get(),
+                1,
+                "no idle actor may retain a timed-out request"
+            );
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime
+                .eval("response.next().catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe timeout");
+            assert_eq!(get_global_json(&runtime, "code").await, "timeout");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_root_deadline_applies_without_body_credit() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(
+                vec![HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"status": 200, "headers": {}}),
+                    is_final: false,
+                }],
+                true,
+            );
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("deliver header");
+            runtime.set_deferred_hostcall_deadline(call_id, Some(std::time::Instant::now()));
+            runtime.tick().await.expect("expire root deadline");
+            assert_eq!(drops.get(), 1);
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime
+                .eval("response.next().then(() => response.next()).catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe root timeout after buffered header");
+            assert_eq!(get_global_json(&runtime, "code").await, "timeout");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_unexpected_eof_rejects_and_releases_tracker() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            runtime
+                .defer_hostcall_stream(
+                    call_id,
+                    Box::pin(DeferredHttpTestStream::new(Vec::new(), false)),
+                )
+                .expect("defer malformed stream");
+            runtime.tick().await.expect("deliver EOF error");
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert_eq!(runtime.pending_hostcall_count(), 0);
+            runtime
+                .eval("response.next().catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe error");
+            assert_eq!(get_global_json(&runtime, "code").await, "io");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_finalizes_actual_outcome_exactly_once() {
+        futures::executor::block_on(async {
+            for (cause, expected) in [
+                ("producer_error", "denied"),
+                ("cancel", "cancelled"),
+                ("root_deadline", "timeout"),
+                ("watchdog", "timeout"),
+                ("complete", "success"),
+            ] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let mut config = PiJsRuntimeConfig::default();
+                config.limits.hostcall_timeout_ms = Some(25);
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("runtime");
+                runtime
+                    .eval(
+                        "globalThis.response = pi.http({url:'https://example.com/',stream:true});",
+                    )
+                    .await
+                    .expect("enqueue request");
+                let requests = runtime.drain_hostcall_requests();
+                let call_id = &requests[0].call_id;
+                let producer = DeferredHttpTestStream::new(Vec::new(), true);
+                let drops = Rc::clone(&producer.drops);
+                runtime
+                    .defer_hostcall_stream(call_id, Box::pin(producer))
+                    .expect("defer stream");
+                let outcomes = Rc::new(RefCell::new(Vec::<String>::new()));
+                let observed = Rc::clone(&outcomes);
+                runtime.set_deferred_hostcall_finalizer(
+                    call_id,
+                    Box::new(move |outcome| {
+                        observed.borrow_mut().push(match outcome {
+                            HostcallOutcome::Error { code, .. } => code.clone(),
+                            _ => "success".to_string(),
+                        });
+                    }),
+                );
+                match cause {
+                    "producer_error" => runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::Error {
+                            code: "denied".to_string(),
+                            message: "HTTP host is denied".to_string(),
+                        },
+                    ),
+                    "cancel" => assert!(runtime.cancel_hostcall(call_id)),
+                    "root_deadline" => runtime
+                        .set_deferred_hostcall_deadline(call_id, Some(std::time::Instant::now())),
+                    "watchdog" => clock.set(25),
+                    "complete" => runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::StreamChunk {
+                            sequence: 0,
+                            chunk: serde_json::Value::Null,
+                            is_final: true,
+                        },
+                    ),
+                    _ => unreachable!("known termination cause"),
+                }
+                runtime.tick().await.expect("deliver termination");
+                runtime
+                    .tick()
+                    .await
+                    .expect("settle duplicate opportunities");
+                assert_eq!(drops.get(), 1, "producer release for {cause}");
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    &[expected],
+                    "outcome for {cause}"
+                );
+                assert!(!runtime.has_deferred_hostcall(call_id));
+                assert!(
+                    !runtime.cancel_hostcall(call_id),
+                    "late cancellation for {cause}"
+                );
+                drop(runtime);
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    &[expected],
+                    "drop must not duplicate {cause}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn pijs_hostcall_timeout_rejects_promise() {
         futures::executor::block_on(async {
@@ -32051,7 +33706,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .eval(
                     r"
                     globalThis.pathResults = {};
-                    import('node:path').then((path) => {
+                    import('node:path').then(({ posix: path }) => {
                         globalThis.pathResults.isAbsRoot = path.isAbsolute('/foo/bar');
                         globalThis.pathResults.isAbsRel = path.isAbsolute('foo/bar');
                         globalThis.pathResults.extJs = path.extname('/a/b/file.js');
@@ -33308,6 +34963,122 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    fn pijs_virtual_http_restart_retains_only_registered_owner_and_origin() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    globalThis.virtualRestartResult = null;
+                    (async () => {
+                        const results = {};
+                        const begin = id => {
+                            __pi_end_extension(__pi_test_secret);
+                            __pi_begin_extension(__pi_test_secret, id, { name: id });
+                        };
+                        const listen = port => __pi_virtual_http_listen('127.0.0.1', port, () => {
+                            let first = true;
+                            return {
+                                poll() {
+                                    if (first) { first = false; return { done: false, value: { status: 201, headers: {} } }; }
+                                    return { done: true };
+                                },
+                                next() { return Promise.resolve(this.poll()); },
+                                cancel() { results.cancelled = true; },
+                                finished: Promise.resolve(),
+                            };
+                        }, () => {});
+                        const rejected = (id, url = 'http://127.0.0.1:28180/v1/test') => {
+                            try { __pi_virtual_http_start(__pi_test_secret, id, { url }); return false; }
+                            catch (_) { return true; }
+                        };
+                        begin('route-owner');
+                        const original = listen(28180);
+                        const spec = { api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1', models: [{ id: 'test' }] };
+                        pi.registerProvider('bound', spec);
+                        pi.registerProvider('unbound', { ...spec, baseUrl: 'http://127.0.0.1:28181/v1', virtualHttpServer: 'virtual-http-server-1', virtualHttpOrigin: 'http://127.0.0.1:28181' });
+                        original.close();
+                        results.missingRejected = rejected('bound');
+
+                        begin('foreign-owner');
+                        const foreign = listen(28180);
+                        begin('route-owner');
+                        results.foreignRejected = rejected('bound');
+                        const differentPort = listen(28181);
+                        results.differentPortRejected = rejected('bound');
+                        results.lateBindingRejected = rejected('unbound', 'http://127.0.0.1:28181/v1/test');
+                        const replacement = listen(28180);
+                        results.invalidOriginsRejected = [
+                            'http://127.0.0.1:28181/v1/test',
+                            'http://user:password@127.0.0.1:28180/v1/test',
+                            'https://127.0.0.1:28180/v1/test',
+                            'http://example.com:28180/v1/test',
+                            'http://127.0.0.1:65536/v1/test',
+                            '/v1/test',
+                        ].every(url => rejected('bound', url));
+
+                        const originalURL = globalThis.URL;
+                        const originalParser = globalThis.__pi_url_parse_native;
+                        const originalJSONParse = JSON.parse;
+                        try {
+                            globalThis.URL = function() { return { protocol: 'http:', hostname: '127.0.0.1', port: '28180' }; };
+                            globalThis.__pi_url_parse_native = () => '{"protocol":"http:","hostname":"127.0.0.1","port":"28180"}';
+                            JSON.parse = () => ({ protocol: 'http:', hostname: '127.0.0.1', port: '28180' });
+                            results.replacedParsersRejected = rejected('bound', 'https://example.com/v1/test');
+                        } finally {
+                            globalThis.URL = originalURL;
+                            globalThis.__pi_url_parse_native = originalParser;
+                            JSON.parse = originalJSONParse;
+                        }
+                        const stream = __pi_virtual_http_start(__pi_test_secret, 'bound', { url: 'http://127.0.0.1:28180/v1/test' });
+                        original.close();
+                        original.cancelRequests();
+                        const first = await __pi_provider_stream_simple_next(__pi_test_secret, stream);
+                        const last = await __pi_provider_stream_simple_next(__pi_test_secret, stream);
+                        results.replacementStatus = first.value.status;
+                        results.completed = last.done;
+                        results.staleHandleCancelledReplacement = results.cancelled === true;
+                        replacement.close();
+                        differentPort.close();
+                        begin('foreign-owner');
+                        foreign.close();
+                        __pi_end_extension(__pi_test_secret);
+                        const counts = __pi_runtime_registry_snapshot(__pi_test_secret);
+                        results.servers = counts.virtualHttpServers;
+                        results.requests = counts.virtualHttpRequests;
+                        results.streams = counts.providerStreams;
+                        globalThis.virtualRestartResult = results;
+                    })();
+                    "#,
+                ))
+                .await
+                .expect("eval route restart isolation");
+            runtime.drain_microtasks().await.expect("drain");
+            assert_eq!(
+                get_global_json(&runtime, "virtualRestartResult").await,
+                json!({
+                    "missingRejected": true,
+                    "foreignRejected": true,
+                    "differentPortRejected": true,
+                    "lateBindingRejected": true,
+                    "invalidOriginsRejected": true,
+                    "replacedParsersRejected": true,
+                    "replacementStatus": 201,
+                    "completed": true,
+                    "staleHandleCancelledReplacement": false,
+                    "servers": 0,
+                    "requests": 0,
+                    "streams": 0,
+                })
+            );
+            assert!(runtime.drain_hostcall_requests().is_empty());
+        });
+    }
+
+    #[test]
     fn pijs_provider_stream_simple_error_cleans_up_registry() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -33992,7 +35763,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .eval(
                     r"
                     globalThis.pathResults2 = {};
-                    import('node:path').then((path) => {
+                    import('node:path').then(({ posix: path }) => {
                         // relative
                         globalThis.pathResults2.relSameDir = path.relative('/a/b/c', '/a/b/c/d');
                         globalThis.pathResults2.relUp = path.relative('/a/b/c', '/a/b');
@@ -34043,6 +35814,486 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             // join doesn't normalize; normalize is separate
             let join_dots = r["joinDots"].as_str().unwrap();
             assert!(join_dots == "b" || join_dots == "a/../b");
+        });
+    }
+
+    #[test]
+    fn pijs_windows_path_defaults_survive_denied_environment_access() {
+        futures::executor::block_on(async {
+            for deny_env in [true, false] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let config = PiJsRuntimeConfig {
+                    cwd: r"C:\work\project".to_string(),
+                    env: HashMap::from([
+                        ("PI_PLATFORM".to_string(), "win32".to_string()),
+                        ("=D:".to_string(), r"D:\saved".to_string()),
+                    ]),
+                    deny_env,
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                };
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("create Windows-path runtime");
+                runtime
+                    .eval(
+                        r"
+                        Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                            const path = mod.default;
+                            const file = path.resolve('note.txt');
+                            fs.writeFileSync(file, 'windows path content');
+                            globalThis.windowsPathDefaults = {
+                                platform: process.platform,
+                                envPlatform: process.env.PI_PLATFORM ?? null,
+                                native: path === mod.win32 && mod.join === path.join,
+                                namespaces: path.posix === mod.posix && path.win32 === mod.win32,
+                                sep: mod.sep,
+                                delimiter: mod.delimiter,
+                                cwd: path.resolve(),
+                                currentDrive: path.resolve('c:src', '..', 'file.rs'),
+                                savedDrive: path.resolve('D:next'),
+                                otherDrive: path.resolve('E:next'),
+                                rooted: path.resolve('C:\\previous', '\\rooted'),
+                                read: fs.readFileSync(path.join(process.cwd(), '.', 'note.txt'), 'utf8'),
+                                done: true,
+                            };
+                        }).catch((error) => {
+                            globalThis.windowsPathDefaults = { error: String(error) };
+                        });
+                        ",
+                    )
+                    .await
+                    .expect("eval Windows default path workflow");
+                drain_until_idle(&runtime, &clock).await;
+                let actual = get_global_json(&runtime, "windowsPathDefaults").await;
+                let saved_drive = if deny_env {
+                    r"D:\next"
+                } else {
+                    r"D:\saved\next"
+                };
+                assert_eq!(
+                    actual,
+                    serde_json::json!({
+                        "platform": "win32",
+                        "envPlatform": if deny_env { serde_json::Value::Null } else { serde_json::json!("win32") },
+                        "native": true,
+                        "namespaces": true,
+                        "sep": "\\",
+                        "delimiter": ";",
+                        "cwd": r"C:\work\project",
+                        "currentDrive": r"c:\work\project\file.rs",
+                        "savedDrive": saved_drive,
+                        "otherDrive": r"E:\next",
+                        "rooted": r"C:\rooted",
+                        "read": "windows path content",
+                        "done": true,
+                    }),
+                    "Windows metadata and path behavior, deny_env={deny_env}"
+                );
+                assert!(runtime.drain_hostcall_requests().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_windows_fs_preserves_paths_at_host_boundaries() {
+        // Probe the actual built-in modules in an isolated context. The full
+        // runtime seals its native hooks; this fixture leaves production
+        // authorization untouched and performs no host filesystem I/O.
+        let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
+        let state = Rc::new(RefCell::new(
+            PiJsModuleState::new().with_disk_cache_dir(None),
+        ));
+        runtime.set_loader(
+            PiJsResolver {
+                state: Rc::clone(&state),
+            },
+            PiJsLoader { state },
+        );
+        let context = rquickjs::Context::full(&runtime).expect("quickjs context");
+        context.with(|ctx| {
+            ctx.eval::<(), _>(
+                r"
+                const cwd = '\\\\server\\share\\project';
+                globalThis.pi = { process: { cwd } };
+                globalThis.process = { platform: 'win32', cwd: () => cwd, env: {} };
+                globalThis.windowsFsHostPaths = {};
+                let extensionId = 'ext.one';
+                const calls = [];
+                globalThis.__pi_get_current_extension_id = () => extensionId;
+                globalThis.__pi_host_temp_roots_json = () =>
+                    JSON.stringify(['T:/', '//?/Z:/', '//temp/share']);
+                globalThis.__pi_host_is_registered_fs_path = (path) => {
+                    calls.push(['registered', path]);
+                    return false;
+                };
+                globalThis.__pi_host_check_read_access = (path) => calls.push(['checkRead', path]);
+                globalThis.__pi_host_check_write_access = (path) => calls.push(['checkWrite', path]);
+                globalThis.__pi_host_read_file_sync = (path) => {
+                    calls.push(['read', path]);
+                    throw new Error('fixture read probe');
+                };
+                globalThis.__pi_host_stat_sync = (path, follow) => {
+                    calls.push(['stat', path, follow]);
+                    return JSON.stringify({ kind: 'file', size: 7 });
+                };
+                globalThis.__pi_host_read_dir_sync = (path) => {
+                    calls.push(['readdir', path]);
+                    return JSON.stringify([{ name: 'child.txt', kind: 'file' }]);
+                };
+                Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                    const path = mod.default;
+                    const inputs = [
+                        path.join('C:\\work', 'file.txt'),
+                        path.resolve('file.txt'),
+                        path.toNamespacedPath('C:\\work\\file.txt'),
+                        path.toNamespacedPath(path.resolve('file.txt')),
+                        path.join('\\\\.\\pipe', 'file.txt'),
+                    ];
+                    windowsFsHostPaths.rows = inputs.map((input) => {
+                        calls.length = 0;
+                        let readProbed = false;
+                        try { fs.readFileSync(input); } catch (error) {
+                            readProbed = String(error).includes('fixture read probe');
+                        }
+                        fs.statSync(input);
+                        fs.lstatSync(input);
+                        fs.readdirSync(path.dirname(input));
+                        fs.writeFileSync(input, new Uint8Array([1]));
+                        const normalized = __pi_vfs_api.normalizePath(input);
+                        return {
+                            readProbed,
+                            normalized,
+                            repeated: __pi_vfs_api.normalizePath(normalized),
+                            calls: calls.slice(),
+                        };
+                    });
+                    windowsFsHostPaths.temp = ['T:\\private.txt', '\\\\?\\Z:\\private.txt', '\\\\temp\\share\\private.txt'].map((input) => {
+                        calls.length = 0;
+                        fs.writeFileSync(input, new Uint8Array([1, 2]));
+                        const canonical = fs.realpathSync(input);
+                        extensionId = 'ext.two';
+                        const visibleToOther = fs.existsSync(input);
+                        extensionId = 'ext.one';
+                        const size = fs.statSync(input).size;
+                        return { canonical, visibleToOther, size, calls: calls.slice() };
+                    });
+                    windowsFsHostPaths.roots = [
+                        'C:\\..\\..', '\\\\server\\share\\..\\..',
+                        '\\\\?\\C:\\..\\..', '\\\\?\\UNC\\server\\share\\..\\..',
+                    ].map((input) => fs.realpathSync(input));
+                    windowsFsHostPaths.done = true;
+                }).catch((error) => {
+                    windowsFsHostPaths.error = String(error);
+                });
+                ",
+            )
+            .expect("evaluate Windows host-boundary fixture");
+        });
+        for _ in 0..64 {
+            if !runtime.execute_pending_job().expect("run import job") {
+                break;
+            }
+        }
+        let actual = context.with(|ctx| {
+            let value: Value<'_> = ctx.globals().get("windowsFsHostPaths").expect("result");
+            js_to_json(&value).expect("convert result")
+        });
+        assert_eq!(actual["done"], json!(true), "{actual}");
+        let expected_paths = [
+            (
+                "C:/work/file.txt",
+                "C:/work/file.txt",
+                "C:/work",
+                "C:/work/child.txt",
+            ),
+            (
+                "//server/share/project/file.txt",
+                "//server/share/project/file.txt",
+                "//server/share/project",
+                "//server/share/project/child.txt",
+            ),
+            (
+                "//?/C:/work/file.txt",
+                r"\\?\C:\work\file.txt",
+                r"\\?\C:\work",
+                r"\\?\C:\work\child.txt",
+            ),
+            (
+                "//?/UNC/server/share/project/file.txt",
+                r"\\?\UNC\server\share\project\file.txt",
+                r"\\?\UNC\server\share\project",
+                r"\\?\UNC\server\share\project\child.txt",
+            ),
+            (
+                "//./pipe/file.txt",
+                r"\\.\pipe\file.txt",
+                r"\\.\pipe",
+                r"\\.\pipe\child.txt",
+            ),
+        ];
+        assert_eq!(
+            actual["rows"].as_array().expect("rows").len(),
+            expected_paths.len()
+        );
+        for (row, (normalized, file, dir, child)) in actual["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .zip(expected_paths)
+        {
+            assert_eq!(
+                row,
+                &json!({
+                    "readProbed": true,
+                    "normalized": normalized,
+                    "repeated": normalized,
+                    "calls": [
+                        ["checkRead", file], ["read", file],
+                        ["checkRead", file], ["stat", file, true],
+                        ["checkRead", file], ["stat", file, false],
+                        ["checkRead", dir], ["readdir", dir], ["checkRead", child],
+                        ["checkWrite", file], ["stat", file, true],
+                    ],
+                }),
+                "host boundary for {normalized}"
+            );
+        }
+        let temp_paths = [
+            ("T:/private.txt", "T:/private.txt"),
+            ("//?/Z:/private.txt", r"\\?\Z:\private.txt"),
+            ("//temp/share/private.txt", "//temp/share/private.txt"),
+        ];
+        assert_eq!(
+            actual["temp"].as_array().expect("temp results").len(),
+            temp_paths.len()
+        );
+        for (row, (canonical, native)) in actual["temp"]
+            .as_array()
+            .expect("temp results")
+            .iter()
+            .zip(temp_paths)
+        {
+            assert_eq!(
+                row,
+                &json!({
+                    "canonical": canonical,
+                    "visibleToOther": false,
+                    "size": 2,
+                    "calls": [["registered", native], ["registered", native], ["registered", native], ["registered", native]],
+                }),
+                "private temp namespace for {canonical}"
+            );
+        }
+        assert_eq!(
+            actual["roots"],
+            json!(["C:/", "//server/share", "//?/C:/", "//?/UNC/server/share"])
+        );
+    }
+
+    #[test]
+    fn pijs_windows_fs_workflows_keep_drive_and_share_roots() {
+        futures::executor::block_on(async {
+            for (cwd, root, uses_unc) in [
+                (r"C:\", "C:/", false),
+                (r"\\server\share", "//server/share", true),
+                (r"\\?\C:\", "//?/C:/", false),
+                (r"\\?\UNC\server\share", "//?/UNC/server/share", true),
+            ] {
+                // UNC boundary and root behavior is covered without I/O by
+                // the probe fixture above. Do not contact an arbitrary live
+                // network share when this test runs on Windows.
+                if cfg!(windows) && uses_unc {
+                    continue;
+                }
+                let clock = Arc::new(DeterministicClock::new(0));
+                let config = PiJsRuntimeConfig {
+                    cwd: cwd.to_string(),
+                    env: HashMap::from([("PI_PLATFORM".to_string(), "win32".to_string())]),
+                    deny_env: true,
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                };
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("create Windows filesystem runtime");
+                let fixture = format!("pijs-roots-{}", uuid::Uuid::new_v4().simple());
+                runtime
+                    .context
+                    .with(|ctx| ctx.globals().set("windowsFsFixture", fixture))
+                    .await
+                    .expect("set unique fixture prefix");
+                runtime
+                    .eval(
+                        r"
+                        Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                            const path = mod.default;
+                            const fileName = windowsFsFixture + '-file.txt';
+                            const projectName = windowsFsFixture + '-project';
+                            const aliasName = windowsFsFixture + '-alias';
+                            const owned = new Map([[aliasName, 'alias'], [fileName, 'file.txt'], [projectName, 'project']]);
+                            const file = path.resolve(fileName);
+                            fs.writeFileSync(file, 'root file');
+                            fs.mkdirSync(path.resolve(projectName, 'links'));
+                            fs.symlinkSync('..\\..\\' + fileName, path.resolve(projectName, 'links', 'file-link'));
+                            fs.symlinkSync(path.resolve(projectName), path.resolve(aliasName));
+                            const clamped = process.cwd() + '\\..\\..\\' + fileName;
+                            globalThis.windowsFsRoots = {
+                                native: path === mod.win32,
+                                root: fs.realpathSync(process.cwd()),
+                                clamped: fs.readFileSync(clamped, 'utf8'),
+                                linked: fs.readFileSync(path.resolve(aliasName, 'links', 'file-link'), 'utf8'),
+                                entries: fs.readdirSync(process.cwd()).filter((name) => owned.has(name)).map((name) => owned.get(name)),
+                                aliasEntries: fs.readdirSync(path.resolve(aliasName)).filter((name) => name === 'links'),
+                                done: true,
+                            };
+                        }).catch((error) => {
+                            globalThis.windowsFsRoots = { error: String(error) };
+                        });
+                        ",
+                    )
+                    .await
+                    .expect("evaluate Windows filesystem workflow");
+                drain_until_idle(&runtime, &clock).await;
+                let actual = get_global_json(&runtime, "windowsFsRoots").await;
+                assert_eq!(
+                    actual,
+                    json!({
+                        "native": true,
+                        "root": root,
+                        "clamped": "root file",
+                        "linked": "root file",
+                        "entries": ["alias", "file.txt", "project"],
+                        "aliasEntries": ["links"],
+                        "done": true,
+                    }),
+                    "filesystem workflow at {cwd}"
+                );
+                assert!(runtime.drain_hostcall_requests().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_explicit_windows_paths_preserve_drives_and_unc_roots_on_unix() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let config = PiJsRuntimeConfig {
+                cwd: "/virtual/project".to_string(),
+                env: HashMap::from([("PI_PLATFORM".to_string(), "linux".to_string())]),
+                deny_env: true,
+                disk_cache_dir: None,
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create Unix-path runtime");
+            runtime
+                .eval(
+                    r"
+                    import('node:path').then((mod) => {
+                        const path = mod.win32;
+                        const invalid = [
+                            () => path.join('C:\\work', {}),
+                            () => path.resolve('C:\\work', null),
+                            () => path.basename('file.txt', 1),
+                            () => path.normalize(undefined),
+                            () => path.parse([]),
+                            () => path.format(null),
+                            () => path.relative('C:\\work', false),
+                        ];
+                        globalThis.windowsPathRoots = {
+                            nativePosix: mod.default === mod.posix && mod.sep === '/',
+                            posixUnchanged: mod.posix.normalize('/a/b/../c') === '/a/c',
+                            driveRoot: path.normalize('C:/../project'),
+                            driveRelative: path.normalize('C:../project'),
+                            uncRoot: path.normalize('\\\\server\\share\\dir\\..\\..\\file'),
+                            bareShare: path.normalize('\\\\server\\share'),
+                            joinShare: path.join('\\\\server', 'share', 'dir', '..', 'file'),
+                            ordinaryRoot: path.join('//', 'server', 'share'),
+                            relativeDrive: path.join('folder', 'C:', 'file'),
+                            exposedDrive: path.normalize('folder\\..\\C:\\file'),
+                            trailing: path.normalize('C:/temp//foo/../'),
+                            caseRelative: path.relative('C:\\Work\\src', 'c:\\work\\tests\\case.rs'),
+                            sameRelative: path.relative('C:\\Work', 'c:\\work'),
+                            differentDrive: path.relative('C:\\work', 'D:\\source\\file'),
+                            sharedServer: path.relative('\\\\srv\\one\\dir', '\\\\srv\\two\\file'),
+                            differentServer: path.relative('\\\\a\\share', '\\\\b\\share\\file'),
+                            resolveSequence: path.resolve('C:\\base', 'C:src', '..', 'out'),
+                            parseDrive: path.parse('C:/source/file.test.rs'),
+                            parseShare: path.parse('\\\\server\\share\\file.txt'),
+                            dirname: path.dirname('C:\\source\\child\\'),
+                            suffix: path.basename('C:\\source\\FILE.TXT', '.txt'),
+                            hiddenExtension: path.extname('C:\\source\\.env'),
+                            parentExtension: path.extname('..'),
+                            extension: path.extname('C:\\source\\file.rs\\'),
+                            format: path.format({ root: 'C:\\', name: 'file', ext: 'rs' }),
+                            absolute: [path.isAbsolute('C:relative'), path.isAbsolute('C:/root'), path.isAbsolute('\\root')],
+                            namespace: path.toNamespacedPath('\\\\server\\share\\file'),
+                            namespaceNormalize: path.normalize('\\\\?\\C:\\path\\..'),
+                            namespaceResolve: path.resolve('\\\\?\\C:\\path', '\\file'),
+                            invalid: invalid.map((call) => {
+                                try { call(); return false; } catch (error) { return error instanceof TypeError; }
+                            }),
+                            done: true,
+                        };
+                    }).catch((error) => {
+                        globalThis.windowsPathRoots = { error: String(error) };
+                    });
+                    ",
+                )
+                .await
+                .expect("eval Windows drive and share workflows");
+            drain_until_idle(&runtime, &clock).await;
+            let actual = get_global_json(&runtime, "windowsPathRoots").await;
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "nativePosix": true,
+                    "posixUnchanged": true,
+                    "driveRoot": r"C:\project",
+                    "driveRelative": r"C:..\project",
+                    "uncRoot": r"\\server\share\file",
+                    "bareShare": "\\\\server\\share\\",
+                    "joinShare": r"\\server\share\file",
+                    "ordinaryRoot": r"\server\share",
+                    "relativeDrive": r".\folder\C:\file",
+                    "exposedDrive": r".\C:\file",
+                    "trailing": "C:\\temp\\",
+                    "caseRelative": r"..\tests\case.rs",
+                    "sameRelative": "",
+                    "differentDrive": r"D:\source\file",
+                    "sharedServer": r"..\..\two\file",
+                    "differentServer": r"\\b\share\file",
+                    "resolveSequence": r"C:\base\out",
+                    "parseDrive": { "root": "C:/", "dir": "C:/source", "base": "file.test.rs", "ext": ".rs", "name": "file.test" },
+                    "parseShare": { "root": "\\\\server\\share\\", "dir": "\\\\server\\share\\", "base": "file.txt", "ext": ".txt", "name": "file" },
+                    "dirname": r"C:\source",
+                    "suffix": "FILE.TXT",
+                    "hiddenExtension": "",
+                    "parentExtension": "",
+                    "extension": ".rs",
+                    "format": r"C:\file.rs",
+                    "absolute": [false, true, true],
+                    "namespace": r"\\?\UNC\server\share\file",
+                    "namespaceNormalize": r"\\?\C:",
+                    "namespaceResolve": r"\\?\file",
+                    "invalid": [true, true, true, true, true, true, true],
+                    "done": true,
+                })
+            );
+            assert!(runtime.drain_hostcall_requests().is_empty());
         });
     }
 

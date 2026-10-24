@@ -171,10 +171,10 @@ fn annotated_or_resource_shaped_additional_edits_are_not_accepted() {
 }
 
 #[test]
-fn snippet_command_and_indentation_modes_fail_before_application() {
+fn unexpanded_snippets_commands_and_unknown_modes_fail_before_application() {
     for extra in [
         json!({"insertTextFormat":2}),
-        json!({"insertTextMode":2}),
+        json!({"insertTextMode":3}),
         json!({"command":{"command":"server.exec"}}),
     ] {
         let mut item = completion();

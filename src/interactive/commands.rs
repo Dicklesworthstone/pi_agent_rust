@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::models::{
-    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings,
-    model_requires_configured_credential, normalize_api_key_opt,
+    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings, find_model_entry,
+    model_requires_configured_credential, normalize_api_key_opt, resolve_model_entry,
 };
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
@@ -191,6 +191,7 @@ pub enum SlashCommand {
     Share,
     Mcp,
     Plan,
+    Prewalk,
     Advisor,
     Checkpoint,
     Rewind,
@@ -254,6 +255,7 @@ impl SlashCommand {
             Self::Share => "/share",
             Self::Mcp => "/mcp",
             Self::Plan => "/plan",
+            Self::Prewalk => "/prewalk",
             Self::Advisor => "/advisor",
             Self::Checkpoint => "/checkpoint",
             Self::Rewind => "/rewind",
@@ -312,6 +314,7 @@ impl SlashCommand {
         Self::Share,
         Self::Mcp,
         Self::Plan,
+        Self::Prewalk,
         Self::Advisor,
         Self::Checkpoint,
         Self::Rewind,
@@ -370,6 +373,7 @@ impl SlashCommand {
             "/share" => Self::Share,
             "/mcp" => Self::Mcp,
             "/plan" => Self::Plan,
+            "/prewalk" => Self::Prewalk,
             "/advisor" => Self::Advisor,
             "/checkpoint" | "/cp2" => Self::Checkpoint,
             "/rewind" => Self::Rewind,
@@ -422,10 +426,12 @@ impl SlashCommand {
   /reload            - Reload skills/prompts from disk
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
-  /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
+  /mcp               - Manage MCP servers: list, add, remove, test, trust, reauth, unauth
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
+  /prewalk [status|off] - Hand off to @smol after planning and the first edit
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
-  /handoff [to] [path] - Generate structured cross-session/cross-agent handoff brief
+  /handoff [focus]   - Compact context into a continuation brief in this session
+  /handoff --report [to] [path] - Generate or deliver a local session report
   /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
   /add-dir <dir>     - Grant access to an additional workspace root
   /remove-dir <dir>  - Revoke an additional workspace root immediately
@@ -1012,12 +1018,12 @@ pub fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
 }
 
 pub fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
-    let left_provider = crate::provider_metadata::canonical_provider_id(&left.model.provider)
-        .unwrap_or(&left.model.provider);
-    let right_provider = crate::provider_metadata::canonical_provider_id(&right.model.provider)
-        .unwrap_or(&right.model.provider);
-
-    left_provider.eq_ignore_ascii_case(right_provider)
+    // Entries already carry their resolved provider identity. Canonicalizing
+    // them here hides separately declared providers from switching/cycling.
+    left.model
+        .provider
+        .trim()
+        .eq_ignore_ascii_case(right.model.provider.trim())
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
@@ -1029,9 +1035,33 @@ pub(super) fn resolve_model_key_with_auth(
         .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
 }
 
-pub(super) fn resolve_model_key_from_default_auth(entry: &ModelEntry) -> Option<String> {
+pub(super) fn load_runtime_auth(
+    cwd: &std::path::Path,
+) -> crate::error::Result<crate::auth::AuthStorage> {
     let auth_path = crate::config::Config::auth_path();
-    crate::auth::AuthStorage::load(auth_path)
+    let mut auth = crate::auth::AuthStorage::load(auth_path)?;
+    auth.set_command_working_directory(cwd)?;
+    Ok(auth)
+}
+
+pub(super) fn create_runtime_provider(
+    entry: &ModelEntry,
+    extensions: Option<&crate::extensions::ExtensionManager>,
+    cwd: &std::path::Path,
+) -> crate::error::Result<std::sync::Arc<dyn crate::provider::Provider>> {
+    // Match load_runtime_auth's file identity without requiring a successful
+    // read now. A provider-owned reload must retain the workspace even if the
+    // file was unavailable during model selection and becomes readable later.
+    let mut auth = crate::auth::AuthStorage::empty_at(crate::config::Config::auth_path());
+    auth.set_command_working_directory(cwd)?;
+    providers::create_provider_with_auth(entry, extensions, Some(&auth))
+}
+
+pub(super) fn resolve_model_key_from_default_auth(
+    entry: &ModelEntry,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    load_runtime_auth(cwd)
         .ok()
         .and_then(|auth| resolve_model_key_with_auth(&auth, entry))
         .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
@@ -1334,7 +1364,7 @@ impl PiApp {
 
     pub(super) fn sync_active_provider_credentials(&mut self, changed_provider: &str) {
         let changed_canonical = normalize_auth_provider_input(changed_provider);
-        let auth = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+        let auth = match load_runtime_auth(&self.cwd) {
             Ok(auth) => auth,
             Err(err) => {
                 tracing::warn!(
@@ -1346,6 +1376,10 @@ impl PiApp {
                 return;
             }
         };
+        let adopted_runtime_key = self.agent.try_lock().ok().map(|mut agent| {
+            agent.handle.adopt_auth_storage(auth.clone());
+            agent.stream_options().api_key.clone()
+        });
 
         let provider_matches_changed =
             |provider: &str| normalize_auth_provider_input(provider) == changed_canonical;
@@ -1364,16 +1398,10 @@ impl PiApp {
             .and_then(|entry| normalize_api_key_opt(entry.api_key.clone()))
             .or_else(|| normalize_api_key_opt(self.model_entry.api_key.clone()));
 
-        let resolved_key_opt =
+        let resolved_key_opt = adopted_runtime_key.unwrap_or_else(|| {
             normalize_api_key_opt(auth.resolve_api_key(&changed_canonical, None))
-                .or(fallback_inline_key);
-
-        if let Ok(mut agent_guard) = self.agent.try_lock() {
-            agent_guard
-                .stream_options_mut()
-                .api_key
-                .clone_from(&resolved_key_opt);
-        }
+                .or(fallback_inline_key)
+        });
 
         self.model_entry.api_key.clone_from(&resolved_key_opt);
         if let Ok(mut shared_entry) = self.model_entry_shared.lock() {
@@ -1452,8 +1480,11 @@ impl PiApp {
         }
 
         let resolved_key_opt = resolved_key_for(&next);
-        let provider_impl = match crate::providers::create_provider(&next, self.extensions.as_ref())
-        {
+        let provider_impl = match crate::providers::create_provider_with_auth(
+            &next,
+            self.extensions.as_ref(),
+            Some(auth),
+        ) {
             Ok(p) => p,
             Err(err) => {
                 self.status_message = Some(format!("Auto-switch failed: {err}"));
@@ -1494,6 +1525,11 @@ impl PiApp {
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
+        agent_guard
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| error.to_string())?;
         let Ok(mut session_guard) = self.session.try_lock() else {
             return Err("Session busy; try again".to_string());
         };
@@ -1506,9 +1542,19 @@ impl PiApp {
         let next_thinking = next.clamp_thinking_level(current_thinking);
         let previous_thinking = session_thinking_level(&session_guard);
 
+        agent_guard
+            .handle
+            .session_mut()
+            .invalidate_background_compaction();
         agent_guard.set_provider(provider_impl);
+        agent_guard.set_tool_call_dialect(next.tool_call_dialect());
         agent_guard.set_keyword_max_thinking_level(
             next.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
+        agent_guard.set_model_accepts_images(
+            next.model
+                .input
+                .contains(&crate::provider::InputType::Image),
         );
         let stream_options = agent_guard.stream_options_mut();
         stream_options.api_key.clone_from(&resolved_key_opt);
@@ -1518,6 +1564,16 @@ impl PiApp {
         // over the previous model's limit.
         stream_options.max_tokens = Some(next.model.max_tokens);
         stream_options.thinking_level = Some(next_thinking);
+        if next.model.context_window > 0 {
+            agent_guard
+                .handle
+                .session_mut()
+                .set_compaction_context_window(next.model.context_window);
+        }
+        agent_guard
+            .handle
+            .session()
+            .refresh_extension_completion_host_state();
 
         session_guard.header.provider = Some(next.model.provider.clone());
         session_guard.header.model_id = Some(next.model.id.clone());
@@ -1580,27 +1636,36 @@ impl PiApp {
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
+        agent_guard
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| error.to_string())?;
         let Ok(mut session_guard) = self.session.try_lock() else {
             return Err("Session busy; try again".to_string());
         };
 
         let session_model = session_guard.effective_model_for_current_path();
         let session_thinking = session_guard.effective_thinking_level_for_current_path();
+        let catalog = agent_guard.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
 
         let (target_entry, sync_model) = match session_model.as_ref() {
             Some((provider, model_id)) => {
-                if provider_ids_match(&self.model_entry.model.provider, provider)
+                if self
+                    .model_entry
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(provider.trim())
                     && self.model_entry.model.id.eq_ignore_ascii_case(model_id)
                 {
                     (self.model_entry.clone(), true)
                 } else {
                     (
-                        self.available_models
-                            .iter()
-                            .find(|entry| {
-                                provider_ids_match(&entry.model.provider, provider)
-                                    && entry.model.id.eq_ignore_ascii_case(model_id)
-                            })
+                        find_model_entry(catalog, provider, model_id)
                             .cloned()
                             .ok_or_else(|| {
                                 format!("Unable to switch provider/model to {provider}/{model_id}")
@@ -1624,15 +1689,23 @@ impl PiApp {
 
         let provider = agent_guard.provider();
         let runtime_matches_target =
-            provider_ids_match(provider.name(), &target_entry.model.provider)
-                && provider
-                    .model_id()
-                    .eq_ignore_ascii_case(&target_entry.model.id);
+            find_model_entry(catalog, provider.name(), provider.model_id()).map_or_else(
+                || {
+                    provider
+                        .name()
+                        .trim()
+                        .eq_ignore_ascii_case(target_entry.model.provider.trim())
+                        && provider
+                            .model_id()
+                            .eq_ignore_ascii_case(&target_entry.model.id)
+                },
+                |entry| model_entry_matches(entry, &target_entry),
+            );
         if !runtime_matches_target {
             let resolved_key_opt = target_entry
                 .api_key
                 .clone()
-                .or_else(|| resolve_model_key_from_default_auth(&target_entry));
+                .or_else(|| resolve_model_key_from_default_auth(&target_entry, &self.cwd));
             if model_requires_configured_credential(&target_entry) && resolved_key_opt.is_none() {
                 return Err(format!(
                     "Missing credentials for provider {}. Run /login {}.",
@@ -1640,8 +1713,13 @@ impl PiApp {
                 ));
             }
 
-            let provider_impl = providers::create_provider(&target_entry, self.extensions.as_ref())
-                .map_err(|err| err.to_string())?;
+            let provider_impl =
+                create_runtime_provider(&target_entry, self.extensions.as_ref(), &self.cwd)
+                    .map_err(|err| err.to_string())?;
+            agent_guard
+                .handle
+                .session_mut()
+                .invalidate_background_compaction();
             agent_guard.set_provider(provider_impl);
             let stream_options = agent_guard.stream_options_mut();
             stream_options.api_key.clone_from(&resolved_key_opt);
@@ -1655,7 +1733,23 @@ impl PiApp {
             target_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
         agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
+        agent_guard.set_model_accepts_images(
+            target_entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
         agent_guard.stream_options_mut().thinking_level = Some(thinking_sync.effective);
+        if target_entry.model.context_window > 0 {
+            agent_guard
+                .handle
+                .session_mut()
+                .set_compaction_context_window(target_entry.model.context_window);
+        }
+        agent_guard
+            .handle
+            .session()
+            .refresh_extension_completion_host_state();
         drop(agent_guard);
 
         let persist_needed = if thinking_sync.persist_needed {
@@ -2249,12 +2343,14 @@ impl PiApp {
                     let reset_thinking = self.new_session_thinking_level();
                     let session_dir = session_guard.session_dir.clone();
                     *session_guard = Session::create_with_dir(session_dir);
+                    session_guard.header.cwd = self.cwd.display().to_string();
                     session_guard.header.provider = Some(self.model_entry.model.provider.clone());
                     session_guard.header.model_id = Some(self.model_entry.model.id.clone());
                     session_guard.header.thinking_level = Some(reset_thinking.to_string());
                     let new_session_id = session_guard.header.id.clone();
                     agent_guard.replace_messages(Vec::new());
                     agent_guard.stream_options_mut().thinking_level = Some(reset_thinking);
+                    agent_guard.session_was_replaced(crate::plan::PlanMode::Off);
                     drop(session_guard);
                     drop(agent_guard);
                     self.session_action_admission.advance_generation();
@@ -2271,6 +2367,7 @@ impl PiApp {
                     self.pending_tool_output = None;
                     self.abort_handle = None;
                     self.pending_oauth = None;
+                    self.title_cancellation = None;
                     self.title_requested = false;
                     self.role_model_overrides.clear();
                     self.displayed_session_id = Some(new_session_id);
@@ -2290,6 +2387,7 @@ impl PiApp {
                 };
 
                 let model_provider = self.model_entry.model.provider.clone();
+                let runtime_cwd = self.cwd.clone();
                 let model_id = self.model_entry.model.id.clone();
                 let model_label = self.model.clone();
                 let reset_thinking = self.new_session_thinking_level();
@@ -2334,6 +2432,7 @@ impl PiApp {
                     }
 
                     let mut new_session = Session::create_with_dir(session_dir);
+                    new_session.header.cwd = runtime_cwd.display().to_string();
                     new_session.header.provider = Some(model_provider);
                     new_session.header.model_id = Some(model_id);
                     new_session.header.thinking_level = Some(reset_thinking.to_string());
@@ -2582,6 +2681,7 @@ impl PiApp {
             SlashCommand::Share => self.handle_slash_share(args),
             SlashCommand::Mcp => self.handle_slash_mcp(args),
             SlashCommand::Plan => self.handle_slash_plan(args),
+            SlashCommand::Prewalk => self.handle_slash_prewalk(args),
             SlashCommand::Advisor => self.handle_slash_advisor(args),
             SlashCommand::Checkpoint => self.handle_slash_checkpoint(args),
             SlashCommand::Rewind => self.handle_slash_rewind(args),
@@ -2940,6 +3040,29 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    /// Resolve explicit commands against the complete runtime catalog. The
+    /// picker list may omit unready providers, but their names remain owned.
+    fn requested_model_entry(
+        &self,
+        provider: &str,
+        model_id: &str,
+        allow_unlisted_native_model: bool,
+    ) -> Result<Option<ModelEntry>, String> {
+        let agent = self
+            .agent
+            .try_lock()
+            .map_err(|_| "Agent busy; try again".to_string())?;
+        let catalog = agent.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
+        Ok(if allow_unlisted_native_model {
+            resolve_model_entry(catalog, provider, model_id)
+        } else {
+            find_model_entry(catalog, provider, model_id).cloned()
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
         // Role targeting (bd-cv653.3.1): `/model <role>` shows the role's
@@ -2992,21 +3115,29 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let pattern_lower = pattern.to_ascii_lowercase();
         let provider_scoped_pattern = split_provider_model_spec(pattern);
 
-        let mut exact_matches = Vec::new();
-        for entry in &self.available_models {
-            let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern)
-                || entry.model.id.eq_ignore_ascii_case(pattern)
-                || provider_scoped_pattern.is_some_and(|(provider, model_id)| {
-                    provider_ids_match(&entry.model.provider, provider)
-                        && entry.model.id.eq_ignore_ascii_case(model_id)
-                })
-            {
-                exact_matches.push(entry.clone());
+        let qualified = match provider_scoped_pattern {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
             }
+            None => None,
+        };
+        let mut exact_matches: Vec<_> = qualified.into_iter().collect();
+        if exact_matches.is_empty() {
+            exact_matches.extend(
+                self.available_models
+                    .iter()
+                    .filter(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                    .cloned(),
+            );
         }
 
-        let mut matches = if exact_matches.is_empty() {
+        let mut matches = if exact_matches.is_empty() && provider_scoped_pattern.is_none() {
             let mut fuzzy = Vec::new();
             for entry in &self.available_models {
                 let full = format!("{}/{}", entry.model.provider, entry.model.id);
@@ -3030,20 +3161,21 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         matches.dedup_by(|a, b| model_entry_matches(a, b));
 
         if matches.is_empty()
-            && let Some((provider, model_id)) = pattern.split_once('/')
+            && let Some((provider, model_id)) = provider_scoped_pattern
         {
-            let provider = normalize_auth_provider_input(provider);
-            let model_id = model_id.trim();
-            if !provider.is_empty()
-                && !model_id.is_empty()
-                && let Some(entry) = crate::models::ad_hoc_model_entry(&provider, model_id)
-            {
-                matches.push(entry);
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => matches.extend(entry),
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
             }
         }
 
         if matches.is_empty() {
-            self.status_message = Some(format!("Model not found: {pattern}"));
+            self.status_message = Some(format!(
+                "Model not found: {pattern}. Use /model to inspect registered provider/model pairs."
+            ));
             return None;
         }
         if matches.len() > 1 {
@@ -3067,7 +3199,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let next = matches.pop().expect("matches is exactly length 1 here");
 
-        let resolved_key_opt = resolve_model_key_from_default_auth(&next);
+        let resolved_key_opt = resolve_model_key_from_default_auth(&next, &self.cwd);
         if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
             self.status_message = Some(format!(
                 "Missing credentials for provider {}. Run /login {}.",
@@ -3084,13 +3216,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
-            Ok(provider_impl) => provider_impl,
-            Err(err) => {
-                self.status_message = Some(err.to_string());
-                return None;
-            }
-        };
+        let provider_impl =
+            match create_runtime_provider(&next, self.extensions.as_ref(), &self.cwd) {
+                Ok(provider_impl) => provider_impl,
+                Err(err) => {
+                    self.status_message = Some(err.to_string());
+                    return None;
+                }
+            };
 
         if let Err(message) =
             self.switch_active_model(&next, provider_impl, resolved_key_opt.as_deref(), "command")
@@ -3115,26 +3248,33 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// bd-cv653.3.1). Records the override in app state and appends a
     /// role-tagged `ModelChange` entry so the assignment replays.
     fn assign_model_to_role(&mut self, role: ModelRole, pattern: &str) -> Option<Cmd> {
-        let mut found: Option<ModelEntry> = None;
-        for entry in &self.available_models {
-            let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern)
-                || entry.model.id.eq_ignore_ascii_case(pattern)
-                || split_provider_model_spec(pattern).is_some_and(|(provider, model_id)| {
-                    provider_ids_match(&entry.model.provider, provider)
-                        && entry.model.id.eq_ignore_ascii_case(model_id)
-                })
-            {
-                found = Some(entry.clone());
-                break;
+        let qualified = match split_provider_model_spec(pattern) {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
             }
-        }
+            None => None,
+        };
+        let mut found = qualified.or_else(|| {
+            self.available_models
+                .iter()
+                .find(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                .cloned()
+        });
         if found.is_none()
             && let Some((provider, model_id)) = split_provider_model_spec(pattern)
         {
-            let provider = normalize_auth_provider_input(provider);
-            if !provider.is_empty() && !model_id.trim().is_empty() {
-                found = crate::models::ad_hoc_model_entry(&provider, model_id.trim());
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => found = entry,
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
             }
         }
         let Some(entry) = found else {
@@ -3178,15 +3318,119 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn handle_slash_prewalk(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message =
+                Some("Wait for the current turn before changing prewalk".to_string());
+            return None;
+        }
+        let Ok(mut agent) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        match args.trim() {
+            "off" => {
+                agent.handle.disarm_prewalk();
+                self.status_message = Some("Prewalk disarmed".to_string());
+                return None;
+            }
+            "status" => {
+                self.status_message = Some(agent.handle.prewalk_target().map_or_else(
+                    || "Prewalk is not armed".to_string(),
+                    |target| format!("Prewalk armed → {}", target.label()),
+                ));
+                return None;
+            }
+            "" => {}
+            _ => {
+                self.status_message = Some("Usage: /prewalk [status|off]".to_string());
+                return None;
+            }
+        }
+        let target = if let Some(target) = agent.handle.prewalk_target() {
+            target.clone()
+        } else {
+            let spec = self
+                .role_model_overrides
+                .get(&ModelRole::Smol)
+                .map(|(provider, model)| format!("{provider}/{model}"))
+                .or_else(|| {
+                    self.config
+                        .model_roles
+                        .as_ref()
+                        .and_then(|roles| roles.smol.clone())
+                });
+            let Some(spec) = spec else {
+                self.status_message = Some(
+                    "Prewalk requires a configured @smol model; use /model smol provider/model"
+                        .to_string(),
+                );
+                return None;
+            };
+            let Some(registry) = agent.handle.session().model_registry() else {
+                self.status_message = Some("Prewalk requires a model registry".to_string());
+                return None;
+            };
+            match crate::app::resolve_prewalk_model_spec(&spec, &self.config, registry, &self.cwd) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.status_message = Some(format!("Prewalk: {error}"));
+                    return None;
+                }
+            }
+        };
+        let owner = self.displayed_session_id.clone();
+        drop(agent);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let note = match OwnedMutexGuard::lock(agent, &cx).await {
+                Ok(mut agent) => {
+                    let current = agent
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await;
+                    if current.ok().as_ref() != owner.as_ref() {
+                        return;
+                    }
+                    match agent.handle.arm_prewalk(target).await {
+                        Ok(Some(target)) => format!("Prewalk armed → {}", target.label()),
+                        Ok(None) => {
+                            "Prewalk: nothing to switch; target model and thinking already match"
+                                .to_string()
+                        }
+                        Err(error) => format!("Prewalk: {error}"),
+                    }
+                }
+                Err(error) => format!("Prewalk: {error}"),
+            };
+            let _ = enqueue_pi_event(&event_tx, &cx, PiMsg::SystemNote(note)).await;
+        });
+        self.status_message = Some("Arming prewalk...".to_string());
+        None
+    }
+
     fn handle_slash_plan(&mut self, args: &str) -> Option<Cmd> {
         let sub = args.trim().to_ascii_lowercase();
-        let plan_state = {
+        let (plan_state, builtins_disabled) = {
             let Ok(agent_guard) = self.agent.try_lock() else {
                 self.status_message = Some("Agent busy; try again".to_string());
                 return None;
             };
-            agent_guard.plan_state()
+            (
+                agent_guard.plan_state(),
+                agent_guard.shared_tools().snapshot().builtins_disabled(),
+            )
         };
+        if builtins_disabled && matches!(sub.as_str(), "" | "on" | "start") {
+            self.status_message = Some(
+                "[PLAN_TOOLS_DISABLED] Plan mode is unavailable while built-in tools are disabled"
+                    .to_string(),
+            );
+            return None;
+        }
         match sub.as_str() {
             "" | "on" | "start" => self.enter_plan_mode(&plan_state),
             "status" => {
@@ -3260,14 +3504,101 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_handoff(&mut self, args: &str) -> Option<Cmd> {
-        let report = {
-            let Ok(session_guard) = self.session.try_lock() else {
-                self.status_message = Some("Session busy; try again".to_string());
+        use super::workspace_reports::HandoffMode;
+        let focus = match super::workspace_reports::handoff_mode(args) {
+            Ok(HandoffMode::InPlace(focus)) => focus.to_string(),
+            Ok(HandoffMode::Report(args)) => {
+                let report = {
+                    let Ok(session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    super::workspace_reports::handoff(&session_guard, args)
+                };
+                self.show_workspace_report(report);
                 return None;
-            };
-            super::workspace_reports::handoff(&session_guard, args)
+            }
+            Ok(HandoffMode::ModelPreview(_)) => {
+                self.status_message = Some(
+                    "Model preview/export is available in the default terminal; use /handoff [focus] here to compact this session".to_string(),
+                );
+                return None;
+            }
+            Ok(HandoffMode::Import(_)) => {
+                self.status_message = Some(
+                    "Handoff bundle import is available in the default terminal with /handoff --import".to_string(),
+                );
+                return None;
+            }
+            Err(error) => {
+                self.status_message = Some(error.to_string());
+                return None;
+            }
         };
-        self.show_workspace_report(report);
+        if self.agent_state != AgentState::Idle
+            || self.bash_running
+            || self.agent.try_lock().is_err()
+        {
+            self.status_message =
+                Some("Handoff is available after the current request finishes".to_string());
+            return None;
+        }
+        let Some(owner_session_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone())
+        else {
+            self.status_message = Some("Handoff unavailable: session is busy".to_string());
+            return None;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.handoff_request_id = Some(request_id.clone());
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.extension_compacting.store(true, Ordering::SeqCst);
+        self.status_message = Some("Preparing in-place handoff (Esc to cancel)...".to_string());
+        let owner = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let event = match OwnedMutexGuard::lock(owner, &cx).await {
+                Ok(mut owner) => {
+                    match owner
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await
+                    {
+                        Ok(current) if current == owner_session_id => {
+                            super::workspace_reports::run_in_place_handoff(
+                                &mut owner.handle,
+                                &focus,
+                                &abort_signal,
+                            )
+                            .await
+                        }
+                        Ok(_) => PiMsg::AgentError(
+                            "Handoff cancelled: the session changed before it started".to_string(),
+                        ),
+                        Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+                    }
+                }
+                Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+            };
+            // Drop the Agent owner before the UI applies its terminal reset.
+            // Delivery uses a fresh context even after owner cancellation.
+            let _ = enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::HandoffFinished {
+                    request_id,
+                    event: Box::new(event),
+                },
+            )
+            .await;
+        });
+        self.scroll_to_bottom();
         None
     }
 
@@ -3383,13 +3714,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// written to the session JSONL: the call builds a throwaway message
     /// list that shares nothing with the session writer.
     pub(super) fn handle_slash_btw(&mut self, args: &str) -> Option<Cmd> {
-        // Lock scope computes the outcome; self mutations happen after the
-        // guard drops.
-        enum BtwPrepared {
-            Ready { context: String, question: String },
-            TransformRefused { message: String },
-            AgentBusy,
-        }
         let Some(client) = self.btw_client.clone() else {
             self.status_message = Some(
                 "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)"
@@ -3404,46 +3728,35 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.scroll_to_bottom();
             return None;
         }
-        // Context + question get the SAME outbound hygiene as the main
-        // provider path: the live message list carries raw user text (the
-        // vault only rewrites the outbound clone), and the smol role can be
-        // a different vendor entirely. Block mode refuses here too.
-        let prepared = self.agent.try_lock().map_or(
-            // Contended agent lock: answer without context, but say so —
-            // a silent empty context reads as a model failure.
-            BtwPrepared::AgentBusy,
-            |mut agent| {
-                let snapshot = agent.messages().to_vec();
-                let summary = pi::btw::build_context_summary(&snapshot);
-                let transformed =
-                    agent
-                        .secrets_transform_outbound_text(&summary)
-                        .and_then(|context| {
-                            agent
-                                .secrets_transform_outbound_text(&question)
-                                .map(|question| (context, question))
-                        });
-                match transformed {
-                    Ok((context, question)) => BtwPrepared::Ready { context, question },
-                    Err(err) => BtwPrepared::TransformRefused {
-                        message: format!("/btw refused: {err}"),
-                    },
-                }
-            },
-        );
-        let (context, question) = match prepared {
-            BtwPrepared::Ready { context, question } => (context, question),
-            BtwPrepared::TransformRefused { message } => {
-                self.status_message = Some(message);
+        if question
+            .len()
+            .saturating_add(pi::btw::BTW_SYSTEM_PROMPT.len())
+            > pi::text_completion::MAX_INPUT_BYTES
+        {
+            self.status_message = Some(
+                "/btw refused: PI_AUXILIARY_INPUT_LIMIT: side question exceeds the privacy scan budget"
+                    .to_string(),
+            );
+            self.scroll_to_bottom();
+            return None;
+        }
+        // Screen complete source fields and the question before clipping;
+        // a busy agent defers preparation until its remembered credentials
+        // are available. Only bounded protected text reaches the provider.
+        let prepared = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|agent| client.prepare_with_agent(&agent, &question));
+        let agent_busy = prepared.is_none();
+        let request = match prepared {
+            Some(Ok(request)) => Some(request),
+            Some(Err(err)) => {
+                self.status_message = Some(format!("/btw refused: {err}"));
                 self.scroll_to_bottom();
                 return None;
             }
-            BtwPrepared::AgentBusy => {
-                self.status_message = Some(String::from(
-                    "(/btw) agent busy — answering without conversation context",
-                ));
-                (String::new(), question)
-            }
+            None => None,
         };
         // asupersync TryLockError carries the guard, so the match temporary
         // would pin the immutable borrow across self mutations (bd-9x70g
@@ -3459,15 +3772,42 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
-            content: format!("(/btw) {question}"),
+            content: if agent_busy {
+                format!("(/btw) {question} — queued until the current turn finishes")
+            } else {
+                format!("(/btw) {question}")
+            },
             thinking: None,
             collapsed: false,
         });
-        self.status_message = Some("(/btw) thinking...".to_string());
+        self.status_message = Some(if agent_busy {
+            "(/btw) waiting for the current turn...".to_string()
+        } else {
+            "(/btw) thinking...".to_string()
+        });
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let session = Arc::clone(&self.session);
         runtime.spawn(async move {
-            let result = client.ask(&context, &question).await;
+            let result = async {
+                let request = if let Some(request) = request {
+                    request
+                } else {
+                    let cx = Cx::for_request();
+                    let agent = OwnedMutexGuard::lock(agent, &cx).await?;
+                    let live_session = OwnedMutexGuard::lock(session, &cx).await?;
+                    if live_session.header.id != owner_session_id {
+                        return Err(pi::error::Error::validation(
+                            "PI_AUXILIARY_SESSION_CHANGED: side question cancelled after session switch",
+                        ));
+                    }
+                    drop(live_session);
+                    client.prepare_with_agent(&agent, &question)?
+                };
+                client.ask_prepared(request).await
+            }
+            .await;
             // Display-only delivery via the UI event channel; the session
             // writer never sees this message.
             // SessionSystemNote is display-only. PiMsg::System/AgentError
@@ -3509,7 +3849,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// parent agent's next idle turn boundary.
     pub(super) fn handle_slash_tan(&mut self, args: &str) -> Option<Cmd> {
         enum TanGate {
-            Enabled,
+            Enabled(Option<pi::tools::ToolModelSelection>),
             Disabled,
             Busy,
         }
@@ -3523,12 +3863,12 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
             if agent.has_tool("subagent") {
-                TanGate::Enabled
+                TanGate::Enabled(agent.shared_tools().snapshot().model_scope().current())
             } else {
                 TanGate::Disabled
             }
         });
-        match gate {
+        let parent_model = match gate {
             TanGate::Busy => {
                 self.status_message = Some("/tan unavailable: agent session is busy".to_string());
                 self.scroll_to_bottom();
@@ -3542,8 +3882,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
                 return None;
             }
-            TanGate::Enabled => {}
-        }
+            TanGate::Enabled(model) => model,
+        };
 
         // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
         let (owner_session_id, session_busy) = self.session.try_lock().map_or_else(
@@ -3557,7 +3897,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
-            .with_role_model_spec(pi::app::subagent_role_spec(&self.config));
+            .with_role_model_spec(pi::app::subagent_role_spec(&self.config))
+            .with_parent_model(parent_model);
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
@@ -3651,33 +3992,78 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
-        let report = super::workspace_reports::review(&self.cwd, args);
-        self.show_workspace_report(report);
+        if self.agent_state != AgentState::Idle {
+            self.status_message =
+                Some("Review is available after the current request finishes".to_string());
+            return None;
+        }
+        let prepared = self
+            .agent
+            .try_lock()
+            .map_err(|_| pi::error::Error::validation("agent is busy"))
+            .and_then(|agent| super::workspace_reports::prepare_review(&self.cwd, args, &agent));
+        let request = match prepared {
+            Ok(request) => request,
+            Err(error) => {
+                self.status_message = Some(format!("Review failed: {error}"));
+                return None;
+            }
+        };
+        let owner = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone());
+        let Some(owner_session_id) = owner else {
+            self.status_message = Some("Review unavailable: session is busy".to_string());
+            return None;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.review_request_id = Some(request_id.clone());
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.status_message =
+            Some("Reviewing text changes with the current model (Esc to cancel)...".to_string());
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let report = request.run(Some(&abort_signal)).await;
+            let message = report.card.unwrap_or(report.status);
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::ReviewFinished {
+                    owner_session_id,
+                    request_id,
+                    message,
+                },
+            )
+            .await;
+        });
+        self.scroll_to_bottom();
         None
     }
 
     /// Switch the active model to a role-resolved spec when one is configured.
-    fn switch_to_role_spec(&mut self, spec: &str, source: &str) {
-        let Some((provider, model_id)) = crate::provider_metadata::split_provider_model_spec(spec)
-        else {
-            return;
-        };
+    fn switch_to_role_spec(&mut self, spec: &str, source: &str) -> Result<(), String> {
+        let (provider, model_id) = split_provider_model_spec(spec).ok_or_else(|| {
+            format!("Invalid model {spec}. Use /model to choose a provider/model pair")
+        })?;
         let entry = self
-            .available_models
-            .iter()
-            .find(|m| {
-                crate::provider_metadata::provider_ids_match(&m.model.provider, provider)
-                    && m.model.id.eq_ignore_ascii_case(model_id)
-            })
-            .cloned()
-            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
-        if let Some(entry) = entry {
-            let key = resolve_model_key_from_default_auth(&entry);
-            if let Ok(provider_impl) = providers::create_provider(&entry, self.extensions.as_ref())
-            {
-                let _ = self.switch_active_model(&entry, provider_impl, key.as_deref(), source);
-            }
+            .requested_model_entry(provider, model_id, true)?
+            .ok_or_else(|| {
+                format!("Model not found: {spec}. Use /model to inspect registered models")
+            })?;
+        let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
+        if model_requires_configured_credential(&entry) && key.is_none() {
+            return Err(format!(
+                "Missing credentials for provider {}. Run /login {}",
+                entry.model.provider, entry.model.provider
+            ));
         }
+        let provider_impl = create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
+            .map_err(|error| error.to_string())?;
+        self.switch_active_model(&entry, provider_impl, key.as_deref(), source)
     }
 
     fn enter_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
@@ -3691,15 +4077,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         plan_state.enter_planning();
         plan_state
             .stash_previous_model(&self.model_entry.model.provider, &self.model_entry.model.id);
-        if let Some(spec) = self
+        let model_warning = if let Some(spec) = self
             .config
             .model_roles
             .as_ref()
             .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
             .map(str::to_string)
         {
-            self.switch_to_role_spec(&spec, "plan-role");
-        }
+            self.switch_to_role_spec(&spec, "plan-role").err()
+        } else {
+            None
+        };
         Self::log_plan_transition(&self.session, "planning");
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
@@ -3707,7 +4095,15 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             thinking: None,
             collapsed: false,
         });
-        self.status_message = Some("Plan mode: planning (read-only)".to_string());
+        self.status_message = Some(model_warning.map_or_else(
+            || "Plan mode: planning (read-only)".to_string(),
+            |error| {
+                format!(
+                    "Plan mode: planning (read-only). {error}. Continuing with {}",
+                    session_model_line(&self.model_entry)
+                )
+            },
+        ));
         self.scroll_to_bottom();
     }
 
@@ -3725,11 +4121,26 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
                     )));
                 }
-                if let Some((provider, model_id)) = plan_state.take_previous_model() {
-                    self.switch_to_role_spec(&format!("{provider}/{model_id}"), "plan-restore");
-                }
+                let model_warning =
+                    plan_state
+                        .take_previous_model()
+                        .and_then(|(provider, model_id)| {
+                            self.switch_to_role_spec(
+                                &format!("{provider}/{model_id}"),
+                                "plan-restore",
+                            )
+                            .err()
+                        });
                 Self::log_plan_transition(&self.session, "approved");
-                self.status_message = Some("Plan approved — execute it.".to_string());
+                self.status_message = Some(model_warning.map_or_else(
+                    || "Plan approved — execute it.".to_string(),
+                    |error| {
+                        format!(
+                            "Plan approved. {error}. Continuing with {}",
+                            session_model_line(&self.model_entry)
+                        )
+                    },
+                ));
             }
             None => {
                 self.status_message = Some("No submitted plan to approve".to_string());
@@ -3948,15 +4359,20 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         }
                     }
 
-                    let models_error =
-                        match crate::auth::AuthStorage::load_async(Config::auth_path()).await {
-                            Ok(auth) => {
-                                let models_path = default_models_path(&Config::global_dir());
-                                let registry = ModelRegistry::load(&auth, Some(models_path));
-                                registry.error().map(ToString::to_string)
-                            }
-                            Err(err) => Some(format!("Failed to load auth.json: {err}")),
-                        };
+                    let auth_result = crate::auth::AuthStorage::load_async(Config::auth_path())
+                        .await
+                        .and_then(|mut auth| {
+                            auth.set_command_working_directory(&cwd)?;
+                            Ok(auth)
+                        });
+                    let models_error = match auth_result {
+                        Ok(auth) => {
+                            let models_path = default_models_path(&Config::global_dir());
+                            let registry = ModelRegistry::load(&auth, Some(models_path));
+                            registry.error().map(ToString::to_string)
+                        }
+                        Err(err) => Some(format!("Failed to load auth.json: {err}")),
+                    };
 
                     let (diagnostics, diag_count) =
                         build_reload_diagnostics(models_error, &resources);
@@ -4015,17 +4431,23 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             });
             return None;
         };
+        let trimmed = args.trim();
+        if let Some((verb @ ("reauth" | "unauth"), name)) = trimmed.split_once(char::is_whitespace)
+        {
+            return self.mcp_handle_auth(&manager, verb, name.trim());
+        }
         let mut parts = args.split_whitespace();
         let subcommand = parts.next().unwrap_or("list");
         let rest: Vec<&str> = parts.collect();
         match subcommand {
+            "reauth" | "unauth" => self.mcp_handle_auth(&manager, subcommand, ""),
             "list" => self.mcp_handle_list(&manager),
             "add" => self.mcp_handle_add(&rest),
             "remove" => self.mcp_handle_remove(&rest),
             "trust" | "deny" | "test" => self.mcp_handle_action(&manager, subcommand, &rest),
             other => {
                 self.status_message = Some(format!(
-                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny"
+                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny|reauth|unauth"
                 ));
                 None
             }
@@ -4101,7 +4523,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         };
         let path = self.cwd.join(".pi/mcp.json");
         let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
-            value["mcpServers"][&name] = entry_value;
+            crate::mcp::config::insert_project_server(&mut value, &name, entry_value)?;
             crate::mcp::config::write_project_config(&path, &value)
         });
         match result {
@@ -4132,9 +4554,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let name = (*name).to_string();
         let path = self.cwd.join(".pi/mcp.json");
         let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
-            if let Some(servers) = value["mcpServers"].as_object_mut()
-                && servers.remove(&name).is_none()
-            {
+            if !crate::mcp::config::remove_project_server(&mut value, &name) {
                 return Err(crate::error::Error::tool(
                     "mcp",
                     format!("[MCP_UNKNOWN_SERVER] {name:?} is not in {}", path.display()),
@@ -4159,8 +4579,91 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    /// Browser login is an operator action, with the same abort lane as a turn.
+    /// No agent lock is held while the callback waits for the browser.
+    fn mcp_handle_auth(
+        &mut self,
+        manager: &std::sync::Arc<crate::mcp::McpManager>,
+        subcommand: &str,
+        name: &str,
+    ) -> Option<Cmd> {
+        if name.is_empty() || name.contains(['\r', '\n']) {
+            self.status_message = Some(format!("usage: /mcp {subcommand} <name>"));
+            return None;
+        }
+        if self.agent_state != AgentState::Idle || self.bash_running {
+            self.status_message = Some("MCP authentication needs an idle session".to_string());
+            return None;
+        }
+        let name = name.to_string();
+        let subcommand = subcommand.to_string();
+        let manager = Arc::clone(manager);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some(format!("MCP {subcommand} {name:?} (Esc to cancel)…"));
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.mcp_auth_request_id = Some(request_id.clone());
+        self.runtime_handle.spawn(async move {
+            let output_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_failed = Arc::clone(&output_failed);
+            let callback_tx = event_tx.clone();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                if callback_tx.try_send(PiMsg::SystemNote(format!(
+                    "Open this URL to sign in to the MCP server:\n{url}\n"
+                ))).is_err() {
+                    callback_failed.store(true, Ordering::Release);
+                }
+            });
+            let work = owner.with_current(async {
+                if subcommand == "reauth" {
+                    manager.reauthenticate(&name, None, on_url).await
+                } else {
+                    manager.unauthenticate(&name).await
+                }
+            });
+            let cancelled = async {
+                while !abort_signal.is_aborted()
+                    && !owner.is_cancel_requested()
+                    && !output_failed.load(Ordering::Acquire)
+                {
+                    owner.time().sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            let outcome = match futures::future::select(
+                Box::pin(cancelled), Box::pin(work),
+            ).await {
+                futures::future::Either::Left(((), pending)) => {
+                    drop(pending);
+                    Err(crate::error::Error::tool(
+                        "mcp", "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
+                    ))
+                }
+                futures::future::Either::Right((result, _)) => result,
+            };
+            let cleanup = Cx::for_request();
+            if let Ok(agent) = agent.lock(&cleanup).await {
+                crate::mcp::reconcile_tools(&manager, &agent.shared_tools());
+            }
+            let message = match outcome {
+                Ok(()) if subcommand == "unauth" =>
+                    format!("Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."),
+                Ok(()) => format!("Signed in to MCP server {name:?}; its tool catalog has been refreshed."),
+                Err(error) => format!("MCP {name:?}: {error}"),
+            };
+            let _ = enqueue_pi_event(
+                &event_tx, &cleanup, PiMsg::McpAuthFinished { request_id, message },
+            ).await;
+        });
+        None
+    }
+
     /// `/mcp trust|deny|test <name>` — async via the runtime, reporting back
     /// as a system message; newly available tools mount into the live agent.
+    #[allow(clippy::option_if_let_else)]
     fn mcp_handle_action(
         &mut self,
         manager: &std::sync::Arc<crate::mcp::McpManager>,
@@ -4186,18 +4689,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 "test" => manager.test(&name).await,
                 _ => manager.trust(&name).await,
             };
+            // A refreshed catalog replaces old definitions and removes tools
+            // no longer admitted, including deny and failed discovery. Take
+            // the Agent lock so publication occurs between its active turns.
+            let changed = if let Ok(agent) = agent.lock(&task_cx).await {
+                crate::mcp::reconcile_tools(&manager, &agent.shared_tools())
+            } else {
+                0
+            };
             let message = match outcome {
                 Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
                 Ok(tools) => {
-                    // Mount any newly available tools into the live agent
-                    // (extend_tools invalidates the def cache).
-                    let wrappers = crate::mcp::mount_tools(&manager);
-                    let mounted = wrappers.len();
-                    if mounted > 0
-                        && let Ok(mut agent) = agent.lock(&task_cx).await
-                    {
-                        agent.extend_tools(wrappers);
-                    }
                     let verb = if subcommand == "test" {
                         "tested"
                     } else {
@@ -4213,10 +4715,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     if tools.len() > 12 {
                         let _ = writeln!(line, "  … and {} more", tools.len() - 12);
                     }
-                    if mounted > 0 {
+                    if changed > 0 {
                         let _ = writeln!(
                             line,
-                            "Mounted {mounted} mcp__* tool(s) into the live session."
+                            "Updated {changed} MCP tool definition(s) in the live session."
                         );
                     }
                     line
@@ -4328,9 +4830,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             if !text.trim().is_empty() {
                 content.push(ContentBlock::Text(TextContent::new(text)));
             }
-            for image in processed.images {
-                content.push(ContentBlock::Image(image));
-            }
+            content.extend(processed.attachments);
 
             if content.is_empty() {
                 self.status_message =
@@ -4372,7 +4872,7 @@ mod tests {
     use crate::extensions::ExtensionManager;
     use crate::keybindings::KeyBindings;
     use crate::model::{Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage};
-    use crate::models::{ExtensionProviderBinding, ModelEntry};
+    use crate::models::{ExtensionProviderBinding, ModelEntry, ModelRole};
     use crate::package_manager::PackageManager;
     use crate::provider::{Context, Provider, StreamOptions};
     use crate::provider::{InputType, Model, ModelCost};
@@ -4985,6 +5485,108 @@ mod tests {
     }
 
     #[test]
+    fn classic_fork_preserves_a_lazy_sources_attached_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture = runtime().block_on(crate::session::fork_tests::workspace_fixture(
+            temp.path(),
+            true,
+        ));
+        let source = Arc::new(Mutex::new(fixture.source.clone()));
+        let (mut app, mut event_rx) = build_bash_test_app(source, &fixture.bound_cwd);
+
+        let _ = app.handle_slash_fork(&fixture.target_id);
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("fork event before timeout")
+            .expect("fork event")
+        });
+        assert!(
+            matches!(terminal, PiMsg::ConversationReset { .. }),
+            "unexpected fork event: {terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(app.cwd, fixture.bound_cwd);
+        let fork_path = {
+            let fork = app.session.try_lock().expect("forked session");
+            fixture.assert_workspace(&fork);
+            fixture.assert_selected_context(&fork);
+            fork.path.clone().expect("persisted fork path")
+        };
+        let saved = runtime()
+            .block_on(Session::open(fork_path.to_str().expect("UTF-8 fork path")))
+            .expect("reopen classic fork");
+        fixture.assert_workspace(&saved);
+        fixture.assert_selected_context(&saved);
+        assert_eq!(
+            std::fs::read(&fixture.source_file).expect("unchanged source"),
+            fixture.source_bytes
+        );
+    }
+
+    #[test]
+    fn classic_fork_rejects_a_newer_attachment_outside_its_runtime_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        // Saving the fixture's source initializes its own `sessions` index
+        // namespace, so build it apart from the store a fork would write to.
+        let fixture_root = temp.path().join("fixture");
+        std::fs::create_dir(&fixture_root).expect("fixture root");
+        let fixture = runtime().block_on(crate::session::fork_tests::workspace_fixture(
+            &fixture_root,
+            true,
+        ));
+        let runtime_cwd = fixture_root
+            .join("previous-workspace")
+            .canonicalize()
+            .expect("runtime workspace");
+        assert_eq!(
+            crate::session_workdir::require_session_workdir(&fixture.source)
+                .expect("lazy active branch still sees its earlier binding"),
+            runtime_cwd
+        );
+        let mut live_source = fixture.source.clone();
+        live_source.session_dir = Some(temp.path().join("sessions"));
+        let source = Arc::new(Mutex::new(live_source));
+        let (mut app, mut event_rx) = build_bash_test_app(source, &runtime_cwd);
+        let source_id = current_session_id(&app);
+
+        let _ = app.handle_slash_fork(&fixture.target_id);
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("fork error before timeout")
+            .expect("fork error")
+        });
+        assert!(
+            matches!(&terminal, PiMsg::AgentError(error) if error.contains("PI_SESSION_WORKDIR_MISMATCH")),
+            "unexpected fork event: {terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(&app), source_id);
+        assert_eq!(app.cwd, runtime_cwd);
+        let source = app.session.try_lock().expect("unchanged source session");
+        assert_eq!(source.leaf_id(), fixture.source.leaf_id());
+        assert_eq!(source.entries.len(), fixture.source.entries.len());
+        assert!(!temp.path().join("sessions").exists());
+        assert_eq!(
+            std::fs::read(&fixture.source_file).expect("unchanged source"),
+            fixture.source_bytes
+        );
+    }
+
+    #[test]
     fn fork_rejects_staged_old_session_delivery() {
         let temp = TempDir::new().expect("tempdir");
         let mut raw_session = Session::in_memory();
@@ -5129,6 +5731,81 @@ mod tests {
                 ..
             }) if text == "old-agent-history"
         ));
+    }
+
+    #[test]
+    fn new_session_keeps_the_live_workspace_with_or_without_extensions() {
+        let temp = TempDir::new().expect("tempdir");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        for with_extensions in [false, true] {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, mut event_rx) = build_bash_test_app(session, temp.path());
+            let original_id = current_session_id(&app);
+            if with_extensions {
+                app.extensions = Some(crate::extensions::ExtensionManager::default());
+            }
+            let _ = app.handle_slash_command(SlashCommand::New, "");
+            if with_extensions {
+                let terminal = runtime().block_on(async {
+                    let cx = Cx::for_testing();
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(10),
+                        event_rx.recv(&cx),
+                    )
+                    .await
+                    .expect("new-session event before timeout")
+                    .expect("new-session event")
+                });
+                assert!(matches!(terminal, PiMsg::ConversationReset { .. }));
+                let _ = app.handle_pi_message(terminal);
+            }
+            assert_ne!(current_session_id(&app), original_id);
+            assert_eq!(
+                app.session.try_lock().expect("session lock").header.cwd,
+                temp.path().display().to_string()
+            );
+            assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
+        }
+    }
+
+    #[test]
+    fn resume_rejects_another_workspace_without_replacing_the_active_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let other = temp.path().join("other-workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+        target.header.cwd = other.display().to_string();
+        runtime().block_on(target.save()).expect("save target");
+        let path = target.path.clone().expect("target path");
+        let original_bytes = std::fs::read(&path).expect("original target bytes");
+        let source = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(source, temp.path());
+        let original_id = current_session_id(&app);
+
+        let _ = app.load_session_from_path(path.to_str().expect("UTF-8 target path"));
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("resume event before timeout")
+            .expect("resume event")
+        });
+        assert!(matches!(
+            &terminal,
+            PiMsg::AgentError(message) if message.contains("PI_SESSION_WORKDIR_MISMATCH")
+        ));
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(&app), original_id);
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged target"),
+            original_bytes
+        );
     }
 
     #[test]
@@ -5279,6 +5956,247 @@ mod tests {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    #[test]
+    fn classic_model_switch_restores_catalog_image_capability_and_original_images() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        app.save_enabled = false;
+        let image_message = ModelMessage::User(UserMessage {
+            content: UserContent::Blocks(vec![crate::model::ContentBlock::Image(
+                crate::model::ImageContent {
+                    data: "aW1hZ2U=".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            )]),
+            timestamp: 17,
+        });
+        let original = serde_json::to_value(&image_message).expect("native image message");
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .add_message(image_message);
+        let mut vision = test_model_entry("dummy", "vision-model");
+        vision.model.input.push(InputType::Image);
+        let text = test_model_entry("dummy", "text-model");
+
+        for entry in [&vision, &text, &vision] {
+            let provider = crate::providers::create_provider(entry, None).expect("provider");
+            app.switch_active_model(entry, provider, entry.api_key.as_deref(), "command")
+                .expect("switch model");
+            let mut agent = app.agent.try_lock().expect("agent after switch");
+            let accepts_images = entry.model.input.contains(&InputType::Image);
+            assert_eq!(agent.model_accepts_images(), accepts_images);
+            let request = agent.request_context_json();
+            assert_eq!(
+                request["messages"][0]["content"][0]["type"],
+                if accepts_images { "image" } else { "text" },
+            );
+            assert_eq!(
+                serde_json::to_value(&agent.messages()[0]).unwrap(),
+                original,
+                "model switching must preserve the native image for later vision turns",
+            );
+        }
+    }
+
+    #[test]
+    fn classic_session_selection_restores_images_even_when_provider_already_matches() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let mut vision = test_model_entry("dummy", "vision-model");
+        vision.model.input.push(InputType::Image);
+        let text = test_model_entry("dummy", "text-model");
+        app.available_models = vec![vision.clone(), text.clone()];
+
+        for entry in [&vision, &text, &vision] {
+            {
+                let mut stored = session.try_lock().expect("session");
+                stored.header.provider = Some(entry.model.provider.clone());
+                stored.header.model_id = Some(entry.model.id.clone());
+            }
+            app.sync_runtime_selection_from_session_header()
+                .expect("restore session selection");
+            let accepts_images = entry.model.input.contains(&InputType::Image);
+            let provider = {
+                let mut agent = app.agent.try_lock().expect("restored agent");
+                assert_eq!(agent.provider().model_id(), entry.model.id);
+                assert_eq!(agent.model_accepts_images(), accepts_images);
+                agent.set_model_accepts_images(!accepts_images);
+                agent.provider()
+            };
+
+            app.sync_runtime_selection_from_session_header()
+                .expect("repair capability without replacing the provider");
+            let agent = app.agent.try_lock().expect("reconciled agent");
+            assert!(Arc::ptr_eq(&provider, &agent.provider()));
+            assert_eq!(agent.model_accepts_images(), accepts_images);
+        }
+    }
+
+    #[test]
+    fn classic_model_commands_switch_declared_aliases_without_losing_the_route() {
+        for reverse in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+            app.save_enabled = false;
+            let mut native = test_model_entry("openrouter", "vendor/shared");
+            native.model.api = "openai-completions".to_string();
+            native
+                .headers
+                .insert("x-route".to_string(), "native".to_string());
+            let mut custom = native.clone();
+            custom.model.provider = "open-router".to_string();
+            custom.model.base_url = "https://declared.example.test/v1".to_string();
+            custom
+                .headers
+                .insert("x-route".to_string(), "declared".to_string());
+            let mut catalog = vec![native.clone(), custom.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            app.available_models = catalog.clone();
+            app.agent
+                .try_lock()
+                .expect("agent")
+                .handle
+                .session_mut()
+                .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                    catalog,
+                ));
+            for target in [&native, &custom, &native] {
+                let spec = format!("{}/{}", target.model.provider, target.model.id);
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(app.model_entry.model.provider, target.model.provider);
+                assert_eq!(app.model_entry.model.base_url, target.model.base_url);
+                assert_eq!(app.model_entry.headers, target.headers);
+                let running = {
+                    let agent = app.agent.try_lock().expect("running agent");
+                    assert_eq!(agent.provider().name(), target.model.provider);
+                    assert_eq!(agent.provider().model_id(), target.model.id);
+                    assert_eq!(agent.stream_options().headers, target.headers);
+                    agent.provider()
+                };
+                let before = session.try_lock().expect("session").entries.len();
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(session.try_lock().expect("session").entries.len(), before);
+                assert!(Arc::ptr_eq(
+                    &running,
+                    &app.agent.try_lock().expect("agent").provider()
+                ));
+                assert_eq!(
+                    session
+                        .try_lock()
+                        .expect("session")
+                        .effective_model_for_current_path(),
+                    Some((target.model.provider.clone(), target.model.id.clone())),
+                );
+            }
+            let _ = app.handle_slash_model("plan open-router/vendor/shared");
+            assert_eq!(
+                app.role_model_overrides.get(&ModelRole::Plan),
+                Some(&("open-router".to_string(), "vendor/shared".to_string())),
+            );
+            app.switch_to_role_spec("open-router/vendor/shared", "plan-role")
+                .expect("switch to the declared plan model");
+            assert_eq!(app.model_entry.model.provider, "open-router");
+            assert_eq!(app.model_entry.headers, custom.headers);
+
+            // A branch/extension selection must reach the same runtime route.
+            session
+                .try_lock()
+                .expect("session")
+                .append_model_change(native.model.provider.clone(), native.model.id.clone());
+            app.sync_runtime_selection_from_session_header()
+                .expect("restore exact provider");
+            assert_eq!(app.model_entry.model.provider, "openrouter");
+            assert_eq!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .stream_options()
+                    .headers,
+                native.headers
+            );
+        }
+    }
+
+    #[test]
+    fn classic_explicit_resolution_keeps_providers_hidden_from_the_ready_picker() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let native = test_model_entry("openrouter", "vendor/shared");
+        let mut custom = test_model_entry("open-router", "vendor/shared");
+        custom.api_key = None;
+        custom.model.base_url = "https://unready-declared.example.test/v1".to_string();
+        let mut native_only = native.clone();
+        native_only.model.id = "vendor/unlisted".to_string();
+        app.available_models = vec![native.clone(), native_only.clone()];
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                native,
+                native_only,
+                custom,
+            ]));
+        let resolved = app
+            .requested_model_entry("open-router", "vendor/shared", true)
+            .expect("catalog lookup")
+            .expect("unready declared entry");
+        assert_eq!(resolved.model.provider, "open-router");
+        assert_eq!(
+            resolved.model.base_url,
+            "https://unready-declared.example.test/v1"
+        );
+        assert!(resolved.api_key.is_none());
+        let before = session.try_lock().expect("session").entries.len();
+        let _ = app.handle_slash_model("open-router/vendor/unlisted");
+        assert!(
+            app.status_message
+                .as_deref()
+                .expect("diagnostic")
+                .contains("Model not found")
+        );
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        let error = app
+            .switch_to_role_spec("open-router/vendor/unlisted", "plan-role")
+            .expect_err("a missing role model must return an actionable failure");
+        assert!(error.contains("open-router/vendor/unlisted"));
+        assert!(error.contains("/model"));
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+    }
+
+    #[test]
+    fn classic_undeclared_native_alias_is_an_idempotent_command() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let mut native = test_model_entry("openrouter", "vendor/shared");
+        native.model.api = "openai-completions".to_string();
+        app.available_models = vec![native];
+        let _ = app.handle_slash_model("openrouter/vendor/shared");
+        let before = session.try_lock().expect("session").entries.len();
+        let running = app.agent.try_lock().expect("agent").provider();
+        let _ = app.handle_slash_model("open-router/vendor/shared");
+        assert_eq!(app.model_entry.model.provider, "openrouter");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        assert!(Arc::ptr_eq(
+            &running,
+            &app.agent.try_lock().expect("agent").provider()
+        ));
     }
 
     #[test]
@@ -5545,10 +6463,12 @@ mod tests {
     }
 
     #[test]
-    fn model_entry_matches_provider_aliases_case_insensitively() {
+    fn resolved_model_entries_keep_declared_aliases_distinct() {
         let left = test_model_entry("openrouter", "openai/gpt-4o-mini");
         let right = test_model_entry("open-router", "openai/gpt-4o-mini");
-        assert!(super::model_entry_matches(&left, &right));
+        assert!(!super::model_entry_matches(&left, &right));
+        let same = test_model_entry(" OpenRouter ", "OPENAI/GPT-4O-MINI");
+        assert!(super::model_entry_matches(&left, &same));
     }
 
     #[test]
@@ -5568,7 +6488,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scoped_model_entries_dedupes_provider_alias_variants() {
+    fn resolve_scoped_model_entries_preserves_separately_declared_aliases() {
         let available = vec![
             test_model_entry("openrouter", "openai/gpt-4o-mini"),
             test_model_entry("open-router", "openai/gpt-4o-mini"),
@@ -5577,7 +6497,11 @@ mod tests {
         let resolved = super::resolve_scoped_model_entries(&patterns, &available)
             .expect("resolve scoped models");
         assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].model.provider, "openrouter");
         assert_eq!(resolved[0].model.id, "openai/gpt-4o-mini");
+        let resolved = super::resolve_scoped_model_entries(&["*".to_string()], &available)
+            .expect("both declared providers remain in the scope");
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]

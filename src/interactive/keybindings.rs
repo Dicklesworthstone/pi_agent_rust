@@ -418,14 +418,19 @@ impl PiApp {
             return;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
+        let provider_impl = match super::commands::create_runtime_provider(
+            &next,
+            self.extensions.as_ref(),
+            &self.cwd,
+        ) {
             Ok(provider_impl) => provider_impl,
             Err(err) => {
                 self.status_message = Some(err.to_string());
                 return;
             }
         };
-        let resolved_key_opt = super::commands::resolve_model_key_from_default_auth(&next);
+        let resolved_key_opt =
+            super::commands::resolve_model_key_from_default_auth(&next, &self.cwd);
         if crate::models::model_requires_configured_credential(&next) && resolved_key_opt.is_none()
         {
             self.status_message = Some(format!(

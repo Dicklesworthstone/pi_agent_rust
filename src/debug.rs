@@ -3,8 +3,13 @@
 
 pub mod adapters;
 mod breakpoints;
+mod configuration;
 pub mod dap;
+mod launch_environment;
+mod ownership;
+mod remote;
 pub mod session;
+mod terminal;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -47,6 +52,8 @@ pub struct DebugTool {
     cwd: PathBuf,
     adapters: Vec<AdapterSpec>,
     session: Mutex<Option<Arc<DapSession>>>,
+    session_scope: crate::jobs::JobSessionScope,
+    session_owners: Mutex<ownership::SessionOwners>,
     operations: Arc<asupersync::sync::Mutex<()>>,
 }
 
@@ -57,6 +64,8 @@ impl DebugTool {
             cwd: cwd.to_path_buf(),
             adapters: adapters::default_adapters(),
             session: Mutex::new(None),
+            session_scope: crate::jobs::JobSessionScope::default(),
+            session_owners: Mutex::new(ownership::SessionOwners::default()),
             operations: Arc::new(asupersync::sync::Mutex::new(())),
         }
     }
@@ -76,6 +85,33 @@ impl DebugTool {
         })
     }
 
+    fn resolve_working_directory(&self, requested: Option<&str>) -> Result<PathBuf> {
+        let candidate = requested.map_or_else(
+            || self.cwd.clone(),
+            |value| {
+                let path = Path::new(value);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.cwd.join(path)
+                }
+            },
+        );
+        let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+            tool_err(
+                "DAP_CWD",
+                format!("cannot resolve debug working directory: {error}"),
+            )
+        })?;
+        if !resolved.is_dir() {
+            return Err(tool_err(
+                "DAP_CWD",
+                "debug working directory must resolve to a directory",
+            ));
+        }
+        Ok(resolved)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_start(&self, input: &DebugInput) -> Result<ToolOutput> {
         if lock(&self.session).is_some() {
@@ -84,9 +120,14 @@ impl DebugTool {
                 "terminate or disconnect the existing debug session before launch or attach",
             ));
         }
+        self.require_debug_capacity()?;
+        if input.remote.port.is_some() {
+            return self.run_remote_start(input).await;
+        }
+        let working_directory = self.resolve_working_directory(input.cwd.as_deref())?;
         let program = if input.action == "launch" {
             let name = input.required("program", input.program.as_deref())?;
-            let path = std::fs::canonicalize(self.cwd.join(name)).map_err(|error| {
+            let path = std::fs::canonicalize(working_directory.join(name)).map_err(|error| {
                 tool_err(
                     "DAP_TARGET_MISSING",
                     format!("cannot resolve launch target: {error}"),
@@ -107,27 +148,36 @@ impl DebugTool {
             None
         };
         let initial = breakpoints::initial(
-            &self.cwd,
+            &working_directory,
             input.initial_breakpoints.as_deref().unwrap_or(&[]),
         )?;
         let requested = input
             .adapter
             .as_deref()
             .or_else(|| input.go_mode.as_ref().map(|_| "dlv"));
-        let adapter = adapters::select_adapter(program.as_deref(), requested, &self.adapters)
-            .ok_or_else(|| {
-                tool_err(
-                    "DAP_ADAPTER_MISSING",
-                    "no matching debug adapter; install lldb-dap, debugpy, or dlv",
-                )
-            })?;
+        let selected = configuration::select(
+            &self.cwd,
+            program.as_deref(),
+            requested,
+            input.adapter_config.as_deref(),
+            &self.adapters,
+        )?;
+        let adapter = &selected.adapter;
         if input.go_mode.is_some() && adapter.id != "dlv" {
             return Err(tool_err("DAP_USAGE", "goMode requires the dlv adapter"));
         }
-        if program.as_ref().is_some_and(|path| path.is_dir()) && adapter.id != "dlv" {
+        let terminal = input.run_in_terminal.unwrap_or(false);
+        if terminal && !matches!(adapter.id.as_str(), "debugpy" | "lldb-dap") {
+            return Err(tool_err(
+                "DAP_UNSUPPORTED",
+                "runInTerminal supports local debugpy and lldb-dap launches",
+            ));
+        }
+        if program.as_ref().is_some_and(|path| path.is_dir()) && !selected.accepts_directory_program
+        {
             return Err(tool_err(
                 "DAP_USAGE",
-                "directory launch targets require the dlv adapter",
+                "directory launch targets require an adapter that accepts directory programs",
             ));
         }
         let command = adapter.resolve_command().ok_or_else(|| {
@@ -150,21 +200,39 @@ impl DebugTool {
             .checkpoint()
             .map_err(|_| tool_err("DAP_CANCELLED", "debug launch cancelled"))?;
         let mut arguments = program.as_ref().map_or_else(
-            || adapters::attach_arguments(&adapter, input.pid.expect("validated pid")),
+            || adapters::attach_arguments(adapter, input.pid.expect("validated pid")),
             |p| {
                 adapters::launch_arguments(
-                    &adapter,
+                    adapter,
                     p,
                     input.args.as_deref().unwrap_or(&[]),
-                    &self.cwd,
+                    &working_directory,
                 )
             },
         );
-        if let Some(stop) = input.stop_on_entry {
-            arguments["stopOnEntry"] = json!(stop);
+        if input.cwd.is_some() {
+            arguments["cwd"] = json!(working_directory.to_str().ok_or_else(|| {
+                tool_err(
+                    "DAP_CWD",
+                    "debug working directory must be representable as UTF-8",
+                )
+            })?);
         }
+        selected.apply_defaults(&input.action, &mut arguments);
+        launch_environment::apply(input.env.as_ref(), &mut arguments)?;
+        configuration::set_stop_on_entry(&adapter.id, &mut arguments, input.stop_on_entry);
         if let Some(mode) = &input.go_mode {
             arguments["mode"] = json!(mode);
+        }
+        if terminal {
+            arguments["console"] = json!("integratedTerminal");
+            if adapter.id == "lldb-dap" {
+                // Older LLDB-DAP versions use this spelling instead of console.
+                arguments["runInTerminal"] = json!(true);
+            } else {
+                arguments["redirectOutput"] = json!(false);
+                arguments["subProcess"] = json!(false);
+            }
         }
         let mut artifacts = None;
         if adapter.id == "dlv"
@@ -205,13 +273,18 @@ impl DebugTool {
         }
         let go_mode = (adapter.id == "dlv" && program.is_some()).then(|| arguments["mode"].clone());
         let transport = if adapter.id == "dlv" {
-            dap::DapTransport::spawn_delve(&command, &adapter.adapter_args, &[], &self.cwd).await?
+            dap::DapTransport::spawn_delve(&command, &adapter.adapter_args, &[], &working_directory)
+                .await?
         } else {
-            dap::DapTransport::spawn(&command, &adapter.adapter_args, &[], &self.cwd)?
+            dap::DapTransport::spawn(&command, &adapter.adapter_args, &[], &working_directory)?
         };
-        let session = DapSession::begin(transport)
-            .await?
-            .with_launch_artifacts(artifacts);
+        let session = if terminal {
+            DapSession::begin_with_terminal(transport, &working_directory).await?
+        } else {
+            DapSession::begin(transport).await?
+        }
+        .with_launch_artifacts(artifacts)
+        .with_source_root(working_directory);
         let timeout_ms = input.startup_timeout_ms.unwrap_or(120_000);
         session
             .start(
@@ -385,7 +458,20 @@ impl DebugTool {
                 session.invalidate_inspection()?;
                 json!({"command":command,"result":session.call(command,input.payload.clone().unwrap_or_else(||json!({}))).await?})
             }
-            "output" => json!({"tail":session.output_tail()}),
+            "output" => {
+                json!({"tail":session.output_tail(),"execution":session.execution_snapshot()})
+            }
+            "terminal_input" => {
+                session
+                    .terminal_input(
+                        input
+                            .text
+                            .as_deref()
+                            .ok_or_else(|| tool_err("DAP_USAGE", "terminal_input requires text"))?,
+                        input.enter.unwrap_or(true),
+                    )
+                    .await?
+            }
             "terminate" | "disconnect" => {
                 let terminate = input.action == "terminate";
                 let result = session.disconnect(terminate).await;
@@ -410,13 +496,14 @@ impl DebugTool {
 
     fn breakpoint_target(
         &self,
+        session: &DapSession,
         input: &DebugInput,
         setting: bool,
     ) -> Result<(Group, Option<Value>, Value)> {
         match input.action.as_str() {
             "set_breakpoint" | "remove_breakpoint" => {
                 let path = breakpoints::source_path(
-                    &self.cwd,
+                    session.source_root().unwrap_or(&self.cwd),
                     input.required("file", input.file.as_deref())?,
                 )?;
                 let line = if setting {
@@ -504,7 +591,7 @@ impl DebugTool {
 
     async fn run_breakpoints(&self, session: &DapSession, input: &DebugInput) -> Result<Value> {
         let setting = input.action.starts_with("set_");
-        let (group, key, mut payload) = self.breakpoint_target(input, setting)?;
+        let (group, key, mut payload) = self.breakpoint_target(session, input, setting)?;
         let change = if setting {
             let mut spec = key.expect("setting requires a key");
             if !matches!(&group, Group::Source(_)) {
@@ -766,9 +853,15 @@ impl DebugTool {
 #[serde(rename_all = "camelCase")]
 struct DebugInput {
     action: String,
+    #[serde(flatten)]
+    remote: remote::AttachOptions,
     program: Option<String>,
     args: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "launch_environment::deserialize")]
+    env: Option<launch_environment::LaunchEnvironment>,
     adapter: Option<String>,
+    adapter_config: Option<String>,
+    cwd: Option<String>,
     go_mode: Option<String>,
     startup_timeout_ms: Option<u64>,
     pid: Option<u32>,
@@ -801,6 +894,9 @@ struct DebugInput {
     initial_breakpoints: Option<Vec<breakpoints::SourceInput>>,
     exception_filters: Option<Vec<String>>,
     stop_on_entry: Option<bool>,
+    run_in_terminal: Option<bool>,
+    text: Option<String>,
+    enter: Option<bool>,
 }
 
 impl DebugInput {
@@ -831,6 +927,50 @@ impl DebugInput {
     }
 
     fn validate(&self) -> Result<()> {
+        self.remote.validate(self)?;
+        if self.env.is_some() && self.action != "launch" {
+            return Err(tool_err(
+                "DAP_USAGE",
+                "env is launch-only; an attached process's environment cannot be changed",
+            ));
+        }
+        configuration::validate_request(
+            self.adapter_config.as_deref(),
+            self.adapter.as_deref(),
+            &self.action,
+            self.remote.port.is_some(),
+        )?;
+        if self.cwd.as_ref().is_some_and(|cwd| {
+            !matches!(self.action.as_str(), "launch" | "attach")
+                || cwd.is_empty()
+                || cwd.len() > 4096
+                || cwd.contains('\0')
+        }) {
+            return Err(tool_err(
+                "DAP_USAGE",
+                "cwd is launch/attach-only, nonempty, NUL-free and at most 4096 UTF-8 bytes",
+            ));
+        }
+        if self.run_in_terminal.is_some() && self.action != "launch" {
+            return Err(tool_err("DAP_USAGE", "runInTerminal is local-launch-only"));
+        }
+        if self.action == "terminal_input" {
+            if self.text.as_ref().is_none_or(|text| {
+                text.len() > 1024
+                    || text.contains('\0')
+                    || (text.is_empty() && !self.enter.unwrap_or(true))
+            }) {
+                return Err(tool_err(
+                    "DAP_USAGE",
+                    "terminal_input requires NUL-free text of at most 1024 UTF-8 bytes",
+                ));
+            }
+        } else if self.text.is_some() || self.enter.is_some() {
+            return Err(tool_err(
+                "DAP_USAGE",
+                "text and enter are terminal_input-only",
+            ));
+        }
         if self
             .limit
             .is_some_and(|limit| limit == 0 || limit > 1_000_000)
@@ -937,10 +1077,10 @@ impl Tool for DebugTool {
         "debug"
     }
     fn description(&self) -> &str {
-        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination."
+        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. Attach with port (instead of pid) to an existing loopback debugpy server; pathMappings maps workspace source to remote source. No local Python adapter is spawned for port attachment. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination. Debuggers belong to the current conversation; sessions lists only its target. Switching back restores that debugger and its breakpoints. Up to four conversations can retain a debugger; capacity never evicts an existing target. For local debugpy/lldb-dap launch, runInTerminal:true requests a host-owned PTY. Read its bounded tail with output; terminal_input sends text with an optional Enter. Attach never grants local terminal-launch authority. For a configured local backend, explicitly pass adapterConfig (workspace-relative dap.json) and adapter (ID). This executes that file's selected command through the same process/session policy; no configuration is auto-loaded. Launch env overrides the debuggee environment through the adapter, not Pi or the adapter process; values are literal strings."
     }
     fn parameters(&self) -> Value {
-        json!({
+        remote::schema(json!({
             "type":"object", "required":["action"],
             "properties": {
                 "action":{"type":"string","enum":["launch","attach","set_breakpoint","remove_breakpoint",
@@ -948,14 +1088,17 @@ impl Tool for DebugTool {
                     "data_breakpoint_info","set_data_breakpoint","remove_data_breakpoint","list_breakpoints","set_exception_breakpoints",
                     "continue","step_over","step_in","step_out","pause","evaluate","stack_trace","threads","scopes","variables",
                     "exception_info","set_variable","set_expression","disassemble","read_memory","write_memory","modules",
-                    "loaded_sources","custom_request","output","terminate","disconnect","sessions"]},
+                    "loaded_sources","custom_request","output","terminal_input","terminate","disconnect","sessions"]},
                 "program":{"type":"string","description":"Binary/script or local Go package directory to launch"},
                 "args":{"type":"array","items":{"type":"string"}},
+                "env":{"type":"object","maxProperties":128,"propertyNames":{"type":"string","maxLength":256,"pattern":"^[A-Za-z_][A-Za-z0-9_]*$"},"additionalProperties":{"type":"string","maxLength":65536},"description":"Launch-only debuggee environment overrides. Literal strings, no NUL, null deletion or expansion. At most 64 KiB total names/values plus separators. Explicit entries override object-shaped launchDefaults.env; omitted env leaves adapter defaults unchanged. Does not modify Pi or adapter-process environment."},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
+                "adapterConfig":{"type":"string","maxLength":4096,"description":"Explicit workspace-relative dap.json with an adapters map; requires adapter ID. Local launch/pid-attach only. Executes the selected configured command; never auto-loaded."},
+                "cwd":{"type":"string","maxLength":4096,"description":"Launch/attach local source directory, relative to the session workspace. Retained for initial and later breakpoint paths. Local adapters also start here; port attach does not change the remote process cwd. adapterConfig and pathMappings.localRoot remain relative to the tool workspace."},
                 "goMode":{"type":"string","enum":["debug","test","exec"]},
                 "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300_000,"default":120_000,"description":"Launch/attach and configuration budget, including Go compilation; excludes adapter discovery and initialize"},
                 "pid":{"type":"integer","minimum":1},
-                "file":{"type":"string","description":"Source path for breakpoint set/remove"},
+                "file":{"type":"string","description":"Source path for breakpoint set/remove; relative to the active debugger's retained sourceRoot"},
                 "line":{"type":"integer","minimum":1,"description":"1-based line; omit on removal to clear the file's set"},
                 "column":{"type":"integer","minimum":1},
                 "condition":{"type":"string","maxLength":4096},
@@ -979,6 +1122,9 @@ impl Tool for DebugTool {
                 "filter":{"type":"string","enum":["named","indexed"]},
                 "command":{"type":"string"}, "payload":{"type":"object"},
                 "stopOnEntry":{"type":"boolean","default":true},
+                "runInTerminal":{"type":"boolean","default":false,"description":"Local launch only: use a real host-owned PTY with debugpy/lldb-dap; no external terminal window or child-session debugging"},
+                "text":{"type":"string","maxLength":1024,"description":"terminal_input text, at most 1024 UTF-8 bytes; no implicit shell"},
+                "enter":{"type":"boolean","default":true,"description":"terminal_input: append carriage return after text"},
                 "exceptionFilters":{"type":"array","maxItems":64,"items":{"type":"string"}},
                 "initialBreakpoints":{"type":"array","maxItems":1024,
                     "items":{"type":"object","required":["file","line"],"additionalProperties":false,
@@ -986,7 +1132,10 @@ impl Tool for DebugTool {
                             "column":{"type":"integer","minimum":1},"condition":{"type":"string"},
                             "hitCondition":{"type":"string"},"logMessage":{"type":"string"}}}}
             }
-        })
+        }))
+    }
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.bind_debug_scope(scope);
     }
     fn effects(&self) -> ToolEffects {
         ToolEffects::process().union(ToolEffects::network())
@@ -1001,19 +1150,29 @@ impl Tool for DebugTool {
             .map_err(|error| tool_err("DAP_USAGE", format!("invalid input: {error}")))?;
         input.validate()?;
         let owner = AgentCx::for_current_or_request();
+        let requested_owner = self.debug_owner(&owner).await?;
         let _operation = OwnedMutexGuard::lock(Arc::clone(&self.operations), owner.cx())
             .await
             .map_err(|_| tool_err("DAP_CANCELLED", "debug operation cancelled while queued"))?;
-        match input.action.as_str() {
+        self.require_debug_owner(&requested_owner, &owner).await?;
+        self.activate_debug_owner(&requested_owner);
+        let output = match input.action.as_str() {
             "launch" | "attach" => self.run_start(&input).await,
             "sessions" if lock(&self.session).is_none() => {
                 let payload = json!({"action":"sessions","sessions":[]});
                 Ok(text_output(payload.to_string(), payload))
             }
             _ => self.run_simple(&input).await,
-        }
+        };
+        // Do not publish an old conversation's result into a new one. The
+        // original adapter stays owned; admitted side effects are not undone.
+        self.require_debug_owner(&requested_owner, &owner).await?;
+        output
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod source_root_tests;

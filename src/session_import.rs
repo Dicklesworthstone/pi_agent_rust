@@ -15,6 +15,10 @@
 //! this reader is idempotent, but an older lossy import cannot mask a repaired
 //! conversion. The native session uses the current workspace and normal model
 //! selection; foreign cwd/model metadata is historical, not a live setting.
+//!
+//! Parent-linked Claude logs select the latest main-message leaf, preserving
+//! other branches as audit attachments rather than active context. Explicit
+//! branch import can select an earlier message or a subagent's own branch.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read};
@@ -29,12 +33,14 @@ use crate::error::{Error, Result};
 use crate::session::Session;
 
 mod conversion;
+mod history;
 mod transcript;
 
 /// Result-envelope schema (the public fields remain unchanged).
 pub const IMPORT_SCHEMA: &str = "pi.session_import.v1";
 /// Conversion semantics, included in provenance and content-addressed ids.
 const IMPORT_FORMAT_REVISION: u32 = 2;
+const CLAUDE_IMPORT_FORMAT_REVISION: u32 = 3;
 const MAX_IMPORT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_HEADER_BYTES: u64 = 64 * 1024;
 
@@ -49,7 +55,7 @@ pub struct ImportOutcome {
     pub session_path: String,
     /// Native messages after tool-exchange reconciliation.
     pub imported: usize,
-    /// Distinct source lines containing unresolved content. Such material is
+    /// Distinct source lines containing unresolved or excluded content. It is
     /// retained as an attachment or explicitly non-executable history.
     pub skipped: usize,
     pub already_imported: bool,
@@ -71,13 +77,35 @@ impl ImportSource {
     }
 }
 
-fn session_id_for(source: ImportSource, content: &[u8]) -> String {
+const fn format_revision(source: ImportSource) -> u32 {
+    match source {
+        ImportSource::Claude => CLAUDE_IMPORT_FORMAT_REVISION,
+        ImportSource::Codex => IMPORT_FORMAT_REVISION,
+    }
+}
+
+fn session_id_for(source: ImportSource, content: &[u8], selected_leaf: Option<&str>) -> String {
     let mut digest = sha2::Sha256::new();
     digest.update(IMPORT_SCHEMA.as_bytes());
-    digest.update(IMPORT_FORMAT_REVISION.to_be_bytes());
+    digest.update(format_revision(source).to_be_bytes());
     digest.update(source.as_str().as_bytes());
     digest.update([0]);
+    if source == ImportSource::Claude {
+        // Delimit raw bytes from the selected leaf without changing existing
+        // Codex revision-2 identities.
+        digest.update(
+            u64::try_from(content.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+    }
     digest.update(content);
+    if let Some(leaf) = selected_leaf {
+        // Effective selection, not invocation spelling: explicitly importing
+        // the default leaf is idempotent, but another branch is a new session.
+        digest.update(b"\0parentUuid\0");
+        digest.update(leaf.as_bytes());
+    }
     let hex = crate::package_manager::hex_encode(&digest.finalize());
     // Session filenames use the FIRST eight id characters. A fixed
     // "import-c..." prefix made unrelated imports share a filename suffix.
@@ -126,11 +154,45 @@ fn read_source(path: &Path) -> Result<Vec<u8>> {
 
 /// Import a Claude Code log, preserving batched tool exchanges and metadata.
 ///
+/// Parent-linked logs import the latest main-message leaf in file order.
+/// Other branches, duplicate envelopes and hidden messages are retained as
+/// audit attachments, not provider context. Unlinked exports stay sequential.
+///
 /// # Errors
 /// Fails on source I/O, admission limits, inaccessible destination scans, or
-/// native persistence errors. Per-record corruption is retained and reported.
+/// native persistence errors. Ambiguous or incomplete parent graphs fail
+/// before destination work. Other per-record corruption is retained/reported.
 pub fn import_claude(path: &Path, target_dir: Option<&Path>) -> Result<ImportOutcome> {
-    import_bytes(ImportSource::Claude, &read_source(path)?, path, target_dir)
+    import_bytes(
+        ImportSource::Claude,
+        &read_source(path)?,
+        path,
+        target_dir,
+        None,
+    )
+}
+
+/// Import the ancestry ending at an exact Claude message UUID.
+///
+/// This can select an earlier answer, a nonterminal fork point, or a subagent
+/// branch. The source and existing imports remain unchanged. Different leaf
+/// selections have different content-addressed session identities.
+///
+/// # Errors
+/// See [`import_claude`]. Also rejects an absent, hidden or non-message UUID,
+/// and logs without explicit parent links. No partial ancestry is guessed.
+pub fn import_claude_branch(
+    path: &Path,
+    leaf_id: &str,
+    target_dir: Option<&Path>,
+) -> Result<ImportOutcome> {
+    import_bytes(
+        ImportSource::Claude,
+        &read_source(path)?,
+        path,
+        target_dir,
+        Some(leaf_id),
+    )
 }
 
 /// Import a Codex rollout, including function/custom-tool calls and outputs.
@@ -138,7 +200,13 @@ pub fn import_claude(path: &Path, target_dir: Option<&Path>) -> Result<ImportOut
 /// # Errors
 /// See [`import_claude`].
 pub fn import_codex(path: &Path, target_dir: Option<&Path>) -> Result<ImportOutcome> {
-    import_bytes(ImportSource::Codex, &read_source(path)?, path, target_dir)
+    import_bytes(
+        ImportSource::Codex,
+        &read_source(path)?,
+        path,
+        target_dir,
+        None,
+    )
 }
 
 /// Read only a bounded first line, and match the actual header id rather than
@@ -216,6 +284,7 @@ fn import_bytes(
     raw: &[u8],
     original_path: &Path,
     target_dir: Option<&Path>,
+    selected_leaf: Option<&str>,
 ) -> Result<ImportOutcome> {
     if raw.len() as u64 > MAX_IMPORT_BYTES {
         return Err(Error::tool(
@@ -223,7 +292,10 @@ fn import_bytes(
             "source exceeds the 128 MiB import limit",
         ));
     }
-    let id = session_id_for(source, raw);
+    // Resolve/validate ancestry before scanning or creating a destination.
+    // An old flattened import must not mask this conversion's corrected path.
+    let history = history::History::prepare(source, raw, selected_leaf)?;
+    let id = session_id_for(source, raw, history.leaf.as_deref());
     let target_root =
         target_dir.map_or_else(crate::config::Config::sessions_dir, Path::to_path_buf);
     if let Some(existing_path) = find_imported_session(&target_root, &id)? {
@@ -253,7 +325,7 @@ fn import_bytes(
         "foreign_import".to_string(),
         Some(json!({
             "schema": IMPORT_SCHEMA,
-            "formatRevision": IMPORT_FORMAT_REVISION,
+            "formatRevision": format_revision(source),
             "source": source.as_str(),
             "originalPath": original_path.display().to_string(),
             "sourceSha256": crate::package_manager::hex_encode(&sha2::Sha256::digest(raw)),
@@ -265,7 +337,23 @@ fn import_bytes(
         records,
         mut unresolved_lines,
         mut report,
-    } = parse_import_lines(source, raw, &mut session);
+    } = parse_import_lines(source, &history, &mut session);
+    if let Some(leaf) = &history.leaf {
+        session.append_custom_entry(
+            "foreign_history_selection".to_string(),
+            Some(json!({
+                "schema": IMPORT_SCHEMA,
+                "strategy": "parentUuid",
+                "selectedLeafId": leaf,
+                "mainLeafCount": history.branches,
+                "explicit": selected_leaf.is_some(),
+            })),
+        );
+        report.push(format!(
+            "imported one parent-linked Claude branch ({} main leaf candidates); excluded messages remain audit attachments",
+            history.branches
+        ));
+    }
 
     let normalized = transcript::normalize(records);
     for reconciliation in normalized.reconciliations {
@@ -287,7 +375,7 @@ fn import_bytes(
     }
     let skipped = unresolved_lines.len();
     report.push(format!(
-        "imported {imported} message(s); preserved {skipped} source line(s) with unresolved content"
+        "imported {imported} message(s); preserved {skipped} source line(s) with unresolved or excluded content"
     ));
     let actual_path = futures::executor::block_on(async {
         session.save().await?;
@@ -317,7 +405,7 @@ struct ParseImportLinesOutcome {
 
 fn parse_import_lines(
     source: ImportSource,
-    raw: &[u8],
+    history: &history::History<'_>,
     session: &mut Session,
 ) -> ParseImportLinesOutcome {
     let mut reader = conversion::ForeignReader::new(source);
@@ -326,8 +414,19 @@ fn parse_import_lines(
     let mut report = Vec::new();
     // Parse bytes per line. Lossy UTF-8 decoding would change corrupt input
     // before it could be archived, making the claimed preservation false.
-    for (line_no, line) in raw.split(|byte| *byte == b'\n').enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) {
+    for &index in &history.order {
+        let source_line = &history.lines[index];
+        let line_no = source_line.number - 1;
+        let line = source_line.bytes;
+        if history.excluded(index) {
+            record_unmappable_line(
+                session,
+                line_no,
+                "outside the selected Claude message ancestry",
+                line,
+                &mut unresolved_lines,
+                &mut report,
+            );
             continue;
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else {
@@ -494,12 +593,12 @@ mod tests {
 
     #[test]
     fn ids_are_stable_source_specific_and_have_content_specific_filename_prefixes() {
-        let first = session_id_for(ImportSource::Claude, b"a");
-        assert_eq!(first, session_id_for(ImportSource::Claude, b"a"));
-        assert_ne!(first, session_id_for(ImportSource::Codex, b"a"));
+        let first = session_id_for(ImportSource::Claude, b"a", None);
+        assert_eq!(first, session_id_for(ImportSource::Claude, b"a", None));
+        assert_ne!(first, session_id_for(ImportSource::Codex, b"a", None));
         assert_ne!(
             &first[..8],
-            &session_id_for(ImportSource::Claude, b"b")[..8]
+            &session_id_for(ImportSource::Claude, b"b", None)[..8]
         );
         assert!(!first.starts_with("import-"));
     }
@@ -508,7 +607,7 @@ mod tests {
     fn header_probe_requires_an_exact_header_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("session.jsonl");
-        let id = session_id_for(ImportSource::Codex, b"fixture");
+        let id = session_id_for(ImportSource::Codex, b"fixture", None);
         std::fs::write(&path, json!({"id": "other", "description": id}).to_string())
             .expect("write");
         assert!(!header_has_id(&path, &id));
@@ -529,6 +628,7 @@ mod tests {
             &raw,
             Path::new("foreign.jsonl"),
             Some(dir.path()),
+            None,
         )
         .expect("import");
         assert_eq!(outcome.skipped, 2);
@@ -579,6 +679,7 @@ mod tests {
             raw.as_bytes(),
             Path::new("codex.jsonl"),
             Some(dir.path()),
+            None,
         )
         .expect("import");
         assert_eq!(outcome.imported, 3);
@@ -625,6 +726,7 @@ mod tests {
             raw.as_bytes(),
             Path::new("cutoff.jsonl"),
             Some(dir.path()),
+            None,
         )
         .expect("import");
         assert_eq!(outcome.skipped, 1);

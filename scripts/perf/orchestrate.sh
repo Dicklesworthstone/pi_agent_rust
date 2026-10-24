@@ -7900,9 +7900,19 @@ try:
         try:
             metadata = os.stat(part, dir_fd=cursor_fd, follow_symlinks=False)
         except FileNotFoundError:
-            os.mkdir(part, 0o700, dir_fd=cursor_fd)
+            try:
+                os.mkdir(part, 0o700, dir_fd=cursor_fd)
+                created = True
+            except FileExistsError:
+                # A concurrent run created this component between the stat
+                # and the mkdir. Intermediate directories are shared between
+                # runs, so the loser of that race continues into the same
+                # no-follow, type and identity checks as for any component
+                # that already existed. The final component is exclusive:
+                # losing the race there leaves `created` false and is refused
+                # below as a preexisting stage.
+                pass
             metadata = os.stat(part, dir_fd=cursor_fd, follow_symlinks=False)
-            created = True
         if final and not created:
             raise SystemExit(f"refusing preexisting post-generation evidence stage: {stage}")
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):

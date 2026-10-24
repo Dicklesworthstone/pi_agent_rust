@@ -219,7 +219,9 @@ fn inbound_restore_writes_real_value_and_masks_echo() {
         }),
         thought_signature: None,
     };
-    let restored = agent.restore_secrets_inbound(tool_call);
+    let restored = agent
+        .restore_secrets_inbound(tool_call)
+        .expect("restore unambiguous arguments");
     let args = serde_json::to_string(&restored.arguments).expect("args");
     harness
         .log()
@@ -276,12 +278,14 @@ fn dotted_key_round_trips_through_the_agent() {
         "placeholder must not be re-vaulted on the second turn: {joined}"
     );
 
-    let restored = agent.restore_secrets_inbound(pi::model::ToolCall {
-        id: "t1".to_string(),
-        name: "bash".to_string(),
-        arguments: json!({ "command": "curl -H 'Authorization: Bearer <pi-secret:000001>'" }),
-        thought_signature: None,
-    });
+    let restored = agent
+        .restore_secrets_inbound(pi::model::ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({ "command": "curl -H 'Authorization: Bearer <pi-secret:000001>'" }),
+            thought_signature: None,
+        })
+        .expect("restore dotted credential");
     let args = serde_json::to_string(&restored.arguments).expect("args");
     assert!(
         args.contains(DOTTED),
@@ -623,12 +627,14 @@ fn json_credentials_stay_protected_after_the_assignment_leaves_history() {
         .secrets_transform_outbound_text(&format!("side question quotes {OPAQUE_SECRET}"))
         .expect("auxiliary outbound screening");
     assert_eq!(side_context, "side question quotes <pi-secret:000001>");
-    let call = agent.restore_secrets_inbound(pi::model::ToolCall {
-        id: "remembered-value".to_string(),
-        name: "write".to_string(),
-        arguments: json!({"path": "key.txt", "content": "<pi-secret:000001>"}),
-        thought_signature: None,
-    });
+    let call = agent
+        .restore_secrets_inbound(pi::model::ToolCall {
+            id: "remembered-value".to_string(),
+            name: "write".to_string(),
+            arguments: json!({"path": "key.txt", "content": "<pi-secret:000001>"}),
+            thought_signature: None,
+        })
+        .expect("restore remembered credential");
     assert_eq!(call.arguments["content"], OPAQUE_SECRET);
     finish_case(&harness, case);
 }
@@ -680,6 +686,74 @@ fn multiline_credentials_are_masked_inside_nested_tool_result_details() {
     assert_eq!(details["count"], 7);
     assert!(!serde_json::to_string(details).unwrap().contains(PEM_BODY));
     finish_case(&harness, case);
+}
+
+#[test]
+fn scalar_tool_details_are_masked_without_falling_back_to_the_original_value() {
+    let harness = TestHarness::new("scalar_tool_details_are_masked");
+    let root = harness.temp_path(".");
+    for value in [
+        json!(123_456_789_012_345_678_u64),
+        json!(true),
+        json!(false),
+        json!(null),
+    ] {
+        let rendered = value.to_string();
+        let (mut agent, _) = build_agent(
+            &root,
+            Some(SecretsSettings {
+                mode: Some("obfuscate".to_string()),
+                extra_patterns: Some(vec![format!("^{}$", regex::escape(&rendered))]),
+            }),
+        );
+        let placeholder = agent
+            .secrets_transform_outbound_text(&rendered)
+            .expect("remember a scalar credential");
+        assert!(placeholder.starts_with("<pi-secret:"));
+        let mut output = ToolOutput {
+            content: Vec::new(),
+            details: Some(value),
+            is_error: false,
+        };
+        agent.mask_secrets_in_output(&mut output);
+        assert_eq!(output.details, Some(json!(placeholder)));
+        assert!(!output.is_error, "masking does not change execution status");
+    }
+}
+
+#[test]
+fn ambiguous_masked_tool_details_are_explicitly_omitted_without_losing_the_result() {
+    let harness = TestHarness::new("ambiguous_masked_tool_details_are_omitted");
+    let root = harness.temp_path(".");
+    let (mut agent, _) = build_agent(&root, None);
+    let placeholder = agent
+        .secrets_transform_outbound_text(SECRET)
+        .expect("remember credential");
+    let mut fields = serde_json::Map::new();
+    fields.insert(SECRET.to_string(), json!("first field"));
+    fields.insert(placeholder, json!("second field"));
+    let mut output = ToolOutput {
+        content: vec![pi::model::ContentBlock::Text(pi::model::TextContent::new(
+            format!("completed using {SECRET}"),
+        ))],
+        details: Some(json!({"nested": [serde_json::Value::Object(fields)]})),
+        is_error: false,
+    };
+    agent.mask_secrets_in_output(&mut output);
+    assert_eq!(first_text(&output), "completed using <pi-secret:000001>");
+    let details = output.details.as_ref().expect("explicit omission record");
+    assert_eq!(details["detailsOmitted"], true);
+    assert!(
+        details["reason"]
+            .as_str()
+            .unwrap()
+            .contains("PI_SECRET_JSON_MASK_KEY_COLLISION")
+    );
+    assert!(!serde_json::to_string(&output).unwrap().contains(SECRET));
+    assert!(
+        !output.is_error,
+        "the completed operation remains successful"
+    );
 }
 
 #[test]
@@ -795,12 +869,14 @@ fn structured_custom_and_tool_arguments_are_screened_request_wide() {
         "content, details and structured arguments should all be protected: {joined}"
     );
 
-    let restored = agent.restore_secrets_inbound(pi::model::ToolCall {
-        id: "restore".to_string(),
-        name: "fixture".to_string(),
-        arguments: json!({"value": "<pi-secret:000001>"}),
-        thought_signature: None,
-    });
+    let restored = agent
+        .restore_secrets_inbound(pi::model::ToolCall {
+            id: "restore".to_string(),
+            name: "fixture".to_string(),
+            arguments: json!({"value": "<pi-secret:000001>"}),
+            thought_signature: None,
+        })
+        .expect("restore structured discovery");
     assert_eq!(restored.arguments["value"], OPAQUE);
 }
 
@@ -888,9 +964,10 @@ fn late_refusal_rolls_back_the_entire_request_vault() {
     let root = harness.temp_path(".");
     let (mut agent, capture) = build_agent(&root, None);
 
-    // A numeric credential cannot be replaced without changing its JSON type,
-    // so obfuscate mode still refuses the whole request.
-    let numeric = assistant(
+    // Numeric credentials from another provider cannot use the model-origin
+    // replay exception. Refuse without changing their JSON type or learning
+    // any earlier secret from this request into the live vault.
+    let mut numeric = assistant(
         vec![tool_call(
             "numeric-call",
             json!({"token": 123_456_789_012_345_678_u64}),
@@ -898,6 +975,10 @@ fn late_refusal_rolls_back_the_entire_request_vault() {
         )],
         pi::model::StopReason::ToolUse,
     );
+    let pi::model::Message::Assistant(message) = &mut numeric else {
+        unreachable!()
+    };
+    Arc::make_mut(message).provider = "other-provider".to_string();
     let error = block_on_local(agent.run_with_messages_with_abort(
         vec![user_text(&format!("remember {EARLY}")), numeric],
         None,
@@ -928,6 +1009,194 @@ fn late_refusal_rolls_back_the_entire_request_vault() {
             .expect("screen early credential after rollback"),
         "<pi-secret:000001>"
     );
+}
+
+#[test]
+#[allow(clippy::significant_drop_tightening)]
+fn unsigned_numeric_tool_arguments_survive_same_origin_continuations() {
+    use pi::model::{ContentBlock, Message, StopReason, TextContent, ToolResultMessage};
+
+    const NUMERIC: u64 = 123_456_789_012_345_678;
+    let harness =
+        TestHarness::new("unsigned_numeric_tool_arguments_survive_same_origin_continuations");
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    let mut arguments = json!({
+        "token": NUMERIC,
+        "nested": [true, false, null, {"echo": NUMERIC.to_string(), "api_key": SECRET}],
+    });
+    arguments
+        .as_object_mut()
+        .expect("arguments object")
+        .insert(SECRET.to_string(), json!("ordinary"));
+    let history = vec![
+        user_text("page through the results"),
+        assistant(
+            vec![tool_call("unsigned-page", arguments.clone(), None)],
+            StopReason::ToolUse,
+        ),
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "unsigned-page".to_string(),
+            tool_name: "fixture".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("page ready"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }),
+    ];
+    let original = serde_json::to_value(&history).expect("original history");
+    agent.replace_messages(history.clone());
+
+    block_on_local(agent.run_continue_with_abort(None, |_| {}))
+        .expect("unsigned numeric history must allow the continuation");
+    block_on_local(agent.run("next page".to_string(), |_| {}))
+        .expect("later prompts must also remain usable");
+
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 2);
+    for (payload, messages) in capture.payloads.iter().zip(&capture.messages) {
+        let replayed = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(message) => Some(&message.content),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|block| match block {
+                ContentBlock::ToolCall(call) if call.id == "unsigned-page" => Some(call),
+                _ => None,
+            })
+            .expect("replayed unsigned tool call");
+        assert!(replayed.thought_signature.is_none());
+        assert_eq!(replayed.arguments["token"].as_u64(), Some(NUMERIC));
+        assert_eq!(replayed.arguments["nested"][0], true);
+        assert_eq!(replayed.arguments["nested"][1], false);
+        assert!(replayed.arguments["nested"][2].is_null());
+        assert_ne!(replayed.arguments["nested"][3]["echo"], NUMERIC.to_string());
+        assert!(
+            !payload.contains(SECRET),
+            "strings and keys still need protection"
+        );
+        assert_eq!(
+            agent
+                .restore_secrets_inbound(replayed.clone())
+                .expect("restore replayed arguments")
+                .arguments,
+            arguments,
+            "string placeholders still restore without changing primitive types"
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(&agent.messages()[..history.len()]).expect("retained history"),
+        original,
+        "the local transcript remains unchanged by outbound projection"
+    );
+}
+
+#[test]
+fn numeric_tool_replay_requires_exact_origin_and_never_bypasses_block_mode() {
+    use pi::model::{Message, StopReason};
+
+    let harness =
+        TestHarness::new("numeric_tool_replay_requires_exact_origin_and_never_bypasses_block_mode");
+    let root = harness.temp_path(".");
+    for mismatch in ["same", "api", "provider", "model", "unknown"] {
+        for mode in ["obfuscate", "block"] {
+            if mismatch == "same" && mode == "obfuscate" {
+                continue;
+            }
+            let (mut agent, capture) = build_agent(
+                &root,
+                Some(SecretsSettings {
+                    mode: Some(mode.to_string()),
+                    extra_patterns: None,
+                }),
+            );
+            let mut numeric = assistant(
+                vec![tool_call(
+                    "numeric-origin",
+                    json!({"token": 123_456_789_012_345_678_u64}),
+                    None,
+                )],
+                StopReason::ToolUse,
+            );
+            let Message::Assistant(message) = &mut numeric else {
+                unreachable!()
+            };
+            let message = Arc::make_mut(message);
+            match mismatch {
+                "api" => message.api = "other-api".to_string(),
+                "provider" => message.provider = "other-provider".to_string(),
+                "model" => message.model = "other-model".to_string(),
+                "unknown" => {
+                    message.api.clear();
+                    message.provider.clear();
+                    message.model.clear();
+                }
+                _ => {}
+            }
+            agent.replace_messages(vec![user_text("continue the page"), numeric]);
+            let error = block_on_local(agent.run_continue_with_abort(None, |_| {}))
+                .expect_err("protected numeric history must refuse before provider entry");
+            assert!(
+                error.to_string().contains(if mode == "block" {
+                    "PI_SECRET_BLOCK"
+                } else {
+                    "PI_SECRET_JSON_PRIMITIVE"
+                }),
+                "{mismatch} {mode}: {error}"
+            );
+            assert!(
+                capture.lock().expect("capture").payloads.is_empty(),
+                "{mismatch} {mode} must not invoke the provider"
+            );
+        }
+    }
+}
+
+#[test]
+fn user_and_tool_result_primitives_do_not_inherit_assistant_replay_exceptions() {
+    use pi::model::{
+        ContentBlock, Message, TextContent, ToolResultMessage, UserContent, UserMessage,
+    };
+
+    let harness = TestHarness::new(
+        "user_and_tool_result_primitives_do_not_inherit_assistant_replay_exceptions",
+    );
+    let root = harness.temp_path(".");
+    let arguments = json!({"token": 123_456_789_012_345_678_u64});
+    let messages = [
+        Message::User(UserMessage {
+            content: UserContent::Blocks(vec![tool_call("user-call", arguments.clone(), None)]),
+            timestamp: 0,
+        }),
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "result-call".to_string(),
+            tool_name: "fixture".to_string(),
+            content: vec![tool_call("nested-call", arguments.clone(), None)],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }),
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "details-call".to_string(),
+            tool_name: "fixture".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("page ready"))],
+            details: Some(arguments),
+            is_error: false,
+            timestamp: 0,
+        }),
+    ];
+    for message in messages {
+        let (mut agent, capture) = build_agent(&root, None);
+        let error = block_on_local(agent.run_with_message_with_abort(message, None, |_| {}))
+            .expect_err("only exact-origin assistant arguments may preserve detected primitives");
+        assert!(
+            error.to_string().contains("PI_SECRET_JSON_PRIMITIVE"),
+            "{error}"
+        );
+        assert!(capture.lock().expect("capture").payloads.is_empty());
+    }
 }
 
 #[test]
@@ -1160,6 +1429,7 @@ fn signed_blocks_and_paused_turns_replay_verbatim_unless_block_mode_refuses() {
 }
 
 #[test]
+#[allow(clippy::significant_drop_tightening)]
 fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() {
     use pi::model::{ContentBlock, Message, StopReason, TextContent, ThinkingContent};
 
@@ -1213,15 +1483,20 @@ fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() 
 
             let capture = capture.lock().expect("capture");
             assert_eq!(capture.payloads.len(), 1);
-            assert!(!capture.payloads[0].contains(OPAQUE), "{mismatch} {reason:?}");
+            assert!(
+                !capture.payloads[0].contains(OPAQUE),
+                "{mismatch} {reason:?}"
+            );
             let Message::Assistant(screened) = &capture.messages[0][0] else {
                 panic!("expected screened assistant history")
             };
             assert_eq!(screened.stop_reason, reason);
             assert!(matches!(&screened.content[0], ContentBlock::Text(text)
                 if text.text == "<pi-secret:000001>" && text.text_signature.is_none()));
-            assert!(matches!(&screened.content[1], ContentBlock::Thinking(thinking)
-                if thinking.thinking == "<pi-secret:000001>" && thinking.thinking_signature.is_none()));
+            assert!(
+                matches!(&screened.content[1], ContentBlock::Thinking(thinking)
+                if thinking.thinking == "<pi-secret:000001>" && thinking.thinking_signature.is_none())
+            );
             assert!(matches!(&screened.content[2], ContentBlock::ToolCall(call)
                 if call.id == "call_source" && call.name == "fixture"
                     && call.arguments == json!({"echo": "<pi-secret:000001>"})
@@ -1232,5 +1507,374 @@ fn foreign_signed_and_paused_history_is_screened_without_mutating_the_session() 
                 "outbound screening must retain original history for a switch back"
             );
         }
+    }
+}
+
+fn attachment_message(
+    content: Vec<pi::model::ContentBlock>,
+    as_tool_result: bool,
+) -> pi::model::Message {
+    if as_tool_result {
+        pi::model::Message::tool_result(pi::model::ToolResultMessage {
+            tool_call_id: "attachment-result".to_string(),
+            tool_name: "fixture".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    } else {
+        pi::model::Message::User(pi::model::UserMessage {
+            content: pi::model::UserContent::Blocks(content),
+            timestamp: 0,
+        })
+    }
+}
+
+#[test]
+#[allow(clippy::significant_drop_tightening)]
+fn media_names_are_discovered_before_earlier_fields_are_screened() {
+    use pi::model::{ContentBlock, MediaContent, Message, TextContent, UserContent};
+
+    let harness = TestHarness::new("media_names_are_discovered_before_earlier_fields_are_screened");
+    let root = harness.temp_path(".");
+    for as_tool_result in [false, true] {
+        for mode in ["obfuscate", "block"] {
+            let (mut agent, capture) = build_agent(
+                &root,
+                Some(SecretsSettings {
+                    mode: Some(mode.to_string()),
+                    extra_patterns: None,
+                }),
+            );
+            let message = attachment_message(
+                vec![
+                    ContentBlock::Text(TextContent::new(format!("earlier echo: {OPAQUE_SECRET}"))),
+                    ContentBlock::Media(MediaContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: "audio/wav".to_string(),
+                        name: Some(SECRET.to_string()),
+                    }),
+                    ContentBlock::Media(MediaContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: "video/mp4".to_string(),
+                        name: Some(format!("password={OPAQUE_SECRET}")),
+                    }),
+                ],
+                as_tool_result,
+            );
+            let original = serde_json::to_value(&message).expect("original attachment message");
+            let outcome = block_on_local(agent.run_with_message_with_abort(message, None, |_| {}));
+            let capture = capture.lock().expect("capture");
+            if mode == "block" {
+                let error = outcome
+                    .expect_err("metadata must obey block mode")
+                    .to_string();
+                assert!(error.contains("PI_SECRET_BLOCK"), "{error}");
+                assert!(!error.contains(SECRET));
+                assert!(!error.contains(OPAQUE_SECRET));
+                assert!(capture.payloads.is_empty());
+            } else {
+                outcome.expect("screened names must reach the provider");
+                assert_eq!(capture.payloads.len(), 1);
+                assert!(!capture.payloads[0].contains(SECRET));
+                assert!(!capture.payloads[0].contains(OPAQUE_SECRET));
+                let blocks = match &capture.messages[0][0] {
+                    Message::User(user) => match &user.content {
+                        UserContent::Blocks(blocks) => blocks,
+                        UserContent::Text(_) => panic!("attachment blocks expected"),
+                    },
+                    Message::ToolResult(result) => &result.content,
+                    _ => panic!("user or tool-result attachment expected"),
+                };
+                assert_eq!(blocks.len(), 3);
+                for block in &blocks[1..] {
+                    let ContentBlock::Media(media) = block else {
+                        panic!("media must be retained")
+                    };
+                    assert_eq!(media.data, "cGF5bG9hZA==");
+                    assert!(matches!(
+                        media.mime_type.as_str(),
+                        "audio/wav" | "video/mp4"
+                    ));
+                    assert!(media.name.as_deref().unwrap().contains("<pi-secret:"));
+                    assert!(!media.placeholder().contains(SECRET));
+                    assert!(!media.placeholder().contains(OPAQUE_SECRET));
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&agent.messages()[0]).expect("local transcript"),
+                original,
+                "screening names must not alter retained media or text"
+            );
+        }
+    }
+}
+
+#[test]
+fn remembered_and_configured_media_names_are_protected_at_provider_entry() {
+    use pi::model::{ContentBlock, MediaContent};
+
+    let harness =
+        TestHarness::new("remembered_and_configured_media_names_are_protected_at_provider_entry");
+    let root = harness.temp_path(".");
+    for as_tool_result in [false, true] {
+        let (mut agent, capture) = build_agent(&root, None);
+        agent
+            .secrets_transform_outbound_text(&format!("password={OPAQUE_SECRET}"))
+            .expect("remember an opaque credential");
+        let media = ContentBlock::Media(MediaContent {
+            data: "cGF5bG9hZA==".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some(OPAQUE_SECRET.to_string()),
+        });
+        block_on_local(agent.run_with_message_with_abort(
+            attachment_message(vec![media], as_tool_result),
+            None,
+            |_| {},
+        ))
+        .expect("remembered names are obfuscated");
+        let capture = capture.lock().expect("capture");
+        assert_eq!(capture.payloads.len(), 1);
+        assert!(!capture.payloads[0].contains(OPAQUE_SECRET));
+        assert!(capture.payloads[0].contains("<pi-secret:"));
+        drop(capture);
+
+        let (mut blocked, blocked_capture) = build_agent(
+            &root,
+            Some(SecretsSettings {
+                mode: Some("block".to_string()),
+                extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+            }),
+        );
+        let error = block_on_local(blocked.run_with_message_with_abort(
+            attachment_message(
+                vec![ContentBlock::Media(MediaContent {
+                    data: "cGF5bG9hZA==".to_string(),
+                    mime_type: "audio/wav".to_string(),
+                    name: Some("ACME-123456".to_string()),
+                })],
+                as_tool_result,
+            ),
+            None,
+            |_| {},
+        ))
+        .expect_err("custom patterns scan the original name field");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
+        assert!(blocked_capture.lock().expect("capture").payloads.is_empty());
+    }
+}
+
+#[test]
+#[allow(clippy::significant_drop_tightening)]
+fn secret_mime_types_refuse_without_changing_transport_or_learning_other_fields() {
+    use pi::model::{ContentBlock, ImageContent, MediaContent, TextContent};
+
+    const EARLY: &str = "sk-aaaaaaaaaaaaaaaaaaaaaaaa";
+    let harness = TestHarness::new(
+        "secret_mime_types_refuse_without_changing_transport_or_learning_other_fields",
+    );
+    let root = harness.temp_path(".");
+    for image in [false, true] {
+        for as_tool_result in [false, true] {
+            for mode in ["obfuscate", "block", "off"] {
+                let (mut agent, capture) = build_agent(
+                    &root,
+                    Some(SecretsSettings {
+                        mode: Some(mode.to_string()),
+                        extra_patterns: None,
+                    }),
+                );
+                let mime = format!("{}/{SECRET}", if image { "image" } else { "audio" });
+                let block = if image {
+                    ContentBlock::Image(ImageContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: mime.clone(),
+                    })
+                } else {
+                    ContentBlock::Media(MediaContent {
+                        data: "cGF5bG9hZA==".to_string(),
+                        mime_type: mime.clone(),
+                        name: Some("recording".to_string()),
+                    })
+                };
+                let message = attachment_message(
+                    vec![
+                        ContentBlock::Text(TextContent::new(if mode == "block" {
+                            "ordinary"
+                        } else {
+                            EARLY
+                        })),
+                        block,
+                    ],
+                    as_tool_result,
+                );
+                let original = serde_json::to_value(&message).expect("original MIME");
+                let outcome =
+                    block_on_local(agent.run_with_message_with_abort(message, None, |_| {}));
+                let capture = capture.lock().expect("capture");
+                if mode == "off" {
+                    outcome.expect("off mode keeps ordinary transport behavior");
+                    assert_eq!(capture.payloads.len(), 1);
+                    assert!(capture.payloads[0].contains(&mime));
+                } else {
+                    let error = outcome.expect_err("secret MIME cannot be sent").to_string();
+                    assert!(
+                        error.contains(if mode == "block" {
+                            "PI_SECRET_BLOCK"
+                        } else {
+                            "PI_SECRET_MEDIA_MIME"
+                        }),
+                        "{error}"
+                    );
+                    assert!(!error.contains(SECRET));
+                    assert!(!error.contains(EARLY));
+                    assert!(capture.payloads.is_empty());
+                    if mode == "obfuscate" {
+                        assert_eq!(
+                            agent
+                                .secrets_transform_outbound_text(EARLY)
+                                .expect("rolled-back vault"),
+                            "<pi-secret:000001>",
+                            "the MIME refusal must roll back discovery of every earlier field"
+                        );
+                    }
+                }
+                assert_eq!(
+                    serde_json::to_value(&agent.messages()[0]).expect("retained MIME"),
+                    original
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn encoded_image_and_media_payloads_remain_opaque_to_secret_screening() {
+    use pi::model::{ContentBlock, ImageContent, MediaContent};
+
+    // This is valid base64 whose bytes also match a built-in AWS-key rule.
+    // Inspecting the encoded payload as text would either corrupt it or refuse.
+    const PAYLOAD: &str = "AKIA1234567890ABCDEF";
+    assert!(pi::secrets::contains_secret(PAYLOAD, &[]));
+    let harness =
+        TestHarness::new("encoded_image_and_media_payloads_remain_opaque_to_secret_screening");
+    let root = harness.temp_path(".");
+    for mode in ["obfuscate", "block"] {
+        let (mut agent, capture) = build_agent(
+            &root,
+            Some(SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: None,
+            }),
+        );
+        let blocks = vec![
+            ContentBlock::Image(ImageContent {
+                data: PAYLOAD.to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Media(MediaContent {
+                data: PAYLOAD.to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: Some("recording".to_string()),
+            }),
+        ];
+        let messages = vec![
+            attachment_message(blocks.clone(), false),
+            attachment_message(blocks, true),
+        ];
+        let original = serde_json::to_value(&messages).expect("original encoded payloads");
+        block_on_local(agent.run_with_messages_with_abort(messages, None, |_| {}))
+            .expect("encoded payloads are not text metadata");
+        let capture = capture.lock().expect("capture");
+        assert_eq!(capture.payloads.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&capture.messages[0]).unwrap(),
+            original
+        );
+        assert_eq!(
+            serde_json::to_value(&agent.messages()[..2]).unwrap(),
+            original
+        );
+    }
+}
+
+#[test]
+fn block_mode_paused_replay_keeps_payloads_opaque_but_screens_content_and_names() {
+    use pi::model::{
+        ContentBlock, ImageContent, MediaContent, StopReason, TextContent, ThinkingContent,
+    };
+
+    const PAYLOAD: &str = "AKIA1234567890ABCDEF";
+    let harness = TestHarness::new(
+        "block_mode_paused_replay_keeps_payloads_opaque_but_screens_content_and_names",
+    );
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, Some(block_mode()));
+    let media = MediaContent {
+        data: PAYLOAD.to_string(),
+        mime_type: "audio/wav".to_string(),
+        name: Some("recording".to_string()),
+    };
+    let paused = assistant(
+        vec![
+            ContentBlock::Media(media.clone()),
+            ContentBlock::Image(ImageContent {
+                data: PAYLOAD.to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Thinking(ThinkingContent {
+                thinking: "check recording".to_string(),
+                thinking_signature: Some(PAYLOAD.to_string()),
+            }),
+            ContentBlock::Text(TextContent {
+                text: "recording received".to_string(),
+                text_signature: Some(PAYLOAD.to_string()),
+            }),
+            tool_call("paused-call", json!({"status": "ready"}), Some(PAYLOAD)),
+        ],
+        StopReason::PauseTurn,
+    );
+    let original = serde_json::to_value(&paused).expect("original paused response");
+    block_on_local(agent.run_with_message_with_abort(paused, None, |_| {}))
+        .expect("opaque paused payloads and signatures must not be screened as text");
+    let capture = capture.lock().expect("capture");
+    assert_eq!(capture.payloads.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&capture.messages[0][0]).unwrap(),
+        original
+    );
+    assert_eq!(
+        serde_json::to_value(&agent.messages()[0]).unwrap(),
+        original
+    );
+    drop(capture);
+
+    let protected_blocks = [
+        ContentBlock::Media(MediaContent {
+            name: Some(SECRET.to_string()),
+            ..media
+        }),
+        tool_call("protected-call", json!({"api_key": SECRET}), Some(PAYLOAD)),
+        ContentBlock::Text(TextContent {
+            text: SECRET.to_string(),
+            text_signature: Some(PAYLOAD.to_string()),
+        }),
+        ContentBlock::Thinking(ThinkingContent {
+            thinking: SECRET.to_string(),
+            thinking_signature: Some(PAYLOAD.to_string()),
+        }),
+    ];
+    for block in protected_blocks {
+        let (mut blocked, blocked_capture) = build_agent(&root, Some(block_mode()));
+        let error = block_on_local(blocked.run_with_message_with_abort(
+            assistant(vec![block], StopReason::PauseTurn),
+            None,
+            |_| {},
+        ))
+        .expect_err("paused replay never exempts readable content from block mode");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"), "{error}");
+        assert!(!error.to_string().contains(SECRET));
+        assert!(blocked_capture.lock().expect("capture").payloads.is_empty());
     }
 }

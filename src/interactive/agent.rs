@@ -1,10 +1,6 @@
-use super::conversation::{
-    add_usage, build_content_blocks_for_input, content_blocks_to_text, last_assistant_message,
-    split_content_blocks_for_input,
-};
+use super::conversation::{add_usage, content_blocks_to_text, last_assistant_message};
 use super::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
 use super::*;
-use crate::extension_events::{BeforeAgentStartOutcome, apply_before_agent_start_response};
 
 pub fn extension_commands_for_catalog(
     manager: &ExtensionManager,
@@ -30,227 +26,8 @@ pub(super) fn build_user_message(text: String) -> ModelMessage {
     })
 }
 
-fn append_turn_artifacts(
-    session: &mut Session,
-    mut messages: Vec<ModelMessage>,
-    repairs: &[crate::dialects::RepairEntry],
-    keyword_activations: &[crate::magic_keywords::KeywordActivation],
-) {
-    // Session retry cleanup requires an Error/Aborted assistant to remain the
-    // leaf. Audit entries are durable completed state, so place them before
-    // the incomplete assistant rather than allowing a Custom entry to mask it.
-    let incomplete_assistant = messages
-        .iter()
-        .rposition(|message| {
-            matches!(
-                message,
-                ModelMessage::Assistant(assistant)
-                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
-            )
-        })
-        .map(|index| messages.remove(index));
-    for message in messages {
-        session.append_model_message(message);
-    }
-    crate::agent::append_dialect_repair_telemetry(session, repairs);
-    crate::magic_keywords::append_session_telemetry(session, keyword_activations);
-    if let Some(message) = incomplete_assistant {
-        session.append_model_message(message);
-    }
-}
-
-async fn dispatch_input_event(
-    manager: &ExtensionManager,
-    text: String,
-    images: Vec<ImageContent>,
-) -> crate::error::Result<InputEventOutcome> {
-    let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
-    let attachments_value = images_value.clone();
-    let text_clone = text.clone();
-    let payload = json!({
-        "text": text,
-        "content": text_clone,
-        "images": images_value,
-        "attachments": attachments_value,
-        "source": "interactive",
-    });
-    let response = manager
-        .dispatch_event_with_response(
-            ExtensionEventName::Input,
-            Some(payload),
-            EXTENSION_EVENT_TIMEOUT_MS,
-        )
-        .await?;
-    Ok(apply_input_event_response(response, text, images))
-}
-
-fn before_agent_start_payload(prompt: &str, images: &[ImageContent], system_prompt: &str) -> Value {
-    let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
-    json!({
-        "prompt": prompt,
-        "images": images_value,
-        "systemPrompt": system_prompt,
-    })
-}
-
-async fn dispatch_before_agent_start_event(
-    manager: &ExtensionManager,
-    prompt: &str,
-    images: &[ImageContent],
-    system_prompt: &str,
-) -> BeforeAgentStartOutcome {
-    let payload = before_agent_start_payload(prompt, images, system_prompt);
-    let response = manager
-        .dispatch_event_with_response(
-            ExtensionEventName::BeforeAgentStart,
-            Some(payload),
-            EXTENSION_EVENT_TIMEOUT_MS,
-        )
-        .await;
-
-    match response {
-        Ok(value) => apply_before_agent_start_response(value, Utc::now().timestamp_millis()),
-        Err(err) => {
-            tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
-            BeforeAgentStartOutcome {
-                messages: Vec::new(),
-                system_prompt: None,
-            }
-        }
-    }
-}
-
-struct TurnSystemPromptGuard<'a> {
-    agent: &'a mut crate::agent::Agent,
-    base_system_prompt: Option<String>,
-}
-
-impl<'a> TurnSystemPromptGuard<'a> {
-    fn new(
-        agent: &'a mut crate::agent::Agent,
-        base_system_prompt: Option<String>,
-        turn_system_prompt: Option<String>,
-    ) -> Self {
-        agent.set_system_prompt(turn_system_prompt.or_else(|| base_system_prompt.clone()));
-        Self {
-            agent,
-            base_system_prompt,
-        }
-    }
-}
-
-impl std::ops::Deref for TurnSystemPromptGuard<'_> {
-    type Target = crate::agent::Agent;
-
-    fn deref(&self) -> &Self::Target {
-        self.agent
-    }
-}
-
-impl std::ops::DerefMut for TurnSystemPromptGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.agent
-    }
-}
-
-impl Drop for TurnSystemPromptGuard<'_> {
-    fn drop(&mut self) {
-        self.agent.set_system_prompt(self.base_system_prompt.take());
-    }
-}
-
 const UI_STREAM_DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(45);
 const UI_STREAM_DELTA_MAX_BUFFER_BYTES: usize = 2 * 1024;
-
-/// System prompt for automatic session titling (bd-cv653.3.1).
-const TITLE_SYSTEM_PROMPT: &str = "You name coding sessions. Reply with ONLY a short plain-text title: 3-7 words, no quotes, no markdown, no trailing punctuation.";
-
-/// One-shot title generation against a tiny/smol-role model entry.
-///
-/// Returns None on ANY failure (auth, provider construction, stream error,
-/// empty/oversized output) — titling is strictly best-effort and must never
-/// disturb the session. Never logs prompt content.
-async fn generate_session_title(
-    entry: &ModelEntry,
-    user_text: &str,
-    assistant_excerpt: &str,
-) -> Option<String> {
-    use crate::model::{Message, StreamEvent};
-    use crate::provider::{Context, StreamOptions};
-    use futures::StreamExt;
-
-    if crate::models::model_requires_configured_credential(entry) {
-        // Cheap-role titling silently disables itself when credentials are
-        // missing — the user never asked for this call.
-        let key = super::commands::resolve_model_key_from_default_auth(entry)?;
-        if key.trim().is_empty() {
-            return None;
-        }
-    }
-    let provider = providers::create_provider(entry, None).ok()?;
-
-    let excerpt = |text: &str, cap: usize| {
-        let trimmed = text.trim();
-        if trimmed.chars().count() <= cap {
-            trimmed.to_string()
-        } else {
-            let mut s: String = trimmed.chars().take(cap).collect();
-            s.push('…');
-            s
-        }
-    };
-    let prompt_text = format!(
-        "Name this coding session.\n\nUser:\n{}\n\nAssistant (excerpt):\n{}",
-        excerpt(user_text, 2000),
-        excerpt(assistant_excerpt, 800)
-    );
-
-    let context = Context {
-        system_prompt: Some(TITLE_SYSTEM_PROMPT.to_string().into()),
-        messages: vec![Message::User(UserMessage {
-            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(prompt_text))]),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-        })]
-        .into(),
-        tools: Vec::new().into(),
-    };
-    let options = StreamOptions {
-        api_key: None,
-        max_tokens: Some(96),
-        thinking_level: Some(entry.clamp_thinking_level(ThinkingLevel::Minimal)),
-        ..Default::default()
-    };
-
-    let mut stream = provider.stream(&context, &options).await.ok()?;
-    let mut collected = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(StreamEvent::TextDelta { delta, .. }) => collected.push_str(&delta),
-            Ok(StreamEvent::Done { .. }) => break,
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-    }
-    sanitize_session_title(&collected)
-}
-
-/// Normalize a raw model reply into a valid session title: single line,
-/// stripped of quotes/markdown/noise, bounded to 60 chars. None when empty.
-fn sanitize_session_title(raw: &str) -> Option<String> {
-    let first_line = raw.lines().next().unwrap_or("").trim();
-    let cleaned: String = first_line
-        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '*' || c == '#')
-        .trim_end_matches(['.', '!', ':'])
-        .chars()
-        .take(60)
-        .collect();
-    let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
-}
 
 const EXTENSION_CUSTOM_WIDGET_KEY: &str = "__pi_custom_overlay";
 const EXTENSION_CUSTOM_MIN_WIDTH: usize = 20;
@@ -302,6 +79,7 @@ struct UiStreamDeltaBatcher {
     /// turn-end card is already in the transcript, so the task must not add
     /// a second `AgentError` block for the same failure.
     turn_error_surfaced: bool,
+    retry_attempts: Option<(u32, u32)>,
 }
 
 impl UiStreamDeltaBatcher {
@@ -326,6 +104,7 @@ impl UiStreamDeltaBatcher {
             pending_tool_update_bytes: 0,
             pending_tool_update_events: 0,
             turn_error_surfaced: false,
+            retry_attempts: None,
             last_tool_update_flush: now,
         }
     }
@@ -467,7 +246,7 @@ impl UiStreamDeltaBatcher {
     }
 }
 
-fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
+fn build_agent_done_pi_msg(messages: &[ModelMessage], retry_attempts: Option<(u32, u32)>) -> PiMsg {
     let last = last_assistant_message(messages);
     let mut usage = Usage::default();
     for message in messages {
@@ -485,7 +264,7 @@ fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
         msg.error_message.as_ref().map(|raw| {
             if stop_reason == StopReason::Error {
                 crate::error::ProviderErrorSummary::from_error_text(Some(&msg.provider), raw)
-                    .turn_end_card(raw, None)
+                    .turn_end_card(raw, retry_attempts)
             } else {
                 raw.clone()
             }
@@ -498,8 +277,72 @@ fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBatcher) {
     match event {
+        AgentEvent::MessageStart {
+            message: ModelMessage::Assistant(_),
+        } => batcher.send_immediate(PiMsg::AssistantMessageStart),
+        AgentEvent::MessageEnd {
+            message: ModelMessage::Assistant(message),
+        } if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) => {
+            batcher.send_immediate(PiMsg::AssistantMessageStart);
+        }
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            ..
+        } => {
+            batcher.retry_attempts = Some((*attempt, *max_attempts));
+            batcher.send_immediate(PiMsg::ProviderRecovery {
+                message: format!(
+                    "Retrying provider request ({attempt}/{max_attempts}) in {delay_ms} ms"
+                ),
+                model: None,
+                discard_incomplete: true,
+            });
+        }
+        AgentEvent::FailoverStart {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            ..
+        } => batcher.send_immediate(PiMsg::ProviderRecovery {
+            message: format!(
+                "Provider fallback: {from_provider}/{from_model} → {to_provider}/{to_model}"
+            ),
+            model: Some((to_provider.clone(), to_model.clone())),
+            discard_incomplete: true,
+        }),
+        AgentEvent::FailoverEnd {
+            provider,
+            model,
+            restored_primary: true,
+            ..
+        } => batcher.send_immediate(PiMsg::ProviderRecovery {
+            message: format!("Primary model restored: {provider}/{model}"),
+            model: Some((provider.clone(), model.clone())),
+            discard_incomplete: false,
+        }),
+        AgentEvent::AutoCompactionStart { reason } => {
+            batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {reason}")));
+        }
+        AgentEvent::PrewalkSwitched {
+            provider,
+            model,
+            thinking,
+        } => {
+            batcher.send_immediate(PiMsg::ProviderRecovery {
+                message: format!("Prewalk switched → {provider}/{model}:{thinking}"),
+                model: Some((provider.clone(), model.clone())),
+                discard_incomplete: false,
+            });
+        }
+        AgentEvent::AdvisorNote { level, rationale } => {
+            batcher.send_immediate(PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}")));
+        }
         AgentEvent::MessageUpdate {
             assistant_message_event,
             ..
@@ -588,18 +431,40 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AgentEnd {
             messages, error, ..
         } => {
-            let done = build_agent_done_pi_msg(messages);
-            if error.is_some()
-                && matches!(
-                    &done,
-                    PiMsg::AgentDone {
-                        stop_reason: StopReason::Error,
-                        error_message: Some(_),
-                        ..
-                    }
-                )
+            let mut done = build_agent_done_pi_msg(messages, batcher.retry_attempts);
+            if let PiMsg::AgentDone {
+                stop_reason,
+                error_message,
+                ..
+            } = &mut done
             {
-                batcher.turn_error_surfaced = true;
+                // SDK AgentEnd follows persistence. A successful assistant
+                // does not make a failed final save a successful turn.
+                if let Some(error) = error
+                    && *stop_reason != StopReason::Aborted
+                {
+                    *stop_reason = StopReason::Error;
+                    if error_message.is_none() {
+                        *error_message = Some(error.clone());
+                    }
+                }
+                batcher.turn_error_surfaced = *stop_reason == StopReason::Error;
+            }
+            // This terminal event is held until the recoverable turn has
+            // returned successfully and its owner is unlocked. Synthetic cap
+            // messages have no streamed delta, so render their durable reason
+            // here and distinguish them from a turn that may drain more work.
+            if error.is_none()
+                && let Some(last) = last_assistant_message(messages)
+                && let Some(message) = crate::agent::time_cap_marker(last)
+            {
+                done = match done {
+                    PiMsg::AgentDone { usage, .. } => PiMsg::AgentTimeCap {
+                        usage,
+                        message: message.to_string(),
+                    },
+                    other => other,
+                };
             }
             batcher.send_immediate(done);
         }
@@ -950,18 +815,98 @@ impl PiApp {
         self.handle_pi_message_with_session_retry(msg, SESSION_EVENT_LOCK_RETRY_ATTEMPTS)
     }
 
+    fn finish_handoff_ui(&mut self) {
+        self.handoff_request_id = None;
+        self.abort_handle = None;
+        self.agent_state = AgentState::Idle;
+        self.current_tool = None;
+        self.current_tool_id = None;
+        self.current_tool_summary.clear();
+        self.extension_compacting.store(false, Ordering::SeqCst);
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_pi_message_with_session_retry(
         &mut self,
         msg: PiMsg,
         attempts_remaining: u8,
     ) -> Option<Cmd> {
+        if let PiMsg::McpAuthFinished {
+            request_id,
+            message,
+        } = msg
+        {
+            if self.mcp_auth_request_id.as_deref() != Some(request_id.as_str()) {
+                return None;
+            }
+            self.mcp_auth_request_id = None;
+            return self
+                .handle_pi_message_with_session_retry(PiMsg::System(message), attempts_remaining);
+        }
+        let (msg, handoff_completion) = match msg {
+            PiMsg::HandoffFinished { request_id, event } => {
+                if self.handoff_request_id.as_deref() != Some(request_id.as_str()) {
+                    return None;
+                }
+                (*event, Some(request_id))
+            }
+            msg => (msg, None),
+        };
+        if handoff_completion.is_some() && !matches!(&msg, PiMsg::ConversationReset { .. }) {
+            self.finish_handoff_ui();
+        }
         match msg {
+            PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return None,
+            PiMsg::System(message) | PiMsg::AgentError(message)
+                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() =>
+            {
+                // Background notices cannot release an operator request's
+                // abort handle or admit another foreground operation.
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
+                self.scroll_to_bottom();
+            }
             PiMsg::AgentStart => {
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
                 self.current_thinking.clear();
+                self.current_assistant_start = (0, 0);
+                self.discard_incomplete_on_next_assistant = false;
                 self.extension_streaming.store(true, Ordering::SeqCst);
+            }
+            PiMsg::AssistantMessageStart => {
+                if self.discard_incomplete_on_next_assistant {
+                    self.current_response
+                        .truncate(self.current_assistant_start.0);
+                    self.current_thinking
+                        .truncate(self.current_assistant_start.1);
+                    self.discard_incomplete_on_next_assistant = false;
+                }
+                self.current_assistant_start =
+                    (self.current_response.len(), self.current_thinking.len());
+            }
+            PiMsg::ProviderRecovery {
+                message,
+                model,
+                discard_incomplete,
+            } => {
+                self.discard_incomplete_on_next_assistant |= discard_incomplete;
+                if let Some((provider, model_id)) = model {
+                    let spec = format!("{provider}/{model_id}");
+                    if let Some(entry) =
+                        crate::failover::resolve_chain_spec(&spec, &self.available_models)
+                    {
+                        self.model_entry = entry.clone();
+                        if let Ok(mut shared) = self.model_entry_shared.lock() {
+                            *shared = entry;
+                        }
+                    }
+                    self.model = spec;
+                }
+                self.status_message = Some(message.clone());
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
+                self.scroll_to_bottom();
             }
             PiMsg::RunPending => {
                 return self.run_next_pending();
@@ -1006,7 +951,10 @@ impl PiApp {
             | PiMsg::AutocompleteCatalog(_)
             | PiMsg::LoginPending { .. }
             | PiMsg::StatusSnapshot(_)
+            | PiMsg::UserInputSubmitted { .. }
             | PiMsg::MessagePicker { .. } => {}
+            #[cfg(feature = "ftui")]
+            PiMsg::Settings { .. } => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();
@@ -1108,11 +1056,21 @@ impl PiApp {
                 self.ask_ui_queue.push_back(request);
                 self.advance_ask_ui_queue();
             }
-            PiMsg::AgentDone {
-                usage,
-                stop_reason,
-                error_message,
-            } => {
+            terminal @ (PiMsg::AgentDone { .. } | PiMsg::AgentTimeCap { .. }) => {
+                let (usage, stop_reason, error_message, time_cap_message) = match terminal {
+                    PiMsg::AgentDone {
+                        usage,
+                        stop_reason,
+                        error_message,
+                    } => (usage, stop_reason, error_message, None),
+                    PiMsg::AgentTimeCap { usage, message } => {
+                        (usage, StopReason::Stop, None, Some(message))
+                    }
+                    _ => return None,
+                };
+                let title_eligible = stop_reason == StopReason::Stop
+                    && error_message.is_none()
+                    && time_cap_message.is_none();
                 // Snapshot follow-tail *before* we mutate conversation state so
                 // we preserve the user's scroll intent.
                 let follow_tail = self.follow_stream_tail;
@@ -1138,10 +1096,34 @@ impl PiApp {
                 // appearing in the next view() frame.
                 self.current_response.clear();
                 self.current_thinking.clear();
+                self.current_assistant_start = (0, 0);
+                self.discard_incomplete_on_next_assistant = false;
 
                 // Update usage
                 if let Some(ref u) = usage {
                     add_usage(&mut self.total_usage, u);
+                }
+
+                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() {
+                    // A delayed terminal from an earlier turn may finalize its
+                    // display, but it does not own this handoff's cancellation
+                    // handle, hook dialogs, or foreground admission state.
+                    if let Some(message) = time_cap_message {
+                        self.pending_inputs_paused_by_time_cap = true;
+                        self.messages.push(ConversationMessage::new(
+                            MessageRole::System,
+                            message,
+                            None,
+                        ));
+                    } else if let Some(message) = error_message {
+                        self.messages.push(ConversationMessage::new(
+                            MessageRole::System,
+                            message,
+                            None,
+                        ));
+                    }
+                    self.refresh_conversation_viewport(follow_tail);
+                    return None;
                 }
 
                 self.agent_state = AgentState::Idle;
@@ -1157,6 +1139,14 @@ impl PiApp {
 
                 if stop_reason == StopReason::Aborted {
                     self.status_message = Some("Request aborted".to_string());
+                } else if let Some(message) = time_cap_message.as_ref() {
+                    self.pending_inputs_paused_by_time_cap = true;
+                    self.status_message = Some(message.clone());
+                    self.messages.push(ConversationMessage::new(
+                        MessageRole::System,
+                        message.clone(),
+                        None,
+                    ));
                 } else if stop_reason == StopReason::Error {
                     let message = error_message.unwrap_or_else(|| "Request failed".to_string());
                     // The status bar is one line: show the headline there and
@@ -1191,18 +1181,16 @@ impl PiApp {
                 // overwritten or missing.
                 self.refresh_conversation_viewport(follow_tail);
 
-                // Auto-titling (bd-cv653.3.1): after the first completed
-                // exchange of an unnamed, persisted session, ask a tiny/smol
-                // role model for a short session name. Async and fire-and-
-                // forget: never blocks the turn, silently no-ops on failure.
-                if !matches!(stop_reason, StopReason::Aborted | StopReason::Error) {
+                // The task prepares from the live Agent after its complete
+                // turn has settled, including persistence and recovery.
+                if title_eligible {
                     self.maybe_request_session_title();
                 }
                 // bd-1qol9: terminal/abort cleanup invalidates every card
                 // from this turn BEFORE idle input or RunPending runs.
                 self.invalidate_input_cards_for_turn_end();
 
-                if !self.pending_inputs.is_empty() {
+                if !self.pending_inputs_paused_by_time_cap && !self.pending_inputs.is_empty() {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
@@ -1210,17 +1198,15 @@ impl PiApp {
                 owner_session_id,
                 title,
             } => {
-                // Apply only when the session is STILL unnamed (a manual /name
-                // during the title call always wins), the originating session
-                // is still current, and persistence is on.
+                // Persistence happens under the AgentSession owner before
+                // this notification. Never turn an event into an unsaved name.
                 if self.save_enabled {
                     let session = Arc::clone(&self.session);
                     match session.try_lock() {
-                        Ok(mut guard)
+                        Ok(guard)
                             if guard.header.id == owner_session_id
-                                && guard.get_name().is_none() =>
+                                && guard.get_name().as_deref() == Some(title.as_str()) =>
                         {
-                            guard.set_name(&title);
                             drop(guard);
                             self.status_message = Some(format!("Session named: {title}"));
                         }
@@ -1312,6 +1298,37 @@ impl PiApp {
                     collapsed: false,
                 });
                 self.scroll_to_bottom();
+            }
+            PiMsg::ReviewFinished {
+                owner_session_id,
+                request_id,
+                message,
+            } => {
+                if self.review_request_id.as_deref() != Some(request_id.as_str()) {
+                    return None;
+                }
+                match self.session_event_ownership(&owner_session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => {
+                        self.review_request_id = None;
+                        return None;
+                    }
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::ReviewFinished {
+                                owner_session_id,
+                                request_id,
+                                message,
+                            },
+                            attempts_remaining,
+                        );
+                    }
+                }
+                self.review_request_id = None;
+                return self.handle_pi_message_with_session_retry(
+                    PiMsg::System(message),
+                    attempts_remaining,
+                );
             }
             PiMsg::SessionSystemNote {
                 owner_session_id,
@@ -1442,8 +1459,15 @@ After approving access in the browser, press Enter in Pi to complete login."
                 if self.agent_state != AgentState::Idle {
                     return None;
                 }
-                self.pending_inputs
-                    .push_back(PendingInput::GeneratedText(text));
+                let retry_input = PendingInput::GeneratedText(text);
+                if self.pending_inputs_paused_by_time_cap {
+                    // A committed /retry owns the next foreground budget;
+                    // earlier unclaimed work stays queued behind that target.
+                    self.pending_inputs.push_front(retry_input);
+                } else {
+                    self.pending_inputs.push_back(retry_input);
+                }
+                self.pending_inputs_paused_by_time_cap = false;
                 return self.run_next_pending();
             }
             PiMsg::ConversationReset {
@@ -1454,18 +1478,39 @@ After approving access in the browser, press Enter in Pi to complete login."
             } => {
                 match self.session_event_ownership(&session_id) {
                     SessionEventOwnership::Current => {}
-                    SessionEventOwnership::Stale => return None,
-                    SessionEventOwnership::Busy => {
-                        return self.retry_busy_session_event(
-                            PiMsg::ConversationReset {
-                                session_id,
-                                messages,
-                                usage,
-                                status,
-                            },
-                            attempts_remaining,
-                        );
+                    SessionEventOwnership::Stale => {
+                        if handoff_completion.is_some() {
+                            self.finish_handoff_ui();
+                            self.status_message = Some("Handoff finished for an earlier session; the current display was kept".to_string());
+                        }
+                        return None;
                     }
+                    SessionEventOwnership::Busy => {
+                        let event = PiMsg::ConversationReset {
+                            session_id,
+                            messages,
+                            usage,
+                            status,
+                        };
+                        if let Some(request_id) = handoff_completion {
+                            if attempts_remaining == 0 {
+                                self.finish_handoff_ui();
+                                self.status_message = Some("Handoff saved; the busy session prevented a conversation display refresh".to_string());
+                                return None;
+                            }
+                            return self.retry_busy_session_event(
+                                PiMsg::HandoffFinished {
+                                    request_id,
+                                    event: Box::new(event),
+                                },
+                                attempts_remaining,
+                            );
+                        }
+                        return self.retry_busy_session_event(event, attempts_remaining);
+                    }
+                }
+                if handoff_completion.is_some() {
+                    self.finish_handoff_ui();
                 }
                 let is_replacement =
                     self.displayed_session_id.as_deref() != Some(session_id.as_str());
@@ -1489,7 +1534,11 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.current_tool_summary.clear();
                 self.abort_handle = None;
                 if is_replacement {
-                    self.title_requested = false;
+                    self.handoff_request_id = None;
+                    self.mcp_auth_request_id = None;
+                    self.title_cancellation = None;
+                    self.pending_inputs_paused_by_time_cap = false;
+                    self.title_requested = !self.messages.is_empty();
                     self.todo_summary = None;
                     self.pending_oauth = None;
                     self.role_model_overrides.clear();
@@ -1524,6 +1573,35 @@ After approving access in the browser, press Enter in Pi to complete login."
                     }
                 }
                 self.input.set_value(&text);
+                self.input.focus();
+            }
+            PiMsg::RestorePendingInput {
+                owner_session_id,
+                text,
+            } => {
+                match self.session_event_ownership(&owner_session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => return None,
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::RestorePendingInput {
+                                owner_session_id,
+                                text,
+                            },
+                            attempts_remaining,
+                        );
+                    }
+                }
+                let combined = [text, self.input.value()]
+                    .into_iter()
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                self.input.set_value(&combined);
+                if combined.contains('\n') {
+                    self.input_mode = InputMode::MultiLine;
+                    self.set_input_height(6);
+                }
                 self.input.focus();
             }
             PiMsg::OpenTree {
@@ -2830,7 +2908,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         if self.title_requested || !self.save_enabled {
             return;
         }
-        let Some(entry) = self.title_model_entry.clone() else {
+        let Some(client) = self.title_client.clone() else {
             return;
         };
         let Some(owner_session_id) = self
@@ -2841,36 +2919,58 @@ After approving access in the browser, press Enter in Pi to complete login."
         else {
             return;
         };
-        let mut user_texts = self
-            .messages
-            .iter()
-            .filter(|m| m.role == MessageRole::User)
-            .map(|m| m.content.clone());
-        let Some(user_text) = user_texts.next() else {
-            return;
-        };
-        if user_texts.next().is_some() {
-            // Only title on the first exchange — later arrivals suggest the
-            // session already has an established topic.
-            return;
-        }
-        if user_text.trim().is_empty() {
-            return;
-        }
-        let assistant_excerpt = self
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == MessageRole::Assistant)
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
         self.title_requested = true;
+        let (cancellation, registration) = crate::session_title::TitleCancellation::new();
+        let cancellation_check = cancellation.handle();
+        self.title_cancellation = Some(cancellation);
+        let owner = Arc::clone(&self.agent);
         let event_tx = self.event_tx.clone();
         self.runtime_handle.spawn(async move {
             let cx = Cx::for_request();
-            if let Some(title) =
-                generate_session_title(&entry, &user_text, &assistant_excerpt).await
+            let prepare_and_generate = async {
+                let agent = OwnedMutexGuard::lock(Arc::clone(&owner), &cx).await.ok()?;
+                let session = agent.handle.session();
+                if !session.save_enabled() || session.ensure_provider_reentry_allowed().is_err() {
+                    return None;
+                }
+                let saved = OwnedMutexGuard::lock(Arc::clone(&session.session), &cx)
+                    .await
+                    .ok()?;
+                if saved.header.id != owner_session_id
+                    || saved.get_name().is_some()
+                    || saved.path.is_none()
+                    || saved.autosave_metrics().pending_mutations != 0
+                {
+                    return None;
+                }
+                let prepared = client.prepare_with_agent(&session.agent).ok()??;
+                drop(saved);
+                drop(agent);
+                let title = client.generate(prepared).await?;
+                let agent = OwnedMutexGuard::lock(owner, &cx).await.ok()?;
+                Some((agent, title))
+            };
+            let Ok(Some((agent, title))) =
+                futures::future::Abortable::new(prepare_and_generate, registration).await
+            else {
+                return;
+            };
+            // Cancellation owns provider work and waiting for the foreground
+            // owner. Once persistence is admitted, let its reconciliation
+            // finish instead of dropping a partially written candidate.
+            if cancellation_check.is_aborted() {
+                return;
+            }
+            if crate::session_title::save_if_unnamed(
+                agent.handle.session(),
+                &owner_session_id,
+                &title,
+                Some(&cancellation_check),
+            )
+            .await
+            .unwrap_or(false)
             {
+                drop(agent);
                 crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &cx,
@@ -2886,7 +2986,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     fn run_next_pending(&mut self) -> Option<Cmd> {
         loop {
-            if self.agent_state != AgentState::Idle {
+            if self.agent_state != AgentState::Idle || self.pending_inputs_paused_by_time_cap {
                 return None;
             }
             let next = self.pending_inputs.pop_front()?;
@@ -2925,6 +3025,24 @@ After approving access in the browser, press Enter in Pi to complete login."
         let trimmed = raw_text.trim();
         if trimmed.is_empty() {
             self.status_message = Some("No input to queue".to_string());
+            return;
+        }
+
+        if self.mcp_auth_request_id.is_some() {
+            self.status_message =
+                Some("MCP authentication is still running; Escape cancels it".to_string());
+            return;
+        }
+        if self.handoff_request_id.is_some()
+            || matches!(
+                SlashCommand::parse(trimmed),
+                Some((SlashCommand::Handoff, _))
+            )
+        {
+            self.status_message = Some(
+                "Handoff must finish before submitting another request; Escape cancels it"
+                    .to_string(),
+            );
             return;
         }
 
@@ -3008,176 +3126,167 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn submit_continue(&mut self) -> Option<Cmd> {
         if let Err(message) = self.sync_runtime_selection_from_session_header() {
             self.status_message = Some(message);
             return None;
         }
+        self.spawn_recoverable_turn(None, None);
+        None
+    }
 
-        let event_tx = self.event_tx.clone();
-        let agent = Arc::clone(&self.agent);
-        let session = Arc::clone(&self.session);
-        let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
-        let mcp_manager = self.mcp_manager.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
+    // The UI batcher stays locked across each event so its messages reach the
+    // UI in event order; the terminal slot has no other owner once the turn
+    // has returned.
+    #[allow(
+        clippy::significant_drop_in_scrutinee,
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines
+    )]
+    fn spawn_recoverable_turn(
+        &mut self,
+        input: Option<UserContent>,
+        keyword_scan_source: Option<String>,
+    ) {
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-
-        // Refuse a dead region before entering `Processing`, not inside the
-        // task. The turn inherits `task_cx` for its deadline and budget, but it
-        // can arrive already cancel-requested — shutdown in flight, or a
-        // previous aborted turn's context still current. A cancel-correct
-        // runtime then cancels the spawned task at its FIRST await, so nothing
-        // the task awaits can report: the agent-lock failure that used to
-        // surface this never runs, and neither does an enqueue placed ahead of
-        // it. Verified directly — a synchronous probe at the top of the task
-        // fires, and the very next `enqueue_pi_event(..).await` never delivers.
-        //
-        // Left to run, the caller has already set `AgentState::Processing` and
-        // the UI sits there with no error, no completion and no way out. The
-        // only place that can still speak is here (bd-k01i6).
+        // A task in an already cancelled region may stop at its first await
+        // before it can report any error. Refuse synchronously (bd-k01i6).
         if task_cx.is_cancel_requested() {
+            self.agent_state = AgentState::Idle;
             self.status_message =
                 Some("Cancelled: the request was already cancelled, so no turn was started".into());
-            return None;
+            return;
         }
-
+        let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
+        // Only a new foreground submission/continue can renew the run budget.
+        // Automatic queue processing cannot reach this point while paused.
+        self.pending_inputs_paused_by_time_cap = false;
+        let extension_compacting = Arc::clone(&self.extension_compacting);
         let (abort_handle, abort_signal) = AbortHandle::new();
+        self.review_request_id = None;
         self.abort_handle = Some(abort_handle);
-
         self.agent_state = AgentState::Processing;
+        // Extensions may send steering while the first request is in backoff
+        // or awaiting an input hook, before the first AgentStart event.
+        self.extension_streaming.store(true, Ordering::SeqCst);
         self.scroll_to_bottom();
-
-        let runtime_handle_for_task = runtime_handle.clone();
-        runtime_handle.spawn(async move {
+        self.runtime_handle.spawn(async move {
             #[cfg(test)]
-            emit_submit_continue_deadline_probe(task_cx.budget().deadline);
-
-            if let Some(manager) = extensions.clone() {
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
+            if input.is_none() {
+                emit_submit_continue_deadline_probe(task_cx.budget().deadline);
             }
-
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            // MCP servers an extension registered after startup reach this
-            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
-            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
-                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
-            }
-            let previous_len = agent_guard.messages().len();
-
-            let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let runtime_handle = runtime_handle_for_task.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
-            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-            let result = agent_guard
-                .run_continue_with_abort(Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle);
-                    }
-                })
-                .await;
-            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
-
-            let new_messages: Vec<crate::model::Message> =
-                agent_guard.messages()[previous_len..].to_vec();
-            let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let repairs = match agent_guard.drain_repair_ledger() {
-                Ok(repairs) => repairs,
+            let mut agent = match OwnedMutexGuard::lock(agent, &task_cx).await {
+                Ok(agent) => agent,
                 Err(err) => {
-                    drop(session_guard);
-                    drop(agent_guard);
-                    let _ = crate::interactive::enqueue_pi_event(
+                    enqueue_pi_event(
                         &event_tx,
                         &Cx::for_request(),
-                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                        PiMsg::AgentError(format!("Failed to lock agent: {err}")),
                     )
                     .await;
                     return;
                 }
             };
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-            append_turn_artifacts(
-                &mut session_guard,
-                new_messages,
-                &repairs,
-                &keyword_activations,
-            );
-            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
-                Some(format!("Failed to save session: {err}"))
-            } else {
-                None
-            };
-            drop(session_guard);
-
-            if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err),
-                )
+            agent.set_magic_keyword_scan_override(keyword_scan_source);
+            let update_user = Arc::new(AtomicBool::new(input.is_some()));
+            let batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
+                event_tx.clone(),
+                tui_pressure_frame_p99_us,
+            )));
+            let output = Arc::clone(&batcher);
+            let terminal = Arc::new(StdMutex::new(None));
+            let callback_terminal = Arc::clone(&terminal);
+            let turn_abort = abort_signal.clone();
+            let result = agent
+                .handle
+                .run_recoverable_turn(input, abort_signal, move |event| {
+                    match &event {
+                        AgentEvent::AutoCompactionStart { .. } => {
+                            extension_compacting.store(true, Ordering::SeqCst);
+                        }
+                        AgentEvent::AutoCompactionEnd { .. } => {
+                            extension_compacting.store(false, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                    // A terminal UI event releases pending input. Retain it
+                    // until the complete logical turn has returned and its
+                    // Agent owner is unlocked, so queued input cannot race
+                    // the final save or be rejected as "Agent busy".
+                    if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                        *callback_terminal
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+                        return;
+                    }
+                    let mut batcher = output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let AgentEvent::MessageStart {
+                        message: ModelMessage::User(user),
+                    } = &event
+                        && update_user.swap(false, Ordering::SeqCst)
+                    {
+                        let display = match &user.content {
+                            UserContent::Text(text) => text.clone(),
+                            UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+                        };
+                        batcher.send_immediate(PiMsg::UpdateLastUserMessage(display));
+                    }
+                    dispatch_agent_event_to_ui(&event, &mut batcher);
+                })
                 .await;
-            }
-
-            if let Err(err) = result
-                && !turn_error_already_surfaced(&ui_stream_batcher)
+            // The handle remains installed in the same mutex through the
+            // final durable save and every recovery step; idle operations
+            // cannot observe half of a provider/session transition.
+            drop(agent);
+            if let Some(event) = terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
             {
-                let formatted = crate::error_hints::format_error_with_hints(&err);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(formatted),
-                )
-                .await;
+                let mut output = batcher
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let persistence_error = result
+                    .as_ref()
+                    .err()
+                    .filter(|error| error.is_session_persistence());
+                if let AgentEvent::AgentEnd { messages, .. } = &event
+                    && (persistence_error.is_some() || turn_abort.is_aborted())
+                {
+                    let mut done = build_agent_done_pi_msg(messages, output.retry_attempts);
+                    if let PiMsg::AgentDone {
+                        stop_reason,
+                        error_message,
+                        ..
+                    } = &mut done
+                    {
+                        // Aborting a request cannot hide an indeterminate
+                        // durable save: that failure still fences re-entry.
+                        *stop_reason = if persistence_error.is_some() {
+                            StopReason::Error
+                        } else {
+                            StopReason::Aborted
+                        };
+                        *error_message = persistence_error.map(ToString::to_string);
+                    }
+                    output.turn_error_surfaced = true;
+                    output.send_immediate(done);
+                } else {
+                    dispatch_agent_event_to_ui(&event, &mut output);
+                }
+            }
+            flush_ui_stream_batcher_with_backpressure(&batcher).await;
+            if let Err(error) = result
+                && !turn_error_already_surfaced(&batcher)
+            {
+                let message = crate::error_hints::format_error_with_hints(&error);
+                enqueue_pi_event(&event_tx, &Cx::for_request(), PiMsg::AgentError(message)).await;
             }
         });
-
-        None
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3215,7 +3324,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         if !display_owned.trim().is_empty() {
             self.messages.push(ConversationMessage {
                 role: MessageRole::User,
-                content: display_owned.clone(),
+                content: display_owned,
                 thinking: None,
                 collapsed: false,
             });
@@ -3232,238 +3341,13 @@ After approving access in the browser, press Enter in Pi to complete login."
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
 
-        let content_for_agent = content;
-        let event_tx = self.event_tx.clone();
-        let agent = Arc::clone(&self.agent);
-        let session = Arc::clone(&self.session);
-        let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
-        let mcp_manager = self.mcp_manager.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
-        let (abort_handle, abort_signal) = AbortHandle::new();
-        self.abort_handle = Some(abort_handle);
-
-        let runtime_handle_for_task = runtime_handle.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-        runtime_handle.spawn(async move {
-            let mut content_for_agent = content_for_agent;
-            let base_system_prompt = {
-                let guard =
-                    match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx)
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &Cx::for_request(),
-                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                let prompt = guard.system_prompt().map(str::to_string);
-                drop(guard);
-                prompt
-            };
-            let before_start = if let Some(manager) = extensions.clone() {
-                let (text, images) = split_content_blocks_for_input(&content_for_agent);
-                match dispatch_input_event(&manager, text, images).await {
-                    Ok(InputEventOutcome::Continue { text, images }) => {
-                        content_for_agent = build_content_blocks_for_input(&text, &images);
-                        let updated = content_blocks_to_text(&content_for_agent);
-                        if updated != display_owned {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::UpdateLastUserMessage(updated),
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::UpdateLastUserMessage("[input blocked]".to_string()),
-                        )
-                        .await;
-                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(message),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-
-                let (text, images) = split_content_blocks_for_input(&content_for_agent);
-                dispatch_before_agent_start_event(
-                    &manager,
-                    &text,
-                    &images,
-                    base_system_prompt.as_deref().unwrap_or(""),
-                )
-                .await
-            } else {
-                BeforeAgentStartOutcome {
-                    messages: Vec::new(),
-                    system_prompt: None,
-                }
-            };
-
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            // MCP servers an extension registered after startup reach this
-            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
-            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
-                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
+        let input = match content.as_slice() {
+            [ContentBlock::Text(text)] if keyword_scan_source.as_deref() == Some("") => {
+                UserContent::Text(text.text.clone())
             }
-            let BeforeAgentStartOutcome {
-                messages: before_messages,
-                system_prompt,
-            } = before_start;
-            let mut turn_agent =
-                TurnSystemPromptGuard::new(&mut agent_guard, base_system_prompt, system_prompt);
-            let preserve_plain_text_shape = keyword_scan_source.as_deref() == Some("");
-            turn_agent.set_magic_keyword_scan_override(keyword_scan_source);
-            let previous_len = turn_agent.messages().len();
-
-            let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let runtime_handle = runtime_handle_for_task.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
-            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-            let user_content = match content_for_agent.as_slice() {
-                [ContentBlock::Text(text)] if preserve_plain_text_shape => {
-                    UserContent::Text(text.text.clone())
-                }
-                _ => UserContent::Blocks(content_for_agent),
-            };
-            let user_message = ModelMessage::User(UserMessage {
-                content: user_content,
-                timestamp: Utc::now().timestamp_millis(),
-            });
-            let mut prompts = Vec::with_capacity(1 + before_messages.len());
-            prompts.push(user_message);
-            prompts.extend(before_messages.into_iter().map(ModelMessage::Custom));
-
-            let result = turn_agent
-                .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle);
-                    }
-                })
-                .await;
-            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
-
-            drop(turn_agent);
-
-            let new_messages: Vec<crate::model::Message> =
-                agent_guard.messages()[previous_len..].to_vec();
-            let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let repairs = match agent_guard.drain_repair_ledger() {
-                Ok(repairs) => repairs,
-                Err(err) => {
-                    drop(session_guard);
-                    drop(agent_guard);
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &Cx::for_request(),
-                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-            append_turn_artifacts(
-                &mut session_guard,
-                new_messages,
-                &repairs,
-                &keyword_activations,
-            );
-            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
-                Some(format!("Failed to save session: {err}"))
-            } else {
-                None
-            };
-            drop(session_guard);
-
-            if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err),
-                )
-                .await;
-            }
-
-            if let Err(err) = result
-                && !turn_error_already_surfaced(&ui_stream_batcher)
-            {
-                let formatted = crate::error_hints::format_error_with_hints(&err);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(formatted),
-                )
-                .await;
-            }
-        });
+            _ => UserContent::Blocks(content),
+        };
+        self.spawn_recoverable_turn(Some(input), keyword_scan_source);
 
         None
     }
@@ -3485,6 +3369,16 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
         if self.handle_ask_ui_input(message) {
+            return None;
+        }
+
+        if self.mcp_auth_request_id.is_some() {
+            self.status_message =
+                Some("MCP authentication is still running; Escape cancels it".to_string());
+            return None;
+        }
+        if self.handoff_request_id.is_some() {
+            self.status_message = Some("Handoff is still running; Escape cancels it".to_string());
             return None;
         }
 
@@ -3587,9 +3481,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             if !text.trim().is_empty() {
                 content.push(ContentBlock::Text(TextContent::new(text)));
             }
-            for image in processed.images {
-                content.push(ContentBlock::Image(image));
-            }
+            content.extend(processed.attachments);
 
             self.history.push(message_owned.clone());
 
@@ -3600,16 +3492,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 Some(keyword_scan_source),
             );
         }
-        let event_tx = self.event_tx.clone();
-        let agent = Arc::clone(&self.agent);
-        let session = Arc::clone(&self.session);
-        let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
-        let mcp_manager = self.mcp_manager.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
-        let (abort_handle, abort_signal) = AbortHandle::new();
-        self.abort_handle = Some(abort_handle);
-
         // Add to history
         self.history.push(message_owned.clone());
 
@@ -3620,7 +3502,6 @@ After approving access in the browser, press Enter in Pi to complete login."
             thinking: None,
             collapsed: false,
         });
-        let displayed_message = message_for_agent.clone();
 
         // Clear input and reset to single-line mode
         self.input.reset();
@@ -3633,226 +3514,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
 
-        let runtime_handle = self.runtime_handle.clone();
-        let keyword_scan_source = message_owned;
-
-        // Spawn async task to run the agent
-        let runtime_handle_for_agent = runtime_handle.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-        runtime_handle.spawn(async move {
-            let mut message_for_agent = message_for_agent;
-            let mut input_images = Vec::new();
-            let base_system_prompt = {
-                let guard =
-                    match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx)
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &Cx::for_request(),
-                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                let prompt = guard.system_prompt().map(str::to_string);
-                drop(guard);
-                prompt
-            };
-            let before_start = if let Some(manager) = extensions.clone() {
-                match dispatch_input_event(&manager, message_for_agent.clone(), Vec::new()).await {
-                    Ok(InputEventOutcome::Continue { text, images }) => {
-                        message_for_agent = text;
-                        input_images = images;
-                        if message_for_agent != displayed_message {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::UpdateLastUserMessage(message_for_agent.clone()),
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::UpdateLastUserMessage("[input blocked]".to_string()),
-                        )
-                        .await;
-                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(message),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-                dispatch_before_agent_start_event(
-                    &manager,
-                    &message_for_agent,
-                    &input_images,
-                    base_system_prompt.as_deref().unwrap_or(""),
-                )
-                .await
-            } else {
-                BeforeAgentStartOutcome {
-                    messages: Vec::new(),
-                    system_prompt: None,
-                }
-            };
-
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            // MCP servers an extension registered after startup reach this
-            // turn's agent (bd-8m21l); same seam as the SDK prompt entry.
-            if let (Some(mcp), Some(ext)) = (mcp_manager.as_ref(), extensions.as_ref()) {
-                crate::mcp::sync_extension_registrations(mcp, ext, &mut agent_guard).await;
-            }
-            let BeforeAgentStartOutcome {
-                messages: before_messages,
-                system_prompt,
-            } = before_start;
-            let mut turn_agent =
-                TurnSystemPromptGuard::new(&mut agent_guard, base_system_prompt, system_prompt);
-            let previous_len = turn_agent.messages().len();
-            turn_agent.set_magic_keyword_scan_override(Some(keyword_scan_source));
-
-            let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
-            let user_content = if input_images.is_empty() {
-                UserContent::Text(message_for_agent)
-            } else {
-                UserContent::Blocks(build_content_blocks_for_input(
-                    &message_for_agent,
-                    &input_images,
-                ))
-            };
-            let user_message = ModelMessage::User(UserMessage {
-                content: user_content,
-                timestamp: Utc::now().timestamp_millis(),
-            });
-            let mut prompts = Vec::with_capacity(1 + before_messages.len());
-            prompts.push(user_message);
-            prompts.extend(before_messages.into_iter().map(ModelMessage::Custom));
-            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
-            let result = turn_agent
-                .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle_for_agent);
-                    }
-                })
-                .await;
-            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
-
-            drop(turn_agent);
-
-            let new_messages: Vec<crate::model::Message> =
-                agent_guard.messages()[previous_len..].to_vec();
-            let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let repairs = match agent_guard.drain_repair_ledger() {
-                Ok(repairs) => repairs,
-                Err(err) => {
-                    drop(session_guard);
-                    drop(agent_guard);
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &Cx::for_request(),
-                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-            append_turn_artifacts(
-                &mut session_guard,
-                new_messages,
-                &repairs,
-                &keyword_activations,
-            );
-            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
-                Some(format!("Failed to save session: {err}"))
-            } else {
-                None
-            };
-            drop(session_guard);
-
-            if let Some(err) = save_error {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err),
-                )
-                .await;
-            }
-
-            if let Err(err) = result
-                && !turn_error_already_surfaced(&ui_stream_batcher)
-            {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &Cx::for_request(),
-                    PiMsg::AgentError(err.to_string()),
-                )
-                .await;
-            }
-        });
+        self.spawn_recoverable_turn(
+            Some(UserContent::Text(message_for_agent)),
+            Some(message_owned),
+        );
 
         None
     }
@@ -3945,7 +3610,7 @@ mod stream_delta_batcher_tests {
     use crate::agent::{Agent, AgentConfig};
     use crate::config::Config;
     use crate::keybindings::KeyBindings;
-    use crate::model::{AssistantMessage, StreamEvent, Usage};
+    use crate::model::{AssistantMessage, ImageContent, StreamEvent, Usage};
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
     use crate::resources::{ResourceCliOptions, ResourceLoader};
     use crate::session::Session;
@@ -4131,40 +3796,6 @@ mod stream_delta_batcher_tests {
         assert_eq!(app.agent_state, AgentState::Idle);
     }
 
-    #[test]
-    fn turn_system_prompt_guard_restores_base_prompt_when_guard_is_dropped() {
-        let mut agent = Agent::new(
-            Arc::new(DummyProvider),
-            ToolRegistry::new(&[], Path::new("."), None),
-            AgentConfig::default(),
-        );
-        agent.set_system_prompt(Some("base-system".to_string()));
-        {
-            let turn_agent = TurnSystemPromptGuard::new(
-                &mut agent,
-                Some("base-system".to_string()),
-                Some("hook-system".to_string()),
-            );
-            assert_eq!(turn_agent.system_prompt(), Some("hook-system"));
-        }
-        assert_eq!(agent.system_prompt(), Some("base-system"));
-    }
-
-    #[test]
-    fn before_agent_start_payload_preserves_prompt_images_and_system_prompt() {
-        let image = ImageContent {
-            data: "aW1hZ2U=".to_string(),
-            mime_type: "image/png".to_string(),
-        };
-        let payload = before_agent_start_payload("hello", &[image], "base-system");
-        assert_eq!(payload["prompt"], json!("hello"));
-        assert_eq!(
-            payload["images"],
-            json!([{"data": "aW1hZ2U=", "mimeType": "image/png"}])
-        );
-        assert_eq!(payload["systemPrompt"], json!("base-system"));
-    }
-
     fn runtime() -> &'static asupersync::runtime::Runtime {
         static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
@@ -4222,7 +3853,38 @@ mod stream_delta_batcher_tests {
     }
 
     fn build_test_app_with_provider(provider: Arc<dyn Provider>) -> (PiApp, mpsc::Receiver<PiMsg>) {
-        let current = model_entry("continue-probe", "continue-probe-model");
+        let mut config = retry_config(0, 1);
+        config.retry.as_mut().expect("retry settings").enabled = Some(false);
+        build_test_app_with_recovery(provider, config, None)
+    }
+
+    fn build_test_app_with_recovery(
+        provider: Arc<dyn Provider>,
+        config: Config,
+        failover: Option<crate::sdk::FailoverOptions>,
+    ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+        build_test_app_with_session_configuration(provider, config, failover, |_| {})
+    }
+
+    fn build_test_app_with_session_configuration(
+        provider: Arc<dyn Provider>,
+        mut config: Config,
+        failover: Option<crate::sdk::FailoverOptions>,
+        configure: impl FnOnce(&mut AgentSession),
+    ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+        let current = failover
+            .as_ref()
+            .and_then(|options| {
+                options.available_models.iter().find(|entry| {
+                    entry.model.provider == provider.name() && entry.model.id == provider.model_id()
+                })
+            })
+            .cloned()
+            .unwrap_or_else(|| model_entry(provider.name(), provider.model_id()));
+        let available_models = failover.as_ref().map_or_else(
+            || vec![current.clone()],
+            |options| options.available_models.clone(),
+        );
         let agent = Agent::new(
             provider,
             ToolRegistry::new(&[], Path::new("."), None),
@@ -4241,32 +3903,42 @@ mod stream_delta_batcher_tests {
             theme_paths: Vec::new(),
         };
         let (event_tx, event_rx) = asupersync::channel::mpsc::channel(64);
-        let config = Config {
-            last_changelog_version: Some(crate::platform::VERSION.to_string()),
-            ..Config::default()
-        };
+        config.last_changelog_version = Some(crate::platform::VERSION.to_string());
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            true,
+            crate::compaction::ResolvedCompactionSettings {
+                enabled: false,
+                ..crate::compaction::ResolvedCompactionSettings::default()
+            },
+        )
+        .with_runtime_handle(runtime_handle())
+        .with_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+            available_models.clone(),
+        ));
+        configure(&mut agent_session);
         (
-            PiApp::new(
-                agent,
-                session,
+            PiApp::from_agent_session(
+                agent_session,
                 config,
                 resources,
                 resource_cli,
                 Path::new(".").to_path_buf(),
-                current.clone(),
+                current,
                 Vec::new(),
-                vec![current],
+                available_models,
                 None,
                 Vec::new(),
                 event_tx,
                 runtime_handle(),
                 true,
                 false,
-                None,
                 Some(KeyBindings::new()),
                 Vec::new(),
                 Usage::default(),
                 None,
+                failover,
             ),
             event_rx,
         )
@@ -4275,6 +3947,996 @@ mod stream_delta_batcher_tests {
     fn build_test_app() -> PiApp {
         let (app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app
+    }
+
+    #[test]
+    fn configured_session_state_survives_classic_startup() {
+        let (app, _events) = build_test_app_with_session_configuration(
+            Arc::new(DummyProvider),
+            retry_config(0, 1),
+            None,
+            |session| {
+                session
+                    .agent
+                    .set_system_prompt(Some("configured system prompt".to_string()));
+                session.agent.stream_options_mut().api_key = Some("configured-key".to_string());
+                session.set_compaction_context_window(47_000);
+                session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    Arc::new(DummyProvider),
+                    "configured-advisor".to_string(),
+                ));
+            },
+        );
+        let agent = app.agent.try_lock().expect("configured AgentSession");
+        assert_eq!(agent.system_prompt(), Some("configured system prompt"));
+        assert_eq!(
+            agent.stream_options().api_key.as_deref(),
+            Some("configured-key")
+        );
+        assert_eq!(
+            agent
+                .handle
+                .session()
+                .compaction_settings()
+                .context_window_tokens,
+            47_000
+        );
+        assert!(agent.handle.session().advisor.is_some());
+    }
+
+    #[test]
+    fn classic_new_session_drops_secret_mappings_and_plan_state() {
+        let mut app = build_test_app();
+        let raw_secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        {
+            let mut agent = app.agent.try_lock().expect("agent");
+            agent
+                .secrets_transform_outbound_text(raw_secret)
+                .expect("learn source Session secret");
+            assert_ne!(agent.mask_secrets_text(raw_secret), raw_secret);
+            agent.plan_state().enter_planning();
+        }
+        let _ = app.submit_message("/new");
+        let agent = app.agent.try_lock().expect("new Session agent");
+        assert_eq!(agent.mask_secrets_text(raw_secret), raw_secret);
+        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
+    }
+
+    #[test]
+    fn abort_during_provider_stream_preserves_a_final_save_failure() {
+        struct AbortSaveProbe {
+            inner: ClassicRecoveryProvider,
+            save_blocked: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for AbortSaveProbe {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+
+            fn api(&self) -> &str {
+                self.inner.api()
+            }
+
+            fn model_id(&self) -> &str {
+                self.inner.model_id()
+            }
+
+            async fn stream(
+                &self,
+                context: &Context<'_>,
+                options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+            > {
+                let _ = self.inner.stream(context, options).await?;
+                self.save_blocked.store(true, Ordering::SeqCst);
+                Ok(Box::pin(stream::pending()))
+            }
+        }
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("aborted-turn.jsonl");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let save_blocked = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(AbortSaveProbe {
+            inner: ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: 0,
+                fail_save_path: Some(path.clone()),
+            },
+            save_blocked: Arc::clone(&save_blocked),
+        });
+        let (mut app, mut events) =
+            build_test_app_with_recovery(provider, retry_config(2, 1), None);
+        app.session.try_lock().expect("session").path = Some(path);
+        let _ = app.submit_message("one prompt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !save_blocked.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider was never admitted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        app.abort_agent();
+        let observed = drive_turn(&mut app, &mut events);
+        assert!(matches!(
+            observed.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Error,
+                error_message: Some(error),
+                ..
+            }) if error.contains(crate::error::Error::SESSION_PERSISTENCE_PREFIX)
+        ));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_)))
+                .count(),
+            1
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            app.agent
+                .try_lock()
+                .expect("terminal event releases Agent owner before UI input")
+                .handle
+                .session()
+                .provider_admission_gate()
+                .ensure_allowed()
+                .is_err_and(|error| error.is_session_persistence())
+        );
+    }
+
+    fn drive_turn(app: &mut PiApp, receiver: &mut mpsc::Receiver<PiMsg>) -> Vec<PiMsg> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    let done = matches!(
+                        event,
+                        PiMsg::AgentDone { .. }
+                            | PiMsg::AgentTimeCap { .. }
+                            | PiMsg::AgentError(_)
+                            | PiMsg::HandoffFinished { .. }
+                    );
+                    let _ = app.handle_pi_message(event.clone());
+                    events.push(event);
+                    if done {
+                        assert!(
+                            app.agent.try_lock().is_ok(),
+                            "terminal UI events must not release pending input before Agent unlock"
+                        );
+                        return events;
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+        panic!("classic turn did not finish: {:?}", app.status_message);
+    }
+
+    fn retry_config(max_retries: u32, delay_ms: u32) -> Config {
+        Config {
+            retry: Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(max_retries),
+                base_delay_ms: Some(delay_ms),
+                max_delay_ms: Some(delay_ms),
+                ..crate::config::RetrySettings::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    struct ClassicRecoveryProvider {
+        calls: Arc<AtomicUsize>,
+        failures: usize,
+        fail_save_path: Option<std::path::PathBuf>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ClassicRecoveryProvider {
+        fn name(&self) -> &'static str {
+            "continue-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "openai-completions"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "continue-probe-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                context
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message, ModelMessage::User(_)))
+                    .count(),
+                1,
+                "recovery must reuse the original user message"
+            );
+            if call < self.failures {
+                return Err(crate::error::Error::provider(
+                    self.name(),
+                    "HTTP 529 overloaded; try again",
+                ));
+            }
+            if call == 0
+                && let Some(path) = &self.fail_save_path
+            {
+                std::fs::rename(path, path.with_extension("saved-before-fault"))
+                    .expect("retain initial durable transcript");
+                std::fs::create_dir(path).expect("make final save destination unwritable");
+            }
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("recovered"))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            })])))
+        }
+    }
+
+    #[test]
+    fn classic_text_content_and_continue_use_one_durable_retry_driver() {
+        for entrypoint in ["text", "content", "continue"] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: 1,
+                fail_save_path: None,
+            });
+            let (mut app, mut receiver) =
+                build_test_app_with_recovery(provider, retry_config(1, 1), None);
+            app.session.try_lock().expect("session").session_dir =
+                Some(temp.path().join("sessions"));
+            match entrypoint {
+                "text" => {
+                    let _ = app.submit_message("one prompt");
+                }
+                "content" => {
+                    let _ = app.submit_content(vec![
+                        ContentBlock::Text(TextContent::new("one prompt")),
+                        ContentBlock::Image(ImageContent {
+                            data: "aW1hZ2U=".to_string(),
+                            mime_type: "image/png".to_string(),
+                        }),
+                    ]);
+                }
+                _ => {
+                    app.session
+                        .try_lock()
+                        .expect("session")
+                        .append_model_message(build_user_message("one prompt".to_string()));
+                    let _ = app.submit_continue();
+                }
+            }
+            let events = drive_turn(&mut app, &mut receiver);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{entrypoint}");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                PiMsg::ProviderRecovery {
+                    message,
+                    model: None,
+                    ..
+                }
+                    if message.starts_with("Retrying provider request")
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PiMsg::AgentDone { .. }))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                events.last(),
+                Some(PiMsg::AgentDone {
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    ..
+                })
+            ));
+            let path = app
+                .session
+                .try_lock()
+                .expect("session")
+                .path
+                .clone()
+                .expect("saved session");
+            let saved = runtime()
+                .block_on(Session::open(path.to_str().expect("path")))
+                .expect("reopen session");
+            let messages = saved.to_messages_for_current_path();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, ModelMessage::User(_)))
+                    .count(),
+                1
+            );
+            assert!(!messages.iter().any(|message| matches!(
+                message,
+                ModelMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
+            )));
+            assert_eq!(app.agent_state, AgentState::Idle);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_time_cap_is_saved_once_and_pauses_queued_startup_input() {
+        let temp = tempfile::TempDir::new().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Isolated durable fixture storage is required.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(ClassicRecoveryProvider {
+            calls: Arc::clone(&calls),
+            failures: 0,
+            fail_save_path: None,
+        });
+        let capped_provider = Arc::clone(&provider);
+        let (mut app, mut receiver) = build_test_app_with_session_configuration(
+            provider,
+            retry_config(0, 1),
+            None,
+            move |session| {
+                session.agent = Agent::new(
+                    capped_provider,
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig {
+                        max_time: Some(std::time::Duration::ZERO),
+                        ..AgentConfig::default()
+                    },
+                );
+            },
+        );
+        app.session.try_lock().expect("session").session_dir = // ubs:ignore[rust.ownership.unwrap-expect] -- Configure the real session persistence destination before the turn.
+            Some(temp.path().join("sessions"));
+        app.pending_inputs
+            .push_back(PendingInput::Text("queued startup input".to_string()));
+        let _ = app.submit_message("capped foreground input");
+        let events = drive_turn(&mut app, &mut receiver);
+        let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
+        assert_eq!(calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- A zero budget must not call the provider.
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Exactly one successful terminal cap must reach the UI.
+            events
+                .iter()
+                .filter(|event| matches!(event, PiMsg::AgentTimeCap { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            // ubs:ignore[rust.panic.assert-macros] -- A cap is one terminal outcome, never a duplicate ordinary completion or error.
+            event,
+            PiMsg::AgentDone { .. } | PiMsg::AgentError(_)
+        )));
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- The durable marker appears exactly once in the transcript.
+            app.messages
+                .iter()
+                .filter(|message| message.content == marker)
+                .count(),
+            1
+        );
+        assert_eq!(app.status_message.as_deref(), Some(marker)); // ubs:ignore[rust.panic.assert-macros] -- The stop reason remains visible at the input boundary.
+        assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- Capping leaves the foreground ready for an explicit user action.
+        assert_eq!(app.pending_inputs.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Unclaimed startup work must remain queued.
+        assert!(app.handle_pi_message(PiMsg::RunPending).is_none()); // ubs:ignore[rust.panic.assert-macros] -- A previously posted automatic wakeup cannot renew the budget.
+        assert_eq!(app.pending_inputs.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- A suppressed wakeup cannot consume queued work.
+        let (session_id, path) = {
+            let stored = app.session.try_lock().expect("saved session"); // ubs:ignore[rust.ownership.unwrap-expect] -- The settled session must be available.
+            (
+                stored.header.id.clone(),
+                stored.path.clone().expect("saved path"),
+            ) // ubs:ignore[rust.ownership.unwrap-expect] -- The successful cap must reach a real file.
+        };
+        let saved = runtime()
+            .block_on(Session::open(path.to_str().expect("path"))) // ubs:ignore[rust.ownership.unwrap-expect] -- Reopen the actual durable session to verify the marker.
+            .expect("reopen capped session");
+        assert_eq!( // ubs:ignore[rust.panic.assert-macros] -- Persistence and UI must agree on one synthetic cap.
+            saved.to_messages_for_current_path().iter().filter(|message| {
+                matches!(message, ModelMessage::Assistant(assistant) if crate::agent::time_cap_marker(assistant) == Some(marker))
+            }).count(),
+            1
+        );
+        assert!(
+            app.handle_pi_message(PiMsg::EnqueuePendingInput {
+                // ubs:ignore[rust.panic.assert-macros] -- A late admitted input is retained without automatic restart.
+                session_id: session_id.clone(),
+                input: PendingInput::Continue,
+            })
+            .is_none()
+        );
+        assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- Both earlier and later queued work remain available.
+        assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- Late queue admission cannot restart the capped turn.
+        assert_eq!(calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Neither queue wakeup may call the provider.
+
+        // A deliberately submitted next foreground run receives its own cap;
+        // it is allowed to start, while another cap keeps old work unclaimed.
+        let _ = app.submit_message("explicit next foreground input");
+        assert!(!app.pending_inputs_paused_by_time_cap); // ubs:ignore[rust.panic.assert-macros] -- A user-owned foreground submission may start a new budget.
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(events.last(), Some(PiMsg::AgentTimeCap { .. }))); // ubs:ignore[rust.panic.assert-macros] -- The actual second run must reach its cap.
+        assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- A second cap must preserve the same unclaimed work.
+
+        let messages = app.messages.clone();
+        let usage = app.total_usage.clone();
+        let _ = app.handle_pi_message(PiMsg::RetryCommitted {
+            session_id,
+            messages,
+            usage,
+            text: "explicit retry target".to_string(),
+            status: None,
+        });
+        assert!(!app.pending_inputs_paused_by_time_cap); // ubs:ignore[rust.panic.assert-macros] -- An explicitly committed retry may renew the budget.
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(events.last(), Some(PiMsg::AgentTimeCap { .. }))); // ubs:ignore[rust.panic.assert-macros] -- The actual retry must finish before inspecting its durable input.
+        let latest_user = app
+            .session
+            .try_lock()
+            .expect("retried session") // ubs:ignore[rust.ownership.unwrap-expect] -- Inspect the actual settled retry journal.
+            .to_messages_for_current_path()
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ModelMessage::User(user) => Some(match &user.content {
+                    UserContent::Text(text) => text.clone(),
+                    UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+                }),
+                _ => None,
+            })
+            .expect("retry user input");
+        assert_eq!(latest_user, "explicit retry target"); // ubs:ignore[rust.panic.assert-macros] -- An older paused entry must not take the explicitly retried target's budget.
+        assert_eq!(app.pending_inputs.len(), 2); // ubs:ignore[rust.panic.assert-macros] -- Retrying must not discard the older paused work.
+        assert!(
+            matches!(app.pending_inputs.front(), Some(PendingInput::Text(text)) if text == "queued startup input")
+        ); // ubs:ignore[rust.panic.assert-macros] -- Older queued input retains its relative order.
+        assert!(matches!(
+            app.pending_inputs.back(),
+            Some(PendingInput::Continue)
+        )); // ubs:ignore[rust.panic.assert-macros] -- The later queued continuation stays after the earlier input.
+    }
+
+    #[test]
+    fn classic_time_cap_lifecycle_never_publishes_before_successful_terminal_save() {
+        let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
+        let message = ModelMessage::Assistant(Arc::new(AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new(marker))],
+            api: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        }));
+        for error in [None, Some("final session save failed".to_string())] {
+            let (sender, mut receiver) = asupersync::channel::mpsc::channel(16);
+            let mut batcher = UiStreamDeltaBatcher::new(sender);
+            dispatch_agent_event_to_ui(
+                &AgentEvent::MessageStart {
+                    message: message.clone(),
+                },
+                &mut batcher,
+            );
+            dispatch_agent_event_to_ui(
+                &AgentEvent::MessageEnd {
+                    message: message.clone(),
+                },
+                &mut batcher,
+            );
+            while let Ok(event) = receiver.try_recv() {
+                assert!(matches!(event, PiMsg::AssistantMessageStart)); // ubs:ignore[rust.panic.assert-macros] -- Pre-save lifecycle events cannot publish a marker or terminal success.
+            }
+            dispatch_agent_event_to_ui(
+                &AgentEvent::AgentEnd {
+                    session_id: Arc::from("time-cap-fixture"),
+                    messages: vec![message.clone()],
+                    error: error.clone(),
+                },
+                &mut batcher,
+            );
+            let terminal = receiver.try_recv().expect("terminal UI outcome"); // ubs:ignore[rust.ownership.unwrap-expect] -- A terminal event must be delivered.
+            if error.is_some() {
+                assert!(matches!(
+                    terminal,
+                    PiMsg::AgentDone {
+                        // ubs:ignore[rust.panic.assert-macros] -- Failed persistence must remain an error and suppress the cap success.
+                        stop_reason: StopReason::Error,
+                        error_message: Some(_),
+                        ..
+                    }
+                ));
+            } else {
+                assert!(
+                    matches!(terminal, PiMsg::AgentTimeCap { message, .. } if message == marker)
+                ); // ubs:ignore[rust.panic.assert-macros] -- Only successful terminal persistence publishes the cap.
+            }
+            assert!(receiver.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- A capped completion must have exactly one terminal outcome.
+        }
+    }
+
+    #[test]
+    fn returned_pending_input_preserves_current_draft_and_rejects_stale_session() {
+        let mut app = build_test_app();
+        app.input.set_value("newly typed draft");
+        let owner_session_id = app.session.try_lock().expect("session").header.id.clone(); // ubs:ignore[rust.ownership.unwrap-expect] -- Read the current fixture identity.
+        let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
+            owner_session_id: owner_session_id.clone(),
+            text: "unclaimed queued input".to_string(),
+        });
+        assert_eq!(
+            app.input.value(),
+            "unclaimed queued input\n\nnewly typed draft"
+        ); // ubs:ignore[rust.panic.assert-macros] -- Restoring old work must preserve newer typing.
+        assert_eq!(app.input_mode, InputMode::MultiLine); // ubs:ignore[rust.panic.assert-macros] -- Both parts of the restored draft must remain editable.
+        let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
+            owner_session_id: "replaced-session".to_string(),
+            text: "stale work".to_string(),
+        });
+        assert_eq!(
+            app.input.value(),
+            "unclaimed queued input\n\nnewly typed draft"
+        ); // ubs:ignore[rust.panic.assert-macros] -- A replaced session cannot alter the current draft.
+        app.input.set_value("  \n ");
+        let _ = app.handle_pi_message(PiMsg::RestorePendingInput {
+            owner_session_id,
+            text: String::new(),
+        });
+        assert_eq!(app.input.value(), "  \n "); // ubs:ignore[rust.panic.assert-macros] -- An empty restore cannot discard authored whitespace in a newer draft.
+    }
+
+    #[test]
+    fn classic_exhausted_retry_reports_the_attempts_on_one_terminal_card() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(ClassicRecoveryProvider {
+            calls: Arc::clone(&calls),
+            failures: usize::MAX,
+            fail_save_path: None,
+        });
+        let (mut app, mut receiver) =
+            build_test_app_with_recovery(provider, retry_config(1, 1), None);
+        app.session.try_lock().expect("session").session_dir = Some(temp.path().join("sessions"));
+        let _ = app.submit_message("one prompt");
+        let events = drive_turn(&mut app, &mut receiver);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            events.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Error,
+                error_message: Some(error),
+                ..
+            }) if error.contains("auto-retried 1/1 before giving up")
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PiMsg::AgentDone { .. } | PiMsg::AgentError(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn classic_retry_disabled_and_abort_during_backoff_never_reenter_provider() {
+        for abort_during_backoff in [false, true] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: usize::MAX,
+                fail_save_path: None,
+            });
+            let mut config = retry_config(2, 5_000);
+            config.retry.as_mut().expect("retry settings").enabled = Some(abort_during_backoff);
+            let (mut app, mut receiver) = build_test_app_with_recovery(provider, config, None);
+            app.session.try_lock().expect("session").session_dir =
+                Some(temp.path().join("sessions"));
+            let _ = app.submit_message("one prompt");
+            if abort_during_backoff {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    assert!(std::time::Instant::now() < deadline, "retry never began");
+                    if let Ok(event) = receiver.try_recv() {
+                        let retrying = matches!(event, PiMsg::ProviderRecovery { .. });
+                        assert!(!matches!(
+                            event,
+                            PiMsg::AgentDone { .. } | PiMsg::AgentError(_)
+                        ));
+                        let _ = app.handle_pi_message(event);
+                        if retrying {
+                            assert_eq!(app.agent_state, AgentState::Processing);
+                            app.abort_agent();
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            let events = drive_turn(&mut app, &mut receiver);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let expected = if abort_during_backoff {
+                StopReason::Aborted
+            } else {
+                StopReason::Error
+            };
+            assert!(matches!(
+                events.last(),
+                Some(PiMsg::AgentDone { stop_reason, .. }) if *stop_reason == expected
+            ));
+            assert_eq!(app.agent_state, AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn classic_save_failures_block_reentry_until_a_new_session_is_installed() {
+        for fail_final_save in [false, true] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let path = temp.path().join("turn.jsonl");
+            if !fail_final_save {
+                std::fs::create_dir(&path).expect("block initial save");
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(ClassicRecoveryProvider {
+                calls: Arc::clone(&calls),
+                failures: 0,
+                fail_save_path: fail_final_save.then(|| path.clone()),
+            });
+            let (mut app, mut receiver) =
+                build_test_app_with_recovery(provider, retry_config(2, 1), None);
+            {
+                let mut session = app.session.try_lock().expect("session");
+                session.path = Some(path);
+                session.session_dir = Some(temp.path().join("new-sessions"));
+            }
+            let _ = app.submit_message("one prompt");
+            let events = drive_turn(&mut app, &mut receiver);
+            assert!(matches!(
+                events.last(),
+                Some(
+                    PiMsg::AgentError(_)
+                        | PiMsg::AgentDone {
+                            stop_reason: StopReason::Error,
+                            ..
+                        }
+                )
+            ));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, PiMsg::ProviderRecovery { .. }))
+            );
+            let expected_calls = usize::from(fail_final_save);
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            assert!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .handle
+                    .session()
+                    .provider_admission_gate()
+                    .reason()
+                    .is_some()
+            );
+
+            let _ = app.submit_message("do not send another request");
+            assert_eq!(app.agent_state, AgentState::Idle);
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            let model = app.model_entry.clone();
+            assert!(
+                app.switch_active_model(
+                    &model,
+                    Arc::new(DummyProvider),
+                    Some("test-key"),
+                    "command",
+                )
+                .is_err()
+            );
+            assert!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .handle
+                    .session()
+                    .provider_admission_gate()
+                    .reason()
+                    .is_some()
+            );
+
+            let _ = app.submit_message("/new");
+            assert!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .handle
+                    .session()
+                    .provider_admission_gate()
+                    .reason()
+                    .is_none()
+            );
+            let _ = app.submit_message("fresh user prompt");
+            let events = drive_turn(&mut app, &mut receiver);
+            assert!(matches!(
+                events.last(),
+                Some(PiMsg::AgentDone {
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    ..
+                })
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls + 1);
+        }
+    }
+
+    #[test]
+    fn classic_recovery_discards_only_the_failed_assistant_after_retry_restarts() {
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::AgentStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("completed tool explanation".to_string()));
+        let _ = app.handle_pi_message(PiMsg::AssistantMessageStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("incomplete response".to_string()));
+        let _ = app.handle_pi_message(PiMsg::ProviderRecovery {
+            message: "retrying".to_string(),
+            model: None,
+            discard_incomplete: true,
+        });
+        assert_eq!(
+            app.current_response,
+            "completed tool explanationincomplete response"
+        );
+        assert_eq!(app.agent_state, AgentState::Processing);
+        let _ = app.handle_pi_message(PiMsg::AssistantMessageStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("recovered response".to_string()));
+        assert_eq!(
+            app.current_response,
+            "completed tool explanationrecovered response"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_fails_over_and_restores_primary_through_real_http_and_persisted_turns() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("fixture address")
+        );
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for attempt in 0..3 {
+                let mut connection = loop {
+                    match listener.accept() {
+                        Ok((connection, _)) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "provider never reached fixture");
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    }
+                };
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                connection
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("write timeout");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let request = loop {
+                    assert!(bytes.len() < 256 * 1024, "oversized fixture request");
+                    let read = connection.read(&mut buffer).expect("request bytes");
+                    assert!(read > 0, "truncated request");
+                    bytes.extend_from_slice(&buffer[..read]);
+                    let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = std::str::from_utf8(&bytes[..end]).expect("HTTP headers");
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().expect("request length"))
+                        })
+                        .expect("Content-Length");
+                    if bytes.len() < end + 4 + length {
+                        continue;
+                    }
+                    break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                        .expect("JSON request");
+                };
+                let requested_model = request["model"].as_str().expect("request model");
+                let (status, content_type, body) = if attempt == 0 {
+                    (
+                        "429 Too Many Requests",
+                        "application/json",
+                        json!({
+                            "error": {
+                                "message": "insufficient_quota",
+                                "type": "insufficient_quota"
+                            }
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    let chunk = json!({
+                        "id": "classic-recovery",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": requested_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "Recovered"},
+                            "finish_reason": null
+                        }]
+                    });
+                    let done = json!({
+                        "id": "classic-recovery", "model": requested_model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    });
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n"),
+                    )
+                };
+                requests_tx.send(request).expect("record request");
+                write!(
+                    connection,
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+                .expect("HTTP fixture response");
+            }
+        });
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let mut primary = model_entry("openai", "classic-primary");
+        primary.model.base_url = url.clone();
+        let mut fallback = model_entry("openai", "classic-fallback");
+        fallback.model.base_url = url;
+        let options = crate::sdk::FailoverOptions {
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec!["openai/classic-fallback".to_string()],
+            )]),
+            available_models: vec![primary.clone(), fallback],
+            auth: crate::auth::AuthStorage::empty_at(temp.path().join("auth.json")),
+            cli_api_key: Some("test-key".to_string()),
+            cooldown_secs: 0,
+        };
+        let provider = providers::create_provider(&primary, None).expect("real OpenAI provider");
+        let (mut app, mut receiver) =
+            build_test_app_with_recovery(provider, retry_config(0, 1), Some(options));
+        app.session.try_lock().expect("session").session_dir = Some(temp.path().join("sessions"));
+        {
+            let mut agent = app.agent.try_lock().expect("agent");
+            agent.set_system_prompt(Some("Preserved classic system prompt".to_string()));
+        }
+
+        let _ = app.submit_message("first prompt");
+        let first = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(
+            first.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Stop,
+                ..
+            })
+        ));
+        assert!(first.iter().any(|event| matches!(
+            event,
+            PiMsg::ProviderRecovery { model: Some((provider, model)), .. }
+                if provider == "openai" && model == "classic-fallback"
+        )));
+        assert_eq!(app.model, "openai/classic-fallback");
+        assert_eq!(
+            app.model_entry_shared
+                .lock()
+                .expect("model indicator")
+                .model
+                .id,
+            "classic-fallback"
+        );
+        assert!(
+            app.session
+                .try_lock()
+                .expect("session")
+                .active_failover_provenance_for_current_path()
+                .is_some()
+        );
+
+        let _ = app.submit_message("second prompt");
+        let second = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(
+            second.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Stop,
+                ..
+            })
+        ));
+        assert!(second.iter().any(|event| matches!(
+            event,
+            PiMsg::ProviderRecovery { message, model: Some((_, model)), .. }
+                if message.starts_with("Primary model restored") && model == "classic-primary"
+        )));
+        assert_eq!(app.model, "openai/classic-primary");
+        worker.join().expect("fixture worker");
+        let requests: Vec<Value> = requests_rx.try_iter().collect();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["model"], "classic-primary");
+        assert_eq!(requests[1]["model"], "classic-fallback");
+        assert_eq!(requests[2]["model"], "classic-primary");
+        for (index, request) in requests.iter().enumerate() {
+            let messages = request["messages"].as_array().expect("messages");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message["role"] == "user")
+                    .count(),
+                if index == 2 { 2 } else { 1 }
+            );
+            assert!(messages.iter().any(|message| message["role"] == "system"
+                && message["content"] == "Preserved classic system prompt"));
+        }
+        let path = app
+            .session
+            .try_lock()
+            .expect("session")
+            .path
+            .clone()
+            .expect("saved path");
+        let saved = runtime()
+            .block_on(Session::open(path.to_str().expect("path")))
+            .expect("reopen final transcript");
+        assert_eq!(
+            saved.effective_model_for_current_path(),
+            Some(("openai".to_string(), "classic-primary".to_string()))
+        );
+        assert!(
+            saved
+                .active_failover_provenance_for_current_path()
+                .is_none()
+        );
+        assert_eq!(
+            saved
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| matches!(message, ModelMessage::User(_)))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -4374,7 +5036,21 @@ mod stream_delta_batcher_tests {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(temp.path().join("sessions")),
         )));
-        app.agent = Arc::new(asupersync::sync::Mutex::new(agent));
+        app.agent = Arc::new(asupersync::sync::Mutex::new(InteractiveAgent {
+            handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        enabled: false,
+                        ..crate::compaction::ResolvedCompactionSettings::default()
+                    },
+                )
+                .with_runtime_handle(runtime_handle()),
+                crate::sdk::EventListeners::default(),
+            ),
+        }));
         app.session = Arc::clone(&session);
         app.cwd = temp.path().to_path_buf();
         app.model_entry = entry.clone();
@@ -4809,6 +5485,37 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn advisor_note_dispatch_flushes_text_and_reaches_the_transcript() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+        batcher.push_delta(StreamDeltaKind::Text, "Completed review.");
+        dispatch_agent_event_to_ui(
+            &AgentEvent::AdvisorNote {
+                level: "CONCERN".to_string(),
+                rationale: "The fixture omits Unicode input.".to_string(),
+            },
+            &mut batcher,
+        );
+
+        let text = rx.try_recv().expect("pending answer precedes the note");
+        assert!(matches!(&text, PiMsg::TextDelta(text) if text == "Completed review."));
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(text);
+        let _ = app.handle_pi_message(rx.try_recv().expect("immediate advisor note"));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationMessage { role: MessageRole::System, content, .. })
+                if content == "[ADVISOR:CONCERN] The fixture omits Unicode input."
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "one emitted note has one display event"
+        );
+    }
+
+    #[test]
     fn normal_tool_updates_flush_immediately() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut batcher = UiStreamDeltaBatcher::new(tx);
@@ -4963,6 +5670,267 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn review_completion_is_bound_to_its_session_and_active_request() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let owner = app.session.try_lock().expect("session").header.id.clone(); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The idle fixture session must be available to capture its owner ID.
+        let original_messages = app.messages.len();
+        app.agent_state = AgentState::Processing;
+        app.review_request_id = Some("current-review".to_string());
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: owner.clone(),
+            request_id: "replaced-review".to_string(),
+            message: "stale request".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Processing); // ubs:ignore[rust.panic.assert-macros] -- A stale request completion must not settle the active review.
+        assert_eq!(app.messages.len(), original_messages); // ubs:ignore[rust.panic.assert-macros] -- A stale request must not append a report card.
+        assert_eq!(app.review_request_id.as_deref(), Some("current-review")); // ubs:ignore[rust.panic.assert-macros] -- Request ownership must remain with the current review.
+
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: "replaced-session".to_string(),
+            request_id: "current-review".to_string(),
+            message: "stale session".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Processing); // ubs:ignore[rust.panic.assert-macros] -- An old session's completion cannot idle its replacement.
+        assert_eq!(app.messages.len(), original_messages); // ubs:ignore[rust.panic.assert-macros] -- Session ownership must prevent stale transcript publication.
+        assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A confirmed stale owner retires that review request ID.
+
+        app.review_request_id = Some("accepted-review".to_string());
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: owner,
+            request_id: "accepted-review".to_string(),
+            message: "current review report".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- A current owned completion must settle the review.
+        assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Successful completion retires request ownership.
+        assert!(
+            matches!(app.messages.last(), Some(ConversationMessage { content, .. }) if content == "current review report")
+        ); // ubs:ignore[rust.panic.assert-macros] -- Only the current review report may reach the transcript.
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.review.test.v1","case":"classic_review_ownership","outcome":"stale completions ignored; current completion settles review"})
+        );
+    }
+
+    #[test]
+    fn classic_handoff_runs_the_native_transaction_and_refreshes_both_views() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("classic-handoff.jsonl");
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) = build_test_app_with_session_configuration(
+            Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }),
+            Config::default(),
+            None,
+            |session| {
+                let mut stored = session.session.try_lock().unwrap();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(directory.path().to_path_buf());
+                stored.append_message(SessionMessage::User {
+                    content: UserContent::Text("Earlier authored migration decision".into()),
+                    timestamp: None,
+                });
+                // Larger than the normal recent budget, so the native safe
+                // boundary retains this entire current turn without cutting it.
+                stored.append_message(SessionMessage::User {
+                    content: UserContent::Text("retained native tail ".repeat(8192)),
+                    timestamp: None,
+                });
+                session
+                    .agent
+                    .replace_messages(stored.to_messages_for_current_path());
+            },
+        );
+        let owner = app.session.try_lock().unwrap().header.id.clone();
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            app.session.lock(&cx).await.unwrap().save().await.unwrap();
+        });
+        let _ = app.submit_message("/handoff preserve migration decisions");
+        assert!(app.handoff_request_id.is_some());
+        assert_eq!(app.agent_state, AgentState::Processing);
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(
+            matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::ConversationReset { .. }))
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.abort_handle.is_none());
+        assert!(app.handoff_request_id.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert_eq!(app.messages.len(), 2);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .starts_with("Handoff saved")
+        );
+        let reopened = runtime()
+            .block_on(Session::open(path.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(reopened.header.id, owner);
+        assert_eq!(reopened.entries.len(), 3);
+        assert!(reopened.entries.iter().any(|entry| matches!(entry,
+            SessionEntry::Compaction(compaction) if compaction.details.as_ref().unwrap()["mode"] == "handoff")));
+        assert_eq!(
+            serde_json::to_value(app.agent.try_lock().unwrap().messages()).unwrap(),
+            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap()
+        );
+        eprintln!(
+            "{}",
+            json!({"schema":"pi.handoff.ui.test.v1","case":"classic_native_transaction"})
+        );
+    }
+
+    #[test]
+    fn classic_handoff_refusal_releases_busy_and_report_stays_explicit() {
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) =
+            build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }));
+        let _ = app.submit_message("/handoff --report");
+        assert!(app.handoff_request_id.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        let _ = app.submit_message("/handoff --unknown target");
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Usage: /handoff")
+        );
+        assert!(app.handoff_request_id.is_none());
+        let _ = app.submit_message("/handoff human is a focus, not a recipient");
+        assert!(app.handoff_request_id.is_some());
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(
+            matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::AgentError(message) if message.contains("Nothing safe to hand off")))
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.abort_handle.is_none());
+        assert!(app.handoff_request_id.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn classic_handoff_keeps_request_ownership_through_busy_snapshot_retries() {
+        let (mut app, _receiver) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let store = Arc::clone(&app.session);
+        let held = store.try_lock().unwrap();
+        let owner = held.header.id.clone();
+        let (abort, signal) = AbortHandle::new();
+        app.handoff_request_id = Some("current-handoff".into());
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        app.extension_compacting.store(true, Ordering::SeqCst);
+        let terminal = PiMsg::HandoffFinished {
+            request_id: "current-handoff".into(),
+            event: Box::new(PiMsg::ConversationReset {
+                session_id: owner,
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("Handoff saved".into()),
+            }),
+        };
+        assert!(
+            app.handle_pi_message_with_session_retry(terminal.clone(), 1)
+                .is_some()
+        );
+        let _ = app.handle_pi_message(PiMsg::AgentError("unrelated background error".into()));
+        let _ = app.handle_pi_message(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        });
+        let _ = app.handle_pi_message(PiMsg::HandoffFinished {
+            request_id: "older-handoff".into(),
+            event: Box::new(PiMsg::System("stale".into())),
+        });
+        assert_eq!(app.handoff_request_id.as_deref(), Some("current-handoff"));
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.abort_handle.is_some());
+        app.input.set_value("Keep this draft");
+        app.queue_input(QueuedMessageKind::FollowUp);
+        assert_eq!(app.input.value(), "Keep this draft");
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        app.abort_agent();
+        assert!(signal.is_aborted());
+        assert!(
+            app.handle_pi_message_with_session_retry(terminal, 0)
+                .is_none()
+        );
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.handoff_request_id.is_none());
+        assert!(app.abort_handle.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Handoff saved")
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("display refresh")
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn classic_mcp_auth_keeps_ownership_until_its_matching_completion() {
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, _receiver) = build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+            state: Arc::clone(&state),
+        }));
+        let (abort, signal) = AbortHandle::new();
+        app.mcp_auth_request_id = Some("current-auth".into());
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        for notice in [
+            PiMsg::SystemNote("Open the sign-in URL".into()),
+            PiMsg::System("An older MCP test completed".into()),
+            PiMsg::AgentError("Unrelated background task failed".into()),
+            PiMsg::AgentDone {
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+            },
+            PiMsg::McpAuthFinished {
+                request_id: "older-auth".into(),
+                message: "stale".into(),
+            },
+        ] {
+            let _ = app.handle_pi_message(notice);
+            assert_eq!(app.mcp_auth_request_id.as_deref(), Some("current-auth"));
+            assert_eq!(app.agent_state, AgentState::Processing);
+            assert!(app.abort_handle.is_some());
+        }
+        app.input.set_value("Keep this draft");
+        app.queue_input(QueuedMessageKind::FollowUp);
+        assert_eq!(app.input.value(), "Keep this draft");
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        let _ = app.submit_message("must wait for authentication");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        app.abort_agent();
+        assert!(signal.is_aborted());
+        let _ = app.handle_pi_message(PiMsg::McpAuthFinished {
+            request_id: "current-auth".into(),
+            message: "Authentication cancelled".into(),
+        });
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.mcp_auth_request_id.is_none());
+        assert!(app.abort_handle.is_none());
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
     fn session_bound_events_reject_stale_input_and_display_notes() {
         let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         let session_id = app
@@ -5099,10 +6067,10 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
                 .await
-                .expect("lock agent");
-            guard.add_message(ModelMessage::Custom(CustomMessage {
+                .expect("lock session");
+            guard.append_model_message(ModelMessage::Custom(CustomMessage {
                 content: "continue-now".to_string(),
                 custom_type: "note".to_string(),
                 display: true,
@@ -5188,6 +6156,15 @@ mod stream_delta_batcher_tests {
                 }]
             }),
         ));
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .extensions = app
+            .extensions
+            .clone()
+            .map(crate::extensions::ExtensionRegion::new);
 
         let _ = app.submit_message("hello");
         wait_for_agent_done(&mut event_rx);
@@ -5224,6 +6201,15 @@ mod stream_delta_batcher_tests {
         app.extensions = Some(build_test_extension_manager_with_before_agent_start_output(
             &json!({}),
         ));
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .extensions = app
+            .extensions
+            .clone()
+            .map(crate::extensions::ExtensionRegion::new);
 
         let _ = app.submit_message("hello");
         wait_for_agent_done(&mut event_rx);
@@ -5424,10 +6410,10 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
                 .await
-                .expect("lock agent");
-            guard.add_message(ModelMessage::Custom(CustomMessage {
+                .expect("lock session");
+            guard.append_model_message(ModelMessage::Custom(CustomMessage {
                 content: "continue-now".to_string(),
                 custom_type: "note".to_string(),
                 display: true,
@@ -5827,6 +6813,22 @@ mod stream_delta_batcher_tests {
         );
 
         let _ = app.handle_pi_message(PiMsg::SessionTitleSuggestion {
+            owner_session_id: current_session_id.clone(),
+            title: "current title".to_string(),
+        });
+        assert!(
+            app.session
+                .try_lock()
+                .expect("lock session")
+                .get_name()
+                .is_none(),
+            "a notification must not install an unpersisted title"
+        );
+        app.session
+            .try_lock()
+            .expect("lock session")
+            .set_name("current title");
+        let _ = app.handle_pi_message(PiMsg::SessionTitleSuggestion {
             owner_session_id: current_session_id,
             title: "current title".to_string(),
         });
@@ -5837,6 +6839,10 @@ mod stream_delta_batcher_tests {
                 .get_name()
                 .as_deref(),
             Some("current title")
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Session named: current title")
         );
     }
 

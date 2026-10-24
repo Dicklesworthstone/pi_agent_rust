@@ -12,11 +12,14 @@ use std::task::Poll;
 use serde_json::json;
 
 use super::{
-    Arc, DEFAULT_MCP_TIMEOUT, Duration, Instant, MAX_SERVER_TOOLS, McpManager, McpToolMeta,
-    McpTransport, Result, ServerEntry, Value, parse_tool_list, tool_err,
+    Arc, Duration, Instant, MAX_SERVER_TOOLS, McpManager, McpToolMeta, McpTransport, Result,
+    ServerEntry, Value, parse_tool_list, tool_err,
 };
 
 mod context;
+
+#[cfg(test)]
+use super::DEFAULT_MCP_TIMEOUT;
 
 const MAX_CATALOG_PAGES: usize = 128;
 const MAX_CURSOR_BYTES: usize = 4096;
@@ -325,8 +328,8 @@ impl McpManager {
     /// Returns trust, capability, cancellation, timeout, restart-budget or
     /// protocol errors. A failed traversal never returns a partial catalog.
     pub async fn refresh_tools(&self, server: &str) -> Result<Vec<McpToolMeta>> {
-        self.refresh_tools_with_timeout(server, DEFAULT_MCP_TIMEOUT)
-            .await
+        let timeout = self.entry(server)?.timeout();
+        self.refresh_tools_with_timeout(server, timeout).await
     }
 
     async fn refresh_tools_with_timeout(
@@ -349,7 +352,7 @@ impl McpManager {
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
     ) -> Result<Vec<McpToolMeta>> {
-        self.collect_tool_catalog_with_timeout(entry, transport, DEFAULT_MCP_TIMEOUT)
+        self.collect_tool_catalog_with_timeout(entry, transport, entry.timeout())
             .await
     }
 
@@ -549,7 +552,11 @@ mod tests {
             env: Vec::new(),
             url: Some("https://catalog.invalid/mcp".to_string()),
             headers: Vec::new(),
+            oauth: None,
             transport_hint: Some("http".to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
             provenance: Provenance::ProjectPi,
             source_file: temp.path().join("mcp.json"),
         };

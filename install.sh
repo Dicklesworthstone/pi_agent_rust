@@ -1183,6 +1183,14 @@ resolve_version() {
     return 0
   fi
 
+  # A local checkout is not a published release. Requiring GitHub metadata
+  # here breaks air-gapped installs and feature branches with no release tag.
+  if [ "$FROM_SOURCE" -eq 1 ] && [ -n "${SOURCE_DIR:-}" ]; then
+    VERSION="local-source"
+    info "Using local source directory; skipping release tag resolution"
+    return 0
+  fi
+
   if [ -n "$ARTIFACT_URL" ] && [ "$FROM_SOURCE" -eq 0 ]; then
     VERSION="custom-artifact"
     info "Using custom artifact URL; skipping release tag resolution"
@@ -1198,10 +1206,17 @@ resolve_version() {
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
   local tag=""
   if command -v curl >/dev/null 2>&1; then
-    tag=$(fetch_url_to_stdout "$latest_url" "release metadata" 2>/dev/null \
-      | grep '"tag_name":' \
-      | sed -E 's/.*"([^"]+)".*/\1/' \
-      || true)
+    local metadata=""
+    if metadata=$(fetch_url_to_stdout "$latest_url" "release metadata" 2>/dev/null); then
+      # GitHub also sends compact JSON. Extract the value belonging to the
+      # key, not the last quoted value on its line (usually the release body).
+      # Escaped key mentions in the body are not metadata. Fold JSON whitespace
+      # so a pretty-printed key, colon and value may span multiple lines.
+      tag=$(printf '%s\n' "$metadata" \
+        | tr '\n' ' ' \
+        | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"\\]+)".*/\1/p' \
+        || true)
+    fi
     if [ -z "$tag" ]; then
       local redirect_target=""
       redirect_target=$(fetch_effective_url "https://github.com/${OWNER}/${REPO}/releases/latest" "release redirect" 2>/dev/null || true)
@@ -1366,6 +1381,11 @@ check_existing_install() {
 }
 
 check_network_preflight() {
+  if [ "$FROM_SOURCE" -eq 1 ] && [ -n "${SOURCE_DIR:-}" ]; then
+    info "Local source directory selected; skipping GitHub preflight"
+    return 0
+  fi
+
   if [ "$OFFLINE" -eq 1 ]; then
     info "Offline mode enabled; skipping network preflight"
     return 0
@@ -1537,8 +1557,8 @@ check_dependencies() {
   fi
 
   if [ "$FROM_SOURCE" -eq 1 ]; then
-    if ! command -v git >/dev/null 2>&1; then
-      err "git is required for --from-source installs"
+    if [ -z "${SOURCE_DIR:-}" ] && ! command -v git >/dev/null 2>&1; then
+      err "git is required for --from-source installs without --source-dir"
       exit 1
     fi
     if ! command -v cargo >/dev/null 2>&1; then
@@ -1836,9 +1856,13 @@ verify_download_checksum() {
     fi
   fi
 
+  # A SHA-256 digest field is 64 hex characters. The awk programs below test
+  # the length and the character class separately: mawk 1.3.4 before 2024
+  # (Ubuntu 22.04, Debian 12) has no interval expressions, so `{64}` in an
+  # awk regex never matches there.
   if [ -z "$expected" ]; then
     expected=$(awk -v name="$asset_name" '
-      $1 ~ /^[0-9a-fA-F]{64}$/ {
+      length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ {
         file=$2
         sub(/^\*/, "", file)
         sub(/^\.\//, "", file)
@@ -1852,9 +1876,9 @@ verify_download_checksum() {
     if [ -z "$expected" ]; then
       if [ "$checksum_source_kind" != "release-manifest" ]; then
         local checksum_count checksum_entry_name
-        checksum_count=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { c += 1 } END { print c + 0 }' "$checksum_file")
+        checksum_count=$(awk 'length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { c += 1 } END { print c + 0 }' "$checksum_file")
         if [ "$checksum_count" -eq 1 ]; then
-          checksum_entry_name=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ {
+          checksum_entry_name=$(awk 'length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ {
             file=$2
             sub(/^\*/, "", file)
             sub(/^\.\//, "", file)
@@ -1862,7 +1886,7 @@ verify_download_checksum() {
             exit
           }' "$checksum_file")
           if [ -z "$checksum_entry_name" ]; then
-            expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+            expected=$(awk 'length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { print $1; exit }' "$checksum_file")
           fi
         fi
       fi
@@ -1979,14 +2003,18 @@ extract_release_artifact() {
       warn "tar is not available to extract $candidate"
       return 1
     fi
-    if ! command -v xz >/dev/null 2>&1; then
-      warn "xz is not available to extract $candidate"
-      return 1
-    fi
     local extract_dir="$TMP/extract-${candidate//\//_}"
     mkdir -p "$extract_dir"
+    # Let tar decide whether it can read xz. bsdtar (macOS, FreeBSD)
+    # decompresses xz itself, and a stock macOS has no `xz` program, so
+    # requiring one made every default install fail there. GNU tar runs the
+    # `xz` program; when that is missing, say so.
     if ! tar -xJf "$artifact_file" -C "$extract_dir"; then
-      warn "Failed to extract archive: $candidate"
+      if command -v xz >/dev/null 2>&1; then
+        warn "Failed to extract archive: $candidate"
+      else
+        warn "xz is not available to extract $candidate"
+      fi
       return 1
     fi
     local found_bin=""
@@ -3690,6 +3718,12 @@ write_state() {
 }
 
 should_skip_reinstall() {
+  # Release labels cannot identify a mutable checkout: a new commit, branch,
+  # or uncommitted edit must be rebuilt even when Cargo.toml is unchanged.
+  if [ "$FROM_SOURCE" -eq 1 ] && [ -n "${SOURCE_DIR:-}" ]; then
+    return 1
+  fi
+
   if [ "$FORCE_INSTALL" -eq 1 ]; then
     return 1
   fi

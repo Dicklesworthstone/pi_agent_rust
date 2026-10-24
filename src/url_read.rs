@@ -1,25 +1,24 @@
 //! URL-aware reads (bd-cv653.2.2).
 //!
 //! `read` on http(s):// paths fetches and converts to reader-mode markdown,
-//! with site-aware extractors, PDF text extraction, notebook rendering, and a
-//! default-on SSRF guard.
+//! with site-aware extractors, PDF text extraction, native DOCX/PPTX/XLSX/EPUB text,
+//! notebook rendering, and a default-on SSRF guard.
 //!
 //! Design notes:
-//! - HTML converts through a boilerplate-skipping htmd pipeline; site
-//!   extractors (GitHub blob→raw, arXiv, registries) shape known hosts before
-//!   the generic converter.
-//! - `:raw` in the path bypasses conversion; `offset`/`limit` page the
-//!   CONVERTED markdown lines exactly like file reads.
-//! - The SSRF guard blocks loopback/private/link-local/metadata targets by
-//!   default; `read.urlAllowPrivateTargets` (or the e2e harness) opts out.
+//! - GitHub file pages resolve to their actual raw document before downloading.
+//! - HTML converts through a boilerplate-skipping htmd pipeline.
+//! - `:raw` bypasses source rewriting and conversion; offset/limit page the
+//!   returned text exactly like file reads.
+//! - Redirects and synthesized source URLs share admission and one deadline.
 
 use crate::error::Error;
-use serde_json::Value;
+
+mod navigation;
+mod notebook;
+pub use navigation::{fetch, github_blob_to_raw, host_is_private_target};
 
 /// Maximum download size for a URL read (10 MiB before conversion).
-const MAX_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
-/// Maximum redirects followed.
-const MAX_REDIRECTS: u32 = 5;
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 /// What the converter produced, for metadata + tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +26,10 @@ pub enum UrlContentKind {
     Html,
     Pdf,
     Notebook,
+    Docx,
+    Pptx,
+    Xlsx,
+    Epub,
     PlainText,
 }
 
@@ -37,6 +40,10 @@ impl UrlContentKind {
             Self::Html => "html",
             Self::Pdf => "pdf",
             Self::Notebook => "notebook",
+            Self::Docx => "docx",
+            Self::Pptx => "pptx",
+            Self::Xlsx => "xlsx",
+            Self::Epub => "epub",
             Self::PlainText => "plaintext",
         }
     }
@@ -47,6 +54,9 @@ impl UrlContentKind {
 pub enum UrlReadMode {
     Reader,
     Raw,
+    /// Resolve source URLs and require exact UTF-8 without document conversion.
+    /// Querying must never silently replace malformed source bytes.
+    SourceUtf8,
 }
 
 /// A fetched URL read rendered for tool output.
@@ -56,7 +66,7 @@ pub struct UrlReadOutcome {
     pub kind: UrlContentKind,
     /// Which extractor produced the content (`generic` when no site rule hit).
     pub extractor: &'static str,
-    /// The final URL after redirects.
+    /// The final URL after redirects and source resolution.
     pub final_url: String,
     /// Content-Type seen on the wire (before conversion).
     pub wire_content_type: String,
@@ -89,156 +99,6 @@ pub fn ssrf_policy_from_config(config: Option<&crate::config::Config>) -> SsrfPo
     }
 }
 
-/// Whether this URL's host is a private/loopback/link-local target.
-#[must_use]
-pub fn host_is_private_target(url: &str) -> bool {
-    let Some(host) = url_host(url) else {
-        return true; // unparseable hosts are treated as unsafe
-    };
-    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") {
-        return true;
-    }
-    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
-        return v4.is_loopback()
-            || v4.is_private()
-            || v4.is_link_local()
-            || v4.is_unspecified()
-            || v4.is_broadcast()
-            || v4.is_documentation()
-            || v4.octets()[0] == 100 && (v4.octets()[1] & 0b0100_0000) != 0; // CGNAT 100.64/10
-    }
-    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
-        return v6.is_loopback()
-            || v6.is_unspecified()
-            || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-            || (v6.segments()[0] & 0xfe00) == 0xfc00; // fc00::/7 unique-local
-    }
-    // Numeric-but-unparseable hosts are treated as unsafe; hostnames resolve
-    // at connect time (documented DNS-rebinding caveat in the bead close-out).
-    host.parse::<std::net::IpAddr>().is_err()
-        && host.chars().all(|c| c.is_ascii_digit() || c == '.')
-}
-
-fn url_host(url: &str) -> Option<String> {
-    let after_scheme = url.split("://").nth(1)?;
-    let authority = after_scheme.split(['/', '?', '#']).next()?;
-    // Bracketed IPv6 literals contain colons: take the bracket span verbatim.
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        return Some(rest[..end].to_string());
-    }
-    let host = authority.split(':').next()?.trim();
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_string())
-}
-
-/// The full fetch pipeline.
-///
-/// Reader mode converts supported documents to
-/// markdown; raw mode returns the downloaded body without conversion. Honors
-/// the global request-timeout override (`PI_HTTP_REQUEST_TIMEOUT_SECS`) via the
-/// shared HTTP client.
-pub async fn fetch(
-    url: &str,
-    policy: SsrfPolicy,
-    mode: UrlReadMode,
-) -> crate::error::Result<UrlReadOutcome> {
-    fetch_with_redirects(url, policy, mode, 0).await
-}
-
-#[allow(clippy::too_many_lines)]
-fn fetch_with_redirects<'a>(
-    url: &'a str,
-    policy: SsrfPolicy,
-    mode: UrlReadMode,
-    depth: u32,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = crate::error::Result<UrlReadOutcome>> + Send + 'a>,
-> {
-    Box::pin(async move {
-        if depth > MAX_REDIRECTS {
-            return Err(Error::tool("read", format!("Too many redirects for {url}")));
-        }
-        if policy == SsrfPolicy::BlockPrivateTargets && host_is_private_target(url) {
-            return Err(Error::tool(
-                "read",
-                format!(
-                    "[SSRF_BLOCKED] Refusing to fetch private/loopback/link-local target {url}. \
-                     Set read.urlAllowPrivateTargets=true to override."
-                ),
-            ));
-        }
-
-        let client = crate::http::client::Client::new();
-        let response = client
-            .get(url)
-            .header("User-Agent", "pi_agent_rust/0.2 (url read)")
-            .header(
-                "Accept",
-                "text/html,application/pdf,text/plain,application/json,*/*",
-            )
-            .send()
-            .await
-            .map_err(|err| Error::tool("read", format!("Failed to fetch {url}: {err}")))?;
-
-        let status = response.status();
-        if (300..400).contains(&status) {
-            let location = response
-                .headers()
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("location"))
-                .map(|(_, value)| value.clone());
-            if let Some(location) = location {
-                let next = resolve_redirect(url, &location);
-                return fetch_with_redirects(&next, policy, mode, depth + 1).await;
-            }
-        }
-        if !(200..300).contains(&status) {
-            return Err(Error::tool("read", format!("HTTP {status} fetching {url}")));
-        }
-
-        let wire_content_type = response
-            .headers()
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.clone())
-            .unwrap_or_default();
-
-        let mut stream = response.bytes_stream();
-        let (mut bytes, mut download_truncated) = (Vec::new(), false);
-        {
-            use futures::StreamExt;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk
-                    .map_err(|err| Error::tool("read", format!("Failed reading {url}: {err}")))?;
-                let remaining = MAX_DOWNLOAD_BYTES.saturating_sub(bytes.len());
-                if chunk.len() > remaining {
-                    bytes.extend_from_slice(&chunk[..remaining]);
-                    download_truncated = true;
-                    break;
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            drop(stream);
-        }
-
-        match mode {
-            UrlReadMode::Reader => {
-                convert_bytes(url, &wire_content_type, &bytes, download_truncated)
-            }
-            UrlReadMode::Raw => Ok(raw_bytes(
-                url,
-                &wire_content_type,
-                &bytes,
-                download_truncated,
-            )),
-        }
-    })
-}
-
 fn raw_bytes(
     url: &str,
     wire_content_type: &str,
@@ -255,26 +115,6 @@ fn raw_bytes(
     }
 }
 
-/// Follow a Location header, resolving relative redirects against the source.
-fn resolve_redirect(base: &str, location: &str) -> String {
-    if location.starts_with("http://") || location.starts_with("https://") {
-        return location.to_string();
-    }
-    if let Some(scheme_end) = base.find("://")
-        && let Some(path_start) = base[scheme_end + 3..].find('/')
-    {
-        let origin = &base[..scheme_end + 3 + path_start];
-        if let Some(rest) = location.strip_prefix('/') {
-            return format!("{origin}/{rest}");
-        }
-        if let Some(slash) = base.rfind('/') {
-            return format!("{}/{}", &base[..slash], location);
-        }
-        return format!("{origin}/{location}");
-    }
-    location.to_string()
-}
-
 /// Convert fetched bytes to markdown/text by content-type and extension.
 /// Exposed for fixture tests (no network).
 pub fn convert_bytes(
@@ -286,7 +126,43 @@ pub fn convert_bytes(
     let kind = classify(url, wire_content_type, bytes);
     let (content, extractor): (String, &'static str) = match kind {
         UrlContentKind::Pdf => (convert_pdf(bytes)?, "pdf"),
-        UrlContentKind::Notebook => (convert_notebook(bytes)?, "notebook"),
+        UrlContentKind::Notebook => {
+            if download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[NOTEBOOK_INCOMPLETE] cannot interpret a truncated notebook",
+                ));
+            }
+            (convert_notebook(bytes)?, "notebook")
+        }
+        UrlContentKind::Docx | UrlContentKind::Pptx | UrlContentKind::Xlsx => {
+            if download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_INCOMPLETE] Cannot interpret a truncated Office document",
+                ));
+            }
+            let document_kind = if kind == UrlContentKind::Docx {
+                crate::document_read::DocumentKind::Docx
+            } else if kind == UrlContentKind::Pptx {
+                crate::document_read::DocumentKind::Pptx
+            } else {
+                crate::document_read::DocumentKind::Xlsx
+            };
+            (
+                crate::document_read::convert(bytes, document_kind)?,
+                document_kind.as_str(),
+            )
+        }
+        UrlContentKind::Epub => {
+            if download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_INCOMPLETE] Cannot interpret a truncated EPUB book",
+                ));
+            }
+            (crate::document_read::convert_epub(bytes)?, "epub")
+        }
         UrlContentKind::Html => {
             let text = String::from_utf8_lossy(bytes);
             convert_html(url, &text)
@@ -315,17 +191,33 @@ fn classify(url: &str, content_type: &str, bytes: &[u8]) -> UrlContentKind {
     if ct.contains("application/pdf") || ext_is("pdf") || bytes.starts_with(b"%PDF") {
         return UrlContentKind::Pdf;
     }
-    if ext_is("ipynb") {
+    if let Some(kind) = crate::document_read::recognize(url, content_type) {
+        return match kind {
+            crate::document_read::DocumentKind::Docx => UrlContentKind::Docx,
+            crate::document_read::DocumentKind::Pptx => UrlContentKind::Pptx,
+            crate::document_read::DocumentKind::Xlsx => UrlContentKind::Xlsx,
+        };
+    }
+    let media_type = ct.split(';').next().unwrap_or_default().trim();
+    if ext_is("epub")
+        || matches!(
+            media_type,
+            "application/epub+zip" | "application/epub" | "application/x-epub+zip"
+        )
+    {
+        return UrlContentKind::Epub;
+    }
+    if ext_is("ipynb") || ct.contains("application/x-ipynb+json") {
         return UrlContentKind::Notebook;
     }
     if ct.contains("text/html") || ct.contains("application/xhtml") {
         return UrlContentKind::Html;
     }
+    if notebook::recognizes(bytes) {
+        return UrlContentKind::Notebook;
+    }
     if ct.starts_with("text/") || ct.contains("json") || ct.contains("xml") {
         return UrlContentKind::PlainText;
-    }
-    if bytes.starts_with(b"{") && bytes.windows(9).any(|w| w == b"\"nbformat\"") {
-        return UrlContentKind::Notebook;
     }
     UrlContentKind::PlainText
 }
@@ -356,100 +248,24 @@ fn convert_pdf(_bytes: &[u8]) -> crate::error::Result<String> {
 }
 
 fn convert_notebook(bytes: &[u8]) -> crate::error::Result<String> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|err| Error::tool("read", format!("Notebook parse failed: {err}")))?;
-    let cells = value
-        .get("cells")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::tool("read", "Notebook has no cells array".to_string()))?;
-    let mut out = String::new();
-    for (index, cell) in cells.iter().enumerate() {
-        let cell_type = cell
-            .get("cell_type")
-            .and_then(Value::as_str)
-            .unwrap_or("code");
-        let source = cell
-            .get("source")
-            .map(|src| match src {
-                Value::String(text) => text.clone(),
-                Value::Array(lines) => lines
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            })
-            .unwrap_or_default();
-        let _ = std::fmt::Write::write_fmt(
-            &mut out,
-            format_args!("\n### cell {} ({})\n", index + 1, cell_type),
-        );
-        if cell_type == "code" {
-            out.push_str("```\n");
-            out.push_str(source.trim_end());
-            out.push_str("\n```\n");
-        } else {
-            out.push_str(source.trim_end());
-            out.push('\n');
-        }
-        if let Some(outputs) = cell.get("outputs").and_then(Value::as_array)
-            && !outputs.is_empty()
-        {
-            let _ = std::fmt::Write::write_fmt(
-                &mut out,
-                format_args!("\n_outputs: {} present_\n", outputs.len()),
-            );
-        }
-    }
-    Ok(out)
+    notebook::render(bytes)
 }
 
 /// HTML conversion with site-aware extraction. Returns (markdown, extractor).
 fn convert_html(url: &str, html: &str) -> (String, &'static str) {
-    // GitHub blob pages: fetch the raw content instead of the chrome page.
-    if let Some(raw_url) = github_blob_to_raw(url) {
-        return (
-            format!("[github blob → raw: {raw_url}]\n\n<fetch the raw URL for the file content>"),
-            "github-blob-raw",
-        );
-    }
+    // Source resolution belongs to fetch, not this network-free converter.
+    // Offline HTML conversion must return the supplied content, not a fake read.
     if let Some(markdown) = arxiv_abs_abstract(url, html) {
         return (markdown, "arxiv-abs");
     }
     (generic_html_to_markdown(html), "generic")
 }
 
-/// Map a github.com/<owner>/<repo>/blob/<ref>/<path> URL to its raw URL.
-#[must_use]
-pub fn github_blob_to_raw(url: &str) -> Option<String> {
-    let host = url_host(url)?;
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-    let (_, after_scheme) = url.split_once("://")?;
-    let (_, path) = after_scheme.split_once('/')?;
-    let mut segments = path.split('/');
-    let owner = segments.next()?;
-    let repo = segments.next()?;
-    if segments.next()? != "blob" {
-        return None;
-    }
-    let git_ref = segments.next()?;
-    let file_path: Vec<&str> = segments.collect();
-    if file_path.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "https://raw.githubusercontent.com/{owner}/{repo}/{git_ref}/{}",
-        file_path.join("/")
-    ))
-}
-
 /// arXiv /abs/<id>: pull the abstract + metadata from the page and point at
 /// the PDF for full text.
 fn arxiv_abs_abstract(url: &str, html: &str) -> Option<String> {
-    let host = url_host(url)?;
-    if !host.eq_ignore_ascii_case("arxiv.org") || !url.contains("/abs/") {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.host_str() != Some("arxiv.org") || !parsed.path().starts_with("/abs/") {
         return None;
     }
     // The abstract lives in <blockquote class="abstract mathjax">…</blockquote>.
@@ -531,6 +347,60 @@ mod tests {
             classify("https://x/data", "application/json", b"{}"),
             UrlContentKind::PlainText
         );
+        assert_eq!(
+            classify(
+                "https://x/REPORT.DOCX?download=1",
+                "application/octet-stream",
+                b"PK"
+            ),
+            UrlContentKind::Docx
+        );
+        assert_eq!(
+            classify(
+                "https://x/download",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation; charset=binary",
+                b"PK",
+            ),
+            UrlContentKind::Pptx
+        );
+        assert_eq!(
+            classify(
+                "https://x/BOOK.XLSX?download=1",
+                "application/octet-stream",
+                b"PK"
+            ),
+            UrlContentKind::Xlsx
+        );
+        assert_eq!(
+            classify(
+                "https://x/download",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; charset=binary",
+                b"PK",
+            ),
+            UrlContentKind::Xlsx
+        );
+    }
+
+    #[test]
+    fn epub_classification_uses_exact_mime_or_case_insensitive_extension() {
+        assert_eq!(
+            classify("https://x/BOOK.EPUB?download=1#chapter", "", b"PK"),
+            UrlContentKind::Epub,
+        );
+        for media_type in [
+            "application/epub+zip; charset=binary",
+            "application/epub",
+            "application/x-epub+zip",
+        ] {
+            assert_eq!(
+                classify("https://x/download", media_type, b"PK"),
+                UrlContentKind::Epub,
+            );
+        }
+        assert_eq!(
+            classify("https://x/download", "application/epub+zip-extra", b"PK"),
+            UrlContentKind::PlainText,
+        );
     }
 
     #[test]
@@ -560,15 +430,15 @@ mod tests {
     #[test]
     fn redirect_resolution_relative_and_absolute() {
         assert_eq!(
-            resolve_redirect("https://a.com/x/y", "/z"),
+            navigation::resolve_redirect("https://a.com/x/y", "/z").unwrap(),
             "https://a.com/z".to_string()
         );
         assert_eq!(
-            resolve_redirect("https://a.com/x/y", "https://b.com/q"),
+            navigation::resolve_redirect("https://a.com/x/y", "https://b.com/q").unwrap(),
             "https://b.com/q".to_string()
         );
         assert_eq!(
-            resolve_redirect("https://a.com/x/y", "w"),
+            navigation::resolve_redirect("https://a.com/x/y", "w").unwrap(),
             "https://a.com/x/w".to_string()
         );
     }

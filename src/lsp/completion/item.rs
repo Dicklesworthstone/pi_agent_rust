@@ -2,6 +2,8 @@
 
 use serde_json::{Value, json};
 
+mod indentation;
+
 use super::{MAX_ITEM_BYTES, bounded_size, malformed};
 use crate::error::Result;
 use crate::lsp::text::{Position, Range, position_to_offset_exact};
@@ -83,18 +85,18 @@ pub(super) fn primary_range(range: Range, position: Position) -> Result<()> {
     Ok(())
 }
 
-fn plain_text_mode(item: &Value) -> Result<()> {
-    for property in ["insertTextFormat", "insertTextMode"] {
-        if item
-            .get(property)
-            .filter(|value| !value.is_null())
-            .is_some_and(|value| value.as_u64() != Some(1))
-        {
-            return Err(tool_err(
-                "LSP_COMPLETION_UNSUPPORTED",
-                "snippets and indentation-adjusting completions are not supported",
-            ));
-        }
+fn insertion_mode(item: &Value) -> Result<indentation::Mode> {
+    // Snippets must first pass the bounded literal-expansion step. Never
+    // insert their wire syntax through this plain TextEdit path.
+    if item
+        .get("insertTextFormat")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| value.as_u64() != Some(1))
+    {
+        return Err(tool_err(
+            "LSP_COMPLETION_UNSUPPORTED",
+            "completion snippets must be expanded before preparing text edits",
+        ));
     }
     if item.get("command").is_some_and(|value| !value.is_null()) {
         return Err(tool_err(
@@ -102,7 +104,7 @@ fn plain_text_mode(item: &Value) -> Result<()> {
             "command-backed completions cannot be applied; no command or partial insertion was performed",
         ));
     }
-    Ok(())
+    indentation::Mode::parse(item)
 }
 
 /// Only the three advertised resolve properties may change. Never let resolve
@@ -138,7 +140,7 @@ pub(super) fn edits(
     cursor: Position,
     fallback: Option<Range>,
 ) -> Result<Vec<Value>> {
-    plain_text_mode(item)?;
+    let mode = insertion_mode(item)?;
     let main = if let Some(edit) = item.get("textEdit").filter(|value| !value.is_null()) {
         let object = edit
             .as_object()
@@ -173,6 +175,7 @@ pub(super) fn edits(
             replace
         };
         primary_range(range, cursor)?;
+        let text = mode.text(text, source, range.start)?;
         json!({"range":range,"newText":text})
     } else {
         let range = fallback.ok_or_else(|| tool_err(
@@ -187,6 +190,7 @@ pub(super) fn edits(
             .unwrap_or_else(|| &item["label"])
             .as_str()
             .ok_or_else(|| malformed("insertText must be a string"))?;
+        let text = mode.text(text, source, range.start)?;
         json!({"range":range,"newText":text})
     };
     let mut edits = vec![main];

@@ -1,10 +1,10 @@
 //! Review and approve an exact, already-staged multi-file refactor.
 //!
-//! One bounded preview belongs to one tool and one live server connection.
+//! One bounded preview belongs to one tool and its contributing connections.
 //! Approval consumes it; no server request or re-planning occurs on approval.
 //! The transaction retains original bytes/permissions even for unopened files.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -16,6 +16,9 @@ use super::{
     text_output, tool_err,
 };
 use crate::agent_cx::AgentCx;
+
+mod group;
+pub(in crate::lsp) use group::{MAX_REFACTOR_SERVERS, RefactorGroup};
 
 const PREVIEW_AGE: Duration = Duration::from_secs(300);
 
@@ -109,46 +112,26 @@ fn output(payload: Value) -> Result<ToolOutput> {
 
 struct Preview {
     id: String,
-    entry: Weak<ServerEntry>,
+    group: RefactorGroup,
     prepared: PreparedEdit,
-    documents: Vec<(String, Arc<str>)>,
     metadata: Value,
     payload: Value,
-    notification: Option<Value>,
     created: Instant,
 }
 
-fn verify_documents(entry: &ServerEntry, documents: &[(String, Arc<str>)]) -> Result<()> {
-    if !entry.client.is_alive() {
-        return Err(stale());
-    }
-    for (uri, before) in documents {
-        if !entry
-            .client
-            .synchronized_text(uri)
-            .is_some_and(|now| Arc::ptr_eq(before, &now))
-        {
-            return Err(stale());
-        }
-    }
-    Ok(())
-}
-
 impl Preview {
-    fn verify(&self, owner: &AgentCx) -> Result<Arc<ServerEntry>> {
+    fn verify(&self, owner: &AgentCx) -> Result<Vec<Arc<ServerEntry>>> {
         check_owner(owner)?;
         if self.created.elapsed() >= PREVIEW_AGE {
             return Err(stale());
         }
-        let entry = self.entry.upgrade().ok_or_else(stale)?;
-        verify_documents(&entry, &self.documents)?;
+        self.group.verify()?;
         self.prepared.verify()?;
         check_owner(owner)?;
         if self.created.elapsed() >= PREVIEW_AGE {
             return Err(stale());
         }
-        verify_documents(&entry, &self.documents)?;
-        Ok(entry)
+        self.group.verify()
     }
 }
 
@@ -162,8 +145,8 @@ impl RefactorCache {
 }
 
 impl LspTool {
-    /// The caller has already validated workspace scope and request-time
-    /// versions before staging. All subsequently read paths are immutable.
+    /// Single-server actions share the same evidence/approval path as groups.
+    /// The caller has already validated workspace scope and request versions.
     pub(super) fn cache_refactor(
         &self,
         entry: &Arc<ServerEntry>,
@@ -174,16 +157,19 @@ impl LspTool {
         owner: &AgentCx,
     ) -> Result<ToolOutput> {
         check_owner(owner)?;
-        let mut documents = Vec::new();
-        for path in prepared.paths() {
-            let uri = try_path_to_uri(path)?;
-            if let Some(text) = entry.client.synchronized_text(&uri) {
-                if !prepared.matches_document(path, &text) {
-                    return Err(stale());
-                }
-                documents.push((uri, text));
-            }
-        }
+        let group = RefactorGroup::capture(vec![(Arc::clone(entry), notification)], &prepared)?;
+        self.cache_refactor_group(group, prepared, edit, metadata, owner)
+    }
+
+    pub(super) fn cache_refactor_group(
+        &self,
+        group: RefactorGroup,
+        prepared: PreparedEdit,
+        edit: Value,
+        metadata: Value,
+        owner: &AgentCx,
+    ) -> Result<ToolOutput> {
+        check_owner(owner)?;
         let id = format!("refactor-{}", uuid::Uuid::new_v4().simple());
         let mut payload = metadata.clone();
         payload["refactorId"] = json!(id);
@@ -191,19 +177,21 @@ impl LspTool {
         payload["preview"] = json!(true);
         payload["expiresInSecs"] = json!(PREVIEW_AGE.as_secs());
         payload["files"] = json!(prepared.summary(&self.cwd));
+        payload["changeAnnotations"] = prepared.change_annotations();
+        let required = prepared.required_annotations();
+        payload["confirmationRequired"] = json!(!required.is_empty());
+        payload["requiredConfirmationIds"] = json!(required);
         payload["workspaceEdit"] = edit;
-        payload["notificationRequested"] = json!(notification.is_some());
+        payload["notificationRequested"] = json!(group.requested());
         payload["notificationWritten"] = json!(false);
         payload["atomic"] = json!(false);
         payload["rollbackOnError"] = json!(true);
         let preview = Preview {
             id,
-            entry: Arc::downgrade(entry),
+            group,
             prepared,
-            documents,
             metadata,
             payload,
-            notification,
             created: Instant::now(),
         };
         preview.verify(owner)?;
@@ -233,7 +221,7 @@ impl LspTool {
             // cannot be replayed, including failures with incomplete rollback.
             cache.take().ok_or_else(stale)?
         };
-        let entry = preview.verify(owner)?;
+        let entries = preview.verify(owner)?;
         if started.elapsed() >= timeout {
             return Err(tool_err(
                 "LSP_TIMEOUT",
@@ -254,13 +242,15 @@ impl LspTool {
         let Preview {
             id,
             prepared,
-            documents,
+            group,
             mut metadata,
-            notification,
             created,
             ..
         } = preview;
-        let result = prepared.commit(|| {
+        // The complete bounded preview includes every referenced annotation.
+        // apply:true confirms that exact batch, never an unseen callback.
+        let confirmed_annotations = prepared.required_annotations();
+        let result = prepared.commit_reviewed(|| {
             check_owner(owner)?;
             if started.elapsed() >= timeout {
                 return Err(tool_err(
@@ -271,12 +261,13 @@ impl LspTool {
             if created.elapsed() >= PREVIEW_AGE {
                 return Err(stale());
             }
-            verify_documents(&entry, &documents)
+            group.verify().map(|_| ())
         });
-        self.invalidate_refactor(&entry);
+        for entry in &entries {
+            self.invalidate_refactor(entry);
+        }
         let outcome = result?;
-        let requested = notification.is_some();
-        let warning = Self::notify_refactor_move(&entry, notification);
+        group.notify(&entries, &mut metadata);
         let files: Vec<_> = outcome
             .files_changed
             .iter()
@@ -286,6 +277,8 @@ impl LspTool {
         metadata["applied"] = json!(true);
         metadata["preview"] = json!(false);
         metadata["filesChanged"] = json!(files);
+        metadata["confirmedAnnotations"] = json!(confirmed_annotations);
+        metadata["confirmationRequired"] = json!(false);
         if input.action == "format" {
             metadata["previewOnly"] = json!(false);
             // A reviewed no-op is consumed and checked but does not represent
@@ -308,9 +301,6 @@ impl LspTool {
             metadata["importUpdates"] = json!(files);
         }
         metadata["fileOps"] = json!(outcome.file_ops_applied);
-        metadata["notificationRequested"] = json!(requested);
-        metadata["notificationWritten"] = json!(requested && warning.is_none());
-        metadata["warning"] = json!(warning);
         metadata["atomic"] = json!(false);
         metadata["rollbackOnError"] = json!(true);
         // The complete preview was bounded before approval. A notification

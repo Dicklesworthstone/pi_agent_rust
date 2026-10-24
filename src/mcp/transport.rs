@@ -2,27 +2,39 @@
 //!
 //! Stdio uses MCP's newline-delimited JSON-RPC wire format with a strict env
 //! allowlist; streamable HTTP does POST-per-message with JSON or SSE responses,
-//! `Mcp-Session-Id` continuity, and custom headers.
+//! `Mcp-Session-Id` continuity, and custom headers. Legacy SSE discovers a
+//! separate POST endpoint and routes responses over one persistent GET stream.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender, TrySendError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{FutureExt as _, StreamExt as _};
 use serde_json::Value;
 
+use super::progress::ProgressRegistry;
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{
     CompletionWaitError, MCP_ENV_ALLOWLIST, PublicTailBuffer, RpcErrorObject, await_completion,
 };
 use crate::tools::{ProcessCleanupMode, ProcessGuard};
+
+#[cfg(test)]
+mod progress_tests;
+
+#[cfg(unix)]
+mod cancellable_stdio;
+
+#[path = "sse_transport.rs"]
+mod legacy_sse;
+pub use legacy_sse::SseTransport;
 
 /// Default per-request timeout for MCP calls.
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,28 +47,201 @@ const HTTP_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-logical-stream event-id budget. Exhaustion fails closed rather than
 /// forgetting old ids and risking duplicate server-request side effects.
 const MAX_HTTP_SSE_EVENT_IDS: usize = 4096;
-/// MCP protocol revision this client speaks.
-pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Preferred MCP protocol revision, matching OMP's current handshake.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+/// Revisions whose shared handshake, tools, resources, and prompts we support.
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
+    MCP_PROTOCOL_VERSION,
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 fn tool_err(code: &str, message: impl Into<String>) -> Error {
     Error::tool("mcp", format!("[{code}] {}", message.into()))
 }
 
+/// Validate the server's negotiated revision before publishing any transport.
+/// HTTP also uses this before accepting a session ID from the response headers.
+pub(super) fn validate_initialize_result(result: &Value) -> Result<&str> {
+    let result = result
+        .as_object()
+        .ok_or_else(|| tool_err("MCP_PROTOCOL", "initialize result must be an object"))?;
+    let version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or_else(|| {
+            tool_err(
+                "MCP_PROTOCOL",
+                "initialize result has an invalid protocolVersion",
+            )
+        })?;
+    if !SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&version) {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            format!(
+                "server selected unsupported protocolVersion {version:?}; supported versions are {}",
+                SUPPORTED_MCP_PROTOCOL_VERSIONS.join(", ")
+            ),
+        ));
+    }
+    if !result.get("capabilities").is_some_and(Value::is_object) {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            "initialize result requires an object-valued capabilities field",
+        ));
+    }
+    let server_info = result
+        .get("serverInfo")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            tool_err(
+                "MCP_PROTOCOL",
+                "initialize result requires an object-valued serverInfo field",
+            )
+        })?;
+    if server_info.get("name").and_then(Value::as_str).is_none()
+        || server_info.get("version").and_then(Value::as_str).is_none()
+    {
+        return Err(tool_err(
+            "MCP_PROTOCOL",
+            "initialize result serverInfo requires string name and version fields",
+        ));
+    }
+    Ok(version)
+}
+
+/// One immutable, client-selected workspace. Server requests never select or
+/// expand this scope, and changing a server's process cwd cannot change it.
+#[derive(Default)]
+struct ClientRoots(OnceLock<Value>);
+
+impl ClientRoots {
+    fn configure(&self, workspace: &Path) -> Result<()> {
+        let path = workspace.canonicalize().map_err(|error| {
+            tool_err(
+                "MCP_ROOT_INVALID",
+                format!("cannot resolve workspace root: {error}"),
+            )
+        })?;
+        if !path.is_dir() {
+            return Err(tool_err(
+                "MCP_ROOT_INVALID",
+                "workspace root must be a directory",
+            ));
+        }
+        let uri = url::Url::from_file_path(&path)
+            .map_err(|()| tool_err("MCP_ROOT_INVALID", "workspace has no absolute file URI"))?;
+        let mut root = serde_json::json!({"uri": uri.as_str()});
+        if let Some(name) = path.file_name().and_then(|name| name.to_str())
+            && !name.chars().any(char::is_control)
+        {
+            root["name"] = Value::String(name.to_string());
+        }
+        let roots = serde_json::json!({"roots": [root]});
+        match self.0.set(roots) {
+            Ok(()) => Ok(()),
+            Err(roots) if self.0.get() == Some(&roots) => Ok(()),
+            Err(_) => Err(tool_err(
+                "MCP_ROOT_INVALID",
+                "an MCP connection's workspace root cannot change",
+            )),
+        }
+    }
+
+    fn capabilities(&self) -> Value {
+        if self.0.get().is_some() {
+            serde_json::json!({"roots": {"listChanged": false}})
+        } else {
+            serde_json::json!({})
+        }
+    }
+
+    fn response(&self, method: &str, id: &Value) -> Value {
+        let result = match method {
+            "ping" => Some(serde_json::json!({})),
+            "roots/list" => self.0.get().cloned(),
+            _ => None,
+        };
+        match result {
+            Some(result) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            None => serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": "client method is not supported"}
+            }),
+        }
+    }
+}
+
 /// One transport connection to an MCP server.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
+    /// Select the session workspace before initialization. Custom transports
+    /// may leave roots unsupported; the default advertises no capabilities.
+    ///
+    /// # Errors
+    /// Built-in transports reject inaccessible roots and changes of scope.
+    fn configure_workspace_root(&self, _workspace: &Path) -> Result<()> {
+        Ok(())
+    }
+    /// Preferred revision for this transport's initialization handshake.
+    fn preferred_protocol_version(&self) -> &'static str {
+        MCP_PROTOCOL_VERSION
+    }
+    /// Capabilities actually implemented by this configured transport.
+    fn client_capabilities(&self) -> Value {
+        serde_json::json!({})
+    }
+    /// Optional, connection-owned progress router. Existing custom transports
+    /// remain valid without an observer and receive no progress token.
+    fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
+        None
+    }
+    /// Logical protocol-session generation used to isolate progress across
+    /// in-place HTTP session renewal. A stdio connection has one generation.
+    fn progress_generation(&self) -> u64 {
+        0
+    }
+    /// Consume a server tools/list invalidation for this transport generation.
+    /// Custom transports that do not receive server notifications remain false.
+    fn take_tools_list_changed(&self) -> bool {
+        false
+    }
     /// Send a request and await its response.
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value>;
+    /// Send with a manager-owned dispatch lease. A transport that queues work
+    /// may claim the lease immediately before its first write. The default
+    /// conservatively claims before entering `request`, preserving uncertain
+    /// delivery handling for transports without finer dispatch information.
+    async fn request_with_dispatch(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        dispatch: std::sync::Arc<RequestDispatch>,
+    ) -> Result<Value> {
+        if !dispatch.claim() {
+            return Err(tool_err("MCP_CANCELLED", "request revoked before dispatch"));
+        }
+        self.request(method, params, timeout).await
+    }
     /// Send a notification.
     async fn notify(&self, method: &str, params: Value) -> Result<()>;
     /// Whether the transport is still usable.
     fn is_alive(&self) -> bool;
+    /// Whether a native authentication failure retired this generation.
+    /// Background HTTP receive failures retain this cause for the manager.
+    fn authentication_required(&self) -> bool {
+        false
+    }
     /// Synchronously abort in-flight work. This is the cancellation-safe
     /// teardown path used when a connection future is dropped at a deadline.
     fn abort(&self);
     /// Activate transport-owned background work after the MCP handshake.
     /// Stdio has no separate receive channel; Streamable HTTP uses this for
-    /// its optional server-message GET stream.
+    /// its optional server-message GET stream. Legacy SSE starts its required
+    /// reader during the first request, because initialization replies use it.
     async fn activate(self: std::sync::Arc<Self>) -> Result<()> {
         Ok(())
     }
@@ -84,6 +269,95 @@ const STDIO_CANCEL_GRACE: Duration = Duration::from_millis(20);
 
 type StdioOutcome = std::result::Result<Value, McpStdioError>;
 type StdioPending = Mutex<HashMap<u64, StdSyncSender<StdioOutcome>>>;
+
+/// A single request's permission to reach the server.
+///
+/// Queue admission is not dispatch: the writer and manager race for this lease
+/// before the first pipe write, so abandoned queued work cannot gain remote
+/// effects afterward.
+///
+/// Transports overriding [`McpTransport::request_with_dispatch`] must claim
+/// this lease before sending any request bytes and send nothing if it fails.
+pub struct RequestDispatch(AtomicU8);
+
+impl RequestDispatch {
+    const QUEUED: u8 = 0;
+    const CLAIMED: u8 = 1;
+    const REVOKED: u8 = 2;
+    const ABANDONED: u8 = 3;
+
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU8::new(Self::QUEUED))
+    }
+
+    /// Observation cannot promote queued or revoked work to dispatched work.
+    pub(crate) fn is_claimed(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::CLAIMED
+    }
+
+    /// Claim permission immediately before dispatch. A false result forbids
+    /// sending this request, including retries or work deferred to a writer.
+    #[must_use]
+    pub fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::CLAIMED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Revoke only unclaimed work. Unlike transport cancellation this does
+    /// not consume the once-only cancellation notification for a sent frame.
+    pub(crate) fn revoke_unsent(&self) -> bool {
+        matches!(
+            self.0.compare_exchange(
+                Self::QUEUED,
+                Self::REVOKED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ),
+            Ok(_) | Err(Self::REVOKED)
+        )
+    }
+
+    /// Revoke unsent work, or return true exactly once for a request whose
+    /// writer already claimed it and may have sent part or all of the frame.
+    fn cancel(&self) -> bool {
+        if self.0.compare_exchange(
+            Self::QUEUED,
+            Self::REVOKED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) != Err(Self::CLAIMED)
+        {
+            return false;
+        }
+        self.0
+            .compare_exchange(
+                Self::CLAIMED,
+                Self::ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn may_have_been_sent(&self) -> bool {
+        matches!(
+            self.0.load(Ordering::SeqCst),
+            Self::CLAIMED | Self::ABANDONED
+        )
+    }
+}
+
+struct StdioRequest {
+    id: u64,
+    response: StdReceiver<StdioOutcome>,
+    dispatch: std::sync::Arc<RequestDispatch>,
+}
 
 #[derive(Debug, Clone)]
 enum McpStdioError {
@@ -135,6 +409,10 @@ impl McpStdioError {
 }
 
 enum WriterCommand {
+    Request {
+        message: Vec<u8>,
+        dispatch: std::sync::Arc<RequestDispatch>,
+    },
     Message(Vec<u8>),
     Cancellation(Vec<u8>),
     Close,
@@ -295,6 +573,7 @@ fn route_stdio_message(
     message: &Value,
     pending: &StdioPending,
     writer_tx: &StdSyncSender<WriterCommand>,
+    roots: &ClientRoots,
 ) -> std::result::Result<(), McpStdioError> {
     let object = message
         .as_object()
@@ -322,29 +601,14 @@ fn route_stdio_message(
             ));
         }
         let Some(id) = id else {
-            return Ok(()); // Valid server notification; no consumer in v1.
+            return Ok(()); // Valid notification; the reader routes progress.
         };
         if !valid_server_request_id(id) {
             return Err(McpStdioError::Protocol(
                 "server request id must be a string, number, or null".to_string(),
             ));
         }
-        let response = if method.as_str() == Some("ping") {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {},
-            })
-        } else {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": "client does not support server-initiated requests",
-                },
-            })
-        };
+        let response = roots.response(method.as_str().unwrap_or_default(), id);
         let encoded = encode_stdio_message(&response)?;
         return writer_tx
             .try_send(WriterCommand::Message(encoded))
@@ -512,6 +776,25 @@ fn writer_loop(
 ) {
     while let Ok(command) = writer_rx.recv() {
         match command {
+            WriterCommand::Request { message, dispatch } => {
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !dispatch.claim() {
+                    continue;
+                }
+                if let Err(error) = stdin.write_all(&message).and_then(|()| stdin.flush()) {
+                    stop_connection(
+                        &pending,
+                        &alive,
+                        &closing,
+                        &tree_cleanup_state,
+                        pid,
+                        McpStdioError::Io(format!("stdio write failed: {error}")),
+                    );
+                    return;
+                }
+            }
             WriterCommand::Message(message) => {
                 if !alive.load(Ordering::SeqCst) {
                     return;
@@ -559,11 +842,14 @@ fn classify_read_error(error: &std::io::Error) -> McpStdioError {
 }
 
 // Ownership is part of the call contract here.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn reader_loop(
-    stdout: std::process::ChildStdout,
+    stdout: impl Read,
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
+    progress: std::sync::Arc<ProgressRegistry>,
+    roots: std::sync::Arc<ClientRoots>,
+    tools_list_changed: std::sync::Arc<AtomicBool>,
     alive: std::sync::Arc<AtomicBool>,
     closing: std::sync::Arc<AtomicBool>,
     tree_cleanup_state: std::sync::Arc<Mutex<TreeCleanupState>>,
@@ -571,9 +857,17 @@ fn reader_loop(
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
+        if !alive.load(Ordering::SeqCst) {
+            return;
+        }
         match read_stdio_message(&mut reader) {
             Ok(Some(message)) => {
-                if let Err(error) = route_stdio_message(&message, &pending, &writer_tx) {
+                // BufReader may already own another complete frame when a
+                // concurrent close cancels its underlying pipe.
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Err(error) = route_stdio_message(&message, &pending, &writer_tx, &roots) {
                     stop_reader_connection(
                         &writer_tx,
                         &pending,
@@ -584,6 +878,13 @@ fn reader_loop(
                         error,
                     );
                     return;
+                }
+                progress.publish(&message, 0);
+                if message.get("method").and_then(Value::as_str)
+                    == Some("notifications/tools/list_changed")
+                    && message.get("id").is_none()
+                {
+                    tools_list_changed.store(true, Ordering::Release);
                 }
             }
             Ok(None) => {
@@ -647,6 +948,9 @@ struct McpStdioClient {
     pid: u32,
     writer_tx: StdSyncSender<WriterCommand>,
     pending: std::sync::Arc<StdioPending>,
+    progress: std::sync::Arc<ProgressRegistry>,
+    roots: std::sync::Arc<ClientRoots>,
+    tools_list_changed: std::sync::Arc<AtomicBool>,
     next_id: AtomicU64,
     alive: std::sync::Arc<AtomicBool>,
     closing: std::sync::Arc<AtomicBool>,
@@ -681,20 +985,13 @@ impl McpStdioClient {
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
         crate::tools::isolate_command_process_group(&mut command_builder);
-        let mut child = command_builder.spawn().map_err(|error| {
-            tool_err(
-                "MCP_SERVER_MISSING",
-                format!("failed to spawn MCP server {command:?}: {error}"),
-            )
-        })?;
-        if !crate::tools::attach_child_job_discipline(&child) {
-            let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
-            let _ = guard.kill();
-            return Err(tool_err(
-                "MCP_PROCESS_ISOLATION",
-                "failed to attach MCP server to process-tree cleanup discipline",
-            ));
-        }
+        let mut child = crate::tools::spawn_command_with_job_discipline(&mut command_builder)
+            .map_err(|error| {
+                tool_err(
+                    "MCP_SERVER_MISSING",
+                    format!("failed to spawn MCP server {command:?}: {error}"),
+                )
+            })?;
         let pid = child.id();
         let Some(stdin) = child.stdin.take() else {
             let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
@@ -722,12 +1019,33 @@ impl McpStdioClient {
         };
 
         let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let progress = std::sync::Arc::new(ProgressRegistry::default());
+        let roots = std::sync::Arc::new(ClientRoots::default());
+        let tools_list_changed = std::sync::Arc::new(AtomicBool::new(false));
         let alive = std::sync::Arc::new(AtomicBool::new(true));
         let closing = std::sync::Arc::new(AtomicBool::new(false));
         let tree_cleanup_state = std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
         let stderr_tail = std::sync::Arc::new(Mutex::new(PublicTailBuffer::new()));
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(STDIO_WRITER_QUEUE_CAP);
         let mut child_guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
+
+        // An escaped descendant can retain any of the three pipe ends after
+        // process-tree cleanup. Prepare every parent endpoint before handing
+        // ownership to a worker, while the child is still guarded locally.
+        #[cfg(unix)]
+        let (stdin, stdout, stderr) = {
+            let pipes =
+                cancellable_stdio::prepare(stdin, stdout, stderr, &alive).map_err(|error| {
+                    alive.store(false, Ordering::SeqCst);
+                    kill_tree_once(pid, &tree_cleanup_state);
+                    let _ = child_guard.kill();
+                    tool_err(
+                        "MCP_TRANSPORT_IO",
+                        format!("failed to prepare cancellable MCP stdio pipes: {error}"),
+                    )
+                })?;
+            (pipes.stdin, pipes.stdout, pipes.stderr)
+        };
 
         let writer_thread = {
             let pending = std::sync::Arc::clone(&pending);
@@ -762,6 +1080,9 @@ impl McpStdioClient {
         let reader_thread = {
             let writer_tx = writer_tx.clone();
             let pending = std::sync::Arc::clone(&pending);
+            let progress = std::sync::Arc::clone(&progress);
+            let roots = std::sync::Arc::clone(&roots);
+            let tools_list_changed = std::sync::Arc::clone(&tools_list_changed);
             let alive = std::sync::Arc::clone(&alive);
             let closing = std::sync::Arc::clone(&closing);
             let tree_cleanup_state = std::sync::Arc::clone(&tree_cleanup_state);
@@ -772,6 +1093,9 @@ impl McpStdioClient {
                         stdout,
                         writer_tx,
                         pending,
+                        progress,
+                        roots,
+                        tools_list_changed,
                         alive,
                         closing,
                         tree_cleanup_state,
@@ -782,6 +1106,8 @@ impl McpStdioClient {
         let _reader_thread = match reader_thread {
             Ok(thread) => thread, // ubs:ignore intentional process-lifetime thread
             Err(error) => {
+                alive.store(false, Ordering::SeqCst);
+                wake_writer_shutdown(&writer_tx);
                 kill_tree_once(pid, &tree_cleanup_state);
                 let _ = child_guard.kill();
                 return Err(tool_err(
@@ -811,6 +1137,8 @@ impl McpStdioClient {
         let _stderr_thread = match stderr_thread {
             Ok(thread) => thread, // ubs:ignore intentional process-lifetime thread
             Err(error) => {
+                alive.store(false, Ordering::SeqCst);
+                wake_writer_shutdown(&writer_tx);
                 kill_tree_once(pid, &tree_cleanup_state);
                 let _ = child_guard.kill();
                 return Err(tool_err(
@@ -825,6 +1153,9 @@ impl McpStdioClient {
             pid,
             writer_tx,
             pending,
+            progress,
+            roots,
+            tools_list_changed,
             next_id: AtomicU64::new(1),
             alive,
             closing,
@@ -846,7 +1177,8 @@ impl McpStdioClient {
         &self,
         method: &str,
         params: Value,
-    ) -> std::result::Result<(u64, StdReceiver<StdioOutcome>), McpStdioError> {
+        dispatch: std::sync::Arc<RequestDispatch>,
+    ) -> std::result::Result<StdioRequest, McpStdioError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         if id == u64::MAX {
             self.abort();
@@ -863,11 +1195,19 @@ impl McpStdioClient {
         let encoded = encode_stdio_message(&message)?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         lock(&self.pending).insert(id, sender);
-        if let Err(error) = self.enqueue(WriterCommand::Message(encoded)) {
+        if let Err(error) = self.enqueue(WriterCommand::Request {
+            message: encoded,
+            dispatch: std::sync::Arc::clone(&dispatch),
+        }) {
+            dispatch.cancel();
             lock(&self.pending).remove(&id);
             return Err(error);
         }
-        Ok((id, receiver))
+        Ok(StdioRequest {
+            id,
+            response: receiver,
+            dispatch,
+        })
     }
 
     fn notify(&self, method: &str, params: Value) -> std::result::Result<(), McpStdioError> {
@@ -879,9 +1219,12 @@ impl McpStdioClient {
         self.enqueue(WriterCommand::Message(encode_stdio_message(&message)?))
     }
 
-    fn cancel_request(&self, id: u64, send_notification: bool) {
+    fn cancel_request(&self, id: u64, dispatch: &RequestDispatch, send_notification: bool) {
+        // Revoke before removing the waiter: the writer must not gain
+        // permission to send an abandoned frame during cancellation cleanup.
+        let cancel_dispatched = dispatch.cancel();
         lock(&self.pending).remove(&id);
-        if send_notification && self.alive.load(Ordering::SeqCst) {
+        if cancel_dispatched && send_notification && self.alive.load(Ordering::SeqCst) {
             let cancellation = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/cancelled",
@@ -987,13 +1330,27 @@ fn append_client_params(
 struct PendingStdioRequest<'a> {
     client: &'a McpStdioClient,
     id: u64,
+    dispatch: std::sync::Arc<RequestDispatch>,
     send_cancellation: bool,
     armed: bool,
 }
 
 impl PendingStdioRequest<'_> {
-    const fn cancellation_was_sent(&mut self) {
-        self.send_cancellation = false;
+    async fn finish_cancellation(&mut self) {
+        self.client
+            .cancel_request(self.id, &self.dispatch, self.send_cancellation);
+        if self.dispatch.may_have_been_sent() {
+            if self.send_cancellation {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let now = cx
+                    .cx()
+                    .timer_driver()
+                    .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+                asupersync::time::sleep(now, STDIO_CANCEL_GRACE).await;
+            }
+            self.client.abort();
+        }
+        self.disarm();
     }
 
     const fn disarm(&mut self) {
@@ -1004,8 +1361,11 @@ impl PendingStdioRequest<'_> {
 impl Drop for PendingStdioRequest<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.client.cancel_request(self.id, self.send_cancellation);
-            self.client.abort();
+            self.client
+                .cancel_request(self.id, &self.dispatch, self.send_cancellation);
+            if self.dispatch.may_have_been_sent() {
+                self.client.abort();
+            }
         }
     }
 }
@@ -1060,25 +1420,75 @@ impl StdioTransport {
 
 #[async_trait]
 impl McpTransport for StdioTransport {
+    fn configure_workspace_root(&self, workspace: &Path) -> Result<()> {
+        self.rpc.roots.configure(workspace)
+    }
+
+    fn client_capabilities(&self) -> Value {
+        self.rpc.roots.capabilities()
+    }
+
+    fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
+        Some(&self.rpc.progress)
+    }
+
+    fn take_tools_list_changed(&self) -> bool {
+        self.rpc.tools_list_changed.swap(false, Ordering::AcqRel)
+    }
+
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        let (id, rx) = self
+        self.request_with_dispatch(
+            method,
+            params,
+            timeout,
+            std::sync::Arc::new(RequestDispatch::new()),
+        )
+        .await
+    }
+
+    async fn request_with_dispatch(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        dispatch: std::sync::Arc<RequestDispatch>,
+    ) -> Result<Value> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| tool_err("MCP_CANCELLED", "cancelled before request dispatch"))?;
+        if timeout.is_zero() {
+            return Err(tool_err("MCP_TIMEOUT", "request timed out before dispatch"));
+        }
+        let StdioRequest {
+            id,
+            response,
+            dispatch,
+        } = self
             .rpc
-            .request(method, params)
+            .request(method, params, dispatch)
             .map_err(|error| tool_err(error.code(), error.message()))?;
         let send_cancellation = method != "initialize";
         let mut pending_request = PendingStdioRequest {
             client: &self.rpc,
             id,
+            dispatch: std::sync::Arc::clone(&dispatch),
             send_cancellation,
             armed: true,
         };
-        let outcome = await_completion(rx, timeout, || {
-            self.rpc.cancel_request(id, send_cancellation);
+        let outcome = await_completion(response, timeout, || {
+            self.rpc.cancel_request(id, &dispatch, send_cancellation);
         })
         .await;
         match outcome {
             Ok(Ok(value)) => {
                 pending_request.disarm();
+                if method == "initialize"
+                    && let Err(error) = validate_initialize_result(&value)
+                {
+                    self.rpc.abort();
+                    return Err(error);
+                }
                 Ok(value)
             }
             Ok(Err(error)) => {
@@ -1089,34 +1499,14 @@ impl McpTransport for StdioTransport {
                 Err(tool_err(error.code(), error.message()))
             }
             Err(CompletionWaitError::Timeout) => {
-                pending_request.cancellation_was_sent();
-                if send_cancellation {
-                    let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                    let now = cx
-                        .cx()
-                        .timer_driver()
-                        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                    asupersync::time::sleep(now, STDIO_CANCEL_GRACE).await;
-                }
-                self.rpc.abort();
-                pending_request.disarm();
+                pending_request.finish_cancellation().await;
                 Err(tool_err(
                     "MCP_TIMEOUT",
                     format!("request timed out after {} ms", timeout.as_millis()),
                 ))
             }
             Err(CompletionWaitError::Cancelled) => {
-                pending_request.cancellation_was_sent();
-                if send_cancellation {
-                    let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                    let now = cx
-                        .cx()
-                        .timer_driver()
-                        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                    asupersync::time::sleep(now, STDIO_CANCEL_GRACE).await;
-                }
-                self.rpc.abort();
-                pending_request.disarm();
+                pending_request.finish_cancellation().await;
                 Err(tool_err("MCP_CANCELLED", "cancelled by ambient context"))
             }
             Err(CompletionWaitError::Closed) => {
@@ -1204,7 +1594,12 @@ pub struct HttpTransport {
     client: crate::http::client::Client,
     url: String,
     headers: Vec<(String, String)>,
+    authentication: Option<super::auth::AuthBinding>,
     session: Mutex<HttpSessionState>,
+    authentication_failed: AtomicBool,
+    progress: std::sync::Arc<ProgressRegistry>,
+    roots: ClientRoots,
+    tools_list_changed_generation: AtomicU64,
     next_id: AtomicU64,
     alive: std::sync::atomic::AtomicBool,
     listener_started: AtomicBool,
@@ -1232,12 +1627,22 @@ struct HttpCancellationDispatch {
     client: crate::http::client::Client,
     url: String,
     headers: Vec<(String, String)>,
+    authentication: Option<super::auth::AuthBinding>,
     wire_state: HttpWireState,
     request_id: u64,
 }
 
 impl HttpCancellationDispatch {
     async fn send(self) -> Result<()> {
+        HttpTransport::run_with_deadline(
+            self.send_inner(),
+            HTTP_CANCEL_TIMEOUT,
+            "HTTP cancellation",
+        )
+        .await
+    }
+
+    async fn send_inner(self) -> Result<()> {
         let frame = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
@@ -1260,6 +1665,11 @@ impl HttpCancellationDispatch {
         if let Some(protocol_version) = self.wire_state.protocol_version {
             request = request.header("Mcp-Protocol-Version", protocol_version);
         }
+        if let Some(authentication) = &self.authentication
+            && let Some(value) = authentication.authorization_header(false).await?
+        {
+            request = request.try_header("Authorization", value)?;
+        }
         let response = request
             .json(&frame)
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("encode cancellation: {err}")))?
@@ -1268,6 +1678,7 @@ impl HttpCancellationDispatch {
             .await
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("send cancellation: {err}")))?;
         let status = response.status();
+        reject_authentication_status(status)?;
         if status != 202 {
             return Err(tool_err(
                 "MCP_PROTOCOL",
@@ -1295,6 +1706,7 @@ struct HttpSessionDeleteDispatch {
     client: crate::http::client::Client,
     url: String,
     headers: Vec<(String, String)>,
+    authentication: Option<super::auth::AuthBinding>,
     wire_state: HttpWireState,
 }
 
@@ -1319,10 +1731,16 @@ impl HttpSessionDeleteDispatch {
         request = request.header("Mcp-Protocol-Version", protocol_version);
         HttpTransport::run_with_deadline(
             async move {
+                if let Some(authentication) = &self.authentication
+                    && let Some(value) = authentication.authorization_header(false).await?
+                {
+                    request = request.try_header("Authorization", value)?;
+                }
                 let response = request.no_timeout().send().await.map_err(|err| {
                     tool_err("MCP_TRANSPORT_IO", format!("terminate HTTP session: {err}"))
                 })?;
                 let status = response.status();
+                reject_authentication_status(status)?;
                 if (200..300).contains(&status) || status == 405 {
                     // Session teardown is complete once the status arrives.
                     // The body is non-semantic and must not extend close time.
@@ -1528,7 +1946,12 @@ impl HttpTransport {
             client: crate::http::client::Client::new(),
             url: url.to_string(),
             headers,
+            authentication: None,
             session: Mutex::new(HttpSessionState::default()),
+            authentication_failed: AtomicBool::new(false),
+            progress: std::sync::Arc::new(ProgressRegistry::default()),
+            roots: ClientRoots::default(),
+            tools_list_changed_generation: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             alive: std::sync::atomic::AtomicBool::new(true),
             listener_started: AtomicBool::new(false),
@@ -1536,6 +1959,45 @@ impl HttpTransport {
             abort_notify: asupersync::sync::Notify::new(),
             lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
         })
+    }
+
+    /// Keep explicit configured headers authoritative. Fallible OAuth header
+    /// insertion follows protocol headers, so header limits fail before send.
+    pub(crate) fn with_authentication(mut self, binding: super::auth::AuthBinding) -> Result<Self> {
+        if self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(tool_err(
+                "MCP_AUTH_STATIC_HEADER",
+                "managed OAuth cannot replace an explicit Authorization header",
+            ));
+        }
+        self.authentication = Some(binding);
+        Ok(self)
+    }
+
+    async fn current_authorization_header(&self) -> Result<Option<String>> {
+        let result = match &self.authentication {
+            Some(binding) => binding.authorization_header(true).await,
+            None => Ok(None),
+        };
+        if result
+            .as_ref()
+            .is_err_and(super::manager::is_authentication_error)
+        {
+            self.authentication_failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn check_authentication_status(&self, status: u16) -> Result<()> {
+        let result = reject_authentication_status(status);
+        if result.is_err() {
+            self.authentication_failed.store(true, Ordering::Release);
+        }
+        result
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1568,6 +2030,7 @@ impl HttpTransport {
             client: self.client.clone(),
             url: self.url.clone(),
             headers: self.headers.clone(),
+            authentication: self.authentication.clone(),
             wire_state,
         }
     }
@@ -1615,6 +2078,7 @@ impl HttpTransport {
             client: self.client.clone(),
             url: self.url.clone(),
             headers: self.headers.clone(),
+            authentication: self.authentication.clone(),
             wire_state: self.wire_state(),
             request_id,
         }
@@ -1835,6 +2299,9 @@ impl HttpTransport {
             // ubs:ignore validated at initialize-state capture below
             request = request.header("Mcp-Protocol-Version", protocol_version.to_string());
         }
+        if let Some(value) = self.current_authorization_header().await? {
+            request = request.try_header("Authorization", value)?;
+        }
         let response = request
             .json(frame)
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("encode: {err}")))?
@@ -1844,6 +2311,9 @@ impl HttpTransport {
             .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("send: {err}")))?;
 
         let status = response.status();
+        // Authentication rejection is definitive. Do not read an untrusted
+        // error body, replay the request, or spend a server-crash retry.
+        self.check_authentication_status(status)?;
         let candidate_session_id = response
             .headers()
             .iter()
@@ -1994,52 +2464,7 @@ impl HttpTransport {
         candidate_session_id: Option<String>,
         initialize_frame: &Value,
     ) -> Result<()> {
-        let result = result
-            .as_object()
-            .ok_or_else(|| tool_err("MCP_PROTOCOL", "initialize result must be an object"))?;
-        let protocol_version = result
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                tool_err(
-                    "MCP_PROTOCOL",
-                    "initialize result is missing protocolVersion",
-                )
-            })?;
-        super::config::validate_http_header_value(protocol_version)
-            .map_err(|err| tool_err("MCP_PROTOCOL", format!("invalid protocolVersion: {err}")))?;
-        if protocol_version != MCP_PROTOCOL_VERSION {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                format!(
-                    "server selected unsupported protocolVersion {protocol_version:?}; supported version is {MCP_PROTOCOL_VERSION}"
-                ),
-            ));
-        }
-        if !result.get("capabilities").is_some_and(Value::is_object) {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                "initialize result requires an object-valued capabilities field",
-            ));
-        }
-        let server_info = result
-            .get("serverInfo")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                tool_err(
-                    "MCP_PROTOCOL",
-                    "initialize result requires an object-valued serverInfo field",
-                )
-            })?;
-        if server_info.get("name").and_then(Value::as_str).is_none()
-            || server_info.get("version").and_then(Value::as_str).is_none()
-        {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                "initialize result serverInfo requires string name and version fields",
-            ));
-        }
+        let protocol_version = validate_initialize_result(result)?;
         if let Some(session_id) = candidate_session_id.as_deref() {
             validate_http_session_id(session_id)?;
         }
@@ -2165,10 +2590,15 @@ impl HttpTransport {
         ))
         .await;
         match result {
-            Err(error) if is_session_expired(&error) => Err(tool_err(
-                "MCP_DELIVERY_INDETERMINATE",
-                "server rejected the client response inside an already-accepted SSE request; refusing to replay the originating request",
-            )),
+            Err(error)
+                if is_session_expired(&error)
+                    || super::manager::is_authentication_error(&error) =>
+            {
+                Err(tool_err(
+                    "MCP_DELIVERY_INDETERMINATE",
+                    "server rejected the client response inside an already-accepted SSE request; the original request may have completed and was not replayed",
+                ))
+            }
             result => result.map(|_| ()),
         }
     }
@@ -2205,6 +2635,11 @@ impl HttpTransport {
         let header_timeout = timeout.unwrap_or(DEFAULT_MCP_TIMEOUT);
         Self::run_with_deadline(
             async move {
+                // Include refresh in the GET's existing deadline, including
+                // event-stream reconnection and resume requests.
+                if let Some(value) = self.current_authorization_header().await? {
+                    request = request.try_header("Authorization", value)?;
+                }
                 let response = request.no_timeout().send().await.map_err(|err| {
                     tool_err(
                         "MCP_TRANSPORT_IO",
@@ -2212,6 +2647,7 @@ impl HttpTransport {
                     )
                 })?;
                 let status = response.status();
+                self.check_authentication_status(status)?;
                 if status == 405 {
                     // GET is optional. Do not let a hostile or broken server
                     // hold activation open by drip-feeding an ignored body.
@@ -2313,9 +2749,15 @@ impl HttpTransport {
                 ));
             }
             let Some(id) = object.get("id") else {
-                // Notifications do not require a response. Optional client
-                // features are not advertised by this transport today, so
-                // no notification dispatch is required at this layer.
+                // Both POST SSE and the optional GET stream reach this path.
+                // Match the receiving stream's generation, not the latest
+                // session: an old stream must not address a new subscription.
+                if method == "notifications/progress" {
+                    self.progress.publish(&value, wire_state.generation);
+                } else if method == "notifications/tools/list_changed" {
+                    self.tools_list_changed_generation
+                        .store(wire_state.generation.wrapping_add(1), Ordering::Release);
+                }
                 return Ok(None);
             };
             if !matches!(id, Value::Number(_) | Value::String(_)) {
@@ -2324,18 +2766,7 @@ impl HttpTransport {
                     "SSE JSON-RPC request id must be a string or number",
                 ));
             }
-            let response = if method == "ping" {
-                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
-            } else {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("client method {method:?} is not supported")
-                    }
-                })
-            };
+            let response = self.roots.response(method, id);
             self.send_server_response(&response, wire_state).await?;
             return Ok(None);
         }
@@ -2451,7 +2882,17 @@ impl HttpTransport {
         };
         let resumed = match self
             .open_event_stream(wire_state, Some(&last_event_id), Some(timeout))
-            .await?
+            .await
+            .map_err(|error| {
+                if super::manager::is_authentication_error(&error) {
+                    tool_err(
+                        "MCP_DELIVERY_INDETERMINATE",
+                        "authentication failed while resuming an already-accepted SSE request; the original request may have completed and was not replayed",
+                    )
+                } else {
+                    error
+                }
+            })?
         {
             HttpEventStreamOpen::Stream(response) => response,
             HttpEventStreamOpen::Unsupported => {
@@ -2683,6 +3124,19 @@ fn classify_http_response_media_type(content_type: &str) -> Result<HttpResponseM
     }
 }
 
+fn reject_authentication_status(status: u16) -> Result<()> {
+    if matches!(status, 401 | 403) {
+        Err(tool_err(
+            "MCP_AUTH_REQUIRED",
+            format!(
+                "HTTP {status}: the MCP server rejected authorization; use /mcp reauth for managed OAuth or update its configured Authorization header"
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_session_expired(error: &Error) -> bool {
     matches!(
         error,
@@ -2840,6 +3294,31 @@ fn parse_sse_responses(body: &str, expected_id: u64) -> Result<Value> {
 
 #[async_trait]
 impl McpTransport for HttpTransport {
+    fn authentication_required(&self) -> bool {
+        self.authentication_failed.load(Ordering::Acquire)
+    }
+
+    fn configure_workspace_root(&self, workspace: &Path) -> Result<()> {
+        self.roots.configure(workspace)
+    }
+
+    fn client_capabilities(&self) -> Value {
+        self.roots.capabilities()
+    }
+
+    fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
+        Some(&self.progress)
+    }
+
+    fn progress_generation(&self) -> u64 {
+        self.session_generation()
+    }
+
+    fn take_tools_list_changed(&self) -> bool {
+        let current = self.session_generation().wrapping_add(1);
+        self.tools_list_changed_generation.swap(0, Ordering::AcqRel) == current
+    }
+
     async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let _lane =
@@ -2991,7 +3470,7 @@ impl McpTransport for HttpTransport {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Captured (headers, body) pairs shared with a fixture server thread.
@@ -3193,6 +3672,356 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    struct HeldStdioPipe {
+        pipe: std::io::PipeWriter,
+        entered: Option<StdSyncSender<()>>,
+        resume: StdReceiver<()>,
+    }
+
+    #[cfg(unix)]
+    impl Write for HeldStdioPipe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered
+                    .send(())
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                self.resume
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
+            self.pipe.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.pipe.flush()
+        }
+    }
+
+    /// The production queue and pump write to a real pipe whose first write
+    /// is held by a handshake. A fixture peer records every frame and returns
+    /// correlated replies through the production router. The idle child gives
+    /// the unmodified transport an owned process to retire on abandonment.
+    #[cfg(unix)]
+    pub struct HeldStdioTransport {
+        pub(crate) transport: std::sync::Arc<StdioTransport>,
+        entered: StdReceiver<()>,
+        resume: StdSyncSender<()>,
+        writer: Option<std::thread::JoinHandle<()>>,
+        server: Option<std::thread::JoinHandle<Vec<Value>>>,
+    }
+
+    #[cfg(unix)]
+    impl HeldStdioTransport {
+        pub(crate) fn new() -> Self {
+            let mut command = std::process::Command::new("sleep");
+            command
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::tools::isolate_command_process_group(&mut command);
+            let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+                .expect("owned fixture process");
+            let pid = child.id();
+            let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(STDIO_WRITER_QUEUE_CAP);
+            let client = McpStdioClient {
+                child: Mutex::new(ProcessGuard::new(child, ProcessCleanupMode::ChildOnly)),
+                pid,
+                writer_tx,
+                pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
+                progress: std::sync::Arc::new(ProgressRegistry::default()),
+                roots: std::sync::Arc::new(ClientRoots::default()),
+                tools_list_changed: std::sync::Arc::new(AtomicBool::new(false)),
+                next_id: AtomicU64::new(1),
+                alive: std::sync::Arc::new(AtomicBool::new(true)),
+                closing: std::sync::Arc::new(AtomicBool::new(false)),
+                tree_cleanup_state: std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending)),
+                stderr_tail: std::sync::Arc::new(Mutex::new(PublicTailBuffer::new())),
+            };
+            let (reader, pipe) = std::io::pipe().expect("fixture pipe");
+            let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+            let (resume, resume_rx) = std::sync::mpsc::sync_channel(1);
+            let pending = std::sync::Arc::clone(&client.pending);
+            let alive = std::sync::Arc::clone(&client.alive);
+            let closing = std::sync::Arc::clone(&client.closing);
+            let cleanup = std::sync::Arc::clone(&client.tree_cleanup_state);
+            let writer = std::thread::spawn(move || {
+                writer_loop(
+                    HeldStdioPipe {
+                        pipe,
+                        entered: Some(entered_tx),
+                        resume: resume_rx,
+                    },
+                    writer_rx,
+                    pending,
+                    alive,
+                    closing,
+                    cleanup,
+                    pid,
+                );
+            });
+            let pending = std::sync::Arc::clone(&client.pending);
+            let writer_tx = client.writer_tx.clone();
+            let server = std::thread::spawn(move || {
+                let mut reader = BufReader::new(reader);
+                let mut messages = Vec::new();
+                while let Some(message) = read_stdio_message(&mut reader).expect("fixture frame") {
+                    if let Some(id) = message.get("id") {
+                        route_stdio_message(
+                            &serde_json::json!({"jsonrpc":"2.0","id":id,"result":message["method"]}),
+                            &pending,
+                            &writer_tx,
+                            &ClientRoots::default(),
+                        )
+                        .expect("fixture response");
+                    }
+                    messages.push(message);
+                }
+                messages
+            });
+            Self {
+                transport: std::sync::Arc::new(StdioTransport { rpc: client }),
+                entered,
+                resume,
+                writer: Some(writer),
+                server: Some(server),
+            }
+        }
+
+        pub(crate) fn wait_for_writer(&self) {
+            self.entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fixture writer claimed the first request");
+        }
+
+        pub(crate) fn release(&self) {
+            let _ = self.resume.try_send(());
+        }
+
+        pub(crate) fn finish(&mut self) -> Vec<Value> {
+            self.release();
+            self.transport.rpc.abort();
+            self.writer
+                .take()
+                .expect("fixture writer")
+                .join()
+                .expect("fixture writer finished");
+            self.server
+                .take()
+                .expect("fixture server")
+                .join()
+                .expect("fixture server finished")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for HeldStdioTransport {
+        fn drop(&mut self) {
+            // Release and join on assertion failure too, so a red regression
+            // cannot strand its process or either side of the pipe.
+            self.release();
+            self.transport.rpc.abort();
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.join();
+            }
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_queued_abandonment_never_dispatches_tools_or_retires_sibling_requests() {
+        for ending in ["drop", "cancel", "timeout"] {
+            let mut fixture = HeldStdioTransport::new();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            let owner = crate::agent_cx::AgentCx::from_cx(
+                runtime.request_cx_with_budget(asupersync::Budget::new()),
+            );
+            runtime.block_on(async {
+                let mut first = Box::pin(fixture.transport.request(
+                    "test/first",
+                    Value::Null,
+                    Duration::from_secs(10),
+                ));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                fixture
+                    .entered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("first request owns the held writer");
+                let timeout = if ending == "timeout" {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(10)
+                };
+                let mut second = Box::pin(owner.with_current(fixture.transport.request(
+                    "tools/call",
+                    serde_json::json!({"name":"must-not-run","arguments":{}}),
+                    timeout,
+                )));
+                assert!(futures::poll!(second.as_mut()).is_pending());
+                assert_eq!(lock(&fixture.transport.rpc.pending).len(), 2);
+                match ending {
+                    "drop" => drop(second),
+                    "cancel" => {
+                        owner.cancel_with(asupersync::types::CancelKind::User, Some("fixture"));
+                        let error = second.await.expect_err("queued call cancelled");
+                        assert!(error.to_string().contains("MCP_CANCELLED"), "{error}");
+                    }
+                    "timeout" => {
+                        let error = second.await.expect_err("queued call timed out");
+                        assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    fixture.transport.is_alive(),
+                    "{ending} killed an unsent call's server"
+                );
+                assert_eq!(lock(&fixture.transport.rpc.pending).len(), 1);
+                let mut third = Box::pin(fixture.transport.request(
+                    "test/third",
+                    Value::Null,
+                    Duration::from_secs(10),
+                ));
+                assert!(futures::poll!(third.as_mut()).is_pending());
+                assert_eq!(lock(&fixture.transport.rpc.pending).len(), 2);
+                fixture.release();
+                let (first, third) = futures::join!(first, third);
+                assert_eq!(first.expect("first response"), "test/first");
+                assert_eq!(third.expect("third response"), "test/third");
+                assert!(fixture.transport.is_alive());
+                assert!(lock(&fixture.transport.rpc.pending).is_empty());
+            });
+            let messages = fixture.finish();
+            let methods: Vec<_> = messages
+                .iter()
+                .map(|message| message["method"].as_str().expect("fixture method"))
+                .collect();
+            assert_eq!(
+                methods,
+                vec!["test/first", "test/third"],
+                "{ending}: {messages:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_dropping_a_writer_claimed_request_still_retires_the_connection() {
+        let mut fixture = HeldStdioTransport::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut request = Box::pin(fixture.transport.request(
+                "tools/call",
+                serde_json::json!({"name":"claimed","arguments":{}}),
+                Duration::from_secs(10),
+            ));
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            fixture
+                .entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("writer claimed the request before cancellation");
+            drop(request);
+            assert!(
+                !fixture.transport.is_alive(),
+                "claimed delivery is indeterminate"
+            );
+            assert!(lock(&fixture.transport.rpc.pending).is_empty());
+            assert_eq!(
+                *lock(&fixture.transport.rpc.tree_cleanup_state),
+                TreeCleanupState::Killed
+            );
+        });
+        let _ = fixture.finish();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_repeated_abandonment_sends_one_cancellation_for_a_claimed_request() {
+        let mut fixture = HeldStdioTransport::new();
+        let request = fixture
+            .transport
+            .rpc
+            .request(
+                "tools/call",
+                serde_json::json!({"name":"claimed"}),
+                std::sync::Arc::new(RequestDispatch::new()),
+            )
+            .expect("queued request");
+        fixture
+            .entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer claimed the request");
+        for _ in 0..2 {
+            fixture
+                .transport
+                .rpc
+                .cancel_request(request.id, &request.dispatch, true);
+        }
+        assert!(lock(&fixture.transport.rpc.pending).is_empty());
+        fixture.release();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(
+                fixture
+                    .transport
+                    .request("test/next", Value::Null, Duration::from_secs(10)),
+            )
+            .expect("successor drains the earlier cancellation");
+        let messages = fixture.finish();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages[0]["method"], "tools/call");
+        assert_eq!(messages[1]["method"], "notifications/cancelled");
+        assert_eq!(messages[1]["params"]["requestId"], request.id);
+        assert_eq!(messages[2]["method"], "test/next");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_zero_budget_and_precancelled_calls_are_rejected_before_queue_admission() {
+        let mut fixture = HeldStdioTransport::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(async {
+            let error = fixture
+                .transport
+                .request("tools/call", Value::Null, Duration::ZERO)
+                .await
+                .expect_err("zero request budget");
+            assert!(error.to_string().contains("MCP_TIMEOUT"), "{error}");
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("before admission"),
+            );
+            let error = owner
+                .with_current(fixture.transport.request(
+                    "tools/call",
+                    Value::Null,
+                    Duration::from_secs(10),
+                ))
+                .await
+                .expect_err("cancelled owner");
+            assert!(error.to_string().contains("MCP_CANCELLED"), "{error}");
+            assert_eq!(fixture.transport.rpc.next_id.load(Ordering::SeqCst), 1);
+            assert!(lock(&fixture.transport.rpc.pending).is_empty());
+            assert!(fixture.transport.is_alive());
+        });
+        assert!(fixture.finish().is_empty());
+    }
+
     #[test]
     fn stdio_reader_preserves_back_to_back_messages() {
         let first = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}});
@@ -3257,6 +4086,7 @@ mod tests {
             &serde_json::json!({"jsonrpc":"2.0","id":8,"result":"wrong"}),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("unknown late id is ignored");
         assert!(matches!(
@@ -3268,6 +4098,7 @@ mod tests {
             &serde_json::json!({"jsonrpc":"2.0","id":7,"result":"right"}),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("matching response");
         assert_eq!(
@@ -3284,7 +4115,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    route_stdio_message(&malformed, &pending, &writer_tx),
+                    route_stdio_message(&malformed, &pending, &writer_tx, &ClientRoots::default()),
                     Err(McpStdioError::Protocol(_))
                 ),
                 "malformed response was accepted: {malformed}"
@@ -3304,6 +4135,7 @@ mod tests {
             }),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("ping response");
         let WriterCommand::Message(message) = writer_rx.recv().expect("ping writer command") else {
@@ -3325,6 +4157,7 @@ mod tests {
             }),
             &pending,
             &writer_tx,
+            &ClientRoots::default(),
         )
         .expect("unsupported request response");
         let WriterCommand::Message(message) = writer_rx.recv().expect("writer command") else {
@@ -4091,6 +4924,217 @@ mod tests {
         })
     }
 
+    #[test]
+    fn initialize_validation_accepts_supported_revisions_and_rejects_malformed_results() {
+        assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
+        for version in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] {
+            let mut result = initialize_success_body();
+            result["protocolVersion"] = serde_json::json!(version);
+            assert_eq!(
+                validate_initialize_result(&result).expect("supported"),
+                version
+            );
+        }
+        for result in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"protocolVersion":"2024-10-07","capabilities":{},"serverInfo":{"name":"unsupported","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2099-01-01","capabilities":{},"serverInfo":{"name":"future","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2025-11-25\r\nInjected: yes","capabilities":{},"serverInfo":{"name":"bad","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2025-11-25","capabilities":[],"serverInfo":{"name":"bad","version":"1"}}),
+            serde_json::json!({"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"bad"}}),
+        ] {
+            let error = validate_initialize_result(&result).expect_err("invalid handshake");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn roots_are_immutable_canonical_file_uris_and_ignore_server_selected_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("project #1 % with spaces");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        let roots = ClientRoots::default();
+        assert_eq!(roots.capabilities(), serde_json::json!({}));
+        assert_eq!(
+            roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
+            -32601
+        );
+        roots.configure(&workspace).expect("select workspace");
+        roots
+            .configure(&workspace)
+            .expect("same workspace is idempotent");
+        assert!(
+            roots.configure(&other).is_err(),
+            "scope cannot expand in place"
+        );
+        assert_eq!(
+            roots.capabilities(),
+            serde_json::json!({"roots":{"listChanged":false}})
+        );
+
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
+        let pending = Mutex::new(HashMap::new());
+        route_stdio_message(
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":"roots-probe", "method":"roots/list",
+                "params":{"path":"/", "roots":[{"uri":"file:///"}]}
+            }),
+            &pending,
+            &writer_tx,
+            &roots,
+        )
+        .expect("server root request");
+        let WriterCommand::Message(encoded) = writer_rx.recv().expect("root response") else {
+            panic!("expected root response message");
+        };
+        let response: Value = serde_json::from_slice(&encoded).expect("root response JSON");
+        assert_eq!(response["id"], "roots-probe");
+        let listed = response["result"]["roots"].as_array().expect("roots array");
+        assert_eq!(listed.len(), 1);
+        let uri = url::Url::parse(listed[0]["uri"].as_str().expect("root URI")).expect("file URI");
+        assert_eq!(
+            uri.to_file_path().expect("native path"),
+            workspace.canonicalize().expect("canonical workspace")
+        );
+        assert!(uri.query().is_none() && uri.fragment().is_none());
+    }
+
+    #[test]
+    fn roots_reject_files_and_missing_workspaces_without_advertising_capability() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("file");
+        std::fs::write(&file, "not a directory").expect("fixture file");
+        let roots = ClientRoots::default();
+        for path in [file, temp.path().join("missing")] {
+            let error = roots.configure(&path).expect_err("invalid workspace");
+            assert!(error.to_string().contains("MCP_ROOT_INVALID"), "{error}");
+        }
+        assert_eq!(roots.capabilities(), serde_json::json!({}));
+        assert_eq!(
+            roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
+            -32601
+        );
+    }
+
+    #[cfg(unix)]
+    const STDIO_ROOTS_PEER: &str = r#"
+import json, sys
+handshake = json.loads(sys.argv[1])
+observed_initialize = None
+roots_reply = None
+waiting = None
+def emit(frame):
+    print(json.dumps(frame), flush=True)
+def finish(ident):
+    emit({'jsonrpc':'2.0', 'id':ident, 'result':{
+        'tools':[], 'initialize':observed_initialize, 'rootsReply':roots_reply}})
+for line in sys.stdin:
+    frame = json.loads(line)
+    method = frame.get('method')
+    if method == 'initialize':
+        observed_initialize = frame['params']
+        emit({'jsonrpc':'2.0', 'id':frame['id'], 'result':handshake})
+    elif method == 'notifications/initialized':
+        emit({'jsonrpc':'2.0', 'id':'roots-probe', 'method':'roots/list',
+              'params':{'path':'/', 'roots':[{'uri':'file:///'}]}})
+    elif frame.get('id') == 'roots-probe':
+        roots_reply = frame
+        if waiting is not None:
+            finish(waiting)
+            waiting = None
+    elif method == 'tools/list':
+        if roots_reply is None:
+            waiting = frame['id']
+        else:
+            finish(frame['id'])
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stdio_validates_negotiation_and_answers_workspace_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("project #1");
+        let server_cwd = temp.path().join("server");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&server_cwd).expect("server cwd");
+        let runtime = runtime_for_tests();
+        for version in [
+            "2025-11-25",
+            "2025-06-18",
+            "2025-03-26",
+            "unsupported",
+            "malformed",
+        ] {
+            let result = if version == "malformed" {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"protocolVersion":version,"capabilities":{},"serverInfo":{"name":"native-peer","version":"1"}})
+            };
+            let args = vec![
+                "-u".to_string(),
+                "-c".to_string(),
+                STDIO_ROOTS_PEER.to_string(),
+                result.to_string(),
+            ];
+            let transport = StdioTransport::spawn("python3", &args, &[], &server_cwd)
+                .expect("native stdio peer");
+            transport
+                .configure_workspace_root(&workspace)
+                .expect("workspace root");
+            runtime.block_on(async {
+                let result = transport
+                    .request(
+                        "initialize",
+                        serde_json::json!({
+                            "protocolVersion": MCP_PROTOCOL_VERSION,
+                            "capabilities": transport.client_capabilities(),
+                            "clientInfo":{"name":"test","version":"1"}
+                        }),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                if matches!(version, "unsupported" | "malformed") {
+                    let error =
+                        result.expect_err("invalid native stdio handshake must be rejected");
+                    assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+                    assert!(!transport.is_alive(), "invalid peer must be retired");
+                    return;
+                }
+                assert_eq!(
+                    result.expect("negotiated revision")["protocolVersion"],
+                    version
+                );
+                transport
+                    .notify("notifications/initialized", serde_json::json!({}))
+                    .await
+                    .expect("initialized");
+                let observed = transport
+                    .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                    .await
+                    .expect("native root request round trip");
+                assert_eq!(observed["initialize"]["protocolVersion"], "2025-11-25");
+                assert_eq!(
+                    observed["initialize"]["capabilities"],
+                    serde_json::json!({"roots":{"listChanged":false}})
+                );
+                let uri = observed["rootsReply"]["result"]["roots"][0]["uri"]
+                    .as_str()
+                    .expect("workspace URI");
+                assert_eq!(
+                    url::Url::parse(uri)
+                        .expect("file URI")
+                        .to_file_path()
+                        .expect("native root"),
+                    workspace.canonicalize().expect("canonical workspace")
+                );
+                transport.close().await;
+            });
+        }
+    }
+
     fn runtime_for_tests() -> asupersync::runtime::Runtime {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -4234,6 +5278,145 @@ mod tests {
         );
     }
 
+    #[test]
+    fn streamable_http_renegotiates_supported_versions_and_keeps_exact_wire_headers() {
+        let mut initial = initialize_success_body();
+        initial["protocolVersion"] = serde_json::json!("2025-06-18");
+        let mut renewed = initialize_success_body();
+        renewed["protocolVersion"] = serde_json::json!("2025-03-26");
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initial, "sid-initial"),
+            http_empty(202, "Accepted"),
+            http_empty(404, "Not Found"),
+            http_ok_with_session("__ECHO_ID__", renewed, "sid-renewed"),
+            http_empty(202, "Accepted"),
+            http_ok_plain("__ECHO_ID__", serde_json::json!({"tools":[]})),
+            http_empty(204, "No Content"),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let workspace = tempfile::tempdir().expect("workspace");
+        transport
+            .configure_workspace_root(workspace.path())
+            .expect("root configuration");
+        runtime_for_tests().block_on(async {
+            transport
+                .request(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion":MCP_PROTOCOL_VERSION,
+                        "capabilities":transport.client_capabilities(),
+                        "clientInfo":{"name":"test","version":"1"}
+                    }),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("supported fallback");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized");
+            transport
+                .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("renewed session");
+            transport.close().await;
+        });
+        let captured = server.captured();
+        assert_eq!(captured.len(), 7);
+        for (index, version) in [
+            (1, "2025-06-18"),
+            (2, "2025-06-18"),
+            (4, "2025-03-26"),
+            (5, "2025-03-26"),
+            (6, "2025-03-26"),
+        ] {
+            assert!(
+                captured[index].0.iter().any(|(name, value)| name
+                    .eq_ignore_ascii_case("MCP-Protocol-Version")
+                    && value == version),
+                "wrong version on request {index}: {:?}",
+                captured[index]
+            );
+        }
+        for index in [0, 3] {
+            let frame: Value = serde_json::from_str(&captured[index].1).expect("initialize frame");
+            assert_eq!(frame["params"]["protocolVersion"], "2025-11-25");
+            assert_eq!(
+                frame["params"]["capabilities"],
+                serde_json::json!({"roots":{"listChanged":false}})
+            );
+            assert!(
+                !captured[index]
+                    .0
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("Mcp-Session-Id")),
+                "renewal must not reuse expired session"
+            );
+        }
+        assert!(server.request_lines()[6].starts_with("DELETE "));
+    }
+
+    #[test]
+    fn streamable_http_post_sse_answers_roots_with_the_negotiated_session() {
+        let root_request = serde_json::json!({
+            "jsonrpc":"2.0", "id":"root-post", "method":"roots/list",
+            "params":{"path":"/", "roots":[{"uri":"file:///"}]}
+        });
+        let stream = format!(
+            "data: {root_request}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":__ECHO_ID__,\"result\":{{\"tools\":[]}}}}\n\n"
+        );
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-roots"),
+            http_empty(202, "Accepted"),
+            http_event_stream(&stream),
+            http_empty(202, "Accepted"),
+            http_empty(204, "No Content"),
+        ]);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        transport
+            .configure_workspace_root(workspace.path())
+            .expect("workspace root");
+        runtime_for_tests().block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized");
+            transport
+                .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("roots exchange while listing tools");
+            transport.close().await;
+        });
+        let captured = server.captured();
+        assert_eq!(captured.len(), 5);
+        let response: Value =
+            serde_json::from_str(&captured[3].1).expect("server request response");
+        assert_eq!(response["id"], "root-post");
+        let roots = response["result"]["roots"].as_array().expect("roots");
+        assert_eq!(roots.len(), 1);
+        let uri = url::Url::parse(roots[0]["uri"].as_str().expect("root URI")).expect("file URI");
+        assert_eq!(
+            uri.to_file_path().expect("native root"),
+            workspace.path().canonicalize().expect("canonical root")
+        );
+        for (name, value) in [
+            ("Mcp-Session-Id", "sid-roots"),
+            ("MCP-Protocol-Version", "2025-11-25"),
+        ] {
+            assert!(
+                captured[3]
+                    .0
+                    .iter()
+                    .any(|(key, actual)| key.eq_ignore_ascii_case(name) && actual == value)
+            );
+        }
+    }
+
     /// Session-expiry 404 clears stale state and performs EXACTLY ONE
     /// bounded reinitialize/retry; a second consecutive expiry surfaces to
     /// the caller instead of looping (bd-zz6yo).
@@ -4296,8 +5479,8 @@ mod tests {
     }
 
     /// The optional GET channel is activated after the handshake, answers
-    /// server pings, resumes exactly once with its own cursor, and suppresses
-    /// a replayed event id rather than duplicating the response side effect.
+    /// server pings and roots requests, resumes once with its own cursor, and
+    /// suppresses a replayed event rather than duplicating its response.
     #[test]
     fn streamable_http_get_resumes_once_without_duplicate_delivery() {
         let first_stream = concat!(
@@ -4308,7 +5491,7 @@ mod tests {
             "id: stream-1:1\n",
             "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-1\",\"method\":\"ping\"}\n\n",
             "id: stream-1:2\n",
-            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-2\",\"method\":\"ping\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"server-2\",\"method\":\"roots/list\"}\n\n",
         );
         let server = ScriptedHttpServer::start(vec![
             http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-get"),
@@ -4320,6 +5503,10 @@ mod tests {
         ]);
         let transport =
             std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        let workspace = tempfile::tempdir().expect("workspace");
+        transport
+            .configure_workspace_root(workspace.path())
+            .expect("workspace root");
         let runtime = runtime_for_tests();
         runtime.block_on(async {
             transport
@@ -4362,6 +5549,15 @@ mod tests {
         assert_eq!(header(2, "Last-Event-ID"), None);
         assert_eq!(header(4, "Last-Event-ID"), Some("stream-1:1"));
         assert_eq!(header(4, "Mcp-Session-Id"), Some("sid-get"));
+        assert_eq!(header(5, "MCP-Protocol-Version"), Some("2025-11-25"));
+        let response: Value = serde_json::from_str(&captured[5].1).expect("GET root response");
+        let roots = response["result"]["roots"].as_array().expect("GET roots");
+        assert_eq!(roots.len(), 1);
+        let uri = url::Url::parse(roots[0]["uri"].as_str().expect("root URI")).expect("file URI");
+        assert_eq!(
+            uri.to_file_path().expect("native root"),
+            workspace.path().canonicalize().expect("canonical root")
+        );
         assert_eq!(
             captured
                 .iter()
@@ -4881,9 +6077,8 @@ mod tests {
     #[test]
     fn streamable_http_dropped_initialize_future_aborts_without_cancellation() {
         let server = DripBodyHttpServer::start(500, "Internal Server Error");
-        let transport = std::sync::Arc::new(
-            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
-        );
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
         let runtime = runtime_for_tests();
         runtime.block_on(async {
             let initialize = Box::pin(transport.request(
@@ -4915,9 +6110,8 @@ mod tests {
     #[test]
     fn streamable_http_dropped_initialized_future_aborts_without_cancellation() {
         let server = DripBodyHttpServer::start(500, "Internal Server Error");
-        let transport = std::sync::Arc::new(
-            HttpTransport::new(&server.url(), Vec::new()).expect("HTTP transport"),
-        );
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
         transport
             .capture_initialize_state(
                 &initialize_success_body(),

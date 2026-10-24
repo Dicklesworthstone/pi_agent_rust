@@ -149,7 +149,7 @@ impl OpenAIResponsesProvider {
         // tool_choice and parallel_tool_calls are always sent (not conditional on tools).
         let (tool_choice, parallel_tool_calls, text, include, reasoning) = if self.codex_mode {
             let effort = options.thinking_level.as_ref().map_or_else(
-                || "high".to_string(),
+                || Some("high".to_string()),
                 |level| responses_effort_for_level(*level, self.compat.as_ref()),
             );
             (
@@ -159,14 +159,15 @@ impl OpenAIResponsesProvider {
                     verbosity: "medium",
                 }),
                 Some(vec!["reasoning.encrypted_content"]),
-                Some(OpenAIResponsesReasoning {
+                effort.map(|effort| OpenAIResponsesReasoning {
                     effort,
                     summary: Some("auto"),
                 }),
             )
-        } else if let Some(level) = options
+        } else if let Some(effort) = options
             .thinking_level
             .filter(|level| self.reasoning && *level != crate::model::ThinkingLevel::Off)
+            .and_then(|level| responses_effort_for_level(level, self.compat.as_ref()))
         {
             // Non-codex reasoning models mirror the TS `openai-responses`
             // builder (gh #165): when the catalog marks the model as reasoning
@@ -179,7 +180,7 @@ impl OpenAIResponsesProvider {
                 None,
                 Some(vec!["reasoning.encrypted_content"]),
                 Some(OpenAIResponsesReasoning {
-                    effort: responses_effort_for_level(level, self.compat.as_ref()),
+                    effort,
                     summary: Some("auto"),
                 }),
             )
@@ -228,7 +229,7 @@ impl OpenAIResponsesProvider {
 fn responses_effort_for_level(
     level: crate::model::ThinkingLevel,
     compat: Option<&CompatConfig>,
-) -> String {
+) -> Option<String> {
     let name = level.to_string();
     if let Some(mapped) = compat
         .and_then(|c| c.thinking_level_map.as_ref())
@@ -236,7 +237,7 @@ fn responses_effort_for_level(
     {
         return mapped.clone();
     }
-    name
+    Some(name)
 }
 
 fn bearer_token_from_authorization_header(value: &str) -> Option<String> {
@@ -622,6 +623,9 @@ impl Provider for OpenAIResponsesProvider {
                             }
 
                             if let Err(e) = state.process_event(&msg.data) {
+                                // A malformed known event is fatal to this response.
+                                // Repolling must not authorize trailing tool calls.
+                                state.finished = true;
                                 return Some((Err(e), state));
                             }
                         }
@@ -669,7 +673,9 @@ impl Provider for OpenAIResponsesProvider {
             },
         );
 
-        Ok(Box::pin(stream))
+        // Fuse so a repoll after the terminal `None` stays at EOF instead of
+        // hitting `Unfold`'s poll-after-completion panic (an abort in release).
+        Ok(Box::pin(stream.fuse()))
     }
 }
 
@@ -868,6 +874,160 @@ struct ToolCallState {
     arguments: String,
 }
 
+// Match the 1024-block admission bound used by other streaming providers.
+// Completed and orphan identities count too: releasing them early would let a
+// later event reuse a call or grow a second, unbounded tracking lane.
+const MAX_STREAMED_TOOL_ITEMS: usize = 1024;
+const MAX_STREAMED_TOOL_IDENTITY_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum ToolItemEvent {
+    Added,
+    ArgumentsDelta,
+    ArgumentsDone,
+    Done,
+}
+
+#[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
+struct ToolItemIdentity {
+    output_index: Option<u32>,
+    function: Option<(String, String)>,
+    added: bool,
+    arguments_done: bool,
+    has_arguments_snapshot: bool,
+    completed: bool,
+}
+
+impl ToolItemIdentity {
+    fn check(
+        &self,
+        function: Option<(&str, &str)>,
+        output_index: Option<u32>,
+        event: ToolItemEvent,
+    ) -> std::result::Result<(), &'static str> {
+        if self.completed {
+            return Err("tool item received an event after completion");
+        }
+        if self.added && matches!(event, ToolItemEvent::Added) {
+            return Err("tool item was added more than once");
+        }
+        if self.arguments_done
+            && matches!(
+                event,
+                ToolItemEvent::ArgumentsDelta | ToolItemEvent::ArgumentsDone
+            )
+        {
+            return Err("tool arguments received an event after finalization");
+        }
+        if let (Some(previous), Some(index)) = (self.output_index, output_index)
+            && previous != index
+        {
+            return Err("tool item changed output index");
+        }
+        if let (Some((previous_call, previous_name)), Some((call_id, name))) =
+            (self.function.as_ref(), function)
+        {
+            if previous_call != call_id {
+                return Err("tool item changed call ID");
+            }
+            if previous_name != name {
+                return Err("tool item changed function name");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ToolIdentities {
+    items: HashMap<String, ToolItemIdentity>,
+    item_by_call_id: HashMap<String, String>,
+    item_by_output_index: HashMap<u32, String>,
+    bytes: usize,
+}
+
+impl ToolIdentities {
+    fn record(
+        &mut self,
+        item_id: &str,
+        function: Option<(&str, &str)>,
+        output_index: Option<u32>,
+        event: ToolItemEvent,
+    ) -> std::result::Result<(), &'static str> {
+        if item_id.trim().is_empty() {
+            return Err("tool item ID is empty");
+        }
+        let existing = self.items.get(item_id);
+        if let Some(identity) = existing {
+            identity.check(function, output_index, event)?;
+        } else if self.items.len() >= MAX_STREAMED_TOOL_ITEMS {
+            return Err("tool identity count limit exceeded");
+        }
+        if let Some((call_id, name)) = function {
+            if call_id.trim().is_empty() {
+                return Err("tool call ID is empty");
+            }
+            if name.trim().is_empty() {
+                return Err("tool function name is empty");
+            }
+            if self
+                .item_by_call_id
+                .get(call_id)
+                .is_some_and(|previous| previous != item_id)
+            {
+                return Err("tool call ID belongs to another item");
+            }
+        }
+        if let Some(index) = output_index
+            && self
+                .item_by_output_index
+                .get(&index)
+                .is_some_and(|previous| previous != item_id)
+        {
+            return Err("tool output index belongs to another item");
+        }
+
+        let new_item_bytes = if existing.is_none() { item_id.len() } else { 0 };
+        let new_function_bytes = if existing.is_none_or(|identity| identity.function.is_none()) {
+            function.map_or(Some(0), |(call_id, name)| {
+                call_id.len().checked_add(name.len())
+            })
+        } else {
+            Some(0)
+        };
+        let bytes = new_function_bytes
+            .and_then(|bytes| bytes.checked_add(new_item_bytes))
+            .and_then(|bytes| bytes.checked_add(self.bytes))
+            .filter(|bytes| *bytes <= MAX_STREAMED_TOOL_IDENTITY_BYTES)
+            .ok_or("tool identity byte limit exceeded")?;
+
+        // All checks precede mutation, including the first anonymous delta.
+        let identity = self.items.entry(item_id.to_string()).or_default();
+        if identity.output_index.is_none()
+            && let Some(index) = output_index
+        {
+            identity.output_index = Some(index);
+            self.item_by_output_index.insert(index, item_id.to_string());
+        }
+        if identity.function.is_none()
+            && let Some((call_id, name)) = function
+        {
+            identity.function = Some((call_id.to_string(), name.to_string()));
+            self.item_by_call_id
+                .insert(call_id.to_string(), item_id.to_string());
+        }
+        match event {
+            ToolItemEvent::Added => identity.added = true,
+            ToolItemEvent::ArgumentsDelta => {}
+            ToolItemEvent::ArgumentsDone => identity.arguments_done = true,
+            ToolItemEvent::Done => identity.completed = true,
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
 enum TerminalContentSnapshot {
     Text {
         content_index: usize,
@@ -895,6 +1055,7 @@ where
     reasoning_blocks: HashMap<ReasoningKey, usize>,
     tool_calls_by_item_id: HashMap<String, ToolCallState>,
     orphan_tool_call_arguments: HashMap<String, String>,
+    tool_identities: ToolIdentities,
     terminal_response_seen: bool,
     terminal_incomplete_reason: Option<String>,
     /// Consecutive WriteZero errors seen without a successful event in between.
@@ -926,6 +1087,7 @@ where
             reasoning_blocks: HashMap::new(),
             tool_calls_by_item_id: HashMap::new(),
             orphan_tool_call_arguments: HashMap::new(),
+            tool_identities: ToolIdentities::default(),
             terminal_response_seen: false,
             terminal_incomplete_reason: None,
             transient_error_count: 0,
@@ -1089,6 +1251,9 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         let chunk: OpenAIResponsesChunk = serde_json::from_str(data)
             .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
@@ -1176,7 +1341,12 @@ where
                 }
                 OpenAIResponsesReasoningSummaryPartDone::Unknown => {}
             },
-            OpenAIResponsesChunk::OutputItemAdded { item } => {
+            OpenAIResponsesChunk::OutputItemAdded { item, output_index } => {
+                if matches!(&item, OpenAIResponsesOutputItem::Unknown)
+                    && self.reject_tool_kind_change(None, output_index)
+                {
+                    return Ok(());
+                }
                 if let OpenAIResponsesOutputItem::FunctionCall {
                     id,
                     call_id,
@@ -1185,12 +1355,27 @@ where
                 } = item
                 {
                     self.ensure_started();
+                    if !self.admit_tool_event(
+                        &id,
+                        Some((&call_id, &name)),
+                        output_index,
+                        ToolItemEvent::Added,
+                    ) {
+                        return Ok(());
+                    }
 
                     let mut buffered_arguments = self
                         .orphan_tool_call_arguments
                         .remove(&id)
                         .unwrap_or_default();
-                    buffered_arguments.insert_str(0, &arguments);
+                    let has_arguments_snapshot = self
+                        .tool_identities
+                        .items
+                        .get(&id)
+                        .is_some_and(|identity| identity.has_arguments_snapshot);
+                    if buffered_arguments.is_empty() || !has_arguments_snapshot {
+                        buffered_arguments.insert_str(0, &arguments);
+                    }
 
                     let content_index = self.partial.content.len();
                     self.partial.content.push(ContentBlock::ToolCall(ToolCall {
@@ -1227,8 +1412,20 @@ where
                     }
                 }
             }
-            OpenAIResponsesChunk::FunctionCallArgumentsDelta { item_id, delta } => {
+            OpenAIResponsesChunk::FunctionCallArgumentsDelta {
+                item_id,
+                output_index,
+                delta,
+            } => {
                 self.ensure_started();
+                if !self.admit_tool_event(
+                    &item_id,
+                    None,
+                    output_index,
+                    ToolItemEvent::ArgumentsDelta,
+                ) {
+                    return Ok(());
+                }
                 if let Some(tc) = self.tool_calls_by_item_id.get_mut(&item_id) {
                     tc.arguments.push_str(&delta);
                     self.pending_events.push_back(StreamEvent::ToolCallDelta {
@@ -1242,7 +1439,45 @@ where
                         .push_str(&delta);
                 }
             }
-            OpenAIResponsesChunk::OutputItemDone { item } => {
+            OpenAIResponsesChunk::FunctionCallArgumentsDone {
+                item_id,
+                output_index,
+                arguments,
+            } => {
+                self.ensure_started();
+                if !self.admit_tool_event(
+                    &item_id,
+                    None,
+                    output_index,
+                    ToolItemEvent::ArgumentsDone,
+                ) {
+                    return Ok(());
+                }
+                // A final snapshot may correct earlier deltas. Preserve the
+                // established empty-field fallback; item completion still owns
+                // ToolCallEnd and strict parsing of the final execution input.
+                if !arguments.is_empty()
+                    && let Some(identity) = self.tool_identities.items.get_mut(&item_id)
+                {
+                    identity.has_arguments_snapshot = true;
+                }
+                let buffered = self.tool_calls_by_item_id.get_mut(&item_id).map_or_else(
+                    || self.orphan_tool_call_arguments.entry(item_id).or_default(),
+                    |call| &mut call.arguments,
+                );
+                if !arguments.is_empty() {
+                    *buffered = arguments;
+                }
+            }
+            OpenAIResponsesChunk::OutputItemDone { item, output_index } => {
+                if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call")
+                    && self.reject_tool_kind_change(
+                        item.get("id").and_then(serde_json::Value::as_str),
+                        output_index,
+                    )
+                {
+                    return Ok(());
+                }
                 // Legacy parity: before the raw-item capture lane, only
                 // `function_call` was a known done-item shape — anything else
                 // (including malformed `reasoning`/`message` payloads) fell
@@ -1272,6 +1507,14 @@ where
                         arguments,
                     } => {
                         self.ensure_started();
+                        if !self.admit_tool_event(
+                            &id,
+                            Some((&call_id, &name)),
+                            output_index,
+                            ToolItemEvent::Done,
+                        ) {
+                            return Ok(());
+                        }
                         self.end_tool_call(&id, &call_id, &name, &arguments);
                     }
                     OpenAIResponsesOutputItemDone::Reasoning {
@@ -1338,6 +1581,43 @@ where
         }
 
         Ok(())
+    }
+
+    fn reject_tool_kind_change(
+        &mut self,
+        item_id: Option<&str>,
+        output_index: Option<u32>,
+    ) -> bool {
+        let collision = item_id.is_some_and(|id| self.tool_identities.items.contains_key(id))
+            || output_index.is_some_and(|index| {
+                self.tool_identities
+                    .item_by_output_index
+                    .contains_key(&index)
+            });
+        if collision {
+            self.reject_tool_response(
+                "Invalid OpenAI Responses tool identity: tool item changed output kind".to_string(),
+            );
+        }
+        collision
+    }
+
+    fn admit_tool_event(
+        &mut self,
+        item_id: &str,
+        function: Option<(&str, &str)>,
+        output_index: Option<u32>,
+        event: ToolItemEvent,
+    ) -> bool {
+        if let Err(message) = self
+            .tool_identities
+            .record(item_id, function, output_index, event)
+        {
+            self.reject_tool_response(format!("Invalid OpenAI Responses tool identity: {message}"));
+            false
+        } else {
+            true
+        }
     }
 
     /// Preserve a completed `reasoning` output item (TS parity: the raw item
@@ -1460,15 +1740,13 @@ where
             });
         }
 
-        let parsed_args: serde_json::Value =
-            serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    raw = %tc.arguments,
-                    "Failed to parse tool arguments as JSON"
-                );
-                serde_json::Value::Null
-            });
+        let parsed_args = match super::openai::parse_final_tool_arguments(&tc.arguments) {
+            Ok(arguments) => arguments,
+            Err(message) => {
+                self.reject_tool_arguments(tc.content_index, message);
+                return;
+            }
+        };
 
         self.partial.stop_reason = StopReason::ToolUse;
         self.pending_events.push_back(StreamEvent::ToolCallEnd {
@@ -1488,6 +1766,36 @@ where
             block.arguments = parsed_args;
             block.thought_signature = Some(item_id.to_string());
         }
+    }
+
+    fn reject_tool_arguments(&mut self, content_index: usize, message: &str) {
+        // A completed item is an execution boundary, unlike the incremental
+        // argument deltas. Do not promote malformed/truncated JSON (or a JSON
+        // scalar) into an executable tool call with invented null arguments.
+        self.reject_tool_response(format!(
+            "Invalid OpenAI Responses tool arguments at content index {content_index}: {message}"
+        ));
+    }
+
+    fn reject_tool_response(&mut self, message: String) {
+        self.ensure_started();
+        self.partial.stop_reason = StopReason::Error;
+        self.partial.error_message = Some(message);
+        // `finish` may have queued other calls from the same batch before it
+        // reached this one. None of those buffered completions can authorize
+        // execution after the batch has failed validation.
+        self.pending_events
+            .retain(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }));
+        self.pending_events.push_back(StreamEvent::Error {
+            reason: StopReason::Error,
+            error: std::mem::take(&mut self.partial),
+        });
+        self.tool_calls_by_item_id.clear();
+        self.orphan_tool_call_arguments.clear();
+        self.tool_identities = ToolIdentities::default();
+        self.terminal_response_seen = false;
+        self.terminal_incomplete_reason = None;
+        self.finished = true;
     }
 
     fn terminal_content_snapshots(&self) -> Vec<TerminalContentSnapshot> {
@@ -1538,6 +1846,13 @@ where
         if self.finished {
             return;
         }
+        if !self.orphan_tool_call_arguments.is_empty() {
+            self.reject_tool_response(
+                "Invalid OpenAI Responses tool identity: argument stream ended without a function-call identity"
+                    .to_string(),
+            );
+            return;
+        }
 
         let mut open_tool_calls = self
             .open_tool_call_snapshots_in_content_order()
@@ -1565,6 +1880,9 @@ where
                         .next_if(|(tool_content_index, ..)| *tool_content_index == content_index)
                     {
                         self.end_tool_call(&item_id, &call_id, &name, &arguments);
+                        if self.finished {
+                            return;
+                        }
                     }
                 }
             }
@@ -1573,6 +1891,9 @@ where
         // Best-effort: close any tool calls whose content block disappeared unexpectedly.
         for (_, item_id, call_id, name, arguments) in open_tool_calls {
             self.end_tool_call(&item_id, &call_id, &name, &arguments);
+            if self.finished {
+                return;
+            }
         }
 
         // Infer stop reason.
@@ -1741,12 +2062,23 @@ enum OpenAIResponsesInputItem {
         #[serde(rename = "type")]
         r#type: &'static str,
         call_id: String,
-        output: String,
+        output: OpenAIResponsesFunctionOutput,
     },
     /// Raw provider item replayed verbatim (currently: `reasoning` items with
     /// their `encrypted_content`, captured on parse into
     /// `ThinkingContent::thinking_signature`).
     RawItem(serde_json::Value),
+}
+
+/// Responses and Codex accept the same text/image content parts in function
+/// outputs as in user input. Keep ordinary tool output as a string; an image
+/// requires the structured form so its bytes stay attached to its call ID.
+/// <https://developers.openai.com/api/docs/guides/function-calling#formatting-results>
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum OpenAIResponsesFunctionOutput {
+    Text(String),
+    Content(Vec<OpenAIResponsesUserContentPart>),
 }
 
 #[derive(Debug, Serialize)]
@@ -1920,26 +2252,57 @@ fn build_openai_responses_input(
                 flush_pending(&mut pending_text, &mut input);
             }
             Message::ToolResult(result) => {
-                let mut out = String::new();
-                for (i, block) in result.content.iter().enumerate() {
-                    if i > 0 {
-                        out.push('\n');
-                    }
-                    if let ContentBlock::Text(t) = block {
-                        out.push_str(&t.text);
-                    }
-                }
                 let (call_id, _) = split_responses_tool_call_id(&result.tool_call_id);
                 input.push(OpenAIResponsesInputItem::FunctionCallOutput {
                     r#type: "function_call_output",
                     call_id: call_id.to_string(),
-                    output: out,
+                    output: convert_tool_result_output(&result.content),
                 });
             }
         }
     }
 
     input
+}
+
+fn convert_tool_result_output(content: &[ContentBlock]) -> OpenAIResponsesFunctionOutput {
+    if content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image(_)))
+    {
+        let parts = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(OpenAIResponsesUserContentPart::InputText {
+                    text: text.text.clone(),
+                }),
+                ContentBlock::Image(image) => Some(OpenAIResponsesUserContentPart::InputImage {
+                    image_url: format!("data:{};base64,{}", image.mime_type, image.data),
+                }),
+                ContentBlock::Media(media) => Some(OpenAIResponsesUserContentPart::InputText {
+                    text: media.placeholder(),
+                }),
+                _ => None,
+            })
+            .collect();
+        return OpenAIResponsesFunctionOutput::Content(parts);
+    }
+
+    // Preserve the existing text-only wire representation, including empty
+    // blocks and their separators. Audio/video get the same explicit omission
+    // explanation as user attachments instead of silently disappearing.
+    let mut output = String::new();
+    for (index, block) in content.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        match block {
+            ContentBlock::Text(text) => output.push_str(&text.text),
+            ContentBlock::Media(media) => output.push_str(&media.placeholder()),
+            _ => {}
+        }
+    }
+    OpenAIResponsesFunctionOutput::Text(output)
 }
 
 /// Maximum item-id length OpenAI accepts on replayed input items.
@@ -2065,14 +2428,35 @@ enum OpenAIResponsesChunk {
         text: String,
     },
     #[serde(rename = "response.output_item.added")]
-    OutputItemAdded { item: OpenAIResponsesOutputItem },
+    OutputItemAdded {
+        item: OpenAIResponsesOutputItem,
+        #[serde(default)]
+        output_index: Option<u32>,
+    },
     /// Raw item payload kept as JSON so `reasoning` items (encrypted content,
     /// ids, status) can be preserved verbatim; typed interpretation happens in
     /// `process_event` via [`OpenAIResponsesOutputItemDone`].
     #[serde(rename = "response.output_item.done")]
-    OutputItemDone { item: serde_json::Value },
+    OutputItemDone {
+        item: serde_json::Value,
+        #[serde(default)]
+        output_index: Option<u32>,
+    },
     #[serde(rename = "response.function_call_arguments.delta")]
-    FunctionCallArgumentsDelta { item_id: String, delta: String },
+    FunctionCallArgumentsDelta {
+        item_id: String,
+        delta: String,
+        #[serde(default)]
+        output_index: Option<u32>,
+    },
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionCallArgumentsDone {
+        item_id: String,
+        #[serde(default)]
+        arguments: String,
+        #[serde(default)]
+        output_index: Option<u32>,
+    },
     #[serde(rename = "response.content_part.done")]
     ContentPartDone {
         item_id: String,
@@ -2485,8 +2869,8 @@ mod tests {
     fn test_build_request_thinking_level_map_overrides_effort() {
         let compat = CompatConfig {
             thinking_level_map: Some(HashMap::from([
-                ("xhigh".to_string(), "max".to_string()),
-                ("high".to_string(), "high".to_string()),
+                ("xhigh".to_string(), Some("max".to_string())),
+                ("high".to_string(), Some("high".to_string())),
             ])),
             ..CompatConfig::default()
         };
@@ -2512,6 +2896,28 @@ mod tests {
         );
         let medium = serde_json::to_value(&medium).expect("serialize request");
         assert_eq!(medium["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn test_build_request_nullable_effort_does_not_use_default() {
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("freeflow-responses")
+                .with_reasoning(true)
+                .with_codex_mode(codex_mode)
+                .with_compat(Some(CompatConfig {
+                    thinking_level_map: Some(HashMap::from([("max".to_string(), None)])),
+                    ..CompatConfig::default()
+                }));
+            let body = provider.build_request(
+                &reasoning_test_context(),
+                &StreamOptions {
+                    thinking_level: Some(crate::model::ThinkingLevel::Max),
+                    ..Default::default()
+                },
+            );
+            let body = serde_json::to_value(body).expect("request JSON");
+            assert!(body.get("reasoning").is_none(), "{body}");
+        }
     }
 
     /// gh #165: no reasoning field when the model is non-reasoning, when the
@@ -2557,7 +2963,10 @@ mod tests {
         let mapped = OpenAIResponsesProvider::new("gpt-5.2-codex")
             .with_codex_mode(true)
             .with_compat(Some(CompatConfig {
-                thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+                thinking_level_map: Some(HashMap::from([(
+                    "xhigh".to_string(),
+                    Some("max".to_string()),
+                )])),
                 ..CompatConfig::default()
             }));
         let request = mapped.build_request(
@@ -2598,6 +3007,237 @@ mod tests {
             is_error: false,
             timestamp: 0,
         }))
+    }
+
+    fn multimodal_tool_result(id: &str, content: Vec<ContentBlock>, is_error: bool) -> Message {
+        Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: "read".to_string(),
+            content,
+            details: None,
+            is_error,
+            timestamp: 0,
+        })
+    }
+
+    fn tool_image(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Image(crate::model::ImageContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    }
+
+    #[test]
+    fn tool_output_images_keep_order_error_content_and_parallel_call_ids() {
+        let calls = ["call_first|fc_first", "call_second"]
+            .into_iter()
+            .map(|id| {
+                ContentBlock::ToolCall(ToolCall {
+                    id: id.to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                })
+            })
+            .collect();
+        let context = Context::owned(
+            None,
+            vec![
+                assistant_message_with_blocks(calls),
+                multimodal_tool_result(
+                    "call_first|fc_first",
+                    vec![tool_image("Zmlyc3Q=", "image/png")],
+                    false,
+                ),
+                multimodal_tool_result(
+                    "call_second",
+                    vec![
+                        ContentBlock::Text(TextContent::new("Capture partly failed")),
+                        tool_image("c2Vjb25k", "image/jpeg"),
+                        ContentBlock::Media(crate::model::MediaContent {
+                            data: "YWJj".to_string(),
+                            mime_type: "video/mp4".to_string(),
+                            name: Some("clip.mp4".to_string()),
+                        }),
+                        ContentBlock::Text(TextContent::new("Inspect the remaining frame")),
+                        tool_image("dGhpcmQ=", "image/webp"),
+                    ],
+                    true,
+                ),
+            ],
+            Vec::new(),
+        );
+        let original = serde_json::to_value(&context.messages).unwrap();
+
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_codex_mode(codex_mode);
+            let request = provider.build_request(&context, &StreamOptions::default());
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                value["input"],
+                json!([
+                    {"type":"function_call", "id":"fc_first", "call_id":"call_first", "name":"read", "arguments":"{}"},
+                    {"type":"function_call", "call_id":"call_second", "name":"read", "arguments":"{}"},
+                    {"type":"function_call_output", "call_id":"call_first", "output":[
+                        {"type":"input_image", "image_url":"data:image/png;base64,Zmlyc3Q="}
+                    ]},
+                    {"type":"function_call_output", "call_id":"call_second", "output":[
+                        {"type":"input_text", "text":"Capture partly failed"},
+                        {"type":"input_image", "image_url":"data:image/jpeg;base64,c2Vjb25k"},
+                        {"type":"input_text", "text":"[media omitted: clip.mp4, video/mp4, 3 B]"},
+                        {"type":"input_text", "text":"Inspect the remaining frame"},
+                        {"type":"input_image", "image_url":"data:image/webp;base64,dGhpcmQ="}
+                    ]}
+                ]),
+                "codex_mode={codex_mode}",
+            );
+        }
+        assert_eq!(serde_json::to_value(&context.messages).unwrap(), original);
+        assert!(matches!(&context.messages[2], Message::ToolResult(result) if result.is_error));
+    }
+
+    #[test]
+    fn tool_output_text_stays_a_string_and_media_has_an_omission_explanation() {
+        let context = Context::owned(
+            None,
+            vec![
+                multimodal_tool_result("empty", Vec::new(), false),
+                multimodal_tool_result(
+                    "text",
+                    vec![
+                        ContentBlock::Text(TextContent::new("first\n")),
+                        ContentBlock::Text(TextContent::new("")),
+                        ContentBlock::Text(TextContent::new("last")),
+                    ],
+                    true,
+                ),
+                multimodal_tool_result(
+                    "media",
+                    vec![ContentBlock::Media(crate::model::MediaContent {
+                        data: "YWJj".to_string(),
+                        mime_type: "audio/wav".to_string(),
+                        name: None,
+                    })],
+                    false,
+                ),
+            ],
+            Vec::new(),
+        );
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_codex_mode(codex_mode);
+            let request = provider.build_request(&context, &StreamOptions::default());
+            let value = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                value["input"],
+                json!([
+                    {"type":"function_call_output", "call_id":"empty", "output":""},
+                    {"type":"function_call_output", "call_id":"text", "output":"first\n\n\nlast"},
+                    {"type":"function_call_output", "call_id":"media", "output":"[media omitted: unnamed, audio/wav, 3 B]"}
+                ]),
+                "codex_mode={codex_mode}",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_image_read_reaches_responses_and_codex_under_agent_image_policy() {
+        use crate::tools::Tool as _;
+        use std::sync::Arc;
+
+        // A real PNG goes through the native read tool before its persisted
+        // result is replayed through Agent and the HTTP request converter.
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("frame.png"),
+            base64::engine::general_purpose::STANDARD
+                .decode(PNG)
+                .unwrap(),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let read = crate::tools::ReadTool::with_settings(dir.path(), false, false);
+        let output = runtime
+            .block_on(read.execute("call_image", json!({"path":"frame.png"}), None))
+            .unwrap();
+        assert!(!output.is_error);
+        let original_content = serde_json::to_value(&output.content).unwrap();
+
+        for codex_mode in [false, true] {
+            for (block_images, model_accepts_images, omission) in [
+                (false, true, None),
+                (true, true, Some("Image reading is disabled.")),
+                (
+                    false,
+                    false,
+                    Some("[Image omitted: the active model does not support image input.]"),
+                ),
+            ] {
+                let (base_url, rx) =
+                    spawn_test_server(200, "text/event-stream", &success_sse_body());
+                let provider = OpenAIResponsesProvider::new("gpt-test")
+                    .with_codex_mode(codex_mode)
+                    .with_base_url(base_url);
+                let mut agent = crate::agent::Agent::new(
+                    Arc::new(provider),
+                    crate::tools::ToolRegistry::from_tools(Vec::new()),
+                    crate::agent::AgentConfig {
+                        block_images,
+                        model_accepts_images,
+                        stream_options: StreamOptions {
+                            api_key: Some(build_test_jwt("acct_images")),
+                            ..Default::default()
+                        },
+                        ..crate::agent::AgentConfig::default()
+                    },
+                );
+                agent.replace_messages(vec![
+                    assistant_message_with_blocks(vec![ContentBlock::ToolCall(ToolCall {
+                        id: "call_image".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path":"frame.png"}),
+                        thought_signature: None,
+                    })]),
+                    multimodal_tool_result("call_image", output.content.clone(), false),
+                ]);
+                let message = runtime
+                    .block_on(agent.run("Describe the frame", |_| {}))
+                    .unwrap();
+                assert_eq!(message.stop_reason, StopReason::Stop);
+                let captured = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let body: Value = serde_json::from_str(&captured.body).unwrap();
+                let result = body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["type"] == "function_call_output")
+                    .expect("original tool output remains attributed");
+                assert_eq!(result["call_id"], "call_image");
+                if let Some(omission) = omission {
+                    assert!(result["output"].as_str().unwrap().contains(omission));
+                    assert!(
+                        !captured.body.contains(PNG),
+                        "filtered image bytes cannot be sent",
+                    );
+                } else {
+                    assert_eq!(
+                        result["output"],
+                        json!([
+                            {"type":"input_text", "text":"Read image file [image/png]"},
+                            {"type":"input_image", "image_url":format!("data:image/png;base64,{PNG}")}
+                        ]),
+                    );
+                }
+                let Message::ToolResult(stored) = &agent.messages()[1] else {
+                    panic!("native tool result must remain in history");
+                };
+                assert_eq!(
+                    serde_json::to_value(&stored.content).unwrap(),
+                    original_content,
+                );
+            }
+        }
     }
 
     fn raw_reasoning_item() -> Value {
@@ -3459,6 +4099,903 @@ mod tests {
             .expect("tool call end");
         assert_eq!(tool_end.id, "call_4");
         assert_eq!(tool_end.arguments, json!({ "text": "buffered" }));
+    }
+
+    fn tool_item_event(kind: &str, id: &str, name: &str, arguments: &str) -> Value {
+        json!({
+            "type": kind,
+            "item": {
+                "type": "function_call",
+                "id": format!("fc_{id}"),
+                "call_id": format!("call_{id}"),
+                "name": name,
+                "arguments": arguments
+            }
+        })
+    }
+
+    fn completed_response_event() -> Value {
+        json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn conflicting_tool_identity_events(arguments: &str) -> Vec<(&'static str, Vec<Value>)> {
+        let added = tool_item_event("response.output_item.added", "identity", "write", arguments);
+        let done = tool_item_event("response.output_item.done", "identity", "write", arguments);
+        let delta = json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_identity", "delta": " "
+        });
+        let arguments_done = json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_identity", "arguments": arguments
+        });
+        let mut changed_call = done.clone();
+        changed_call["item"]["call_id"] = json!("private-rewritten-call");
+        let mut changed_name = done.clone();
+        changed_name["item"]["name"] = json!("private-rewritten-name");
+        let mut changed_item = done.clone();
+        changed_item["item"]["id"] = json!("private-rewritten-item");
+        let mut indexed_added = added.clone();
+        indexed_added["output_index"] = json!(0);
+        let mut indexed_other =
+            tool_item_event("response.output_item.done", "other", "write", arguments);
+        indexed_other["output_index"] = json!(0);
+        let mut moved_done = done.clone();
+        moved_done["output_index"] = json!(1);
+        let mut moved_arguments = arguments_done.clone();
+        moved_arguments["output_index"] = json!(1);
+        let mut empty_item = done.clone();
+        empty_item["item"]["id"] = json!("");
+        let mut empty_call = done.clone();
+        empty_call["item"]["call_id"] = json!(" ");
+        let mut empty_name = done.clone();
+        empty_name["item"]["name"] = json!("\t");
+        vec![
+            ("duplicate added", vec![added.clone(), added.clone()]),
+            ("duplicate done", vec![done.clone(), done.clone()]),
+            ("added after done", vec![done.clone(), added.clone()]),
+            ("changed call", vec![added.clone(), changed_call]),
+            ("changed name", vec![added.clone(), changed_name]),
+            ("changed item", vec![added.clone(), changed_item.clone()]),
+            ("completed call reused", vec![done.clone(), changed_item]),
+            (
+                "output slot reused",
+                vec![indexed_added.clone(), indexed_other],
+            ),
+            (
+                "item moved at completion",
+                vec![indexed_added.clone(), moved_done],
+            ),
+            (
+                "item moved at arguments done",
+                vec![indexed_added.clone(), moved_arguments],
+            ),
+            (
+                "slot reused by orphan delta",
+                vec![
+                    indexed_added,
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_other", "output_index": 0, "delta": "{}"
+                    }),
+                ],
+            ),
+            (
+                "item became a message",
+                vec![
+                    added.clone(),
+                    json!({
+                        "type":"response.output_item.done", "item":{"type":"message", "id":"fc_identity"}
+                    }),
+                ],
+            ),
+            (
+                "item became an unknown kind",
+                vec![
+                    added.clone(),
+                    json!({
+                        "type":"response.output_item.done", "item":{"id":"fc_identity"}
+                    }),
+                ],
+            ),
+            (
+                "tool slot became reasoning",
+                vec![
+                    json!({
+                        "type":"response.output_item.added", "output_index":0, "item":added["item"]
+                    }),
+                    json!({
+                        "type":"response.output_item.done", "output_index":0,
+                        "item":{"type":"reasoning", "id":"rs_other"}
+                    }),
+                ],
+            ),
+            (
+                "non-function added reused a tool slot",
+                vec![
+                    json!({
+                        "type":"response.output_item.added", "output_index":0, "item":added["item"]
+                    }),
+                    json!({
+                        "type":"response.output_item.added", "output_index":0,
+                        "item":{"type":"message", "id":"msg_other"}
+                    }),
+                ],
+            ),
+            ("delta after item done", vec![done.clone(), delta.clone()]),
+            (
+                "arguments after item done",
+                vec![done, arguments_done.clone()],
+            ),
+            (
+                "duplicate arguments done",
+                vec![
+                    added.clone(),
+                    arguments_done.clone(),
+                    arguments_done.clone(),
+                ],
+            ),
+            (
+                "delta after arguments done",
+                vec![added, arguments_done, delta],
+            ),
+            ("empty item", vec![empty_item]),
+            ("empty call", vec![empty_call]),
+            ("empty name", vec![empty_name]),
+        ]
+    }
+
+    #[test]
+    fn contradictory_tool_identities_end_the_response_once_without_rewriting_calls() {
+        for (case, mut events) in conflicting_tool_identity_events("{}") {
+            events.push(tool_item_event(
+                "response.output_item.done",
+                "after_failure",
+                "write",
+                "{}",
+            ));
+            events.push(completed_response_event());
+            let out = collect_events(&events);
+            assert_eq!(
+                out.iter()
+                    .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                    .count(),
+                1,
+                "{case}"
+            );
+            assert!(
+                !out.iter()
+                    .any(|event| matches!(event, StreamEvent::Done { .. })),
+                "{case}"
+            );
+            assert!(
+                !out.iter().any(|event| matches!(
+                    event, StreamEvent::ToolCallStart { id, .. } if id == "call_after_failure"
+                )),
+                "{case}"
+            );
+            let Some(StreamEvent::Error { reason, error }) = out.last() else {
+                panic!("{case}: missing terminal error");
+            };
+            assert_eq!(*reason, StopReason::Error);
+            assert_eq!(error.stop_reason, StopReason::Error);
+            let detail = error.error_message.as_deref().unwrap();
+            assert!(
+                detail.contains("Invalid OpenAI Responses tool identity"),
+                "{case}"
+            );
+            assert!(!detail.contains("private-rewritten"), "{case}");
+            assert!(!detail.contains("fc_identity"), "{case}");
+            assert!(!detail.contains("call_identity"), "{case}");
+        }
+    }
+
+    #[test]
+    fn parallel_tool_lifecycles_preserve_optional_fields_and_authoritative_snapshots() {
+        let mut done_without_arguments =
+            tool_item_event("response.output_item.done", "first", "write", "");
+        done_without_arguments["item"]
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        let events = [
+            json!({"type":"response.function_call_arguments.delta", "item_id":"fc_first", "delta":"{\"old\":"}),
+            tool_item_event("response.output_item.added", "second", "write", "{}"),
+            tool_item_event("response.output_item.added", "first", "write", ""),
+            json!({"type":"response.function_call_arguments.done", "item_id":"fc_first", "output_index":0, "arguments":"{\"final\":true}"}),
+            tool_item_event("response.output_item.done", "second", "write", "{}"),
+            done_without_arguments,
+            tool_item_event("response.output_item.done", "done_only", "write", ""),
+            completed_response_event(),
+        ];
+        let out = collect_events(&events);
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. }))
+        );
+        let Some(StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message,
+        }) = out.last()
+        else {
+            panic!("valid parallel calls must complete");
+        };
+        let calls = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].id, "call_second");
+        assert_eq!(calls[1].id, "call_first");
+        assert_eq!(calls[1].arguments, json!({"final":true}));
+        assert_eq!(calls[1].thought_signature.as_deref(), Some("fc_first"));
+        assert_eq!(calls[2].id, "call_done_only");
+        assert_eq!(calls[2].arguments, json!({}));
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            3
+        );
+
+        for output_done in [false, true] {
+            let mut events = vec![
+                tool_item_event("response.output_item.added", "snapshot", "write", "{}"),
+                json!({"type":"response.function_call_arguments.done", "item_id":"fc_snapshot", "arguments":"{\"final\":1}"}),
+            ];
+            if output_done {
+                events.push(tool_item_event(
+                    "response.output_item.done",
+                    "snapshot",
+                    "write",
+                    r#"{"final":2}"#,
+                ));
+            }
+            events.push(completed_response_event());
+            let out = collect_events(&events);
+            let expected = if output_done { 2 } else { 1 };
+            assert!(out.iter().any(|event| matches!(
+                event, StreamEvent::ToolCallEnd { tool_call, .. }
+                    if tool_call.arguments == json!({"final": expected})
+            )));
+            assert!(
+                !out.iter()
+                    .any(|event| matches!(event, StreamEvent::Error { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn argument_done_before_added_preserves_snapshots_and_empty_fallback() {
+        for final_arguments in [None, Some(""), Some(r#"{"snapshot":true}"#)] {
+            let mut arguments_done = json!({
+                "type":"response.function_call_arguments.done", "item_id":"fc_ordered"
+            });
+            if let Some(arguments) = final_arguments {
+                arguments_done["arguments"] = json!(arguments);
+            }
+            let out = collect_events(&[
+                json!({"type":"response.function_call_arguments.delta", "item_id":"fc_ordered", "delta":"1}"}),
+                arguments_done,
+                tool_item_event("response.output_item.added", "ordered", "write", r#"{"a":"#),
+                tool_item_event("response.output_item.done", "ordered", "write", ""),
+                completed_response_event(),
+            ]);
+            let expected = if final_arguments.is_some_and(|arguments| !arguments.is_empty()) {
+                json!({"snapshot":true})
+            } else {
+                json!({"a":1})
+            };
+            assert!(out.iter().any(|event| matches!(
+                event, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.arguments == expected
+            )));
+            assert!(
+                !out.iter()
+                    .any(|event| matches!(event, StreamEvent::Error { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn tool_identity_limits_include_orphans_and_completed_items() {
+        let mut events = (0..MAX_STREAMED_TOOL_ITEMS)
+            .map(|index| {
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": format!("fc_{index}"), "delta": ""
+                })
+            })
+            .collect::<Vec<_>>();
+        // Completing an orphan neither charges the same item twice nor frees
+        // its identity for reuse before the actual end of the wire stream.
+        events.push(tool_item_event(
+            "response.output_item.added",
+            "0",
+            "write",
+            "{}",
+        ));
+        events.push(tool_item_event(
+            "response.output_item.done",
+            "0",
+            "write",
+            "{}",
+        ));
+        events.push(json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_over_limit", "delta": ""
+        }));
+        events.push(completed_response_event());
+        let out = collect_events(&events);
+        let Some(StreamEvent::Error { error, .. }) = out.last() else {
+            panic!("distinct orphan identities must be bounded");
+        };
+        assert!(
+            error
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("count limit")
+        );
+        assert!(out.iter().any(|event| matches!(
+            event, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.id == "call_0"
+        )));
+
+        let oversized_item = "x".repeat(MAX_STREAMED_TOOL_IDENTITY_BYTES + 1);
+        let almost_full_item = "x".repeat(MAX_STREAMED_TOOL_IDENTITY_BYTES - 1);
+        for mut events in [
+            vec![json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": oversized_item, "delta": ""
+            })],
+            vec![
+                json!({"type":"response.function_call_arguments.delta", "item_id":almost_full_item, "delta":""}),
+                json!({"type":"response.output_item.added", "item":{
+                    "type":"function_call", "id":almost_full_item,
+                    "call_id":"call_private", "name":"write", "arguments":"{}"
+                }}),
+            ],
+        ] {
+            events.push(completed_response_event());
+            let out = collect_events(&events);
+            let Some(StreamEvent::Error { error, .. }) = out.last() else {
+                panic!("identity bytes must be bounded before retaining function fields");
+            };
+            assert!(
+                error
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("byte limit")
+            );
+            assert!(!out.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallStart { .. } | StreamEvent::Done { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn orphan_arguments_fail_closed_without_replacing_provider_failure_details() {
+        let orphan = json!({
+            "type":"response.function_call_arguments.done", "item_id":"fc_orphan",
+            "arguments":"{}"
+        });
+        let out = collect_events(&[orphan.clone(), completed_response_event()]);
+        assert!(matches!(out.last(), Some(StreamEvent::Error { error, .. })
+            if error.error_message.as_deref().unwrap().contains("without a function-call identity")));
+        for failure in [
+            json!({"type":"response.failed", "response":{"error":{"message":"original provider failure"}}}),
+            json!({"type":"error", "message":"original provider failure"}),
+        ] {
+            let out = collect_events(&[orphan.clone(), completed_response_event(), failure]);
+            let Some(StreamEvent::Error { reason, error }) = out.last() else {
+                panic!("provider failure must stay terminal");
+            };
+            assert_eq!(*reason, StopReason::Error);
+            assert_eq!(
+                error.error_message.as_deref(),
+                Some("original provider failure")
+            );
+            assert_eq!(
+                out.iter()
+                    .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::format_collect)]
+    fn contradictory_streamed_identities_never_execute_a_valid_sibling() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("identity-must-not-be-written.txt");
+        let arguments = json!({"path":marker, "content":"must not execute"}).to_string();
+        for (case, conflict) in conflicting_tool_identity_events(&arguments) {
+            let mut events = vec![tool_item_event(
+                "response.output_item.done",
+                "valid_peer",
+                "write",
+                &arguments,
+            )];
+            events.extend(conflict);
+            events.push(completed_response_event());
+            let body = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_base_url(base_url);
+            let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+                crate::tools::WriteTool::new(dir.path()),
+            )]);
+            let mut agent = crate::agent::Agent::new(
+                Arc::new(provider),
+                tools,
+                crate::agent::AgentConfig {
+                    max_tool_iterations: 1,
+                    stream_options: StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..Default::default()
+                    },
+                    ..crate::agent::AgentConfig::default()
+                },
+            );
+            let executions = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&executions);
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let message = runtime
+                .block_on(agent.run("Apply both edits", move |event| {
+                    if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }))
+                .unwrap();
+            assert_eq!(message.stop_reason, StopReason::Error, "{case}");
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Invalid OpenAI Responses tool identity"),
+                "{case}"
+            );
+            assert_eq!(executions.load(Ordering::SeqCst), 0, "{case}");
+            assert!(!marker.exists(), "{case}: a peer must not execute");
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|message| matches!(message, Message::ToolResult(_))),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::format_collect)]
+    fn valid_parallel_response_calls_execute_once_and_replay_matching_results() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for codex in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("first.txt");
+            let second = dir.path().join("second.txt");
+            let first_args = json!({"path":first, "content":"one"}).to_string();
+            let second_args = json!({"path":second, "content":"two"}).to_string();
+            let events = [
+                json!({"type":"response.function_call_arguments.delta", "item_id":"fc_first", "delta":"{"}),
+                tool_item_event("response.output_item.added", "first", "write", ""),
+                tool_item_event("response.output_item.done", "second", "write", &second_args),
+                json!({"type":"response.function_call_arguments.done", "item_id":"fc_first", "arguments":first_args}),
+                tool_item_event("response.output_item.done", "first", "write", ""),
+                completed_response_event(),
+            ];
+            let content_type = if codex {
+                "application/x-ndjson"
+            } else {
+                "text/event-stream"
+            };
+            let body = if codex {
+                ndjson_body_from_events(&events)
+            } else {
+                events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>()
+            };
+            let follow_up = if codex {
+                ndjson_body_from_events(&[completed_response_event()])
+            } else {
+                success_sse_body()
+            };
+            let (base_url, requests) =
+                spawn_test_server_with_bodies(200, content_type, vec![body, follow_up]);
+            let provider = OpenAIResponsesProvider::new("gpt-test")
+                .with_codex_mode(codex)
+                .with_base_url(base_url);
+            let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+                crate::tools::WriteTool::new(dir.path()),
+            )]);
+            let mut agent = crate::agent::Agent::new(
+                Arc::new(provider),
+                tools,
+                crate::agent::AgentConfig {
+                    max_tool_iterations: 1,
+                    stream_options: StreamOptions {
+                        api_key: Some(if codex {
+                            build_test_jwt("acct-test")
+                        } else {
+                            "test-key".to_string()
+                        }),
+                        ..Default::default()
+                    },
+                    ..crate::agent::AgentConfig::default()
+                },
+            );
+            let executions = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&executions);
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let result = runtime
+                .block_on(agent.run("Apply both edits", move |event| {
+                    if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }))
+                .unwrap();
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(executions.load(Ordering::SeqCst), 2);
+            assert_eq!(std::fs::read_to_string(first).unwrap(), "one");
+            assert_eq!(std::fs::read_to_string(second).unwrap(), "two");
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            let follow_up = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            let body: Value = serde_json::from_str(&follow_up.body).unwrap();
+            let mut result_ids = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            result_ids.sort_unstable();
+            assert_eq!(result_ids, ["call_first", "call_second"]);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::format_collect)]
+    fn fatal_tool_payload_parse_error_cannot_resume_after_repoll() {
+        for event_type in ["response.output_item.added", "response.output_item.done"] {
+            let events = [
+                tool_item_event("response.output_item.added", "before_error", "write", "{}"),
+                json!({
+                    "type": event_type,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_malformed",
+                        "name": "write",
+                        "arguments": "{}"
+                    }
+                }),
+                tool_item_event("response.output_item.done", "after_error", "write", "{}"),
+                completed_response_event(),
+            ];
+            let body = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_base_url(base_url);
+            let context = Context::owned(
+                None,
+                vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Apply the edit".to_string()),
+                    timestamp: 0,
+                })],
+                Vec::new(),
+            );
+            let options = StreamOptions {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let mut stream = provider.stream(&context, &options).await.unwrap();
+                let mut saw_error = false;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Err(error) => {
+                            assert!(error.to_string().contains("JSON parse error"));
+                            saw_error = true;
+                            break;
+                        }
+                        Ok(StreamEvent::Done { .. } | StreamEvent::ToolCallEnd { .. }) => {
+                            panic!("{event_type}: malformed payload cannot complete a call");
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                assert!(
+                    saw_error,
+                    "{event_type}: expected the known-item parse error"
+                );
+                assert!(
+                    stream.next().await.is_none(),
+                    "{event_type}: resumed after error"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn malformed_completed_tool_arguments_cannot_become_executable_calls() {
+        for raw in [
+            r#"{"command":"sensitive-argument""#,
+            r#"{"command":"sensitive-argument"} trailing"#,
+            "null",
+            "false",
+            "42",
+            "[]",
+            r#""sensitive-argument""#,
+        ] {
+            // The same strict boundary applies to done-only items, accumulated
+            // deltas, authoritative final snapshots and terminal fallback.
+            for route in 0..4 {
+                let mut events = Vec::new();
+                if route != 0 {
+                    events.push(tool_item_event(
+                        "response.output_item.added",
+                        "bad",
+                        "write",
+                        "",
+                    ));
+                    events.push(json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_bad",
+                        "delta": if route == 2 { "{}" } else { raw }
+                    }));
+                }
+                if route != 3 {
+                    events.push(tool_item_event(
+                        "response.output_item.done",
+                        "bad",
+                        "write",
+                        if route == 1 { "" } else { raw },
+                    ));
+                }
+                events.push(completed_response_event());
+                let out = collect_events(&events);
+                assert_eq!(
+                    out.iter()
+                        .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                        .count(),
+                    1,
+                    "one error terminal for route {route}, raw {raw:?}",
+                );
+                assert!(!out.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. }
+                )));
+                let Some(StreamEvent::Error { reason, error }) = out.last() else {
+                    panic!("expected terminal error");
+                };
+                assert_eq!(*reason, StopReason::Error);
+                assert_eq!(error.stop_reason, StopReason::Error);
+                let detail = error.error_message.as_deref().unwrap();
+                assert!(detail.contains("Invalid OpenAI Responses tool arguments"));
+                assert!(!detail.contains("sensitive-argument"));
+                assert!(matches!(
+                    error.content.last(),
+                    Some(ContentBlock::ToolCall(call)) if call.arguments.is_null()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn completed_tool_arguments_accept_objects_and_complete_final_snapshots() {
+        for raw in ["", " \n\t ", "{}", r#"{"items":[1,{"ok":true}],"n":null}"#] {
+            let out = collect_events(&[
+                tool_item_event("response.output_item.done", "valid", "echo", raw),
+                completed_response_event(),
+            ]);
+            let calls = out
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1);
+            let expected = if raw.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(raw).unwrap()
+            };
+            assert_eq!(calls[0].arguments, expected);
+            assert!(matches!(
+                out.last(),
+                Some(StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    ..
+                })
+            ));
+        }
+
+        let out = collect_events(&[
+            tool_item_event(
+                "response.output_item.added",
+                "snapshot",
+                "echo",
+                "{\"text\":",
+            ),
+            tool_item_event(
+                "response.output_item.done",
+                "snapshot",
+                "echo",
+                r#"{"text":"complete final snapshot"}"#,
+            ),
+            completed_response_event(),
+        ]);
+        assert!(out.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallEnd { tool_call, .. }
+                if tool_call.arguments == json!({"text": "complete final snapshot"})
+        )));
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn fallback_finalization_discards_buffered_tool_ends_when_one_call_is_invalid() {
+        let out = collect_events(&[
+            tool_item_event("response.output_item.added", "first", "write", "{}"),
+            tool_item_event("response.output_item.added", "bad", "write", "[1]"),
+            tool_item_event("response.output_item.added", "last", "write", "{}"),
+            completed_response_event(),
+        ]);
+        assert!(!out.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. }
+        )));
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::format_collect)]
+    fn invalid_tool_completion_is_terminal_on_sse_and_ndjson_transports() {
+        let events = [
+            tool_item_event("response.output_item.done", "bad", "write", "null"),
+            tool_item_event("response.output_item.done", "later", "write", "{}"),
+            completed_response_event(),
+        ];
+        for ndjson in [false, true] {
+            let body = if ndjson {
+                ndjson_body_from_events(&events)
+            } else {
+                events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>()
+                    + "data: [DONE]\n\n"
+            };
+            let content_type = if ndjson {
+                "application/x-ndjson"
+            } else {
+                "text/event-stream"
+            };
+            let (base_url, _requests) = spawn_test_server(200, content_type, &body);
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_base_url(base_url);
+            let context = Context::owned(None, Vec::new(), Vec::new());
+            let options = StreamOptions {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            };
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let mut stream = provider.stream(&context, &options).await.unwrap();
+                let mut errors = 0;
+                while let Some(event) = stream.next().await {
+                    match event.unwrap() {
+                        StreamEvent::Error { reason, .. } => {
+                            assert_eq!(reason, StopReason::Error);
+                            errors += 1;
+                        }
+                        StreamEvent::ToolCallStart { id, .. } => assert_eq!(id, "call_bad"),
+                        StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. } => {
+                            panic!("failed tool completion must not authorize execution");
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(errors, 1);
+                assert!(stream.next().await.is_none(), "terminal stream stays fused");
+            });
+        }
+    }
+
+    #[test]
+    #[allow(clippy::format_collect)]
+    fn malformed_parallel_tool_batch_never_executes_the_valid_sibling() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-be-written.txt");
+        let events = [
+            tool_item_event(
+                "response.output_item.done",
+                "valid",
+                "write",
+                &json!({"path": marker, "content": "must not execute"}).to_string(),
+            ),
+            tool_item_event("response.output_item.done", "bad", "write", "null"),
+            completed_response_event(),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
+        let provider = OpenAIResponsesProvider::new("gpt-test").with_base_url(base_url);
+        let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+            crate::tools::WriteTool::new(dir.path()),
+        )]);
+        let mut agent = crate::agent::Agent::new(
+            Arc::new(provider),
+            tools,
+            crate::agent::AgentConfig {
+                max_tool_iterations: 1,
+                stream_options: StreamOptions {
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+                ..crate::agent::AgentConfig::default()
+            },
+        );
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&executions);
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let message = runtime
+            .block_on(agent.run("Read the files", move |event| {
+                if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }))
+            .unwrap();
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(
+            !marker.exists(),
+            "valid sibling of a malformed batch must not run"
+        );
+        assert!(
+            !agent
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::ToolResult(_)))
+        );
     }
 
     #[test]
@@ -4524,13 +6061,20 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        spawn_test_server_with_bodies(status_code, content_type, vec![body.to_string()])
+    }
+
+    fn spawn_test_server_with_bodies(
+        status_code: u16,
+        content_type: &str,
+        bodies: Vec<String>,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = mpsc::channel();
-        let body = body.to_string();
         let content_type = content_type.to_string();
 
-        std::thread::spawn(move || {
+        let serve = move |body: String| {
             let (mut socket, _) = listener.accept().expect("accept");
             // 250ms is the POLLING interval; the deadline below is the budget.
             // Treating a timed-out read as end-of-request truncated the buffer
@@ -4614,6 +6158,11 @@ mod tests {
                 .write_all(response.as_bytes())
                 .expect("write response");
             socket.flush().expect("flush response");
+        };
+        std::thread::spawn(move || {
+            for body in bodies {
+                serve(body);
+            }
         });
 
         (format!("http://{addr}/responses"), rx)

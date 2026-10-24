@@ -4536,8 +4536,9 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
     let step = apply_pi(&harness, &mut app, "PiMsg::SetEditorText", editor);
     assert_after_contains(&harness, &step, "Child message");
 
-    let repo_cwd = std::env::current_dir().expect("cwd");
-    let fork_dir = base_dir.join(encode_cwd(&repo_cwd));
+    // A fork inherits its source session's cwd (36f58ca33), so it is stored
+    // under that workspace's folder, not under the test process's directory.
+    let fork_dir = base_dir.join(encode_cwd(&cwd));
     let mut has_jsonl = false;
     if let Ok(entries) = std::fs::read_dir(&fork_dir) {
         for entry in entries.flatten() {

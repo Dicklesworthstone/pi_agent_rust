@@ -14,6 +14,8 @@ const MAX_LOCATIONS: usize = 1000;
 const MAX_URI_BYTES: usize = 8192;
 const MAX_LSP_UINTEGER: u32 = 2_147_483_647;
 
+mod selection;
+
 fn malformed(message: &str) -> crate::error::Error {
     tool_err("LSP_NAVIGATION_MALFORMED", message)
 }
@@ -292,8 +294,17 @@ fn capability(caps: &Value, action: &str) -> Result<()> {
         "implementation" => "implementationProvider",
         "references" => "referencesProvider",
         "hover" => "hoverProvider",
+        "selection_ranges" => "selectionRangeProvider",
         _ => return Err(tool_err("LSP_USAGE", "unknown navigation action")),
     };
+    if action == "selection_ranges"
+        && matches!(caps.get(key), None | Some(Value::Null | Value::Bool(false)))
+    {
+        return Err(tool_err(
+            "LSP_UNSUPPORTED",
+            "server did not advertise selection ranges",
+        ));
+    }
     match caps.get(key) {
         // Missing metadata preserves older servers' request behavior; it does
         // not certify support. An explicit refusal must not be ignored.
@@ -344,18 +355,37 @@ impl LspTool {
         let position =
             selected.ok_or_else(|| tool_err("LSP_USAGE", "missing navigation position"))?;
         capability(&source.entry.client.capabilities().raw, action)?;
-        let mut params = json!({"textDocument":{"uri":source.uri},"position":position});
+        let selections = action == "selection_ranges";
+        let mut params = if selections {
+            json!({"textDocument":{"uri":source.uri},"positions":[position]})
+        } else {
+            json!({"textDocument":{"uri":source.uri},"position":position})
+        };
         if let Some(extra) = extra_params.as_object() {
             for (key, value) in extra {
                 params[key] = value.clone();
             }
         }
         source.verify(&budget)?;
-        let raw = source
-            .entry
-            .client
-            .call(method, params, budget.remaining()?)
-            .await?;
+        let raw = if action == "hover" {
+            source
+                .entry
+                .client
+                .call(method, params, budget.remaining()?)
+                .await?
+        } else {
+            source
+                .entry
+                .client
+                .call_with_array_partial_results(
+                    method,
+                    params,
+                    budget.remaining()?,
+                    MAX_RESPONSE_BYTES,
+                    if selections { 1 } else { MAX_SERVER_LOCATIONS },
+                )
+                .await?
+        };
         source.verify(&budget)?;
         let payload = json!({
             "action":action,"file":display_path(&source.path,&self.cwd),
@@ -364,6 +394,15 @@ impl LspTool {
         });
         let payload = if action == "hover" {
             hover_output(&raw, &source.text, payload)?
+        } else if selections {
+            selection::output(
+                &raw,
+                &source.text,
+                position,
+                input.limit.unwrap_or(16).min(selection::MAX_LEVELS),
+                payload,
+                &budget,
+            )?
         } else {
             location_output(
                 &raw,

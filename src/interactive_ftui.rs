@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use ftui::core::geometry::Rect;
 use ftui::render::sanitize::sanitize;
-use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
+use ftui::runtime::subscription::{StopSignal, SubId, Subscription, SubscriptionSender};
 use ftui::text::{Text, WrapMode, display_width};
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
@@ -65,7 +65,10 @@ use std::collections::{HashMap, VecDeque};
 mod info_commands;
 mod plan_commands;
 pub mod session_pins;
+mod settings;
 mod workspace_commands;
+
+pub use settings::{SettingsKey, SettingsSnapshot};
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -145,6 +148,27 @@ const PICKER_HINT: &str = "type to filter · ↑/↓ navigate · Enter apply · 
 /// loop this long has stalled it: input sits unread, agent deltas queue, and
 /// the next present is late by at least this much.
 const LOOP_STALL_BUDGET: Duration = Duration::from_millis(250);
+
+/// Frame budget handed to ftui for the interactive stack.
+///
+/// ftui gives a frame 16 ms by default and does not present a frame that used
+/// more than that: the buffer is rendered, the present phase is skipped, and
+/// the next frame starts from scratch. A view that keeps costing more than the
+/// budget (an unoptimised build, a heavily loaded machine, a long in-flight
+/// reasoning block) therefore never reaches the terminal again. The screen
+/// stays on its last frame and typed keys are not echoed, while the session
+/// itself keeps running. A late frame is better than no frame, so the budget
+/// is set far above any real frame time. That also keeps ftui's load governor,
+/// whose target is this value, from lowering render quality: the lower levels
+/// blank the transcript. Slow frames are still reported through
+/// `LOOP_STALL_BUDGET`.
+const FRAME_BUDGET: Duration = Duration::from_hours(1);
+
+/// The frame budget every surface that runs [`PiFtuiModel`] must use.
+#[must_use]
+pub fn frame_budget() -> ftui::render::budget::FrameBudgetConfig {
+    ftui::render::budget::FrameBudgetConfig::strict(FRAME_BUDGET)
+}
 
 /// Event-loop phase a stall is attributed to. Mirrors the render / input /
 /// agent-event split that omp's `loop-watchdog.ts` reports.
@@ -359,7 +383,7 @@ impl LoopWatchdog {
 /// pass a plain closure and terminate via channel disconnect instead.
 fn drain_agent_events(
     rx: &Receiver<PiMsg>,
-    sender: &Sender<PiFtuiMsg>,
+    send: impl Fn(PiFtuiMsg) -> std::result::Result<(), std::sync::mpsc::SendError<PiFtuiMsg>>,
     stopped: impl Fn() -> bool,
 ) {
     loop {
@@ -368,8 +392,8 @@ fn drain_agent_events(
         }
         match rx.recv_timeout(AGENT_EVENT_POLL) {
             Ok(msg) => {
-                if sender.send(PiFtuiMsg::Agent(msg)).is_err() {
-                    // Runtime dropped its receiver: program is exiting.
+                if send(PiFtuiMsg::Agent(msg)).is_err() {
+                    // The runtime disconnected or cancelled a full-queue wait.
                     return;
                 }
             }
@@ -529,14 +553,16 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
         AGENT_EVENTS_SUB_ID
     }
 
-    fn run(&self, sender: Sender<PiFtuiMsg>, stop: StopSignal) {
+    #[allow(clippy::result_large_err)]
+    fn run(&self, sender: SubscriptionSender<PiFtuiMsg>, stop: StopSignal) {
         let Some(rx) = self.rx.lock().ok().and_then(|mut slot| slot.take()) else {
             // Already consumed (or poisoned): nothing to drain. The runtime
             // only calls run() once per running subscription, so this is a
             // defensive no-op rather than an expected path.
             return;
         };
-        drain_agent_events(&rx, &sender, || stop.is_stopped());
+        // Forward through the runtime's bounded, stop-aware sender directly.
+        drain_agent_events(&rx, |message| sender.send(message), || stop.is_stopped());
     }
 }
 
@@ -1336,6 +1362,8 @@ impl PickerOverlay {
                     || (item != id && crate::model_selector::fuzzy_match(query, item))
             }
             PickerKind::Theme
+            | PickerKind::Settings
+            | PickerKind::SettingValue(_)
             | PickerKind::Session
             | PickerKind::Rewind
             | PickerKind::ForkFrom
@@ -1390,6 +1418,9 @@ impl PickerOverlay {
 enum PickerKind {
     /// Built-in theme picker (`/theme`): applies the palette UI-side.
     Theme,
+    /// Driver-backed preferences, followed by one setting's validated values.
+    Settings,
+    SettingValue(SettingsKey),
     /// Model picker (`/model` with no arguments): items are
     /// `provider/model-id` strings; selection routes `UiCommand::SetModel`.
     Model,
@@ -1443,6 +1474,61 @@ impl std::fmt::Debug for LoginInput {
     }
 }
 
+/// One admitted handoff owns its cancellation lane even while another driver
+/// command is finishing. Private construction gives every request a unique ID;
+/// clones share that identity and its abort handle.
+#[derive(Debug, Clone)]
+pub struct HandoffRequest {
+    id: String,
+    owner_session_id: String,
+    abort: crate::agent::AbortHandle,
+}
+
+impl HandoffRequest {
+    fn new(owner_session_id: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner_session_id,
+            abort: crate::agent::AbortHandle::new().0,
+        }
+    }
+}
+
+impl PartialEq for HandoffRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.owner_session_id == other.owner_session_id
+    }
+}
+
+impl Eq for HandoffRequest {}
+
+/// MCP authentication keeps its exact cancellation and session owner while
+/// earlier commands finish in the sequential driver.
+#[derive(Debug, Clone)]
+pub struct McpAuthRequest {
+    id: String,
+    owner_session_id: String,
+    abort: crate::agent::AbortHandle,
+}
+
+impl McpAuthRequest {
+    fn new(owner_session_id: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner_session_id,
+            abort: crate::agent::AbortHandle::new().0,
+        }
+    }
+}
+
+impl PartialEq for McpAuthRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.owner_session_id == other.owner_session_id
+    }
+}
+
+impl Eq for McpAuthRequest {}
+
 /// Command from the UI to the agent driver.
 ///
 /// The seed of the bubbletea stack's input-routing chain: prompts run agent
@@ -1452,8 +1538,14 @@ impl std::fmt::Debug for LoginInput {
 pub enum UiCommand {
     /// Run an agent turn with this prompt.
     Prompt(String),
+    /// Consume the driver's prepared CLI attachment message exactly once.
+    InitialPrompt,
     /// Switch the session's active model (`/model provider/model`).
     SetModel { provider: String, model: String },
+    /// Read effective settings from the live session for `/settings` or F2.
+    Settings,
+    /// Save one preference, then apply it to the existing live session.
+    SetSetting { key: SettingsKey, value: String },
     /// Run a shell command. `!cmd` (exclude=false) shows the output AND
     /// submits it to the agent as a turn — the bubbletea semantics; `!!cmd`
     /// (exclude=true) is display-only.
@@ -1464,12 +1556,19 @@ pub enum UiCommand {
     /// Compact the conversation (`/compact`): the driver runs compaction and
     /// replays the rewritten history into the transcript.
     Compact,
+    /// Generate and install a continuation brief without changing sessions.
+    Handoff {
+        focus: String,
+        request: HandoffRequest,
+    },
     /// OMP `/shake` (also `/compact shake`): compact by dropping bulky tool
     /// output from the older span, with no model summary.
     Shake,
     /// Control read-only planning and session-bound review (`/plan`).
     /// The driver retains the exact displayed proposal, not the UI command.
     Plan { action: String },
+    /// Arm a one-shot model handoff, inspect it, or cancel it (`/prewalk`).
+    Prewalk { action: String },
     /// Roll back (`/undo`) or re-apply (`/redo`) recorded agent file edits
     /// (bd-cv653.3.13).
     Undo {
@@ -1484,9 +1583,18 @@ pub enum UiCommand {
         subcommand: String,
         name: Option<String>,
     },
+    /// A browser login/logout with request-scoped completion and cancellation.
+    McpAuth {
+        subcommand: String,
+        name: String,
+        request: McpAuthRequest,
+    },
     /// Dispatch a non-built-in slash command to the extension runtime; the
     /// driver checks registration and reports unknown commands.
     ExtensionCommand { name: String, args: String },
+    /// A registered extension owned this token when it was submitted. If a
+    /// reload removes it, refuse instead of running a same-named template.
+    RegisteredExtensionCommand { name: String, args: String },
     /// Start a fresh session (`/new`): the driver builds a new session from
     /// the launch template with the current provider/model selection and a
     /// reset thinking level, swaps it in, and replays the (empty) history.
@@ -1508,8 +1616,12 @@ pub enum UiCommand {
     Reload,
     /// `/btw <question>`: an ephemeral side question to the smol role model
     /// with a compact, vault-transformed summary of the conversation. The
-    /// answer is display-only and never enters the session.
-    Btw(String),
+    /// answer is display-only and never enters the session. Bind queued
+    /// questions to the session that was visible when they were submitted.
+    Btw {
+        question: String,
+        owner_session_id: String,
+    },
     /// `/fresh`: reset provider stream state (new stream session id and
     /// prompt cache key) without changing the transcript.
     Fresh,
@@ -1746,6 +1858,9 @@ pub struct PiFtuiModel {
     palette: FtuiPalette,
     /// Modal picker overlay; captures all keys while open.
     picker: Option<PickerOverlay>,
+    /// Last driver-confirmed preferences; never updated optimistically.
+    settings_snapshot: Option<SettingsSnapshot>,
+    settings_pending: bool,
     /// `provider/model-id` entries for the `/model` picker (from the launch
     /// path's model registry; empty when unset).
     available_models: Vec<String>,
@@ -1793,8 +1908,8 @@ pub struct PiFtuiModel {
     /// (`session_control`): Enter steers it, alt+enter queues a follow-up,
     /// Escape aborts it. Empty between turns.
     turn_control: Option<TurnControlSlot>,
-    /// `/btw` client, for side questions asked while the driver is busy
-    /// with a turn (answered without conversation context).
+    /// `/btw` availability. The driver prepares every side question against
+    /// its live transcript and remembered credentials after the active turn.
     btw_client: Option<Arc<crate::btw::BtwClient>>,
     /// Background answers that arrived mid-turn, rendered at the turn boundary.
     ///
@@ -1828,6 +1943,12 @@ pub struct PiFtuiModel {
     /// state machine and the [`crate::autocomplete`] provider with the
     /// charmed stack, so both surfaces complete from the same command list.
     autocomplete: AutocompleteState,
+    /// Registered commands from the driver's current session. Routing must
+    /// consult this catalog before built-ins, not the filtered popup items.
+    extension_commands: Vec<crate::autocomplete::NamedEntry>,
+    /// Production routing reads the current manager directly; asynchronous
+    /// completion messages may still describe a replaced session.
+    extension_command_registry: Option<ExtensionCommandRegistry>,
     /// Where submitted user input goes. The launch path hands the sending
     /// half of the channel its agent loop consumes; tests read the receiver
     /// directly. `None` falls back to echoing into the transcript only.
@@ -1909,6 +2030,7 @@ pub struct PiFtuiModel {
     /// reply clears it (the driver is sequential, so the next non-tick
     /// message belongs to the in-flight operation).
     busy: Option<BusyOp>,
+    mcp_auth_request: Option<McpAuthRequest>,
     /// Transcript markdown spacing policy (issue #202), resolved from
     /// `markdown.spacing` in settings at launch.
     markdown_spacing: crate::config::MarkdownSpacing,
@@ -1930,6 +2052,7 @@ struct CachedBlock {
 struct BusyOp {
     label: String,
     tick_pending: bool,
+    handoff: Option<HandoffRequest>,
 }
 
 /// Vertical frame regions, top to bottom. The clamp/normalize string hacks of
@@ -1995,9 +2118,6 @@ async fn reload_driver_resources(
         Ok(loader) => {
             *catalog = AutocompleteCatalog::from_resources(&loader);
             *resources = Some(loader);
-            let mut completion = catalog.clone();
-            completion.extension_commands = extension_commands;
-            let _ = agent_tx.send(PiMsg::AutocompleteCatalog(completion));
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::System(format!(
@@ -2005,6 +2125,46 @@ async fn reload_driver_resources(
             )));
         }
     }
+    // The extension session has already been replaced even if loading a
+    // skill or prompt fails. Never keep its old command registrations.
+    catalog.extension_commands = extension_commands;
+    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog.clone()));
+}
+
+/// Publish registrations from the live session, including an empty set when
+/// extensions were removed. Called at startup and after every driver command:
+/// `/new`, `/resume`, `/fork`, and dynamic registration can change them too.
+fn refresh_extension_commands(
+    handle: &crate::sdk::AgentSessionHandle,
+    catalog: &mut AutocompleteCatalog,
+    agent_tx: &Sender<PiMsg>,
+) {
+    catalog.extension_commands = handle
+        .extension_manager()
+        .map(extension_commands_for_catalog)
+        .unwrap_or_default();
+    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog.clone()));
+}
+
+/// Preserve the runtime's registered spelling while accepting the same
+/// case-insensitive tokens as built-ins. An exact registration wins when
+/// an extension deliberately registers names that differ only in case.
+fn extension_command_name<'a>(
+    commands: &'a [crate::autocomplete::NamedEntry],
+    token: &str,
+) -> Option<&'a str> {
+    let name = token.trim_start_matches('/').trim();
+    if name.is_empty() {
+        return None;
+    }
+    let names = || {
+        commands
+            .iter()
+            .map(|entry| entry.name.trim_start_matches('/').trim())
+    };
+    names()
+        .find(|registered| *registered == name)
+        .or_else(|| names().find(|registered| registered.eq_ignore_ascii_case(name)))
 }
 
 /// Default popup height when settings don't override it (matches the
@@ -2083,6 +2243,8 @@ impl PiFtuiModel {
             usage_line: None,
             palette: FtuiPalette::default(),
             picker: None,
+            settings_snapshot: None,
+            settings_pending: false,
             available_models: Vec::new(),
             model_names: HashMap::new(),
             pending_quit: false,
@@ -2114,6 +2276,7 @@ impl PiFtuiModel {
             render_cache_width: std::cell::Cell::new(0),
             render_stats: std::cell::Cell::new((0, 0)),
             busy: None,
+            mcp_auth_request: None,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             #[cfg(test)]
             suspend_task_override: None,
@@ -2140,6 +2303,8 @@ impl PiFtuiModel {
                 state.max_visible = DEFAULT_COMPLETION_ROWS;
                 state
             },
+            extension_commands: Vec::new(),
+            extension_command_registry: None,
             submit_tx: None,
         }
     }
@@ -2153,6 +2318,8 @@ impl PiFtuiModel {
         self.file_ref_cwd.clone_from(&launch.cwd);
         self.steer_resources = launch.resources;
         self.autocomplete.provider.set_cwd(launch.cwd);
+        self.extension_commands
+            .clone_from(&launch.catalog.extension_commands);
         self.autocomplete.provider.set_catalog(launch.catalog);
         self.autocomplete.max_visible = launch.max_visible.clamp(1, 20);
         self.autocomplete.close();
@@ -2165,6 +2332,23 @@ impl PiFtuiModel {
     pub fn with_submit_channel(mut self, tx: Sender<UiCommand>) -> Self {
         self.submit_tx = Some(tx);
         self
+    }
+
+    fn with_extension_command_registry(mut self, registry: ExtensionCommandRegistry) -> Self {
+        self.extension_command_registry = Some(registry);
+        self
+    }
+
+    fn registered_extension_command(&self, token: &str) -> Option<String> {
+        if let Some(registry) = &self.extension_command_registry {
+            let manager = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()?;
+            let commands = extension_commands_for_catalog(&manager);
+            return extension_command_name(&commands, token).map(str::to_string);
+        }
+        extension_command_name(&self.extension_commands, token).map(str::to_string)
     }
 
     /// Whether thinking starts shown in full (`hideThinkingBlock` off) or
@@ -2743,16 +2927,66 @@ impl PiFtuiModel {
 
     #[allow(clippy::too_many_lines)]
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
+        if let PiMsg::McpAuthFinished {
+            request_id,
+            message,
+        } = msg
+        {
+            if self
+                .mcp_auth_request
+                .as_ref()
+                .map(|request| request.id.as_str())
+                != Some(request_id.as_str())
+            {
+                return Cmd::none();
+            }
+            self.mcp_auth_request = None;
+            self.busy = None;
+            self.dismiss_pending_interactions();
+            self.flush_stream();
+            self.state = AgentUiState::Ready;
+            self.current_tool = None;
+            self.thinking.clear();
+            self.settle_pending_cards();
+            self.drain_deferred_notes();
+            return self.handle_agent(PiMsg::System(message));
+        }
+        if let PiMsg::HandoffFinished { request_id, event } = msg {
+            if self
+                .busy
+                .as_ref()
+                .and_then(|op| op.handoff.as_ref().map(|request| request.id.as_str()))
+                != Some(request_id.as_str())
+            {
+                return Cmd::none();
+            }
+            self.busy = None;
+            // A previously queued turn may have delivered AgentStart after
+            // handoff admission. Its terminal event preserves this request's
+            // ownership, so only this matching completion can make it idle.
+            self.dismiss_pending_interactions();
+            self.flush_stream();
+            self.state = AgentUiState::Ready;
+            self.current_tool = None;
+            self.settle_pending_cards();
+            let command = self.handle_agent(*event);
+            // A successful reset replaces the transcript; append deferred
+            // background answers afterwards so the refresh cannot erase them.
+            self.drain_deferred_notes();
+            return command;
+        }
         // A busy out-of-turn operation (issue #203) is over once the
         // sequential driver replies with anything of substance. Background
         // ticks don't count, and neither does the in-progress chatter of an
         // extension command's own tool card (its ToolEnd/System reply is
         // what settles it).
-        if self.busy.is_some()
+        if self.mcp_auth_request.is_none()
+            && self.busy.as_ref().is_some_and(|op| op.handoff.is_none())
             && !matches!(
                 msg,
                 PiMsg::AutocompleteRefresh
                     | PiMsg::AutocompleteCatalog(_)
+                    | PiMsg::SystemNote(_)
                     | PiMsg::ToolStart { .. }
                     | PiMsg::ToolInvocation { .. }
                     | PiMsg::ToolUpdate { .. }
@@ -2761,9 +2995,25 @@ impl PiFtuiModel {
             self.busy = None;
         }
         match msg {
+            PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return Cmd::none(),
+            PiMsg::AgentError(message)
+                if self.handoff_in_progress() || self.mcp_auth_request.is_some() =>
+            {
+                // An unrelated background failure must not dismiss a native
+                // before-compaction hook's active question or capability card.
+                self.push_entry(EntryRole::Error, sanitize(&message).into_owned());
+            }
             PiMsg::AgentStart => {
                 self.state = AgentUiState::Working;
                 self.autocomplete.close();
+                if self.picker.as_ref().is_some_and(|picker| {
+                    matches!(
+                        picker.kind,
+                        PickerKind::Settings | PickerKind::SettingValue(_)
+                    )
+                }) {
+                    self.picker = None;
+                }
                 // Start the spinner tick chain; it dies naturally once the
                 // agent goes idle (Tick reschedules only while Working —
                 // same self-limiting pattern as the bubbletea spinner gate).
@@ -2824,12 +3074,24 @@ impl PiFtuiModel {
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary.map(|s| sanitize(&s).into_owned());
             }
+            PiMsg::AgentTimeCap { usage, message } => {
+                let command = self.handle_agent(PiMsg::AgentDone {
+                    usage,
+                    stop_reason: crate::model::StopReason::Stop,
+                    error_message: None,
+                });
+                self.push_entry(EntryRole::System, sanitize(&message).into_owned());
+                return command;
+            }
             PiMsg::AgentDone {
                 usage,
                 error_message,
                 ..
             } => {
-                self.dismiss_pending_interactions();
+                let handoff_running = self.handoff_in_progress() || self.mcp_auth_request.is_some();
+                if !handoff_running {
+                    self.dismiss_pending_interactions();
+                }
                 self.flush_stream();
                 if let Some(err) = error_message {
                     let text = sanitize(&err).into_owned();
@@ -2840,6 +3102,9 @@ impl PiFtuiModel {
                         "tokens {}↑ {}↓ · total {}",
                         usage.input, usage.output, usage.total_tokens
                     ));
+                }
+                if handoff_running {
+                    return Cmd::none();
                 }
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
@@ -2867,9 +3132,36 @@ impl PiFtuiModel {
                 let text = sanitize(&text).into_owned();
                 self.push_entry(EntryRole::System, text);
             }
+            PiMsg::ProviderRecovery {
+                message,
+                model,
+                discard_incomplete,
+            } => {
+                if discard_incomplete {
+                    self.streaming.clear();
+                    self.thinking.clear();
+                } else {
+                    self.flush_stream();
+                }
+                if let Some((provider, model)) = model
+                    && let Some(snapshot) = &mut self.status_snapshot
+                {
+                    snapshot.model = self
+                        .model_names
+                        .get(&format!("{provider}/{model}"))
+                        .cloned()
+                        .unwrap_or(model);
+                }
+                self.push_entry(EntryRole::System, sanitize(&message).into_owned());
+            }
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
+            }
+            | PiMsg::ReviewFinished {
+                owner_session_id,
+                message,
+                ..
             } => {
                 if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
                     let text = sanitize(&message).into_owned();
@@ -2886,6 +3178,19 @@ impl PiFtuiModel {
                     } else {
                         self.push_entry(EntryRole::System, text);
                     }
+                }
+            }
+            PiMsg::UserInputSubmitted {
+                owner_session_id,
+                text,
+                history_text,
+            } => {
+                if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
+                    let text = sanitize(&text).into_owned();
+                    self.error_banner = None;
+                    self.record_history(&sanitize(&history_text));
+                    self.push_entry(EntryRole::User, text);
+                    self.scroll_from_tail = 0;
                 }
             }
             PiMsg::ConversationReset {
@@ -2966,6 +3271,8 @@ impl PiFtuiModel {
                 // list once the driver's session (and its extension
                 // runtime) exists. Any open popup was computed against the
                 // old list; drop it, the next keystroke recomputes.
+                self.extension_commands
+                    .clone_from(&catalog.extension_commands);
                 self.autocomplete.provider.set_catalog(catalog);
                 self.autocomplete.close();
             }
@@ -2990,6 +3297,42 @@ impl PiFtuiModel {
             PiMsg::StatusSnapshot(snapshot) => {
                 self.status_snapshot = Some(snapshot);
             }
+            PiMsg::Settings { snapshot, changed } => {
+                self.settings_pending = false;
+                match changed {
+                    Some(SettingsKey::HideThinking) => {
+                        self.show_thinking = !snapshot.hide_thinking;
+                    }
+                    Some(SettingsKey::MarkdownSpacing) => {
+                        self.markdown_spacing = snapshot.markdown_spacing;
+                    }
+                    Some(SettingsKey::DoubleEscape) => {
+                        self.double_escape_action = snapshot.double_escape;
+                        self.last_idle_escape = None;
+                    }
+                    Some(SettingsKey::AutocompleteRows) => {
+                        self.autocomplete.max_visible = snapshot.autocomplete_rows;
+                        self.autocomplete.close();
+                    }
+                    _ => {}
+                }
+                if matches!(
+                    changed,
+                    Some(SettingsKey::HideThinking | SettingsKey::MarkdownSpacing)
+                ) {
+                    self.render_cache.borrow_mut().clear();
+                }
+                self.settings_snapshot = Some(snapshot);
+                if self.state == AgentUiState::Ready
+                    && !self.handoff_in_progress()
+                    && self.active_ask.is_none()
+                    && self.active_ext.is_none()
+                    && self.login_pending.is_none()
+                {
+                    self.open_settings_picker();
+                }
+            }
+            PiMsg::MessagePicker { .. } if self.handoff_in_progress() => {}
             PiMsg::MessagePicker { fork, messages } => {
                 if messages.is_empty() {
                     self.push_entry(
@@ -3032,6 +3375,23 @@ impl PiFtuiModel {
                 .is_none_or(|shown| shown == owner_session_id) =>
             {
                 self.input.set_text(&text);
+            }
+            PiMsg::RestorePendingInput {
+                owner_session_id,
+                text,
+            } if self
+                .displayed_session_id
+                .as_deref()
+                .is_none_or(|shown| shown == owner_session_id)
+                && !text.is_empty() =>
+            {
+                let draft = self.input.text();
+                let restored = if draft.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{draft}")
+                };
+                self.input.set_text(&restored);
             }
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
@@ -3121,16 +3481,40 @@ impl PiFtuiModel {
     /// Commands wait for the turn to end; text the lane cannot take yet (the
     /// turn is starting or ending) becomes the next prompt instead.
     fn submit_mid_turn(&mut self, follow_up: bool) {
+        if self.mcp_auth_request.is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("MCP authentication is still running; press Escape to cancel it."),
+            );
+            return;
+        }
+        if self.handoff_in_progress() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Handoff is still running; press Escape to cancel it."),
+            );
+            return;
+        }
         let text = self.input.text();
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
         }
         let clean = sanitize(trimmed).into_owned();
+        let token = clean.split_whitespace().next().unwrap_or("");
+        if token.starts_with('/') && self.registered_extension_command(token).is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from(
+                    "Extension commands wait until the agent finishes; press Escape to abort it.",
+                ),
+            );
+            return;
+        }
         // /btw is the one command meant for mid-turn use.
         if let Some(question) = strip_command(&clean, "/btw") {
             let question = question.trim().to_string();
-            self.queue_btw_mid_turn(&question);
+            self.queue_btw(&question);
             return;
         }
         // OMP /queue <message>: a follow-up for after the agent yields, the
@@ -3167,7 +3551,7 @@ impl PiFtuiModel {
                 self.push_entry(
                     EntryRole::Error,
                     String::from(
-                        "Images attach once the agent finishes; the message is kept in the editor.",
+                        "Attachments send once the agent finishes; the message is kept in the editor.",
                     ),
                 );
                 return;
@@ -3205,39 +3589,46 @@ impl PiFtuiModel {
         }
     }
 
-    /// `/btw` while the agent works: the driver is inside the turn and cannot
-    /// build (or vault-transform) a conversation summary, so the question goes
-    /// out alone, as the classic stack does when its agent is busy, and says
-    /// so. The answer shows as soon as it arrives.
-    fn queue_btw_mid_turn(&mut self, question: &str) {
+    /// Every side question waits for the driver to screen it against the live
+    /// vault. Sending directly while a turn owns the Agent would miss bare
+    /// credentials learned earlier in the conversation.
+    fn queue_btw(&mut self, question: &str) {
         if question.is_empty() {
             self.push_entry(EntryRole::Error, String::from(BTW_USAGE));
             return;
         }
-        let Some(client) = self.btw_client.clone() else {
+        if self.btw_client.is_none() {
             self.push_entry(EntryRole::Error, String::from(BTW_UNAVAILABLE));
+            return;
+        }
+        if question.len()
+            > crate::text_completion::MAX_INPUT_BYTES
+                .saturating_sub(crate::btw::BTW_SYSTEM_PROMPT.len())
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("/btw refused: question exceeds the auxiliary privacy scan budget"),
+            );
+            return;
+        }
+        let Some(owner_session_id) = self.displayed_session_id.clone() else {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("/btw: session is still loading; try again when it is ready"),
+            );
             return;
         };
         self.input.set_text("");
-        self.push_entry(
-            EntryRole::System,
-            format!("(/btw) {question} — agent busy, answering without conversation context"),
-        );
-        let question = question.to_string();
-        self.pending_task = Some(Box::new(move || {
-            let answer = asupersync::runtime::RuntimeBuilder::new()
-                .build()
-                .map_err(|err| err.to_string())
-                .and_then(|runtime| {
-                    runtime
-                        .block_on(client.ask("", &question))
-                        .map_err(|err| err.to_string())
-                });
-            PiFtuiMsg::Agent(PiMsg::System(match answer {
-                Ok(answer) => format!("(/btw) {answer}"),
-                Err(err) => format!("(/btw) failed: {err}"),
-            }))
-        }));
+        let note = if self.state == AgentUiState::Working {
+            format!("(/btw) {question} — queued until the current turn finishes")
+        } else {
+            format!("(/btw) {question}")
+        };
+        self.push_entry(EntryRole::System, note);
+        self.send_command(UiCommand::Btw {
+            question: question.to_string(),
+            owner_session_id,
+        });
     }
 
     /// alt+up: pull steering and follow-up messages the running turn has not
@@ -3277,6 +3668,23 @@ impl PiFtuiModel {
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
+        if self.mcp_auth_request.is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("MCP authentication is still running; press Escape to cancel it."),
+            );
+            return;
+        }
+        if self.settings_pending {
+            return;
+        }
+        if self.handoff_in_progress() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Handoff is still running; press Escape to cancel it."),
+            );
+            return;
+        }
         let text = self.input.text();
         let trimmed = text.trim();
         if let Some((provider, accepts_empty_input)) = self.login_pending.clone() {
@@ -3306,6 +3714,32 @@ impl PiFtuiModel {
         if trimmed.is_empty() {
             return;
         }
+        // Routing and busy admission must inspect the same sanitized token:
+        // pasted terminal controls can otherwise hide a registered command.
+        let clean = sanitize(trimmed).into_owned();
+        let token = clean.split_whitespace().next().unwrap_or("");
+        if token.eq_ignore_ascii_case("/handoff")
+            && self.registered_extension_command(token).is_none()
+            && (self.busy.is_some() || self.state == AgentUiState::Working)
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Handoff needs an idle session; wait for the current request or press Escape to cancel it."),
+            );
+            return;
+        }
+        if self.busy.is_some()
+            && clean.starts_with('/')
+            && self
+                .registered_extension_command(clean.split_whitespace().next().unwrap_or(""))
+                .is_some()
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Extension commands wait until the current operation finishes."),
+            );
+            return;
+        }
         if self.state == AgentUiState::Working {
             self.submit_mid_turn(false);
             return;
@@ -3313,9 +3747,6 @@ impl PiFtuiModel {
         // Sending anything dismisses the pinned error banner
         // (bd-cv653.9.2 dismiss-on-send semantics).
         self.error_banner = None;
-        // User input is the one text source the user typed themself, but it
-        // still goes through sanitize: paste can smuggle control sequences.
-        let clean = sanitize(trimmed).into_owned();
         self.record_history(&clean);
         self.input.set_text("");
         self.autocomplete.close();
@@ -3355,6 +3786,17 @@ impl PiFtuiModel {
         // Token-exact: /model and /m route here; /mode or /modelx fall
         // through to the tail (extension dispatch), matching bubbletea.
         let (token, rest) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        // A registered command owns its token, including tokens that gained
+        // built-in behavior later (/plan, /todos, /status, /branch, ...).
+        // Completion filtering and prompt templates do not confer ownership.
+        if let Some(name) = self.registered_extension_command(token) {
+            self.begin_busy(format!("running /{name} ..."));
+            self.send_command(UiCommand::RegisteredExtensionCommand {
+                name,
+                args: rest.trim().to_string(),
+            });
+            return true;
+        }
         // OMP `/switch` is `/model` with a selector.
         if token.eq_ignore_ascii_case("/model")
             || token.eq_ignore_ascii_case("/m")
@@ -3469,6 +3911,14 @@ impl PiFtuiModel {
             self.pending_quit = true;
             return true;
         }
+        if let Some(args) = strip_command(clean, "/settings") {
+            if args.trim().is_empty() {
+                self.request_settings();
+            } else {
+                self.push_entry(EntryRole::Error, String::from("Usage: /settings"));
+            }
+            return true;
+        }
         // OMP's /plan-review re-opens the review of the latest plan.
         if canon == "/plan-review" {
             self.begin_busy("updating plan ...");
@@ -3488,6 +3938,34 @@ impl PiFtuiModel {
         }
         let (token, rest) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
         if let Some(command) = workspace_commands::WorkspaceCommand::parse(token) {
+            if command == workspace_commands::WorkspaceCommand::Handoff {
+                match crate::interactive::workspace_reports::handoff_mode(rest) {
+                    Ok(crate::interactive::workspace_reports::HandoffMode::InPlace(focus)) => {
+                        let Some(owner_session_id) = self.displayed_session_id.clone() else {
+                            self.push_entry(
+                                EntryRole::Error,
+                                String::from("Handoff unavailable: session is still loading"),
+                            );
+                            return true;
+                        };
+                        let request = HandoffRequest::new(owner_session_id);
+                        self.begin_busy("preparing handoff (Esc to cancel) ...");
+                        if let Some(busy) = &mut self.busy {
+                            busy.handoff = Some(request.clone());
+                        }
+                        self.send_command(UiCommand::Handoff {
+                            focus: focus.to_string(),
+                            request,
+                        });
+                        return true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.push_entry(EntryRole::Error, error.to_string());
+                        return true;
+                    }
+                }
+            }
             self.begin_busy(format!("{} ...", token.to_ascii_lowercase()));
             self.send_command(UiCommand::Workspace {
                 command,
@@ -3503,6 +3981,20 @@ impl PiFtuiModel {
                 });
             } else {
                 self.push_entry(EntryRole::Error, plan_commands::USAGE.to_string());
+            }
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/prewalk") {
+            if matches!(rest.trim(), "" | "status" | "off") {
+                self.begin_busy("updating prewalk ...");
+                self.send_command(UiCommand::Prewalk {
+                    action: rest.trim().to_string(),
+                });
+            } else {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from("Usage: /prewalk [status|off]"),
+                );
             }
             return true;
         }
@@ -3632,20 +4124,55 @@ impl PiFtuiModel {
             return true;
         }
         if let Some(rest) = strip_command(clean, "/mcp") {
-            let mut parts = rest.split_whitespace();
-            let subcommand = parts.next().unwrap_or("list").to_ascii_lowercase();
-            let name = parts.next().map(str::to_string);
-            let valid = match subcommand.as_str() {
-                "list" => name.is_none() && parts.next().is_none(),
-                "trust" | "deny" | "test" => name.is_some() && parts.next().is_none(),
-                _ => false,
-            };
+            let rest = rest.trim();
+            let (verb, remainder) = rest
+                .split_once(char::is_whitespace)
+                .map_or((rest, ""), |(verb, name)| (verb, name.trim()));
+            let subcommand = if verb.is_empty() { "list" } else { verb }.to_ascii_lowercase();
+            let authentication = matches!(subcommand.as_str(), "reauth" | "unauth");
+            let name = (!remainder.is_empty()).then(|| remainder.to_string());
+            let valid = !rest.contains(['\r', '\n'])
+                && match subcommand.as_str() {
+                    "list" => name.is_none(),
+                    "trust" | "deny" | "test" => {
+                        name.is_some() && remainder.split_whitespace().count() == 1
+                    }
+                    "reauth" | "unauth" => name.is_some(),
+                    _ => false,
+                };
             if valid {
-                self.send_command(UiCommand::Mcp { subcommand, name });
+                if authentication {
+                    if self.busy.is_some() || self.state == AgentUiState::Working {
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from("MCP authentication needs an idle session"),
+                        );
+                        return true;
+                    }
+                    let Some(owner_session_id) = self.displayed_session_id.clone() else {
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from(
+                                "MCP authentication unavailable: session is still loading",
+                            ),
+                        );
+                        return true;
+                    };
+                    let request = McpAuthRequest::new(owner_session_id);
+                    self.mcp_auth_request = Some(request.clone());
+                    self.begin_busy("MCP authentication (Escape to cancel) ...");
+                    self.send_command(UiCommand::McpAuth {
+                        subcommand,
+                        name: remainder.to_string(),
+                        request,
+                    });
+                } else {
+                    self.send_command(UiCommand::Mcp { subcommand, name });
+                }
             } else {
                 self.push_entry(
                     EntryRole::Error,
-                    String::from("usage: /mcp [list|trust <name>|deny <name>|test <name>]"),
+                    String::from("usage: /mcp [list|trust <name>|deny <name>|test <name>|reauth <name>|unauth <name>]"),
                 );
             }
             return true;
@@ -3703,11 +4230,13 @@ impl PiFtuiModel {
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
-                     /commit [--dry-run], /review [target], /handoff, /approval [mode], \
+                     /commit [--dry-run], /review [target], /handoff [focus], \
+                     /handoff --report [to] [path], /handoff --model [preview options], \
+                     /handoff --import <bundle> [import options], /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
-                     /context, /todo, /jobs, /stats, /help, \
+                     /context, /todo, /jobs, /stats, /settings (F2), /help, \
                      /restart, /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
                      (display-only)",
                 ),
@@ -3789,15 +4318,7 @@ impl PiFtuiModel {
                 return true;
             }
             "/btw" => {
-                let question = cmd_args.trim();
-                if question.is_empty() {
-                    self.push_entry(EntryRole::Error, String::from(BTW_USAGE));
-                } else if self.btw_client.is_none() {
-                    self.push_entry(EntryRole::Error, String::from(BTW_UNAVAILABLE));
-                } else {
-                    self.push_entry(EntryRole::System, format!("(/btw) {question}"));
-                    self.send_command(UiCommand::Btw(question.to_string()));
-                }
+                self.queue_btw(cmd_args.trim());
                 return true;
             }
             "/tan" => {
@@ -4041,7 +4562,14 @@ impl PiFtuiModel {
                 }
             }
             AppAction::SelectCancel => {
+                let setting_value = self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| matches!(picker.kind, PickerKind::SettingValue(_)));
                 self.picker = None;
+                if setting_value {
+                    self.open_settings_picker();
+                }
             }
             AppAction::SelectConfirm => {
                 // Enter with nothing matching the filter keeps the picker
@@ -4093,6 +4621,46 @@ impl PiFtuiModel {
 
     fn apply_picker_choice(&mut self, kind: PickerKind, choice: &str) {
         match kind {
+            PickerKind::Settings => {
+                let Some(key) = SettingsKey::parse(choice) else {
+                    return;
+                };
+                let current = self
+                    .settings_snapshot
+                    .as_ref()
+                    .map(|settings| settings.value(key));
+                let (items, values) = key
+                    .choices()
+                    .iter()
+                    .map(|(value, label)| {
+                        let selected = current.as_deref() == Some(*value);
+                        (
+                            format!("{label}{}", if selected { " (current)" } else { "" }),
+                            (*value).to_string(),
+                        )
+                    })
+                    .unzip();
+                let mut picker = PickerOverlay::new(
+                    format!("{} (Enter saves, Esc returns)", key.label()),
+                    items,
+                    values,
+                    PickerKind::SettingValue(key),
+                );
+                picker.selected = key
+                    .choices()
+                    .iter()
+                    .position(|(value, _)| current.as_deref() == Some(*value))
+                    .unwrap_or(0);
+                self.picker = Some(picker);
+            }
+            PickerKind::SettingValue(key) => {
+                self.settings_pending = true;
+                self.begin_busy("saving settings ...");
+                self.send_settings_command(UiCommand::SetSetting {
+                    key,
+                    value: choice.to_string(),
+                });
+            }
             PickerKind::Theme => {
                 let theme = if choice == "light" {
                     crate::theme::Theme::light()
@@ -4150,6 +4718,64 @@ impl PiFtuiModel {
                 self.scroll_from_tail = 0;
             }
         }
+    }
+
+    fn request_settings(&mut self) {
+        if self.state != AgentUiState::Ready
+            || self.busy.is_some()
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            || self.login_pending.is_some()
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Settings are available when the current operation finishes."),
+            );
+            return;
+        }
+        self.autocomplete.close();
+        self.settings_pending = true;
+        self.begin_busy("loading settings ...");
+        self.send_settings_command(UiCommand::Settings);
+    }
+
+    fn send_settings_command(&mut self, command: UiCommand) {
+        if self
+            .submit_tx
+            .as_ref()
+            .is_none_or(|tx| tx.send(command).is_err())
+        {
+            self.settings_pending = false;
+            self.busy = None;
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Settings require an active agent session."),
+            );
+        }
+    }
+
+    fn open_settings_picker(&mut self) {
+        let Some(snapshot) = &self.settings_snapshot else {
+            return;
+        };
+        let (items, values) = SettingsKey::ALL
+            .into_iter()
+            .map(|key| {
+                (
+                    format!("{}: {}", key.label(), snapshot.value(key)),
+                    key.id().to_string(),
+                )
+            })
+            .unzip();
+        self.picker = Some(PickerOverlay::new(
+            format!(
+                "Settings · {}",
+                sanitize(&snapshot.path.display().to_string())
+            ),
+            items,
+            values,
+            PickerKind::Settings,
+        ));
     }
 
     /// Ask the driver for the messages on the current path; the picker opens
@@ -4216,7 +4842,49 @@ impl PiFtuiModel {
         self.busy = Some(BusyOp {
             label: label.into(),
             tick_pending: true,
+            handoff: None,
         });
+    }
+
+    fn handoff_in_progress(&self) -> bool {
+        self.busy.as_ref().is_some_and(|op| op.handoff.is_some())
+    }
+
+    /// Cancel an operator command that uses the driver's shared abort lane.
+    fn abort_driver_operation(&mut self) -> bool {
+        let abort = self
+            .mcp_auth_request
+            .as_ref()
+            .map(|request| request.abort.clone())
+            .or_else(|| {
+                self.turn_abort.as_ref().and_then(|slot| {
+                    slot.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+            });
+        if let Some(abort) = abort {
+            // Later keys can still reach an older turn or the normal exit path.
+            if abort.signal().is_aborted() {
+                return false;
+            }
+            abort.abort();
+            if let Some(busy) = &mut self.busy {
+                busy.label = "cancelling operation ...".to_string();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn abort_handoff(&mut self) {
+        if let Some(busy) = &mut self.busy
+            && let Some(request) = &busy.handoff
+        {
+            request.abort.abort();
+            busy.label = "cancelling handoff ...".to_string();
+        }
     }
 
     /// The active busy operation's status label, if any.
@@ -4411,6 +5079,10 @@ impl PiFtuiModel {
                 let double_tap = self
                     .last_ctrl_c
                     .is_some_and(|at| at.elapsed() < CTRL_C_EXIT_WINDOW);
+                if ctrl_c && self.busy.is_some() && self.abort_driver_operation() {
+                    self.last_ctrl_c = None;
+                    return Cmd::none();
+                }
                 if ctrl_c && !double_tap {
                     self.last_ctrl_c = Some(std::time::Instant::now());
                     if self.picker.is_some() {
@@ -4434,6 +5106,7 @@ impl PiFtuiModel {
                     // Issue #205: cancel the in-flight turn before quitting;
                     // otherwise teardown blocks on the driver joining a full
                     // provider stream plus remaining tool calls.
+                    self.abort_handoff();
                     if let Some(slot) = &self.turn_abort
                         && let Some(handle) = slot
                             .lock()
@@ -4446,6 +5119,13 @@ impl PiFtuiModel {
                         control.abort();
                     }
                     return Cmd::quit();
+                }
+
+                // A save is already in progress on the driver. Keep the
+                // editor draft and session selection stable until its reply;
+                // Ctrl+C above still works throughout slow filesystem I/O.
+                if self.settings_pending {
+                    return Cmd::none();
                 }
 
                 // Modal picker captures all input while open (same precedence
@@ -4504,6 +5184,7 @@ impl PiFtuiModel {
                     // stack behind a slash command. Both keys are advertised by
                     // /hotkeys and did nothing here until they were routed.
                     .or_else(|| pick(AppAction::SelectModel))
+                    .or_else(|| pick(AppAction::OpenSettings))
                     .or_else(|| pick(AppAction::Help))
                     // shift+tab. Only the driver can see the model's catalog
                     // entry, so the cycle itself lives there; this is the
@@ -4546,6 +5227,24 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::CursorUp))
                     .or_else(|| pick(AppAction::CursorDown));
                 let page = self.body_height().saturating_sub(1).max(1);
+                if self.handoff_in_progress()
+                    && matches!(
+                        action,
+                        Some(
+                            AppAction::SelectModel
+                                | AppAction::OpenSettings
+                                | AppAction::CycleThinkingLevel
+                                | AppAction::CycleModelForward
+                                | AppAction::CycleModelBackward
+                        )
+                    )
+                {
+                    self.push_entry(
+                        EntryRole::Error,
+                        String::from("Handoff is still running; press Escape to cancel it."),
+                    );
+                    return Cmd::none();
+                }
                 match action {
                     Some(AppAction::Suspend) => {
                         // Freeze model mutations synchronously (the flag is
@@ -4573,7 +5272,10 @@ impl PiFtuiModel {
                     Some(AppAction::PageDown) => {
                         return self.consume_scroll(|m| m.scroll_down(page));
                     }
-                    Some(AppAction::Exit) if self.input.is_empty() => return Cmd::quit(),
+                    Some(AppAction::Exit) if self.input.is_empty() => {
+                        self.abort_handoff();
+                        return Cmd::quit();
+                    }
                     Some(AppAction::Interrupt) if self.active_ask.is_some() => {
                         // Escape dismisses the pending ask card.
                         if let Some(ask) = self.active_ask.take() {
@@ -4588,6 +5290,15 @@ impl PiFtuiModel {
                     Some(AppAction::Interrupt) if self.active_ext.is_some() => {
                         // Escape cancels the pending extension prompt.
                         self.cancel_active_ext();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt) if self.handoff_in_progress() => {
+                        self.abort_handoff();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt)
+                        if self.busy.is_some() && self.abort_driver_operation() =>
+                    {
                         return Cmd::none();
                     }
                     Some(AppAction::Interrupt) if self.state == AgentUiState::Working => {
@@ -4646,6 +5357,10 @@ impl PiFtuiModel {
                         // The same path a bare `/model` takes.
                         self.route_model_command("");
                         return Cmd::none();
+                    }
+                    Some(AppAction::OpenSettings) => {
+                        self.request_settings();
+                        return self.take_busy_tick();
                     }
                     Some(AppAction::Help) => {
                         self.route_slash_command_tail("/help");
@@ -4776,6 +5491,7 @@ impl PiFtuiModel {
                     picker.push_query_str(&paste.text);
                 }
             }
+            Event::Paste(_) if self.settings_pending => {}
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
                     // Paste and other editor-relevant events flow through.
@@ -5629,6 +6345,20 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         E::AutoCompactionStart { reason } => {
             vec![PiMsg::SystemNote(format!("compacting context: {reason}"))]
         }
+        E::AdvisorNote { level, rationale } => {
+            vec![PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}"))]
+        }
+        E::PrewalkSwitched {
+            provider,
+            model,
+            thinking,
+        } => {
+            vec![PiMsg::ProviderRecovery {
+                message: format!("Prewalk switched → {provider}/{model}:{thinking}"),
+                model: Some((provider.clone(), model.clone())),
+                discard_incomplete: false,
+            }]
+        }
         E::AutoCompactionEnd {
             aborted,
             error_message,
@@ -5682,6 +6412,9 @@ const EXT_UI_TIMEOUT_MS: u64 = 300_000;
 /// `AskTool::install_channel_ui`.
 struct FtuiExtensionUiHandler {
     agent_tx: Sender<PiMsg>,
+    // A manager can retain this UI handler through its hostcall bridge. Keep
+    // this reference weak so the routing slot cannot create an owner cycle.
+    command_registry: std::sync::Weak<Mutex<Option<crate::extensions::ExtensionManager>>>,
     reply_channel_open: std::sync::atomic::AtomicBool,
     pending: Mutex<
         std::collections::HashMap<
@@ -5695,8 +6428,18 @@ impl FtuiExtensionUiHandler {
     fn new(agent_tx: Sender<PiMsg>) -> Self {
         Self {
             agent_tx,
+            command_registry: std::sync::Weak::new(),
             reply_channel_open: std::sync::atomic::AtomicBool::new(true),
             pending: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn install_command_registry(&self, handle: &crate::sdk::AgentSessionHandle) {
+        if let Some(registry) = self.command_registry.upgrade() {
+            *registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                handle.extension_manager().cloned();
         }
     }
 
@@ -5886,10 +6629,48 @@ fn install_ask_bridges(
 /// whatever tool is current when the reply arrives.
 type CurrentAsk = Arc<Mutex<Option<crate::ask::AskTool>>>;
 
+/// The UI and driver share the current session's command authority. Manager
+/// clones observe dynamic registrations; replacement swaps the whole source.
+type ExtensionCommandRegistry = Arc<Mutex<Option<crate::extensions::ExtensionManager>>>;
+
 /// Shared slot holding the abort handle for the driver's in-flight prompt
 /// turn (issue #205): the driver installs a handle per turn, the UI thread
 /// fires it on Ctrl-C.
 type TurnAbortSlot = Arc<Mutex<Option<crate::agent::AbortHandle>>>;
+
+async fn run_handoff_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    focus: &str,
+    request: HandoffRequest,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let abort_signal = request.abort.signal();
+    let event = if abort_signal.is_aborted() {
+        PiMsg::System("Handoff cancelled".to_string())
+    } else {
+        match handle
+            .with_session(|session| session.header.id.clone())
+            .await
+        {
+            Ok(owner) if owner == request.owner_session_id => {
+                crate::interactive::workspace_reports::run_in_place_handoff(
+                    handle,
+                    focus,
+                    &abort_signal,
+                )
+                .await
+            }
+            Ok(_) => PiMsg::AgentError(
+                "Handoff cancelled: the session changed before it started".to_string(),
+            ),
+            Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+        }
+    };
+    let _ = agent_tx.send(PiMsg::HandoffFinished {
+        request_id: request.id,
+        event: Box::new(event),
+    });
+}
 
 const BTW_USAGE: &str = "Usage: /btw <question>";
 /// OMP's double-tap window: a second ctrl+c this soon after the first quits.
@@ -5897,14 +6678,15 @@ const CTRL_C_EXIT_WINDOW: std::time::Duration = std::time::Duration::from_millis
 const BTW_UNAVAILABLE: &str =
     "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)";
 
-/// `/btw` in the driver: summarize the conversation tail, pass context and
-/// question through the secrets vault exactly as the main provider path
-/// does (a refusal stops it), and ask the smol role model off-thread. The
-/// answer is display-only and never enters the session.
+/// `/btw` in the driver: screen complete selected context fields and the
+/// question with the configured policy and live vault before clipping them.
+/// Only bounded, protected text crosses into the background provider task.
+/// The answer is display-only and never enters the session.
 async fn run_btw_command(
-    handle: &mut crate::sdk::AgentSessionHandle,
+    handle: &crate::sdk::AgentSessionHandle,
     client: Option<&Arc<crate::btw::BtwClient>>,
     question: String,
+    owner_session_id: String,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) {
@@ -5912,33 +6694,27 @@ async fn run_btw_command(
         let _ = agent_tx.send(PiMsg::AgentError(String::from(BTW_UNAVAILABLE)));
         return;
     };
-    let summary = crate::btw::build_context_summary(handle.session().agent.messages());
-    let agent = &mut handle.session_mut().agent;
-    let prepared = agent
-        .secrets_transform_outbound_text(&summary)
-        .and_then(|context| {
-            agent
-                .secrets_transform_outbound_text(&question)
-                .map(|question| (context, question))
-        });
-    let (context, question) = match prepared {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            let _ = agent_tx.send(PiMsg::AgentError(format!("/btw refused: {err}")));
-            return;
-        }
-    };
-    let Ok(owner_session_id) = handle
+    let Ok(current_session_id) = handle
         .with_session(|session| session.header.id.clone())
         .await
     else {
         let _ = agent_tx.send(PiMsg::AgentError(String::from("/btw: session busy")));
         return;
     };
+    if current_session_id != owner_session_id {
+        return;
+    }
+    let prepared = match client.prepare_with_agent(&handle.session().agent, &question) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("/btw refused: {err}")));
+            return;
+        }
+    };
     // ubs:ignore Sender clone per background question — the task must own it
     let tx = agent_tx.clone();
     runtime_handle.spawn(async move {
-        let message = match client.ask(&context, &question).await {
+        let message = match client.ask_prepared(prepared).await {
             Ok(answer) => format!("(/btw) {answer}"),
             Err(err) => format!("(/btw) failed: {err}"),
         };
@@ -6111,7 +6887,18 @@ async fn run_tan_command(
         }
     };
 
-    let tool = crate::subagents::SubagentTool::new(cwd).with_role_model_spec(role_spec);
+    // Capture before spawning: a later /model command must not retarget work
+    // the user has already delegated to this background child.
+    let parent_model = handle
+        .session()
+        .agent
+        .shared_tools()
+        .snapshot()
+        .model_scope()
+        .current();
+    let tool = crate::subagents::SubagentTool::new(cwd)
+        .with_role_model_spec(role_spec)
+        .with_parent_model(parent_model);
     // ubs:ignore Sender clone per background job — the task must own its sender
     let tx = agent_tx.clone();
     runtime_handle.spawn(async move {
@@ -6141,30 +6928,31 @@ async fn run_tan_command(
 /// Run one prompt as a controlled turn (`session_control`): its control lane
 /// is published for the UI thread, so the user can steer, queue follow-ups
 /// or abort (Escape, Ctrl-C) while it runs. Input the turn never claimed
-/// (typed as it was ending) is not lost: it runs as the next turn.
+/// (typed as it was ending) runs as the next turn after ordinary completion,
+/// or returns to the editor after an abort, failure, or run-time cap.
 async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
-    images: Vec<crate::model::ImageContent>,
+    attachments: Vec<crate::model::ContentBlock>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) {
-    let mut next = Some((prompt, images));
-    while let Some((prompt, images)) = next.take() {
+    let mut next = Some((prompt, attachments));
+    while let Some((prompt, attachments)) = next.take() {
         let (leftover, stopped) =
-            run_controlled_turn(handle, prompt, images, agent_tx, turn_control).await;
+            run_controlled_turn(handle, prompt, attachments, agent_tx, turn_control).await;
         if leftover.is_empty() {
             continue;
         }
         let text = leftover.join("\n\n");
         if stopped {
-            // The turn was aborted or failed: hand unsent messages back
-            // rather than starting another turn nobody asked for.
+            // A cap is a pause too: starting a new turn here would reset its
+            // timer and immediately resume work the user asked us to stop.
             if let Ok(owner_session_id) = handle
                 .with_session(|session| session.header.id.clone())
                 .await
             {
-                let _ = agent_tx.send(PiMsg::SetEditorText {
+                let _ = agent_tx.send(PiMsg::RestorePendingInput {
                     owner_session_id,
                     text,
                 });
@@ -6184,17 +6972,30 @@ async fn run_prompt_turn(
 }
 
 /// One controlled turn; returns the text of inputs it never claimed and
-/// whether the turn was aborted or failed.
+/// whether completion requires a pause before those inputs may run.
+#[allow(clippy::option_if_let_else)]
 async fn run_controlled_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
-    images: Vec<crate::model::ImageContent>,
+    attachments: Vec<crate::model::ContentBlock>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) -> (Vec<String>, bool) {
     // ubs:ignore Sender clone per turn — the event callback must own its sender
     let tx = agent_tx.clone();
-    let turn = handle.prompt_controlled_with_images(prompt, images, move |event| {
+    let content = if attachments.is_empty() {
+        crate::model::UserContent::Text(prompt)
+    } else {
+        let mut blocks = Vec::with_capacity(attachments.len() + 1);
+        if !prompt.is_empty() {
+            blocks.push(crate::model::ContentBlock::Text(
+                crate::model::TextContent::new(prompt),
+            ));
+        }
+        blocks.extend(attachments);
+        crate::model::UserContent::Blocks(blocks)
+    };
+    let turn = handle.prompt_controlled_input(content, move |event| {
         for msg in agent_event_to_pi_msgs(&event) {
             let _ = tx.send(msg);
         }
@@ -6212,12 +7013,17 @@ async fn run_controlled_turn(
         .into_iter()
         .map(|input| input.text)
         .collect::<Vec<_>>();
-    // An aborted or failed turn hands unsent input back instead of running it.
-    let stopped = result.is_err()
-        || matches!(
-            &result,
-            Ok(message) if message.stop_reason == crate::model::StopReason::Aborted
-        );
+    // The SDK result is the durability boundary. A successful cap must stop
+    // the outer continuation loop just like an abort or terminal failure.
+    let stopped = match &result {
+        Err(_) => true,
+        Ok(message) => {
+            matches!(
+                message.stop_reason,
+                crate::model::StopReason::Aborted | crate::model::StopReason::Error
+            ) || crate::agent::time_cap_marker(message).is_some()
+        }
+    };
     report_turn_result(result, agent_tx);
     (leftover, stopped)
 }
@@ -6247,7 +7053,13 @@ fn report_turn_result(
                     .headline();
             let _ = agent_tx.send(PiMsg::AgentError(headline));
         }
-        Ok(_) => {}
+        Ok(message) => {
+            // Synthetic cap messages have no text delta. Their lifecycle
+            // events precede persistence, so show the reason only now.
+            if let Some(marker) = crate::agent::time_cap_marker(&message) {
+                let _ = agent_tx.send(PiMsg::System(marker.to_string()));
+            }
+        }
     }
 }
 
@@ -6264,6 +7076,9 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
     // before the driver thread's runtime exists, so it cannot carry one.
     // `replacement_options` installs the live one at each construction site.
     template.runtime_handle = None;
+    // Launch flags are one-shot intent, not a standing rule for restored
+    // sessions or branches. `/prewalk` can explicitly arm the new owner.
+    template.prewalk = None;
     template
 }
 
@@ -6331,7 +7146,18 @@ fn prepare_prompt(
     cwd: &std::path::Path,
     workspace: Option<&crate::workspace::WorkspaceHandle>,
     auto_resize_images: bool,
-) -> std::result::Result<(String, Vec<crate::model::ImageContent>), String> {
+) -> std::result::Result<(String, Vec<crate::model::ContentBlock>), String> {
+    prepare_prompt_with_source(prompt, resources, cwd, workspace, auto_resize_images)
+        .map(|(text, attachments, _)| (text, attachments))
+}
+
+fn prepare_prompt_with_source(
+    prompt: &str,
+    resources: Option<&crate::resources::ResourceLoader>,
+    cwd: &std::path::Path,
+    workspace: Option<&crate::workspace::WorkspaceHandle>,
+    auto_resize_images: bool,
+) -> std::result::Result<(String, Vec<crate::model::ContentBlock>, String), String> {
     let expand = |text: &str| resources.map_or_else(|| text.to_string(), |r| r.expand_input(text));
     let (without_refs, refs) = crate::interactive::extract_file_references(prompt, |path| {
         crate::tools::resolve_read_path(path, cwd)
@@ -6339,7 +7165,7 @@ fn prepare_prompt(
             .then(|| path.to_string())
     });
     if refs.is_empty() {
-        return Ok((expand(prompt), Vec::new()));
+        return Ok((expand(prompt), Vec::new(), prompt.to_string()));
     }
     let single;
     #[allow(clippy::option_if_let_else)]
@@ -6353,11 +7179,12 @@ fn prepare_prompt(
     let processed = crate::tools::process_file_arguments(&refs, cwd, auto_resize_images, workspace)
         .map_err(|err| err.to_string())?;
     let mut text = processed.text;
-    let message = expand(without_refs.trim());
+    let keyword_scan_source = without_refs.trim().to_string();
+    let message = expand(&keyword_scan_source);
     if !message.trim().is_empty() {
         text.push_str(&message);
     }
-    Ok((text, processed.images))
+    Ok((text, processed.attachments, keyword_scan_source))
 }
 
 /// Run what the user typed as a turn: `@file` references, `/skill:name`
@@ -6374,16 +7201,34 @@ async fn run_typed_prompt(
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) {
+    // Startup text reaches the driver before the editor's slash router.
+    // Resolve live extension ownership before expanding a same-name template
+    // or reading file-looking command arguments.
+    let registered = handle.extension_manager().and_then(|manager| {
+        registered_prompt_command(&extension_commands_for_catalog(manager), &prompt)
+    });
+    if let Some((name, args)) = registered {
+        run_extension_command(handle, cwd, &name, &args, true, agent_tx).await;
+        return;
+    }
     let workspace = handle.workspace();
-    match prepare_prompt(
+    match prepare_prompt_with_source(
         &prompt,
         resources,
         cwd,
         workspace.as_ref(),
         auto_resize_images,
     ) {
-        Ok((text, images)) => {
-            run_prompt_turn(handle, text, images, agent_tx, turn_control).await;
+        Ok((text, attachments, keyword_scan_source)) => {
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(Some(keyword_scan_source));
+            run_prompt_turn(handle, text, attachments, agent_tx, turn_control).await;
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(None);
         }
         Err(err) => {
             if let Ok(owner_session_id) = handle
@@ -6398,6 +7243,120 @@ async fn run_typed_prompt(
             let _ = agent_tx.send(PiMsg::AgentError(format!("Not sent: {err}")));
         }
     }
+}
+
+fn registered_prompt_command(
+    commands: &[crate::autocomplete::NamedEntry],
+    input: &str,
+) -> Option<(String, String)> {
+    let clean = input.trim();
+    if !clean.starts_with('/') {
+        return None;
+    }
+    let (token, args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+    extension_command_name(commands, token).map(|name| (name.to_string(), args.trim().to_string()))
+}
+
+/// Expand only the authored suffix. The prefix contains already-read file
+/// bodies and references; parsing it as fresh input would reread files and
+/// let generated content acquire command or magic-keyword authority.
+fn expand_initial_prompt(
+    mut initial: crate::app::InitialMessage,
+    resources: Option<&crate::resources::ResourceLoader>,
+) -> crate::app::InitialMessage {
+    if let Some(resources) = resources
+        && let Some(prefix_len) = initial
+            .text
+            .strip_suffix(&initial.keyword_scan_source)
+            .map(str::len)
+    {
+        let expanded = resources.expand_input(&initial.keyword_scan_source);
+        initial.text.truncate(prefix_len);
+        initial.text.push_str(&expanded);
+    }
+    initial
+}
+
+/// Transcript-only rendering: attachment payloads never become display text.
+fn prompt_display(text: &str, attachments: &[crate::model::ContentBlock]) -> String {
+    use crate::model::ContentBlock;
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(text.to_string());
+    }
+    for block in attachments {
+        match block {
+            ContentBlock::Text(text) => parts.push(text.text.clone()),
+            ContentBlock::Image(image) => parts.push(format!("[Image: {}]", image.mime_type)),
+            ContentBlock::Media(media) => parts.push(format!(
+                "[Media: {}, {}, {}]",
+                media.name.as_deref().unwrap_or("unnamed"),
+                media.mime_type,
+                crate::model::format_media_size(media.decoded_size_bytes())
+            )),
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+async fn publish_submitted_input(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+    text: String,
+    history_text: String,
+) -> bool {
+    match handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    {
+        Ok(owner_session_id) => agent_tx
+            .send(PiMsg::UserInputSubmitted {
+                owner_session_id,
+                text,
+                history_text,
+            })
+            .is_ok(),
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("startup input: {err}")));
+            false
+        }
+    }
+}
+
+async fn run_initial_prompt(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    pending: &mut Option<crate::app::InitialMessage>,
+    resources: Option<&crate::resources::ResourceLoader>,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) {
+    let Some(initial) = pending.take() else {
+        return;
+    };
+    if !publish_submitted_input(
+        handle,
+        agent_tx,
+        prompt_display(&initial.text, &initial.attachments),
+        initial.keyword_scan_source.clone(),
+    )
+    .await
+    {
+        return;
+    }
+    let initial = expand_initial_prompt(initial, resources);
+    let content = crate::app::build_initial_content(&initial);
+    handle
+        .session_mut()
+        .agent
+        .set_magic_keyword_scan_override(Some(initial.keyword_scan_source));
+    run_prompt_turn(handle, String::new(), content, agent_tx, turn_control).await;
+    // A rejection before the Agent loop consumes its one-shot provenance
+    // must not affect a later user-entered prompt.
+    handle
+        .session_mut()
+        .agent
+        .set_magic_keyword_scan_override(None);
 }
 
 /// `/name args` as a prompt-template turn: the expanded text when `name` is
@@ -6430,21 +7389,35 @@ async fn run_extension_command(
     cwd: &std::path::Path,
     name: &str,
     args: &str,
+    expected_registration: bool,
     agent_tx: &Sender<PiMsg>,
 ) {
+    let unavailable = |extensions_enabled| {
+        if expected_registration {
+            format!(
+                "Extension command '/{name}' is no longer registered; submit it again to use the current command."
+            )
+        } else {
+            unrouted_command_message(name, extensions_enabled)
+        }
+    };
     let manager = handle
         .session()
         .extensions
         .as_ref()
         .map(|region| region.manager().clone());
     let Some(manager) = manager else {
-        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, false)));
+        let _ = agent_tx.send(PiMsg::System(unavailable(false)));
         return;
     };
-    if !manager.has_command(name) {
-        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, true)));
+    // Re-resolve against the current runtime: the UI may have queued this
+    // command before a reload replaced or removed its registration. Never
+    // reinterpret that stale command as a built-in with different effects.
+    let commands = extension_commands_for_catalog(&manager);
+    let Some(name) = extension_command_name(&commands, name) else {
+        let _ = agent_tx.send(PiMsg::System(unavailable(true)));
         return;
-    }
+    };
     let Some(runtime) = manager.runtime() else {
         let _ = agent_tx.send(PiMsg::System(format!(
             "Extension command '/{name}' is not available (runtime not enabled)"
@@ -6487,7 +7460,7 @@ async fn run_extension_command(
 /// Handle the default FTUI's MCP control surface against the manager owned by
 /// this exact SDK session (bd-vjfol).
 async fn run_mcp_command(
-    handle: &mut crate::sdk::AgentSessionHandle,
+    handle: &crate::sdk::AgentSessionHandle,
     subcommand: &str,
     name: Option<&str>,
     agent_tx: &Sender<PiMsg>,
@@ -6538,10 +7511,10 @@ async fn run_mcp_command(
             return;
         }
     };
+    let changed = crate::mcp::reconcile_tools(&manager, &handle.session().agent.shared_tools());
     let message = match outcome {
         Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
         Ok(tools) => {
-            let mounted = handle.mount_mcp_server_tools_if_absent(name);
             let verb = if subcommand == "test" {
                 "tested"
             } else {
@@ -6557,10 +7530,10 @@ async fn run_mcp_command(
             if tools.len() > 12 {
                 let _ = writeln!(line, "  … and {} more", tools.len() - 12);
             }
-            if mounted > 0 {
+            if changed > 0 {
                 let _ = writeln!(
                     line,
-                    "Mounted {mounted} new mcp__* tool(s) into the live session."
+                    "Updated {changed} MCP tool definition(s) in the live session."
                 );
             }
             line
@@ -6568,6 +7541,94 @@ async fn run_mcp_command(
         Err(err) => format!("MCP {name:?}: {err}"),
     };
     let _ = agent_tx.send(PiMsg::System(message));
+}
+
+/// Operator-owned browser login, separate from an LLM turn.
+async fn run_mcp_auth_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    subcommand: &str,
+    name: &str,
+    request: &McpAuthRequest,
+    turn_abort: &TurnAbortSlot,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let finish = |message: String| {
+        *turn_abort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = agent_tx.send(PiMsg::McpAuthFinished {
+            request_id: request.id.clone(),
+            message,
+        });
+    };
+    let abort_signal = request.abort.signal();
+    *turn_abort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.abort.clone());
+    if abort_signal.is_aborted() {
+        finish("MCP authentication cancelled".to_string());
+        return;
+    }
+    let Some(manager) = handle.mcp_manager() else {
+        finish("MCP discovery is disabled".to_string());
+        return;
+    };
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    let output_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_failed = Arc::clone(&output_failed);
+    let callback_tx = agent_tx.clone();
+    let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+        if callback_tx
+            .send(PiMsg::SystemNote(format!(
+                "Open this URL to sign in to the MCP server:\n{url}\n"
+            )))
+            .is_err()
+        {
+            callback_failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+    let work = owner.with_current(async {
+        let current_session = handle
+            .with_session(|session| session.header.id.clone())
+            .await?;
+        if current_session != request.owner_session_id {
+            return Err(crate::error::Error::validation(
+                "MCP authentication cancelled: the session changed before it started",
+            ));
+        }
+        if subcommand == "reauth" {
+            manager.reauthenticate(name, None, on_url).await
+        } else {
+            manager.unauthenticate(name).await
+        }
+    });
+    let cancelled = async {
+        while !abort_signal.is_aborted()
+            && !owner.is_cancel_requested()
+            && !output_failed.load(std::sync::atomic::Ordering::Acquire)
+        {
+            owner.time().sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let outcome = match futures::future::select(Box::pin(cancelled), Box::pin(work)).await {
+        futures::future::Either::Left(((), pending)) => {
+            drop(pending);
+            Err(crate::error::Error::tool(
+                "mcp",
+                "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
+            ))
+        }
+        futures::future::Either::Right((result, _)) => result,
+    };
+    crate::mcp::reconcile_tools(&manager, &handle.session().agent.shared_tools());
+    let message = match outcome {
+        Ok(()) if subcommand == "unauth" => format!(
+            "Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."
+        ),
+        Ok(()) => format!("Signed in to MCP server {name:?}; its tool catalog has been refreshed."),
+        Err(error) => format!("MCP {name:?}: {error}"),
+    };
+    finish(message);
 }
 
 /// A `/login` waiting for the user's input, with the localhost callback
@@ -6685,7 +7746,7 @@ fn adopt_stored_credentials(
     auth_path: &std::path::Path,
 ) {
     match crate::auth::AuthStorage::load(auth_path.to_path_buf()) {
-        Ok(auth) => handle.session_mut().adopt_auth_storage(auth),
+        Ok(auth) => handle.adopt_auth_storage(auth),
         Err(err) => tracing::warn!(
             event = "ftui.login.adopt_credentials_failed",
             error = %err,
@@ -6714,6 +7775,42 @@ async fn run_set_model_command(
         Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
     };
     let _ = agent_tx.send(msg);
+}
+
+async fn run_prewalk_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    action: &str,
+    default_target: Option<&crate::prewalk::PrewalkTarget>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let message = match action {
+        "off" => {
+            handle.disarm_prewalk();
+            PiMsg::System(String::from("Prewalk disarmed"))
+        }
+        "status" => PiMsg::System(handle.prewalk_target().map_or_else(
+            || String::from("Prewalk is not armed"),
+            |target| format!("Prewalk armed → {}", target.label()),
+        )),
+        _ => {
+            let target = handle.prewalk_target().or(default_target).cloned();
+            match target {
+                Some(target) => match handle.arm_prewalk(target).await {
+                    Ok(Some(target)) => {
+                        PiMsg::System(format!("Prewalk armed → {}", target.label()))
+                    }
+                    Ok(None) => PiMsg::System(String::from(
+                        "Prewalk: nothing to switch; target model and thinking already match",
+                    )),
+                    Err(error) => PiMsg::AgentError(format!("Prewalk: {error}")),
+                },
+                None => PiMsg::AgentError(String::from(
+                    "Prewalk requires a configured @smol model; set --smol provider/model or modelRoles.smol",
+                )),
+            }
+        }
+    };
+    let _ = agent_tx.send(message);
 }
 
 /// Handle `/compact` in the driver: run compaction with events translated to
@@ -6785,6 +7882,7 @@ async fn complete_replacement_after_shutdown(
 /// after the old handle completes awaited shutdown so singleton servers never
 /// overlap and the previous session flushes before replacement.
 /// Construction failures surface as UI errors and keep the current session.
+/// Returns whether a replacement completed; errors report terminal cleanup.
 async fn new_session_command(
     template: &crate::sdk::SessionOptions,
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -6792,7 +7890,7 @@ async fn new_session_command(
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let (provider, model_id) = handle.model();
     let mut options = replacement_options(template, ext_handler, runtime_handle);
     // `thinking` is deliberately left as the template carries it: that is the
@@ -6813,13 +7911,14 @@ async fn new_session_command(
                             "Uncommitted new session cleanup issue: {issue}"
                         )));
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             // Commit the candidate before teardown begins. Cancellation during
             // any later await can no longer leave a partially decommissioned
             // old handle installed as the current session.
             let old_handle = std::mem::replace(handle, new_handle);
+            ext_handler.install_command_registry(handle);
             if let Some(ask) = old_handle.ask_tool() {
                 ask.close_channel_ui();
             }
@@ -6859,12 +7958,13 @@ async fn new_session_command(
                 |entry| crate::interactive::model_display_label(&entry),
             );
             let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {label}")));
+            Ok(true)
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("new session: {err}")));
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Handle `/session`: report the live session's file/id/name/model/thinking/
@@ -7740,8 +8840,13 @@ fn run_undo_command(
 }
 
 /// Handle `/usage` in the driver (bd-cv653.7.4): read-only quota table.
-async fn run_usage_command(refresh: bool, agent_tx: &Sender<PiMsg>) {
-    let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+async fn run_usage_command(cwd: &std::path::Path, refresh: bool, agent_tx: &Sender<PiMsg>) {
+    let auth =
+        crate::auth::AuthStorage::load(crate::config::Config::auth_path()).and_then(|mut auth| {
+            auth.set_command_working_directory(cwd)?;
+            Ok(auth)
+        });
+    let message = match auth {
         Ok(auth) => {
             let rows = crate::usage::gather_usage(&auth, refresh).await;
             crate::usage::render_usage_text(&rows)
@@ -7771,9 +8876,6 @@ fn build_fork_session(
         .header
         .thinking_level
         .clone_from(&source.header.thinking_level);
-    if let Some(parent) = source.path.as_ref() {
-        forked.set_branched_from(Some(parent.display().to_string()));
-    }
     forked.init_from_fork_plan(plan);
     Ok((forked, selected_text))
 }
@@ -7936,7 +9038,7 @@ async fn reload_session_command(
             return Ok(());
         }
     };
-    match saved {
+    let replaced = match saved {
         Some(path) => {
             Box::pin(resume_session_command(
                 &path.to_string_lossy(),
@@ -7947,7 +9049,7 @@ async fn reload_session_command(
                 agent_tx,
                 runtime_handle,
             ))
-            .await?;
+            .await?
         }
         None if empty => {
             Box::pin(new_session_command(
@@ -7958,7 +9060,7 @@ async fn reload_session_command(
                 agent_tx,
                 runtime_handle,
             ))
-            .await?;
+            .await?
         }
         None => {
             let _ = agent_tx.send(PiMsg::AgentError(String::from(
@@ -7967,6 +9069,9 @@ async fn reload_session_command(
             )));
             return Ok(());
         }
+    };
+    if !replaced {
+        return Ok(());
     }
     let _ = agent_tx.send(PiMsg::System(String::from(
         "Reloaded extensions, skills, prompt templates, themes and context files.",
@@ -7978,7 +9083,7 @@ async fn reload_session_command(
 /// launch selection preserved, await the previous handle's shutdown before
 /// starting the replacement's MCP servers, rewire the ask bridge, and replay
 /// the conversation into the UI. Construction failures keep the current
-/// session.
+/// session. Returns whether replacement completed; errors report terminal cleanup.
 async fn resume_session_command(
     path: &str,
     template: &crate::sdk::SessionOptions,
@@ -7987,25 +9092,23 @@ async fn resume_session_command(
     ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let mut options = replacement_options(template, ext_handler, runtime_handle);
     options.session_path = Some(std::path::PathBuf::from(path));
+    // `/reload` resumes this same file. Flush the outgoing session before
+    // constructing its replacement so the new context includes pending rows.
+    // No runtime resources are stopped until the candidate is installed.
+    let prepared = match handle.preflight_replacement().await {
+        Ok(prepared) => prepared,
+        Err(shutdown) => {
+            report_replacement_shutdown_failure(&shutdown, agent_tx);
+            return Ok(false);
+        }
+    };
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
-            let prepared = match handle.preflight_replacement().await {
-                Ok(prepared) => prepared,
-                Err(shutdown) => {
-                    report_replacement_shutdown_failure(&shutdown, agent_tx);
-                    let cleanup = new_handle.discard_uncommitted_resources().await;
-                    for issue in cleanup.messages() {
-                        let _ = agent_tx.send(PiMsg::System(format!(
-                            "Uncommitted resumed session cleanup issue: {issue}"
-                        )));
-                    }
-                    return Ok(());
-                }
-            };
             let old_handle = std::mem::replace(handle, new_handle);
+            ext_handler.install_command_registry(handle);
             if let Some(ask) = old_handle.ask_tool() {
                 ask.close_channel_ui();
             }
@@ -8027,28 +9130,33 @@ async fn resume_session_command(
             if let Ok(Some(name)) = handle.with_session(crate::session::Session::get_name).await {
                 let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
             }
+            Ok(true)
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("resume: {err}")));
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Snapshot the handle's conversation and reset the UI transcript from it.
 /// `/retry` driver half: branch the session back to before the last user
-/// turn and replay the history (with the turn's text) into the transcript.
-/// Returns the text to re-send, or `None` after reporting why not.
+/// turn and replay the history into the transcript. The display projection
+/// carries labels while the returned native content retains every payload.
 async fn prepare_retry_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     agent_tx: &Sender<PiMsg>,
-) -> Option<String> {
-    let text = match handle.prepare_retry().await {
-        Ok(text) => text,
+) -> Option<crate::model::UserContent> {
+    let content = match handle.prepare_retry_content().await {
+        Ok(content) => content,
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("retry: {err}")));
             return None;
         }
+    };
+    let text = match &content {
+        crate::model::UserContent::Text(text) => text.clone(),
+        crate::model::UserContent::Blocks(blocks) => prompt_display("", blocks),
     };
     let snapshot = handle
         .with_session(|session| {
@@ -8062,16 +9170,43 @@ async fn prepare_retry_turn(
                 session_id,
                 messages,
                 usage,
-                text: text.clone(),
+                text,
                 status: Some(String::from("Retrying last turn")),
             });
-            Some(text)
+            Some(content)
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("retry: {err}")));
             None
         }
     }
+}
+
+async fn run_retry_turn(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) {
+    let Some(content) = prepare_retry_turn(handle, agent_tx).await else {
+        return;
+    };
+    let (text, attachments) = match content {
+        crate::model::UserContent::Text(text) => (text, Vec::new()),
+        crate::model::UserContent::Blocks(blocks) => {
+            // Persisted blocks have no surviving authored-source boundary;
+            // retry must not activate file-body or template keywords.
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(Some(String::new()));
+            (String::new(), blocks)
+        }
+    };
+    run_prompt_turn(handle, text, attachments, agent_tx, turn_control).await;
+    handle
+        .session_mut()
+        .agent
+        .set_magic_keyword_scan_override(None);
 }
 
 async fn send_conversation_reset(
@@ -8209,8 +9344,12 @@ async fn create_driver_session(
     agent_tx: &Sender<PiMsg>,
     ext_reply_rx: std::sync::mpsc::Receiver<ExtensionUiResponse>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
+    command_registry: &ExtensionCommandRegistry,
 ) -> Option<(crate::sdk::AgentSessionHandle, Arc<FtuiExtensionUiHandler>)> {
-    let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+    let ext_handler = Arc::new(FtuiExtensionUiHandler {
+        command_registry: Arc::downgrade(command_registry),
+        ..FtuiExtensionUiHandler::new(agent_tx.clone())
+    });
     session_options.extension_ui_handler =
         Some(Arc::clone(&ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
     // The driver runtime is what extension observation events are dispatched
@@ -8220,7 +9359,10 @@ async fn create_driver_session(
     session_options.runtime_handle = Some(runtime_handle.clone());
     spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
     match crate::sdk::create_agent_session(session_options).await {
-        Ok(handle) => Some((handle, ext_handler)),
+        Ok(handle) => {
+            ext_handler.install_command_registry(&handle);
+            Some((handle, ext_handler))
+        }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
             None
@@ -8228,7 +9370,85 @@ async fn create_driver_session(
     }
 }
 
-/// Working directory for `!` bash commands in the driver.
+/// Resolve the standalone frontend's workspace before the UI and driver copy
+/// launch options. The CLI already supplies both cwd and the shared root set;
+/// the SDK remains responsible for validating its actual session open.
+async fn prepare_driver_session_options(
+    mut options: crate::sdk::SessionOptions,
+) -> crate::error::Result<crate::sdk::SessionOptions> {
+    let process_cwd = std::env::current_dir()?;
+    let resolve = |path: &std::path::Path, base: &std::path::Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        }
+    };
+    let requested_cwd = options
+        .working_directory
+        .as_deref()
+        .map_or_else(|| process_cwd.clone(), |path| resolve(path, &process_cwd));
+    // Locators belong to the caller's requested directory, even if their
+    // saved transcript is attached to another workspace.
+    options.session_path = options
+        .session_path
+        .as_deref()
+        .map(|path| resolve(path, &requested_cwd));
+    options.session_dir = options
+        .session_dir
+        .as_deref()
+        .map(|path| resolve(path, &requested_cwd));
+    if options.working_directory.is_some() && options.workspace.is_some() {
+        options.working_directory = Some(requested_cwd);
+        return Ok(options);
+    }
+
+    let mut cwd = requested_cwd.clone();
+    let mut additional_roots = Vec::new();
+    if !options.no_session
+        && let Some(path) = options.session_path.as_deref()
+        && crate::session::session_path_entry_exists(path)?
+    {
+        let saved = crate::session_workdir::inspect_saved_session_workdir(path).await?;
+        cwd = saved.resolve_runtime_cwd(
+            options
+                .working_directory
+                .as_ref()
+                .map(|_| requested_cwd.as_path()),
+        )?;
+        if let Some(workspace) = &options.workspace {
+            saved.check_runtime_cwd(workspace.snapshot_or(&cwd).primary())?;
+        }
+        let source = saved.source_path.to_str().ok_or_else(|| {
+            crate::error::Error::session(
+                "PI_SESSION_WORKDIR_INVALID_ENCODING: session path must be UTF-8",
+            )
+        })?;
+        let session = crate::session::Session::open(source).await?;
+        saved.check_loaded_session(&session)?;
+        saved.check_runtime_cwd(&cwd)?;
+        additional_roots = session.additional_roots();
+        options.session_path = Some(saved.source_path);
+    }
+    if options.workspace.is_none() {
+        let mut workspace = crate::workspace::WorkspaceHandle::single(&cwd);
+        for root in additional_roots {
+            if !root.is_absolute() {
+                tracing::warn!(path = %root.display(), "Skipping non-absolute saved workspace root");
+                continue;
+            }
+            match crate::workspace::validate_new_root(&root) {
+                Ok(canonical) => workspace.add_root(&canonical),
+                Err(error) => tracing::warn!(%error, "Skipping unavailable saved workspace root"),
+            }
+        }
+        options.workspace = Some(workspace);
+    }
+    options.working_directory = Some(cwd);
+    Ok(options)
+}
+
+/// Working directory for `!` bash commands in the prepared driver options.
 fn driver_bash_cwd(session_options: &crate::sdk::SessionOptions) -> std::path::PathBuf {
     session_options
         .working_directory
@@ -8290,6 +9510,9 @@ pub struct FtuiSettings {
     /// `/btw` side-question client for the smol role model, when it resolves
     /// with credentials.
     pub btw_client: Option<Arc<crate::btw::BtwClient>>,
+    /// Optional tiny/smol client for naming a new saved session after its
+    /// first successful exchange.
+    pub title_client: Option<Arc<crate::session_title::TitleClient>>,
     /// The `hideThinkingBlock` setting: start with thinking collapsed to
     /// one line (ctrl+t still shows it). Off, as in OMP and classic, shows
     /// thinking in full.
@@ -8300,6 +9523,41 @@ pub struct FtuiSettings {
     pub model_names: HashMap<String, String>,
     /// `--plan-mode`: start in planning, as the classic stack does.
     pub start_in_plan_mode: bool,
+    /// Resolved @smol destination for `/prewalk`; admission checks credentials.
+    pub prewalk_target: Option<crate::prewalk::PrewalkTarget>,
+    /// CLI files and their first authored message, already read and bounded.
+    pub initial_content: Option<crate::app::InitialMessage>,
+    /// Remaining CLI messages, routed through the ordinary prompt path.
+    pub initial_messages: Vec<String>,
+}
+
+fn queue_initial_commands(
+    submit_tx: &Sender<UiCommand>,
+    start_in_plan_mode: bool,
+    has_initial_content: bool,
+    messages: Vec<String>,
+) -> std::io::Result<usize> {
+    let send = |command| {
+        submit_tx
+            .send(command)
+            .map_err(|_| std::io::Error::other("FTUI startup command queue closed"))
+    };
+    if start_in_plan_mode {
+        send(UiCommand::Plan {
+            action: String::from("enter"),
+        })?;
+    }
+    if has_initial_content {
+        send(UiCommand::InitialPrompt)?;
+    }
+    let mut count = 0;
+    for message in messages {
+        if !message.trim().is_empty() {
+            send(UiCommand::Prompt(message))?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8310,9 +9568,24 @@ pub fn run(
     available_models: Vec<String>,
     available_sessions: Vec<(String, String)>,
     settings: FtuiSettings,
-    autocomplete: AutocompleteLaunch,
+    mut autocomplete: AutocompleteLaunch,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
+    // This synchronous boundary precedes terminal ownership and driver
+    // creation. Native metadata I/O uses its own workers; no provider,
+    // extension or MCP startup is run on this thread.
+    let supplied_workspace =
+        session_options.working_directory.is_some() && session_options.workspace.is_some();
+    let session_options =
+        futures::executor::block_on(prepare_driver_session_options(session_options))
+            .map_err(std::io::Error::other)?;
+    let bash_cwd = driver_bash_cwd(&session_options);
+    let workspace = session_options.workspace.clone();
+    autocomplete.cwd.clone_from(&bash_cwd);
+    if !supplied_workspace && let Some(source) = &mut autocomplete.resource_source {
+        source.package_manager = crate::package_manager::PackageManager::new(bash_cwd.clone())
+            .with_project_trust(session_options.workspace_trusted);
+    }
     let FtuiSettings {
         markdown_spacing,
         gh_path,
@@ -8320,11 +9593,16 @@ pub fn run(
         subagent_role_spec,
         cycle_models,
         btw_client,
+        title_client,
         hide_thinking_block,
         double_escape_action,
         model_names,
         start_in_plan_mode,
+        prewalk_target,
+        mut initial_content,
+        initial_messages,
     } = settings;
+    let prewalk_requested = session_options.prewalk.is_some();
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
         available_models.clone()
@@ -8342,30 +9620,54 @@ pub fn run(
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
     let mut driver_resources = autocomplete.resources.clone();
-    let resource_source = autocomplete.resource_source.clone();
+    let mut resource_source = autocomplete.resource_source.clone();
     // `images.autoResize` from settings; default on, as on the classic stack.
-    let auto_resize_images = resource_source
+    let mut auto_resize_images = resource_source
         .as_ref()
         .is_none_or(|source| source.config.image_auto_resize());
+    let mut settings_config = resource_source
+        .as_ref()
+        .map(|source| source.config.clone())
+        .unwrap_or_default();
+    // Match the effective launch preferences, including caller overrides.
+    settings_config.hide_thinking_block = Some(hide_thinking_block);
+    settings_config.markdown.get_or_insert_default().spacing = Some(markdown_spacing);
+    settings_config.autocomplete_max_visible =
+        u32::try_from(autocomplete.max_visible.clamp(1, 20)).ok();
+    settings_config.double_escape_action = Some(
+        match double_escape_action {
+            DoubleEscapeAction::Rewind => "rewind",
+            DoubleEscapeAction::Fork => "fork",
+            DoubleEscapeAction::Tree => "tree",
+            DoubleEscapeAction::None => "none",
+        }
+        .to_string(),
+    );
+    let settings_path = settings::settings_destination(
+        crate::config::Config::config_path_override_from_env(&bash_cwd).as_deref(),
+        &crate::config::Config::global_dir(),
+        &bash_cwd,
+        session_options.workspace_trusted,
+    );
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
-    // `--plan-mode` enters planning the way `/plan` does. Queued before the
-    // UI exists, the driver runs it as soon as its session is ready.
-    if start_in_plan_mode {
-        let _ = submit_tx.send(UiCommand::Plan {
-            action: String::from("enter"),
-        });
-    }
+    // Planning precedes every startup turn. Files have already been read by
+    // main; queue a one-shot marker and move their payload into the driver.
+    let mut initial_messages_remaining = queue_initial_commands(
+        &submit_tx,
+        start_in_plan_mode,
+        initial_content.is_some(),
+        initial_messages,
+    )?;
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
-    let bash_cwd = driver_bash_cwd(&session_options);
     let resume_cwd = bash_cwd.display().to_string();
     let bash_shell = resource_source
         .as_ref()
         .map(|source| BashUiShell::from_config(&source.config))
         .unwrap_or_default();
-    let resume_template = resume_template_from(&session_options);
+    let mut resume_template = resume_template_from(&session_options);
     // Issue #205: shared slot so Ctrl-C on the UI thread can abort the
     // driver's in-flight prompt turn instead of waiting it out.
     let turn_abort: TurnAbortSlot = Arc::new(Mutex::new(None));
@@ -8374,6 +9676,8 @@ pub fn run(
     // follow-ups and aborts through it while the driver awaits the turn.
     let turn_control: TurnControlSlot = Arc::new(Mutex::new(None));
     let driver_turn_control = Arc::clone(&turn_control);
+    let command_registry: ExtensionCommandRegistry = Arc::default();
+    let driver_command_registry = Arc::clone(&command_registry);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -8403,27 +9707,41 @@ pub fn run(
                     &agent_tx,
                     ext_reply_rx,
                     &runtime_handle,
+                    &driver_command_registry,
                 ))
                 .await?;
+                let mut settings_controller =
+                    settings::SettingsController::new(settings_config, settings_path, &handle);
+                // Replacements must retain the exact live root set, including
+                // saved roots the SDK restored and later /remove-dir changes.
+                resume_template.workspace = handle.workspace();
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
+                // Publish extension ownership before the initial ready/reset
+                // event, so completion and routing use the live session.
+                let mut info_catalog = driver_catalog;
+                refresh_extension_commands(&handle, &mut info_catalog, &agent_tx);
                 send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
-                Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
-                // Issue #208: extension-contributed slash commands become
-                // completable now that the extension runtime is up.
-                // Resource catalog for the info commands (/skills).
-                let mut info_catalog = driver_catalog.clone();
-                if let Some(manager) = handle.extension_manager() {
-                    let mut catalog = driver_catalog;
-                    catalog.extension_commands = extension_commands_for_catalog(manager);
-                    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog));
+                if prewalk_requested {
+                    let note = handle.prewalk_target().map_or_else(
+                        || String::from("Prewalk: nothing to switch; target model and thinking already match"),
+                        |target| format!("Prewalk armed → {}", target.label()),
+                    );
+                    let _ = agent_tx.send(PiMsg::SystemNote(note));
                 }
+                Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                 // Issue #200: a session opened named at launch (--session)
                 // titles the terminal tab after itself immediately.
                 if let Ok(Some(name)) = handle.with_session(crate::session::Session::get_name).await
                 {
                     let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
                 }
+                let mut auto_title = Box::new(
+                    handle
+                        .with_session(crate::session_title::AutoTitleController::for_session)
+                        .await
+                        .unwrap_or_default(),
+                );
                 let mut plans = plan_commands::PlanController::default();
                 let mut replacement_failure = None;
                 // The `/login` waiting for input, if any (boxed: the driver
@@ -8433,9 +9751,22 @@ pub fn run(
                     let received = submit_rx.try_recv();
                     // Every handled command may change what the status line
                     // shows (model, thinking, mode, session, usage).
-                    let refresh_status = received.is_ok();
+                    let mut refresh_status = received.is_ok();
                     match received {
                         Ok(UiCommand::Prompt(prompt)) => {
+                            if initial_messages_remaining > 0 {
+                                initial_messages_remaining -= 1;
+                                if !publish_submitted_input(
+                                    &handle,
+                                    &agent_tx,
+                                    prompt.clone(),
+                                    prompt.clone(),
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                            }
                             run_typed_prompt(
                                 &mut handle,
                                 prompt,
@@ -8447,8 +9778,65 @@ pub fn run(
                             )
                             .await;
                         }
+                        Ok(UiCommand::InitialPrompt) => {
+                            run_initial_prompt(
+                                &mut handle,
+                                &mut initial_content,
+                                driver_resources.as_ref(),
+                                &agent_tx,
+                                &driver_turn_control,
+                            )
+                            .await;
+                        }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Prewalk { action }) => {
+                            run_prewalk_command(&mut handle, &action, prewalk_target.as_ref(), &agent_tx).await;
+                        }
+                        Ok(UiCommand::Settings) => {
+                            let _ = agent_tx.send(PiMsg::Settings {
+                                snapshot: settings_controller.snapshot(&handle),
+                                changed: None,
+                            });
+                        }
+                        Ok(UiCommand::SetSetting { key, value }) => {
+                            let (snapshot, changed) =
+                                match settings_controller.apply(&mut handle, key, &value) {
+                                    Ok(snapshot) => {
+                                        auto_resize_images = snapshot.auto_resize_images;
+                                        if matches!(
+                                            key,
+                                            SettingsKey::AutoRetry
+                                                | SettingsKey::ModelFallback
+                                                | SettingsKey::FallbackOn
+                                        ) {
+                                            resume_template.retry = handle.retry_policy();
+                                        }
+                                        if key == SettingsKey::AutoCompaction
+                                            && let Some(compaction) =
+                                                &mut resume_template.compaction_settings
+                                        {
+                                            compaction.enabled = snapshot.auto_compaction;
+                                        }
+                                        if let Some(source) = &mut resource_source {
+                                            source.config = settings_controller.config().clone();
+                                        }
+                                        let _ = agent_tx.send(PiMsg::System(format!(
+                                            "{}: {} (saved)",
+                                            key.label(),
+                                            snapshot.value(key),
+                                        )));
+                                        (snapshot, Some(key))
+                                    }
+                                    Err(err) => {
+                                        let _ = agent_tx.send(PiMsg::AgentError(format!(
+                                            "Settings could not be saved: {err}. Live settings are unchanged.",
+                                        )));
+                                        (settings_controller.snapshot(&handle), None)
+                                    }
+                                };
+                            let _ = agent_tx.send(PiMsg::Settings { snapshot, changed });
                         }
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // `!` semantics: the output becomes the next
@@ -8476,6 +9864,9 @@ pub fn run(
                         Ok(UiCommand::Compact) => {
                             run_compact_command(&mut handle, false, &agent_tx).await;
                         }
+                        Ok(UiCommand::Handoff { focus, request }) => {
+                            run_handoff_command(&mut handle, &focus, request, &agent_tx).await;
+                        }
                         Ok(UiCommand::Shake) => {
                             run_compact_command(&mut handle, true, &agent_tx).await;
                         }
@@ -8495,11 +9886,17 @@ pub fn run(
                             run_undo_command(&handle, count, force, redo, &agent_tx);
                         }
                         Ok(UiCommand::Usage { refresh }) => {
-                            run_usage_command(refresh, &agent_tx).await;
+                            run_usage_command(&bash_cwd, refresh, &agent_tx).await;
+                        }
+                        Ok(UiCommand::McpAuth { subcommand, name, request }) => {
+                            run_mcp_auth_command(
+                                &handle, &subcommand, &name, &request, &driver_turn_abort, &agent_tx,
+                            ).await;
                         }
                         Ok(UiCommand::Mcp { subcommand, name }) => {
-                            run_mcp_command(&mut handle, &subcommand, name.as_deref(), &agent_tx)
-                                .await;
+                            run_mcp_command(
+                                &handle, &subcommand, name.as_deref(), &agent_tx,
+                            ).await;
                         }
                         Ok(UiCommand::ExtensionCommand { name, args }) => {
                             // A prompt template runs as a turn, unless an
@@ -8529,11 +9926,18 @@ pub fn run(
                                 )
                                 .await;
                             } else {
-                                run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
-                                    .await;
+                                run_extension_command(
+                                    &handle, &bash_cwd, &name, &args, false, &agent_tx,
+                                )
+                                .await;
                             }
                         }
+                        Ok(UiCommand::RegisteredExtensionCommand { name, args }) => {
+                            run_extension_command(&handle, &bash_cwd, &name, &args, true, &agent_tx)
+                                .await;
+                        }
                         Ok(UiCommand::ResumeSession { path }) => {
+                            auto_title.cancel_pending();
                             plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(resume_session_command(
@@ -8552,6 +9956,7 @@ pub fn run(
                             }
                         }
                         Ok(UiCommand::DeleteSession) => {
+                            auto_title.cancel_pending();
                             // Only a file that exists: a new or in-memory
                             // session has nothing to delete.
                             let doomed = handle
@@ -8617,6 +10022,7 @@ pub fn run(
                             });
                         }
                         Ok(UiCommand::NewSession) => {
+                            auto_title.cancel_pending();
                             plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(new_session_command(
@@ -8646,6 +10052,15 @@ pub fn run(
                             });
                         }
                         Ok(UiCommand::Workspace { command, args }) => {
+                            if command == workspace_commands::WorkspaceCommand::Review {
+                                let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
+                                *driver_turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(abort_handle);
+                                Box::pin(workspace_commands::run_review(
+                                    &args, &handle, &bash_cwd, Some(&abort_signal), &agent_tx,
+                                )).await;
+                                *driver_turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                                continue;
+                            }
                             let advisor = resume_template
                                 .advisor
                                 .as_ref()
@@ -8697,22 +10112,17 @@ pub fn run(
                             });
                         }
                         Ok(UiCommand::Retry) => {
-                            if let Some(text) = prepare_retry_turn(&mut handle, &agent_tx).await {
-                                run_prompt_turn(
-                                    &mut handle,
-                                    text,
-                                    Vec::new(),
-                                    &agent_tx,
-                                    &driver_turn_control,
-                                )
-                                .await;
-                            }
+                            run_retry_turn(&mut handle, &agent_tx, &driver_turn_control).await;
                         }
-                        Ok(UiCommand::Btw(question)) => {
+                        Ok(UiCommand::Btw {
+                            question,
+                            owner_session_id,
+                        }) => {
                             run_btw_command(
-                                &mut handle,
+                                &handle,
                                 driver_btw_client.as_ref(),
                                 question,
+                                owner_session_id,
                                 &agent_tx,
                                 &runtime_handle,
                             )
@@ -8817,6 +10227,7 @@ pub fn run(
                             .await;
                         }
                         Ok(UiCommand::Reload) => {
+                            auto_title.cancel_pending();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(reload_session_command(
                                 &resume_template,
@@ -8848,6 +10259,7 @@ pub fn run(
                             }
                         }
                         Ok(UiCommand::Fork { args }) => {
+                            auto_title.cancel_pending();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(fork_session_command(
                                 &args,
@@ -8888,10 +10300,25 @@ pub fn run(
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
+                    if let Some(title) = Box::pin(auto_title.tick(
+                        handle.session(),
+                        title_client.as_ref(),
+                        &runtime_handle,
+                    ))
+                    .await
+                    {
+                        let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {title}")));
+                        refresh_status = true;
+                    }
                     if refresh_status {
+                        // Session replacement does not require a resource
+                        // source. Refresh here as well as after /reload's
+                        // resource read, including new/removed registrations.
+                        refresh_extension_commands(&handle, &mut info_catalog, &agent_tx);
                         Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                     }
                 }
+                auto_title.cancel_pending();
                 let session_store = handle.session_store();
                 let shutdown = if replacement_failure.is_some() {
                     handle.discard_uncommitted_resources().await
@@ -8961,9 +10388,10 @@ pub fn run(
         );
     }
 
-    let model = PiFtuiModel::new(agent_rx)
+    let mut model = PiFtuiModel::new(agent_rx)
         .with_keybindings(keybindings_result.bindings)
         .with_submit_channel(submit_tx)
+        .with_extension_command_registry(command_registry)
         .with_turn_abort(turn_abort)
         .with_turn_control(turn_control)
         .with_btw_client(btw_client)
@@ -8981,6 +10409,9 @@ pub fn run(
         .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
+    if let Some(workspace) = workspace {
+        model.autocomplete.provider.set_workspace(workspace);
+    }
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
     // remains the default.
@@ -8988,7 +10419,9 @@ pub fn run(
         ftui::App::inline_auto(model, INLINE_MIN_HEIGHT, INLINE_MAX_HEIGHT)
     } else {
         ftui::App::fullscreen(model)
-    };
+    }
+    // Present every frame, however late (see `FRAME_BUDGET`).
+    .with_budget(frame_budget());
     // Divert tracing output away from the terminal while the TUI owns it
     // (bd-trkef); restored on drop.
     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
@@ -9226,6 +10659,259 @@ mod tests {
         assert!(
             !options.no_session,
             "a replacement session is always persisted, whatever the launch flags said"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn standalone_launch_binds_shell_tools_and_replacements_to_the_saved_workspace() {
+        // Relative locators resolve against, and the test finally checks, the
+        // process cwd, which other unit tests change while holding this lock.
+        let _cwd_lock = crate::test_current_dir_lock();
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        let root = tempfile::tempdir_in(&process_cwd).expect("relative locator fixture");
+        let cwd = root.path().join("attached-workspace");
+        let additional = root.path().join("additional-workspace");
+        std::fs::create_dir(&cwd).expect("attached workspace");
+        std::fs::create_dir(&additional).expect("additional workspace");
+        std::fs::write(cwd.join("probe.txt"), "attached workspace content")
+            .expect("workspace probe");
+        let path = root.path().join("conversation.jsonl");
+        let sessions_dir = root.path().join("future-sessions");
+        let mut source = crate::session::Session::in_memory();
+        source.header.cwd = root.path().join("moved-away").display().to_string();
+        source.path = Some(path.clone());
+        source.session_dir = Some(root.path().to_path_buf());
+        source.set_additional_roots(std::slice::from_ref(&additional));
+        crate::session_workdir::attach_session_workdir(&mut source, &cwd)
+            .expect("attach saved workspace");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(async {
+            source.save().await.expect("save source");
+            let original_bytes = std::fs::read(&path).expect("source bytes");
+            let options = crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("ftui-workspace-fixture-key")),
+                // `SessionOptions::default()` is an in-memory launch, which
+                // deliberately bypasses saved-workspace recovery.
+                no_session: false,
+                session_path: Some(path.strip_prefix(&process_cwd).unwrap().to_path_buf()),
+                session_dir: Some(
+                    sessions_dir
+                        .strip_prefix(&process_cwd)
+                        .unwrap()
+                        .to_path_buf(),
+                ),
+                enabled_tools: Some(vec![String::from("read"), String::from("write")]),
+                ..crate::sdk::SessionOptions::default()
+            };
+            let prepared = prepare_driver_session_options(options)
+                .await
+                .expect("prepare standalone launch");
+            let bound = cwd.canonicalize().expect("canonical workspace");
+            assert_eq!(driver_bash_cwd(&prepared), bound);
+            assert_eq!(prepared.session_path.as_deref(), Some(path.as_path()));
+            assert_eq!(
+                prepared.session_dir.as_deref(),
+                Some(sessions_dir.as_path())
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("source unchanged"),
+                original_bytes
+            );
+            let mut template = resume_template_from(&prepared);
+            let mut handle = crate::sdk::create_agent_session(prepared)
+                .await
+                .expect("start prepared session");
+            template.workspace = handle.workspace();
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let output = run_bash_ui_command(
+                &bound,
+                &BashUiShell::default(),
+                "cat probe.txt && printf shell-completed > shell-result.txt",
+                true,
+                &agent_tx,
+            )
+            .await
+            .expect("shell command output");
+            assert!(output.contains("attached workspace content"), "{output}");
+            assert_eq!(
+                std::fs::read_to_string(cwd.join("shell-result.txt")).expect("shell result"),
+                "shell-completed"
+            );
+            assert!(
+                agent_rx
+                    .try_iter()
+                    .any(|message| matches!(message, PiMsg::BashResult { .. }))
+            );
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let read = tools
+                .get("read")
+                .expect("read tool")
+                .execute(
+                    "ftui-workspace-read",
+                    serde_json::json!({"path": "probe.txt"}),
+                    None,
+                )
+                .await
+                .expect("read through SDK workspace");
+            assert!(!read.is_error);
+            assert!(
+                serde_json::to_string(&read)
+                    .unwrap()
+                    .contains("attached workspace content")
+            );
+            let extra_file = additional.join("continued.txt");
+            let write = tools
+                .get("write")
+                .expect("write tool")
+                .execute(
+                    "ftui-additional-write",
+                    serde_json::json!({"path": extra_file, "content": "saved extra root"}),
+                    None,
+                )
+                .await
+                .expect("write in restored additional root");
+            assert!(!write.is_error);
+            handle
+                .remove_workspace_root(&additional)
+                .await
+                .expect("revoke root");
+            assert!(
+                template
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .additional_roots()
+                    .is_empty()
+            );
+            assert!(
+                tools
+                    .get("write")
+                    .unwrap()
+                    .execute(
+                        "ftui-revoked-write",
+                        serde_json::json!({"path": extra_file, "content": "must not be written"}),
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_to_string(extra_file).unwrap(),
+                "saved extra root"
+            );
+            assert_eq!(template.working_directory.as_deref(), Some(bound.as_path()));
+            assert_eq!(
+                template.session_dir.as_deref(),
+                Some(sessions_dir.as_path())
+            );
+            let next = crate::sdk::create_agent_session(template)
+                .await
+                .expect("create replacement in the same workspace");
+            assert_eq!(
+                next.with_session(|session| session.header.cwd.clone())
+                    .await
+                    .unwrap(),
+                bound.display().to_string()
+            );
+            assert!(next.shutdown_owned_resources().await.completed_cleanly());
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            assert_eq!(
+                std::env::current_dir().expect("unchanged process cwd"),
+                process_cwd
+            );
+        }));
+    }
+
+    #[test]
+    fn standalone_launch_rejects_mismatched_or_missing_saved_workspaces() {
+        // Launch preparation reads the process cwd, which other unit tests
+        // change while holding this lock.
+        let _cwd_lock = crate::test_current_dir_lock();
+        let root = tempfile::tempdir().expect("fixture root");
+        let cwd = root.path().join("saved-workspace");
+        let other = root.path().join("other-workspace");
+        std::fs::create_dir(&cwd).expect("saved workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        let path = root.path().join("conversation.jsonl");
+        let mut source = crate::session::Session::in_memory();
+        source.header.cwd = cwd.display().to_string();
+        source.path = Some(path.clone());
+        // Keep the save's session-index bookkeeping out of the user's store.
+        source.session_dir = Some(root.path().join("sessions"));
+        futures::executor::block_on(async {
+            source.save().await.expect("save source");
+            let original_bytes = std::fs::read(&path).expect("source bytes");
+            for explicit_handle in [false, true] {
+                // `SessionOptions::default()` is an in-memory launch, which
+                // deliberately bypasses saved-workspace recovery.
+                let mut options = crate::sdk::SessionOptions {
+                    no_session: false,
+                    session_path: Some(path.clone()),
+                    ..crate::sdk::SessionOptions::default()
+                };
+                if explicit_handle {
+                    options.workspace = Some(crate::workspace::WorkspaceHandle::single(&other));
+                } else {
+                    options.working_directory = Some(other.clone());
+                }
+                let error = prepare_driver_session_options(options)
+                    .await
+                    .err()
+                    .expect("mismatch");
+                assert!(
+                    error.to_string().contains("PI_SESSION_WORKDIR_MISMATCH"),
+                    "{error}"
+                );
+            }
+            std::fs::rename(&cwd, root.path().join("moved-workspace")).expect("move workspace");
+            let error = prepare_driver_session_options(crate::sdk::SessionOptions {
+                no_session: false,
+                session_path: Some(path.clone()),
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .err()
+            .expect("missing workspace");
+            assert!(
+                error.to_string().contains("PI_SESSION_WORKDIR_UNAVAILABLE"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("unchanged source"),
+                original_bytes
+            );
+        });
+    }
+
+    #[test]
+    fn standalone_no_session_ignores_an_invalid_saved_locator() {
+        let root = tempfile::tempdir().expect("workspace");
+        let path = root.path().join("invalid.jsonl");
+        std::fs::write(&path, "not a saved session").expect("invalid session fixture");
+        let options = futures::executor::block_on(prepare_driver_session_options(
+            crate::sdk::SessionOptions {
+                no_session: true,
+                working_directory: Some(root.path().to_path_buf()),
+                session_path: Some(std::path::PathBuf::from("invalid.jsonl")),
+                session_dir: Some(std::path::PathBuf::from("new-sessions")),
+                ..crate::sdk::SessionOptions::default()
+            },
+        ))
+        .expect("in-memory launch must ignore saved locator contents");
+        assert!(options.no_session);
+        assert_eq!(options.session_path.as_deref(), Some(path.as_path()));
+        assert_eq!(options.session_dir, Some(root.path().join("new-sessions")));
+        assert_eq!(driver_bash_cwd(&options), root.path());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "not a saved session"
         );
     }
 
@@ -9653,8 +11339,8 @@ mod tests {
             "ctrl+o is routed on FTUI now: {text:?}"
         );
         assert!(
-            !text.contains("Open settings"),
-            "unsupported actions like OpenSettings must not be advertised on FTUI: {text:?}"
+            text.contains("Open settings"),
+            "the live settings editor must be advertised on FTUI: {text:?}"
         );
     }
 
@@ -10107,17 +11793,9 @@ mod tests {
     }
 
     #[test]
-    fn every_pi_command_is_either_routed_here_or_named_as_unimplemented() {
-        // Type each canonical pi slash command and see whether this stack
-        // claims it. Whatever it does not claim falls through to extension
-        // dispatch, and the message there must not call a real pi command
-        // "Unknown command" — that reads as "pi is broken" and sends the user
-        // to a /help that lists only what this stack already has.
-        //
-        // This also keeps the size of the ftui/charmed command gap measured
-        // rather than asserted: implementing one here moves it between the two
-        // buckets and the test keeps passing either way.
-        let mut routed = Vec::new();
+    fn every_pi_command_routes_on_the_default_stack() {
+        // /settings was the final advertised command that fell through to
+        // generic extension dispatch. Keep every built-in reachable here.
         let mut unrouted = Vec::new();
         for command in crate::interactive::SlashCommand::ALL {
             let name = command.canonical();
@@ -10128,38 +11806,218 @@ mod tests {
             sim.init();
             type_str(&mut sim, name);
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-            match submit_rx.try_recv() {
-                Ok(UiCommand::ExtensionCommand { name: sent, .. }) => unrouted.push(sent),
-                _ => routed.push(name),
+            if let Ok(UiCommand::ExtensionCommand { name: sent, .. }) = submit_rx.try_recv() {
+                unrouted.push(sent);
             }
         }
 
         assert!(
-            !routed.is_empty() && !unrouted.is_empty(),
-            "expected both buckets to be non-empty; routed {routed:?}, unrouted {unrouted:?}"
+            unrouted.is_empty(),
+            "the current pi commands must all route on the default stack; missing {unrouted:?}"
         );
-        // The bucket a command lands in is deliberately not frozen — that is
-        // the point of measuring rather than listing — but these five are what
-        // this stack is FOR, and one of them falling through to extension
-        // dispatch is a routing regression, not progress.
-        for core in ["/help", "/model", "/clear", "/new", "/exit"] {
+    }
+
+    fn settings_snapshot_fixture() -> SettingsSnapshot {
+        SettingsSnapshot {
+            path: std::path::PathBuf::from("/workspace/.pi/settings.json"),
+            auto_retry: true,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
+            auto_compaction: true,
+            steering: crate::agent::QueueMode::OneAtATime,
+            follow_up: crate::agent::QueueMode::OneAtATime,
+            auto_resize_images: true,
+            hide_thinking: false,
+            markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
+            double_escape: DoubleEscapeAction::Rewind,
+            autocomplete_rows: 8,
+        }
+    }
+
+    #[test]
+    fn settings_picker_round_trip_saves_only_the_selected_choice_and_keeps_the_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "unfinished draft");
+        sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("F2 request"),
+            UiCommand::Settings
+        );
+        assert!(sim.model().settings_pending);
+        sim.send(PiFtuiMsg::Agent(PiMsg::Settings {
+            snapshot: settings_snapshot_fixture(),
+            changed: None,
+        }));
+        assert_eq!(
+            sim.model().picker.as_ref().expect("settings").kind,
+            PickerKind::Settings
+        );
+        assert_eq!(sim.model().input.text(), "unfinished draft");
+
+        // Enter opens the first setting's choices; Down selects Off.
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            sim.model().picker.as_ref().expect("choices").kind,
+            PickerKind::SettingValue(SettingsKey::AutoRetry)
+        );
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("save request"),
+            UiCommand::SetSetting {
+                key: SettingsKey::AutoRetry,
+                value: "off".to_string(),
+            }
+        );
+        assert!(
+            sim.model()
+                .settings_snapshot
+                .as_ref()
+                .expect("old snapshot")
+                .auto_retry,
+            "a selection is not an acknowledged save"
+        );
+        let mut saved = settings_snapshot_fixture();
+        saved.auto_retry = false;
+        sim.send(PiFtuiMsg::Agent(PiMsg::Settings {
+            snapshot: saved,
+            changed: Some(SettingsKey::AutoRetry),
+        }));
+        assert!(
+            !sim.model()
+                .settings_snapshot
+                .as_ref()
+                .expect("saved snapshot")
+                .auto_retry
+        );
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert_eq!(
+            sim.model().picker.as_ref().expect("back to settings").kind,
+            PickerKind::Settings
+        );
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(sim.model().picker.is_none());
+        assert_eq!(sim.model().input.text(), "unfinished draft");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "dismissing settings must not submit a prompt"
+        );
+    }
+
+    #[test]
+    fn settings_route_obeys_extension_ownership_busy_admission_and_custom_hotkeys() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        assert!(model.route_slash_command("/settings"));
+        assert_eq!(
+            submit_rx.try_recv().expect("slash request"),
+            UiCommand::Settings
+        );
+        model.handle_agent(PiMsg::Settings {
+            snapshot: settings_snapshot_fixture(),
+            changed: None,
+        });
+        model.picker = None;
+        model.state = AgentUiState::Working;
+        model.request_settings();
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "mid-turn settings must be refused"
+        );
+        model.state = AgentUiState::Ready;
+        model
+            .extension_commands
+            .push(crate::autocomplete::NamedEntry {
+                name: "settings".to_string(),
+                description: None,
+            });
+        assert!(model.route_slash_command("/settings extension-args"));
+        assert_eq!(
+            submit_rx.try_recv().expect("extension wins"),
+            UiCommand::RegisteredExtensionCommand {
+                name: "settings".to_string(),
+                args: "extension-args".to_string(),
+            }
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(&path, r#"{"openSettings":["ctrl+j"]}"#).expect("custom keybinding");
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_keybindings(KeyBindings::load(&path).expect("bindings"));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+        assert_eq!(
+            submit_rx.try_recv().expect("custom settings shortcut"),
+            UiCommand::Settings
+        );
+    }
+
+    #[test]
+    fn unavailable_settings_driver_releases_the_editor_and_reports_failure() {
+        for disconnected in [false, true] {
+            let (_tx, mut model) = new_model();
+            if disconnected {
+                let (submit_tx, submit_rx) = mpsc::channel();
+                drop(submit_rx);
+                model = model.with_submit_channel(submit_tx);
+            }
+            model.input.set_text("unfinished draft");
+            model.request_settings();
+            assert!(!model.settings_pending);
+            assert!(model.busy.is_none());
+            assert_eq!(model.input.text(), "unfinished draft");
             assert!(
-                routed.contains(&core),
-                "{core} must be handled here, not dispatched as an extension command; \
-                 routed {routed:?}"
+                model
+                    .transcript
+                    .last()
+                    .expect("failure message")
+                    .text
+                    .contains("active agent session")
             );
         }
-        for name in &unrouted {
-            let message = unrouted_command_message(name, true);
-            assert!(
-                message.contains("does not implement yet") && message.contains("--classic"),
-                "/{name} is a real pi command; this stack must say so: {message}"
-            );
-            assert!(
-                !message.contains("Unknown command"),
-                "/{name} is a real pi command and must not be called unknown: {message}"
-            );
-        }
+    }
+
+    #[test]
+    fn settings_acknowledgement_updates_only_the_selected_live_display_preference() {
+        let (_tx, mut model) = new_model();
+        model.show_thinking = false; // An unsaved Ctrl+T preference.
+        let mut snapshot = settings_snapshot_fixture();
+        snapshot.markdown_spacing = crate::config::MarkdownSpacing::Compact;
+        model.handle_agent(PiMsg::Settings {
+            snapshot: snapshot.clone(),
+            changed: Some(SettingsKey::MarkdownSpacing),
+        });
+        assert_eq!(
+            model.markdown_spacing,
+            crate::config::MarkdownSpacing::Compact
+        );
+        assert!(
+            !model.show_thinking,
+            "unrelated settings must preserve Ctrl+T state"
+        );
+        snapshot.autocomplete_rows = 15;
+        model.handle_agent(PiMsg::Settings {
+            snapshot: snapshot.clone(),
+            changed: Some(SettingsKey::AutocompleteRows),
+        });
+        assert_eq!(model.autocomplete.max_visible, 15);
+        snapshot.double_escape = DoubleEscapeAction::None;
+        model.handle_agent(PiMsg::Settings {
+            snapshot,
+            changed: Some(SettingsKey::DoubleEscape),
+        });
+        assert_eq!(model.double_escape_action, DoubleEscapeAction::None);
     }
 
     #[test]
@@ -11115,6 +12973,326 @@ mod tests {
     }
 
     #[test]
+    fn registered_extension_commands_override_builtins_with_original_arguments() {
+        for name in [
+            "plan", "status", "todos", "branch", "model", "memory", "review", "commit", "handoff",
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let mut sim =
+                ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+            sim.init();
+            sim.send(PiFtuiMsg::Agent(PiMsg::AutocompleteCatalog(
+                AutocompleteCatalog {
+                    extension_commands: vec![crate::autocomplete::NamedEntry {
+                        name: name.to_string(),
+                        description: None,
+                    }],
+                    ..AutocompleteCatalog::default()
+                },
+            )));
+            type_str(
+                &mut sim,
+                &format!("/{} Keep  These ARGs", name.to_ascii_uppercase()),
+            );
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("registered command routed"),
+                UiCommand::RegisteredExtensionCommand {
+                    name: name.to_string(),
+                    args: String::from("Keep  These ARGs"),
+                },
+                "/{name} must reach its registered handler"
+            );
+            assert!(sim.model().picker.is_none());
+            assert_eq!(
+                sim.model().busy_label(),
+                Some(format!("running /{name} ...").as_str())
+            );
+            assert!(submit_rx.try_recv().is_err(), "no second built-in dispatch");
+        }
+    }
+
+    #[test]
+    fn live_extension_registration_wins_over_stale_completion_catalogs() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let manager = crate::extensions::ExtensionManager::new();
+        let registry = Arc::new(Mutex::new(Some(manager.clone())));
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_extension_command_registry(Arc::clone(&registry));
+
+        // Register after the UI is wired, without any completion delivery.
+        manager.register_command("Plan", None);
+        assert!(model.route_slash_command("/PLAN unsupported-by-built-in"));
+        assert_eq!(
+            submit_rx.try_recv().expect("live registration"),
+            UiCommand::RegisteredExtensionCommand {
+                name: String::from("Plan"),
+                args: String::from("unsupported-by-built-in"),
+            }
+        );
+        let _ = model.handle_agent(PiMsg::AutocompleteCatalog(AutocompleteCatalog {
+            extension_commands: vec![crate::autocomplete::NamedEntry {
+                name: String::from("status"),
+                description: None,
+            }],
+            ..AutocompleteCatalog::default()
+        }));
+        assert!(model.route_slash_command("/status"));
+        assert_eq!(
+            submit_rx
+                .try_recv()
+                .expect("stale completion is not authority"),
+            UiCommand::Info(info_commands::InfoCommand::Extensions)
+        );
+
+        // Replacing the manager immediately removes old ownership, even if
+        // an old completion message arrives afterwards.
+        *registry.lock().expect("registry") = None;
+        let _ = model.handle_agent(PiMsg::AutocompleteCatalog(AutocompleteCatalog {
+            extension_commands: vec![crate::autocomplete::NamedEntry {
+                name: String::from("Plan"),
+                description: None,
+            }],
+            ..AutocompleteCatalog::default()
+        }));
+        assert!(model.route_slash_command("/plan status"));
+        assert_eq!(
+            submit_rx.try_recv().expect("built-in restored"),
+            UiCommand::Plan {
+                action: String::from("status")
+            }
+        );
+    }
+
+    #[test]
+    fn busy_extension_commands_keep_the_draft_and_do_not_become_steering() {
+        for name in ["plan", "btw", "queue"] {
+            for modifiers in [Modifiers::empty(), Modifiers::ALT] {
+                let (_agent_tx, rx) = mpsc::channel();
+                let (submit_tx, submit_rx) = mpsc::channel();
+                let manager = crate::extensions::ExtensionManager::new();
+                manager.register_command(name, None);
+                let model = PiFtuiModel::new(rx)
+                    .with_submit_channel(submit_tx)
+                    .with_turn_control(Arc::default())
+                    .with_extension_command_registry(Arc::new(Mutex::new(Some(manager))));
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+                let draft = format!("/{name} Keep this draft");
+                type_str(&mut sim, &draft);
+                sim.inject_event(key(KeyCode::Enter, modifiers));
+                assert!(
+                    submit_rx.try_recv().is_err(),
+                    "busy /{name} must not dispatch"
+                );
+                assert_eq!(sim.model().input.text(), draft);
+                assert!(sim.model().transcript.iter().any(|entry| {
+                    entry.role == EntryRole::Error
+                        && entry.text.starts_with("Extension commands wait")
+                }));
+                assert!(sim.model().input_history.is_empty());
+            }
+        }
+
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let manager = crate::extensions::ExtensionManager::new();
+        manager.register_command("status", None);
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_extension_command_registry(Arc::new(Mutex::new(Some(manager))));
+        model.begin_busy("reloading resources ...");
+        model.input.set_text("/status Keep this draft");
+        model.submit_input();
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(model.input.text(), "/status Keep this draft");
+        assert_eq!(model.busy_label(), Some("reloading resources ..."));
+        let pasted = "\x1b[31m/status Keep this draft\x1b[0m";
+        assert!(sanitize(pasted).starts_with("/status"));
+        model.input.set_text(pasted);
+        let draft = model.input.text();
+        model.submit_input();
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(model.input.text(), draft);
+        assert_eq!(model.busy_label(), Some("reloading resources ..."));
+    }
+
+    #[test]
+    fn native_handoff_owns_busy_state_until_its_matching_completion() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let slot: TurnAbortSlot = Arc::default();
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_turn_abort(Arc::clone(&slot));
+        model.displayed_session_id = Some("current-session".into());
+        model
+            .input
+            .set_text("/HANDOFF preserve @notes.md and Next Steps");
+        model.submit_input();
+        let UiCommand::Handoff { focus, request } = submit_rx.try_recv().unwrap() else {
+            panic!("native handoff route");
+        };
+        assert_eq!(focus, "preserve @notes.md and Next Steps");
+        assert!(!request.id.is_empty());
+        assert!(model.handoff_in_progress());
+        let _ = model.handle_agent(PiMsg::SystemNote("background task completed".into()));
+        let _ = model.handle_agent(PiMsg::StatusSnapshot(
+            crate::interactive::FtuiStatusSnapshot::default(),
+        ));
+        let _ = model.handle_agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        });
+        let _ = model.handle_agent(PiMsg::MessagePicker {
+            fork: false,
+            messages: vec![("earlier branch".into(), "old-entry".into())],
+        });
+        assert!(
+            model.picker.is_none(),
+            "late pickers cannot replace handoff ownership"
+        );
+        let _ = model.handle_agent(PiMsg::HandoffFinished {
+            request_id: "older-request".into(),
+            event: Box::new(PiMsg::System("stale".into())),
+        });
+        assert!(model.handoff_in_progress());
+        assert!(!model.transcript.iter().any(|entry| entry.text == "stale"));
+        let _ = model.handle_agent(PiMsg::LoginPending {
+            provider: Some("late-login".into()),
+            accepts_empty_input: false,
+        });
+        model.input.set_text("Keep this draft");
+        model.submit_input();
+        model.submit_mid_turn(true);
+        assert_eq!(model.input.text(), "Keep this draft");
+        assert!(submit_rx.try_recv().is_err());
+        assert!(model.handoff_in_progress());
+        let _ = model.handle_agent(PiMsg::HandoffFinished {
+            request_id: request.id,
+            event: Box::new(PiMsg::System("Handoff cancelled".into())),
+        });
+        assert!(!model.handoff_in_progress());
+        assert_eq!(model.input.text(), "Keep this draft");
+        assert!(
+            model
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "Handoff cancelled")
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"request_owned_busy"})
+        );
+    }
+
+    #[test]
+    fn native_handoff_requires_idle_and_keeps_report_and_preview_explicit() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.state = AgentUiState::Working;
+        model.input.set_text("/handoff migration focus");
+        model.submit_input();
+        assert_eq!(model.input.text(), "/handoff migration focus");
+        assert!(submit_rx.try_recv().is_err());
+        assert!(model.input_history.is_empty());
+        model.state = AgentUiState::Ready;
+        model.begin_busy("loading session ...");
+        model.submit_input();
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(model.busy_label(), Some("loading session ..."));
+        model.busy = None;
+        for args in [
+            "--report",
+            "--report human",
+            "--model -- remaining work",
+            "--import /tmp/brief.json",
+        ] {
+            assert!(model.route_slash_command(&format!("/handoff {args}")));
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::Workspace {
+                    command: workspace_commands::WorkspaceCommand::Handoff,
+                    args: args.into(),
+                }
+            );
+            model.busy = None;
+        }
+        assert!(model.route_slash_command("/handoff --unknown target"));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(model.busy.is_none());
+        assert!(
+            model
+                .transcript
+                .iter()
+                .any(|entry| entry.role == EntryRole::Error
+                    && entry.text.contains("Usage: /handoff"))
+        );
+    }
+
+    #[test]
+    fn native_handoff_completion_settles_a_delayed_previous_turn() {
+        for success in [false, true] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+            model.displayed_session_id = Some("current-session".into());
+            model.input.set_text("/handoff preserve the next step");
+            model.submit_input();
+            let UiCommand::Handoff { request, .. } = submit_rx.try_recv().unwrap() else {
+                panic!("native handoff route");
+            };
+            let _ = model.handle_agent(PiMsg::AgentStart);
+            let _ = model.handle_agent(PiMsg::SessionSystemNote {
+                owner_session_id: "current-session".into(),
+                message: "Background answer".into(),
+            });
+            let _ = model.handle_agent(PiMsg::AgentDone {
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+            });
+            assert_eq!(model.state, AgentUiState::Working);
+            assert!(model.handoff_in_progress());
+            let event = if success {
+                PiMsg::ConversationReset {
+                    session_id: "current-session".into(),
+                    messages: Vec::new(),
+                    usage: crate::model::Usage::default(),
+                    status: Some("Handoff saved".into()),
+                }
+            } else {
+                PiMsg::System("Handoff cancelled".into())
+            };
+            let _ = model.handle_agent(PiMsg::HandoffFinished {
+                request_id: request.id,
+                event: Box::new(event),
+            });
+            assert_eq!(model.state, AgentUiState::Ready);
+            assert!(!model.handoff_in_progress());
+            assert!(model.deferred_notes.is_empty());
+            assert!(
+                model
+                    .transcript
+                    .iter()
+                    .any(|entry| entry.text == "Background answer")
+            );
+            model.input.set_text("Continue the work");
+            model.submit_input();
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::Prompt("Continue the work".into())
+            );
+        }
+    }
+
+    #[test]
     fn tool_status_renders_while_running() {
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model);
@@ -11232,6 +13410,106 @@ mod tests {
         assert_eq!(sim.model().scroll_from_tail, 0);
     }
 
+    #[test]
+    fn mcp_auth_routes_exact_names_and_stays_cancellable_without_a_model_turn() {
+        for cancel in [
+            key(KeyCode::Escape, Modifiers::empty()),
+            key(KeyCode::Char('c'), Modifiers::CTRL),
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let slot: TurnAbortSlot = Arc::new(Mutex::new(None));
+            let mut model = PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_turn_abort(Arc::clone(&slot));
+            model.displayed_session_id = Some("owner-session".to_string());
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, "earlier prompt");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::Prompt("earlier prompt".into())
+            );
+            // The preceding prompt has not yet delivered AgentStart.
+            type_str(&mut sim, "/mcp reauth remote  service");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            let UiCommand::McpAuth {
+                subcommand,
+                name,
+                request,
+            } = submit_rx.try_recv().expect("operator command")
+            else {
+                panic!("expected native MCP authentication command");
+            };
+            assert_eq!(subcommand, "reauth");
+            assert_eq!(name, "remote  service");
+            assert_eq!(request.owner_session_id, "owner-session");
+            let auth_signal = request.abort.signal();
+            // An earlier queued command can replace the shared driver lane.
+            // The admitted auth command must retain its own exact handle.
+            let (earlier_handle, earlier_signal) = crate::agent::AbortHandle::new();
+            *slot.lock().expect("slot") = Some(earlier_handle);
+            sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+            for notice in [
+                PiMsg::SystemNote("Open the sign-in URL".into()),
+                PiMsg::System("An older MCP test completed".into()),
+                PiMsg::AgentError("Unrelated background task failed".into()),
+                PiMsg::AgentDone {
+                    usage: None,
+                    stop_reason: crate::model::StopReason::Stop,
+                    error_message: None,
+                },
+                PiMsg::McpAuthFinished {
+                    request_id: "older-auth".into(),
+                    message: "stale".into(),
+                },
+            ] {
+                sim.send(PiFtuiMsg::Agent(notice));
+                assert!(
+                    sim.model().busy.is_some(),
+                    "only the matching auth completion ends busy"
+                );
+                assert_eq!(
+                    sim.model().mcp_auth_request.as_ref().unwrap().id,
+                    request.id
+                );
+                assert!(matches!(sim.model().state, AgentUiState::Working));
+            }
+            for draft in ["keep this draft", "/queue next", "/new"] {
+                sim.model_mut().input.set_text(draft);
+                sim.model_mut().submit_input();
+                sim.model_mut().submit_mid_turn(true);
+                assert_eq!(sim.model().input.text(), draft);
+                assert!(
+                    submit_rx.try_recv().is_err(),
+                    "auth must not enqueue foreground work"
+                );
+            }
+            sim.inject_event(cancel);
+            assert!(auth_signal.is_aborted());
+            assert!(
+                !earlier_signal.is_aborted(),
+                "cancel targets the admitted auth request"
+            );
+            assert!(
+                !sim.model_mut().abort_driver_operation(),
+                "an aborted auth request must not swallow later cancellation keys"
+            );
+            sim.send(PiFtuiMsg::Agent(PiMsg::McpAuthFinished {
+                request_id: request.id,
+                message: "MCP authentication cancelled".into(),
+            }));
+            assert!(sim.model().busy.is_none());
+            assert!(sim.model().mcp_auth_request.is_none());
+            assert!(matches!(sim.model().state, AgentUiState::Ready));
+            assert!(
+                slot.lock().expect("slot").is_some(),
+                "UI cannot erase another driver handle"
+            );
+        }
+    }
+
     /// Issue #205: Ctrl-C must fire the in-flight turn's abort handle before
     /// quitting, so process teardown doesn't wait for the provider stream
     /// and remaining tool calls to finish naturally.
@@ -11318,13 +13596,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn drain_loop_bridges_agent_channel_until_disconnect() {
         let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
         let (msg_tx, msg_rx) = mpsc::channel::<PiFtuiMsg>();
         let handle = std::thread::spawn(move || {
             // Dropping the agent sender terminates the loop via Disconnected,
             // the same teardown path the bridge shutdown uses today.
-            drain_agent_events(&agent_rx, &msg_tx, || false);
+            drain_agent_events(&agent_rx, |message| msg_tx.send(message), || false);
         });
         agent_tx.send(PiMsg::AgentStart).unwrap();
         let bridged = msg_rx
@@ -11336,11 +13615,35 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn drain_loop_honors_stop_predicate() {
-        let (_agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
         let (msg_tx, _msg_rx) = mpsc::channel::<PiFtuiMsg>();
+        agent_tx.send(PiMsg::AgentStart).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture receiver must remain connected before the drain.
         // stop=true up front: must return immediately without receiving.
-        drain_agent_events(&agent_rx, &msg_tx, || true);
+        drain_agent_events(&agent_rx, |message| msg_tx.send(message), || true);
+        assert!(matches!(agent_rx.try_recv(), Ok(PiMsg::AgentStart)));
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn drain_loop_stops_consuming_when_the_runtime_sender_fails() {
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        let (msg_tx, msg_rx) = mpsc::channel::<PiFtuiMsg>();
+        agent_tx.send(PiMsg::AgentStart).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture receiver must remain connected before the drain.
+        agent_tx // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture receiver must remain connected before the drain.
+            .send(PiMsg::TextDelta("still queued".to_string()))
+            .unwrap();
+        drop(agent_tx);
+        drop(msg_rx);
+
+        // SubscriptionSender returns the same SendError when disconnected or
+        // interrupted while its bounded queue is full. Stop after that failure.
+        drain_agent_events(&agent_rx, |message| msg_tx.send(message), || false);
+        assert!(matches!(
+            agent_rx.try_recv(),
+            Ok(PiMsg::TextDelta(text)) if text == "still queued"
+        ));
     }
 
     #[test]
@@ -12395,6 +14698,27 @@ mod tests {
             // ubs:ignore panic in #[cfg(test)] match-else is an assertion failure, not library code
             other => panic!("unexpected translation: {other:?}"),
         }
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for message in agent_event_to_pi_msgs(&E::AdvisorNote {
+            level: "BLOCKER".to_string(),
+            rationale: "The patch skips the configured limit.".to_string(),
+        }) {
+            sim.send(PiFtuiMsg::Agent(message));
+        }
+        assert_eq!(
+            sim.model()
+                .transcript
+                .iter()
+                .filter(|entry| {
+                    entry.text == "[ADVISOR:BLOCKER] The patch skips the configured limit."
+                })
+                .count(),
+            1,
+            "an emitted advisor note must reach the visible transcript once"
+        );
     }
 
     #[test]
@@ -13642,16 +15966,25 @@ mod tests {
                 &extension,
                 format!(
                     "export default function init(pi) {{\n\
-                     pi.registerCommand(\"{command}\", {{ description: \"probe\", handler: async () => {{}} }});\n\
+                     pi.registerCommand(\"{command}\", {{ description: \"probe\", handler: async (args) => ({{command: \"{command}\", args}}) }});\n\
                      }}\n"
                 ),
             )
             .expect("write extension");
         };
-        write_extension("v1-cmd");
+        write_extension("Plan");
 
         let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
-        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+        let registry: ExtensionCommandRegistry = Arc::default();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler {
+            command_registry: Arc::downgrade(&registry),
+            ..FtuiExtensionUiHandler::new(agent_tx.clone())
+        });
+        let (_model_tx, model_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(model_rx)
+            .with_submit_channel(submit_tx)
+            .with_extension_command_registry(registry);
         let template = resume_template_from(&crate::sdk::SessionOptions {
             provider: Some(String::from("openai")),
             model: Some(String::from("gpt-4o")),
@@ -13675,11 +16008,39 @@ mod tests {
             assert!(
                 handle
                     .extension_manager()
-                    .is_some_and(|manager| manager.has_command("v1-cmd"))
+                    .is_some_and(|manager| manager.has_command("Plan"))
             );
+            ext_handler.install_command_registry(&handle);
+            let mut catalog = AutocompleteCatalog::default();
+            refresh_extension_commands(&handle, &mut catalog, &agent_tx);
+            assert!(
+                catalog
+                    .extension_commands
+                    .iter()
+                    .any(|entry| entry.name == "Plan")
+            );
+            assert!(model.route_slash_command("/PLAN Keep  These ARGs"));
+            let UiCommand::RegisteredExtensionCommand { name, args } =
+                submit_rx.try_recv().expect("extension route")
+            else {
+                panic!("registered /plan must precede the built-in");
+            };
+            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            assert!(
+                agent_rx.try_iter().any(|message| {
+                    matches!(message, PiMsg::SystemNote(text)
+                        if text.contains(r#""command":"Plan""#)
+                            && text.contains(r#""args":"Keep  These ARGs""#))
+                }),
+                "the real registered handler must receive its original arguments"
+            );
+            assert!(model.route_slash_command("/plan stale-before-reload"));
+            let stale = submit_rx.try_recv().expect("queued before reload");
 
-            // A saved conversation to keep across the reload.
-            let session_id = {
+            // A saved conversation with a newer pending row. Reload must
+            // flush it even when ordinary shutdown uses throughput mode, and
+            // open the replacement only after that flush reaches disk.
+            let (session_id, session_path) = {
                 let store = handle.session_store();
                 let cx = crate::agent_cx::AgentCx::for_request();
                 let mut session = store.lock(cx.cx()).await.expect("session lock");
@@ -13688,10 +16049,78 @@ mod tests {
                     timestamp: Some(0),
                 });
                 session.save().await.expect("save session");
-                session.header.id.clone()
+                session.set_autosave_durability_mode(
+                    crate::session::AutosaveDurabilityMode::Throughput,
+                );
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(String::from("keep pending too")),
+                    timestamp: Some(1),
+                });
+                assert_eq!(session.autosave_metrics().pending_mutations, 1);
+                (
+                    session.header.id.clone(),
+                    session.path.clone().expect("saved session path"),
+                )
             };
 
-            write_extension("v2-cmd");
+            // A failed default-mode save must leave the old runtime live and
+            // must not announce a completed reload. Repairing the destination
+            // lets the same handle retry with every queued row still present.
+            let original_store = handle.session_store();
+            let blocked = sessions.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked).expect("block reload save");
+            {
+                let mut session = original_store.try_lock().expect("current session");
+                session.path = Some(blocked);
+                session.set_autosave_durability_mode(
+                    crate::session::AutosaveDurabilityMode::Balanced,
+                );
+            }
+            reload_session_command(
+                &template,
+                &mut handle,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("a refused reload keeps the driver running");
+            assert!(Arc::ptr_eq(&original_store, &handle.session_store()));
+            let refused = agent_rx.try_iter().collect::<Vec<_>>();
+            assert!(refused.iter().any(|message| matches!(
+                message,
+                PiMsg::AgentError(text) if text.contains("failed to flush session autosave")
+            )));
+            assert!(!refused.iter().any(|message| matches!(
+                message,
+                PiMsg::System(text) if text.starts_with("Reloaded")
+            )));
+            run_extension_command(&handle, cwd.path(), "Plan", "still live", true, &agent_tx).await;
+            assert!(agent_rx.try_iter().any(|message| matches!(
+                message,
+                PiMsg::SystemNote(text) if text.contains(r#""args":"still live""#)
+            )), "refused preflight must not stop the old extension runtime");
+            {
+                let mut session = original_store.try_lock().expect("retryable session");
+                assert_eq!(session.header.id, session_id);
+                assert_eq!(session.autosave_metrics().pending_mutations, 1);
+                session.path = Some(session_path.clone());
+                session.set_autosave_durability_mode(
+                    crate::session::AutosaveDurabilityMode::Throughput,
+                );
+            }
+            let old_origin = handle
+                .session()
+                .session_action_admission_gate()
+                .capture_origin();
+            let old_extension_session = handle
+                .extension_manager()
+                .expect("current extension manager")
+                .session_handle()
+                .expect("current extension session adapter");
+
+            write_extension("status");
             reload_session_command(
                 &template,
                 &mut handle,
@@ -13703,31 +16132,115 @@ mod tests {
             .await
             .expect("reload");
 
+            let stale_error = old_extension_session
+                .append_custom_entry(
+                    "pre-reload-action".to_string(),
+                    None,
+                    Some(old_origin),
+                )
+                .await
+                .expect_err("an action captured before replacement cannot mutate the old store");
+            assert!(stale_error.to_string().contains("active Session changed"));
+            assert!(original_store.try_lock().unwrap().entries.iter().all(|entry| !matches!(
+                entry,
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == "pre-reload-action"
+            )));
             let manager = handle.extension_manager().expect("extensions after reload");
-            assert!(manager.has_command("v2-cmd"), "the edited extension must load");
-            assert!(!manager.has_command("v1-cmd"), "the old version must be gone");
-            let (id, kept) = handle
+            assert!(
+                manager.has_command("status"),
+                "the edited extension must load"
+            );
+            assert!(!manager.has_command("Plan"), "the old version must be gone");
+            // No resource source and no catalog delivery: committed replacement
+            // alone must update routing, including newly shadowed built-ins.
+            assert!(model.route_slash_command("/status after reload"));
+            let UiCommand::RegisteredExtensionCommand { name, args } =
+                submit_rx.try_recv().expect("new live extension route")
+            else {
+                panic!("reloaded /status must precede the built-in");
+            };
+            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            assert!(model.route_slash_command("/plan status"));
+            assert_eq!(
+                submit_rx
+                    .try_recv()
+                    .expect("removed override restores built-in"),
+                UiCommand::Plan {
+                    action: String::from("status")
+                }
+            );
+            refresh_extension_commands(&handle, &mut catalog, &agent_tx);
+            assert!(
+                catalog
+                    .extension_commands
+                    .iter()
+                    .any(|entry| entry.name == "status")
+            );
+            assert!(
+                !catalog
+                    .extension_commands
+                    .iter()
+                    .any(|entry| entry.name == "Plan")
+            );
+            let (id, kept, kept_pending) = handle
                 .with_session(|session| {
-                    let kept = session
-                        .to_messages_for_current_path()
+                    let messages = session.to_messages_for_current_path();
+                    let contains = |expected: &str| messages
                         .iter()
                         .any(|message| matches!(
                             message,
                             crate::model::Message::User(user)
-                                if matches!(&user.content, crate::model::UserContent::Text(text) if text == "keep me")
+                                if matches!(&user.content, crate::model::UserContent::Text(text) if text == expected)
                         ));
-                    (session.header.id.clone(), kept)
+                    (session.header.id.clone(), contains("keep me"), contains("keep pending too"))
                 })
                 .await
                 .expect("session snapshot");
             assert_eq!(id, session_id, "reload keeps the same session");
             assert!(kept, "reload keeps the conversation");
+            assert!(kept_pending, "reload includes mutations flushed during replacement preflight");
+            let reopened = crate::session::Session::open(
+                session_path.to_str().expect("session path"),
+            )
+            .await
+            .expect("reopen reloaded session");
+            assert!(reopened.to_messages_for_current_path().iter().any(|message| matches!(
+                message,
+                crate::model::Message::User(user)
+                    if matches!(&user.content, crate::model::UserContent::Text(text) if text == "keep pending too")
+            )), "reload durably saves throughput-mode pending rows");
             let replies = agent_rx.try_iter().collect::<Vec<_>>();
             assert!(
                 replies
                     .iter()
                     .any(|msg| matches!(msg, PiMsg::System(text) if text.starts_with("Reloaded"))),
                 "the user is told the reload happened"
+            );
+            assert!(
+                replies.iter().any(|message| {
+                    matches!(message, PiMsg::SystemNote(text)
+                        if text.contains(r#""command":"status""#)
+                            && text.contains(r#""args":"after reload""#))
+                }),
+                "the replacement runtime executes the newly registered command"
+            );
+            let UiCommand::RegisteredExtensionCommand { name, args } = stale else {
+                panic!("queued registration retains strict dispatch");
+            };
+            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            let stale_replies = agent_rx.try_iter().collect::<Vec<_>>();
+            assert!(
+                !stale_replies
+                    .iter()
+                    .any(|message| matches!(message, PiMsg::ToolStart { .. }))
+            );
+            assert!(
+                stale_replies.iter().any(|message| {
+                    matches!(message, PiMsg::System(text)
+                        if text.starts_with("Extension command '/Plan' is no longer registered"))
+                }),
+                "an obsolete queued command must be refused, not reinterpreted"
             );
 
             // The planted negative: an unsaved in-memory conversation.
@@ -13798,16 +16311,20 @@ mod tests {
     fn slash_btw_routes_when_a_smol_client_exists_and_refuses_otherwise() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-        let model = PiFtuiModel::new(rx)
+        let mut model = PiFtuiModel::new(rx)
             .with_submit_channel(submit_tx)
             .with_btw_client(Some(unroutable_btw_client()));
+        model.displayed_session_id = Some(String::from("btw-session"));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         type_str(&mut sim, "/btw what is a monad");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
-            UiCommand::Btw(String::from("what is a monad"))
+            UiCommand::Btw {
+                question: String::from("what is a monad"),
+                owner_session_id: String::from("btw-session"),
+            }
         );
 
         let (_agent_tx, rx) = mpsc::channel();
@@ -13829,35 +16346,235 @@ mod tests {
         );
     }
 
-    /// Mid-turn, /btw is the one command allowed: it is asked from the UI
-    /// thread without context (the driver is inside the turn) and never
-    /// reaches the steering lane or the command channel.
+    /// Mid-turn questions stay ephemeral and wait in the command lane until
+    /// the driver can screen them against the live vault. The UI must never
+    /// spawn an unseeded auxiliary request while the Agent is borrowed.
     #[test]
-    fn slash_btw_mid_turn_asks_without_context_instead_of_steering() {
+    fn slash_btw_mid_turn_waits_for_live_privacy_projection() {
         let slot: TurnControlSlot = Arc::new(Mutex::new(None));
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-        let model = PiFtuiModel::new(rx)
+        let mut model = PiFtuiModel::new(rx)
             .with_submit_channel(submit_tx)
             .with_turn_control(slot)
             .with_btw_client(Some(unroutable_btw_client()));
+        model.displayed_session_id = Some(String::from("busy-session"));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
         type_str(&mut sim, "/btw quick check");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert!(
-            submit_rx.try_recv().is_err(),
-            "the busy driver is not asked"
+        assert_eq!(
+            submit_rx
+                .try_recv()
+                .expect("question queued for the driver"),
+            UiCommand::Btw {
+                question: String::from("quick check"),
+                owner_session_id: String::from("busy-session"),
+            }
         );
+        assert!(sim.model().pending_task.is_none());
         assert!(sim.model().input.text().is_empty());
         assert!(
-            sim.model()
-                .transcript
-                .iter()
-                .any(|entry| entry.text.starts_with("(/btw) quick check — agent busy")),
-            "the note says there is no conversation context"
+            sim.model().transcript.iter().any(|entry| entry
+                .text
+                .contains("queued until the current turn finishes")),
+            "the note explains when the question will be answered"
         );
+    }
+
+    #[test]
+    fn side_question_queue_bounds_raw_input_and_requires_session_identity() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_btw_client(Some(unroutable_btw_client()));
+        model.queue_btw("a question before the session has loaded");
+        assert!(submit_rx.try_recv().is_err());
+        model.displayed_session_id = Some(String::from("busy-session"));
+        model.state = AgentUiState::Working;
+        model.queue_btw(&"x".repeat(crate::text_completion::MAX_INPUT_BYTES));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(model.pending_task.is_none());
+        assert!(
+            model
+                .transcript
+                .last()
+                .is_some_and(|entry| entry.text.contains("privacy scan budget"))
+        );
+    }
+
+    #[derive(Default)]
+    struct BtwPrivacyProbe {
+        prompts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for BtwPrivacyProbe {
+        fn name(&self) -> &str {
+            "btw-privacy"
+        }
+
+        fn api(&self) -> &str {
+            "test"
+        }
+
+        fn model_id(&self) -> &str {
+            "btw-privacy"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            assert!(context.tools.is_empty());
+            let crate::model::Message::User(user) = &context.messages[0] else {
+                panic!("expected auxiliary user message");
+            };
+            let crate::model::UserContent::Text(text) = &user.content else {
+                panic!("expected auxiliary text projection");
+            };
+            self.prompts.lock().unwrap().push(text.clone());
+            Ok(Box::pin(futures::stream::iter([Ok(
+                crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new("screened side answer"),
+                        )],
+                        ..Default::default()
+                    },
+                },
+            )])))
+        }
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    fn side_question_driver_rejects_stale_owners_and_screens_remembered_credentials() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async {
+            let provider = Arc::new(BtwPrivacyProbe::default());
+            let known = "previouslyLearnedCredentialValue123456";
+            let mut agent = crate::agent::Agent::new(
+                provider.clone(),
+                crate::tools::ToolRegistry::from_tools(Vec::new()),
+                crate::agent::AgentConfig::default(),
+            );
+            agent
+                .secrets_transform_outbound_text(&format!("API_KEY={known}"))
+                .unwrap();
+            let session = crate::session::Session::in_memory();
+            let owner_session_id = session.header.id.clone();
+            let session = crate::agent::AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                session,
+                crate::sdk::EventListeners::default(),
+            );
+            let blocked_client = Arc::new(
+                crate::btw::BtwClient::new(provider.clone(), None).with_secrets_settings(Some(
+                    &crate::secrets::SecretsSettings {
+                        mode: Some(String::from("block")),
+                        extra_patterns: None,
+                    },
+                )),
+            );
+            let (agent_tx, agent_rx) = mpsc::channel();
+            run_btw_command(
+                &handle,
+                Some(&blocked_client),
+                String::from("a clean but stale question"),
+                String::from("replaced-session"),
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await;
+            assert!(agent_rx.try_recv().is_err());
+            run_btw_command(
+                &handle,
+                Some(&blocked_client),
+                format!("Does {known} still work?"),
+                owner_session_id.clone(),
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await;
+            assert!(matches!(
+                agent_rx.try_recv().expect("privacy refusal"),
+                PiMsg::AgentError(message)
+                    if message.starts_with("/btw refused:") && !message.contains(known)
+            ));
+            assert!(provider.prompts.lock().unwrap().is_empty());
+
+            // A permitted request must really reach the same provider, with
+            // the remembered value removed even though no assignment remains
+            // in the current transcript.
+            let redacting_client = Arc::new(crate::btw::BtwClient::new(provider.clone(), None));
+            run_btw_command(
+                &handle,
+                Some(&redacting_client),
+                format!("Does {known} still work?"),
+                owner_session_id.clone(),
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await;
+            let answer = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                async {
+                    loop {
+                        if let Ok(message) = agent_rx.try_recv() {
+                            break message;
+                        }
+                        asupersync::time::sleep(
+                            asupersync::time::wall_now(),
+                            Duration::from_millis(1),
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await
+            .expect("screened side request completes");
+            assert!(matches!(
+                answer,
+                PiMsg::SessionSystemNote { owner_session_id: owner, message }
+                    if owner == owner_session_id && message == "(/btw) screened side answer"
+            ));
+            let prompts = provider.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(!prompts[0].contains(known));
+            assert!(prompts[0].contains("<pi-secret:redacted>"));
+            assert!(handle.session().agent.messages().is_empty());
+            assert!(
+                handle
+                    .session()
+                    .session
+                    .try_lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+        });
     }
 
     /// OMP's read-only info commands and aliases route on the default stack;
@@ -13984,6 +16701,51 @@ mod tests {
         assert_eq!(sim.model().input.text(), "reword me");
     }
 
+    #[test]
+    fn returned_control_input_preserves_draft_and_ignores_stale_sessions() {
+        let (_unused, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: String::from("current"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        type_str(&mut sim, "existing draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: String::from("previous"),
+            text: String::from("stale controls"),
+        }));
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            sim.model().input.text(),
+            "existing draft"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: String::from("current"),
+            text: String::from("first control\n\nsecond control"),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: String::from("current"),
+            text: String::new(),
+        }));
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            sim.model().input.text(),
+            "first control\n\nsecond control\n\nexisting draft"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+            owner_session_id: String::from("current"),
+            text: String::from("explicit replacement"),
+        }));
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            sim.model().input.text(),
+            "explicit replacement"
+        );
+    }
+
     /// The fork keeps everything before the selected user message, drops that
     /// message and what followed, and returns its text for the editor.
     #[test]
@@ -14030,6 +16792,77 @@ mod tests {
         assert_eq!(forked.header.model_id.as_deref(), Some("claude-test"));
         assert_eq!(forked.header.thinking_level.as_deref(), Some("high"));
         assert_eq!(forked.session_dir.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn ftui_fork_preserves_a_lazy_sources_workspace_and_resumed_sdk_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let fixture = crate::session::fork_tests::workspace_fixture(temp.path(), true).await;
+            let (mut fork, selected_text) = build_fork_session(
+                &fixture.source,
+                &fixture.target_id,
+                "anthropic".to_string(),
+                "test-model".to_string(),
+            )
+            .expect("build FTUI fork");
+            assert_eq!(selected_text, "revise this request");
+            fixture.assert_workspace(&fork);
+            fixture.assert_selected_context(&fork);
+            fork.save().await.expect("persist FTUI fork");
+            let mut workspace = crate::workspace::WorkspaceHandle::single(&fixture.bound_cwd);
+            workspace.add_root(&fixture.additional_root);
+            let options = crate::sdk::SessionOptions {
+                provider: Some("openai".to_string()),
+                model: Some("gpt-4o".to_string()),
+                api_key: Some("fork-workspace-test-key".to_string()),
+                session_path: fork.path.clone(),
+                working_directory: Some(fixture.bound_cwd.clone()),
+                workspace: Some(workspace),
+                workspace_trusted: true,
+                enabled_tools: Some(vec!["write".to_string()]),
+                ..crate::sdk::SessionOptions::default()
+            };
+            let handle = crate::sdk::create_agent_session(options)
+                .await
+                .expect("resume FTUI fork in its attached workspace");
+            assert!(
+                handle
+                    .session()
+                    .agent
+                    .system_prompt()
+                    .unwrap()
+                    .contains(crate::session::fork_tests::WORKSPACE_CONTEXT)
+            );
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let output = tools
+                .get("write")
+                .expect("write tool")
+                .execute(
+                    "fork-workspace-write",
+                    serde_json::json!({"path": "fork-continuation.txt", "content": "continued fork"}),
+                    None,
+                )
+                .await
+                .expect("write from resumed fork");
+            assert!(!output.is_error);
+            assert_eq!(
+                std::fs::read_to_string(fixture.bound_cwd.join("fork-continuation.txt"))
+                    .expect("fork output in bound workspace"),
+                "continued fork"
+            );
+            assert!(!fixture.original_cwd.exists());
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            assert_eq!(
+                std::fs::read(&fixture.source_file).expect("unchanged source"),
+                fixture.source_bytes
+            );
+        }));
     }
 
     /// While a login waits for input, the next line is the secret: it goes to
@@ -15111,6 +17944,920 @@ mod tests {
             "group counter missing: {rendered:?}"
         );
     }
+    #[derive(Clone)]
+    struct NativePromptCall {
+        content: crate::model::UserContent,
+        thinking: Option<crate::model::ThinkingLevel>,
+        system_prompt: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct NativePromptProbe {
+        calls: Mutex<Vec<NativePromptCall>>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for NativePromptProbe {
+        fn name(&self) -> &str {
+            "ftui-native-input"
+        }
+
+        fn api(&self) -> &str {
+            "test"
+        }
+
+        fn model_id(&self) -> &str {
+            "ftui-native-input"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let content = context
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    crate::model::Message::User(user) => Some(user.content.clone()),
+                    _ => None,
+                })
+                .expect("provider must receive a user input");
+            self.calls.lock().unwrap().push(NativePromptCall {
+                content,
+                thinking: options.thinking_level,
+                system_prompt: context.system_prompt.as_deref().map(str::to_string),
+            });
+            Ok(Box::pin(futures::stream::iter([Ok(
+                crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new("completed native input"),
+                        )],
+                        ..Default::default()
+                    },
+                },
+            )])))
+        }
+    }
+
+    fn native_prompt_handle(provider: Arc<NativePromptProbe>) -> crate::sdk::AgentSessionHandle {
+        let mut agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::from_tools(Vec::new()),
+            crate::agent::AgentConfig {
+                stream_options: crate::provider::StreamOptions {
+                    thinking_level: Some(crate::model::ThinkingLevel::Low),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        )
+    }
+
+    #[test]
+    fn escape_before_handoff_dequeue_cancels_native_work_without_a_provider_call() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let slot: TurnAbortSlot = Arc::default();
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_turn_abort(Arc::clone(&slot));
+        model.displayed_session_id = Some("admitting-session".into());
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/handoff next steps");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let UiCommand::Handoff { focus, request } = submit_rx.try_recv().unwrap() else {
+            panic!("native handoff route");
+        };
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(request.abort.signal().is_aborted());
+        assert!(sim.model().handoff_in_progress());
+        sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "settings cannot replace the handoff owner"
+        );
+        assert!(sim.model().handoff_in_progress());
+        let provider = Arc::new(NativePromptProbe::default());
+        let mut handle = native_prompt_handle(Arc::clone(&provider));
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        // A different queued workspace command can replace and clear the
+        // legacy global slot without touching this request's cancellation.
+        *slot.lock().unwrap() = Some(crate::agent::AbortHandle::new().0);
+        *slot.lock().unwrap() = None;
+        runtime.block_on(run_handoff_command(&mut handle, &focus, request, &agent_tx));
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert!(
+            handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(slot.lock().unwrap().is_none());
+        sim.send(PiFtuiMsg::Agent(agent_rx.try_recv().unwrap()));
+        assert!(!sim.model().handoff_in_progress());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "Handoff cancelled")
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"pre_dequeue_escape"})
+        );
+    }
+
+    #[test]
+    fn native_handoff_driver_persists_same_session_and_replays_its_history() {
+        use crate::model::{ContentBlock, ImageContent, Message, TextContent, UserContent};
+        use crate::session::{Session, SessionEntry, SessionMessage};
+        let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
+        runtime.block_on(Box::pin(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("interactive-handoff.jsonl");
+            let mut stored = Session::in_memory();
+            stored.path = Some(path.clone());
+            stored.session_dir = Some(directory.path().to_path_buf());
+            stored.set_name("Migration decisions");
+            stored.append_message(SessionMessage::User {
+                content: UserContent::Text("earlier migration evidence ".repeat(300)), timestamp: None,
+            });
+            let kept = UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("Continue with these exact inputs")),
+                ContentBlock::Image(ImageContent { data: "aGVsbG8=".into(), mime_type: "image/png".into() }),
+            ]);
+            stored.append_message(SessionMessage::User { content: kept.clone(), timestamp: None });
+            stored.save().await.unwrap();
+            let owner = stored.header.id.clone();
+            let original_len = stored.entries.len();
+            let provider = Arc::new(NativePromptProbe::default());
+            let agent = crate::agent::Agent::new(provider.clone(),
+                crate::tools::ToolRegistry::from_tools(Vec::new()), crate::agent::AgentConfig::default());
+            let session = crate::agent::AgentSession::new(agent,
+                Arc::new(asupersync::sync::Mutex::new(stored)), true,
+                crate::compaction::ResolvedCompactionSettings {
+                    enabled: false, keep_recent_tokens: 8,
+                    ..crate::compaction::ResolvedCompactionSettings::default()
+                });
+            let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                session, crate::sdk::EventListeners::default());
+            let request = HandoffRequest::new(owner.clone());
+            let expected_request_id = request.id.clone();
+            let (agent_tx, agent_rx) = mpsc::channel();
+            run_handoff_command(&mut handle, "preserve migration decisions", request, &agent_tx).await;
+            let PiMsg::HandoffFinished { request_id, event } = agent_rx.try_recv().unwrap() else {
+                panic!("owned terminal completion");
+            };
+            assert_eq!(request_id, expected_request_id);
+            let PiMsg::ConversationReset { session_id, messages, status, .. } = *event else {
+                panic!("native durable handoff reset");
+            };
+            assert_eq!(session_id, owner);
+            assert!(status.unwrap().starts_with("Handoff saved"));
+            assert_eq!(messages.len(), 2, "full historical transcript remains available");
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(reopened.header.id, owner);
+            assert_eq!(reopened.path.as_deref(), Some(path.as_path()));
+            assert_eq!(reopened.entries.len(), original_len + 1);
+            let compaction = reopened.entries.iter().find_map(|entry| match entry {
+                SessionEntry::Compaction(entry) => Some(entry), _ => None,
+            }).unwrap();
+            assert_eq!(compaction.details.as_ref().unwrap()["mode"], "handoff");
+            let active = reopened.to_messages_for_current_path();
+            assert!(active.iter().any(|message| matches!(message, Message::User(user)
+                if serde_json::to_value(&user.content).unwrap() == serde_json::to_value(&kept).unwrap())));
+            assert_eq!(serde_json::to_value(handle.session().agent.messages()).unwrap(), serde_json::to_value(&active).unwrap());
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(serde_json::to_string(&calls[0].content).unwrap().contains("preserve migration decisions"));
+            assert!(agent_rx.try_recv().is_err());
+            eprintln!("{}", serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"native_driver_durability"}));
+        }));
+    }
+
+    #[test]
+    fn queued_handoff_refuses_a_replacement_session_before_provider_admission() {
+        let provider = Arc::new(NativePromptProbe::default());
+        let mut handle = native_prompt_handle(Arc::clone(&provider));
+        let request = HandoffRequest::new("replaced-session".into());
+        let expected_request_id = request.id.clone();
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(run_handoff_command(
+            &mut handle,
+            "keep the original task",
+            request,
+            &agent_tx,
+        ));
+        let PiMsg::HandoffFinished { request_id, event } = agent_rx.try_recv().unwrap() else {
+            panic!("owned terminal refusal");
+        };
+        assert_eq!(request_id, expected_request_id);
+        assert!(matches!(event.as_ref(), PiMsg::AgentError(message)
+            if message.contains("session changed before it started")));
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert!(
+            handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(handle.session().agent.messages().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn capped_turn_returns_pending_input_and_reports_only_a_durable_pause() {
+        use crate::agent::AgentEvent;
+        use crate::model::{ContentBlock, Message, UserContent};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let reactor = asupersync::runtime::reactor::create_reactor() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime must initialize.
+            .expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread() // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture runtime must initialize.
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(async {
+            for fail_save in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+                let path = dir.path().join("capped-turn.jsonl");
+                let mut stored = crate::session::Session::in_memory();
+                stored.header.cwd = dir.path().display().to_string();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(dir.path().to_path_buf());
+                let owner_session_id = stored.header.id.clone();
+                let provider = Arc::new(NativePromptProbe::default());
+                let agent = crate::agent::Agent::new(
+                    provider.clone(),
+                    crate::tools::ToolRegistry::from_tools(Vec::new()),
+                    crate::agent::AgentConfig {
+                        max_time: Some(Duration::ZERO),
+                        ..Default::default()
+                    },
+                );
+                let session = crate::agent::AgentSession::new(
+                    agent,
+                    Arc::new(asupersync::sync::Mutex::new(stored)),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                );
+                let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                    session,
+                    crate::sdk::EventListeners::default(),
+                );
+                let control: TurnControlSlot = Arc::new(Mutex::new(None));
+                let (tx, rx) = mpsc::channel();
+                send_conversation_reset(&handle, &tx, "cap regression").await;
+
+                let queued = Arc::new(AtomicBool::new(false));
+                let generated = Arc::new(AtomicUsize::new(0));
+                let queue_once = Arc::clone(&queued);
+                let generated_for_callback = Arc::clone(&generated);
+                let published_control = Arc::clone(&control);
+                let store = handle.session_store();
+                let invalid_save_path = dir.path().to_path_buf();
+                handle.subscribe(move |event| match event {
+                    AgentEvent::AgentStart { .. } if !queue_once.swap(true, Ordering::SeqCst) => {
+                        let current = published_control // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Fixture control must be published before AgentStart.
+                            .lock()
+                            .expect("control lock")
+                            .clone()
+                            .expect("active control");
+                        current // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission must succeed.
+                            .follow_up("first unclaimed follow-up")
+                            .expect("queue first follow-up");
+                        current // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission must succeed.
+                            .follow_up("second unclaimed follow-up")
+                            .expect("queue second follow-up");
+                    }
+                    AgentEvent::MessageEnd {
+                        message: Message::Assistant(message),
+                    } if message.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text(text)
+                                if text.text.starts_with("[time cap reached] ")
+                        )
+                    }) =>
+                    {
+                        generated_for_callback.fetch_add(1, Ordering::SeqCst);
+                        if fail_save {
+                            // The user input has already been saved. Fail only
+                            // the later save of the actual synthetic cap.
+                            store.try_lock().expect("idle session store").path = // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Inject the intended post-generation persistence failure.
+                                Some(invalid_save_path.clone());
+                        }
+                    }
+                    _ => {}
+                });
+
+                asupersync::time::timeout(
+                    // ubs:ignore[rust.ownership.unwrap-expect] -- A broken continuation loop must fail within the watchdog.
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(10),
+                    Box::pin(run_prompt_turn(
+                        &mut handle,
+                        "initial capped prompt".to_string(),
+                        Vec::new(),
+                        &tx,
+                        &control,
+                    )),
+                )
+                .await
+                .expect("capped driver watchdog");
+                assert!(queued.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    generated.load(Ordering::SeqCst),
+                    1,
+                    "pending work must not start another run with a fresh cap"
+                );
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    provider.calls.lock().expect("provider capture").is_empty() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
+                );
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    control.lock().expect("control lock").is_none() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
+                );
+
+                let events = rx.try_iter().collect::<Vec<_>>();
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, PiMsg::AgentStart))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, PiMsg::AgentDone { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    events
+                        .iter()
+                        .any(|event| matches!(event, PiMsg::AgentError(_))),
+                    fail_save
+                );
+                let restored = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        PiMsg::RestorePendingInput {
+                            owner_session_id,
+                            text,
+                        } => Some((owner_session_id.as_str(), text.as_str())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let pending_text = "first unclaimed follow-up\n\nsecond unclaimed follow-up";
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    restored,
+                    vec![(owner_session_id.as_str(), pending_text)]
+                );
+
+                let saved = crate::session::Session::open(&path.display().to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- The accepted input must remain durably readable.
+                    .await
+                    .expect("reopen original session");
+                let messages = saved.to_messages_for_current_path();
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count(),
+                    1
+                );
+                assert!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages.iter().any(|message| matches!(
+                        message,
+                        Message::User(user)
+                            if matches!(&user.content, UserContent::Text(text)
+                                if text == "initial capped prompt")
+                    ))
+                );
+                let expected_markers = usize::from(!fail_save);
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    messages
+                        .iter()
+                        .filter(|message| matches!(
+                            message,
+                            Message::Assistant(assistant)
+                                if crate::agent::time_cap_marker(assistant).is_some()
+                        ))
+                        .count(),
+                    expected_markers
+                );
+
+                let (_unused, model) = new_model();
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                for event in events {
+                    if matches!(&event, PiMsg::RestorePendingInput { .. }) {
+                        // The user may start another draft after completion
+                        // but before the pending controls reach the editor.
+                        type_str(&mut sim, "new unsent draft");
+                    }
+                    sim.send(PiFtuiMsg::Agent(event));
+                }
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    sim.model().input.text(),
+                    format!("{pending_text}\n\nnew unsent draft")
+                );
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    sim.model().state,
+                    AgentUiState::Ready
+                );
+                assert_eq!(
+                    // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                    sim.model()
+                        .transcript
+                        .iter()
+                        .filter(|entry| { entry.text.starts_with("[time cap reached] ") })
+                        .count(),
+                    expected_markers,
+                    "only a durably saved cap appears, exactly once"
+                );
+            }
+        }));
+    }
+
+    #[test]
+    fn provider_text_and_noncanonical_empty_identity_replies_do_not_report_a_pause() {
+        use crate::model::{AssistantMessage, ContentBlock, TextContent};
+
+        let marker = "[time cap reached] time cap reached after 0s (--max-time); stopping at the turn boundary";
+        let (tx, rx) = mpsc::channel();
+        report_turn_result(
+            Ok(AssistantMessage {
+                api: "openai-responses".to_string(),
+                provider: "openai".to_string(),
+                model: "fixture".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(marker))],
+                ..Default::default()
+            }),
+            &tx,
+        );
+        for text in [
+            "[time cap reached] quoted documentation, not a runtime pause",
+            "[time cap reached] time cap reached after -1s (--max-time); stopping at the turn boundary",
+            "[time cap reached] time cap reached after 18446744073709551616s (--max-time); stopping at the turn boundary",
+        ] {
+            report_turn_result(
+                Ok(AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    ..Default::default()
+                }),
+                &tx,
+            );
+        }
+        report_turn_result(
+            Ok(AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new(marker)),
+                    ContentBlock::Text(TextContent::new("additional provider content")),
+                ],
+                ..Default::default()
+            }),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+    }
+
+    #[test]
+    fn startup_commands_queue_plan_before_one_native_turn_and_remaining_prompts() {
+        let (tx, rx) = mpsc::channel();
+        let count = queue_initial_commands(
+            &tx,
+            true,
+            true,
+            vec!["first".into(), " \n ".into(), "/triage second".into()],
+        )
+        .expect("startup queue");
+        assert_eq!(count, 2);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                UiCommand::Plan {
+                    action: "enter".into(),
+                },
+                UiCommand::InitialPrompt,
+                UiCommand::Prompt("first".into()),
+                UiCommand::Prompt("/triage second".into()),
+            ]
+        );
+        assert_eq!(
+            queue_initial_commands(&tx, false, false, Vec::new()).unwrap(),
+            0
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an empty launch must not submit a turn"
+        );
+    }
+
+    #[test]
+    fn startup_extension_resolution_preserves_registration_and_raw_arguments() {
+        let commands = vec![crate::autocomplete::NamedEntry {
+            name: "Review".into(),
+            description: None,
+        }];
+        assert_eq!(
+            registered_prompt_command(&commands, " /review\t@private.wav  keep spaces "),
+            Some(("Review".into(), "@private.wav  keep spaces".into()))
+        );
+        for input in [
+            "/reviewer",
+            "review",
+            "/unregistered @private.wav",
+            "see /review",
+        ] {
+            assert!(registered_prompt_command(&commands, input).is_none());
+        }
+    }
+
+    #[test]
+    fn startup_user_rows_require_current_session_and_keep_authored_history() {
+        let (_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        let submitted = |owner: &str| {
+            PiFtuiMsg::Agent(PiMsg::UserInputSubmitted {
+                owner_session_id: owner.to_string(),
+                text: "\x1b[31mvisible generated file body\x1b[0m".into(),
+                history_text: "authored prompt".into(),
+            })
+        };
+        sim.send(submitted("current"));
+        assert!(sim.model().input_history.is_empty());
+        assert!(sim.model().transcript.is_empty());
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "current".into(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(submitted("replaced"));
+        assert!(sim.model().input_history.is_empty());
+        assert!(sim.model().transcript.is_empty());
+        sim.send(submitted("current"));
+        assert_eq!(sim.model().transcript.len(), 1);
+        let user = &sim.model().transcript[0];
+        assert_eq!(user.role, EntryRole::User);
+        assert!(user.text.contains("visible generated file body"));
+        assert!(!user.text.contains('\x1b'));
+        assert_eq!(
+            sim.model().input_history,
+            vec!["authored prompt".to_string()]
+        );
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "display must not enqueue another turn"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "replacement".into(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(submitted("current"));
+        assert!(sim.model().transcript.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn typed_prompt_scans_prose_without_file_names_bodies_or_template_bytes() {
+        use crate::model::{ThinkingLevel, UserContent};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ultrathink.txt"), "attached workflowz").unwrap();
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "triage".into(),
+            description: String::new(),
+            content: "expanded template ultrathink".into(),
+            source: "user".into(),
+            file_path: dir.path().join("triage.md"),
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(provider.clone());
+            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let (tx, rx) = mpsc::channel();
+            for prompt in ["/triage @ultrathink.txt orchestrate", "ultrathink"] {
+                run_typed_prompt(
+                    &mut handle,
+                    prompt.into(),
+                    Some(&resources),
+                    dir.path(),
+                    false,
+                    &tx,
+                    &control,
+                )
+                .await;
+            }
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            let UserContent::Text(first) = &calls[0].content else {
+                panic!("text-only prompt must retain its text representation");
+            };
+            assert!(first.contains("attached workflowz"));
+            assert!(first.contains("expanded template ultrathink"));
+            assert_eq!(calls[0].thinking, Some(ThinkingLevel::Low));
+            let system = calls[0].system_prompt.as_deref().unwrap();
+            assert!(system.contains("invoked `orchestrate`"));
+            assert!(!system.contains("invoked `workflowz`"));
+            assert_eq!(calls[1].thinking, Some(ThinkingLevel::High));
+            assert!(matches!(&calls[1].content, UserContent::Text(text) if text == "ultrathink"));
+            assert!(
+                !rx.try_iter()
+                    .any(|event| matches!(event, PiMsg::AgentError(_)))
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn initial_native_prompt_keeps_prepared_bytes_order_and_authored_authority_once() {
+        use crate::model::{ContentBlock, TextContent, ThinkingLevel, UserContent};
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio = b"RIFF\x00\xffWAVEfrozen-audio";
+        let video = b"\x00\x00\x00\x18ftypisom\xff\x80frozen-video";
+        let png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAA7x2FoAAAAASUVORK5CYII=";
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(png_data)
+            .unwrap();
+        for (name, bytes) in [
+            ("clip.MP4", video.as_slice()),
+            ("image.png", png.as_slice()),
+            ("voice.WAV", audio.as_slice()),
+            (
+                "notes.txt",
+                b"frozen notes: ultrathink @mentioned.txt".as_slice(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        std::fs::write(dir.path().join("mentioned.txt"), "must not be read again").unwrap();
+        let source = "/triage orchestrate";
+        let mut messages = vec![source.to_string(), "remaining CLI turn".to_string()];
+        let mut pending = crate::app::prepare_initial_message(
+            dir.path(),
+            &[
+                "clip.MP4".into(),
+                "image.png".into(),
+                "voice.WAV".into(),
+                "notes.txt".into(),
+            ],
+            &mut messages,
+            false,
+            &crate::workspace::WorkspaceHandle::single(dir.path()),
+        )
+        .unwrap();
+        let prepared = pending.as_ref().expect("prepared initial turn");
+        let expanded = "Review the supplied files. workflowz";
+        let text = format!("{}{expanded}", prepared.text.strip_suffix(source).unwrap());
+        let mut expected = vec![ContentBlock::Text(TextContent::new(text))];
+        expected.extend_from_slice(&prepared.attachments);
+        assert!(matches!(
+            expected.as_slice(),
+            [
+                ContentBlock::Text(_),
+                ContentBlock::Media(_),
+                ContentBlock::Image(_),
+                ContentBlock::Media(_)
+            ]
+        ));
+        let expected = serde_json::to_value(UserContent::Blocks(expected)).unwrap();
+        for name in ["clip.MP4", "image.png", "voice.WAV", "notes.txt"] {
+            std::fs::write(dir.path().join(name), "changed after startup preparation").unwrap();
+        }
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "triage".into(),
+            description: String::new(),
+            content: expanded.into(),
+            source: "user".into(),
+            file_path: dir.path().join("triage.md"),
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(provider.clone());
+            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let (tx, rx) = mpsc::channel();
+            send_conversation_reset(&handle, &tx, "startup").await;
+            run_initial_prompt(&mut handle, &mut pending, Some(&resources), &tx, &control).await;
+            run_initial_prompt(&mut handle, &mut pending, Some(&resources), &tx, &control).await;
+            assert!(pending.is_none());
+            assert!(control.lock().unwrap().is_none());
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "a duplicate startup marker must not replay input"
+            );
+            assert_eq!(serde_json::to_value(&calls[0].content).unwrap(), expected);
+            assert_eq!(calls[0].thinking, Some(ThinkingLevel::Low));
+            let system = calls[0]
+                .system_prompt
+                .as_deref()
+                .expect("authored directive");
+            assert!(system.contains("invoked `orchestrate`"));
+            assert!(!system.contains("invoked `workflowz`"));
+            drop(calls);
+
+            let events = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PiMsg::UserInputSubmitted { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PiMsg::AgentStart))
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, PiMsg::AgentError(_)))
+            );
+            let (_tx, model) = new_model();
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            for event in events {
+                sim.send(PiFtuiMsg::Agent(event));
+            }
+            let users = sim
+                .model()
+                .transcript
+                .iter()
+                .filter(|entry| entry.role == EntryRole::User)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                users.len(),
+                1,
+                "agent events must not duplicate the startup user row"
+            );
+            assert!(users[0].text.contains("frozen notes"));
+            assert!(users[0].text.contains("video/mp4"));
+            assert!(!users[0].text.contains(png_data));
+            assert_eq!(sim.model().input_history, vec![source.to_string()]);
+            assert_eq!(sim.model().state, AgentUiState::Ready);
+        });
+        assert_eq!(messages, vec!["remaining CLI turn".to_string()]);
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn retry_driver_preserves_interleaved_native_blocks_and_plain_text() {
+        use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent, UserContent};
+        let blocks = vec![
+            ContentBlock::Media(MediaContent {
+                data: "AP+A/w==".into(),
+                mime_type: "audio/wav".into(),
+                name: Some("voice.wav".into()),
+            }),
+            ContentBlock::Text(TextContent::new("first text ultrathink")),
+            ContentBlock::Image(ImageContent {
+                data: "aW1hZ2U=".into(),
+                mime_type: "image/png".into(),
+            }),
+            ContentBlock::Text(TextContent::new("second text workflowz")),
+            ContentBlock::Media(MediaContent {
+                data: "AAECAw==".into(),
+                mime_type: "video/mp4".into(),
+                name: Some("clip.mp4".into()),
+            }),
+        ];
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for content in [
+                UserContent::Blocks(blocks),
+                UserContent::Text("plain authored prompt".into()),
+            ] {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = native_prompt_handle(provider.clone());
+                let control: TurnControlSlot = Arc::new(Mutex::new(None));
+                let (tx, rx) = mpsc::channel();
+                let (text, attachments) = match &content {
+                    UserContent::Text(text) => (text.clone(), Vec::new()),
+                    UserContent::Blocks(blocks) => {
+                        handle
+                            .session_mut()
+                            .agent
+                            .set_magic_keyword_scan_override(Some(String::new()));
+                        (String::new(), blocks.clone())
+                    }
+                };
+                run_prompt_turn(&mut handle, text, attachments, &tx, &control).await;
+                run_retry_turn(&mut handle, &tx, &control).await;
+                assert!(control.lock().unwrap().is_none());
+                let calls = provider.calls.lock().unwrap();
+                assert_eq!(calls.len(), 2, "retry must start a real second turn");
+                let expected = serde_json::to_value(&content).unwrap();
+                for call in calls.iter() {
+                    assert_eq!(serde_json::to_value(&call.content).unwrap(), expected);
+                    assert_eq!(call.thinking, Some(crate::model::ThinkingLevel::Low));
+                    assert!(call.system_prompt.as_deref().is_none_or(str::is_empty));
+                }
+                let events = rx.try_iter().collect::<Vec<_>>();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, PiMsg::AgentError(_)))
+                );
+                let text = events
+                    .iter()
+                    .find_map(|event| match event {
+                        PiMsg::RetryCommitted { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .expect("retry transcript update");
+                match &content {
+                    UserContent::Blocks(_) => {
+                        assert!(text.find("voice.wav").unwrap() < text.find("first text").unwrap());
+                        assert!(
+                            text.find("image/png").unwrap() < text.find("second text").unwrap()
+                        );
+                        assert!(text.ends_with("[Media: clip.mp4, video/mp4, 4 B]"));
+                        for payload in ["AP+A/w==", "aW1hZ2U=", "AAECAw=="] {
+                            assert!(!text.contains(payload));
+                        }
+                    }
+                    UserContent::Text(expected) => assert_eq!(text, expected),
+                }
+            }
+        });
+    }
+
     /// `@file` references are read in: a text file is inlined ahead of the
     /// message, an image is attached, and the reference leaves the text. A
     /// prompt without references still expands templates.
@@ -15473,7 +19220,7 @@ mod tests {
     #[test]
     fn reload_picks_up_a_prompt_template_added_after_launch() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let source = ResourceSource {
+        let mut source = ResourceSource {
             package_manager: crate::package_manager::PackageManager::new(dir.path().to_path_buf()),
             config: crate::config::Config::default(),
             cli: crate::resources::ResourceCliOptions {
@@ -15524,6 +19271,33 @@ mod tests {
         };
         assert!(sent.prompt_templates.iter().any(|t| t.name == "triage"));
         assert!(sent.extension_commands.iter().any(|c| c.name == "ext-cmd"));
+
+        // A resource failure must not resurrect the replaced runtime's old
+        // commands. Retain the last good prompts while publishing removals.
+        source.cli.no_prompt_templates = true;
+        source.cli.prompt_paths = vec![String::new()];
+        runtime.block_on(reload_driver_resources(
+            &source,
+            dir.path(),
+            Vec::new(),
+            &mut resources,
+            &mut catalog,
+            &tx,
+        ));
+        let replies = rx.try_iter().collect::<Vec<_>>();
+        assert!(replies.iter().any(|message| {
+            matches!(message, PiMsg::System(text) if text.contains("were not re-read"))
+        }));
+        assert!(replies.iter().any(|message| {
+            matches!(message, PiMsg::AutocompleteCatalog(updated)
+                if updated.extension_commands.is_empty()
+                    && updated.prompt_templates.iter().any(|entry| entry.name == "triage"))
+        }));
+        assert!(catalog.extension_commands.is_empty());
+        assert_eq!(
+            template_prompt(resources.as_ref(), false, "triage", "#13").as_deref(),
+            Some("Triage issue #13")
+        );
     }
 
     /// ctrl+o expands a long tool result the card keeps and collapses it

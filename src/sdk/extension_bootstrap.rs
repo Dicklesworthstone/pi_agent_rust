@@ -27,6 +27,7 @@ pub(super) fn provisional_selection(registry: &ModelRegistry) -> Result<ModelSel
 pub(super) struct SelectionInputs<'a> {
     pub cli: &'a Cli,
     pub config: &'a Config,
+    pub cwd: &'a Path,
     pub scoped_patterns: &'a [String],
     pub global_dir: &'a Path,
     pub oauth_refresh: &'a OAuthRefreshReport,
@@ -119,11 +120,6 @@ async fn finish_selection_inner(
     candidate_registry
         .merge_extension_registry(&bindings, entries)
         .map_err(|error| Error::validation(error.to_string()))?;
-    let scoped_models = if inputs.scoped_patterns.is_empty() {
-        Vec::new()
-    } else {
-        app::resolve_model_scope(inputs.scoped_patterns, &candidate_registry, explicit_key)
-    };
     let store = Arc::clone(&session.session);
     let selection = {
         let stored = store
@@ -131,6 +127,15 @@ async fn finish_selection_inner(
             .await
             .map_err(|error| Error::session(error.to_string()))?;
         ensure_startup_active(&cx)?;
+        let scoped_models = app::resolve_startup_model_scope(
+            inputs.cli,
+            &stored,
+            inputs.scoped_patterns,
+            &candidate_registry,
+            inputs.config,
+            inputs.cwd,
+        )
+        .map_err(|error| Error::validation(error.to_string()))?;
         app::select_model_and_thinking(
             inputs.cli,
             inputs.config,
@@ -168,7 +173,11 @@ async fn finish_selection_inner(
     let api_key = app::resolve_api_key(auth, inputs.cli, &selection.model_entry)
         .map_err(|error| Error::validation(error.to_string()))?;
     ensure_startup_active(&cx)?;
-    let provider = crate::providers::create_provider(&selection.model_entry, Some(&manager))?;
+    let provider = crate::providers::create_provider_with_auth(
+        &selection.model_entry,
+        Some(&manager),
+        Some(auth),
+    )?;
 
     // Complete every fallible operation before publishing the final identity.
     // Keep the extension-installed request hook and other stream options; only
@@ -211,7 +220,7 @@ async fn finish_selection_inner(
             window
         });
     }
-    app::update_session_for_selection(&mut stored, &selection);
+    app::update_session_for_selection(&mut stored, &selection, &candidate_registry);
     drop(stored);
     session.set_model_registry(candidate_registry.clone());
     *registry = candidate_registry;

@@ -1,4 +1,5 @@
 //! Content-Length-framed DAP over owned adapter stdio or loopback TCP.
+//! Connected external adapters are socket-owned, never process-owned.
 //! Dedicated, bounded writer/reader lanes keep blocking I/O off the reactor.
 
 use std::collections::HashMap;
@@ -17,7 +18,10 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{await_completion, encode_frame, read_frame_with_scratch};
 
+mod connect;
 mod delve;
+mod reverse;
+pub use reverse::ReverseRequestHandler;
 
 const MAX_PENDING: usize = 32;
 const MAX_OUTBOUND: usize = 2 * 1024 * 1024;
@@ -91,17 +95,19 @@ impl std::fmt::Display for DapError {
 type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, DapError>>>>;
 
 struct Lifetime {
-    child: Mutex<crate::tools::ProcessGuard>,
+    child: Mutex<Option<crate::tools::ProcessGuard>>,
     // Shutting down a clone wakes both TCP I/O lanes, even if the peer never
     // closes its end. Process teardown alone is insufficient for TCP streams.
     socket: Option<TcpStream>,
     alive: AtomicBool,
     pending: Arc<PendingMap>,
+    reverse: reverse::State,
 }
 
 impl Lifetime {
     fn close(&self, reason: &str) {
         if self.alive.swap(false, Ordering::SeqCst) {
+            self.reverse.close();
             if let Some(socket) = &self.socket {
                 let _ = socket.shutdown(Shutdown::Both);
             }
@@ -109,7 +115,9 @@ impl Lifetime {
             for (_, sender) in waiting {
                 let _ = sender.try_send(Err(DapError::Transport(reason.to_string())));
             }
-            let _ = lock(&self.child).kill();
+            if let Some(child) = lock(&self.child).as_mut() {
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -172,7 +180,8 @@ struct AdapterIo {
     tail: OutputTail,
 }
 
-/// The session owns the adapter; each request owns its pending wait and frame.
+/// The session owns its connection and, only for spawned adapters, its process.
+/// Each request owns its pending wait and frame.
 /// Blocking OS I/O and process cleanup are not hard real-time operations.
 pub struct DapTransport {
     life: Arc<Lifetime>,
@@ -230,24 +239,24 @@ impl DapTransport {
             use std::os::unix::process::CommandExt as _;
             cmd.process_group(0);
         }
-        let mut child = owner.process().spawn_checked(&mut cmd).map_err(|err| {
+        let child = owner.process().spawn_checked(&mut cmd).map_err(|err| {
             tool_err(
                 "DAP_ADAPTER_MISSING",
                 format!("failed to spawn debug adapter {command:?}: {err}"),
             )
         })?;
-        crate::tools::attach_child_job_discipline(&child);
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(tool_err("DAP_TRANSPORT", "adapter pipes unavailable"));
-        };
-        let child = crate::tools::ProcessGuard::new(
+        // spawn_checked already owns an atomic Windows Job registration.
+        // Reattaching would replace and close the Job containing the adapter.
+        let mut child = crate::tools::ProcessGuard::new(
             child,
             crate::tools::ProcessCleanupMode::ProcessGroupTree,
         );
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.take_stdin(), child.take_stdout(), child.take_stderr())
+        else {
+            let _ = child.kill();
+            return Err(tool_err("DAP_TRANSPORT", "adapter pipes unavailable"));
+        };
         owner
             .checkpoint()
             .map_err(|_| tool_err("DAP_CANCELLED", "cancelled during adapter spawn"))?;
@@ -263,22 +272,33 @@ impl DapTransport {
     }
 
     fn from_io(io: AdapterIo) -> Self {
+        Self::from_lanes(Some(io.child), io.input, io.output, io.socket, io.tail)
+    }
+
+    fn from_lanes(
+        child: Option<crate::tools::ProcessGuard>,
+        input: Box<dyn Write + Send>,
+        output: Box<dyn Read + Send>,
+        socket: Option<TcpStream>,
+        tail: OutputTail,
+    ) -> Self {
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
         let life = Arc::new(Lifetime {
-            child: Mutex::new(io.child),
-            socket: io.socket,
+            child: Mutex::new(child),
+            socket,
             alive: AtomicBool::new(true),
             pending: Arc::clone(&pending),
+            reverse: reverse::State::default(),
         });
         let next_seq = Arc::new(AtomicU64::new(1));
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(512);
         let (writer, writes) = std::sync::mpsc::sync_channel::<Frame>(MAX_PENDING);
         let frames_read = Arc::new(AtomicU64::new(0));
-        spawn_writer(io.input, writes, Arc::clone(&life));
+        spawn_writer(input, writes, Arc::clone(&life));
         spawn_reader(
-            io.output,
+            output,
             Arc::clone(&life),
-            Arc::clone(&io.tail),
+            Arc::clone(&tail),
             writer.clone(),
             Arc::clone(&next_seq),
             Arc::clone(&frames_read),
@@ -289,7 +309,7 @@ impl DapTransport {
             writer,
             pending,
             next_seq,
-            stderr_tail: io.tail,
+            stderr_tail: tail,
             event_rx: Mutex::new(event_rx),
             frames_read,
         }
@@ -300,13 +320,22 @@ impl DapTransport {
         self.frames_read.load(Ordering::SeqCst)
     }
 
+    /// A terminal owner observes connection retirement without retaining the
+    /// transport itself. The closure cannot send messages or select a target.
+    pub(super) fn connection_liveness(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let life = Arc::clone(&self.life);
+        Arc::new(move || life.alive.load(Ordering::SeqCst))
+    }
+
     #[must_use]
     pub fn is_alive(&self) -> bool {
         if !self.life.alive.load(Ordering::SeqCst) {
             return false;
         }
-        let status = lock(&self.life.child).try_wait_child();
-        if !matches!(status, Ok(None)) {
+        let exited = lock(&self.life.child)
+            .as_mut()
+            .is_some_and(|child| !matches!(child.try_wait_child(), Ok(None)));
+        if exited {
             self.life
                 .close("adapter process exited or could not be queried");
         }
@@ -318,6 +347,33 @@ impl DapTransport {
         command: &str,
         arguments: Value,
         timeout: Duration,
+    ) -> std::result::Result<Value, DapError> {
+        self.request_inner(command, arguments, timeout, None).await
+    }
+
+    /// Service adapter-to-host requests only while this request is pending.
+    /// The host callback, not the adapter, owns policy and resource cleanup.
+    /// Callbacks run serially on the async caller under its original AgentCx,
+    /// never on the DAP reader. Default requests still refuse reverse calls.
+    /// Only one such window can be active per connection; ordinary requests
+    /// (for example configurationDone) may proceed concurrently.
+    pub async fn request_with_reverse(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+        handler: ReverseRequestHandler,
+    ) -> std::result::Result<Value, DapError> {
+        self.request_inner(command, arguments, timeout, Some(handler))
+            .await
+    }
+
+    async fn request_inner(
+        &self,
+        command: &str,
+        arguments: Value,
+        timeout: Duration,
+        handler: Option<ReverseRequestHandler>,
     ) -> std::result::Result<Value, DapError> {
         let owner = AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| DapError::Cancelled)?;
@@ -341,6 +397,9 @@ impl DapTransport {
                 "outbound DAP frame exceeds 2 MiB".into(),
             ));
         }
+        let reverse = handler
+            .map(|handler| reverse::Permit::open(self, owner.clone(), timeout, handler))
+            .transpose()?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         {
             let mut pending = lock(&self.pending);
@@ -362,7 +421,21 @@ impl DapTransport {
         self.writer
             .try_send(Frame { bytes, phase })
             .map_err(|_| DapError::Transport("DAP writer queue is full or closed".into()))?;
-        let outcome = await_completion(receiver, timeout, || {}).await;
+        let completion = await_completion(receiver, timeout, || {});
+        let outcome = if let Some(reverse) = &reverse {
+            match futures::future::select(Box::pin(completion), Box::pin(reverse.drive())).await {
+                futures::future::Either::Left((result, pending)) => {
+                    drop(pending);
+                    result
+                }
+                futures::future::Either::Right((error, pending)) => {
+                    drop(pending);
+                    return Err(error);
+                }
+            }
+        } else {
+            completion.await
+        };
         lease.answered = outcome.is_ok();
         match outcome {
             Ok(result) => result,
@@ -392,8 +465,10 @@ impl DapTransport {
         lock(&self.stderr_tail).tail()
     }
 
+    /// Close both I/O lanes and fail pending requests. Only a process spawned
+    /// by this transport is killed; an external adapter has no process guard.
     pub fn kill(&self) {
-        self.life.close("adapter terminated by the client");
+        self.life.close("adapter connection retired by the client");
     }
 }
 
@@ -475,6 +550,13 @@ fn spawn_reader(
             match read_frame_with_scratch(&mut reader, &mut scratch) {
                 Ok(Some(message)) => {
                     frames.fetch_add(1, Ordering::SeqCst);
+                    // Admission only: never execute host code on this lane.
+                    if let Some(accepted) = life.reverse.enqueue(&message) {
+                        if accepted {
+                            continue;
+                        }
+                        break "DAP reverse-request admission failed";
+                    }
                     if !dispatch(&message, &life.pending, &events, &tail, &writer, &sequence) {
                         break "DAP event/reply buffer overflow or invalid control message";
                     }

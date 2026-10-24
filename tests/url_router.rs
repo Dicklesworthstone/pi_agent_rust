@@ -5,8 +5,8 @@
 //!    stubbed via `ResolveOptions`).
 //! 2. `read skill://<name>` returns the skill content, identical to the
 //!    resources loader, through the read tool.
-//! 3. Merge-conflict fixture: read marks regions; write @theirs resolves;
-//!    conflict://* bulk form.
+//! 3. Merge-conflict fixtures: guarded native writes, typed batches, exact
+//!    authored bytes, workspace scope, undo/redo and invalid-input refusal.
 //! 4. Unknown scheme foo:// → error listing available schemes.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
@@ -74,6 +74,9 @@ fn init_repo_with_conflict(harness: &TestHarness, tag: &str) -> PathBuf {
     git(&dir, &["init", "-b", "main"]);
     git(&dir, &["config", "user.email", "t@t"]);
     git(&dir, &["config", "user.name", "T"]);
+    git(&dir, &["config", "commit.gpgsign", "false"]);
+    git(&dir, &["config", "merge.conflictStyle", "merge"]);
+    git(&dir, &["config", "core.autocrlf", "false"]);
     std::fs::write(dir.join("f.txt"), "line\n").expect("write");
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-m", "init"]);
@@ -91,6 +94,60 @@ fn init_repo_with_conflict(harness: &TestHarness, tag: &str) -> PathBuf {
         .expect("merge");
     assert!(!out.status.success(), "merge must conflict");
     dir
+}
+
+fn conflict_token(repo: &Path, index: usize) -> String {
+    let output = block_on_local(pi::tools::ReadTool::new(repo).execute(
+        "inspect-conflict",
+        json!({"path": format!("conflict://{index}")}),
+        None,
+    ))
+    .expect("read current conflict token");
+    output.details.as_ref().expect("read details")["metadata"]["token"]
+        .as_str()
+        .expect("snapshot token")
+        .to_owned()
+}
+
+fn add_conflict_path(repo: &Path, relative: &str, content: &str) {
+    use std::io::Write as _;
+    let output = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["ls-files", "--unmerged", "-z", "--", "f.txt"])
+        .output()
+        .expect("stages");
+    assert!(output.status.success());
+    let mut records = Vec::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .expect("stage header");
+        records.extend_from_slice(&record[..tab]);
+        records.push(b'\t');
+        records.extend_from_slice(relative.as_bytes());
+        records.push(0);
+    }
+    let mut child = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["update-index", "-z", "--index-info"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("fixture index");
+    child
+        .stdin
+        .take()
+        .expect("index input")
+        .write_all(&records)
+        .expect("write stages");
+    assert!(child.wait().expect("index exit").success());
+    let path = repo.join(relative);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+    std::fs::write(path, content).expect("second conflict image");
 }
 
 #[test]
@@ -144,8 +201,8 @@ fn conflict_read_write_bulk_and_resolution() {
     harness
         .log()
         .info("verify", format!("conflict doc: {text}"));
-    assert!(text.contains("--- ours ---"), "{text}");
-    assert!(text.contains("--- theirs ---"), "{text}");
+    assert!(text.contains("--- ours (\"HEAD\") ---"), "{text}");
+    assert!(text.contains("--- theirs (\"side\") ---"), "{text}");
 
     let bulk =
         block_on_local(tool.execute("t2", json!({"path": "conflict://*"}), None)).expect("bulk");
@@ -155,9 +212,27 @@ fn conflict_read_write_bulk_and_resolution() {
         .expect("theirs");
     assert!(first_text(&theirs).contains("side"));
 
-    // Write the resolution: @theirs wins.
-    let region = pi::url_router::write_conflict_resolution(&repo, 0, "theirs").expect("resolve");
-    assert_eq!(region.file, "f.txt");
+    let index = std::fs::read(repo.join(".git/index")).expect("index before");
+    let written = block_on_local(pi::tools::WriteTool::new(&repo).execute(
+        "resolve",
+        json!({"path":"conflict://*", "conflicts":[{
+            "index":0, "token":conflict_token(&repo, 0), "resolution":{"kind":"theirs"}
+        }]}),
+        None,
+    ))
+    .expect("resolve through native write");
+    assert_eq!(
+        written.details.as_ref().unwrap()["schema"],
+        "pi.conflict.write.v1"
+    );
+    assert_eq!(
+        written.details.as_ref().unwrap()["regions"][0]["file"],
+        "f.txt"
+    );
+    assert_eq!(
+        std::fs::read(repo.join(".git/index")).expect("index after"),
+        index
+    );
     let content = std::fs::read_to_string(repo.join("f.txt")).expect("read");
     harness
         .log()
@@ -169,6 +244,245 @@ fn conflict_read_write_bulk_and_resolution() {
             .is_empty(),
         "no conflicts remain after resolution"
     );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn conflict_write_preserves_literal_bytes_and_supports_undo_redo() {
+    let case = "conflict_write_preserves_literal_bytes_and_supports_undo_redo";
+    let harness = TestHarness::new(case);
+    let repo = init_repo_with_conflict(&harness, "literal");
+    let block = "<<<<<<< ours\r\nours 😀\r\n||||||| base\r\nbase\r\n=======\r\ntheirs 雪\r\n>>>>>>> theirs\r\n";
+    let original = format!("\u{feff}prefix\r\n{block}middle\r\n{block}tail");
+    std::fs::write(repo.join("f.txt"), &original).expect("exact fixture");
+    let recorder = std::sync::Arc::new(pi::undo::FileMutationRecorder::default());
+    let tool = pi::tools::WriteTool::new(&repo).with_mutation_recorder(Some(recorder.clone()));
+    let replacement = "@theirs\r\n  merged 😀\r\n";
+    let expected = format!("\u{feff}prefix\r\n{block}middle\r\n{replacement}tail");
+    let token = conflict_token(&repo, 1);
+    block_on_local(tool.execute(
+        "literal",
+        json!({
+            "path":format!("conflict://1/{token}"), "content":replacement
+        }),
+        None,
+    ))
+    .expect("write authored region");
+    assert_eq!(
+        std::fs::read(repo.join("f.txt")).unwrap(),
+        expected.as_bytes()
+    );
+    assert_eq!(recorder.stats().undo_depth, 1);
+    assert_eq!(recorder.undo(1, false).applied.len(), 1);
+    assert_eq!(
+        std::fs::read(repo.join("f.txt")).unwrap(),
+        original.as_bytes()
+    );
+    assert_eq!(recorder.redo(1, false).applied.len(), 1);
+    assert_eq!(
+        std::fs::read(repo.join("f.txt")).unwrap(),
+        expected.as_bytes()
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn conflict_write_batch_refuses_partial_admission_and_undoes_all_files() {
+    let case = "conflict_write_batch_refuses_partial_admission_and_undoes_all_files";
+    let harness = TestHarness::new(case);
+    let repo = init_repo_with_conflict(&harness, "batch");
+    let original = std::fs::read_to_string(repo.join("f.txt")).unwrap();
+    add_conflict_path(&repo, "nested/g.txt", &original);
+    let index = std::fs::read(repo.join(".git/index")).unwrap();
+    let recorder = std::sync::Arc::new(pi::undo::FileMutationRecorder::default());
+    let tool = pi::tools::WriteTool::new(&repo).with_mutation_recorder(Some(recorder.clone()));
+    let first =
+        json!({"index":0, "token":conflict_token(&repo, 0), "resolution":{"kind":"theirs"}});
+    let second = json!({"index":1, "token":conflict_token(&repo, 1), "resolution":{"kind":"text","value":"merged\n"}});
+    let mut stale = second.clone();
+    stale["token"] = json!("0".repeat(64));
+    let mut absent_base = second.clone();
+    absent_base["resolution"] = json!({"kind":"base"});
+    for choices in [
+        json!([first.clone(), stale]),
+        json!([first.clone(), first.clone()]),
+        json!([first.clone(), absent_base]),
+    ] {
+        block_on_local(tool.execute(
+            "refused",
+            json!({"path":"conflict://*","conflicts":choices}),
+            None,
+        ))
+        .expect_err("one invalid choice must refuse the complete batch");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("nested/g.txt")).unwrap(),
+            original
+        );
+        assert_eq!(recorder.stats().undo_depth, 0);
+    }
+    let output = block_on_local(tool.execute(
+        "batch",
+        json!({
+            "path":"conflict://*", "conflicts":[first, second]
+        }),
+        None,
+    ))
+    .expect("valid multi-file batch");
+    assert_eq!(
+        output.details.as_ref().unwrap()["regions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+        "side\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("nested/g.txt")).unwrap(),
+        "merged\n"
+    );
+    assert_eq!(
+        recorder.stats().undo_depth,
+        1,
+        "one tool call is one undo unit"
+    );
+    assert_eq!(recorder.undo(1, false).applied.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+        original
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("nested/g.txt")).unwrap(),
+        original
+    );
+    assert_eq!(recorder.redo(1, false).applied.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("nested/g.txt")).unwrap(),
+        "merged\n"
+    );
+    assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn conflict_write_uses_live_workspace_roots_instead_of_the_git_root() {
+    let case = "conflict_write_uses_live_workspace_roots_instead_of_the_git_root";
+    let harness = TestHarness::new(case);
+    let repo = init_repo_with_conflict(&harness, "workspace");
+    let original = std::fs::read_to_string(repo.join("f.txt")).unwrap();
+    add_conflict_path(&repo, "nested/g.txt", &original);
+    let cwd = repo.join("nested");
+    let mut workspace = pi::workspace::WorkspaceHandle::single(&cwd);
+    let recorder = std::sync::Arc::new(pi::undo::FileMutationRecorder::default());
+    let tool = pi::tools::WriteTool::new(&cwd)
+        .with_workspace(workspace.clone())
+        .with_mutation_recorder(Some(recorder.clone()));
+    let request = json!({"path":"conflict://*", "conflicts":[
+        {"index":0, "token":conflict_token(&cwd, 0), "resolution":{"kind":"theirs"}},
+        {"index":1, "token":conflict_token(&cwd, 1), "resolution":{"kind":"ours"}}
+    ]});
+    let error = block_on_local(tool.execute("outside", request.clone(), None)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Cannot write outside the working directory"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("nested/g.txt")).unwrap(),
+        original
+    );
+    assert_eq!(recorder.stats().undo_depth, 0);
+    workspace.add_root(&repo);
+    block_on_local(tool.execute("authorized", request.clone(), None))
+        .expect("live additional root");
+    assert_eq!(recorder.undo(1, false).applied.len(), 1);
+    assert!(workspace.remove_root(&repo));
+    block_on_local(tool.execute("revoked", request, None))
+        .expect_err("revoked root must not be cached");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+        original
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("nested/g.txt")).unwrap(),
+        original
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn conflict_write_rejects_bad_shapes_before_git_or_filesystem_fallback() {
+    let case = "conflict_write_rejects_bad_shapes_before_git_or_filesystem_fallback";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let tool = pi::tools::WriteTool::new(&root);
+    let token = "a".repeat(64);
+    let choice = json!({"index":0,"token":token,"resolution":{"kind":"ours"}});
+    for input in [
+        json!({"path":"conflict://0","content":"x"}),
+        json!({"path":"conflict://0/ours","content":"x"}),
+        json!({"path":format!("conflict://0/{token}/theirs"),"content":"x"}),
+        json!({"path":"conflict://*","conflicts":[]}),
+        json!({"path":"conflict://*","conflicts":[choice.clone()],"content":""}),
+        json!({"path":"conflict://*"}),
+        json!({"path":"conflict://*","conflicts":[choice.clone()],"extra":true}),
+        json!({"path":format!("conflict://0/{token}"),"content":"x","extra":true}),
+        json!({"path":"conflict://*","conflicts":[{
+            "index":0,"token":token,"resolution":{"kind":"ours"},"path":"elsewhere"
+        }]}),
+        json!({"path":"conflict://*","conflicts":[{
+            "index":0,"token":token,"resolution":{"kind":"text","value":"x","extra":true}
+        }]}),
+        json!({"path":"conflict://*","conflicts":[{"index":0,"token":token,"resolution":{"kind":"shell","value":"ignored"}}]}),
+        json!({"path":format!("conflict://0/{token}"),"content":"x".repeat(64*1024+1)}),
+    ] {
+        let error = block_on_local(tool.execute("invalid", input, None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PI_CONFLICT_"), "{error}");
+        assert!(
+            !error.contains("PI_CONFLICT_GIT"),
+            "invalid input reached Git: {error}"
+        );
+    }
+    std::fs::write(root.join("ordinary.txt"), "keep").unwrap();
+    block_on_local(tool.execute(
+        "wrong-path",
+        json!({
+            "path":"ordinary.txt","content":"overwrite","conflicts":[choice]
+        }),
+        None,
+    ))
+    .expect_err("conflict fields on ordinary writes are never ignored");
+    assert_eq!(
+        std::fs::read_to_string(root.join("ordinary.txt")).unwrap(),
+        "keep"
+    );
+    assert!(!root.join("conflict:").exists());
+    finish_case(&harness, case);
+}
+
+#[test]
+fn write_effects_distinguish_files_conflicts_and_remote_schemes() {
+    let case = "write_effects_distinguish_files_conflicts_and_remote_schemes";
+    let harness = TestHarness::new(case);
+    let tool = pi::tools::WriteTool::new(&harness.temp_path("."));
+    let ordinary = tool.effects_for_input(&json!({"path":"f.txt","content":"x"}));
+    assert!(ordinary.writes());
+    assert!(!ordinary.processes() && !ordinary.networks());
+    let conflict = tool.effects_for_input(&json!({"path":"conflict://*","conflicts":[]}));
+    assert!(conflict.writes() && conflict.processes() && !conflict.networks());
+    let remote = tool.effects_for_input(&json!({"path":"ssh://host/file","content":"x"}));
+    assert!(remote.writes() && remote.processes() && remote.networks());
+    let malformed = tool.effects_for_input(&json!({"path":7}));
+    assert!(malformed.processes() && malformed.networks());
     finish_case(&harness, case);
 }
 

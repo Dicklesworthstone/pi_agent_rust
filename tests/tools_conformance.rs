@@ -51,6 +51,246 @@ impl Drop for UnixModeGuard {
 mod read_tool {
     use super::*;
 
+    // Captured from stock SQLite 3.53.1, not synthesized by the reader's WAL
+    // checksum implementation. The second row exists only in the WAL.
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    fn stock_sqlite_wal_fixture(root: &Path) -> (Vec<u8>, Vec<u8>) {
+        use base64::Engine as _;
+        // Zero-filled ranges are omitted; offsets and nonzero bytes come
+        // directly from stock SQLite, independently of the WAL reader.
+        let mut image = vec![0_u8; 1024];
+        for (offset, encoded) in [
+            (
+                0,
+                "U1FMaXRlIGZvcm1hdCAzAAIAAgIAQCAgAAAAAwAAAAIAAAAAAAAAAAAAAAEAAAAEAAAAAAAAAAAAAAAB",
+            ),
+            (95, "AwAulckNAAAAAQGtAAGt"),
+            (
+                429,
+                "UQEGFxsbAXt0YWJsZXJlY29yZHNyZWNvcmRzAkNSRUFURSBUQUJMRSByZWNvcmRzKGlkIElOVEVHRVIgUFJJTUFSWSBLRVksIG5hbWUgVEVYVCkNAAAAAQH1AAH1",
+            ),
+            (1013, "CQEDABliZWZvcmU="),
+        ] {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            image[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        let mut wal = vec![0_u8; 568];
+        for (offset, encoded) in [
+            (
+                0,
+                "N38GggAt4hgAAAIAAAAAAEuCK8XwQS9wmfaFXsH/nvMAAAACAAAAAkuCK8XwQS9wpJUO465LAVMNAAAAAgHjAAH1AeM=",
+            ),
+            (539, "CL///////////wMAF2FmdGVyCQEDABliZWZvcmU="),
+        ] {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            wal[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        std::fs::write(root.join("data.sqlite"), &image).unwrap();
+        std::fs::write(root.join("data.sqlite-wal"), &wal).unwrap();
+        (image, wal)
+    }
+
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    #[test]
+    fn sqlite_read_queries_committed_wal_without_mutating_source() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let (image, wal) = stock_sqlite_wal_fixture(directory.path());
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let result = tool
+                .execute("schema", serde_json::json!({"path":"data.sqlite"}), None)
+                .await
+                .unwrap();
+            assert!(get_text_content(&result.content).contains("records"));
+            let result = tool
+                .execute(
+                    "row",
+                    serde_json::json!({"path":"data.sqlite:records:9223372036854775807"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.contains("9223372036854775807"));
+            assert!(text.contains("after"));
+            assert!(!text.contains("before"));
+            assert_eq!(result.details.as_ref().unwrap()["walFrames"], 1);
+            let result = tool
+                .execute(
+                    "page",
+                    serde_json::json!({"path":"data.sqlite:records?order=id:asc&limit=1&offset=1"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text_content(&result.content).contains("after"));
+            assert_eq!(result.details.as_ref().unwrap()["hasMoreRows"], false);
+            let result = tool.execute("projection", serde_json::json!({"path":"data.sqlite?q=SELECT name FROM records ORDER BY id DESC"}), None).await.unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.find("after").unwrap() < text.find("before").unwrap());
+            assert_eq!(
+                std::fs::read(directory.path().join("data.sqlite")).unwrap(),
+                image
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join("data.sqlite-wal")).unwrap(),
+                wal
+            );
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+            assert!(
+                tool.execute(
+                    "anchors",
+                    serde_json::json!({"path":"data.sqlite:records","hashline":true}),
+                    None
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("SQLITE_HASHLINE")
+            );
+            assert!(
+                tool.execute(
+                    "write",
+                    serde_json::json!({"path":"data.sqlite?q=DELETE FROM records"}),
+                    None
+                )
+                .await
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn sqlite_selectors_preserve_plain_db_reads_and_enforce_workspace_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("plain.db"), "ordinary text database").unwrap();
+            std::fs::write(outside.path().join("private.sqlite"), b"SQLite format 3\0").unwrap();
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let output = tool
+                .execute("plain", serde_json::json!({"path":"plain.db"}), None)
+                .await
+                .unwrap();
+            assert!(get_text_content(&output.content).contains("ordinary text database"));
+            let error = tool
+                .execute(
+                    "invalid",
+                    serde_json::json!({"path":"plain.db:records"}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("SQLite format 3"));
+            let path = format!(
+                "{}?q=SELECT name FROM records",
+                outside.path().join("private.sqlite").display()
+            );
+            let error = tool
+                .execute("outside", serde_json::json!({"path":path}), None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+        });
+    }
+
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    #[test]
+    fn json_read_filters_pages_and_keeps_source_edit_anchors_separate() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let source = r#"{"items":[{"id":12345678901234567890,"name":"Ada","active":true},{"id":2,"name":"Grace","active":false},{"id":3,"name":"Lin","active":true}]}"#;
+            std::fs::write(directory.path().join("data.json"), source).unwrap();
+            std::fs::write(
+                directory.path().join("events.jsonl"),
+                "{\"name\":\"Ada\"}\n{\"name\":\"Grace\"}\n{\"name\":\"Lin\"}\n",
+            )
+            .unwrap();
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let result = tool
+                .execute(
+                    "integer",
+                    serde_json::json!({"path":"data.json?q=.items[0].id"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text_content(&result.content).contains("12345678901234567890"));
+            let result = tool
+                .execute(
+                    "filter",
+                    serde_json::json!({"path":"data.json?q=.items | map(select(.active)) | map(.name)&compact=true"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.contains("[\"Ada\",\"Lin\"]"));
+            assert!(!text.contains("Grace"));
+            let result = tool
+                .execute(
+                    "page",
+                    serde_json::json!({"path":"events.jsonl?q=.name&raw=true&limit=1&offset=1"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text_content(&result.content);
+            assert!(text.contains("Grace"));
+            assert!(!text.contains("Ada"));
+            assert!(!text.contains("Lin"));
+            assert_eq!(
+                result.details.as_ref().unwrap()["pagination"]["nextOffset"],
+                2
+            );
+            let error = tool
+                .execute(
+                    "anchors",
+                    serde_json::json!({"path":"data.json?q=.","hashline":true}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("JSON_QUERY_HASHLINE"));
+            let raw = tool
+                .execute(
+                    "source",
+                    serde_json::json!({"path":"data.json","hashline":true}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text_content(&raw.content).contains("1#"));
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("data.json")).unwrap(),
+                source
+            );
+        });
+    }
+
+    #[test]
+    fn json_query_sources_still_enforce_workspace_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("private.json"), "{\"secret\":true}").unwrap();
+            let tool = pi::tools::ReadTool::new(directory.path());
+            let path = format!(
+                "{}?q=.secret",
+                outside.path().join("private.json").display()
+            );
+            let error = tool
+                .execute("outside", serde_json::json!({"path":path}), None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+        });
+    }
+
     #[test]
     fn test_read_existing_file() {
         asupersync::test_utils::run_test(|| async {
@@ -1178,6 +1418,332 @@ mod bash_tool {
 
 mod grep_tool {
     use super::*;
+
+    #[test]
+    fn grep_internal_documents_merge_context_and_share_the_match_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = format!("grep-documents-{}", uuid::Uuid::new_v4());
+            let first = format!("{prefix}-first");
+            let second = format!("{prefix}-second");
+            pi::url_router::write_local(&first, "before\nTARGET.one\nbetween\nTARGET.two\nafter\n")
+                .unwrap();
+            pi::url_router::write_local(&second, "other\nTARGET.three\nlast\n").unwrap();
+            let paths = format!("local://{first}; local://{second}");
+            let tool = pi::tools::GrepTool::new(temp.path());
+            let output = tool
+                .execute(
+                    "virtual-context",
+                    serde_json::json!({
+                        "pattern": "target.", "literal": true, "ignoreCase": true,
+                        "path": paths, "context": 1, "limit": 3,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text_content(&output.content);
+            assert_eq!(
+                text,
+                format!(
+                    "local://{first}-1- before\nlocal://{first}:2: TARGET.one\nlocal://{first}-3- between\nlocal://{first}:4: TARGET.two\nlocal://{first}-5- after\nlocal://{second}-1- other\nlocal://{second}:2: TARGET.three\nlocal://{second}-3- last"
+                )
+            );
+            let details = output.details.unwrap();
+            assert_eq!(details["matches"], 3);
+            assert_eq!(details["resources"].as_array().unwrap().len(), 2);
+            assert!(details.get("matchLimitReached").is_none());
+            assert!(details["resources"][0].get("content").is_none());
+
+            pi::url_router::write_local(&second, "updated contents\n").unwrap();
+            let fresh = tool
+                .execute(
+                    "virtual-fresh",
+                    serde_json::json!({
+                        "pattern": "TARGET", "path": format!("local://{second}"),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(get_text_content(&fresh.content), "No matches found");
+        });
+    }
+
+    #[test]
+    fn grep_internal_resource_limit_reports_unsearched_sources() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = format!("grep-limit-{}", uuid::Uuid::new_v4());
+            pi::url_router::write_local(&format!("{prefix}-one"), "needle first\n").unwrap();
+            pi::url_router::write_local(
+                &format!("{prefix}-two"),
+                "needle second\nneedle overflow\n",
+            )
+            .unwrap();
+            let output = pi::tools::GrepTool::new(temp.path()).execute(
+                "virtual-limit", serde_json::json!({
+                    "pattern": "needle",
+                    "path": format!("local://{prefix}-one;local://{prefix}-two;local://{prefix}-not-resolved"),
+                    "limit": 2,
+                }), None,
+            ).await.unwrap();
+            let text = get_text_content(&output.content);
+            assert!(text.contains("needle first"));
+            assert!(text.contains("needle second"));
+            assert!(!text.contains("needle overflow"));
+            assert!(text.contains("1 remaining resources were not searched"));
+            let details = output.details.unwrap();
+            assert_eq!(details["matchLimitReached"], 2);
+            assert_eq!(details["resourcesSkipped"], 1);
+        });
+    }
+
+    #[test]
+    fn grep_resource_validation_precedes_resolution_and_never_falls_back() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let tool = pi::tools::GrepTool::new(temp.path());
+            for (extra, expected) in [
+                (serde_json::json!({"hashline":true}), "DOCUMENT_HASHLINE"),
+                (serde_json::json!({"glob":"*.rs"}), "GREP_RESOURCE_GLOB"),
+                (
+                    serde_json::json!({"limit":10001}),
+                    "GREP_RESOURCE_MATCH_LIMIT",
+                ),
+            ] {
+                let mut input = serde_json::json!({"pattern":"needle","path":"local://unresolved-validation-fixture"});
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let error = tool
+                    .execute("invalid-options", input, None)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+            for path in [
+                "local://missing;",
+                "local://missing;README.md",
+                "local://missing;https://example.com",
+            ] {
+                let error = tool
+                    .execute(
+                        "invalid-list",
+                        serde_json::json!({
+                            "pattern":"needle", "path":path,
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("GREP_RESOURCE_LIST"), "{error}");
+            }
+            let too_many = std::iter::repeat_n("local://missing", 17)
+                .collect::<Vec<_>>()
+                .join(";");
+            let error = tool
+                .execute(
+                    "too-many-resources",
+                    serde_json::json!({
+                        "pattern":"needle", "path":too_many,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("GREP_RESOURCE_COUNT"));
+            for (path, code) in [
+                ("unregistered://document", "PI_URL_UNKNOWN_SCHEME"),
+                (
+                    "agent://unknown-grep-child/findings/0/path",
+                    "PI_URL_AGENT_NOT_FOUND",
+                ),
+            ] {
+                let error = tool
+                    .execute(
+                        "unknown-resource",
+                        serde_json::json!({
+                            "pattern":"needle", "path":path,
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains(code), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_resource_size_and_unicode_line_limits_are_explicit() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let name = format!("grep-sized-{}", uuid::Uuid::new_v4());
+            let path = format!("local://{name}");
+            let tool = pi::tools::GrepTool::new(temp.path());
+            pi::url_router::write_local(&name, &"🦀".repeat(600)).unwrap();
+            let output = tool
+                .execute(
+                    "unicode-line",
+                    serde_json::json!({
+                        "pattern":"🦀", "path":path,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text_content(&output.content);
+            assert_eq!(text.matches('🦀').count(), 500);
+            assert_eq!(output.details.as_ref().unwrap()["linesTruncated"], true);
+
+            pi::url_router::write_local(&name, &"x".repeat(10 * 1024 * 1024 + 1)).unwrap();
+            let error = tool
+                .execute(
+                    "oversized-source",
+                    serde_json::json!({
+                        "pattern":"x", "path":path,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("GREP_RESOURCE_BYTES"), "{error}");
+            pi::url_router::write_local(&name, "released fixture bytes").unwrap();
+        });
+    }
+
+    #[test]
+    fn grep_skill_supporting_documents_keep_the_skill_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_skill_supporting_documents");
+            harness.create_file(".pi/skills/grep-review/SKILL.md", b"---\nname: grep-review\ndescription: Search fixture\n---\nReview the references.\n");
+            harness.create_file(
+                ".pi/skills/grep-review/references/checklist.md",
+                b"first\nreview needle\nlast\n",
+            );
+            harness.create_file(".pi/skills/outside.md", b"outside needle\n");
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let output = tool
+                .execute(
+                    "skill-grep",
+                    serde_json::json!({
+                        "pattern":"needle", "path":"skill://grep-review/references/checklist.md",
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                get_text_content(&output.content),
+                "skill://grep-review/references/checklist.md:2: review needle"
+            );
+            let error = tool
+                .execute(
+                    "skill-escape",
+                    serde_json::json!({
+                        "pattern":"needle", "path":"skill://grep-review/../outside.md",
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("PI_URL_SKILL_"), "{error}");
+        });
+    }
+
+    #[test]
+    fn grep_http_reader_raw_and_private_target_policy_share_the_read_fetcher() {
+        use common::harness::MockHttpResponse;
+
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_http_reader_raw_policy");
+            let server = harness.start_mock_http_server();
+            server.add_route("GET", "/document;version=1", MockHttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "text/html".to_string())],
+                body: b"<html><body><main><p>Visible document text.</p><script>hiddenNeedle</script></main></body></html>".to_vec(),
+            });
+            let url = format!("{}/document;version=1", server.base_url());
+            let denied = pi::tools::GrepTool::new(harness.temp_dir())
+                .execute(
+                    "private-denied",
+                    serde_json::json!({"pattern":"hiddenNeedle","path":url}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(denied.to_string().contains("SSRF"), "{denied}");
+            assert!(server.requests().is_empty());
+
+            let config = serde_json::from_value::<pi::config::Config>(serde_json::json!({
+                "read":{"urlAllowPrivateTargets":true},
+            }))
+            .unwrap();
+            let registry =
+                pi::tools::ToolRegistry::new(&["grep"], harness.temp_dir(), Some(&config));
+            let tool = registry.get("grep").unwrap();
+            let reader = tool
+                .execute(
+                    "reader",
+                    serde_json::json!({
+                        "pattern":"hiddenNeedle", "path":url,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(get_text_content(&reader.content), "No matches found");
+            let raw = tool
+                .execute(
+                    "raw",
+                    serde_json::json!({
+                        "pattern":"hiddenNeedle", "path":format!("{url}:raw"),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text_content(&raw.content).contains("<script>hiddenNeedle</script>"));
+            assert_eq!(raw.details.as_ref().unwrap()["resources"][0]["url"], url);
+            assert_eq!(server.requests().len(), 2);
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|request| request.path == "/document;version=1")
+            );
+        });
+    }
+
+    #[test]
+    fn grep_remote_resources_declare_their_process_and_network_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = pi::tools::GrepTool::new(temp.path());
+        for path in [
+            "pr://12/diff",
+            "issue://owner/repo/12",
+            "ssh://host/var/log/app",
+            "local://notes;pr://12/diff",
+        ] {
+            let effects =
+                tool.effects_for_input(&serde_json::json!({"pattern":"needle","path":path}));
+            assert!(effects.processes(), "{path}");
+            assert!(effects.networks(), "{path}");
+        }
+        let web = tool.effects_for_input(
+            &serde_json::json!({"pattern":"needle","path":"https://example.com:raw"}),
+        );
+        assert!(web.networks());
+        assert!(!web.processes());
+        let local =
+            tool.effects_for_input(&serde_json::json!({"pattern":"needle","path":"local://notes"}));
+        assert_eq!(local, pi::tools::ToolEffects::read());
+        let invalid = tool.effects_for_input(&serde_json::json!({"pattern":"needle","path":7}));
+        assert!(invalid.processes());
+        assert!(invalid.networks());
+    }
 
     #[test]
     fn test_grep_basic_pattern() {
@@ -3228,6 +3794,737 @@ fn log_tool_execution(
 
 mod e2e_read {
     use super::*;
+    use std::io::{Cursor, Write as _};
+
+    fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(*name, options).expect("start ZIP member");
+            writer.write_all(content).expect("write ZIP member");
+        }
+        writer.finish().expect("finish ZIP fixture").into_inner()
+    }
+
+    #[test]
+    fn e2e_read_zip_navigation_paginates_members_and_keeps_cache_identity() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_zip_navigation_paginates_members_and_keeps_cache_identity",
+            );
+            let bytes = zip_fixture(&[
+                ("config/a.txt", b"alpha-1\nalpha-2\nalpha-3\n"),
+                ("config/b.txt", b"beta-1\nbeta-2\nbeta-3\n"),
+                ("README.md", b"release\n"),
+            ]);
+            let path = harness.create_file("release.zip", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for (request, expected) in [
+                ("release.zip", "    1→README.md (8 bytes)\n    2→config/"),
+                (
+                    "release.zip:config",
+                    "    1→a.txt (24 bytes)\n    2→b.txt (21 bytes)",
+                ),
+            ] {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    request,
+                    serde_json::json!({"path": request}),
+                )
+                .await
+                .expect("list archive without explicit directory entries");
+                assert_eq!(get_text_content(&output.content), expected);
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], "archive");
+                assert_eq!(details["isDirectory"], true);
+                assert_eq!(details["entryCount"], 3);
+            }
+            // Alternate equal windows from distinct members, then revisit
+            // each cached request. The outer archive is the same dependency.
+            for (attempt, (member, expected)) in [
+                ("config/a.txt", "alpha-2"),
+                ("config/b.txt", "beta-2"),
+                ("config/a.txt", "alpha-2"),
+                ("config/b.txt", "beta-2"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-member-{attempt}"),
+                    serde_json::json!({
+                        "path": format!("release.zip:{member}"), "offset": 2, "limit": 1,
+                    }),
+                )
+                .await
+                .expect("read the selected ZIP member window");
+                let text = get_text_content(&output.content);
+                assert_eq!(text.lines().next().unwrap(), format!("    2→{expected}"));
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["member"], member);
+                assert_eq!(details["isDirectory"], false);
+                assert_eq!(details["totalLines"], 3);
+                assert_eq!(details["outputLines"], 1);
+                assert_eq!(details["nextOffset"], 3);
+                assert_eq!(details["truncated"], true);
+            }
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(!harness.temp_dir().join("config").exists());
+            assert!(!harness.temp_dir().join("README.md").exists());
+        });
+    }
+
+    #[test]
+    fn e2e_read_zip_listing_pages_reach_every_entry() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("e2e_read_zip_listing_pages_reach_every_entry");
+            let names: Vec<String> = (0..501)
+                .map(|index| format!("entry-{index:03}.txt"))
+                .collect();
+            let entries: Vec<(&str, &[u8])> = names
+                .iter()
+                .map(|name| (name.as_str(), b"x".as_slice()))
+                .collect();
+            harness.create_file("many.zip", &zip_fixture(&entries));
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1_u64;
+            let mut actual = Vec::new();
+            for page in 0..4 {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-listing-page-{page}"),
+                    serde_json::json!({"path": "many.zip", "offset": offset, "limit": 200}),
+                )
+                .await
+                .expect("read the next archive listing page");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["entryCount"], 501);
+                assert_eq!(details["totalLines"], 501);
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 200);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, entry) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(entry.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else {
+                    assert_eq!(details["truncated"], false);
+                    break;
+                };
+                assert_eq!(details["truncated"], true);
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            let expected: Vec<String> = names
+                .iter()
+                .map(|name| format!("{name} (1 bytes)"))
+                .collect();
+            assert_eq!(actual, expected);
+        });
+    }
+
+    #[test]
+    fn e2e_read_zip_raw_and_hashline_flags_preserve_container_boundaries() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_zip_raw_and_hashline_flags_preserve_container_boundaries",
+            );
+            let bytes = zip_fixture(&[("member.txt", b"inside\n")]);
+            harness.create_file("release.zip", &bytes);
+            harness.create_file("source.zip", b"literal source\n");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let raw = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-raw-container",
+                serde_json::json!({"path": "release.zip", "raw": true}),
+            )
+            .await
+            .expect("raw ZIP uses the existing source-byte read behavior");
+            assert!(get_text_content(&raw.content).starts_with("    1→PK"));
+            assert_ne!(
+                raw.details
+                    .as_ref()
+                    .and_then(|details| details["contentType"].as_str()),
+                Some("archive"),
+            );
+            let source = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-raw-source",
+                serde_json::json!({"path": "source.zip", "raw": true}),
+            )
+            .await
+            .expect("raw bypasses format recognition");
+            assert_eq!(get_text_content(&source.content), "    1→literal source");
+            let member = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-raw-member",
+                serde_json::json!({"path": "release.zip:member.txt", "raw": true}),
+            )
+            .await
+            .expect("an explicit member selector still navigates the archive");
+            assert_eq!(get_text_content(&member.content), "    1→inside");
+            assert_eq!(member.details.as_ref().unwrap()["member"], "member.txt");
+            for (path, raw) in [
+                ("release.zip", false),
+                ("release.zip:member.txt", false),
+                ("release.zip:member.txt", true),
+            ] {
+                let error = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-hashline-{raw}-{path}"),
+                    serde_json::json!({"path": path, "raw": raw, "hashline": true}),
+                )
+                .await
+                .expect_err("archive views cannot authorize source hashline edits");
+                assert!(error.to_string().contains("ARCHIVE_HASHLINE"));
+            }
+        });
+    }
+
+    #[test]
+    fn e2e_read_zip_keeps_outer_scope_and_rechecks_cached_permissions() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_zip_keeps_outer_scope_and_rechecks_cached_permissions");
+            let outside = tempfile::tempdir().expect("outside workspace");
+            let bytes = zip_fixture(&[("nested/private.txt", b"private fixture\n")]);
+            let outside_path = outside.path().join("outside.zip");
+            std::fs::write(&outside_path, &bytes).unwrap();
+            let local_path = harness.create_file("local.zip", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for suffix in ["", ":nested/private.txt"] {
+                let error = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("zip-outside{suffix}"),
+                    serde_json::json!({"path": format!("{}{suffix}", outside_path.display())}),
+                )
+                .await
+                .expect_err("the outer archive must be admitted before reading any member");
+                assert!(error.to_string().contains("outside"));
+            }
+            let input = serde_json::json!({"path": "local.zip:nested/private.txt"});
+            let output = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "zip-admitted",
+                input.clone(),
+            )
+            .await
+            .expect("read an admitted member");
+            assert_eq!(get_text_content(&output.content), "    1→private fixture");
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&outside_path, harness.temp_dir().join("escape.zip"))
+                    .expect("outside archive symlink");
+                for path in ["escape.zip", "escape.zip:nested/private.txt"] {
+                    let error = execute_tool_with_diagnostics(
+                        &harness,
+                        &tool,
+                        "read",
+                        path,
+                        serde_json::json!({"path": path}),
+                    )
+                    .await
+                    .expect_err("a symlink cannot admit an outside archive");
+                    assert!(error.to_string().contains("outside"));
+                }
+                let _mode = UnixModeGuard::set(&local_path, 0);
+                execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    "zip-cache-mode-denied",
+                    input,
+                )
+                .await
+                .expect_err("cached archive output must not bypass current file permissions");
+            }
+            assert_eq!(std::fs::read(&local_path).unwrap(), bytes);
+            assert_eq!(std::fs::read(&outside_path).unwrap(), bytes);
+            assert!(!harness.temp_dir().join("nested").exists());
+            assert!(!outside.path().join("nested").exists());
+        });
+    }
+
+    #[test]
+    fn e2e_read_xlsx_pages_keep_saved_values_and_original_coordinates() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_xlsx_pages_keep_saved_values_and_original_coordinates");
+            let bytes = zip_fixture(&[
+                (
+                    "_rels/.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="main" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/workbook.xml",
+                    br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Finance" sheetId="1" r:id="sheet"/></sheets></workbook>"#,
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="sheet" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet.xml"/><Relationship Id="strings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#,
+                ),
+                (
+                    "xl/sharedStrings.xml",
+                    br#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Revenue</t></si><si><t>Amount</t></si></sst>"#,
+                ),
+                (
+                    "xl/worksheets/sheet.xml",
+                    br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row><row r="3"><c r="C3"><f>1+1</f><v>2</v></c></row></sheetData></worksheet>"#,
+                ),
+            ]);
+            let path = harness.create_file("FINANCE.XLSX", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1_u64;
+            let mut actual = Vec::new();
+            for page in 0..4 {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("xlsx-page-{page}"),
+                    serde_json::json!({"path": "FINANCE.XLSX", "offset": offset, "limit": 2}),
+                )
+                .await
+                .expect("render the next workbook page");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], "xlsx");
+                assert_eq!(details["totalLines"], 6);
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 2);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, value) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(value.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else {
+                    assert_eq!(details["truncated"], false);
+                    break;
+                };
+                assert_eq!(details["truncated"], true);
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            assert_eq!(
+                actual,
+                [
+                    "## Finance",
+                    "",
+                    "| Row | A | C |",
+                    "| --- | --- | --- |",
+                    "| 1 | Revenue | Amount |",
+                    "| 3 |  | 2 |",
+                ],
+            );
+            let error = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "xlsx-hashline-refused",
+                serde_json::json!({"path": "FINANCE.XLSX", "hashline": true}),
+            )
+            .await
+            .expect_err("rendered workbook coordinates cannot authorize source edits");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn e2e_read_xlsx_raw_bypasses_conversion_and_invalid_packages_fail() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_xlsx_raw_bypasses_conversion_and_invalid_packages_fail");
+            let path = harness.create_file("source.xlsx", b"literal source\n");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "xlsx-invalid-package",
+                serde_json::json!({"path": "source.xlsx"}),
+            )
+            .await
+            .expect_err("an XLSX extension must not turn an invalid ZIP into text");
+            let raw = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "xlsx-raw-source",
+                serde_json::json!({"path": "source.xlsx", "raw": true}),
+            )
+            .await
+            .expect("raw keeps the original source-byte read behavior");
+            assert_eq!(get_text_content(&raw.content), "    1→literal source");
+            assert_ne!(
+                raw.details
+                    .as_ref()
+                    .and_then(|details| details["contentType"].as_str()),
+                Some("xlsx"),
+            );
+            assert_eq!(std::fs::read(path).unwrap(), b"literal source\n");
+        });
+    }
+
+    #[test]
+    fn e2e_read_epub_pages_follow_the_spine_and_preserve_the_source() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_epub_pages_follow_the_spine_and_preserve_the_source");
+            let bytes = zip_fixture(&[
+                ("mimetype", b"application/epub+zip"),
+                (
+                    "META-INF/container.xml",
+                    br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="Book/package.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+                ),
+                (
+                    "Book/package.opf",
+                    br#"<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Field Guide</dc:title></metadata><manifest><item id="last" href="last.xhtml" media-type="application/xhtml+xml"/><item id="first" href="first.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="first"/><itemref idref="last"/></spine></package>"#,
+                ),
+                (
+                    "Book/last.xhtml",
+                    br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Final saved chapter.</p><script>must_not_execute()</script></body></html>"#,
+                ),
+                (
+                    "Book/first.xhtml",
+                    br#"<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><body><p>First saved chapter.</p></body></html>"#,
+                ),
+            ]);
+            let path = harness.create_file("GUIDE.EPUB", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1_u64;
+            let mut actual = Vec::new();
+            for page in 0..6 {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("epub-page-{page}"),
+                    serde_json::json!({"path": "GUIDE.EPUB", "offset": offset, "limit": 2}),
+                )
+                .await
+                .expect("read the next EPUB page");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], "epub");
+                assert_eq!(details["extractor"], "epub");
+                assert_eq!(details["rendered"], true);
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 2);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, value) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(value.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else {
+                    assert_eq!(details["truncated"], false);
+                    break;
+                };
+                assert_eq!(details["truncated"], true);
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            assert_eq!(
+                actual,
+                [
+                    "**Title:** Field Guide",
+                    "",
+                    "## Section 1",
+                    "",
+                    "First saved chapter.",
+                    "",
+                    "## Section 2",
+                    "",
+                    "Final saved chapter.",
+                ],
+            );
+            let error = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "epub-hashline-refused",
+                serde_json::json!({"path": "GUIDE.EPUB", "hashline": true}),
+            )
+            .await
+            .expect_err("book text does not provide source edit anchors");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(!harness.temp_dir().join("Book").exists());
+        });
+    }
+
+    #[test]
+    fn e2e_read_epub_checks_all_chapters_before_returning_a_short_page() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_epub_checks_all_chapters_before_returning_a_short_page");
+            let bytes = zip_fixture(&[
+                ("mimetype", b"application/epub+zip"),
+                (
+                    "META-INF/container.xml",
+                    br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+                ),
+                (
+                    "book.opf",
+                    br#"<package xmlns="http://www.idpf.org/2007/opf"><metadata/><manifest><item id="first" href="first.xhtml" media-type="application/xhtml+xml"/><item id="missing" href="missing.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="first"/><itemref idref="missing"/></spine></package>"#,
+                ),
+                (
+                    "first.xhtml",
+                    br#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Partial book.</p></body></html>"#,
+                ),
+            ]);
+            let path = harness.create_file("incomplete.epub", &bytes);
+            harness.create_file("source.epub", b"literal source\n");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "epub-missing-chapter",
+                serde_json::json!({"path": "incomplete.epub", "offset": 1, "limit": 1}),
+            )
+            .await
+            .expect_err("a readable first page cannot hide a missing later chapter");
+            let raw = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "epub-raw-source",
+                serde_json::json!({"path": "source.epub", "raw": true}),
+            )
+            .await
+            .expect("raw bypasses book recognition");
+            assert_eq!(get_text_content(&raw.content), "    1→literal source");
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn e2e_read_local_notebook_preserves_saved_results_and_raw_edit_access() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new(
+                "e2e_read_local_notebook_preserves_saved_results_and_raw_edit_access",
+            );
+            let source = serde_json::json!({
+                "nbformat": 4,
+                "nbformat_minor": 5,
+                "metadata": {"language_info": {"name": "python"}},
+                "cells": [{
+                    "cell_type": "code",
+                    "metadata": {},
+                    "source": ["raise RuntimeError('must never execute during read')\n"],
+                    "execution_count": 7,
+                    "outputs": [
+                        {"output_type": "stream", "name": "stdout", "text": ["saved result: 42\n"]},
+                        {"output_type": "error", "ename": "ValueError", "evalue": "saved failure", "traceback": ["saved frame"]}
+                    ]
+                }]
+            });
+            let bytes = serde_json::to_vec(&source).expect("notebook JSON");
+            let path = harness.create_file("analysis.ipynb", &bytes);
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let output = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "notebook-rendered",
+                serde_json::json!({"path": "analysis.ipynb"}),
+            )
+            .await
+            .expect("render saved notebook");
+            let text = get_text_content(&output.content);
+            assert!(text.contains("### cell 1 (code)"));
+            assert!(text.contains("saved result: 42"));
+            assert!(text.contains("ValueError: saved failure"));
+            assert!(text.contains("saved frame"));
+            assert!(text.contains("code was not executed"));
+            assert_eq!(output.details.as_ref().unwrap()["contentType"], "notebook");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+            let error = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "notebook-hashline-refused",
+                serde_json::json!({"path": "analysis.ipynb", "hashline": true}),
+            )
+            .await
+            .expect_err("rendered lines cannot authorize source edits");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+            let raw = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "notebook-raw",
+                serde_json::json!({"path": "analysis.ipynb", "raw": true, "hashline": true}),
+            )
+            .await
+            .expect("read exact JSON for editing");
+            let raw_text = get_text_content(&raw.content);
+            assert!(raw_text.starts_with("1#"));
+            assert!(raw_text.ends_with(std::str::from_utf8(&bytes).unwrap()));
+            assert!(!raw_text.contains("### cell 1 (code)"));
+        });
+    }
+
+    #[test]
+    fn e2e_read_document_pagination_covers_every_rendered_line_once() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_document_pagination_covers_every_rendered_line_once");
+            let source = serde_json::json!({
+                "nbformat": 4,
+                "cells": [{"cell_type": "markdown", "source": "first\nsecond\nthird\n世界\nlast"}]
+            });
+            let bytes = serde_json::to_vec(&source).unwrap();
+            harness.create_file("pages.ipynb", &bytes);
+            let expected = pi::url_read::convert_bytes(
+                "pages.ipynb",
+                "application/x-ipynb+json",
+                &bytes,
+                false,
+            )
+            .unwrap()
+            .content;
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let mut offset = 1u64;
+            let mut actual = Vec::new();
+            for page in 0..20 {
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    &format!("notebook-page-{page}"),
+                    serde_json::json!({"path": "pages.ipynb", "offset": offset, "limit": 2}),
+                )
+                .await
+                .unwrap();
+                let details = output.details.as_ref().unwrap();
+                let shown = usize::try_from(details["outputLines"].as_u64().unwrap()).unwrap();
+                assert!(shown <= 2);
+                let text = get_text_content(&output.content);
+                for line in text.lines().take(shown) {
+                    let (number, content) = line.split_once('→').unwrap();
+                    assert_eq!(number.trim().parse::<usize>().unwrap(), actual.len() + 1);
+                    actual.push(content.to_string());
+                }
+                let Some(next) = details["nextOffset"].as_u64() else {
+                    break;
+                };
+                assert_eq!(next, offset + u64::try_from(shown).unwrap());
+                offset = next;
+            }
+            assert_eq!(
+                actual,
+                expected.lines().map(str::to_string).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn e2e_read_document_rejects_malformed_and_oversized_inputs() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_document_rejects_malformed_and_oversized_inputs");
+            harness.create_file("broken.ipynb", b"{invalid notebook");
+            let large = harness.create_file("large.ipynb", b"{}");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(large)
+                .unwrap()
+                .set_len(10 * 1024 * 1024 + 1)
+                .unwrap();
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for (path, code) in [
+                ("broken.ipynb", "NOTEBOOK_INVALID"),
+                ("large.ipynb", "DOCUMENT_TOO_LARGE"),
+            ] {
+                let error = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    code,
+                    serde_json::json!({"path": path}),
+                )
+                .await
+                .expect_err("invalid document must not return misleading source text");
+                assert!(error.to_string().contains(code), "{error}");
+            }
+            harness.create_file("source.html", b"<script>source_code()</script>");
+            let html = execute_tool_with_diagnostics(
+                &harness,
+                &tool,
+                "read",
+                "local-html-source",
+                serde_json::json!({"path": "source.html"}),
+            )
+            .await
+            .unwrap();
+            assert!(get_text_content(&html.content).contains("<script>source_code()</script>"));
+        });
+    }
+
+    #[test]
+    fn e2e_read_document_limit_cannot_bypass_line_or_byte_budgets() {
+        asupersync::test_utils::run_test(|| async {
+            let harness =
+                TestHarness::new("e2e_read_document_limit_cannot_bypass_line_or_byte_budgets");
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            for (name, source) in [
+                ("lines.ipynb", "line\n".repeat(2100)),
+                (
+                    "bytes.ipynb",
+                    format!("{}\n", "界".repeat(100_000)).repeat(4),
+                ),
+            ] {
+                let notebook = serde_json::json!({
+                    "nbformat": 4,
+                    "cells": [{"cell_type": "markdown", "source": source}]
+                });
+                harness.create_file(name, &serde_json::to_vec(&notebook).unwrap());
+                let output = execute_tool_with_diagnostics(
+                    &harness,
+                    &tool,
+                    "read",
+                    name,
+                    serde_json::json!({"path": name, "limit": i64::MAX}),
+                )
+                .await
+                .unwrap();
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["truncated"], true);
+                assert!(details["outputLines"].as_u64().unwrap() <= 2000);
+                assert!(details["nextOffset"].as_u64().is_some());
+                assert!(
+                    get_text_content(&output.content).len() <= pi::tools::DEFAULT_MAX_BYTES + 200
+                );
+                if name == "bytes.ipynb" {
+                    assert_eq!(details["byteLimited"], true);
+                }
+            }
+        });
+    }
 
     #[test]
     fn e2e_read_success_with_artifacts() {

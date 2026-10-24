@@ -9,11 +9,14 @@
 //! parent's in-memory registry is the roster of record; the on-disk queue
 //! files are the delivery mechanism. Writers and readers coordinate through
 //! a stable sidecar lock, including recovery of interrupted draining batches.
+//! Native children use an authenticated, process-owned loopback channel to read
+//! the parent's roster and their own inbox, and to send to peers or the parent.
+//! The parent reads its inbox explicitly; messages never start unsolicited turns.
 //!
 //! NTM layer distinction: this hub manages pi's OWN spawned children in this
 //! process. It does not rebuild ntm's cross-tmux fleet orchestration.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +25,12 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+
+pub mod ipc;
+mod wait;
+
+pub(crate) use wait::DependencyHold;
+pub use wait::{InboxWaitResult, InboxWaitStatus, PendingReply, wait_for_replies};
 
 /// Maximum transcript bytes paged back per `transcript` call.
 const TRANSCRIPT_PAGE_BYTES: usize = 32 * 1024;
@@ -134,16 +143,54 @@ pub struct BusMessage {
 #[derive(Default)]
 pub struct AgentHubRegistry {
     entries: BTreeMap<String, ChildEntry>,
+    /// Process-control authority ends at reap, even when an accepted result
+    /// still awaits ordered worktree application. Entry PIDs remain history.
+    live_processes: BTreeMap<String, u32>,
     /// Complete user assignments, separate from display previews and from
     /// generated continuation prompts. Kept for the lifetime of this hub.
     original_tasks: BTreeMap<String, String>,
+    /// Only the native executor can install a replayable launch policy. A
+    /// public roster registration alone must never authorize hub execution.
+    native_launches: BTreeMap<String, crate::subagents::RevivalSpec>,
+    /// Explicit revivals and corrective retries retain one lineage root so
+    /// an active grandchild also fences revival of an older ancestor.
+    native_lineages: BTreeMap<String, String>,
+    /// A terminal control request can precede process reap and worktree
+    /// disposition. Revival waits for the owning lease to finish both.
+    active_executions: BTreeSet<String>,
     seq: u64,
     /// Per-recipient delivered/queued bus messages (in-memory view; the
     /// on-disk steer files are the cross-process channel).
     bus: BTreeMap<String, VecDeque<BusMessage>>,
+    /// Last evicted delivery in each inbox. Global sequence numbers are not
+    /// contiguous per recipient, so oldest retained alone cannot prove loss.
+    dropped_bus_through: BTreeMap<String, u64>,
+    /// Successful sends awaiting any later message from the recipient. The
+    /// bounded tracker contains identities and sequence numbers, never bodies.
+    pending_replies: BTreeMap<String, BTreeMap<String, u64>>,
+    dropped_reply_tracking_through: BTreeMap<String, u64>,
+    /// Weak entries never own a wait or lock the registry during cleanup.
+    wait_holds: Vec<std::sync::Weak<wait::DependencyHold>>,
     bus_seq: u64,
     /// Artifacts dir for this session's hub files.
     dir: Option<PathBuf>,
+    /// Only an exclusively created namespace belongs to this registry.
+    /// Explicit test directories and stale PID directories are never retired.
+    owns_dir: bool,
+}
+
+pub(crate) struct RevivalSource {
+    pub(crate) entry: ChildEntry,
+    pub(crate) launch: crate::subagents::RevivalSpec,
+    original_task: String,
+    lineage_root: String,
+}
+
+impl RevivalSource {
+    /// Read the bounded transcript after releasing the registry mutex.
+    pub(crate) fn continuation_prompt(&self) -> Result<String> {
+        revival_prompt(&self.entry, &self.original_task)
+    }
 }
 
 impl std::fmt::Debug for AgentHubRegistry {
@@ -178,25 +225,78 @@ impl AgentHubRegistry {
     #[doc(hidden)]
     pub fn set_dir_for_tests(&mut self, dir: PathBuf) {
         self.dir = Some(dir);
+        self.owns_dir = false;
     }
 
-    /// Artifacts directory for hub files: `<global_dir>/agent-hub/<pid>/`.
-    /// Created lazily; per-process so concurrent sessions never share files.
+    /// Allocate one private namespace per registry, not merely per OS PID.
+    /// A crashed process can leave queued instructions and transcripts behind;
+    /// PID reuse must never turn those files into a new child's input/history.
     fn dir(&mut self) -> Result<PathBuf> {
-        let dir = self.dir.clone().unwrap_or_else(|| {
-            crate::config::Config::global_dir()
-                .join("agent-hub")
-                .join(std::process::id().to_string())
-        });
-        // Idempotent: also covers pre-set test dirs that were never created.
-        fs::create_dir_all(&dir).map_err(|e| {
+        self.dir_in(&crate::config::Config::global_dir().join("agent-hub"))
+    }
+
+    fn dir_in(&mut self, root: &Path) -> Result<PathBuf> {
+        if let Some(dir) = &self.dir {
+            if self.owns_dir {
+                // Do not silently recreate a vanished namespace or adopt a
+                // symlink: older children still reference its original files.
+                let metadata = fs::symlink_metadata(dir).map_err(|error| {
+                    Error::tool("hub", format!("inspect hub dir {}: {error}", dir.display()))
+                })?;
+                if !metadata.file_type().is_dir() {
+                    return Err(Error::tool(
+                        "hub",
+                        "agent-hub namespace is no longer a directory",
+                    ));
+                }
+            } else {
+                // Explicit test overrides remain caller-owned, including
+                // fixtures that supply a directory which does not exist yet.
+                fs::create_dir_all(dir).map_err(|error| {
+                    Error::tool(
+                        "hub",
+                        format!("create hub test dir {}: {error}", dir.display()),
+                    )
+                })?;
+            }
+            return Ok(dir.clone());
+        }
+        fs::create_dir_all(root).map_err(|error| {
             Error::tool(
                 "hub",
-                format!("create agent-hub dir {}: {e}", dir.display()),
+                format!("create agent-hub root {}: {error}", root.display()),
             )
         })?;
-        self.dir = Some(dir.clone());
-        Ok(dir)
+        for _ in 0..16 {
+            let dir = root.join(format!("{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            // Exclusive creation, never create_dir_all on the random leaf.
+            // Even a collision must not adopt existing queues or recovery files.
+            match builder.create(&dir) {
+                Ok(()) => {
+                    self.dir = Some(dir.clone());
+                    self.owns_dir = true;
+                    return Ok(dir);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(Error::tool(
+                        "hub",
+                        format!("create private hub dir {}: {error}", dir.display()),
+                    ));
+                }
+            }
+        }
+        Err(Error::tool(
+            "hub",
+            "could not allocate an unused agent-hub namespace",
+        ))
     }
 
     /// Register a child at spawn time. Returns the assigned run id.
@@ -232,6 +332,104 @@ impl AgentHubRegistry {
         Ok(entry)
     }
 
+    /// A persistent worker has a native cleanup owner but no one-shot
+    /// revival policy: a replacement process cannot retain its conversation.
+    #[cfg(unix)]
+    pub(crate) fn register_worker(&mut self, name: &str, kind: ChildKind) -> Result<ChildEntry> {
+        let entry = self.register_kind(name, "Persistent RPC worker", kind)?;
+        self.active_executions.insert(entry.id.clone());
+        Ok(entry)
+    }
+
+    pub(crate) fn register_native(
+        &mut self,
+        name: &str,
+        task: &str,
+        kind: ChildKind,
+        launch: crate::subagents::RevivalSpec,
+        revived_from: Option<&str>,
+    ) -> Result<ChildEntry> {
+        let lineage_root = if let Some(id) = revived_from {
+            let prior = self.native_revival_source(id)?;
+            if prior.entry.name != name || prior.entry.kind != kind {
+                return Err(Error::tool(
+                    "hub",
+                    "PI_HUB_REVIVAL_POLICY: replacement does not match its native source",
+                ));
+            }
+            Some(prior.lineage_root)
+        } else {
+            None
+        };
+        let mut entry = self.register_kind(name, task, kind)?;
+        // Retain the complete protected assignment for revival, while a
+        // consultant's visible roster entry carries only its question.
+        if let Some(public_task) = launch.public_task() {
+            entry.task = truncate_chars(public_task, 500);
+        }
+        entry.revived_from = revived_from.map(str::to_string);
+        self.entries.insert(entry.id.clone(), entry.clone());
+        self.native_launches.insert(entry.id.clone(), launch);
+        self.native_lineages.insert(
+            entry.id.clone(),
+            lineage_root.unwrap_or_else(|| entry.id.clone()),
+        );
+        self.active_executions.insert(entry.id.clone());
+        Ok(entry)
+    }
+
+    pub(crate) fn finish_native_execution(&mut self, id: &str) {
+        self.active_executions.remove(id);
+    }
+
+    /// Snapshot only execution-owned launch metadata. This performs no
+    /// transcript I/O and registers nothing, so a refused preparation leaves
+    /// no Starting entry behind.
+    pub(crate) fn native_revival_source(&self, id: &str) -> Result<RevivalSource> {
+        let entry = self
+            .entries
+            .get(id)
+            .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?;
+        if !entry.status.settled() || self.active_executions.contains(id) {
+            return Err(Error::validation(format!(
+                "hub: cannot revive '{id}' — execution or cleanup is still active"
+            )));
+        }
+        let lineage_root = self.native_lineages.get(id).ok_or_else(|| {
+            Error::tool(
+                "hub",
+                "PI_HUB_REVIVAL_UNAVAILABLE: original native launch policy is unavailable",
+            )
+        })?;
+        if self
+            .active_executions
+            .iter()
+            .any(|active| self.native_lineages.get(active) == Some(lineage_root))
+        {
+            return Err(Error::validation(format!(
+                "hub: cannot revive '{id}' — a replacement is already active"
+            )));
+        }
+        let launch = self.native_launches.get(id).cloned().ok_or_else(|| {
+            Error::tool(
+                "hub",
+                "PI_HUB_REVIVAL_UNAVAILABLE: original native launch policy is unavailable",
+            )
+        })?;
+        let original_task = self.original_tasks.get(id).cloned().ok_or_else(|| {
+            Error::tool(
+                "hub",
+                "PI_HUB_REVIVAL_UNAVAILABLE: complete original assignment is unavailable",
+            )
+        })?;
+        Ok(RevivalSource {
+            entry: entry.clone(),
+            launch,
+            original_task,
+            lineage_root: lineage_root.clone(),
+        })
+    }
+
     /// Mark a newly spawned child running. A late spawn callback cannot
     /// resurrect an already killed or cancelled run.
     pub fn mark_running(&mut self, id: &str, pid: u32) {
@@ -240,7 +438,19 @@ impl AgentHubRegistry {
         {
             entry.pid = Some(pid);
             entry.status = ChildStatus::Running;
+            self.live_processes.insert(id.to_string(), pid);
         }
+    }
+
+    /// A historical PID must never authorize signalling a reused OS process.
+    /// A reaped child can still be killed logically while writeback is pending.
+    #[must_use]
+    pub(crate) fn control_pid(&self, id: &str) -> Option<u32> {
+        self.live_processes.get(id).copied()
+    }
+
+    pub(crate) fn mark_process_reaped(&mut self, id: &str) {
+        self.live_processes.remove(id);
     }
 
     /// Latch the first terminal outcome. A process-reaping callback must not
@@ -249,6 +459,7 @@ impl AgentHubRegistry {
         if !status.settled() {
             return;
         }
+        self.mark_process_reaped(id);
         if let Some(entry) = self.entries.get_mut(id)
             && !entry.status.settled()
         {
@@ -264,11 +475,14 @@ impl AgentHubRegistry {
             return;
         };
         entry.output_bytes = entry.output_bytes.saturating_add(line.len());
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&entry.transcript_path)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(&entry.transcript_path) {
             let _ = writeln!(file, "{line}");
         }
     }
@@ -331,16 +545,91 @@ impl AgentHubRegistry {
         append_steer_line(&entry.steer_path, &message)?;
         self.bus_seq = seq;
         let queue = self.bus.entry(id.to_string()).or_default();
-        if queue.len() >= MAX_QUEUE_PER_CHILD {
-            queue.pop_front();
+        if queue.len() >= MAX_QUEUE_PER_CHILD
+            && let Some(dropped) = queue.pop_front()
+        {
+            self.dropped_bus_through.insert(id.to_string(), dropped.seq);
         }
         queue.push_back(message.clone());
+        self.record_reply_delivery(&message);
         Ok(message)
     }
 
-    /// Peer bus send: deliver `body` into recipient child's steering channel.
+    /// Deliver to a child's steering channel, or retain an explicit parent
+    /// inbox message. Parent delivery does not inject a new model turn.
     pub fn bus_send(&mut self, to: &str, from: &str, body: &str) -> Result<BusMessage> {
-        self.steer(to, from, body)
+        if to != "parent" {
+            return self.steer(to, from, body);
+        }
+        let seq = self
+            .bus_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::validation("hub: messaging sequence exhausted"))?;
+        let message = BusMessage {
+            seq,
+            from: from.to_string(),
+            to: "parent".to_string(),
+            body: body.to_string(),
+            sent_ms: now_ms(),
+        };
+        if body.trim().is_empty() {
+            return Err(Error::validation(
+                "hub: parent message requires non-empty text",
+            ));
+        }
+        if body.len() > MAX_STEER_FRAME_BYTES
+            || serde_json::to_vec(&message)?.len().saturating_add(1) > MAX_STEER_FRAME_BYTES
+        {
+            return Err(Error::validation("hub: serialized message exceeds 64 KiB"));
+        }
+        self.bus_seq = seq;
+        let queue = self.bus.entry("parent".to_string()).or_default();
+        if queue.len() >= MAX_QUEUE_PER_CHILD
+            && let Some(dropped) = queue.pop_front()
+        {
+            self.dropped_bus_through
+                .insert("parent".to_string(), dropped.seq);
+        }
+        queue.push_back(message.clone());
+        self.record_reply_delivery(&message);
+        Ok(message)
+    }
+
+    /// Return a bounded retained inbox page. Cursors are exclusive delivery
+    /// sequence numbers; reading a page does not consume steering delivery.
+    /// oldest_cursor exposes the oldest retained sequence after history rolls.
+    pub fn inbox_page(&self, id: &str, cursor: Option<u64>) -> Result<ipc::Reply> {
+        if id != "parent" && !self.entries.contains_key(id) {
+            return Err(Error::validation(format!("hub: unknown child '{id}'")));
+        }
+        let cursor = cursor.unwrap_or(0);
+        let queue = self.bus.get(id);
+        let oldest_cursor = queue
+            .and_then(VecDeque::front)
+            .map_or(0, |message| message.seq);
+        let mut messages = Vec::new();
+        let mut bytes = 0_usize;
+        let mut next_cursor = cursor;
+        let mut has_more = false;
+        if let Some(queue) = queue {
+            for message in queue.iter().filter(|message| message.seq > cursor) {
+                let size = serde_json::to_vec(message)?.len();
+                if bytes.saturating_add(size) > ipc::MAX_INBOX_PAGE_BYTES {
+                    has_more = true;
+                    break;
+                }
+                bytes += size;
+                next_cursor = message.seq;
+                messages.push(message.clone());
+            }
+        }
+        Ok(ipc::Reply::Inbox {
+            id: id.to_string(),
+            messages,
+            next_cursor,
+            has_more,
+            oldest_cursor,
+        })
     }
 
     /// Inbox view for one child (parent-side record, in delivery order).
@@ -378,16 +667,7 @@ impl AgentHubRegistry {
                 "complete original assignment unavailable; refusing partial revival",
             )
         })?;
-        let tail = read_transcript_tail(&prior.transcript_path, REVIVE_TRANSCRIPT_BUDGET)?;
-        let mut vault = crate::secrets::SecretVault::default();
-        let (tail, _audit) = crate::secrets::obfuscate(&tail, &mut vault, &[]);
-        let task = format!(
-            "{}\n\n[Continuation of a prior run ({}). Its transcript tail follows; \
-             pick up where it left off and finish the task.]\n{}",
-            original_task,
-            prior.status.as_str(),
-            tail
-        );
+        let task = revival_prompt(&prior, &original_task)?;
         // Keep the original assignment as this run's revival source, not
         // the generated prompt containing the previous run's transcript.
         let mut entry = self.register_kind(&prior.name, &original_task, prior.kind)?;
@@ -396,13 +676,62 @@ impl AgentHubRegistry {
         Ok((entry, task))
     }
 
-    /// Remove this session's hub artifacts directory (session exit).
+    /// Remove only this registry's retired namespace (session exit).
+    /// Busy registries, live children and unfinished native cleanup retain
+    /// their files. No PID-derived directory or caller-owned fixture is removed.
     pub fn cleanup_session_files() {
-        let dir = crate::config::Config::global_dir()
-            .join("agent-hub")
-            .join(std::process::id().to_string());
-        let _ = fs::remove_dir_all(dir);
+        if let Some(registry) = REGISTRY.get() {
+            cleanup_registry_files(registry);
+        }
     }
+
+    fn take_retired_dir(&mut self) -> Option<PathBuf> {
+        if !self.owns_dir
+            || !self.live_processes.is_empty()
+            || !self.active_executions.is_empty()
+            || self.entries.values().any(|entry| !entry.status.settled())
+        {
+            return None;
+        }
+        self.owns_dir = false;
+        self.dir.take()
+    }
+}
+
+fn cleanup_registry_files(registry: &Mutex<AgentHubRegistry>) {
+    let Ok(mut hub) = registry.try_lock() else {
+        return;
+    };
+    let Some(dir) = hub.take_retired_dir() else {
+        return;
+    };
+    // A subsequent registration gets a different namespace. Filesystem cleanup
+    // must not hold the hub mutex or sweep sibling sessions/recovery artifacts.
+    drop(hub);
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if let Err(error) = fs::remove_dir_all(&dir) {
+                tracing::warn!(path = %dir.display(), %error, "could not remove retired hub files");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            tracing::warn!(path = %dir.display(), "retired hub path changed; leaving it in place");
+        }
+    }
+}
+
+fn revival_prompt(prior: &ChildEntry, original_task: &str) -> Result<String> {
+    let tail = read_transcript_tail(&prior.transcript_path, REVIVE_TRANSCRIPT_BUDGET)?;
+    let mut vault = crate::secrets::SecretVault::default();
+    let (tail, _audit) = crate::secrets::obfuscate(&tail, &mut vault, &[]);
+    Ok(format!(
+        "{}\n\n[Continuation of a prior run ({}). Its transcript tail follows; \
+         pick up where it left off and finish the task.]\n{}",
+        original_task,
+        prior.status.as_str(),
+        tail
+    ))
 }
 
 /// The lock inode must never be renamed with the queue: otherwise a writer
@@ -761,6 +1090,264 @@ mod tests {
 
     fn poll_until_ready(path: &Path) -> SteerDrain {
         poll_until_uncontended(path).expect("steering poll")
+    }
+
+    #[test]
+    fn fresh_namespace_never_adopts_a_stale_pid_queue_or_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join(std::process::id().to_string());
+        fs::create_dir(&legacy).unwrap();
+        let frame = BusMessage {
+            seq: 1,
+            from: "old-parent".to_string(),
+            to: "worker-1".to_string(),
+            body: "instruction from a crashed session".to_string(),
+            sent_ms: 0,
+        };
+        let mut wire = serde_json::to_vec(&frame).unwrap();
+        wire.push(b'\n');
+        for name in ["worker-1.steer", "worker-1.draining"] {
+            fs::write(legacy.join(name), &wire).unwrap();
+        }
+        let transcript = legacy.join("worker-1.transcript.jsonl");
+        fs::write(&transcript, "old session transcript\n").unwrap();
+
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "new assignment").unwrap();
+        assert_eq!(child.id, "worker-1");
+        assert_ne!(dir, legacy);
+        assert_eq!(child.steer_path.parent(), Some(dir.as_path()));
+        assert_eq!(poll_until_ready(&child.steer_path), SteerDrain::Empty);
+        assert_eq!(reg.transcript_page(&child.id).unwrap(), "");
+        assert!(reg.inbox(&child.id).is_empty());
+        for name in ["worker-1.steer", "worker-1.draining"] {
+            assert_eq!(fs::read(legacy.join(name)).unwrap(), wire);
+        }
+        assert_eq!(
+            fs::read_to_string(transcript).unwrap(),
+            "old session transcript\n"
+        );
+    }
+
+    #[test]
+    fn registries_in_the_same_process_have_independent_disk_delivery_and_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = fresh_registry();
+        let first_dir = first.dir_in(temp.path()).unwrap();
+        let a = first.register("worker", "assignment A").unwrap();
+        first.steer(&a.id, "parent", "only A").unwrap();
+        first.append_transcript(&a.id, "progress A");
+        let recovering = a.steer_path.with_extension("draining");
+        fs::rename(&a.steer_path, &recovering).unwrap();
+        let retained = fs::read(&recovering).unwrap();
+
+        let mut second = fresh_registry();
+        let second_dir = second.dir_in(temp.path()).unwrap();
+        let b = second.register("worker", "assignment B").unwrap();
+        assert_eq!(a.id, b.id);
+        assert_ne!(first_dir, second_dir);
+        second.steer(&b.id, "parent", "only B").unwrap();
+        second.append_transcript(&b.id, "progress B");
+        assert_eq!(
+            poll_until_ready(&b.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] only B".to_string()])
+        );
+        assert_eq!(fs::read(&recovering).unwrap(), retained);
+        assert_eq!(
+            poll_until_ready(&a.steer_path),
+            SteerDrain::Messages(vec!["[hub:parent] only A".to_string()])
+        );
+        assert_eq!(first.transcript_page(&a.id).unwrap(), "progress A\n");
+        assert_eq!(second.transcript_page(&b.id).unwrap(), "progress B\n");
+    }
+
+    #[test]
+    fn namespace_is_stable_for_children_and_failed_creation_is_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("hub-root");
+        fs::write(&root, "do not overwrite").unwrap();
+        let mut reg = fresh_registry();
+        assert!(reg.dir_in(&root).is_err());
+        assert!(reg.dir.is_none());
+        assert!(!reg.owns_dir);
+        assert_eq!(reg.seq, 0);
+        assert!(reg.roster().is_empty());
+        assert_eq!(fs::read_to_string(&root).unwrap(), "do not overwrite");
+        fs::rename(&root, temp.path().join("retained-file")).unwrap();
+
+        let dir = reg.dir_in(&root).unwrap();
+        let first = reg.register("worker", "first").unwrap();
+        let second = reg.register("worker", "second").unwrap();
+        assert_eq!(first.steer_path.parent(), Some(dir.as_path()));
+        assert_eq!(second.steer_path.parent(), Some(dir.as_path()));
+        let unrelated = temp.path().join("different-root");
+        assert_eq!(reg.dir_in(&unrelated).unwrap(), dir);
+        assert!(
+            !unrelated.exists(),
+            "a cached namespace must not change roots"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn missing_owned_namespace_is_not_recreated_for_later_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "first").unwrap();
+        reg.steer(&child.id, "parent", "retained input").unwrap();
+        let wire = fs::read(&child.steer_path).unwrap();
+        let moved = temp.path().join("retained-namespace");
+        fs::rename(&dir, &moved).unwrap();
+
+        assert!(
+            reg.register("worker", "must not adopt a fresh directory")
+                .is_err()
+        );
+        assert_eq!(reg.seq, 1);
+        assert_eq!(reg.roster().len(), 1);
+        assert!(!dir.exists());
+        assert_eq!(
+            fs::read(moved.join(child.steer_path.file_name().unwrap())).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn cleanup_waits_for_starting_running_and_native_writeback_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "task").unwrap();
+        reg.steer(&child.id, "parent", "pending").unwrap();
+        let bytes = fs::read(&child.steer_path).unwrap();
+        let registry = Mutex::new(reg);
+        cleanup_registry_files(&registry);
+        assert_eq!(fs::read(&child.steer_path).unwrap(), bytes);
+
+        registry.lock().unwrap().mark_running(&child.id, 4242);
+        cleanup_registry_files(&registry);
+        assert!(dir.exists());
+        {
+            let mut hub = registry.lock().unwrap();
+            hub.mark_process_reaped(&child.id);
+            hub.active_executions.insert(child.id.clone());
+        }
+        cleanup_registry_files(&registry);
+        assert!(dir.exists(), "reap alone is not completed writeback");
+        registry.lock().unwrap().mark_killed(&child.id);
+        cleanup_registry_files(&registry);
+        assert!(
+            dir.exists(),
+            "terminal status does not release the native lease"
+        );
+        registry.lock().unwrap().finish_native_execution(&child.id);
+        cleanup_registry_files(&registry);
+        assert!(!dir.exists());
+        assert!(registry.lock().unwrap().dir.is_none());
+        cleanup_registry_files(&registry);
+        assert!(temp.path().exists());
+    }
+
+    #[test]
+    fn cleanup_removes_only_its_retired_namespace_and_next_use_gets_a_fresh_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join(std::process::id().to_string());
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("recovery"), "retain legacy files").unwrap();
+        let mut a = fresh_registry();
+        let a_dir = a.dir_in(temp.path()).unwrap();
+        let first = a.register("worker", "first").unwrap();
+        a.append_transcript(&first.id, "completed work");
+        a.settle(&first.id, ChildStatus::Done);
+        let mut b = fresh_registry();
+        let b_dir = b.dir_in(temp.path()).unwrap();
+        let second = b.register("worker", "unrelated live child").unwrap();
+        b.steer(&second.id, "parent", "do not remove").unwrap();
+        let wire = fs::read(&second.steer_path).unwrap();
+
+        let registry = Mutex::new(a);
+        cleanup_registry_files(&registry);
+        assert!(!a_dir.exists());
+        assert_eq!(fs::read(&second.steer_path).unwrap(), wire);
+        assert_eq!(
+            fs::read_to_string(legacy.join("recovery")).unwrap(),
+            "retain legacy files"
+        );
+        let next = registry.lock().unwrap().dir_in(temp.path()).unwrap();
+        assert_ne!(next, a_dir);
+        assert_ne!(next, b_dir);
+        assert!(next.exists());
+    }
+
+    #[test]
+    fn cleanup_does_not_claim_explicit_caller_owned_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().join("caller-owned"));
+        let child = reg.register("worker", "task").unwrap();
+        reg.append_transcript(&child.id, "caller-owned history");
+        reg.settle(&child.id, ChildStatus::Done);
+        let registry = Mutex::new(reg);
+        cleanup_registry_files(&registry);
+        assert_eq!(
+            fs::read_to_string(child.transcript_path).unwrap(),
+            "caller-owned history\n"
+        );
+        assert!(registry.lock().unwrap().dir.is_some());
+        assert!(fresh_registry().take_retired_dir().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_namespaces_and_transcripts_are_private_at_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "task").unwrap();
+        reg.append_transcript(&child.id, "private transcript");
+        reg.steer(&child.id, "parent", "private instruction")
+            .unwrap();
+        for path in [
+            dir,
+            child.transcript_path,
+            child.steer_path.with_extension("steer.lock"),
+            child.steer_path,
+        ] {
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_namespace_symlink_is_neither_adopted_nor_cleaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        let dir = reg.dir_in(temp.path()).unwrap();
+        let child = reg.register("worker", "task").unwrap();
+        reg.append_transcript(&child.id, "original history");
+        let retained = temp.path().join("retained");
+        fs::rename(&dir, &retained).unwrap();
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep"), "unrelated data").unwrap();
+        std::os::unix::fs::symlink(&unrelated, &dir).unwrap();
+        assert!(reg.register("worker", "must not follow the link").is_err());
+        assert_eq!(reg.seq, 1);
+        reg.settle(&child.id, ChildStatus::Done);
+        cleanup_registry_files(&Mutex::new(reg));
+        assert_eq!(fs::read_link(dir).unwrap(), unrelated);
+        assert_eq!(
+            fs::read_to_string(unrelated.join("keep")).unwrap(),
+            "unrelated data"
+        );
+        assert_eq!(
+            fs::read_to_string(retained.join(child.transcript_path.file_name().unwrap())).unwrap(),
+            "original history\n"
+        );
     }
 
     #[test]
@@ -1297,6 +1884,38 @@ mod tests {
         let serialized = serde_json::to_value(tan_roster).expect("serialize roster entry");
         assert_eq!(serialized["kind"], "tan");
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn reaped_child_keeps_history_but_loses_pid_control_before_writeback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reg = fresh_registry();
+        reg.dir = Some(temp.path().to_path_buf());
+        let first = reg.register("worker", "first").unwrap();
+        let second = reg.register("worker", "second").unwrap();
+        assert_eq!(reg.control_pid(&first.id), None);
+        reg.mark_running(&first.id, 4242);
+        reg.mark_running(&second.id, 4243);
+        assert_eq!(reg.control_pid(&first.id), Some(4242));
+
+        reg.mark_process_reaped(&first.id);
+        let waiting = reg.get(&first.id).unwrap();
+        assert_eq!(waiting.pid, Some(4242));
+        assert_eq!(waiting.status, ChildStatus::Running);
+        assert_eq!(reg.control_pid(&first.id), None);
+        assert_eq!(reg.control_pid(&second.id), Some(4243));
+        reg.mark_running(&first.id, 9999);
+        assert_eq!(reg.control_pid(&first.id), None);
+
+        reg.mark_killed(&first.id);
+        reg.settle(&first.id, ChildStatus::Done);
+        let killed = reg.get(&first.id).unwrap();
+        assert_eq!(killed.pid, Some(4242));
+        assert_eq!(killed.status, ChildStatus::Killed);
+        assert_eq!(reg.control_pid(&first.id), None);
+        reg.settle(&second.id, ChildStatus::Done);
+        assert_eq!(reg.control_pid(&second.id), None);
+        assert_eq!(reg.get(&second.id).unwrap().pid, Some(4243));
     }
 
     #[test]

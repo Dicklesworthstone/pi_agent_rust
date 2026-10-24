@@ -444,12 +444,8 @@ fn plan_fork_from_user_message_branches_from_parent_and_returns_selected_text() 
         Some(root_assistant.as_str())
     );
 
-    let pi::session::ForkPlan {
-        entries, leaf_id, ..
-    } = plan;
     let mut forked = Session::create();
-    forked.entries = entries;
-    forked._test_set_leaf_id(leaf_id);
+    forked.init_from_fork_plan(plan);
 
     let appended = forked.append_message(make_user_message("Followup"));
     let appended_entry = forked.get_entry(&appended).expect("appended entry");

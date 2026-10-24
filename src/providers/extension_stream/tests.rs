@@ -212,9 +212,10 @@ fn successful_stop_with_complete_tool_calls_normalizes_both_terminal_reasons() {
         if let ContentBlock::ToolCall(call) = &mut message.content[0] {
             call.thought_signature = Some("tool-signature".into());
         }
-        message
-            .content
-            .insert(0, ContentBlock::Text(TextContent::new("Writing the output")));
+        message.content.insert(
+            0,
+            ContentBlock::Text(TextContent::new("Writing the output")),
+        );
         message.content.push(ContentBlock::ToolCall(ToolCall {
             id: "call-2".into(),
             name: "read".into(),

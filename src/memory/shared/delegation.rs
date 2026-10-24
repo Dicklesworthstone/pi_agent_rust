@@ -328,6 +328,7 @@ impl SharedMemoryGrant {
             db_path: grant.database,
             project_root: grant.project_root,
             project_key: grant.project_key,
+            secret_patterns: Vec::new(),
         });
         Ok(Self {
             store: SharedMemoryStore::new(bank, grant.session_id).map_err(|_| invalid_grant())?,

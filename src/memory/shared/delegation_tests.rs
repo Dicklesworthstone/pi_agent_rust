@@ -19,6 +19,7 @@ fn bank(root: &Path) -> Arc<MemoryStore> {
         db_path: root.join("bank.sqlite"),
         project_key: "grant-fixture".to_string(),
         project_root: root.canonicalize().unwrap(),
+        secret_patterns: Vec::new(),
     })
 }
 

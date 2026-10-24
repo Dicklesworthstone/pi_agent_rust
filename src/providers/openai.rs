@@ -28,9 +28,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
+
+#[path = "openai_deepseek.rs"]
+mod deepseek;
 
 // ============================================================================
 // Constants
@@ -234,9 +237,9 @@ impl OpenAIProvider {
     /// (gh #166): `"deepseek"` opts any custom OpenAI-compatible provider into
     /// the DeepSeek dialect regardless of provider id or base URL,
     /// `"openrouter"` opts a proxy into the OpenRouter shape, while any other
-    /// declared format (the legacy catalog also carries `"openai"`, `"zai"`,
-    /// `"qwen"`) explicitly opts out — those serialize with no reasoning
-    /// controls, exactly like providers with no dialect.
+    /// declared format opts out. A provider that explicitly declares
+    /// `supportsReasoningEffort: true` may use the plain OpenAI effort field,
+    /// either with `"openai"` or without a declared format (pi-freeflow).
     ///
     /// When no `thinkingFormat` is declared, DeepSeek is identified the same
     /// way `ModelEntry::is_deepseek_reasoning_model` does it — by the
@@ -271,6 +274,9 @@ impl OpenAIProvider {
             if format.eq_ignore_ascii_case("openrouter") {
                 return Some(ReasoningStyle::OpenRouter);
             }
+            if format.eq_ignore_ascii_case("openai") && self.supports_plain_reasoning_effort() {
+                return Some(ReasoningStyle::OpenAI);
+            }
             return None;
         }
         let provider_is_deepseek = canonical_provider_id(&self.provider)
@@ -279,9 +285,18 @@ impl OpenAIProvider {
         let base_is_deepseek = self.base_url.to_ascii_lowercase().contains("deepseek.com");
         if provider_is_deepseek || base_is_deepseek {
             Some(ReasoningStyle::DeepSeek)
+        } else if self.supports_plain_reasoning_effort() {
+            Some(ReasoningStyle::OpenAI)
         } else {
             None
         }
+    }
+
+    fn supports_plain_reasoning_effort(&self) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.supports_reasoning_effort)
+            == Some(true)
     }
 
     fn is_sap_ai_core(&self) -> bool {
@@ -299,7 +314,6 @@ impl OpenAIProvider {
             .as_ref()
             .and_then(|c| c.system_role_name.as_deref())
             .unwrap_or("system");
-        let messages = Self::build_messages_with_role(context, system_role);
 
         let tools_supported = self
             .compat
@@ -312,6 +326,12 @@ impl OpenAIProvider {
         } else {
             Some(context.tools.iter().map(convert_tool_to_openai).collect())
         };
+        // DeepSeek requires prior reasoning_content to be replayed on requests
+        // that admit tools. Keep this independent of the current thinking-level
+        // override: disabling thinking now must not erase reasoning from history.
+        let replay_reasoning =
+            tools.is_some() && self.reasoning_style() == Some(ReasoningStyle::DeepSeek);
+        let messages = self.build_messages_with_role(context, system_role, replay_reasoning);
 
         // Determine which max-tokens field to populate based on compat config.
         let use_alt_field = self
@@ -342,9 +362,9 @@ impl OpenAIProvider {
             .then_some(OpenAIUsageAccounting { include: true });
 
         // Forward the reasoning level for providers with a request-side reasoning
-        // dialect: DeepSeek's vendor fields, or OpenRouter's normalized
-        // `reasoning` object (gh #220). Every other transport gets all-`None`,
-        // so its serialized body is unchanged. DeepSeek collapses `low`/`medium`
+        // dialect: DeepSeek's vendor fields, OpenRouter's normalized
+        // `reasoning` object, or an explicitly enabled plain OpenAI effort.
+        // Undeclared transports keep their existing body. DeepSeek collapses `low`/`medium`
         // into `high` itself, so we only emit the values it documents and let
         // `off` request the explicit non-thinking path. Both `xhigh` and `max`
         // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
@@ -352,18 +372,23 @@ impl OpenAIProvider {
         // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
         // enabled levels (gh #117/#165), matching the anthropic-messages and
         // openai-responses transports; `off` never emits an effort.
-        let (thinking, reasoning_effort, reasoning) = match self.reasoning_style() {
+        let level = options.thinking_level.unwrap_or_default();
+        let mapped_effort = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_level_map.as_ref())
+            .and_then(|map| map.get(level.to_string().as_str()));
+        let style = if mapped_effort.is_some_and(Option::is_none) {
+            None
+        } else {
+            self.reasoning_style()
+        };
+        let (thinking, reasoning_effort, reasoning) = match style {
             Some(ReasoningStyle::DeepSeek) => {
-                let level = options.thinking_level.unwrap_or_default();
                 if level == ThinkingLevel::Off {
                     (Some(OpenAIThinking { kind: "disabled" }), None, None)
                 } else {
-                    let mapped = self
-                        .compat
-                        .as_ref()
-                        .and_then(|c| c.thinking_level_map.as_ref())
-                        .and_then(|map| map.get(level.to_string().as_str()))
-                        .map(String::as_str);
+                    let mapped = mapped_effort.and_then(Option::as_deref);
                     let effort = mapped.or(match level {
                         ThinkingLevel::High => Some("high"),
                         ThinkingLevel::XHigh | ThinkingLevel::Max => Some("max"),
@@ -375,11 +400,19 @@ impl OpenAIProvider {
                     (Some(OpenAIThinking { kind: "enabled" }), effort, None)
                 }
             }
-            Some(ReasoningStyle::OpenRouter) => (
-                None,
-                None,
-                self.openrouter_reasoning(options.thinking_level.unwrap_or_default()),
-            ),
+            Some(ReasoningStyle::OpenRouter) => (None, None, self.openrouter_reasoning(level)),
+            Some(ReasoningStyle::OpenAI) => {
+                let effort = mapped_effort.and_then(Option::as_deref).or(match level {
+                    ThinkingLevel::Off => None,
+                    ThinkingLevel::Minimal => Some("minimal"),
+                    ThinkingLevel::Low => Some("low"),
+                    ThinkingLevel::Medium => Some("medium"),
+                    ThinkingLevel::High => Some("high"),
+                    ThinkingLevel::XHigh => Some("xhigh"),
+                    ThinkingLevel::Max => Some("max"),
+                });
+                (None, effort, None)
+            }
             None => (None, None, None),
         };
 
@@ -422,7 +455,8 @@ impl OpenAIProvider {
             .as_ref()
             .and_then(|c| c.thinking_level_map.as_ref())
             .and_then(|map| map.get(level.to_string().as_str()))
-            .map(|value| value.trim())
+            .and_then(Option::as_deref)
+            .map(str::trim)
             .filter(|value| !value.is_empty());
         match mapped {
             Some(value) => match value.parse::<u32>() {
@@ -496,8 +530,10 @@ impl OpenAIProvider {
 
     /// Build the messages array with system prompt prepended using the given role name.
     fn build_messages_with_role<'a>(
+        &self,
         context: &'a Context<'_>,
         system_role: &'a str,
+        replay_reasoning: bool,
     ) -> Vec<OpenAIMessage<'a>> {
         let mut messages = Vec::with_capacity(context.messages.len() + 1);
 
@@ -508,13 +544,29 @@ impl OpenAIProvider {
                 content: Some(OpenAIContent::Text(Cow::Borrowed(system))),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
 
-        // Convert conversation messages
+        // Every tool call in an assistant turn must be answered before a new
+        // user message. Collect images across the consecutive tool-result run
+        // and attach them only after all of its tool replies (GH #248).
+        let mut tool_images = Vec::new();
         for message in context.messages.iter() {
-            messages.extend(convert_message_to_openai(message));
+            if !matches!(message, Message::ToolResult(_)) {
+                append_tool_result_images(&mut messages, &mut tool_images);
+            }
+            let mut converted = convert_message_to_openai(message, &mut tool_images);
+            if replay_reasoning && let Message::Assistant(assistant) = message {
+                converted.reasoning_content = Some(deepseek_replay_reasoning(
+                    assistant,
+                    &self.provider,
+                    &self.model,
+                ));
+            }
+            messages.push(converted);
         }
+        append_tool_result_images(&mut messages, &mut tool_images);
 
         messages
     }
@@ -865,6 +917,7 @@ where
     event_source: SseStream<S>,
     partial: AssistantMessage,
     tool_calls: Vec<ToolCallState>,
+    deepseek_recovery: Option<deepseek::Recovery>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
@@ -1039,6 +1092,8 @@ where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
     fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
+        let deepseek_recovery =
+            deepseek::is_target(&provider, &model).then(deepseek::Recovery::default);
         Self {
             event_source,
             partial: AssistantMessage {
@@ -1053,6 +1108,7 @@ where
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
             tool_calls: Vec::new(),
+            deepseek_recovery,
             pending_events: VecDeque::new(),
             started: false,
             done: false,
@@ -1113,7 +1169,8 @@ where
         }
 
         // Process choices
-        if let Some(choice) = chunk.choices.into_iter().next() {
+        if let Some(mut choice) = chunk.choices.into_iter().next() {
+            choice.delta.normalize_reasoning();
             if !self.started
                 && choice.finish_reason.is_none()
                 && choice.delta.content.is_none()
@@ -1142,16 +1199,19 @@ where
     fn finalize_tool_call_arguments(&mut self) -> Result<()> {
         // Validate the whole batch before exposing any completed tool call.
         // Best-effort streaming snapshots are for display, never execution.
+        let mut ids = HashSet::new();
         let arguments = self
             .tool_calls
             .iter()
             .map(|tc| {
-                parse_final_tool_arguments(&tc.arguments).map_err(|message| {
-                    Error::api(format!(
-                        "Invalid OpenAI tool arguments at index {}: {message}",
-                        tc.index
-                    ))
-                })
+                validate_final_tool_identity(&mut ids, &tc.id, &tc.name)
+                    .and_then(|()| parse_final_tool_arguments(&tc.arguments))
+                    .map_err(|message| {
+                        Error::api(format!(
+                            "Invalid OpenAI tool call at index {}: {message}",
+                            tc.index
+                        ))
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -1165,11 +1225,114 @@ where
         Ok(())
     }
 
+    /// Append only text that is safe to expose to streaming clients and replay.
+    fn append_text(&mut self, content: String) {
+        let content_index = if matches!(self.partial.content.last(), Some(ContentBlock::Text(_))) {
+            self.partial.content.len() - 1
+        } else {
+            let index = self.partial.content.len();
+            self.partial
+                .content
+                .push(ContentBlock::Text(TextContent::new("")));
+            self.pending_events.push_back(StreamEvent::TextStart {
+                content_index: index,
+            });
+            index
+        };
+        if let Some(ContentBlock::Text(text)) = self.partial.content.get_mut(content_index) {
+            text.text.push_str(&content);
+        }
+        self.pending_events.push_back(StreamEvent::TextDelta {
+            content_index,
+            delta: content,
+        });
+    }
+
+    fn process_text(&mut self, content: String) {
+        let visible = match &mut self.deepseek_recovery {
+            Some(recovery) => match recovery.feed(&content) {
+                Ok(visible) if visible.is_empty() => return,
+                Ok(visible) => visible,
+                // Defer rejection until terminal: genuine native calls may
+                // still arrive and remain authoritative over the text lane.
+                Err(_) => return,
+            },
+            None => content,
+        };
+        self.append_text(visible);
+    }
+
+    fn finalize_deepseek_content(&mut self) {
+        let Some(mut recovery) = self.deepseek_recovery.take() else {
+            return;
+        };
+        let native_calls = !self.tool_calls.is_empty();
+        if native_calls && self.partial.stop_reason == StopReason::Stop {
+            self.partial.stop_reason = StopReason::ToolUse;
+        }
+        let parts = match recovery.finish() {
+            Ok(parts) => parts,
+            Err(_) if native_calls => {
+                tracing::debug!("Ignored malformed DeepSeek text markup beside native tool calls");
+                return;
+            }
+            Err(message) => {
+                self.record_error(message.to_string());
+                return;
+            }
+        };
+        // Some hosts send the same call through both text and the native lane.
+        // Native deltas are authoritative, even if they arrived after the text.
+        // Interrupted/refused/failed responses never gain executable calls.
+        let recover_calls = !native_calls
+            && matches!(
+                self.partial.stop_reason,
+                StopReason::Stop | StopReason::ToolUse
+            );
+        for part in parts {
+            match part {
+                deepseek::Part::Text(text) => self.append_text(text),
+                deepseek::Part::Call { name, arguments } if recover_calls => {
+                    let content_index = self.partial.content.len();
+                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    let raw_arguments = arguments.to_string();
+                    self.partial.content.push(ContentBlock::ToolCall(ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments,
+                        thought_signature: None,
+                    }));
+                    self.pending_events.push_back(StreamEvent::ToolCallStart {
+                        content_index,
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
+                    self.pending_events.push_back(StreamEvent::ToolCallDelta {
+                        content_index,
+                        delta: raw_arguments.clone(),
+                    });
+                    self.tool_calls.push(ToolCallState {
+                        index: self.tool_calls.len(),
+                        content_index,
+                        id,
+                        name,
+                        arguments: raw_arguments,
+                    });
+                    if self.partial.stop_reason == StopReason::Stop {
+                        self.partial.stop_reason = StopReason::ToolUse;
+                    }
+                }
+                deepseek::Part::Call { .. } => {}
+            }
+        }
+    }
+
     fn finalize_content(&mut self) {
         if self.finalized {
             return;
         }
         self.finalized = true;
+        self.finalize_deepseek_content();
 
         if let Err(error) = self.finalize_tool_call_arguments() {
             self.record_error(error.to_string());
@@ -1304,37 +1467,10 @@ where
             });
         }
 
-        // Handle text content
-
+        // Handle text content. DeepSeek markup stays out of client snapshots
+        // until the entire terminal tool batch has been validated.
         if let Some(content) = delta.content {
-            // Update partial content
-
-            let last_is_text = matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-
-            let content_index = if last_is_text {
-                self.partial.content.len() - 1
-            } else {
-                let idx = self.partial.content.len();
-
-                self.partial
-                    .content
-                    .push(ContentBlock::Text(TextContent::new("")));
-
-                self.pending_events
-                    .push_back(StreamEvent::TextStart { content_index: idx });
-
-                idx
-            };
-
-            if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(content_index) {
-                t.text.push_str(&content);
-            }
-
-            self.pending_events.push_back(StreamEvent::TextDelta {
-                content_index,
-
-                delta: content,
-            });
+            self.process_text(content);
         }
 
         // Handle tool calls
@@ -1470,10 +1606,32 @@ where
     }
 }
 
+/// Each completed call needs an unambiguous result identity and a function
+/// name. Validate the accumulated wire values without repairing them: changing
+/// an ID here would no longer answer the call the provider actually emitted.
+/// Diagnostics exclude the values, which can contain sensitive provider data.
+pub(super) fn validate_final_tool_identity<'a>(
+    ids: &mut HashSet<&'a str>,
+    id: &'a str,
+    name: &str,
+) -> std::result::Result<(), &'static str> {
+    if id.trim().is_empty() {
+        return Err("tool call ID is empty");
+    }
+    if name.trim().is_empty() {
+        return Err("tool function name is empty");
+    }
+    if !ids.insert(id) {
+        return Err("tool call ID is duplicated");
+    }
+    Ok(())
+}
+
 /// Parse final tool arguments without the repairs used for streaming previews.
-/// Empty arguments remain compatible with providers that omit an empty object
-/// for a no-argument tool. Every nonempty payload must be a complete JSON object.
-/// Error text deliberately excludes the payload, which may contain secrets.
+/// Empty arguments remain compatible with providers that omit an empty object.
+/// Every nonempty payload must be a complete JSON object with unique decoded
+/// keys in every nested object. Error text deliberately excludes the payload,
+/// which may contain secrets.
 pub(super) fn parse_final_tool_arguments(
     raw: &str,
 ) -> std::result::Result<serde_json::Value, &'static str> {
@@ -1485,12 +1643,83 @@ pub(super) fn parse_final_tool_arguments(
     if !arguments.is_object() {
         return Err("arguments must be a JSON object");
     }
+    serde_json::from_str::<UniqueToolArgumentKeys>(raw)
+        .map_err(|_| "arguments contain duplicate JSON object keys")?;
     Ok(arguments)
+}
+
+/// Validation-only JSON traversal that rejects duplicate decoded object keys
+/// before serde_json::Value can silently keep the last occurrence.
+struct UniqueToolArgumentKeys;
+
+impl<'de> Deserialize<'de> for UniqueToolArgumentKeys {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueToolArgumentKeys {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON with unique object keys")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate JSON object key"));
+            }
+            map.next_value::<Self>()?;
+        }
+        Ok(self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while sequence.next_element::<Self>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_string<E: serde::de::Error>(self, _: String) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
 }
 
 #[cfg(test)]
 #[path = "openai_terminal_safety_tests.rs"]
 mod terminal_safety_tests;
+
+#[cfg(test)]
+#[path = "openai_deepseek_tests.rs"]
+mod deepseek_tests;
 
 // ============================================================================
 // OpenAI API Types
@@ -1520,7 +1749,8 @@ pub struct OpenAIRequest<'a> {
     /// OpenAI-compatible providers never set this, so it serializes away.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<OpenAIThinking>,
-    /// DeepSeek-only reasoning effort (`"high"` | `"max"`). DeepSeek maps
+    /// Plain reasoning effort, enabled explicitly or by the DeepSeek dialect.
+    /// DeepSeek maps
     /// `low`/`medium` to `high` and `xhigh` to `max` itself, so we only emit the
     /// two values it documents — unless a catalog `thinkingLevelMap` remaps the
     /// level, in which case the mapped value (borrowed from the provider's
@@ -1582,6 +1812,8 @@ struct OpenAIThinking {
 /// (zai/qwen) can be added without touching the `build_request` call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReasoningStyle {
+    /// Plain `reasoning_effort`, only for an explicit capability declaration.
+    OpenAI,
     /// DeepSeek: `thinking: {type: enabled|disabled}` + `reasoning_effort`
     /// (`high`|`max`). Mirrors the legacy `@earendil-works/pi-ai` `thinkingFormat`.
     DeepSeek,
@@ -1600,6 +1832,9 @@ struct OpenAIMessage<'a> {
     tool_calls: Option<Vec<OpenAIToolCallRef<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    /// Native DeepSeek reasoning replay; omitted for other dialects and roles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1677,8 +1912,40 @@ struct OpenAIDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Gateways disagree on the name of the streamed reasoning field:
+    /// `reasoning_content` (DeepSeek), `reasoning` (OpenRouter) and
+    /// `reasoning_text`. The two alternatives are read as raw JSON so that a
+    /// gateway sending a non-string there cannot fail the whole chunk.
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_text: Option<serde_json::Value>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+}
+
+impl OpenAIDelta {
+    /// Fold a non-empty `reasoning` or `reasoning_text` string into
+    /// `reasoning_content` when that field carries no text itself.
+    fn normalize_reasoning(&mut self) {
+        if self
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            return;
+        }
+        let alternative = [self.reasoning.take(), self.reasoning_text.take()]
+            .into_iter()
+            .flatten()
+            .find_map(|value| match value {
+                serde_json::Value::String(text) if !text.is_empty() => Some(text),
+                _ => None,
+            });
+        if alternative.is_some() {
+            self.reasoning_content = alternative;
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1733,24 +2000,61 @@ struct OpenAIChunkError {
 // Conversion Functions
 // ============================================================================
 
+/// Reconstruct the exact native DeepSeek reasoning text from already-screened
+/// same-provider history. Signed or foreign reasoning is never downgraded into
+/// DeepSeek's unsigned replay field.
+fn deepseek_replay_reasoning<'a>(
+    assistant: &'a AssistantMessage,
+    provider: &str,
+    model: &str,
+) -> Cow<'a, str> {
+    if assistant.api != "openai-completions"
+        || !crate::provider_metadata::provider_ids_match(&assistant.provider, provider)
+        || assistant.model != model
+    {
+        return Cow::Borrowed("");
+    }
+    let mut parts = assistant.content.iter().filter_map(|block| match block {
+        ContentBlock::Thinking(thinking) if thinking.thinking_signature.is_none() => {
+            Some(thinking.thinking.as_str())
+        }
+        _ => None,
+    });
+    let Some(first) = parts.next() else {
+        return Cow::Borrowed("");
+    };
+    let Some(second) = parts.next() else {
+        return Cow::Borrowed(first);
+    };
+    let mut reasoning = String::from(first);
+    reasoning.push_str(second);
+    for part in parts {
+        reasoning.push_str(part);
+    }
+    Cow::Owned(reasoning)
+}
+
 #[allow(clippy::too_many_lines)]
-fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
+fn convert_message_to_openai<'a>(
+    message: &'a Message,
+    tool_images: &mut Vec<OpenAIContentPart<'a>>,
+) -> OpenAIMessage<'a> {
     match message {
-        Message::User(user) => vec![OpenAIMessage {
+        Message::User(user) => OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
-        }],
-        Message::Custom(custom) => vec![OpenAIMessage {
+            reasoning_content: None,
+        },
+        Message::Custom(custom) => OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
-        }],
+            reasoning_content: None,
+        },
         Message::Assistant(assistant) => {
-            let mut messages = Vec::new();
-
             // Collect text content
             let text: String = assistant
                 .content
@@ -1796,14 +2100,13 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                 Some(tool_calls)
             };
 
-            messages.push(OpenAIMessage {
+            OpenAIMessage {
                 role: Cow::Borrowed("assistant"),
                 content,
                 tool_calls,
                 tool_call_id: None,
-            });
-
-            messages
+                reasoning_content: None,
+            }
         }
         Message::ToolResult(result) => {
             let mut text_parts: Vec<Cow<'_, str>> = Vec::new();
@@ -1838,29 +2141,45 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                 Some(OpenAIContent::Text(Cow::Owned(text_parts.join("\n"))))
             };
 
-            let mut messages = vec![OpenAIMessage {
+            if !image_parts.is_empty() {
+                tool_images.push(OpenAIContentPart::Text {
+                    text: Cow::Owned(format!(
+                        "Images from {} (tool call {}):",
+                        result.tool_name, result.tool_call_id
+                    )),
+                });
+                tool_images.extend(image_parts);
+            }
+            OpenAIMessage {
                 role: Cow::Borrowed("tool"),
                 content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(&result.tool_call_id),
-            }];
-
-            if !image_parts.is_empty() {
-                let mut parts = vec![OpenAIContentPart::Text {
-                    text: Cow::Borrowed("Attached image(s) from tool result:"),
-                }];
-                parts.extend(image_parts);
-                messages.push(OpenAIMessage {
-                    role: Cow::Borrowed("user"),
-                    content: Some(OpenAIContent::Parts(parts)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
+                reasoning_content: None,
             }
-
-            messages
         }
     }
+}
+
+fn append_tool_result_images<'a>(
+    messages: &mut Vec<OpenAIMessage<'a>>,
+    images: &mut Vec<OpenAIContentPart<'a>>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    parts.push(OpenAIContentPart::Text {
+        text: Cow::Borrowed("Attached image(s) from tool results:"),
+    });
+    parts.append(images);
+    messages.push(OpenAIMessage {
+        role: Cow::Borrowed("user"),
+        content: Some(OpenAIContent::Parts(parts)),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
 }
 
 fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
@@ -2030,9 +2349,10 @@ mod tests {
             is_error: false,
             timestamp: 0,
         });
-        let messages = convert_message_to_openai(&result);
-        assert_eq!(messages.len(), 1, "no trailing image turn for media");
-        let wire = serde_json::to_value(&messages[0]).expect("serialize");
+        let mut tool_images = Vec::new();
+        let message = convert_message_to_openai(&result, &mut tool_images);
+        assert!(tool_images.is_empty(), "no trailing image turn for media");
+        let wire = serde_json::to_value(&message).expect("serialize");
         assert_eq!(wire["role"], "tool");
         assert_eq!(
             wire["content"],
@@ -2047,9 +2367,200 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_openai(&message);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
+        let mut tool_images = Vec::new();
+        let converted = convert_message_to_openai(&message, &mut tool_images);
+        assert_eq!(converted.role, "user");
+        assert!(tool_images.is_empty());
+    }
+
+    fn tool_call_message(ids: &[&str]) -> Message {
+        Message::assistant(AssistantMessage {
+            content: ids
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: (*id).to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path": id}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        })
+    }
+
+    fn image_block(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Image(crate::model::ImageContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    }
+
+    fn tool_result_message(id: &str, content: Vec<ContentBlock>) -> Message {
+        Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: "read".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    fn request_messages(messages: Vec<Message>) -> Value {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: messages.into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+        let request = provider.build_request(&context, &options);
+        serde_json::to_value(request).expect("serialize request")["messages"].clone()
+    }
+
+    #[test]
+    fn parallel_tool_results_precede_one_ordered_image_bundle() {
+        let wire = request_messages(vec![
+            tool_call_message(&["call_a", "call_b", "call_c", "call_empty"]),
+            tool_result_message(
+                "call_a",
+                vec![
+                    ContentBlock::Text(TextContent::new("first result")),
+                    image_block("AQ==", "image/png"),
+                    image_block("Ag==", "image/jpeg"),
+                ],
+            ),
+            tool_result_message(
+                "call_b",
+                vec![ContentBlock::Text(TextContent::new("text-only result"))],
+            ),
+            tool_result_message("call_c", vec![image_block("Aw==", "image/webp")]),
+            tool_result_message("call_empty", Vec::new()),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool", "tool", "user"]
+        );
+        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(messages[0]["tool_calls"][index]["id"], *id);
+            assert_eq!(messages[index + 1]["tool_call_id"], *id);
+        }
+        assert_eq!(messages[1]["content"], "first result");
+        assert_eq!(messages[2]["content"], "text-only result");
+        assert_eq!(messages[3]["content"], "(see attached image)");
+        assert_eq!(messages[4]["content"], "");
+        assert_eq!(
+            messages[5]["content"],
+            json!([
+                {"type": "text", "text": "Attached image(s) from tool results:"},
+                {"type": "text", "text": "Images from read (tool call call_a):"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Ag=="}},
+                {"type": "text", "text": "Images from read (tool call call_c):"},
+                {"type": "image_url", "image_url": {"url": "data:image/webp;base64,Aw=="}}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_image_bundles_stay_with_their_run_and_preserve_user_images() {
+        let wire = request_messages(vec![
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(vec![image_block("AQ==", "image/png")]),
+                timestamp: 0,
+            }),
+            tool_call_message(&["call_a"]),
+            tool_result_message("call_a", vec![image_block("Ag==", "image/jpeg")]),
+            tool_call_message(&["call_b"]),
+            tool_result_message("call_b", vec![image_block("Aw==", "image/webp")]),
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(vec![image_block("BA==", "image/png")]),
+                timestamp: 0,
+            }),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "user"
+            ]
+        );
+        for (message_index, part_index, expected) in [
+            (0, 0, "data:image/png;base64,AQ=="),
+            (3, 2, "data:image/jpeg;base64,Ag=="),
+            (6, 2, "data:image/webp;base64,Aw=="),
+            (7, 0, "data:image/png;base64,BA=="),
+        ] {
+            assert_eq!(
+                messages[message_index]["content"][part_index]["image_url"]["url"],
+                expected
+            );
+        }
+        assert_eq!(messages[3]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(messages[6]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            messages[3]["content"][1]["text"],
+            "Images from read (tool call call_a):"
+        );
+        assert_eq!(
+            messages[6]["content"][1]["text"],
+            "Images from read (tool call call_b):"
+        );
+    }
+
+    #[test]
+    fn text_and_media_tool_results_do_not_add_an_image_turn() {
+        let wire = request_messages(vec![
+            tool_call_message(&["call_text", "call_media", "call_empty"]),
+            tool_result_message(
+                "call_text",
+                vec![ContentBlock::Text(TextContent::new("plain result"))],
+            ),
+            tool_result_message(
+                "call_media",
+                vec![ContentBlock::Media(crate::model::MediaContent {
+                    data: "AAAA".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                })],
+            ),
+            tool_result_message("call_empty", Vec::new()),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool"]
+        );
+        assert_eq!(messages[1]["content"], "plain result");
+        assert_eq!(
+            messages[2]["content"],
+            "[media omitted: clip.mp4, video/mp4, 3 B]"
+        );
+        assert_eq!(messages[3]["content"], "");
+        assert!(!wire.to_string().contains("AAAA"));
     }
 
     #[test]
@@ -2237,6 +2748,160 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_tool_requests_replay_same_origin_reasoning_exactly() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let assistant = AssistantMessage {
+            api: "openai-completions".to_string(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: " first\n".to_string(),
+                    thinking_signature: None,
+                }),
+                ContentBlock::Text(TextContent::new("visible")),
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "日本語🙂 last ".to_string(),
+                    thinking_signature: None,
+                }),
+            ],
+            ..AssistantMessage::default()
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::assistant(assistant)].into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body = serde_json::to_value(provider.build_request(
+            &context,
+            &StreamOptions {
+                thinking_level: Some(ThinkingLevel::High),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            " first\n日本語🙂 last "
+        );
+        assert_eq!(body["messages"][0]["content"], "visible");
+    }
+
+    #[test]
+    fn deepseek_replay_survives_current_thinking_off_but_requires_tools() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let message = Message::assistant(AssistantMessage {
+            api: "openai-completions".to_string(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            content: vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "prior".to_string(),
+                thinking_signature: None,
+            })],
+            ..AssistantMessage::default()
+        });
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let with_tools = Context {
+            system_prompt: None,
+            messages: vec![message.clone()].into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body = serde_json::to_value(provider.build_request(&with_tools, &options)).unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["messages"][0]["reasoning_content"], "prior");
+
+        let without_tools = Context {
+            system_prompt: None,
+            messages: vec![message].into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let body = serde_json::to_value(provider.build_request(&without_tools, &options)).unwrap();
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn deepseek_replay_never_exports_foreign_or_signed_reasoning() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        for (source_provider, signature) in [("other-provider", None), ("deepseek", Some("opaque"))]
+        {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::assistant(AssistantMessage {
+                    api: "openai-completions".to_string(),
+                    provider: source_provider.to_string(),
+                    model: "deepseek-reasoner".to_string(),
+                    content: vec![ContentBlock::Thinking(ThinkingContent {
+                        thinking: "private-reasoning".to_string(),
+                        thinking_signature: signature.map(str::to_string),
+                    })],
+                    ..AssistantMessage::default()
+                })]
+                .into(),
+                tools: vec![ToolDef {
+                    name: "read".to_string(),
+                    description: "Read".to_string(),
+                    parameters: json!({"type":"object"}),
+                }]
+                .into(),
+            };
+            let body =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .unwrap();
+            assert_eq!(body["messages"][0]["reasoning_content"], "");
+            assert!(!body.to_string().contains("private-reasoning"));
+            assert!(!body.to_string().contains("opaque"));
+        }
+    }
+
+    #[test]
+    fn non_deepseek_transport_never_adds_reasoning_content() {
+        let provider = OpenAIProvider::new("gpt-test").with_reasoning(true);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::assistant(AssistantMessage {
+                api: "openai-completions".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-test".to_string(),
+                content: vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "local display thought".to_string(),
+                    thinking_signature: None,
+                })],
+                ..AssistantMessage::default()
+            })]
+            .into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .unwrap();
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn test_build_request_deepseek_forwards_thinking_and_reasoning_effort() {
         // Builds the serialized request body for a given thinking level.
         let body = |provider: &OpenAIProvider, level: crate::model::ThinkingLevel| {
@@ -2371,9 +3036,9 @@ mod tests {
             .with_reasoning(true)
             .with_compat(Some(CompatConfig {
                 thinking_level_map: Some(HashMap::from([
-                    ("xhigh".to_string(), "high".to_string()),
-                    ("medium".to_string(), "medium".to_string()),
-                    ("off".to_string(), "none".to_string()),
+                    ("xhigh".to_string(), Some("high".to_string())),
+                    ("medium".to_string(), Some("medium".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
                 ])),
                 ..Default::default()
             }));
@@ -2812,6 +3477,63 @@ mod tests {
             .expect("serialize request")
     }
 
+    #[test]
+    fn explicit_plain_effort_capability_preserves_maps_and_null_tiers() {
+        let make = |enabled, reasoning| {
+            OpenAIProvider::new("ovh-free/gpt-oss-120b")
+                .with_provider_name("freeflow")
+                .with_base_url("http://127.0.0.1:28180/v1/chat/completions".to_string())
+                .with_reasoning(reasoning)
+                .with_compat(Some(CompatConfig {
+                    supports_reasoning_effort: enabled,
+                    thinking_level_map: Some(HashMap::from([
+                        ("xhigh".to_string(), Some("high".to_string())),
+                        ("medium".to_string(), None),
+                    ])),
+                    ..CompatConfig::default()
+                }))
+        };
+        let enabled = make(Some(true), true);
+        let mapped = openrouter_body(&enabled, ThinkingLevel::XHigh);
+        assert_eq!(mapped["reasoning_effort"], "high");
+        assert!(mapped.get("reasoning").is_none());
+        assert!(mapped.get("thinking").is_none());
+        assert_eq!(
+            openrouter_body(&enabled, ThinkingLevel::Low)["reasoning_effort"],
+            "low"
+        );
+        for level in [ThinkingLevel::Off, ThinkingLevel::Medium] {
+            let body = openrouter_body(&enabled, level);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+        for provider in [
+            make(None, true),
+            make(Some(false), true),
+            make(Some(true), false),
+        ] {
+            let body = openrouter_body(&provider, ThinkingLevel::XHigh);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_null_effort_does_not_fall_back_to_a_vendor_dialect() {
+        for format in ["deepseek", "openrouter", "openai"] {
+            let provider = OpenAIProvider::new("freeflow-reasoner")
+                .with_reasoning(true)
+                .with_compat(Some(CompatConfig {
+                    supports_reasoning_effort: Some(true),
+                    thinking_format: Some(format.to_string()),
+                    thinking_level_map: Some(HashMap::from([("max".to_string(), None)])),
+                    ..CompatConfig::default()
+                }));
+            let body = openrouter_body(&provider, ThinkingLevel::Max);
+            assert!(body.get("reasoning_effort").is_none(), "{format}: {body}");
+            assert!(body.get("reasoning").is_none(), "{format}: {body}");
+            assert!(body.get("thinking").is_none(), "{format}: {body}");
+        }
+    }
+
     /// gh #220: on the OpenRouter transport a reasoning model's thinking
     /// level goes out as the gateway's normalized `reasoning: {effort}`
     /// object — one fixture per level — and never as a vendor field.
@@ -2884,11 +3606,11 @@ mod tests {
             .with_reasoning(true)
             .with_compat(Some(CompatConfig {
                 thinking_level_map: Some(HashMap::from([
-                    ("high".to_string(), "8000".to_string()),
-                    ("max".to_string(), " 32000 ".to_string()),
-                    ("low".to_string(), "minimal".to_string()),
-                    ("off".to_string(), "none".to_string()),
-                    ("medium".to_string(), "0".to_string()),
+                    ("high".to_string(), Some("8000".to_string())),
+                    ("max".to_string(), Some(" 32000 ".to_string())),
+                    ("low".to_string(), Some("minimal".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
+                    ("medium".to_string(), Some("0".to_string())),
                 ])),
                 ..Default::default()
             }));
@@ -4167,6 +4889,51 @@ mod tests {
             "expected ThinkingEnd after finish_reason"
         );
         assert_eq!(collect_thinking_text(&out), "plan");
+    }
+
+    #[test]
+    fn reasoning_field_aliases_emit_thinking_and_non_strings_are_ignored() {
+        for (delta, expected) in [
+            (json!({"reasoning": "plan"}), "plan"),
+            (json!({"reasoning_text": "plan"}), "plan"),
+            // `reasoning_content` wins when a gateway sends more than one.
+            (
+                json!({"reasoning_content": "kept", "reasoning": "dropped"}),
+                "kept",
+            ),
+            // An empty `reasoning_content` does not hide the alternative.
+            (
+                json!({"reasoning_content": "", "reasoning": "plan"}),
+                "plan",
+            ),
+        ] {
+            let events = vec![
+                json!({"choices": [{"delta": delta, "finish_reason": null}]}),
+                json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                Value::String("[DONE]".to_string()),
+            ];
+            let out = collect_events(&events);
+            assert_eq!(collect_thinking_text(&out), expected, "{events:?}");
+        }
+
+        // A non-string `reasoning` (some gateways echo an object) is not
+        // thinking text and must not fail the chunk that carries the answer.
+        let events = vec![
+            json!({"choices": [{
+                "delta": {"content": "answer", "reasoning": {"effort": "high"}},
+                "finish_reason": null
+            }]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            Value::String("[DONE]".to_string()),
+        ];
+        let out = collect_events(&events);
+        assert_eq!(collect_thinking_text(&out), "");
+        assert!(
+            out.iter().any(
+                |event| matches!(event, StreamEvent::TextDelta { delta, .. } if delta == "answer")
+            ),
+            "the answer text still streams: {out:?}"
+        );
     }
 
     #[test]

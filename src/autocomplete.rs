@@ -862,7 +862,7 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "settings",
-            description: "Show current settings summary",
+            description: "Edit and save session preferences",
         },
         BuiltinSlashCommand {
             name: "theme",
@@ -923,6 +923,10 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         BuiltinSlashCommand {
             name: "plan",
             description: "Enter or manage read-only plan mode",
+        },
+        BuiltinSlashCommand {
+            name: "prewalk",
+            description: "Hand off to @smol after planning and the first edit",
         },
         BuiltinSlashCommand {
             name: "advisor",

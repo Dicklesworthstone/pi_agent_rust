@@ -68,16 +68,22 @@ case_dir() {
 # Make an `xz` visible inside the case sandbox when the host has one.
 #
 # Cases run with PATH restricted to "<case>/fakebin:/usr/bin:/bin", and
-# install.sh checks `command -v xz` before extracting a .tar.xz. Linux ships xz
-# in /usr/bin so the restricted PATH finds it; macOS does not, and Homebrew's
-# copy in /opt/homebrew/bin is outside that PATH. Eight cases build .tar.xz
-# fixtures, so without this the suite tests a different code path on each
-# platform. Linking the host binary keeps the sandbox restricted while giving
-# the installer the tool it legitimately requires. If the host has no xz at all
+# install.sh extracts a .tar.xz with `tar -xJf`. GNU tar runs the `xz` program
+# for that; bsdtar (macOS) decompresses xz itself. Linux ships xz in /usr/bin
+# so the restricted PATH finds it; macOS has none there, and Homebrew's copy in
+# /opt/homebrew/bin is outside that PATH. Eight cases build .tar.xz fixtures.
+# Linking the host binary gives a GNU tar found on such a host the program it
+# needs while the sandbox stays restricted. If a GNU-tar host has no xz at all
 # the link is simply absent and the affected cases fail with install.sh's own
 # "xz is not available" message, which is the honest outcome.
+#
+# INSTALLER_TEST_NO_HOST_XZ=1 leaves the link out, for the case that proves a
+# tar which reads xz by itself needs no `xz` program.
 provide_host_xz() {
   local dir="$1" host_xz
+  if [ "${INSTALLER_TEST_NO_HOST_XZ:-0}" = "1" ]; then
+    return 0
+  fi
   if [ -x /usr/bin/xz ] || [ -x /bin/xz ]; then
     return 0
   fi
@@ -681,6 +687,37 @@ require_linux() {
   fi
   echo "skipping: requires Linux (running on $(uname -s))" >&2
   return 77
+}
+
+# The case sandbox PATH is "<case>/fakebin:/usr/bin:/bin". Only a host whose
+# tar decompresses xz itself and which has no `xz` in /usr/bin or /bin (a stock
+# macOS) can show the installer working with no `xz` program in reach.
+require_tar_reading_xz_without_an_xz_program() {
+  if [ -x /usr/bin/xz ] || [ -x /bin/xz ]; then
+    echo "skipping: this host has an xz program on the sandbox PATH" >&2
+    return 77
+  fi
+  if ! PATH="/usr/bin:/bin" tar --version 2>/dev/null | grep -q 'bsdtar'; then
+    echo "skipping: this host's tar does not decompress xz itself" >&2
+    return 77
+  fi
+  return 0
+}
+
+# mawk 1.3.4 before 2024, the default awk of Ubuntu 22.04 and Debian 12, has
+# no interval expressions: `/^[0-9a-f]{64}$/` silently never matches there,
+# and the installer then rejected every release checksum on those systems.
+# The cases below run with the host's awk (gawk or BSD awk, which have
+# intervals), so they cannot catch this; check the source instead. Bash's own
+# `[[ ... =~ ... ]]` supports intervals and is allowed.
+test_installer_regexes_avoid_interval_expressions() {
+  local hits
+  hits="$(grep -nE '\]\{[0-9]+(,[0-9]*)?\}' "${INSTALLER}" | grep -v '=~' || true)"
+  if [ -n "$hits" ]; then
+    echo "install.sh uses regex interval expressions outside bash =~ tests:" >&2
+    printf '%s\n' "$hits" >&2
+    return 1
+  fi
 }
 
 test_help_lists_installer_flags() {
@@ -1937,6 +1974,45 @@ test_release_install_uses_dsr_asset_sidecar_when_manifest_absent() {
   [ -x "$installed" ] || { echo "expected installed binary at ${installed}" >&2; return 1; }
 }
 
+# A stock macOS has no `xz` program, and its tar reads xz without one. The
+# installer used to require the program before calling tar, so the documented
+# one-liner failed there with "xz is not available to extract ...".
+test_release_install_extracts_tar_xz_without_an_xz_program() {
+  require_tar_reading_xz_without_an_xz_program || return $?
+  local dir artifact archive sidecar checksum installed
+  dir="$(INSTALLER_TEST_NO_HOST_XZ=1 case_dir "tar-xz-without-xz-program")"
+  if [ -e "${dir}/fakebin/xz" ]; then
+    echo "the sandbox unexpectedly provides an xz program" >&2
+    return 1
+  fi
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+
+  artifact="${dir}/fixtures/pi"
+  archive="${dir}/fixtures/pi-linux-amd64.tar.xz"
+  sidecar="${archive}.sha256"
+  write_artifact_binary "$artifact" "unsupported"
+  tar -cJf "$archive" -C "${dir}/fixtures" pi
+  checksum="$(sha256_file "$archive")"
+  printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$sidecar"
+
+  STUB_ARTIFACT_SOURCE="$archive" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi-linux-amd64.tar.xz" \
+  STUB_SHA256_SIDECAR_SOURCE="$sidecar" \
+  run_installer "$dir" \
+    --yes --no-gum \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  assert_output_not_contains "$dir" "xz is not available"
+  installed="${dir}/dest/pi"
+  [ -x "$installed" ] || { echo "expected installed binary at ${installed}" >&2; return 1; }
+}
+
 test_release_install_falls_back_to_legacy_manifest_when_sidecar_absent() {
   local dir artifact archive manifest checksum curl_log installed
   dir="$(case_dir "checksum-legacy-manifest-fallback")"
@@ -2932,6 +3008,7 @@ main() {
     exit 0
   fi
 
+  run_test test_installer_regexes_avoid_interval_expressions
   run_test test_help_lists_installer_flags
   run_test test_release_publish_no_verify_is_secret_scoped
   run_test test_installer_retain_temp_mode_preserves_owned_scratch
@@ -2978,6 +3055,7 @@ main() {
   run_test test_checksum_missing_manifest_entry_fails_hard
   run_test test_local_checksum_copy_failure_fails_closed
   run_test test_release_install_uses_dsr_asset_sidecar_when_manifest_absent
+  run_test test_release_install_extracts_tar_xz_without_an_xz_program
   run_test test_release_install_falls_back_to_legacy_manifest_when_sidecar_absent
   run_test test_release_install_without_any_checksum_fails_closed
   run_test test_release_install_rejects_wrong_dsr_asset_sidecar

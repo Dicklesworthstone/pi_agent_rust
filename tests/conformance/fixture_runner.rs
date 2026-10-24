@@ -1079,6 +1079,26 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::Import { .. }) => json!({
             "name": "import",
         }),
+        Some(Commands::Recover {
+            source,
+            output,
+            session_output,
+            json,
+            active,
+            branch,
+            root,
+        }) => json!({
+            "name": "recover",
+            "source": source,
+            "output": output.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "session_output": session_output
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            "json": json,
+            "active": active,
+            "branch": branch,
+            "root": root,
+        }),
         Some(Commands::SelfUpdate { .. }) => json!({
             "name": "self-update",
         }),

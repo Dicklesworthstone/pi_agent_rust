@@ -4,6 +4,7 @@
 //! reports unsupported origins instead of guessing a public package identity.
 
 pub mod dependencies;
+mod dependency_review;
 mod osv;
 mod source;
 
@@ -61,7 +62,7 @@ impl Tool for SecurityScanTool {
         "security scan"
     }
     fn description(&self) -> &'static str {
-        "Review local source with plan/run/disposition/compare. dependency_plan inventories Cargo/npm lockfiles offline. audit_dependencies sends eligible public-registry package names, ecosystems and exact versions to OSV, returning known advisory matches and explicit completeness/exclusions. Source code, lockfile paths and private-registry entries are not uploaded. An optional new root-level .sarif report is never overwritten. This is not exploitability or installed-code analysis."
+        "Review local source with plan/run/disposition/compare. dependency_plan inventories Cargo/npm lockfiles offline. audit_dependencies sends eligible public-registry package names, ecosystems and exact versions to OSV, returning known advisory matches and explicit completeness/exclusions. compare_dependencies compares saved audits offline with paged findings and per-package uncertainty. disposition_dependencies records one hash-bound review decision in a new report without hiding findings or changing future audits. Source code, lockfile paths and private-registry entries are not uploaded. New dependency reports never overwrite existing files. This is not exploitability or installed-code analysis."
     }
     fn parameters(&self) -> Value {
         let mut schema = self.source.parameters();
@@ -71,18 +72,40 @@ impl Tool for SecurityScanTool {
             "disposition",
             "compare",
             "dependency_plan",
-            "audit_dependencies"
+            "audit_dependencies",
+            "compare_dependencies",
+            "disposition_dependencies"
         ]);
         schema["properties"]["op"]["description"] = json!(
-            "Source review: plan/run/disposition/compare. dependency_plan: offline lockfile inventory. audit_dependencies: native OSV known-vulnerability lookup."
+            "Source review: plan/run/disposition/compare. dependency_plan: offline lockfile inventory. audit_dependencies: OSV lookup. compare_dependencies: offline comparison. disposition_dependencies: exact-fingerprint review in a new SARIF artifact; does not alter future audits."
         );
         schema["properties"]["paths"]["description"] = json!(
             "Source ops: relative files/directories. Dependency ops: up to 32 relative Cargo.lock or package-lock.json/npm-shrinkwrap.json files; default root Cargo.lock and package-lock.json only."
         );
         schema["properties"]["timeoutMs"] = json!({"type":"integer","minimum":1,"maximum":120_000,"default":60_000,
             "description":"audit_dependencies only: total inventory/network deadline; blocking filesystem calls are not preemptible"});
+        schema["properties"]["baseline"]["description"] = json!(
+            "compare: source baseline. compare_dependencies: required root-level baseline .sarif filename from audit_dependencies."
+        );
+        schema["properties"]["current"] = json!({"type":"string",
+            "description":"compare_dependencies/disposition_dependencies: required root-level native dependency .sarif filename; comparison requires the same lockfile paths as baseline"});
+        schema["properties"]["offset"] = json!({"type":"integer","minimum":0,"default":0,
+            "description":"compare_dependencies: stable page offset; compare returned report hashes across pages"});
+        schema["properties"]["limit"] = json!({"type":"integer","minimum":1,"maximum":50,"default":20,
+            "description":"compare_dependencies: findings per page; counts always cover the full comparison"});
+        schema["properties"]["decision"] = json!({"type":"string",
+            "enum":["accepted_risk","false_positive","reopen"],
+            "description":"disposition_dependencies: explicit decision for one exact dependency fingerprint; reason and new sarifOut required"});
+        schema["properties"]["expectedSha256"] = json!({"type":"string","pattern":"^[a-f0-9]{64}$",
+            "description":"disposition_dependencies: required current.sha256 from compare_dependencies; changed source bytes are refused"});
         schema["properties"]["sarifOut"]["description"] = json!(
-            "run: source report path. audit_dependencies: optional NEW root-level .sarif filename; existing files are never overwritten, no default export."
+            "run: source report. audit_dependencies: optional new root-level .sarif. disposition_dependencies: required new root-level .sarif; original audit is never overwritten."
+        );
+        schema["properties"]["reason"]["description"] = json!(
+            "disposition/disposition_dependencies: reason required; dependency decisions allow up to 2048 UTF-8 bytes"
+        );
+        schema["properties"]["fingerprint"]["description"] = json!(
+            "disposition: source finding identity. disposition_dependencies: exact 64-hex pi/dependency/v1 fingerprint from the selected report"
         );
         schema
     }
@@ -104,6 +127,12 @@ impl Tool for SecurityScanTool {
             .to_ascii_lowercase();
         if op == "audit_dependencies" {
             return self.osv.execute(&self.cwd, input).await;
+        }
+        if op == "compare_dependencies" {
+            return dependency_review::compare(&self.cwd, input).await;
+        }
+        if op == "disposition_dependencies" {
+            return dependency_review::apply_disposition(&self.cwd, input).await;
         }
         if op != "dependency_plan" {
             return self.source.execute(call_id, input, on_update).await;
@@ -170,6 +199,8 @@ mod tests {
             "compare",
             "dependency_plan",
             "audit_dependencies",
+            "compare_dependencies",
+            "disposition_dependencies",
         ] {
             assert!(
                 schema["properties"]["op"]["enum"]

@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+pub(crate) mod provider_code;
+
 /// Failure classes relevant to failover decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailoverClass {
@@ -23,6 +25,112 @@ pub enum FailoverClass {
     Overload,
     /// Other transient failures after the retry budget is spent.
     Transient,
+}
+
+/// Which eligible provider failures may switch to a fallback model.
+/// Same-provider retries keep their own classification and budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackOn {
+    #[default]
+    Any,
+    UsageLimit,
+    ExceptUsageLimit,
+}
+
+impl FallbackOn {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::UsageLimit => "usage-limit",
+            Self::ExceptUsageLimit => "except-usage-limit",
+        }
+    }
+
+    /// Filter an already eligible provider failure. This never makes an
+    /// authentication, context, or durability failure eligible for recovery.
+    #[must_use]
+    pub fn allows(self, error_text: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::UsageLimit => is_usage_limit(error_text),
+            Self::ExceptUsageLimit => !is_usage_limit(error_text),
+        }
+    }
+}
+
+/// Account or subscription exhaustion, distinct from short rate/concurrency
+/// throttles. A bare 402/429 carries no finer evidence; explicit throttle
+/// wording takes precedence over ambiguous quota language.
+fn is_usage_limit(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    let status = recovery_http_status(&lower);
+    if status != Some(402)
+        && ([
+            "per minute",
+            "per-minute",
+            "per second",
+            "per-second",
+            "requests/min",
+            "tokens/min",
+            "concurrent",
+            "concurrency",
+            "throttling.allocationquota",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+            || lower
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .any(|token| matches!(token, "rpm" | "tpm" | "rps" | "tps")))
+    {
+        return false;
+    }
+    if is_quota_exhaustion(&lower)
+        || [
+            "usage_limit",
+            "usage limit",
+            "daily limit",
+            "weekly limit",
+            "monthly limit",
+            "daily quota",
+            "weekly quota",
+            "monthly quota",
+            "subscription limit",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return true;
+    }
+    if !matches!(status, Some(402 | 429)) {
+        return false;
+    }
+    let headline = lower
+        .strip_prefix("provider error: ")
+        .map_or(lower.as_str(), |rest| {
+            rest.split_once(": ").map_or(rest, |(_, message)| message)
+        });
+    headline
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .all(|token| {
+            matches!(
+                token,
+                "api"
+                    | "http"
+                    | "https"
+                    | "status"
+                    | "error"
+                    | "code"
+                    | "response"
+                    | "message"
+                    | "no"
+                    | "body"
+                    | "402"
+                    | "429"
+            )
+        })
 }
 
 /// Recognize response status evidence, never a numeric substring in an id.
@@ -90,17 +198,32 @@ fn is_quota_exhaustion(lower: &str) -> bool {
         "quota exceeded",
         "quota_exceeded",
         "quota has been exceeded",
+        "quota exhausted",
+        "quota_exhausted",
+        "quota will reset",
+        "exhausted your capacity",
         "billing hard limit",
         "billing_not_active",
         "not enough credits",
         "credit balance is too low",
         "spending limit",
+        "spending cap",
+        "usage_limit_reached",
+        "usage limit reached",
+        "usage limit exceeded",
+        "insufficient credits",
+        "credits exhausted",
+        "out of credits",
+        "prepaid balance is used up",
     ]
     .iter()
     .any(|pattern| lower.contains(pattern))
 }
 
 fn response_refuses_retry(lower: &str) -> bool {
+    if let Some(class) = provider_code::connect_recovery(lower) {
+        return class.is_none();
+    }
     recovery_http_status(lower)
         .is_some_and(|status| (400..=499).contains(&status) && !matches!(status, 408 | 429))
 }
@@ -115,6 +238,9 @@ fn provider_text_is_retryable(
 ) -> bool {
     if crate::error::is_context_overflow(error_text, usage_input_tokens, context_window) {
         return false;
+    }
+    if let Some(class) = provider_code::connect_recovery(error_text) {
+        return class.is_some();
     }
     let lower = error_text.to_ascii_lowercase();
     if let Some(status) = recovery_http_status(&lower)
@@ -208,10 +334,20 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     if is_auth_failure(&text) {
         return None;
     }
-    if is_quota_exhaustion(&text) {
+    // A validated Connect code is the response classification, not an HTTP
+    // status inferred from its explanation. Refusals above still win.
+    if let Some(class) = provider_code::connect_recovery(error_text) {
+        return class;
+    }
+    // Broad usage-limit labels can describe invalid request fields. Only
+    // concrete exhaustion evidence may override a permanent client response.
+    let status = recovery_http_status(&text);
+    let usage_label_is_eligible = status
+        .is_none_or(|status| !(400..=499).contains(&status) || matches!(status, 402 | 408 | 429));
+    if is_quota_exhaustion(&text) || (usage_label_is_eligible && is_usage_limit(&text)) {
         return Some(FailoverClass::Quota);
     }
-    if let Some(status) = recovery_http_status(&text) {
+    if let Some(status) = status {
         match status {
             408 | 504 => return Some(FailoverClass::Transient),
             429 => return Some(FailoverClass::Quota),
@@ -248,13 +384,16 @@ pub struct FailoverChain {
 ///
 /// Looks up fallback chains from `retry.fallbackChains`. Role keys take precedence
 /// over exact model specs. Provider aliases and surrounding spec whitespace follow
-/// model resolution. An exact key wins over equivalent spellings; otherwise the
-/// lexicographically first matching key wins, independent of `HashMap` iteration order.
+/// model resolution in the full catalog, before credential filtering. Separately
+/// declared providers cannot borrow each other's policy through a built-in alias.
+/// An exact key wins over equivalent spellings; otherwise the lexicographically
+/// first matching key wins, independent of `HashMap` iteration order.
 pub fn chain_for<S: std::hash::BuildHasher>(
     chains: &HashMap<String, Vec<String>, S>,
     role: &str,
     provider: &str,
     model_id: &str,
+    models: &[crate::models::ModelEntry],
 ) -> Option<FailoverChain> {
     if let Some(entries) = chains.get(role)
         && !entries.is_empty()
@@ -273,29 +412,51 @@ pub fn chain_for<S: std::hash::BuildHasher>(
     }
     chains
         .iter()
-        .filter(|(key, entries)| !entries.is_empty() && model_spec_matches(key, provider, model_id))
+        .filter(|(key, entries)| {
+            !entries.is_empty() && model_spec_matches(key, provider, model_id, models)
+        })
         .min_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, entries)| FailoverChain {
             entries: entries.clone(),
         })
 }
 
-/// Use the same identity relation as `resolve_chain_spec`, including provider
-/// aliases and nested model ids. Raw string equality is not model identity.
-fn model_spec_matches(spec: &str, provider: &str, model_id: &str) -> bool {
+/// Policy ownership uses the same declared destinations as chain walking.
+fn model_spec_matches(
+    spec: &str,
+    provider: &str,
+    model_id: &str,
+    models: &[crate::models::ModelEntry],
+) -> bool {
     crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
         |(candidate_provider, candidate_model)| {
-            crate::provider_metadata::provider_ids_match(provider, candidate_provider)
-                && model_id.eq_ignore_ascii_case(candidate_model)
+            crate::models::model_identities_match(
+                models,
+                provider,
+                model_id,
+                candidate_provider,
+                candidate_model,
+            )
         },
     )
 }
 
-fn model_specs_match(left: &str, right: &str) -> bool {
-    crate::provider_metadata::split_provider_model_spec(right).map_or_else(
-        || left.eq_ignore_ascii_case(right),
-        |(provider, model_id)| model_spec_matches(left, provider, model_id),
-    )
+fn model_specs_match(left: &str, right: &str, models: &[crate::models::ModelEntry]) -> bool {
+    match (
+        crate::provider_metadata::split_provider_model_spec(left),
+        crate::provider_metadata::split_provider_model_spec(right),
+    ) {
+        (Some((left_provider, left_model)), Some((right_provider, right_model))) => {
+            crate::models::model_identities_match(
+                models,
+                left_provider,
+                left_model,
+                right_provider,
+                right_model,
+            )
+        }
+        _ => left.eq_ignore_ascii_case(right),
+    }
 }
 
 /// Cooldown FSM for the primary after a failover.
@@ -568,8 +729,8 @@ pub struct FailoverState {
 /// Full provenance matters because sibling branches can share a lifecycle and
 /// cursor while recording different deadlines. Entry identity also separates
 /// older records without lifecycle IDs or usable deadlines.
-#[derive(Debug, PartialEq, Eq)]
-struct FailoverSource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailoverSource {
     session_id: String,
     entry_id: Option<String>,
     entry_parent_id: Option<String>,
@@ -578,7 +739,7 @@ struct FailoverSource {
 }
 
 impl FailoverSource {
-    fn from_session(session: &crate::session::Session) -> Option<Self> {
+    pub(crate) fn from_session(session: &crate::session::Session) -> Option<Self> {
         let change = session.active_failover_model_change_for_current_path()?;
         Some(Self {
             session_id: session.header.id.clone(),
@@ -676,7 +837,8 @@ impl FailoverState {
         {
             return;
         }
-        *self = Self::reconstruct_from_provenance(&source.provenance, configured_cooldown_secs, now);
+        *self =
+            Self::reconstruct_from_provenance(&source.provenance, configured_cooldown_secs, now);
         self.source = Some(source);
     }
 
@@ -885,15 +1047,27 @@ impl<'a> FailoverWalk<'a> {
     /// The next candidate spec and the chain index it occupies, advancing past
     /// it. The index is captured BEFORE the advance: reporting the post-advance
     /// cursor as the chain index is off by one (bd-oqo03).
-    pub fn next_spec(&mut self) -> Option<(usize, &'a str)> {
+    /// Pass the full catalog so separately declared providers are not skipped
+    /// as aliases of the live model or of earlier entries.
+    pub fn next_spec(&mut self, models: &[crate::models::ModelEntry]) -> Option<(usize, &'a str)> {
         while self.position < self.entries.len() {
             let index = self.position;
             let spec = self.entries[index].as_str();
             self.position += 1;
-            let is_current = model_spec_matches(spec, self.current_provider, self.current_model);
+            let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
+                |(provider, model)| {
+                    crate::models::model_identities_match(
+                        models,
+                        provider,
+                        model,
+                        self.current_provider,
+                        self.current_model,
+                    )
+                },
+            );
             let is_duplicate = self.entries[..index]
                 .iter()
-                .any(|earlier| model_specs_match(earlier, spec));
+                .any(|earlier| model_specs_match(earlier, spec, models));
             if is_current || is_duplicate {
                 continue;
             }
@@ -911,23 +1085,16 @@ impl<'a> FailoverWalk<'a> {
 
 /// Resolve one `provider/model` chain spec against the configured model list.
 ///
-/// A well-formed pair that is simply not configured falls back to an ad-hoc
-/// entry. `None` means the spec names nothing usable and the walk should move
-/// on.
+/// Native providers can resolve unlisted models from their routing defaults.
+/// A separately declared provider keeps its own identity and cannot borrow
+/// a built-in alias's route. `None` lets the walk try its next configured spec.
 #[must_use]
 pub fn resolve_chain_spec(
     spec: &str,
-    available_models: &[crate::models::ModelEntry],
+    models: &[crate::models::ModelEntry],
 ) -> Option<crate::models::ModelEntry> {
     let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
-    available_models
-        .iter()
-        .find(|entry| {
-            crate::provider_metadata::provider_ids_match(&entry.model.provider, provider)
-                && entry.model.id.eq_ignore_ascii_case(model_id)
-        })
-        .cloned()
-        .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+    crate::models::resolve_model_entry(models, provider, model_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1215,45 @@ pub enum TurnOutcome<'a> {
     Failed(&'a crate::error::Error),
 }
 
+/// Overflow can justify changing the context, never resending it unchanged.
+/// Keep the ordinary recovery refusals ahead of this separate maintenance path:
+/// a local/session failure or mixed authentication diagnostic must not trigger
+/// summary-provider calls. Byte-size HTTP 413 refusals need token evidence.
+#[must_use]
+pub(crate) fn needs_context_compaction(
+    outcome: TurnOutcome<'_>,
+    context_window: Option<u32>,
+) -> bool {
+    let (error_text, input_tokens) = match outcome {
+        TurnOutcome::Completed(message)
+            if message.stop_reason == crate::model::StopReason::Error =>
+        {
+            (
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap_or("Request error")
+                    .to_string(),
+                Some(message.usage.input),
+            )
+        }
+        TurnOutcome::Failed(error) if is_provider_call_error(error) => (error.to_string(), None),
+        _ => return false,
+    };
+    let lower = error_text.to_ascii_lowercase();
+    if marks_session_persistence(&error_text) || is_auth_failure(&lower) {
+        return false;
+    }
+    if recovery_http_status(&lower) == Some(413)
+        && !input_tokens
+            .zip(context_window)
+            .is_some_and(|(tokens, window)| tokens > u64::from(window))
+    {
+        return false;
+    }
+    crate::error::is_context_overflow(&error_text, input_tokens, context_window)
+}
+
 /// Why a turn must end without another provider call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalReason {
@@ -1089,6 +1295,10 @@ pub enum TurnDecision {
 /// The configured limits a turn is decided against.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
+    /// Whether recovery may switch models at all.
+    pub model_fallback: bool,
+    /// Which eligible provider failures may switch models.
+    pub fallback_on: FallbackOn,
     /// Same-provider retries allowed per chain entry.
     pub max_retries: u32,
     /// Successful fallback swaps allowed in one turn. The chain walk itself is
@@ -1108,13 +1318,15 @@ impl RetryPolicy {
     /// default — the whole point of `retry.enabled = false` is that nobody
     /// re-enters the provider on the user's behalf.
     ///
-    /// One reader for the four config keys, so a surface adopting this policy
+    /// One reader for the recovery settings, so a surface adopting this policy
     /// cannot accidentally consult a different set (bd-u2qv4). Print mode
     /// supplies its own `max_retries` from the CLI and so builds its policy
     /// directly.
     #[must_use]
     pub fn from_config(config: &crate::config::Config) -> Option<Self> {
         config.retry_enabled().then(|| Self {
+            model_fallback: config.model_fallback_enabled(),
+            fallback_on: config.retry_fallback_on(),
             max_retries: config.retry_max_retries(),
             max_failovers_per_turn: config.max_failovers_per_turn(),
             base_delay_ms: config.retry_base_delay_ms(),
@@ -1166,8 +1378,9 @@ pub fn decide(
     let budget_left = progress.retry_count < policy.max_retries && progress.stream_can_retry;
     // A fallback also re-enters the provider. A surface that cannot retract
     // visible output must not bypass its no-retry boundary by changing models.
-    let may_fail_over =
-        progress.stream_can_retry && progress.failovers_this_turn < policy.max_failovers_per_turn;
+    let may_fail_over = policy.model_fallback
+        && progress.stream_can_retry
+        && progress.failovers_this_turn < policy.max_failovers_per_turn;
 
     // Each outcome shape decides only what is specific to it — whether the turn
     // is terminal, and whether its failure is retryable. The budget arithmetic
@@ -1202,7 +1415,8 @@ pub fn decide(
             let retryable = error_result_is_retryable(message, context_window);
             (
                 retryable,
-                retryable || classify_failover(error_text).is_some(),
+                policy.fallback_on.allows(error_text)
+                    && (retryable || classify_failover(error_text).is_some()),
             )
         }
         TurnOutcome::Failed(error) => {
@@ -1224,7 +1438,8 @@ pub fn decide(
             let retryable = call_error_is_retryable(error);
             (
                 retryable,
-                retryable || classify_failover(&error_text).is_some(),
+                policy.fallback_on.allows(&error_text)
+                    && (retryable || classify_failover(&error_text).is_some()),
             )
         }
     };
@@ -1261,6 +1476,8 @@ mod recovery_boundary_tests {
 
     fn policy() -> RetryPolicy {
         RetryPolicy {
+            model_fallback: true,
+            fallback_on: FallbackOn::Any,
             max_retries: 3,
             max_failovers_per_turn: 2,
             base_delay_ms: 0,
@@ -1424,21 +1641,21 @@ mod tests {
             vec!["google/gemini-3-pro".to_string()],
         );
         assert_eq!(
-            chain_for(&chains, "default", "anthropic", "claude-opus-4-7")
+            chain_for(&chains, "default", "anthropic", "claude-opus-4-7", &[])
                 .unwrap()
                 .entries,
             vec!["openai/gpt-5-mini".to_string()]
         );
         // Non-default role name that is not configured: falls to the exact model key.
         assert_eq!(
-            chain_for(&chains, "task", "anthropic", "claude-opus-4-7")
+            chain_for(&chains, "task", "anthropic", "claude-opus-4-7", &[])
                 .unwrap()
                 .entries,
             vec!["google/gemini-3-pro".to_string()]
         );
         // The "default" role key matches any model by design; an UNCONFIGURED
         // role + unconfigured exact model yields no chain.
-        assert!(chain_for(&chains, "task", "openai", "gpt-5.5").is_none());
+        assert!(chain_for(&chains, "task", "openai", "gpt-5.5", &[]).is_none());
     }
 
     #[test]
@@ -1448,7 +1665,7 @@ mod tests {
             vec!["openai/gpt-y".to_string()],
         )]);
         for provider in ["google", "gemini", "GOOGLE"] {
-            let resolved = chain_for(&chains, "task", provider, "gemini-z")
+            let resolved = chain_for(&chains, "task", provider, "gemini-z", &[])
                 .expect("configured aliases must resolve like model selection");
             assert_eq!(resolved.entries, vec!["openai/gpt-y".to_string()]);
         }
@@ -1472,13 +1689,13 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            chain_for(&chains, "task", "google", "gemini-z")
+            chain_for(&chains, "task", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["role/winner".to_string()]
         );
         assert_eq!(
-            chain_for(&chains, "unconfigured", "google", "gemini-z")
+            chain_for(&chains, "unconfigured", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["exact/winner".to_string()]
@@ -1496,7 +1713,7 @@ mod tests {
                 .map(|key| (key.to_string(), vec![key.to_string()]))
                 .collect();
             assert_eq!(
-                chain_for(&chains, "task", "google", "gemini-z")
+                chain_for(&chains, "task", "google", "gemini-z", &[])
                     .unwrap()
                     .entries,
                 vec!["GEMINI/GEMINI-Z".to_string()]
@@ -1515,11 +1732,101 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            chain_for(&chains, "task", "google", "gemini-z")
+            chain_for(&chains, "task", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["openai/gpt-y".to_string()]
         );
+    }
+
+    #[test]
+    fn chain_policies_belong_to_declared_providers_in_either_catalog_order() {
+        for (native_provider, declared_provider) in
+            [("openrouter", "open-router"), ("google", "gemini")]
+        {
+            let native = crate::models::ad_hoc_model_entry(native_provider, "vendor/shared")
+                .expect("native policy fixture");
+            let mut declared = native.clone();
+            declared.model.provider = declared_provider.to_string();
+            declared.model.base_url = "https://declared.example.test/v1".to_string();
+            // An unavailable declaration still owns its policy namespace.
+            declared.api_key = None;
+            for reverse in [false, true] {
+                let mut catalog = vec![native.clone(), declared.clone()];
+                if reverse {
+                    catalog.reverse();
+                }
+                for (current, other) in [
+                    (native_provider, declared_provider),
+                    (declared_provider, native_provider),
+                ] {
+                    let mut chains = HashMap::from([(
+                        format!("{other}/vendor/shared"),
+                        vec!["wrong/policy".to_string()],
+                    )]);
+                    assert!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog).is_none(),
+                        "{current} cannot borrow {other}'s policy (reverse={reverse})"
+                    );
+                    chains.insert(
+                        format!(" {} / VENDOR/SHARED ", current.to_ascii_uppercase()),
+                        vec!["own/policy".to_string()],
+                    );
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("own normalized policy")
+                            .entries,
+                        vec!["own/policy".to_string()]
+                    );
+                    chains.insert(
+                        format!("{current}/vendor/shared"),
+                        vec!["exact/policy".to_string()],
+                    );
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("exact policy takes precedence")
+                            .entries,
+                        vec!["exact/policy".to_string()]
+                    );
+                    chains.insert("task".to_string(), vec!["role/policy".to_string()]);
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("role policy takes precedence")
+                            .entries,
+                        vec!["role/policy".to_string()]
+                    );
+                }
+            }
+            // Declaring a different model still reserves the provider identity;
+            // removing an unavailable model from the pool cannot grant its policy.
+            declared.model.id = "vendor/other".to_string();
+            let chains = HashMap::from([(
+                format!("{native_provider}/vendor/shared"),
+                vec!["native/policy".to_string()],
+            )]);
+            assert!(
+                chain_for(
+                    &chains,
+                    "task",
+                    declared_provider,
+                    "vendor/shared",
+                    &[native.clone(), declared],
+                )
+                .is_none()
+            );
+            assert_eq!(
+                chain_for(
+                    &chains,
+                    "task",
+                    declared_provider,
+                    "vendor/shared",
+                    &[native],
+                )
+                .expect("an undeclared native alias retains its policy")
+                .entries,
+                vec!["native/policy".to_string()]
+            );
+        }
     }
 
     #[test]
@@ -1878,9 +2185,9 @@ mod tests {
             "google/gemini-z",
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
-        assert_eq!(walk.next_spec(), Some((3, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 4);
     }
 
@@ -1893,10 +2200,10 @@ mod tests {
             "google/gemini-next",
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((0, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
-        assert_eq!(walk.next_spec(), Some((3, "google/gemini-next")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((0, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "google/gemini-next")));
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 4);
     }
 
@@ -1909,9 +2216,9 @@ mod tests {
             "anthropic/claude-x",
         ]);
         let mut walk = FailoverWalk::new(&chain, 2, "openai", "gpt-y");
-        assert_eq!(walk.next_spec(), Some((3, "anthropic/claude-x")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "anthropic/claude-x")));
         assert_eq!(walk.position(), 4);
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), None);
     }
 
     #[test]
@@ -1925,9 +2232,9 @@ mod tests {
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "openai", "gpt-y");
         for (index, spec) in chain.entries[..4].iter().enumerate() {
-            assert_eq!(walk.next_spec(), Some((index, spec.as_str())));
+            assert_eq!(walk.next_spec(&[]), Some((index, spec.as_str())));
         }
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 5);
     }
 
@@ -1937,7 +2244,7 @@ mod tests {
         // off by one, and that index is what reaches the failover event.
         let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        let (index, spec) = walk.next_spec().expect("first candidate");
+        let (index, spec) = walk.next_spec(&[]).expect("first candidate");
         assert_eq!((index, spec), (0, "openai/gpt-y"));
         assert_eq!(
             walk.position(),
@@ -1952,8 +2259,8 @@ mod tests {
         // one must still reach entry two on the next turn.
         let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
         let mut walk = FailoverWalk::new(&chain, 1, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((1, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((1, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), None);
     }
 
     #[test]
@@ -1962,9 +2269,9 @@ mod tests {
         // caller; the walk only decides what is worth looking at.
         let chain = chain(&["not-a-spec", "openai/gpt-y"]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((0, "not-a-spec")));
+        assert_eq!(walk.next_spec(&[]), Some((0, "not-a-spec")));
         assert!(resolve_chain_spec("not-a-spec", &[]).is_none());
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
     }
 
     #[test]
@@ -1976,6 +2283,39 @@ mod tests {
             "openai"
         ));
         assert!(entry.model.id.eq_ignore_ascii_case("gpt-y"));
+    }
+
+    #[test]
+    fn chain_resolution_keeps_declared_provider_routes_in_either_catalog_order() {
+        let mut native = crate::models::ad_hoc_model_entry("openrouter", "vendor/shared")
+            .expect("native model fixture");
+        native.api_key = Some("native-fixture-key".to_string());
+        let mut custom = native.clone();
+        custom.model.provider = "open-router".to_string();
+        custom.model.base_url = "https://declared.example.test/v1".to_string();
+        custom.api_key = Some("declared-fixture-key".to_string());
+        custom
+            .headers
+            .insert("x-route".to_string(), "declared".to_string());
+        let mut unlisted = native.clone();
+        unlisted.model.id = "vendor/unlisted".to_string();
+        for reverse in [false, true] {
+            let mut catalog = vec![native.clone(), unlisted.clone(), custom.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            let entry = resolve_chain_spec("open-router/vendor/shared", &catalog)
+                .expect("declared failover destination");
+            assert_eq!(entry.model.provider, "open-router");
+            assert_eq!(entry.model.id, "vendor/shared");
+            assert_eq!(entry.model.base_url, custom.model.base_url);
+            assert_eq!(entry.api_key, custom.api_key);
+            assert_eq!(entry.headers, custom.headers);
+            assert!(resolve_chain_spec("open-router/vendor/unlisted", &catalog).is_none());
+        }
+        let alias = resolve_chain_spec("open-router/vendor/shared", &[native])
+            .expect("undeclared alias remains supported");
+        assert_eq!(alias.model.provider, "openrouter");
     }
 
     // -- shared retry policy (bd-u2qv4) ------------------------------------
@@ -2074,6 +2414,8 @@ mod tests {
 
     fn policy() -> RetryPolicy {
         RetryPolicy {
+            model_fallback: true,
+            fallback_on: FallbackOn::Any,
             max_retries: 2,
             max_failovers_per_turn: 1,
             base_delay_ms: 500,
@@ -2094,6 +2436,8 @@ mod tests {
         let settings = |enabled: bool| crate::config::Config {
             retry: Some(crate::config::RetrySettings {
                 enabled: Some(enabled),
+                model_fallback: Some(false),
+                fallback_on: Some(FallbackOn::UsageLimit),
                 max_retries: Some(4),
                 base_delay_ms: Some(250),
                 max_delay_ms: Some(9_000),
@@ -2108,6 +2452,8 @@ mod tests {
         assert_eq!(policy.base_delay_ms, 250);
         assert_eq!(policy.max_delay_ms, 9_000);
         assert_eq!(policy.max_failovers_per_turn, 2);
+        assert!(!policy.model_fallback);
+        assert_eq!(policy.fallback_on, FallbackOn::UsageLimit);
 
         // "off" must mean off. A surface that substituted a default here would
         // re-enter the provider on behalf of a user who said not to.
@@ -2127,6 +2473,169 @@ mod tests {
             ),
             TurnDecision::Finish { success: true }
         );
+    }
+
+    #[test]
+    fn fallback_filters_distinguish_account_exhaustion_from_transient_throttles() {
+        let cases = [
+            ("HTTP 429: insufficient_quota", true),
+            ("HTTP 400: usage_limit_reached", true),
+            ("HTTP 400: quota exhausted", true),
+            ("HTTP 402: credit balance is too low", true),
+            ("HTTP 402", true),
+            ("usage_limit_reached: your weekly limit is exhausted", true),
+            ("HTTP 429: quota will reset tomorrow", true),
+            ("HTTP 429", true),
+            ("HTTP 429: rate limit exceeded", false),
+            ("HTTP 429: requests per minute quota exceeded", false),
+            ("HTTP 429: tpm exhausted (quota_exceeded)", false),
+            ("HTTP 429: concurrent requests quota exceeded", false),
+            ("HTTP 503: service unavailable", false),
+            ("connection reset by peer", false),
+        ];
+        for (text, usage_limit) in cases {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            for (filter, allowed) in [
+                (FallbackOn::Any, true),
+                (FallbackOn::UsageLimit, usage_limit),
+                (FallbackOn::ExceptUsageLimit, !usage_limit),
+            ] {
+                let policy = RetryPolicy {
+                    fallback_on: filter,
+                    ..policy()
+                };
+                for outcome in [
+                    TurnOutcome::Completed(&message),
+                    TurnOutcome::Failed(&error),
+                ] {
+                    assert_eq!(
+                        decide(outcome, &progress(2, 0), &policy, None),
+                        if allowed {
+                            TurnDecision::FailOver
+                        } else {
+                            TurnDecision::Finish { success: false }
+                        },
+                        "{filter:?}: {text}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usage_limit_labels_cannot_override_invalid_request_responses() {
+        for text in [
+            "HTTP 400: invalid request parameter usage_limit",
+            "HTTP 400: invalid daily limit parameter",
+            "HTTP 404: model usage_limit does not exist",
+            "HTTP 422: unsupported subscription limit argument",
+        ] {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            assert_eq!(classify_failover(text), None, "{text}");
+            for filter in [
+                FallbackOn::Any,
+                FallbackOn::UsageLimit,
+                FallbackOn::ExceptUsageLimit,
+            ] {
+                let policy = RetryPolicy {
+                    fallback_on: filter,
+                    ..policy()
+                };
+                for state in [progress(0, 0), progress(2, 0)] {
+                    for outcome in [
+                        TurnOutcome::Completed(&message),
+                        TurnOutcome::Failed(&error),
+                    ] {
+                        assert_eq!(
+                            decide(outcome, &state, &policy, None),
+                            TurnDecision::Finish { success: false },
+                            "{filter:?}: {text}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disabling_model_fallback_preserves_same_provider_retries() {
+        let message = errored_message(Some("503 service unavailable"), 0);
+        let disabled = RetryPolicy {
+            model_fallback: false,
+            ..policy()
+        };
+        assert!(matches!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(0, 0),
+                &disabled,
+                None
+            ),
+            TurnDecision::Retry { attempt: 1, .. }
+        ));
+        assert_eq!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(2, 0),
+                &disabled,
+                None
+            ),
+            TurnDecision::Finish { success: false }
+        );
+        let filtered = RetryPolicy {
+            fallback_on: FallbackOn::UsageLimit,
+            ..policy()
+        };
+        assert!(matches!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(0, 0),
+                &filtered,
+                None
+            ),
+            TurnDecision::Retry { attempt: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn no_fallback_filter_can_admit_authentication_context_or_durability_failures() {
+        for filter in [
+            FallbackOn::Any,
+            FallbackOn::UsageLimit,
+            FallbackOn::ExceptUsageLimit,
+        ] {
+            let policy = RetryPolicy {
+                fallback_on: filter,
+                ..policy()
+            };
+            let persistence = format!(
+                "{}quota exceeded",
+                crate::error::Error::SESSION_PERSISTENCE_PREFIX
+            );
+            for text in [
+                "HTTP 401: insufficient_quota",
+                "HTTP 403: quota exceeded",
+                "context window exceeded",
+                persistence.as_str(),
+            ] {
+                let message = errored_message(Some(text), 0);
+                let error = crate::error::Error::api(text);
+                for outcome in [
+                    TurnOutcome::Completed(&message),
+                    TurnOutcome::Failed(&error),
+                ] {
+                    assert!(
+                        !matches!(
+                            decide(outcome, &progress(2, 0), &policy, None),
+                            TurnDecision::FailOver
+                        ),
+                        "{filter:?}: {text}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2541,6 +3050,43 @@ mod tests {
     }
 
     #[test]
+    fn context_compaction_requires_provider_overflow_and_preserves_terminal_refusals() {
+        use crate::error::Error;
+
+        let overflow = Error::api("context_length_exceeded: prompt is too long");
+        assert!(needs_context_compaction(
+            TurnOutcome::Failed(&overflow),
+            None
+        ));
+        for error in [
+            Error::session("context_length_exceeded"),
+            Error::Auth("context_length_exceeded".to_string()),
+            Error::api("HTTP 401 unauthorized: context_length_exceeded"),
+            Error::api("HTTP 413: context_length_exceeded"),
+            Error::api(Error::session_persistence("context_length_exceeded").to_string()),
+        ] {
+            assert!(
+                !needs_context_compaction(TurnOutcome::Failed(&error), Some(8_192)),
+                "{error}",
+            );
+        }
+        let silent = errored_message(Some("500 internal server error"), 8_193);
+        assert!(needs_context_compaction(
+            TurnOutcome::Completed(&silent),
+            Some(8_192),
+        ));
+        assert!(!needs_context_compaction(
+            TurnOutcome::Completed(&silent),
+            None
+        ));
+        let payload = errored_message(Some("HTTP 413: payload rejected"), 8_193);
+        assert!(needs_context_compaction(
+            TurnOutcome::Completed(&payload),
+            Some(8_192),
+        ));
+    }
+
+    #[test]
     fn call_errors_classify_from_the_typed_error_before_its_prose() {
         let persistence = crate::error::Error::session_persistence("write failed");
         assert!(!call_error_is_retryable(&persistence));
@@ -2785,7 +3331,13 @@ mod tests {
             "HTTP 400: credit balance is too low",
             "HTTP 402: not enough credits",
             "HTTP 400: insufficient_quota",
+            "HTTP 400: usage_limit_reached",
+            "HTTP 400: quota exhausted",
+            "HTTP 400: quota_exhausted",
+            "HTTP 400: quota will reset tomorrow",
+            "HTTP 400: exhausted your capacity",
             "HTTP 402: billing_not_active",
+            "HTTP 402",
         ] {
             assert_eq!(classify_failover(text), Some(FailoverClass::Quota));
             let message = errored_message(Some(text), 0);

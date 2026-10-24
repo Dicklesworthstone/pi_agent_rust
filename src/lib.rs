@@ -18,6 +18,10 @@
 //! - [`sdk`] module
 
 #![forbid(unsafe_code)]
+// The pinned nightly exposes safe, lifetime-bound Windows process attributes.
+// Assigning a Job during creation keeps even the child's first descendants
+// inside its cancellation boundary, including when Pi is used as a library.
+#![cfg_attr(windows, feature(windows_process_extensions_raw_attribute))]
 // Raised from the default 128 because the RPC command dispatcher's nested
 // async blocks exceed it while the compiler proves `Send` for the spawned
 // future (src/rpc.rs:2057, `run_extension_command` inside
@@ -93,6 +97,7 @@ pub mod agent_hub;
 #[doc(hidden)]
 pub mod app;
 pub mod approval;
+pub(crate) mod archive_read;
 #[doc(hidden)]
 pub(crate) mod artifact_output;
 pub mod ask;
@@ -146,6 +151,7 @@ pub mod delight;
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
+pub(crate) mod document_read;
 #[doc(hidden)]
 pub(crate) mod embedded_assets;
 #[doc(hidden)]
@@ -194,6 +200,7 @@ pub mod gallery;
 pub mod gc;
 #[doc(hidden)]
 pub mod github;
+pub mod goal;
 pub mod handoff;
 #[doc(hidden)]
 pub mod hostcall_amac;
@@ -224,6 +231,7 @@ pub mod interactive;
 pub mod interactive_ftui;
 #[doc(hidden)]
 pub mod jobs;
+pub mod judgment;
 #[doc(hidden)]
 pub mod keybindings;
 #[doc(hidden)]
@@ -264,6 +272,7 @@ pub mod plan;
 pub mod platform;
 #[doc(hidden)]
 pub mod pmu_telemetry;
+pub mod prewalk;
 pub mod profiler;
 #[doc(hidden)]
 pub mod provider;
@@ -302,11 +311,15 @@ pub mod session_metrics;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod session_picker;
+pub mod session_recovery;
 #[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
 pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
+#[cfg(feature = "tui")]
+#[doc(hidden)]
+pub mod session_title;
 #[doc(hidden)]
 pub mod session_workdir;
 #[doc(hidden)]

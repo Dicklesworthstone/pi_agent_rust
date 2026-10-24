@@ -93,6 +93,16 @@ fn test_handoff_generator_end_to_end_extraction() {
                             }),
                             thought_signature: None,
                         }),
+                        ContentBlock::ToolCall(ToolCall {
+                            id: "tc-edit-2".to_string(),
+                            name: "edit".to_string(),
+                            arguments: serde_json::json!({
+                                "path": "src/headers.rs",
+                                "StartLine": 10,
+                                "EndLine": 20
+                            }),
+                            thought_signature: None,
+                        }),
                     ],
                     provider: "anthropic".to_string(),
                     model: "claude-3-5-sonnet".to_string(),
@@ -100,13 +110,29 @@ fn test_handoff_generator_end_to_end_extraction() {
                 },
             },
         }),
+        // A file is reported as modified only when its edit has a matching
+        // successful result; the failed edit of the other file stays an attempt.
         SessionEntry::Message(MessageEntry {
             base: EntryBase::new(Some("msg-2".to_string()), "msg-3".to_string()),
             message: SessionMessage::ToolResult {
                 tool_call_id: "tc-edit-1".to_string(),
                 tool_name: "edit".to_string(),
                 content: vec![ContentBlock::Text(TextContent {
-                    text: "Error: target content not found in src/auth.rs".to_string(),
+                    text: "Successfully replaced text in src/auth.rs".to_string(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: None,
+            },
+        }),
+        SessionEntry::Message(MessageEntry {
+            base: EntryBase::new(Some("msg-3".to_string()), "msg-4".to_string()),
+            message: SessionMessage::ToolResult {
+                tool_call_id: "tc-edit-2".to_string(),
+                tool_name: "edit".to_string(),
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "Error: target content not found in src/headers.rs".to_string(),
                     text_signature: None,
                 })],
                 details: None,
@@ -115,7 +141,7 @@ fn test_handoff_generator_end_to_end_extraction() {
             },
         }),
         SessionEntry::Message(MessageEntry {
-            base: EntryBase::new(Some("msg-3".to_string()), "msg-4".to_string()),
+            base: EntryBase::new(Some("msg-4".to_string()), "msg-5".to_string()),
             message: SessionMessage::BashExecution {
                 command: "cargo test auth::tests".to_string(),
                 output: "test auth::tests::test_header_format ... FAILED\nassertion failed: `(left == right)`".to_string(),
@@ -173,6 +199,19 @@ fn test_handoff_generator_end_to_end_extraction() {
     };
     assert_eq!(file.role, "modified");
     assert!(file.line_refs.contains(&"L50-L75".to_string()));
+
+    // A failed edit is an attempt, never a completed modification
+    let Some(failed_file) = handoff
+        .files_touched
+        .iter()
+        .find(|f| f.path == "src/headers.rs")
+    else {
+        panic!("src/headers.rs should exist");
+    };
+    assert_eq!(
+        failed_file.role,
+        "edit attempted (tool reported failure; effects may be partial)"
+    );
 
     // Verify failed approaches
     assert_eq!(handoff.failed_approaches.len(), 2);

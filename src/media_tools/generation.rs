@@ -3,7 +3,7 @@
 use super::{artifact, transport};
 use crate::error::{Error, Result};
 use crate::http::client::Client;
-use crate::model::{ContentBlock, TextContent};
+use crate::model::{ContentBlock, ImageContent, TextContent};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -15,6 +15,9 @@ mod inputs;
 const NAME: &str = "generate_image";
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+// Returning pixels is opt-in: keep persisted tool results and the next model
+// request bounded without changing or recompressing the full-resolution file.
+const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
 const COMMON_RATIOS: &[&str] = &["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9"];
 
 pub struct GenerateImageTool {
@@ -88,7 +91,7 @@ impl Tool for GenerateImageTool {
         "Generate Image"
     }
     fn description(&self) -> &str {
-        "Generate or edit an image through OpenAI, Gemini or xAI and save the actual provider bytes. Supply image_path or ordered image_paths for editing; OpenAI GPT image models also support mask_path. Existing files are never overwritten."
+        "Generate or edit an image through OpenAI, Gemini or xAI and save the actual provider bytes. Supply image_path or ordered image_paths for editing; OpenAI GPT image models also support mask_path. Existing files are never overwritten. Set include_image to true to return a bounded native image block for visual review and follow-up edits."
     }
 
     fn parameters(&self) -> Value {
@@ -107,6 +110,7 @@ impl Tool for GenerateImageTool {
                 "mask_path": {"type": "string", "description": "OpenAI editing only: local PNG alpha mask for the first input image. Provider validates mask dimensions and alpha semantics."},
                 "input_fidelity": {"type": "string", "enum": ["low", "high"], "description": "OpenAI editing only: fidelity to the source images"},
                 "output_path": {"type": "string", "description": "New destination file. Omit to choose an extension matching the received image."},
+                "include_image": {"type": "boolean", "default": false, "description": "Return the saved image as a native image block for visual review (up to 4 MiB). Larger images remain saved and return an explicit preview-omission notice. Does not resize or alter the saved image."},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300_000, "default": 180_000}
             }
         })
@@ -125,6 +129,8 @@ impl Tool for GenerateImageTool {
         args: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        // Host-only controls must be validated before any paid provider work.
+        let include_image = preview_requested(&args)?;
         let prompt = transport::required(&args, NAME, "prompt")?;
         let requested = transport::optional(&args, NAME, "output_path")?;
         let env_provider = std::env::var("PI_IMAGE_GEN_PROVIDER").ok();
@@ -224,19 +230,65 @@ impl Tool for GenerateImageTool {
                 bytes.len()
             )
         };
+        let (content, preview_status) = image_output(message, &bytes, mime, include_image);
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(message))],
+            content,
             details: Some(json!({
                 "saved_path": path.display().to_string(), "provider": provider, "model": model,
                 "mime_type": mime, "size_bytes": bytes.len(), "mock": is_mock,
                 "size": payload.get("size"),
                 "aspect_ratio": transport::optional(&args, NAME, "aspect_ratio")?,
                 "edited": reference_count > 0,
-                "reference_count": reference_count
+                "reference_count": reference_count,
+                "preview": {
+                    "requested": include_image,
+                    "included": preview_status == "included",
+                    "status": preview_status,
+                    "max_bytes": MAX_PREVIEW_BYTES
+                }
             })),
             is_error: false,
         })
     }
+}
+
+/// Keep this host-only option out of every provider request body. A malformed
+/// option must not generate (and bill for) an image before returning an error.
+fn preview_requested(args: &Value) -> Result<bool> {
+    match args.get("include_image") {
+        None => Ok(false),
+        Some(Value::Bool(include)) => Ok(*include),
+        Some(_) => Err(Error::tool(NAME, "include_image must be a boolean")),
+    }
+}
+
+/// Called only after validation and successful publication. The preview is
+/// the exact saved payload, not another provider call, a URL fetch, or a lossy
+/// transform. Omission never turns a successfully saved artifact into failure.
+fn image_output(
+    mut message: String,
+    bytes: &[u8],
+    mime: &str,
+    include_image: bool,
+) -> (Vec<ContentBlock>, &'static str) {
+    let status = if !include_image {
+        "not_requested"
+    } else if bytes.len() > MAX_PREVIEW_BYTES {
+        message.push_str(
+            "\nInline preview omitted: the image exceeds 4 MiB. The complete image is saved at the path above.",
+        );
+        "omitted_size_limit"
+    } else {
+        "included"
+    };
+    let mut content = vec![ContentBlock::Text(TextContent::new(message))];
+    if status == "included" {
+        content.push(ContentBlock::Image(ImageContent {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type: mime.to_string(),
+        }));
+    }
+    (content, status)
 }
 
 // Keep provider-specific validation beside the corresponding image request payload.
@@ -517,7 +569,7 @@ mod tests {
             let output = runtime
                 .block_on(tool.execute(
                     "generate",
-                    json!({"prompt":"Draw a red square","output_path":"out.png"}),
+                    json!({"prompt":"Draw a red square","output_path":"out.png","include_image":true}),
                     None,
                 ))
                 .unwrap();
@@ -529,7 +581,17 @@ mod tests {
             );
             assert_eq!(output.details.as_ref().unwrap()["mock"], false);
             assert_eq!(output.details.as_ref().unwrap()["model"], model);
+            assert_eq!(
+                output.details.as_ref().unwrap()["preview"]["included"],
+                true
+            );
+            let ContentBlock::Image(image) = &output.content[1] else {
+                panic!("visual review must receive a native image, not base64 text");
+            };
+            assert_eq!(image.data, RED_PNG);
+            assert_eq!(image.mime_type, "image/png");
             let request = worker.join().unwrap();
+            assert!(request.body.get("include_image").is_none());
             if provider == "gemini" {
                 assert!(
                     request
@@ -588,12 +650,16 @@ mod tests {
         let output = runtime
             .block_on(tool.execute(
                 "edit",
-                json!({"prompt":"Make it red","image_path":"source.png"}),
+                json!({"prompt":"Make it red","image_path":"source.png","include_image":true}),
                 None,
             ))
             .unwrap();
         assert_eq!(output.details.as_ref().unwrap()["edited"], true);
         assert_eq!(output.details.as_ref().unwrap()["reference_count"], 1);
+        let ContentBlock::Image(image) = &output.content[1] else {
+            panic!("an edit must return its result, not just the source path");
+        };
+        assert_eq!(image.data, RED_PNG);
         let request = worker.join().unwrap();
         let sent = request
             .body
@@ -711,5 +777,112 @@ mod tests {
                 .unwrap(),
             "IMAGE_SIZE_TWO_K"
         );
+    }
+
+    #[test]
+    fn preview_option_is_strict_and_preserves_text_only_defaults() {
+        assert!(!preview_requested(&json!({})).unwrap());
+        assert!(!preview_requested(&json!({"include_image":false})).unwrap());
+        assert!(preview_requested(&json!({"include_image":true})).unwrap());
+        for value in [json!(null), json!(0), json!("true"), json!([]), json!({})] {
+            assert!(preview_requested(&json!({"include_image":value})).is_err());
+        }
+    }
+
+    #[test]
+    fn preview_limit_never_discards_or_reencodes_the_saved_image() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(RED_PNG)
+            .unwrap();
+        let (content, status) = image_output("saved".into(), &bytes, "image/png", false);
+        assert_eq!(status, "not_requested");
+        assert_eq!(content.len(), 1);
+
+        let oversized = vec![0; MAX_PREVIEW_BYTES + 1];
+        let (content, status) = image_output("saved".into(), &oversized, "image/png", true);
+        assert_eq!(status, "omitted_size_limit");
+        assert_eq!(content.len(), 1);
+        let ContentBlock::Text(text) = &content[0] else {
+            panic!("the artifact location must survive preview omission");
+        };
+        assert!(text.text.starts_with("saved"));
+        assert!(text.text.contains("exceeds 4 MiB"));
+
+        let boundary = &oversized[..MAX_PREVIEW_BYTES];
+        let (content, status) = image_output("saved".into(), boundary, "image/png", true);
+        assert_eq!(status, "included");
+        let ContentBlock::Image(image) = &content[1] else {
+            panic!("the inclusive byte boundary must admit the preview");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .unwrap(),
+            boundary
+        );
+    }
+
+    #[test]
+    fn preview_mock_and_opt_out_keep_artifact_and_result_in_sync() {
+        for include in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let tool = GenerateImageTool::with_defaults(
+                dir.path(),
+                Some("openai".into()),
+                Some("gpt-image-1.5".into()),
+            )
+            .with_mock(true);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let output = runtime
+                .block_on(tool.execute(
+                    "preview",
+                    json!({"prompt":"test","output_path":"out.png","include_image":include}),
+                    None,
+                ))
+                .unwrap();
+            let details = output.details.as_ref().unwrap();
+            assert_eq!(details["mock"], true);
+            assert_eq!(details["preview"]["included"], include);
+            assert_eq!(output.content.len(), if include { 2 } else { 1 });
+            let bytes = std::fs::read(dir.path().join("out.png")).unwrap();
+            assert_eq!(bytes, super::super::MIN_VALID_PNG);
+            if let Some(ContentBlock::Image(image)) = output.content.get(1) {
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&image.data)
+                        .unwrap(),
+                    bytes
+                );
+            }
+            let ContentBlock::Text(text) = &output.content[0] else {
+                panic!("the existing artifact message must stay first");
+            };
+            assert!(text.text.contains("mock; no provider request"));
+        }
+    }
+
+    #[test]
+    fn invalid_preview_option_fails_before_creating_an_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = GenerateImageTool::new(dir.path()).with_mock(true);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(tool.execute(
+                "invalid-preview",
+                json!({"prompt":"test","output_path":"out.png","include_image":"true"}),
+                None,
+            ))
+            .err()
+            .expect("invalid controls must not be silently ignored");
+        assert!(
+            error
+                .to_string()
+                .contains("include_image must be a boolean")
+        );
+        assert!(!dir.path().join("out.png").exists());
     }
 }

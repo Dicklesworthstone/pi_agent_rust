@@ -114,6 +114,26 @@ impl WorkspaceHandle {
         )
     }
 
+    /// Publish an already validated canonical root set without resolving paths
+    /// again after persistence. A host may hold another mutable clone, so an
+    /// SDK transaction must not overwrite root changes made while it saved.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(crate) fn replace_additional_roots_if_unchanged(
+        &mut self,
+        expected: &[PathBuf],
+        roots: Vec<PathBuf>,
+    ) -> bool {
+        let mut guard = self
+            .additional
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.as_slice() != expected {
+            return false;
+        }
+        *guard = roots;
+        true
+    }
+
     /// Whether `path` sits under any configured root. An identity handle
     /// (no primary, no additional roots — the `Default`) allows everything:
     /// legacy behavior for unwired tools and tests.

@@ -3980,6 +3980,7 @@ impl ExtensionManager {
     /// merging into the `ModelRegistry`.
     #[allow(clippy::too_many_lines)]
     pub fn extension_model_entries(&self) -> Vec<crate::models::ModelEntry> {
+        use crate::models::{CompatConfig, merge_compat};
         use crate::provider::{InputType, Model, ModelCost};
         use std::collections::HashMap;
 
@@ -4011,6 +4012,24 @@ impl ExtensionManager {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let parse_compat = |spec: &Value| {
+                spec.get("compat")
+                    .filter(|value| !value.is_null())
+                    .and_then(
+                        |value| match serde_json::from_value::<CompatConfig>(value.clone()) {
+                            Ok(compat) => Some(compat),
+                            Err(error) => {
+                                tracing::warn!(
+                                    provider = %provider_id,
+                                    %error,
+                                    "Invalid extension provider compatibility settings"
+                                );
+                                None
+                            }
+                        },
+                    )
+            };
+            let provider_compat = parse_compat(provider_spec);
 
             // Resolve API key (supports env var names).
             let resolved_key = if api_key_ref.is_empty() {
@@ -4090,6 +4109,27 @@ impl ExtensionManager {
                     .get("reasoning")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let model_compat = parse_compat(model_spec);
+                let mut compat = merge_compat(provider_compat.as_ref(), model_compat.as_ref());
+                if let Some(map) = model_spec
+                    .get("thinkingLevelMap")
+                    .or_else(|| model_spec.get("thinking_level_map"))
+                    .filter(|value| !value.is_null())
+                {
+                    match serde_json::from_value::<HashMap<String, Option<String>>>(map.clone()) {
+                        Ok(map) => {
+                            compat
+                                .get_or_insert_with(CompatConfig::default)
+                                .thinking_level_map = Some(map);
+                        }
+                        Err(error) => tracing::warn!(
+                            provider = %provider_id,
+                            model = %model_id,
+                            %error,
+                            "Invalid extension model thinkingLevelMap"
+                        ),
+                    }
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 let context_window = model_spec
                     .get("contextWindow")
@@ -4176,7 +4216,7 @@ impl ExtensionManager {
                     api_key: resolved_key.clone(),
                     headers: model_headers,
                     auth_header: true,
-                    compat: None,
+                    compat,
                     oauth_config: oauth_config.clone(),
                 });
             }

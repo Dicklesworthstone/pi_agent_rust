@@ -11,16 +11,34 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::{
-    ACP_STOP_REASON_CANCELLED, ACP_STOP_REASON_END_TURN, ACP_STOP_REASON_ERROR,
-    AcpSessionsMap, AbortSignal, AgentCx, AgentSession, history, json_rpc_notification,
+    ACP_STOP_REASON_CANCELLED, ACP_STOP_REASON_END_TURN, ACP_STOP_REASON_ERROR, AbortSignal,
+    AcpOutput, AcpSessionsMap, AgentCx, AgentSession, history, json_rpc_notification,
 };
 use crate::mcp::{ConfiguredServer, McpDiscovery, McpManager, ServerInfo};
+
+/// Enforce host isolation before inspecting definitions or constructing state.
+pub(super) fn parse_servers(
+    params: &Value,
+    cwd: &Path,
+    disabled: bool,
+) -> Result<Option<Vec<ConfiguredServer>>, String> {
+    if disabled {
+        return match params.get("mcpServers") {
+            None => Ok(None),
+            Some(Value::Array(servers)) if servers.is_empty() => Ok(Some(Vec::new())),
+            _ => Err(
+                "PI_MCP_DISABLED: this host was launched with --no-mcp; omit mcpServers or supply an empty list"
+                    .to_string(),
+            ),
+        };
+    }
+    crate::mcp::config::parse_acp_servers(params, cwd)
+}
 
 // Refresh before the native manager's five-minute tool-cache TTL expires.
 // Failed setup is eligible sooner, but the native restart budget still owns
@@ -35,30 +53,41 @@ struct CatalogRefresh {
 }
 
 fn acknowledged_servers(rows: &[ServerInfo]) -> Vec<String> {
-    let mut names: Vec<_> = rows.iter()
+    let mut names: Vec<_> = rows
+        .iter()
         .filter(|row| row.trust == "acknowledged")
-        .map(|row| row.name.clone()).collect();
+        .map(|row| row.name.clone())
+        .collect();
     names.sort();
     names
 }
 
 impl CatalogRefresh {
     fn due(&self, rows: &[ServerInfo], now: Instant) -> bool {
-        let Some(completed_at) = self.completed_at else { return true };
+        let Some(completed_at) = self.completed_at else {
+            return true;
+        };
         if acknowledged_servers(rows) != self.acknowledged {
             return true;
         }
-        let trusted: Vec<_> = rows.iter()
-            .filter(|row| row.trust == "acknowledged").collect();
-        let retryable = trusted.iter().any(|row|
-            row.health == "not started" || row.health.starts_with("unhealthy"));
+        let trusted: Vec<_> = rows
+            .iter()
+            .filter(|row| row.trust == "acknowledged")
+            .collect();
+        let retryable = trusted
+            .iter()
+            .any(|row| row.health == "not started" || row.health.starts_with("unhealthy"));
         let ready = trusted.iter().any(|row| row.health.starts_with("ready"));
         if !retryable && !ready {
             // Pending/denied servers must not be contacted. A terminally
             // failed server requires the explicit native /mcp test remedy.
             return false;
         }
-        let interval = if retryable { CATALOG_RETRY_INTERVAL } else { CATALOG_REFRESH_INTERVAL };
+        let interval = if retryable {
+            CATALOG_RETRY_INTERVAL
+        } else {
+            CATALOG_REFRESH_INTERVAL
+        };
         now.saturating_duration_since(completed_at) >= interval
     }
 
@@ -81,8 +110,10 @@ pub(super) struct SessionMcp {
 }
 
 fn signatures(servers: &[ConfiguredServer], cwd: &Path) -> Vec<(String, String)> {
-    let mut signatures: Vec<_> = servers.iter()
-        .map(|server| (server.name.clone(), server.fingerprint(cwd))).collect();
+    let mut signatures: Vec<_> = servers
+        .iter()
+        .map(|server| (server.name.clone(), server.fingerprint(cwd)))
+        .collect();
     signatures.sort();
     signatures
 }
@@ -108,10 +139,14 @@ pub(super) fn prepare(
         (server.name.clone(), description)
     }).collect();
     Some(Arc::new(SessionMcp {
-        manager: Arc::new(McpManager::new(cwd, global_dir, McpDiscovery {
-            servers,
-            warnings: Vec::new(),
-        })),
+        manager: Arc::new(McpManager::new(
+            cwd,
+            global_dir,
+            McpDiscovery {
+                servers,
+                warnings: Vec::new(),
+            },
+        )),
         signatures,
         descriptions,
         started: AtomicBool::new(false),
@@ -120,8 +155,11 @@ pub(super) fn prepare(
     }))
 }
 
+// Exclusive access is part of the call contract; callers live in sibling modules.
+#[allow(clippy::needless_pass_by_ref_mut)]
 pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     let shared = agent.agent.shared_tools();
+    shared.bind_mcp_manager(&state.manager);
     let current = shared.snapshot();
     let host = state.host_registry.get_or_init(|| current.clone_shallow());
     let mut next = host.clone_shallow();
@@ -137,11 +175,13 @@ pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     }
 
     // The native manager exposes only complete, fresh, healthy, trusted
-    // catalogs. Replacing the overlay withdraws removed tools and resource/
-    // prompt context wrappers as well as adding or revising current tools.
+    // catalogs; context wrappers are gated on that same admitted catalog
+    // (they are otherwise trust-derived). Replacing the overlay withdraws
+    // removed tools and the resource/prompt context wrappers of unavailable
+    // or denied servers, as well as adding or revising current tools.
     // Do not filter by name prefix: a host tool is not owned by this manager
     // merely because it has an MCP-looking name.
-    next.extend(crate::mcp::mount_tools(&state.manager));
+    next.extend(crate::mcp::mount_admitted_tools(&state.manager));
     shared.update(|registry| *registry = next);
     // SharedToolRegistry's version invalidates the provider schema cache.
     // Old snapshots held by an in-flight caller still use native per-call
@@ -157,7 +197,9 @@ pub(super) fn check_reattach(
     supplied: Option<&[ConfiguredServer]>,
     cwd: &Path,
 ) -> Result<(), String> {
-    let Some(supplied) = supplied else { return Ok(()) };
+    let Some(supplied) = supplied else {
+        return Ok(());
+    };
     let actual = signatures(supplied, cwd);
     let previous = current.map_or(&[][..], |state| state.signatures.as_slice());
     if previous != actual.as_slice() {
@@ -167,17 +209,20 @@ pub(super) fn check_reattach(
 }
 
 pub(super) fn commands_notification(id: &str) -> String {
-    json_rpc_notification("session/update", json!({
-        "sessionId": id,
-        "update": {
-            "sessionUpdate": "available_commands_update",
-            "availableCommands": [{
-                "name": "mcp",
-                "description": "Inspect, refresh, trust, deny, or test this session's MCP servers",
-                "input": { "hint": "list | refresh | inspect NAME | trust NAME | deny NAME | test NAME" },
-            }],
-        },
-    }))
+    json_rpc_notification(
+        "session/update",
+        json!({
+            "sessionId": id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [{
+                    "name": "mcp",
+                    "description": "Inspect, refresh, trust, authenticate, or test this session's MCP servers",
+                    "input": { "hint": "list | refresh | inspect NAME | trust NAME | deny NAME | test NAME | reauth NAME | unauth NAME" },
+                }],
+            },
+        }),
+    )
 }
 
 fn status(state: &SessionMcp) -> String {
@@ -189,6 +234,8 @@ fn status(state: &SessionMcp) -> String {
         // targets. Expose a bounded health category, not raw diagnostics.
         let health = if row.health.starts_with("ready") {
             "ready"
+        } else if row.health.starts_with("authentication required") {
+            "authentication required; use /mcp reauth NAME"
         } else if row.health.starts_with("unhealthy") {
             "unhealthy; use /mcp test after checking the server"
         } else if row.health.starts_with("failed") {
@@ -196,16 +243,22 @@ fn status(state: &SessionMcp) -> String {
         } else {
             "not started"
         };
-        lines.push(format!("{}: {}, {}, {} tools", row.name, row.trust, health, row.tools));
+        lines.push(format!(
+            "{}: {}, {}, {} tools",
+            row.name, row.trust, health, row.tools
+        ));
     }
-    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp refresh reloads trusted tool catalogs; /mcp deny NAME revokes a server.".into());
+    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp reauth NAME signs in to a trusted HTTP server; /mcp unauth NAME removes its managed login. /mcp refresh reloads trusted tool catalogs; /mcp deny NAME revokes a server.".into());
     lines.join("\n")
 }
 
 pub(super) async fn announce(
-    state: &Arc<SessionMcp>, id: &str, out: &SyncSender<String>,
+    state: &Arc<SessionMcp>,
+    id: &str,
+    out: &AcpOutput,
 ) -> Result<(), String> {
-    history::send_line(out, commands_notification(id)).await
+    history::send_line(out, commands_notification(id))
+        .await
         .map_err(|_| "Cannot deliver MCP command availability".to_string())?;
     emit_text(out, id, &status(state)).await
 }
@@ -218,36 +271,63 @@ pub(super) enum Command {
     Trust(String),
     Deny(String),
     Test(String),
+    Reauth(String),
+    Unauth(String),
 }
 
 /// Inspect original wire blocks, NOT flattened model content. An embedded
 /// resource, tool result, image caption, or replayed message cannot grant trust.
 pub(super) fn command_from_prompt(blocks: &[Value]) -> Result<Option<Command>, String> {
-    let first_text = blocks.first().filter(|block| block["type"] == "text")
-        .and_then(|block| block.get("text")).and_then(Value::as_str);
-    let Some(text) = first_text else { return Ok(None) };
+    let first_text = blocks
+        .first()
+        .filter(|block| block["type"] == "text")
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str);
+    let Some(text) = first_text else {
+        return Ok(None);
+    };
     let text = text.trim();
-    let Some(rest) = text.strip_prefix("/mcp") else { return Ok(None) };
+    let Some(rest) = text.strip_prefix("/mcp") else {
+        return Ok(None);
+    };
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return Ok(None);
     }
     if blocks.len() != 1 || text.contains(['\r', '\n']) {
-        return Err("An MCP operator command must be one standalone text block on one line".to_string());
+        return Err(
+            "An MCP operator command must be one standalone text block on one line".to_string(),
+        );
+    }
+    // Authentication uses the exact configured name, including internal spaces.
+    let rest = rest.trim();
+    if let Some((verb, name)) = rest.split_once(char::is_whitespace) {
+        let name = name.trim();
+        if !name.is_empty() {
+            match verb {
+                "reauth" => return Ok(Some(Command::Reauth(name.to_string()))),
+                "unauth" => return Ok(Some(Command::Unauth(name.to_string()))),
+                _ => {}
+            }
+        }
     }
     let words: Vec<_> = rest.split_whitespace().collect();
-    let command = match words.as_slice() {
-        [] | ["list"] => Command::List,
-        ["refresh"] => Command::Refresh,
-        ["inspect", name] => Command::Inspect((*name).to_string()),
-        ["trust", name] => Command::Trust((*name).to_string()),
-        ["deny", name] => Command::Deny((*name).to_string()),
-        ["test", name] => Command::Test((*name).to_string()),
-        _ => return Err("Usage: /mcp list | refresh | inspect NAME | trust NAME | deny NAME | test NAME".to_string()),
-    };
+    let command =
+        match words.as_slice() {
+            [] | ["list"] => Command::List,
+            ["refresh"] => Command::Refresh,
+            ["inspect", name] => Command::Inspect((*name).to_string()),
+            ["trust", name] => Command::Trust((*name).to_string()),
+            ["deny", name] => Command::Deny((*name).to_string()),
+            ["test", name] => Command::Test((*name).to_string()),
+            _ => return Err(
+                "Usage: /mcp list | refresh | inspect NAME | trust NAME | deny NAME | test NAME | reauth NAME | unauth NAME"
+                    .to_string(),
+            ),
+        };
     Ok(Some(command))
 }
 
-async fn emit_text(out: &SyncSender<String>, id: &str, text: &str) -> Result<(), String> {
+async fn emit_text(out: &AcpOutput, id: &str, text: &str) -> Result<(), String> {
     history::send_line(out, json_rpc_notification("session/update", json!({
         "sessionId": id,
         "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } },
@@ -258,7 +338,9 @@ async fn emit_text(out: &SyncSender<String>, id: &str, text: &str) -> Result<(),
 /// MCP connection future invokes its construction/handshake cleanup guards.
 /// A durable trust decision already written is NOT rolled back by cancellation.
 async fn cancellable<F: Future>(
-    signal: &AbortSignal, cx: &AgentCx, work: F,
+    signal: &AbortSignal,
+    cx: &AgentCx,
+    work: F,
 ) -> Result<F::Output, ()> {
     if signal.is_aborted() || cx.is_cancel_requested() {
         return Err(());
@@ -269,7 +351,10 @@ async fn cancellable<F: Future>(
         }
     };
     match futures::future::select(Box::pin(cancelled), Box::pin(cx.with_current(work))).await {
-        futures::future::Either::Left(((), pending)) => { drop(pending); Err(()) }
+        futures::future::Either::Left(((), pending)) => {
+            drop(pending);
+            Err(())
+        }
         futures::future::Either::Right((result, _)) => Ok(result),
     }
 }
@@ -280,11 +365,20 @@ async fn cancellable<F: Future>(
 async fn refresh_catalogs(state: &SessionMcp) {
     let acknowledged = acknowledged_servers(&state.manager.list());
     state.manager.connect_trusted().await;
-    state.refresh.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    state
+        .refresh
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .complete(acknowledged, Instant::now());
 }
 
-async fn execute(state: &SessionMcp, command: Command) -> String {
+// The Ok/Err arms read clearer as a match than as map_or_else closures.
+#[allow(clippy::option_if_let_else)]
+async fn execute(
+    state: &SessionMcp,
+    command: Command,
+    on_url: Arc<dyn Fn(&str) + Send + Sync>,
+) -> String {
     match command {
         Command::List => status(state),
         Command::Refresh => {
@@ -293,8 +387,10 @@ async fn execute(state: &SessionMcp, command: Command) -> String {
         }
         Command::Inspect(name) => state.descriptions.iter()
             .find(|(candidate, _)| candidate == &name)
-            .map(|(_, text)| text.clone())
-            .unwrap_or_else(|| "Unknown MCP server; use /mcp list".to_string()),
+            .map_or_else(
+                || "Unknown MCP server; use /mcp list".to_string(),
+                |(_, text)| text.clone(),
+            ),
         Command::Trust(name) => match state.manager.trust(&name).await {
             Ok(tools) => format!("Trusted and connected MCP server {name}: {} tools", tools.len()),
             Err(_) => "MCP trust/connect did not complete. Any trust decision already persisted remains in effect; inspect the editor configuration, then use /mcp list or /mcp deny NAME.".to_string(),
@@ -306,6 +402,18 @@ async fn execute(state: &SessionMcp, command: Command) -> String {
         Command::Test(name) => match state.manager.test(&name).await {
             Ok(tools) => format!("Connected MCP server {name}: {} tools", tools.len()),
             Err(_) => "MCP test failed. Inspect the server configuration and its trust state with /mcp list.".to_string(),
+        },
+        Command::Reauth(name) => match state.manager.reauthenticate(&name, None, on_url).await {
+            Ok(()) => format!("Signed in to MCP server {name}; its tool catalog has been refreshed"),
+            Err(error) if error.to_string().contains("[MCP_AUTH_RECONNECT_FAILED]") =>
+                "MCP login was saved, but reconnecting or loading tools failed. Use /mcp list and /mcp test NAME after checking the server.".to_string(),
+            Err(_) =>
+                "MCP sign-in did not complete. The server must be trusted, enabled, and HTTP-based without a configured Authorization header; inspect its configuration and use /mcp list.".to_string(),
+        },
+        Command::Unauth(name) => match state.manager.unauthenticate(&name).await {
+            Ok(()) => format!("Removed the managed login for MCP server {name}; its connection and tools were retired. Trust is unchanged."),
+            Err(_) =>
+                "MCP credential removal did not complete. An explicit Authorization header must be removed from the server configuration; otherwise check the credential store and retry.".to_string(),
         },
     }
 }
@@ -319,7 +427,7 @@ pub(super) async fn before_prompt(
     command: Option<Command>,
     signal: &AbortSignal,
     cx: &AgentCx,
-    out: &SyncSender<String>,
+    out: &AcpOutput,
     id: &str,
 ) -> Option<&'static str> {
     if signal.is_aborted() || cx.is_cancel_requested() {
@@ -327,28 +435,50 @@ pub(super) async fn before_prompt(
     }
     if let Some(command) = command {
         let text = if let Some(state) = state {
-            let Ok(text) = cancellable(signal, cx, execute(state, command)).await else {
+            let callback_out = out.clone();
+            let callback_id = id.to_string();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                // The synchronous output lane fails closed on disconnect or
+                // overflow, which also aborts the reserved ACP prompt.
+                let _ = callback_out.send(json_rpc_notification("session/update", json!({
+                    "sessionId": callback_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": format!("Open this URL to sign in to the MCP server:\n{url}\n")},
+                    },
+                })));
+            });
+            let result = cancellable(signal, cx, execute(state, command, on_url)).await;
+            // Even cancellation can follow durable credential removal.
+            mount(agent, state);
+            let Ok(text) = result else {
                 return Some(ACP_STOP_REASON_CANCELLED);
             };
-            // Publish the whole current overlay, including removals on deny.
-            mount(agent, state);
             text
         } else {
             "No MCP servers were supplied for this session.".to_string()
         };
-        return Some(match cancellable(signal, cx, emit_text(out, id, &text)).await {
-            Ok(Ok(())) => ACP_STOP_REASON_END_TURN,
-            Ok(Err(_)) => ACP_STOP_REASON_ERROR,
-            Err(()) => ACP_STOP_REASON_CANCELLED,
-        });
+        return Some(
+            match cancellable(signal, cx, emit_text(out, id, &text)).await {
+                Ok(Ok(())) => ACP_STOP_REASON_END_TURN,
+                Ok(Err(_)) => ACP_STOP_REASON_ERROR,
+                Err(()) => ACP_STOP_REASON_CANCELLED,
+            },
+        );
     }
     if let Some(state) = state {
         let first = !state.started.load(Ordering::Acquire);
         let rows = state.manager.list();
-        let refresh_due = state.refresh.lock()
+        let refresh_due = state
+            .refresh
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .due(&rows, Instant::now());
-        if refresh_due && cancellable(signal, cx, refresh_catalogs(state)).await.is_err() {
+        if refresh_due
+            && cancellable(signal, cx, refresh_catalogs(state))
+                .await
+                .is_err()
+        {
             return Some(ACP_STOP_REASON_CANCELLED);
         }
         mount(agent, state);
@@ -390,21 +520,59 @@ mod integration_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn disabled_host_refuses_definitions_before_parsing() {
+        let cwd = Path::new("/not-opened");
+        assert!(parse_servers(&json!({}), cwd, true).unwrap().is_none());
+        assert!(
+            parse_servers(&json!({"mcpServers": []}), cwd, true)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        for supplied in [json!([{"not": "a server"}]), json!(null), json!("bad")] {
+            let error = parse_servers(&json!({"mcpServers": supplied}), cwd, true)
+                .expect_err("host isolation wins before definition validation");
+            assert!(error.starts_with("PI_MCP_DISABLED:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn launch_flag_survives_acp_selection_reconstruction() {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::parse_from(["pi", "--acp", "--no-mcp"]);
+        let launch = super::super::AcpLaunchOptions::from_cli(&cli);
+        assert!(launch.no_mcp);
+        assert!(launch.selection_cli().unwrap().no_mcp);
+        assert!(!launch.no_tools);
+    }
+
     fn runtime() -> asupersync::runtime::Runtime {
-        asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime")
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
     }
 
     fn http_servers(cwd: &Path) -> Vec<ConfiguredServer> {
-        crate::mcp::config::parse_acp_servers(&json!({"mcpServers":[{
-            "type":"http","name":"remote","url":"https://example.invalid/mcp",
-            "headers":[{"name":"Authorization","value":"PRIVATE-HEADER-VALUE"}],
-        }]}), cwd).expect("decode").expect("supplied")
+        crate::mcp::config::parse_acp_servers(
+            &json!({"mcpServers":[{
+                "type":"http","name":"remote","url":"https://example.invalid/mcp",
+                "headers":[{"name":"Authorization","value":"PRIVATE-HEADER-VALUE"}],
+            }]}),
+            cwd,
+        )
+        .expect("decode")
+        .expect("supplied")
     }
 
     fn row(trust: &str, health: &str) -> ServerInfo {
         ServerInfo {
-            name: "remote".into(), target: "<http>".into(), provenance: "acp".into(),
-            trust: trust.into(), health: health.into(), tools: 0,
+            name: "remote".into(),
+            target: "<http>".into(),
+            provenance: "acp".into(),
+            trust: trust.into(),
+            health: health.into(),
+            tools: 0,
             source_file: std::path::PathBuf::from("unused"),
         }
     }
@@ -416,15 +584,28 @@ mod tests {
         let ready = [row("acknowledged", "ready (1 tools)")];
         assert!(refresh.due(&ready, now));
         refresh.complete(acknowledged_servers(&ready), now);
-        assert!(!refresh.due(&ready, now + CATALOG_REFRESH_INTERVAL - Duration::from_millis(1)));
+        assert!(
+            !refresh.due(
+                &ready,
+                (now + CATALOG_REFRESH_INTERVAL)
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("instant just before the refresh deadline")
+            )
+        );
         assert!(refresh.due(&ready, now + CATALOG_REFRESH_INTERVAL));
 
         let pending = [row("pending", "not started")];
-        assert!(refresh.due(&pending, now), "a revocation changes the acknowledged set");
+        assert!(
+            refresh.due(&pending, now),
+            "a revocation changes the acknowledged set"
+        );
         refresh.complete(Vec::new(), now);
         assert!(!refresh.due(&pending, now + Duration::from_secs(3600)));
         assert!(!refresh.due(&[row("denied", "not started")], now));
-        assert!(refresh.due(&ready, now), "new external trust is not hidden by the refresh interval");
+        assert!(
+            refresh.due(&ready, now),
+            "new external trust is not hidden by the refresh interval"
+        );
     }
 
     #[test]
@@ -434,7 +615,14 @@ mod tests {
         for health in ["not started", "unhealthy (retry 1/3): unavailable"] {
             let rows = [row("acknowledged", health)];
             refresh.complete(acknowledged_servers(&rows), now);
-            assert!(!refresh.due(&rows, now + CATALOG_RETRY_INTERVAL - Duration::from_millis(1)));
+            assert!(
+                !refresh.due(
+                    &rows,
+                    (now + CATALOG_RETRY_INTERVAL)
+                        .checked_sub(Duration::from_millis(1))
+                        .expect("instant just before the retry deadline")
+                )
+            );
             assert!(refresh.due(&rows, now + CATALOG_RETRY_INTERVAL));
         }
         let failed = [row("acknowledged", "failed: exhausted 3 retries")];
@@ -480,8 +668,12 @@ mod tests {
                         }
                         Err(error) => panic!("catalog fixture accept: {error}"),
                     };
-                    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
                     let mut headers = Vec::new();
                     while !headers.ends_with(b"\r\n\r\n") {
                         let mut byte = [0_u8; 1];
@@ -490,11 +682,14 @@ mod tests {
                         assert!(headers.len() <= 32 * 1024, "bounded fixture headers");
                     }
                     let headers = String::from_utf8(headers).unwrap();
-                    let length = headers.lines().find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    }).unwrap_or(0);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
                     assert!(length <= 2 * 1024 * 1024, "bounded fixture body");
                     let mut body = vec![0_u8; length];
                     stream.read_exact(&mut body).unwrap();
@@ -522,24 +717,43 @@ mod tests {
                         };
                         result.map_or_else(
                             || ("202 Accepted", "application/json", String::new()),
-                            |result| ("200 OK", "application/json", json!({
-                                "jsonrpc": "2.0", "id": request["id"], "result": result,
-                            }).to_string()),
+                            |result| {
+                                (
+                                    "200 OK",
+                                    "application/json",
+                                    json!({
+                                        "jsonrpc": "2.0", "id": request["id"], "result": result,
+                                    })
+                                    .to_string(),
+                                )
+                            },
                         )
                     } else {
-                        assert!(headers.starts_with("POST /v1/chat/completions "), "{headers}");
+                        assert!(
+                            headers.starts_with("POST /v1/chat/completions "),
+                            "{headers}"
+                        );
                         worker_requests.lock().unwrap().push(request);
-                        let body = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        let body = format!(
+                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                             json!({"id":"probe","object":"chat.completion.chunk","model":"gpt-4o",
                                 "choices":[{"index":0,"delta":{"role":"assistant","content":"schema observed"},"finish_reason":null}]}),
                             json!({"id":"probe","object":"chat.completion.chunk","model":"gpt-4o",
-                                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
+                                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+                        );
                         ("200 OK", "text/event-stream", body)
                     };
                     write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 }
             });
-            Self { url, catalog, requests, lists, stop, worker: Some(worker) }
+            Self {
+                url,
+                catalog,
+                requests,
+                lists,
+                stop,
+                worker: Some(worker),
+            }
         }
     }
 
@@ -548,7 +762,9 @@ mod tests {
             self.stop.store(true, Ordering::Release);
             if let Some(worker) = self.worker.take() {
                 let result = worker.join();
-                if !std::thread::panicking() { result.expect("catalog fixture worker"); }
+                if !std::thread::panicking() {
+                    result.expect("catalog fixture worker");
+                }
             }
         }
     }
@@ -558,7 +774,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let server = CatalogServer::start();
         let runtime = asupersync::runtime::RuntimeBuilder::new()
-            .worker_threads(1).blocking_threads(1, 2).build().unwrap();
+            .worker_threads(1)
+            .blocking_threads(1, 2)
+            .build()
+            .unwrap();
         let handle = runtime.handle();
         runtime.block_on(async {
             let cx = AgentCx::for_current_or_request();
@@ -590,9 +809,14 @@ mod tests {
                 let host_snapshot = shared.snapshot();
                 assert!(host_snapshot.is_discoverable("lsp"));
                 let state = Arc::new(asupersync::sync::Mutex::new(super::super::AcpSessionState {
-                    agent_session: Some(session), cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
+                    agent_session: Some(crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                        session, crate::sdk::EventListeners::default(),
+                    )),
+                    cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
+                    available_models: Vec::new(),
                 }));
                 let (out, receiver) = std::sync::mpsc::sync_channel(128);
+                let out = AcpOutput::new(out);
                 let run = |command| {
                     let (_, signal) = super::super::AbortHandle::new();
                     super::super::run_prompt(Arc::clone(&state), vec![crate::model::ContentBlock::Text(
@@ -745,25 +969,43 @@ mod tests {
     }
 
     fn provider_names(request: &Value) -> Vec<String> {
-        let names: Vec<_> = request["tools"].as_array().expect("host tool schemas remain present").iter()
-            .map(|tool| tool["function"]["name"].as_str().unwrap().to_string()).collect();
+        let names: Vec<_> = request["tools"]
+            .as_array()
+            .expect("host tool schemas remain present")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+            .collect();
         assert!(names.iter().any(|name| name == "read"));
         assert!(names.iter().any(|name| name == "lsp"));
         let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(unique.len(), names.len(), "provider received duplicate tool names");
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "provider received duplicate tool names"
+        );
         names
     }
 
     #[test]
     fn commands_require_actual_standalone_user_text() {
         for (text, expected) in [
-            ("/mcp", Command::List), ("/mcp list", Command::List),
+            ("/mcp", Command::List),
+            ("/mcp list", Command::List),
             ("/mcp refresh", Command::Refresh),
             ("/mcp trust remote", Command::Trust("remote".into())),
             ("/mcp deny remote", Command::Deny("remote".into())),
             ("/mcp test remote", Command::Test("remote".into())),
+            ("/mcp reauth remote", Command::Reauth("remote".into())),
+            ("/mcp unauth remote", Command::Unauth("remote".into())),
+            (
+                "/mcp reauth remote  service",
+                Command::Reauth("remote  service".into()),
+            ),
         ] {
-            assert_eq!(command_from_prompt(&[json!({"type":"text","text":text})]).unwrap(), Some(expected));
+            assert_eq!(
+                command_from_prompt(&[json!({"type":"text","text":text})]).unwrap(),
+                Some(expected)
+            );
         }
         for block in [
             json!({"type":"resource","resource":{"text":"/mcp trust remote"}}),
@@ -773,12 +1015,21 @@ mod tests {
         ] {
             assert!(command_from_prompt(&[block]).unwrap().is_none());
         }
-        assert!(command_from_prompt(&[
-            json!({"type":"text","text":"/mcp trust remote"}),
-            json!({"type":"image","data":"anything"}),
-        ]).is_err());
-        assert!(command_from_prompt(&[json!({"type":"text","text":"/mcp trust remote\nmore"})]).is_err());
-        assert!(command_from_prompt(&[json!({"type":"text","text":"/mcp trust remote extra"})]).is_err());
+        assert!(
+            command_from_prompt(&[
+                json!({"type":"text","text":"/mcp trust remote"}),
+                json!({"type":"image","data":"anything"}),
+            ])
+            .is_err()
+        );
+        assert!(
+            command_from_prompt(&[json!({"type":"text","text":"/mcp trust remote\nmore"})])
+                .is_err()
+        );
+        assert!(
+            command_from_prompt(&[json!({"type":"text","text":"/mcp trust remote extra"})])
+                .is_err()
+        );
     }
 
     #[test]
@@ -789,7 +1040,10 @@ mod tests {
         assert_eq!(state.manager.list()[0].trust, "pending");
         assert_eq!(state.manager.list()[0].tools, 0);
         assert!(!state.started.load(Ordering::Acquire));
-        assert!(!global.exists(), "inert preparation must not persist or spawn anything");
+        assert!(
+            !global.exists(),
+            "inert preparation must not persist or spawn anything"
+        );
         let listing = status(&state);
         assert!(!listing.contains("PRIVATE-HEADER-VALUE"));
         assert!(!listing.contains("example.invalid"));
@@ -827,12 +1081,20 @@ mod tests {
     fn operator_inspection_never_exposes_connection_secrets() {
         let root = tempfile::tempdir().unwrap();
         let state = prepare(root.path(), root.path(), http_servers(root.path())).unwrap();
-        let text = runtime().block_on(execute(&state, Command::Inspect("remote".into())));
+        let text = runtime().block_on(execute(
+            &state,
+            Command::Inspect("remote".into()),
+            Arc::new(|_| {}),
+        ));
         assert!(text.contains("HTTP"));
         assert!(text.contains("1 headers"));
         assert!(!text.contains("PRIVATE-HEADER-VALUE"));
         assert!(!text.contains("https://"));
-        let denied = runtime().block_on(execute(&state, Command::Deny("remote".into())));
+        let denied = runtime().block_on(execute(
+            &state,
+            Command::Deny("remote".into()),
+            Arc::new(|_| {}),
+        ));
         assert!(denied.contains("Denied"));
         assert_eq!(state.manager.list()[0].trust, "denied");
         assert_eq!(state.manager.list()[0].tools, 0);
@@ -843,7 +1105,13 @@ mod tests {
         let value: Value = serde_json::from_str(&commands_notification("session-1")).unwrap();
         assert_eq!(value["method"], "session/update");
         assert_eq!(value["params"]["sessionId"], "session-1");
-        assert_eq!(value["params"]["update"]["sessionUpdate"], "available_commands_update");
-        assert_eq!(value["params"]["update"]["availableCommands"][0]["name"], "mcp");
+        assert_eq!(
+            value["params"]["update"]["sessionUpdate"],
+            "available_commands_update"
+        );
+        assert_eq!(
+            value["params"]["update"]["availableCommands"][0]["name"],
+            "mcp"
+        );
     }
 }

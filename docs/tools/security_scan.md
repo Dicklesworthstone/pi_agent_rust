@@ -2,7 +2,135 @@
 
 `security_scan` retains its existing local source operations: `plan`, `run`,
 `disposition`, and `compare`. The source-rule engine is now in
-`src/security_scan/source.rs`; its implementation and tests are retained intact.
+`src/security_scan/source.rs`. Dependency operations use a separate engine.
+
+## Source scans and source comparisons
+
+```json
+{"op":"plan","paths":["src"]}
+{"op":"run","paths":["src"],"sarifOut":"source-baseline.sarif"}
+{"op":"compare","paths":["./src/"],"baseline":"source-baseline.sarif"}
+```
+
+Source rules match complete UTF-8 files, not independently truncated lines.
+Line-aware `^`/`$` anchors and CRLF handling are enabled by default. Explicit
+newlines, whitespace classes, negated character classes and equivalent inline
+flag spellings retain their regex meaning; `(?s)` is not required just to cross
+a line boundary. Dot still excludes line terminators unless enabled with `s`.
+Use `\A`/`\z` for absolute file anchors or `(?-m:...)` to disable line anchoring.
+Findings use original file line numbers; CRLF counts as one line break. Fingerprints
+remain based on rule ID, normalized path, matched text and occurrence ordinal.
+Whitespace changes inside a match can therefore change its fingerprint.
+
+Planning validates compiled rules and discovers the selected scope; it does not
+read every file's contents. A source scan refuses traversal/ignore-rule errors,
+unreadable files, non-regular inputs and invalid project rule inventories.
+Those failures do not become a successful zero-finding report. Non-UTF-8 files
+are instead explicit exclusions: the summary reports their count and the SARIF
+lists their paths. An excluded binary or undecodable text file was not assessed.
+
+Source limits are 256 selected roots, 20,000 distinct files, 16 MiB per file,
+256 MiB combined input and 10,000 findings. Project rules are capped at 64 packs,
+1 MiB per pack and 1,024 total rules. Empty/duplicate rule IDs are errors, including
+collisions with embedded rules. Source reports are capped at 16 MiB; the tool
+previews at most 50 findings while SARIF retains all admitted findings. Limits
+fail the operation rather than publishing a partial scan as complete. Rule and
+scan failures occur before report publication.
+
+`compare` accepts a single native source SARIF run. Malformed rows, duplicate
+native JSON fields, duplicate finding identities, wrong tool namespaces and
+explicit failed invocations are errors, not empty baselines. The SDK function
+`findings_from_sarif` now returns `Result<Vec<Finding>>`; callers must handle
+import errors. Dependency audits belong to `compare_dependencies`, not `compare`.
+
+New reports carry a digest of each rule's matching semantics. A baseline finding
+is classified as `fixed` only when its file was successfully read and scanned
+under that same applicable rule and no longer matches. Non-UTF-8 conversions,
+ignore changes, removed files and changed/removed rules instead yield
+`unassessed`. Older reports without rule digests can retain persistent matches,
+but cannot establish absence: regenerate the baseline before relying on fixes.
+These digests compare rule definitions; they do not authenticate a report.
+
+`src`, `./src/` and `.` are normalized consistently for scope filtering.
+Comparison returns `new`, `fixed`, `regressed` and `unassessed` previews (50 each),
+full `counts` and an explicit `truncated` flag. Unassessed in-scope findings set
+`comparisonComplete: false` and `isError: true` without discarding the other
+results. Narrow `paths` to inspect a truncated comparison. Here, `fixed` means
+no longer matched under the unchanged rule, not proof of a secure program.
+
+### Source report and review persistence
+
+An explicit `sarifOut` must name a **new workspace-relative `.sarif` file**.
+Existing destinations are never overwritten, even if created concurrently.
+Omitting it still updates the conventional `.pi/security-scan.sarif`, but now
+by atomic replacement of a fully written and synced private staging file.
+An existing report inode (including other hard-link names for it) is never
+truncated. Explicitly selecting the conventional filename is also create-only;
+omit `sarifOut` to use its reserved replacement behavior.
+
+Baseline and disposition reads are bounded, regular-file-only and no-follow
+through every relative component. The workspace directory is pinned before
+scanning, and publication uses pinned parent descriptors rather than reopening
+paths after asynchronous work. Symlink ancestors and final symlinks are refused.
+Named exports use a create-only hard link; only Pi-owned default state permits
+replacement. Payload sync precedes publication; directory-entry crash durability
+is not promised. Staging files are cleaned up on errors.
+
+Source `disposition` holds a persistent lock across reading the latest map,
+merging one decision and atomic publication. Competing cooperating writers get
+a busy error and may retry; successful individual updates are not lost through
+an unlocked read/modify/write. Do not remove `.pi/security-dispositions.lock`:
+replacing the lock inode defeats coordination. The locked `.pi` directory stays
+pinned for the transaction, including if its name changes.
+
+Stored maps are capped at 4 MiB and 10,000 entries. Keys must be 16 lowercase
+hexadecimal source fingerprints; statuses remain `false-positive`, `accepted`
+and `fixed`. Reasons must be nonblank and at most 2,048 UTF-8 bytes. Duplicate
+keys/fields, invalid entries and corrupt existing maps are errors, never an
+empty policy or permission to overwrite prior decisions. The SDK
+`save_dispositions` function remains an intentional whole-map replacement,
+not a concurrent per-entry merge; the tool operation provides the latter.
+
+The hardened persistence backend currently requires supported Unix descriptor
+APIs. Other platforms explicitly refuse source report/baseline/disposition
+persistence instead of falling back to path-based writes. Pure matching and
+source discovery remain separate. This is a platform limitation, not a claim
+of Windows persistence support.
+
+### Request lifetime
+
+Source tool calls retain the captured restricted owner in their blocking worker.
+Dropping the awaiting request also revokes a per-invocation lease without
+cancelling the shared session or sibling scans. Queued work refuses to start;
+running work checks revocation between directory entries, rule compilation,
+64 KiB source-read chunks, files and regex matches. Individual filesystem calls
+and regex searches are not preemptible.
+
+Only the final atomic rename/link holds the publication gate. A request dropped
+before admission prevents publication. A commit already admitted may finish;
+dropping the request waits for that syscall before completing revocation, after
+which no later commit can be admitted. This is not a hard real-time cancellation
+bound or rollback: a report published before cancellation remains published,
+and preparation may have created directories or a persistent lock file.
+
+These source operations remain pattern-based review, not reachability analysis,
+a race-free workspace snapshot or a filesystem sandbox. Source/rule discovery
+and content reads still have their separate path-based confinement limitations;
+hardening report persistence does not make those reads a sandbox. Other code
+running as the same OS user is outside this confinement model.
+
+Sixteen source regression tests were added for completeness, limits, multiline
+matching, native import and comparison uncertainty, including the public tool
+scan/compare path. They have not run in the implementation environment: DSR is
+unavailable (`dsr: command not found`, exit 127). Compilation, formatting, Clippy
+and Rust tests remain unverified; no release or Bead-completion claim follows.
+
+Ten additional persistence regressions and nine request-lifetime regressions
+were authored, covering actual filesystem publication, stored-state corruption,
+lock contention, path substitutions, cancelled workers and dropping the real
+blocking future after its publisher starts. These tests also remain unexecuted:
+the DSR entry point was unavailable (exit 127) during implementation. Static
+source/hash/whitespace checks are not a compile or test pass.
 
 ## Inspect locked dependencies without a network request
 
@@ -51,7 +179,7 @@ therefore do not become an unbounded model-facing message.
 ## Validation
 
 The implementation adds pure parser/identity/limit tests and real temporary-file
-confinement tests. Existing source scanner tests are retained unchanged. The
+confinement tests. Existing source scanner coverage is retained. The
 required quality entry point is `dsr quality --tool pi_agent_rust`; no direct
 Cargo or GitHub Actions lane substitutes for it. No Rust test or compile pass
 is claimed until that gate has run.
@@ -143,8 +271,11 @@ A failed query marks SARIF `executionSuccessful: false`.
 Dependency fingerprints cover ecosystem, name, version and advisory ID rather
 than line numbers. They occupy the `pi/dependency/v1` namespace. Existing source
 `compare` and `disposition` operations continue to operate on source-rule scans;
-do not pass dependency SARIF to source `compare`. Dependency suppression and
-cross-audit comparison are not implemented in this increment. A known-advisory
+do not pass dependency SARIF to source `compare`. Use the offline
+[`compare_dependencies` operation](dependency-review.md) for saved dependency
+audits. Its companion `disposition_dependencies` operation records hash-bound
+review decisions in a new SARIF artifact without removing findings, rewriting
+the source audit, or installing suppression policy for future audits. A known-advisory
 match is not proof of exploitability, and absence of matches is not proof that
 code has no vulnerabilities. Installed dependencies, build reachability, patched
 forks and lockfile provenance require separate analysis.

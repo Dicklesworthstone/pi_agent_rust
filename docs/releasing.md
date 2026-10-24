@@ -226,8 +226,8 @@ Run this matrix before declaring distribution parity complete for a release cand
 Release operations must keep benchmark evidence and shipping artifacts distinct.
 
 - **Shipping/distribution artifacts**: built, packaged, and published by DSR
-  using the Cargo `release` profile (exact `pi` archives + same-name `.sha256`
-  sidecars).
+  using the Cargo `dist` profile, which is `release` with `opt-level = 3` (exact
+  `pi` archives + same-name `.sha256` sidecars).
 - **Benchmark evidence artifacts**: produced by PERF-3X lanes (`scripts/perf/orchestrate.sh`,
   `scripts/bench_extension_workloads.sh`) using benchmark profile labeling (typically `perf`)
   with run-level provenance (`correlation_id`, build/profile metadata, allocator/PGO metadata).

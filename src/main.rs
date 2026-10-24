@@ -132,6 +132,18 @@ impl std::error::Error for ApprovalSurfaceUnavailable {}
 /// and resource loading issues without parsing stderr.
 const EXIT_CODE_RESOURCE_LOAD_FAILED: i32 = 4;
 
+/// Stack size of the main runtime's worker threads.
+///
+/// asupersync gives each worker an explicit 2 MiB stack, so `RUST_MIN_STACK`
+/// does not apply to them. Tasks the runtime spawns are polled on these
+/// workers, and an RPC agent turn's future chain no longer fits 2 MiB in an
+/// unoptimised build: `pi --mode rpc` aborted with "thread
+/// 'asupersync-worker-N' has overflowed its stack" as soon as it accepted a
+/// prompt. This is the headroom the FTUI driver thread already has
+/// (`DRIVER_STACK_BYTES`). The reservation is virtual; pages are committed
+/// only when touched.
+const RUNTIME_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// Raised when configured skills, prompts, themes, or extensions fail to load (gh #223).
 #[derive(Debug)]
 struct ConfiguredResourceLoadFailed(String);
@@ -214,6 +226,10 @@ fn main() {
     // spawn until its wrapper is covered by kill-on-close Job discipline.
     #[cfg(windows)]
     if let Some(exit_code) = pi::tools::run_windows_share_job_child_if_requested() {
+        std::process::exit(exit_code);
+    }
+
+    if let Some(exit_code) = pi::tools::run_structured_read_worker_if_requested() {
         std::process::exit(exit_code);
     }
 
@@ -484,6 +500,7 @@ fn collect_fetch_models_context_conflicts(
     add_fetch_models_conflict(conflicts, cli.no_migrations, "--no-migrations");
     add_fetch_models_conflict(conflicts, cli.verbose, "--verbose");
     add_fetch_models_conflict(conflicts, cli.no_tools, "--no-tools");
+    add_fetch_models_conflict(conflicts, cli.no_mcp, "--no-mcp");
     add_fetch_models_conflict(
         conflicts,
         cli.extension_policy.is_some() || cli.repair_policy.is_some(),
@@ -563,6 +580,7 @@ async fn resolve_selection_with_auth(
     cli: &mut cli::Cli,
     config: &Config,
     session: &Session,
+    cwd: &Path,
     model_registry: &mut ModelRegistry,
     scoped_patterns: &[String],
     auth: &mut AuthStorage,
@@ -572,15 +590,14 @@ async fn resolve_selection_with_auth(
     extra_entries: &[ModelEntry],
 ) -> Result<Option<(pi::app::ModelSelection, Option<String>)>> {
     loop {
-        let scoped_models = if scoped_patterns.is_empty() {
-            Vec::new()
-        } else {
-            pi::app::resolve_model_scope(
-                scoped_patterns,
-                model_registry,
-                has_cli_api_key_override(cli.api_key.as_deref()),
-            )
-        };
+        let scoped_models = pi::app::resolve_startup_model_scope(
+            cli,
+            session,
+            scoped_patterns,
+            model_registry,
+            config,
+            cwd,
+        )?;
 
         let selection = match pi::app::select_model_and_thinking(
             cli,
@@ -642,11 +659,20 @@ fn should_retry_selection_after_extensions(
     err: &anyhow::Error,
     has_extensions: bool,
 ) -> bool {
-    if !has_extensions || (cli.provider.is_none() && cli.model.is_none()) {
+    if !has_extensions {
         return false;
     }
 
     let message = err.to_string().to_ascii_lowercase();
+    // The complete scope may contain an allowed extension model that has
+    // not been registered yet. Defer this decision once; final selection
+    // after extension loading must pass the same provider policy.
+    if message.contains("[model_scope_disabled]") || message.contains("[model_scope_empty]") {
+        return true;
+    }
+    if cli.provider.is_none() && cli.model.is_none() {
+        return false;
+    }
     message.contains(" not found") || message.contains("no models available for provider")
 }
 
@@ -712,6 +738,53 @@ fn default_log_filter_for(rust_log: Option<&str>) -> EnvFilter {
     }
 }
 
+fn handle_recover_blocking(
+    source: &Path,
+    output: Option<&Path>,
+    session_output: Option<&Path>,
+    json_output: bool,
+    active: bool,
+    branch: Option<&str>,
+    root: bool,
+) -> Result<()> {
+    if let Some(destination) = session_output {
+        let selected = if root { Some("") } else { branch };
+        let id = Session::fork_recovered_text(source, destination, selected)?;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "Created text-only recovery session {id}. Resume it with pi --session."
+        );
+        return Ok(());
+    }
+
+    let report = Session::recover_text(source)?;
+    let selection = match branch {
+        Some(id) => pi::session_recovery::RecoverySelection::Branch(id),
+        None if active => pi::session_recovery::RecoverySelection::Active,
+        None => pi::session_recovery::RecoverySelection::All,
+    };
+    let format = if json_output {
+        pi::session_recovery::RecoveryExport::Json
+    } else {
+        pi::session_recovery::RecoveryExport::Text(selection)
+    };
+
+    if let Some(destination) = output {
+        report.export_file(destination, format)?;
+        return Ok(());
+    }
+
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    match format {
+        pi::session_recovery::RecoveryExport::Json => report.write_json(&mut writer)?,
+        pi::session_recovery::RecoveryExport::Text(selection) => {
+            report.write_selected_text(selection, &mut writer)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
@@ -720,16 +793,40 @@ fn main_impl() -> Result<()> {
     };
 
     validate_fetch_models_is_standalone(&cli, &extension_flags, &raw_args)?;
+    if cli.session_workdir.is_some() && cli.command.is_some() {
+        bail!("--session-workdir requires resuming an existing --session");
+    }
 
     if cli.version {
         print_version();
         return Ok(());
     }
 
-    // Validate theme file paths.
-    // Named themes (without .json, /, ~) are validated later after resource loading.
+    // Recovery intentionally precedes crash capture, config/auth loading,
+    // migrations, resource discovery, tracing, and async-runtime startup.
+    if let Some(cli::Commands::Recover {
+        source,
+        output,
+        session_output,
+        json,
+        active,
+        branch,
+        root,
+    }) = &cli.command
+    {
+        handle_recover_blocking(
+            source,
+            output.as_deref(),
+            session_output.as_deref(),
+            *json,
+            *active,
+            branch.as_deref(),
+            *root,
+        )?;
+        return Ok(());
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
 
     // Crash capture (bd-cv653.7.12): bundles land under the agent dir;
     let crash_agent_dir = pi::config::Config::global_dir();
@@ -1003,14 +1100,16 @@ fn main_impl() -> Result<()> {
         }
     }
 
-    if cli.command.is_none()
+    let piped_stdin = if cli.command.is_none()
         && cli.fetch_models.is_none()
         && !cli.acp
         && cli.mode.as_deref().is_none_or(|mode| mode.ne("rpc"))
     {
         let stdin_content = read_piped_stdin()?;
-        pi::app::apply_piped_stdin(&mut cli, stdin_content);
-    }
+        pi::app::apply_piped_stdin(&mut cli, stdin_content)
+    } else {
+        None
+    };
 
     if !cli.print && cli.mode.is_none() && !cli.message_args().is_empty() {
         cli.print = true;
@@ -1029,6 +1128,7 @@ fn main_impl() -> Result<()> {
         && cli.fetch_models.is_none()
         && early_mode.eq("text")
         && cli.export.is_none()
+        && piped_stdin.is_none()
         && cli.file_args().is_empty()
         && cli
             .message_args()
@@ -1053,11 +1153,18 @@ fn main_impl() -> Result<()> {
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
         .blocking_threads(1, 2)
+        .thread_stack_size(RUNTIME_WORKER_STACK_BYTES)
         .with_reactor(reactor)
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
-    let result = runtime.block_on(run(cli, extension_flags, handle, package_subcommand_trust));
+    let result = runtime.block_on(run(
+        cli,
+        extension_flags,
+        handle,
+        package_subcommand_trust,
+        piped_stdin,
+    ));
     // `run()` owns graceful application shutdown. Exiting here avoids waiting on
     // runtime-owned background tasks after the CLI/TUI has already finished.
     // Background bash jobs are session-scoped (bd-cv653.3.10): kill any
@@ -1410,11 +1517,12 @@ fn advisor_options(
         );
         return None;
     }
-    match pi::providers::create_provider(&entry, None) {
+    match pi::providers::create_provider_with_auth(&entry, None, Some(auth)) {
         Ok(provider) => Some(pi::advisor::AdvisorOptions {
             provider,
             label: format!("{}/{}", entry.model.provider, entry.model.id),
             timeout: Duration::from_secs(config.advisor_timeout_secs()),
+            continue_severity: config.advisor_continue_severity(),
             api_key: key,
         }),
         Err(err) => {
@@ -1428,14 +1536,407 @@ fn advisor_options(
     }
 }
 
+const fn cli_uses_runtime_session(cli: &cli::Cli) -> bool {
+    cli.command.is_none()
+        && cli.fetch_models.is_none()
+        && cli.export.is_none()
+        && cli.list_models.is_none()
+        && !cli.acp
+}
+
+fn cli_session_path_exists(path: &Path) -> io::Result<bool> {
+    // A dangling symlink is an existing, invalid source, not a new session.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn invocation_path(path: &Path, invocation_cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        invocation_cwd.join(path)
+    }
+}
+
+#[allow(clippy::unnecessary_debug_formatting)]
+fn cli_path_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Session selection requires a UTF-8 path: {path:?}"))
+}
+
+/// Select the original store before project trust, configuration or tools.
+/// Session locators are anchored to the invocation directory; runtime paths
+/// are resolved later, against the saved workspace. No process cwd is changed.
+#[allow(clippy::too_many_lines, clippy::unnecessary_debug_formatting)]
+async fn resolve_cli_session_workdir(
+    cli: &mut cli::Cli,
+    invocation_cwd: &Path,
+) -> Result<Option<pi::session_workdir::SavedSessionWorkdir>> {
+    if !cli_uses_runtime_session(cli) {
+        if cli.session_workdir.is_some() {
+            bail!("--session-workdir requires resuming an existing --session");
+        }
+        return Ok(None);
+    }
+    if cli.no_session {
+        return Ok(None);
+    }
+    if let Some(path) = &cli.session_dir {
+        cli.session_dir = Some(cli_path_string(&invocation_path(
+            Path::new(path),
+            invocation_cwd,
+        ))?);
+    }
+    let selected = if let Some(path) = &cli.session {
+        Some(invocation_path(Path::new(path), invocation_cwd))
+    } else if cli.resume {
+        // The destination's project settings cannot be read until the picker
+        // has selected it. Only global picker preferences are safe here.
+        let picker_config = Config::load_global_only()?;
+        let input = picker_config
+            .session_picker_input
+            .filter(|value| *value > 0)
+            .map(|value| value.to_string());
+        Box::pin(Session::resume_with_picker(
+            cli.session_dir.as_deref().map(Path::new),
+            &picker_config,
+            input,
+        ))
+        .await?
+        .path
+    } else if cli.r#continue {
+        Session::recent_session_path_in_dir(cli.session_dir.as_deref().map(Path::new)).await?
+    } else {
+        None
+    };
+    // Do not scan or open a second picker after project startup. In particular,
+    // FTUI must receive exactly the same selected store as classic/RPC.
+    cli.resume = false;
+    cli.r#continue = false;
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    let path = invocation_path(&path, invocation_cwd);
+    cli.session = Some(cli_path_string(&path)?);
+    if !cli_session_path_exists(&path)? {
+        if cli.session_workdir.is_some() {
+            bail!("--session-workdir requires an existing --session file: {path:?}");
+        }
+        return Ok(None);
+    }
+
+    let mut saved = pi::session_workdir::inspect_saved_session_workdir(&path).await?;
+    let session_path = cli_path_string(&saved.source_path)?;
+    cli.session = Some(session_path.clone());
+    if let Some(target) = &cli.session_workdir {
+        let target = invocation_path(target, invocation_cwd);
+        let (mut session, diagnostics) = Session::open_with_diagnostics(&session_path).await?;
+        if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty()
+        {
+            bail!(
+                "PI_SESSION_RECOVERY_DIAGNOSTICS: inspect this session with --session-audit before workdir recovery"
+            );
+        }
+        saved.check_loaded_session(&session)?;
+        if pi::session_workdir::attach_session_workdir(&mut session, &target)? {
+            // Explicit consent only becomes effective after its provenance is
+            // durable. A save failure must not launch tools in the new project.
+            session.save().await?;
+        }
+        saved = pi::session_workdir::inspect_saved_session_workdir(&saved.source_path).await?;
+    }
+    Ok(Some(saved))
+}
+
+/// Native operator commands supplied directly on the print command line.
+#[derive(Debug, PartialEq, Eq)]
+enum PrintMcpCommand {
+    List,
+    Inspect(String),
+    Trust(String),
+    Deny(String),
+    Test(String),
+    Refresh(Option<String>),
+    Reauthenticate(String),
+    Unauthenticate(String),
+}
+
+impl PrintMcpCommand {
+    const fn rpc_name(&self) -> &'static str {
+        match self {
+            Self::List => "mcp_list",
+            Self::Inspect(_) => "mcp_inspect",
+            Self::Trust(_) => "mcp_trust",
+            Self::Deny(_) => "mcp_deny",
+            Self::Test(_) => "mcp_test",
+            Self::Refresh(_) => "mcp_refresh",
+            Self::Reauthenticate(_) => "mcp_reauth",
+            Self::Unauthenticate(_) => "mcp_unauth",
+        }
+    }
+}
+
+/// Read original argv before files or prompt resources can supply text. One
+/// quoted argument preserves exact names, including internal whitespace.
+fn print_mcp_command(cli: &cli::Cli, piped_stdin: Option<&str>) -> Result<Option<PrintMcpCommand>> {
+    let print_mode = cli
+        .mode
+        .as_deref()
+        .map_or(cli.print, |mode| matches!(mode, "text" | "json"));
+    if !print_mode || cli.acp || cli.export.is_some() || cli.list_models.is_some() {
+        return Ok(None);
+    }
+    let messages = cli.message_args();
+    let candidate = messages.iter().find_map(|text| {
+        let rest = text.trim().strip_prefix("/mcp")?;
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some((rest.trim(), *text))
+    });
+    let Some((rest, original)) = candidate else {
+        return Ok(None);
+    };
+    if messages.len() != 1 || !cli.file_args().is_empty() || piped_stdin.is_some() {
+        bail!(
+            "MCP operator commands require one standalone quoted argument, without piped input or file attachments"
+        );
+    }
+    if original.contains(['\r', '\n']) {
+        bail!("An MCP operator command must be on one line");
+    }
+    let (verb, name) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, None), |(verb, name)| {
+            (verb, Some(name.trim()).filter(|name| !name.is_empty()))
+        });
+    let command = match (verb, name) {
+        ("" | "list", None) => PrintMcpCommand::List,
+        ("inspect", Some(name)) => PrintMcpCommand::Inspect(name.to_string()),
+        ("trust", Some(name)) => PrintMcpCommand::Trust(name.to_string()),
+        ("deny", Some(name)) => PrintMcpCommand::Deny(name.to_string()),
+        ("test", Some(name)) => PrintMcpCommand::Test(name.to_string()),
+        ("refresh", name) => PrintMcpCommand::Refresh(name.map(str::to_string)),
+        ("reauth", Some(name)) => PrintMcpCommand::Reauthenticate(name.to_string()),
+        ("unauth", Some(name)) => PrintMcpCommand::Unauthenticate(name.to_string()),
+        _ => bail!(
+            "Usage: /mcp list | inspect NAME | trust NAME | deny NAME | test NAME | refresh [NAME] | reauth NAME | unauth NAME"
+        ),
+    };
+    Ok(Some(command))
+}
+
+async fn execute_print_mcp_command(
+    manager: &pi::mcp::McpManager,
+    command: &PrintMcpCommand,
+    on_url: Arc<dyn Fn(&str) + Send + Sync>,
+) -> pi::error::Result<Value> {
+    match command {
+        PrintMcpCommand::List => Ok(json!({"servers": manager.list()})),
+        PrintMcpCommand::Inspect(name) => {
+            let server = manager
+                .list()
+                .into_iter()
+                .find(|server| server.name == *name)
+                .ok_or_else(|| {
+                    pi::error::Error::tool(
+                        "mcp",
+                        format!("[MCP_UNKNOWN_SERVER] unknown server {name:?}; use /mcp list"),
+                    )
+                })?;
+            Ok(json!({"server": server}))
+        }
+        PrintMcpCommand::Trust(name) => {
+            let tools = manager.trust(name).await?;
+            Ok(json!({"server": name, "trusted": true, "tools": tools.len()}))
+        }
+        PrintMcpCommand::Deny(name) => {
+            manager.deny(name).await?;
+            Ok(json!({"server": name, "trusted": false}))
+        }
+        PrintMcpCommand::Test(name) => {
+            let tools = manager.test(name).await?;
+            Ok(json!({"server": name, "tools": tools.len()}))
+        }
+        PrintMcpCommand::Refresh(Some(name)) => {
+            let tools = manager.refresh_tools(name).await?;
+            Ok(json!({"server": name, "tools": tools.len()}))
+        }
+        PrintMcpCommand::Refresh(None) => {
+            manager.connect_trusted().await;
+            Ok(json!({"servers": manager.list()}))
+        }
+        PrintMcpCommand::Reauthenticate(name) => {
+            Box::pin(manager.reauthenticate(name, None, on_url)).await?;
+            let tools = manager
+                .list()
+                .iter()
+                .find(|server| server.name == *name)
+                .map_or(0, |server| server.tools);
+            Ok(json!({"server": name, "authenticated": true, "tools": tools}))
+        }
+        PrintMcpCommand::Unauthenticate(name) => {
+            Box::pin(manager.unauthenticate(name)).await?;
+            Ok(json!({"server": name, "authenticated": false, "tools": 0}))
+        }
+    }
+}
+
+/// Run before resources, extensions, or provider credentials load. The startup
+/// path still verifies a selected session's workspace before invoking MCP.
+/// Native MCP setup must work even when no LLM account has been configured.
 #[allow(clippy::too_many_lines)]
+async fn run_print_mcp_command(
+    command: PrintMcpCommand,
+    cli: &cli::Cli,
+    cwd: &Path,
+    global_dir: &Path,
+    project_trusted: bool,
+) -> Result<()> {
+    let json_mode = cli.mode.as_deref() == Some("json");
+    let action = command.rpc_name();
+    let auth_server = match &command {
+        PrintMcpCommand::Reauthenticate(name) | PrintMcpCommand::Unauthenticate(name) => {
+            Some(name.clone())
+        }
+        _ => None,
+    };
+    let record_type = if auth_server.is_some() {
+        "mcp_auth_result"
+    } else {
+        "mcp_result"
+    };
+    let outcome: Result<Value> = async {
+        if cli.no_mcp {
+            bail!("MCP is disabled by --no-mcp");
+        }
+        let manager =
+            pi::mcp::McpManager::bootstrap(cwd, global_dir, &cli.mcp_config, project_trusted)?;
+        let output_error = Arc::new(StdMutex::new(None::<io::Error>));
+        let owner = pi::agent_cx::AgentCx::for_current_or_request();
+        let on_url: Arc<dyn Fn(&str) + Send + Sync> = {
+            let server = auth_server.clone();
+            let output_error = Arc::clone(&output_error);
+            let owner = owner.clone();
+            Arc::new(move |url| {
+                let Some(server) = server.as_deref() else {
+                    return;
+                };
+                let output = if json_mode {
+                    format!(
+                        "{}\n",
+                        json!({
+                            "type": "mcp_auth_url",
+                            "command": "mcp_reauth",
+                            "server": server,
+                            "url": url,
+                        }),
+                    )
+                } else {
+                    format!("Open this URL to sign in to MCP server {server}:\n{url}\n")
+                };
+                if let Err(error) = emit_text_delta(&output) {
+                    *output_error
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                    // Stop waiting when the sign-in URL could not be delivered.
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("MCP sign-in URL output failed"),
+                    );
+                }
+            })
+        };
+        let result = owner
+            .with_current(Box::pin(execute_print_mcp_command(
+                &manager, &command, on_url,
+            )))
+            .await;
+        // This invocation owns its processes and receive tasks, including
+        // partial connections left by failed setup or authentication.
+        manager.shutdown_all().await;
+        let failed_output = output_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(error) = failed_output {
+            return Err(error.into());
+        }
+        result.map_err(anyhow::Error::from)
+    }
+    .await;
+    match outcome {
+        Ok(data) => {
+            let output = if json_mode {
+                let record = if auth_server.is_some() {
+                    let mut record = data;
+                    record["type"] = json!(record_type);
+                    record["command"] = json!(action);
+                    record["success"] = json!(true);
+                    record
+                } else {
+                    json!({
+                        "type": record_type,
+                        "command": action,
+                        "success": true,
+                        "data": data,
+                    })
+                };
+                record.to_string()
+            } else {
+                serde_json::to_string_pretty(&data)?
+            };
+            emit_text_delta(&format!("{output}\n"))?;
+            Ok(())
+        }
+        Err(error) => {
+            if json_mode {
+                let mut record = json!({
+                    "type": record_type,
+                    "command": action,
+                    "success": false,
+                    "error": error.to_string(),
+                });
+                if let Some(server) = auth_server {
+                    record["server"] = json!(server);
+                }
+                emit_text_delta(&format!("{record}\n"))?;
+            }
+            Err(error)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::future_not_send,
+    clippy::unnecessary_debug_formatting
+)]
 async fn run(
     mut cli: cli::Cli,
     extension_flags: Vec<cli::ExtensionCliFlag>,
     runtime_handle: RuntimeHandle,
     package_subcommand_trust: Option<bool>,
+    piped_stdin: Option<String>,
 ) -> Result<()> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let invocation_cwd = std::env::current_dir()?;
+    let requested_session = pi::app::requested_a_session(&cli);
+    if cli_uses_runtime_session(&cli)
+        && !requested_session
+        && (cli.print || matches!(cli.mode.as_deref(), Some("text" | "json")))
+    {
+        cli.no_session = true;
+    }
+    let saved_workdir = resolve_cli_session_workdir(&mut cli, &invocation_cwd).await?;
+    let cwd = match &saved_workdir {
+        Some(saved) => saved.resolve_runtime_cwd(None)?,
+        None => invocation_cwd,
+    };
+    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
+    for path in &mut cli.mcp_config {
+        *path = invocation_path(path, &cwd);
+    }
 
     // Multi-root workspace (bd-cv653.3.12): shared handle threaded through
     // @-file processing, the tool registry, and the interactive host so
@@ -1443,15 +1944,15 @@ async fn run(
     // Arc<RwLock> is shared across clones).
     let mut workspace = pi::workspace::WorkspaceHandle::single(&cwd);
 
-    // #210: install the effective proxy configuration before any HTTP client
-    // is constructed, so provider calls, OAuth, update checks, URL reads, and
-    // package fetches all take the same route. Settings-file failures are not
-    // fatal here (the ambient environment still applies) — the config load
-    // below reports them on its own path.
-    for warning in
-        pi::http::proxy::configure(Config::load().ok().and_then(|config| config.http).as_ref())
-    {
-        tracing::warn!("{warning}");
+    // Subcommands can use HTTP before the runtime configuration below. Normal
+    // session startup installs the selected workspace's trusted proxy settings
+    // after discovery instead of reading the invocation project's settings.
+    if cli.command.is_some() || cli.fetch_models.is_some() {
+        for warning in
+            pi::http::proxy::configure(Config::load().ok().and_then(|config| config.http).as_ref())
+        {
+            tracing::warn!("{warning}");
+        }
     }
 
     // Resolve the HTTP request timeout before any provider HTTP client is
@@ -1473,7 +1974,7 @@ async fn run(
         } else {
             false
         };
-        handle_subcommand(command, &cwd, project_trusted).await?;
+        handle_subcommand(command, &cwd, project_trusted, &mut cli).await?;
         return Ok(());
     }
 
@@ -1500,6 +2001,7 @@ async fn run(
         }
     }
 
+    let config_path = Config::config_path_override_from_env(&cwd);
     // Workspace trust (GH #151): before any project settings merge or
     // resource resolution, decide whether this workspace's project-local
     // configuration (.pi/settings.json packages, .pi/extensions/) may load
@@ -1520,10 +2022,15 @@ async fn run(
             && io::stdout().is_terminal();
         // trustAllWorkspaces is honored from the GLOBAL settings only: a
         // project file granting itself trust would defeat the gate.
-        let trust_all = Config::load_global_only()
-            .ok()
-            .and_then(|global| global.trust_all_workspaces)
-            .unwrap_or(false);
+        let trust_all = Config::load_with_roots_and_project_trust(
+            config_path.as_deref(),
+            &Config::global_dir(),
+            &cwd,
+            false,
+        )
+        .ok()
+        .and_then(|global| global.trust_all_workspaces)
+        .unwrap_or(false);
         let inputs = pi::workspace_trust::TrustInputs {
             cli_trust: cli.trust,
             trust_all_workspaces: trust_all,
@@ -1551,7 +2058,15 @@ async fn run(
         state.trusted
     };
 
-    let mut config = Config::load_with_project_trust(workspace_trusted)?;
+    let mut config = Config::load_with_roots_and_project_trust(
+        config_path.as_deref(),
+        &Config::global_dir(),
+        &cwd,
+        workspace_trusted,
+    )?;
+    for warning in pi::http::proxy::configure(config.http.as_ref()) {
+        tracing::warn!("{warning}");
+    }
     if let Some(theme_spec) = cli.theme.as_deref() {
         // Theme already validated above
         config.theme = Some(theme_spec.to_string());
@@ -1569,6 +2084,66 @@ async fn run(
         && let Some(secs) = config.request_timeout_secs
     {
         pi::http::client::set_request_timeout_override(secs);
+    }
+
+    // Open and verify the store before resource loading, auth refresh, tool
+    // construction or extension prewarm can act on the selected workspace.
+    let startup_session = if cli_uses_runtime_session(&cli) {
+        let mut session = Box::pin(Session::new(&cli, &config)).await?;
+        if let Some(saved) = &saved_workdir {
+            saved.check_loaded_session(&session)?;
+            saved.check_runtime_cwd(&cwd)?;
+        } else if !cli.no_session {
+            if let Some(path) = cli.session.as_deref()
+                && cli_session_path_exists(Path::new(path))?
+            {
+                bail!(
+                    "PI_SESSION_WORKDIR_SOURCE_CHANGED: session file appeared during startup; retry discovery before resuming"
+                );
+            }
+            session.header.cwd = cli_path_string(&cwd)?;
+        }
+        // All roots must be available to tools and to initial @file scope
+        // checks, including roots restored from the saved session header.
+        for dir in &cli.add_dir {
+            let path = invocation_path(dir, &cwd);
+            let canonical = pi::workspace::validate_new_root(&path)
+                .map_err(|error| anyhow::anyhow!("--add-dir: {error}"))?;
+            workspace.add_root(&canonical);
+        }
+        for root in session.additional_roots() {
+            if !root.is_absolute() {
+                eprintln!("Warning: skipping non-absolute saved workspace root: {root:?}");
+                continue;
+            }
+            if let Err(error) = pi::workspace::validate_new_root(&root) {
+                eprintln!("Warning: skipping restored workspace root: {error}");
+            } else {
+                workspace.add_root(&root);
+            }
+        }
+        let snapshot = workspace.snapshot_or(&cwd);
+        let additional = snapshot.additional();
+        if !additional.is_empty() || !cli.add_dir.is_empty() {
+            session.set_additional_roots(additional);
+        }
+        Some(session)
+    } else {
+        None
+    };
+
+    // Verify any selected session's workspace above before MCP can act on it.
+    // Only original operator argv enters this route, before prompt/resource
+    // expansion, extension prewarm, or provider credential/model selection.
+    if let Some(command) = print_mcp_command(&cli, piped_stdin.as_deref())? {
+        return Box::pin(run_print_mcp_command(
+            command,
+            &cli,
+            &cwd,
+            &Config::global_dir(),
+            workspace_trusted,
+        ))
+        .await;
     }
 
     let startup_mode = cli.mode.clone().unwrap_or_else(|| {
@@ -1673,7 +2248,14 @@ async fn run(
     let prewarm_memory_limit_bytes =
         (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
 
-    let is_interactive = !cli.print && cli.mode.is_none() && cli.export.is_none();
+    let is_interactive = !cli.acp && !cli.print && cli.mode.is_none() && cli.export.is_none();
+    let supports_prewalk = is_interactive
+        || cli.acp
+        || (cli.export.is_none()
+            && (cli.print || matches!(cli.mode.as_deref(), Some("text" | "json" | "rpc"))));
+    if !supports_prewalk && (cli.prewalk || cli.prewalk_into.is_some()) {
+        bail!("Prewalk CLI flags require an agent execution mode, not session export");
+    }
     // The default FTUI stack runs on an SDK session that boots its own
     // extension runtime (`pi::sdk::create_agent_session`), so the classic
     // startup below must not boot one as well: until 2026-09-02 every FTUI
@@ -1729,13 +2311,17 @@ async fn run(
     for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
         eprintln!("Warning: --tools: \"{name}\" is not selected with --tools; {how}");
     }
-    let shared_tools = pi::tools::SharedToolRegistry::new(ToolRegistry::with_mutation_recorder(
-        &shared_enabled_tools,
-        &cwd,
-        Some(&config),
-        Some(Arc::clone(&session_mutation_recorder)),
-        Some(&workspace),
-    ));
+    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.no_tools {
+        ToolRegistry::without_builtins(Some(&config))
+    } else {
+        ToolRegistry::with_mutation_recorder(
+            &shared_enabled_tools,
+            &cwd,
+            Some(&config),
+            Some(Arc::clone(&session_mutation_recorder)),
+            Some(&workspace),
+        )
+    });
 
     // Pre-warm extension runtime in a background task so startup work can overlap
     // with auth refresh, model selection, and session creation.
@@ -1835,6 +2421,7 @@ async fn run(
         }
         Err(err) => return Err(err.into()),
     };
+    auth.set_command_working_directory(&cwd)?;
 
     // gh #218: refresh stored OAuth credentials without letting an unrelated
     // provider's stale login abort the run. An explicit `--api-key` for an
@@ -1871,7 +2458,7 @@ async fn run(
     }
 
     let global_dir = Config::global_dir();
-    let package_dir = Config::package_dir();
+    let package_dir = invocation_path(&Config::package_dir(), &cwd);
     let models_path = default_models_path(&global_dir);
     let mut model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
     if let Some(error) = model_registry.error() {
@@ -1886,19 +2473,25 @@ async fn run(
     // for Zed editor integration. Sessions are created on-demand via the protocol
     // so we skip the normal session/model selection pipeline.
     if cli.acp {
-        let available_models = model_registry.get_available();
+        let available_models = rpc_available_models(&model_registry, cli.api_key.as_deref());
         let acp_options = pi::acp::AcpOptions {
             config: config.clone(),
+            launch: pi::acp::AcpLaunchOptions::from_cli(&cli),
             available_models,
             model_registry: model_registry.clone(),
             auth: auth.clone(),
+            oauth_refresh_failures: startup_oauth_refresh
+                .failed_provider_ids()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             runtime_handle: runtime_handle.clone(),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
-            // ACP sessions always carry the read tool, so skills are listed
-            // as on the terminal stacks.
+            // The ACP prompt builder advertises skills only when this launch
+            // enables the read tool, as on the terminal stacks.
             skills_prompt: Some(resources.format_skills_for_prompt()),
         };
-        return run_acp_mode(acp_options).await;
+        return Box::pin(run_acp_mode(acp_options)).await;
     }
 
     if let Some(export_path) = cli.export.clone() {
@@ -1910,17 +2503,11 @@ async fn run(
 
     pi::app::validate_rpc_args(&cli)?;
 
-    // Explicit --add-dir roots must be live BEFORE @file arguments are
-    // scope-checked below, or `pi --add-dir /extra "@/extra/notes.md"`
-    // fails with "Cannot read outside the working directory". Restored
-    // session roots are layered later (they need the session open).
-    for dir in &cli.add_dir {
-        let canonical =
-            pi::workspace::validate_new_root(dir).map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
-        workspace.add_root(&canonical);
-    }
-
     let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
+    let first_message_is_piped = piped_stdin.is_some();
+    if let Some(input) = piped_stdin {
+        messages.insert(0, input);
+    }
     let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
     let initial = pi::app::prepare_initial_message(
         &cwd,
@@ -1943,13 +2530,9 @@ async fn run(
         }
     });
     let is_print_mode = mode.eq("text") || mode.eq("json");
-    // `pi::app::normalize_cli` has already applied this for `--print`; this
-    // covers `--mode text|json` without `-p`, and keeps the policy stated at
-    // the point of use. The two conditions must stay identical, which is why
-    // both call the same predicate (bd-print-session-path-persists-nothing).
-    if is_print_mode && !pi::app::requested_a_session(&cli) {
-        cli.no_session = true;
-    }
+    // Persistence was decided before resolving --continue/--resume into an
+    // exact path, including the no-candidate case that creates a new session.
+    debug_assert!(!is_print_mode || requested_session || cli.no_session);
     if mode.eq("text") && initial.is_none() && messages.is_empty() {
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
     }
@@ -1969,6 +2552,8 @@ async fn run(
         config.enabled_models.clone().unwrap_or_default()
     };
     let disabled_providers = config.disabled_providers.clone().unwrap_or_default();
+    // This pre-registration view feeds the initial picker.
+    // resolve_selection_with_auth validates the final scope on every pass.
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
@@ -1989,44 +2574,18 @@ async fn run(
     };
     let has_extensions = !resources.extensions().is_empty();
 
-    if has_cli_api_key_override(cli.api_key.as_deref())
-        && cli.provider.is_none()
-        && cli.model.is_none()
-    {
-        let allow_unresolved_scope = has_extensions && !scoped_patterns.is_empty();
-        if scoped_models.is_empty() && !allow_unresolved_scope {
-            bail!("--api-key requires a model to be specified via --provider/--model or --models");
-        }
-    }
+    validate_startup_api_key_scope(&cli, &scoped_patterns)?;
 
     let allow_setup_prompt =
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
-    let mut session = Box::pin(Session::new(&cli, &config)).await?;
-
-    // Multi-root roots (bd-cv653.3.12): restore persisted additional_roots on
-    // resume (explicit --add-dir flags were layered above, before @file
-    // scope checks) and persist the resulting canonical set for future
-    // resumes. A vanished restored root degrades to a warning rather than
-    // blocking resume; `add_root` dedups against the explicit flags.
-    {
-        for root in session.additional_roots() {
-            if let Err(err) = pi::workspace::validate_new_root(&root) {
-                eprintln!("Warning: skipping restored workspace root: {err}");
-            } else {
-                workspace.add_root(&root);
-            }
-        }
-        let snapshot = workspace.snapshot_or(&cwd);
-        let additional = snapshot.additional();
-        if !additional.is_empty() || !cli.add_dir.is_empty() {
-            session.set_additional_roots(additional);
-        }
-    }
+    let session =
+        startup_session.ok_or_else(|| anyhow::anyhow!("Runtime session was not initialized"))?;
 
     let (mut selection, mut resolved_key) = match resolve_selection_with_auth(
         &mut cli,
         &config,
         &session,
+        &cwd,
         &mut model_registry,
         &scoped_patterns,
         &mut auth,
@@ -2050,17 +2609,38 @@ async fn run(
             }
         }
     };
-    // gh #218: now that the model is known, a failed refresh matters only if
-    // this run would actually send that provider's stale OAuth token.
-    if !has_cli_api_key_override(cli.api_key.as_deref())
-        && let Some(failure) =
-            startup_oauth_refresh.failure_for(&selection.model_entry.model.provider)
-    {
-        return Err(anyhow::Error::new(pi::error::Error::auth(format!(
-            "OAuth token refresh failed for: {} ({}) — run `pi auth login {}` to renew it",
-            failure.provider, failure.error, failure.provider
-        ))));
-    }
+    // Extensions can replace this preliminary selection, including the native
+    // bootstrap used while an allowed scoped extension model is unregistered.
+    // The SDK validates its final destination; classic/RPC does so below.
+    validate_startup_oauth_refresh(
+        &cli,
+        &startup_oauth_refresh,
+        &selection.model_entry.model.provider,
+        &[],
+        has_extensions,
+    )?;
+
+    let prewalk_enabled = !cli.no_prewalk
+        && (cli.prewalk
+            || cli.prewalk_into.is_some()
+            || (is_interactive
+                && saved_workdir.is_none()
+                && config
+                    .prewalk
+                    .as_ref()
+                    .and_then(|settings| settings.enabled)
+                    == Some(true)));
+    let prewalk_target = if prewalk_enabled {
+        Some(pi::app::resolve_prewalk_target(
+            cli.prewalk_into.as_deref().unwrap_or("@smol"),
+            &cli,
+            &config,
+            &model_registry,
+            &cwd,
+        )?)
+    } else {
+        None
+    };
 
     let enabled_tools = cli.enabled_tools();
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
@@ -2103,29 +2683,12 @@ async fn run(
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>();
-        // `--continue` (bd-ydz1t.3). The classic stack resolves it inside
-        // Session::from_cli, which this path does not use; SessionOptions
-        // has no "reopen the latest" concept, so the flag was silently
-        // dropped and the user got a fresh session instead of their last
-        // one. Resolve it to a concrete path here, through the same lookup
-        // the classic stack uses, and hand it over as `session_path`.
-        //
-        // `--session` still wins, and `--no-session` short-circuits below,
-        // which is Session::from_cli's own precedence. `None` means this
-        // directory has nothing continuable, and a new session is exactly
-        // what the classic stack produces there too.
-        let continue_session_path = if cli.r#continue && cli.session.is_none() {
-            pi::session::Session::recent_session_path_in_dir(
-                cli.session_dir.as_ref().map(Path::new),
-            )
-            .await?
-        } else {
-            None
-        };
         let options = pi::sdk::SessionOptions {
             provider: cli.provider.clone(),
             model: cli.model.clone(),
+            model_scope: cli.models.as_deref().map(pi::app::parse_models_arg),
             api_key: cli.api_key.clone(),
+            prewalk: prewalk_target.clone(),
             working_directory: Some(cwd.clone()),
             workspace_trusted,
             // Session persistence honors the same flags as the default
@@ -2134,11 +2697,8 @@ async fn run(
             // creates its own session file; the bootstrap session was
             // dropped above without writing anything.
             no_session: cli.no_session,
-            session_path: cli
-                .session
-                .as_ref()
-                .map(PathBuf::from)
-                .or(continue_session_path),
+            // Startup already resolved --session, --continue and --resume.
+            session_path: cli.session.as_ref().map(PathBuf::from),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
             workspace: Some(workspace.clone()),
             // Extensions load with UI prompts bridged (bd-1eoh4): the
@@ -2167,8 +2727,9 @@ async fn run(
                 .contains(&"read")
                 .then(|| resources.format_skills_for_prompt()),
             max_tool_iterations,
+            max_time: cli.max_time.map(std::time::Duration::from_secs),
             package_dir: Some(package_dir.clone()),
-            mcp: Some(pi::sdk::McpSessionOptions {
+            mcp: (!cli.no_mcp).then(|| pi::sdk::McpSessionOptions {
                 config_paths: cli.mcp_config.clone(),
                 global_dir: Some(pi::config::Config::global_dir()),
             }),
@@ -2265,6 +2826,16 @@ async fn run(
                 hide_thinking_block: config.hide_thinking_block.unwrap_or(false),
                 model_names: ftui_model_names,
                 start_in_plan_mode: cli.plan_mode,
+                prewalk_target: pi::app::resolve_prewalk_target(
+                    "@smol",
+                    &cli,
+                    &config,
+                    &model_registry,
+                    &cwd,
+                )
+                .ok(),
+                initial_content: initial,
+                initial_messages: messages,
                 double_escape_action: pi::interactive_ftui::DoubleEscapeAction::from_setting(
                     config.double_escape_action.as_deref(),
                 ),
@@ -2272,6 +2843,16 @@ async fn run(
                 // the classic stack does: the `task` role, falling back to
                 // `smol`.
                 subagent_role_spec: pi::app::subagent_role_spec(&config),
+                title_client: pi::app::titling_model_entry(&cli, &config, &model_registry)
+                    .and_then(|entry| {
+                        pi::session_title::TitleClient::for_model_entry(
+                            &entry,
+                            &selection.model_entry,
+                            cli.api_key.as_deref(),
+                            &auth,
+                            config.secrets.as_ref(),
+                        )
+                    }),
                 // /btw answers with the smol role model, resolved exactly as
                 // the classic stack resolves it; `None` without credentials.
                 btw_client: pi::app::resolve_role_model(
@@ -2285,6 +2866,7 @@ async fn run(
                         &resolution.model_entry,
                         cli.api_key.as_deref(),
                         &auth,
+                        config.secrets.as_ref(),
                     )
                 }),
                 // ctrl+p cycles the same resolved scope the classic stack
@@ -2345,8 +2927,8 @@ async fn run(
         Some(&foreign_rules),
         &config,
     )?;
-    let provider =
-        providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
+    let provider = providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))
+        .map_err(anyhow::Error::new)?;
     let stream_options =
         pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
 
@@ -2394,6 +2976,15 @@ async fn run(
             .agent
             .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
     }
+    if !test_mode && !cli.no_context_files {
+        agent_session
+            .agent
+            .set_stream_rule_source(pi::stream_rules::StreamRuleSource::new(
+                cwd.clone(),
+                global_dir.clone(),
+                workspace_trusted,
+            ))?;
+    }
     // The todo tool needs the live session for todo_list.v1 persistence, so
     // it joins after construction (opt-in via --tools ...todo, like subagent).
     if enabled_tools.contains(&"todo") {
@@ -2403,17 +2994,19 @@ async fn run(
         ]);
     }
     // submit_plan shares the agent's plan-mode state (bd-cv653.3.5); it is
-    // always registered — the tool self-errors outside plan mode.
+    // registered when built-ins are enabled, and self-errors outside plan mode.
     {
         let plan_state = agent_session.agent.plan_state();
         let auto_approve = cli.plan_yolo || config.plan_auto_approve();
-        agent_session
-            .agent
-            .extend_tools(vec![Box::new(pi::plan::SubmitPlanTool::new(
-                plan_state.clone(),
-                auto_approve,
-            )) as Box<dyn pi::tools::Tool>]);
-        if cli.plan_mode {
+        if !cli.no_tools {
+            agent_session
+                .agent
+                .extend_tools(vec![Box::new(pi::plan::SubmitPlanTool::new(
+                    plan_state.clone(),
+                    auto_approve,
+                )) as Box<dyn pi::tools::Tool>]);
+        }
+        if cli.plan_mode && !cli.no_tools {
             plan_state.enter_planning();
             let cx = pi::agent_cx::AgentCx::for_request();
             if let Ok(mut inner) = agent_session.session.lock(cx.cx()).await {
@@ -2422,11 +3015,17 @@ async fn run(
                     Some(serde_json::json!({"mode": "planning", "via": "--plan-mode"})),
                 );
             }
+        } else if cli.plan_mode {
+            eprintln!("Warning: --plan-mode is unavailable while --no-tools is enabled");
         }
     }
     agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)
         .as_ref()
-        .map(pi::advisor::AdvisorOptions::runtime);
+        .map(|options| {
+            options
+                .runtime()
+                .with_secrets_settings(config.secrets.as_ref())
+        });
     // Host authorization must not depend on granting the model the ask tool.
     // The registry picker is always handed to interactive/RPC hosts; only this
     // conditional extend adds ask to the provider-visible schema.
@@ -2462,16 +3061,25 @@ async fn run(
                     &resolution.model_entry,
                     cli.api_key.as_deref(),
                     &auth,
+                    config.secrets.as_ref(),
                 )
             });
     // Rebinding factory (bd-9jgrt): lets `/model smol <spec>` rebuild the
     // /btw client mid-session against fresh on-disk credentials.
     let btw_api_key = cli.api_key.clone();
+    let btw_secrets_settings = config.secrets.clone();
+    let btw_cwd = cwd.clone();
     let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
-        let Ok(auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
+        let Ok(mut auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
             return None;
         };
-        pi::btw::BtwClient::for_model_entry(entry, btw_api_key.as_deref(), &auth)
+        auth.set_command_working_directory(&btw_cwd).ok()?;
+        pi::btw::BtwClient::for_model_entry(
+            entry,
+            btw_api_key.as_deref(),
+            &auth,
+            btw_secrets_settings.as_ref(),
+        )
     });
 
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
@@ -2480,12 +3088,16 @@ async fn run(
     // first-class mcp__<server>__<tool> tools. Pending/denied servers are
     // never spawned; /mcp shows provenance + health for everything. The
     // default FTUI launched above owns its manager through its SDK session.
-    let mcp_manager = std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
-        &cwd,
-        &pi::config::Config::global_dir(),
-        &cli.mcp_config,
-        workspace_trusted,
-    )?);
+    let mcp_manager = if cli.no_mcp {
+        None
+    } else {
+        Some(std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
+            &cwd,
+            &pi::config::Config::global_dir(),
+            &cli.mcp_config,
+            workspace_trusted,
+        )?))
+    };
     let mut extension_bindings = Vec::new();
     let mut extension_model_entries = Vec::new();
 
@@ -2562,14 +3174,16 @@ async fn run(
             // Bridge extension-registered MCP servers into the unified MCP
             // client registry (bd-cv653.6.1): same spawn path, same trust
             // gate, provenance=extension in /mcp.
-            for spec in region.manager().extension_mcp_servers() {
-                let name = spec
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if !name.is_empty() {
-                    mcp_manager.register_extension_server(&name, &spec);
+            if let Some(mcp_manager) = &mcp_manager {
+                for spec in region.manager().extension_mcp_servers() {
+                    let name = spec
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        mcp_manager.register_extension_server(&name, &spec);
+                    }
                 }
             }
             extension_bindings =
@@ -2664,9 +3278,9 @@ async fn run(
     // The classic/RPC session owns this manager; FTUI's SDK-owned manager
     // performs its own connect-and-mount pass after that session's
     // extensions load (bd-vjfol).
-    let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(&mcp_manager).await;
-    if !mcp_wrappers.is_empty() {
-        agent_session.agent.extend_tools(mcp_wrappers);
+    if let Some(mcp_manager) = &mcp_manager {
+        mcp_manager.connect_trusted().await;
+        pi::mcp::reconcile_tools(mcp_manager, &agent_session.agent.shared_tools());
     }
 
     if has_extensions {
@@ -2684,6 +3298,7 @@ async fn run(
             &mut cli,
             &config,
             &session_snapshot,
+            &cwd,
             &mut model_registry,
             &scoped_patterns,
             &mut auth,
@@ -2697,15 +3312,23 @@ async fn run(
             return Ok(());
         };
 
+        validate_startup_oauth_refresh(
+            &cli,
+            &startup_oauth_refresh,
+            &updated_selection.model_entry.model.provider,
+            &extension_bindings,
+            false,
+        )?;
         selection = updated_selection;
         resolved_key = updated_key;
 
-        let provider = providers::create_provider(
+        let provider = providers::create_provider_with_auth(
             &selection.model_entry,
             agent_session
                 .extensions
                 .as_ref()
                 .map(ExtensionRegion::manager),
+            Some(&auth),
         )
         .map_err(anyhow::Error::new)?;
         agent_session.agent.set_provider(provider);
@@ -2751,7 +3374,7 @@ async fn run(
             .lock(cx.cx())
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        pi::app::update_session_for_selection(&mut session, &selection);
+        pi::app::update_session_for_selection(&mut session, &selection, &model_registry);
     }
 
     if let Some(message) = &selection.fallback_message {
@@ -2774,6 +3397,15 @@ async fn run(
         agent_session.agent.replace_messages(history);
     }
 
+    if let Some(target) = prewalk_target {
+        match agent_session.arm_prewalk(target).await? {
+            Some(target) => eprintln!("Prewalk armed → {}", target.label()),
+            None => {
+                eprintln!("Prewalk: nothing to switch; target model and thinking already match")
+            }
+        }
+    }
+
     // Clone session handle for shutdown flush (ensures autosave queue is drained).
     let session_handle = Arc::clone(&agent_session.session);
 
@@ -2791,11 +3423,14 @@ async fn run(
         // owns the MCP manager: servers extensions register after startup are
         // synced into the session at the next prompt (bd-1wr1n).
         let mut agent_session = agent_session;
-        agent_session.set_mcp_manager(mcp_manager.clone());
+        if let Some(mcp_manager) = &mcp_manager {
+            agent_session.set_mcp_manager(mcp_manager.clone());
+        }
         // Boxed: this future is large (clippy::large_futures); boxing keeps the
         // enclosing future small.
         Box::pin(run_rpc_mode(
             agent_session,
+            cwd.clone(),
             resources,
             config.clone(),
             available_models,
@@ -2823,7 +3458,22 @@ async fn run(
                 )
             })
             .collect::<Vec<_>>();
-        let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
+        let title_client =
+            pi::app::titling_model_entry(&cli, &config, &model_registry).and_then(|entry| {
+                pi::session_title::TitleClient::for_model_entry(
+                    &entry,
+                    &selection.model_entry,
+                    cli.api_key.as_deref(),
+                    &auth,
+                    config.secrets.as_ref(),
+                )
+            });
+        let failover = pi::sdk::FailoverOptions::from_config(
+            &config,
+            available_models.clone(),
+            auth.clone(),
+            cli.api_key.clone(),
+        );
 
         Box::pin(run_interactive_mode(
             agent_session,
@@ -2833,7 +3483,7 @@ async fn run(
             selection.model_entry.clone(),
             model_scope,
             available_models,
-            title_model_entry,
+            title_client,
             !cli.no_session,
             resources,
             resource_cli,
@@ -2844,7 +3494,8 @@ async fn run(
             ask_tool,
             btw_client,
             Some(btw_factory),
-            Some(mcp_manager),
+            mcp_manager,
+            failover,
         ))
         .await
     } else {
@@ -2883,6 +3534,7 @@ async fn run(
             &mode,
             initial,
             messages,
+            first_message_is_piped,
             &resources,
             runtime_handle.clone(),
             &config,
@@ -2926,6 +3578,7 @@ const fn subcommand_uses_package_manager(command: &cli::Commands) -> bool {
             | cli::Commands::Remove { .. }
             | cli::Commands::Update { .. }
             | cli::Commands::List
+            | cli::Commands::Review { offline: false, .. }
             | cli::Commands::Config {
                 show: true,
                 paths: false,
@@ -2978,6 +3631,7 @@ async fn handle_subcommand(
     command: cli::Commands,
     cwd: &Path,
     project_trusted: bool,
+    cli: &mut cli::Cli,
 ) -> Result<()> {
     let manager = PackageManager::new(cwd.to_path_buf()).with_project_trust(project_trusted);
     match command {
@@ -3016,6 +3670,25 @@ async fn handle_subcommand(
             from_codex,
         } => {
             handle_import(from_claude.as_deref(), from_codex.as_deref())?;
+        }
+        cli::Commands::Recover {
+            source,
+            output,
+            session_output,
+            json,
+            active,
+            branch,
+            root,
+        } => {
+            handle_recover_blocking(
+                &source,
+                output.as_deref(),
+                session_output.as_deref(),
+                json,
+                active,
+                branch.as_deref(),
+                root,
+            )?;
         }
         cli::Commands::Handoff {
             to,
@@ -3062,6 +3735,7 @@ async fn handle_subcommand(
         }
         cli::Commands::Review {
             target,
+            offline,
             fail_on,
             format,
             confidence_threshold,
@@ -3076,7 +3750,11 @@ async fn handle_subcommand(
                 confidence_threshold,
                 max_findings,
                 out,
-            )?;
+                offline,
+                project_trusted,
+                cli,
+            )
+            .await?;
         }
         cli::Commands::Gc {
             older_than,
@@ -5434,7 +6112,7 @@ fn handle_stats(
 /// `pi rules list|add|remove|test|export|import` (bd-cv653.3.4):
 /// user-facing stream rules manager.
 fn handle_rules(cwd: &Path, command: &cli::RulesCommands) -> Result<()> {
-    let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd);
+    let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd)?;
 
     match command {
         cli::RulesCommands::List { global } => {
@@ -5552,7 +6230,7 @@ fn handle_grievances(cwd: &Path, command: &cli::GrievancesCommands) -> Result<()
             println!("  Pattern: {}", candidate.pattern);
             println!("  Body: {}", candidate.body);
 
-            let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd);
+            let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd)?;
             store.add_rule(candidate, false)?;
             println!("Saved candidate rule to project .pi/stream-rules.json");
         }
@@ -5749,7 +6427,8 @@ async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
 }
 
 /// `pi review [TARGET]` (bd-cv653.3.11): prioritized code review with ship verdict.
-fn handle_review(
+#[allow(clippy::too_many_arguments)]
+async fn handle_review(
     cwd: &Path,
     target: Option<&str>,
     fail_on: Option<&str>,
@@ -5757,6 +6436,9 @@ fn handle_review(
     confidence_threshold: f64,
     max_findings: usize,
     out: Option<PathBuf>,
+    offline: bool,
+    project_trusted: bool,
+    cli: &mut cli::Cli,
 ) -> Result<()> {
     // An unparseable --fail-on must not silently disable the gate (CI would
     // pass with P0 findings present).
@@ -5776,8 +6458,14 @@ fn handle_review(
         max_findings,
         out_file: out,
     };
+    options.validate()?;
 
-    let report = pi::review::CodeReviewer::review(cwd, &options)?;
+    let report = if offline {
+        pi::review::CodeReviewer::review(cwd, &options)?
+    } else {
+        let client = review_model_client(cli, cwd, project_trusted).await?;
+        client.review(cwd, &options, None).await?
+    };
 
     match format {
         "json" => {
@@ -5792,11 +6480,7 @@ fn handle_review(
     }
 
     if let Some(threshold_sev) = fail_severity {
-        let has_failing = report
-            .findings
-            .iter()
-            .any(|f| f.severity <= threshold_sev && f.confidence >= confidence_threshold);
-        if has_failing {
+        if report.failing_findings > 0 {
             return Err(anyhow::anyhow!(
                 "Review failed: findings met or exceeded severity threshold {threshold_sev}"
             ));
@@ -5804,6 +6488,87 @@ fn handle_review(
     }
 
     Ok(())
+}
+
+/// Reuse the normal headless model/credential resolver without constructing a
+/// second agent, loading tools/extensions, or creating a durable conversation.
+async fn review_model_client(
+    cli: &mut cli::Cli,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<pi::review::ModelReviewer> {
+    let global = Config::global_dir();
+    let config_path = Config::config_path_override_from_env(cwd);
+    let config = Config::load_with_roots_and_project_trust(
+        config_path.as_deref(),
+        &global,
+        cwd,
+        project_trusted,
+    )?;
+    for warning in pi::http::proxy::configure(config.http.as_ref()) {
+        tracing::warn!("{warning}");
+    }
+    if cli.request_timeout.is_none()
+        && let Some(seconds) = config.request_timeout_secs
+    {
+        pi::http::client::set_request_timeout_override(seconds);
+    }
+    let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
+    let refresh = if startup_oauth_refresh_required(cli) {
+        auth.refresh_expired_oauth_tokens_report().await
+    } else {
+        pi::auth::OAuthRefreshReport::default()
+    };
+    let models_path = default_models_path(&global);
+    let mut registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+    if let Some(error) = registry.error() {
+        return Err(anyhow::anyhow!("Cannot load review model catalog: {error}"));
+    }
+    let scope = config
+        .model_scope_overrides
+        .as_deref()
+        .and_then(|overrides| pi::failover::best_scope_override(overrides, cwd));
+    let patterns = cli
+        .models
+        .as_deref()
+        .map(pi::app::parse_models_arg)
+        .or_else(|| scope.and_then(|scope| scope.enabled_models.clone()))
+        .unwrap_or_else(|| config.enabled_models.clone().unwrap_or_default());
+    validate_startup_api_key_scope(cli, &patterns)?;
+    let session = Session::in_memory();
+    let (selection, key) = resolve_selection_with_auth(
+        cli,
+        &config,
+        &session,
+        cwd,
+        &mut registry,
+        &patterns,
+        &mut auth,
+        &models_path,
+        false,
+        &[],
+        &[],
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("No review model selected"))?;
+    validate_startup_oauth_refresh(
+        cli,
+        &refresh,
+        &selection.model_entry.model.provider,
+        &[],
+        false,
+    )?;
+    if let Some(warning) = &selection.fallback_message {
+        eprintln!("{warning}");
+    }
+    let provider =
+        pi::providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))?;
+    let stream_options = pi::app::build_stream_options(&config, key, &selection, &session);
+    Ok(pi::review::ModelReviewer::new(
+        provider,
+        stream_options,
+        config.secrets.as_ref(),
+    ))
 }
 
 /// `pi gc` (bd-cv653.7.11): retention-policy pruning for sessions, artifacts, and caches.
@@ -8771,6 +9536,46 @@ fn has_cli_api_key_override(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|value| !value.trim().is_empty())
 }
 
+fn validate_startup_api_key_scope(cli: &cli::Cli, patterns: &[String]) -> Result<()> {
+    // Nonempty scopes are validated against the final registry, after any
+    // extension registration. A key alone must not select an arbitrary provider.
+    if has_cli_api_key_override(cli.api_key.as_deref())
+        && cli.provider.is_none()
+        && cli.model.is_none()
+        && patterns.is_empty()
+    {
+        bail!("--api-key requires a model to be specified via --provider/--model or --models");
+    }
+    Ok(())
+}
+
+/// Reject stale native OAuth credentials only after the final destination is
+/// known. A pending extension pass may change both the model and its auth flow.
+fn validate_startup_oauth_refresh(
+    cli: &cli::Cli,
+    refresh: &pi::auth::OAuthRefreshReport,
+    selected_provider: &str,
+    extension_bindings: &[ExtensionProviderBinding],
+    extensions_pending: bool,
+) -> Result<()> {
+    if extensions_pending
+        || has_cli_api_key_override(cli.api_key.as_deref())
+        || extension_bindings.iter().any(|binding| {
+            pi::provider_metadata::provider_ids_match(&binding.provider, selected_provider)
+                && binding.oauth_config.is_some()
+        })
+    {
+        return Ok(());
+    }
+    if let Some(failure) = refresh.failure_for(selected_provider) {
+        return Err(anyhow::Error::new(pi::error::Error::auth(format!(
+            "OAuth token refresh failed for: {} ({}) — run `pi auth login {}` to renew it",
+            failure.provider, failure.error, failure.provider
+        ))));
+    }
+    Ok(())
+}
+
 /// Whether startup should touch the stored OAuth credentials at all (gh #218).
 ///
 /// An explicit `--api-key` for an explicit `--provider`/`--model` satisfies
@@ -8795,6 +9600,7 @@ fn rpc_available_models(registry: &ModelRegistry, cli_api_key: Option<&str>) -> 
 #[allow(clippy::too_many_arguments)]
 async fn run_rpc_mode(
     session: AgentSession,
+    cwd: PathBuf,
     resources: ResourceLoader,
     config: Config,
     available_models: Vec<ModelEntry>,
@@ -8819,6 +9625,7 @@ async fn run_rpc_mode(
     let rpc_task = pi::rpc::run_stdio(
         session,
         pi::rpc::RpcOptions {
+            working_directory: Some(cwd),
             config,
             resources,
             available_models,
@@ -8882,12 +9689,217 @@ struct FailoverResolution<'a> {
     cli_api_key: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintCommand {
+    Compact,
+    Shake,
+    Retry,
+    Handoff,
+}
+
+impl PrintCommand {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Compact | Self::Shake => "compact",
+            Self::Retry => "retry",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
+/// Inspect original argv bytes only. Resource expansion and piped/file input
+/// never acquire command authority from their contents.
+fn parse_print_command(input: &str, from_argument: bool) -> Result<Option<PrintCommand>> {
+    if !from_argument {
+        return Ok(None);
+    }
+    let input = input.trim();
+    let (name, args) = input
+        .split_once(char::is_whitespace)
+        .map_or((input, ""), |(name, args)| (name, args.trim()));
+    match (name, args) {
+        ("/compact", "") => Ok(Some(PrintCommand::Compact)),
+        ("/compact", "shake") => Ok(Some(PrintCommand::Shake)),
+        ("/retry", "") => Ok(Some(PrintCommand::Retry)),
+        ("/compact", _) => bail!("Print mode supports /compact or /compact shake"),
+        ("/retry", _) => bail!("Print-mode /retry takes no arguments"),
+        ("/handoff", focus) if focus.len() > 4096 || focus.contains('\0') => {
+            bail!("Handoff focus must fit 4096 bytes and contain no NUL")
+        }
+        ("/handoff", _) => Ok(Some(PrintCommand::Handoff)),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug)]
+struct PrintRequest {
+    text: String,
+    command: Option<PrintCommand>,
+}
+
+fn prepare_print_requests(
+    messages: Vec<String>,
+    first_is_piped: bool,
+) -> Result<Vec<PrintRequest>> {
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(_, message)| !message.trim().is_empty())
+        .map(|(index, text)| {
+            let command = parse_print_command(&text, !first_is_piped || index != 0)?;
+            Ok(PrintRequest { text, command })
+        })
+        .collect()
+}
+
+fn validate_print_attachment_command(initial: &InitialMessage, first_is_piped: bool) -> Result<()> {
+    if parse_print_command(&initial.keyword_scan_source, !first_is_piped)?.is_some() {
+        bail!(
+            "Print-mode session commands cannot consume @file attachments. Run the command separately so no attached content is discarded"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_print_command_response(message: &AssistantMessage) -> Result<()> {
+    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+        bail!(
+            "{}",
+            message
+                .error_message
+                .as_deref()
+                .unwrap_or("Retried turn failed")
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum PrintCommandOutcome {
+    Compacted(Option<serde_json::Value>),
+    Retry(pi::model::UserContent),
+}
+
+fn print_retry_input(content: pi::model::UserContent) -> PromptInput {
+    // Stored input may contain expanded templates or generated attachment
+    // wrappers. Replaying it cannot confer new authored-keyword authority.
+    match content {
+        pi::model::UserContent::Text(text) => PromptInput::Text {
+            text,
+            keyword_scan_source: Some(String::new()),
+        },
+        pi::model::UserContent::Blocks(content) => PromptInput::Content {
+            content,
+            keyword_scan_source: Some(String::new()),
+        },
+    }
+}
+
+#[derive(Default)]
+struct PrintCompactionObservation {
+    started: bool,
+    result: Option<serde_json::Value>,
+    failure: Option<String>,
+}
+
+/// Execute maintenance against the same live session as ordinary prompts.
+/// Dropping a cancelled transaction retains the native persistence fence.
+async fn execute_print_command(
+    session: &mut AgentSession,
+    command: PrintCommand,
+    focus: &str,
+    abort: &pi::agent::AbortSignal,
+    on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+) -> Result<PrintCommandOutcome> {
+    if abort.is_aborted() {
+        return Err(pi::error::Error::Aborted.into());
+    }
+    let observed = Arc::new(StdMutex::new(PrintCompactionObservation::default()));
+    let capture = Arc::clone(&observed);
+    let on_event = Arc::new(on_event);
+    let forward = Arc::clone(&on_event);
+    let event_handler = move |event: AgentEvent| {
+        {
+            let mut state = capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &event {
+                AgentEvent::AutoCompactionStart { .. } => state.started = true,
+                AgentEvent::AutoCompactionEnd {
+                    result,
+                    aborted,
+                    error_message,
+                    ..
+                } => {
+                    state.started = false;
+                    state.result.clone_from(result);
+                    state.failure = error_message
+                        .clone()
+                        .or_else(|| aborted.then(|| "Compaction cancelled".to_string()));
+                }
+                _ => {}
+            }
+        }
+        forward(event);
+    };
+    let operation = async {
+        match command {
+            PrintCommand::Retry => session
+                .prepare_retry_content()
+                .await
+                .map(PrintCommandOutcome::Retry),
+            PrintCommand::Compact | PrintCommand::Shake | PrintCommand::Handoff => {
+                if command != PrintCommand::Handoff && !session.compaction_settings().enabled {
+                    return Err(pi::error::Error::validation(
+                        "Compaction is disabled in the current session settings",
+                    ));
+                }
+                if command == PrintCommand::Handoff {
+                    session.handoff_now(focus, abort, event_handler).await?;
+                } else if command == PrintCommand::Shake {
+                    session.shake_now(event_handler).await?;
+                } else {
+                    session.compact_now(event_handler).await?;
+                }
+                let state = observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(error) = &state.failure {
+                    return Err(pi::error::Error::session(error.clone()));
+                }
+                Ok(PrintCommandOutcome::Compacted(state.result.clone()))
+            }
+        }
+    };
+    let cancelled = abort.wait();
+    futures::pin_mut!(operation, cancelled);
+    match futures::future::select(cancelled, operation).await {
+        futures::future::Either::Right((result, _)) => result.map_err(Into::into),
+        futures::future::Either::Left(_) => {
+            let started = observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .started;
+            if started {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: true,
+                    will_retry: false,
+                    error_message: Some("Compaction cancelled".to_string()),
+                });
+            }
+            Err(pi::error::Error::Aborted.into())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_print_mode(
     session: &mut AgentSession,
     mode: &str,
     initial: Option<InitialMessage>,
     messages: Vec<String>,
+    first_message_is_piped: bool,
     resources: &ResourceLoader,
     runtime_handle: RuntimeHandle,
     config: &Config,
@@ -8897,6 +9909,10 @@ async fn run_print_mode(
     if mode.ne("text") && mode.ne("json") {
         bail!("Unknown mode: {mode}");
     }
+    if let Some(initial) = &initial {
+        validate_print_attachment_command(initial, first_message_is_piped)?;
+    }
+    let messages = prepare_print_requests(messages, first_message_is_piped && initial.is_none())?;
 
     if mode.eq("json") {
         let cx = pi::agent_cx::AgentCx::for_request();
@@ -8967,15 +9983,6 @@ async fn run_print_mode(
         initial.text = generated_prefix + &expanded_source;
     }
 
-    let messages = messages
-        .into_iter()
-        .map(|keyword_scan_source| {
-            let text = resources.expand_input(&keyword_scan_source);
-            (text, keyword_scan_source)
-        })
-        .filter(|(message, _)| !message.trim().is_empty())
-        .collect::<Vec<_>>();
-
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
             flush_stdout()?;
@@ -9039,7 +10046,8 @@ async fn run_print_mode(
         }
     }
 
-    for (message, keyword_scan_source) in messages {
+    for request in messages {
+        let retry_command = request.command == Some(PrintCommand::Retry);
         // Cooldown restoration (bd-gm481.1) is a between-prompt lifecycle: the
         // previous prompt's turn is finished and its `FailoverEnd
         // { restoredPrimary: false }` already closed, so this can open and
@@ -9053,6 +10061,57 @@ async fn run_print_mode(
         // covers the refusals, which is where the return value earns its keep.
         let _restored =
             maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
+        let input = if let Some(command) = request.command {
+            let focus = request
+                .text
+                .trim()
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, args)| args.trim());
+            let outcome =
+                execute_print_command(session, command, focus, &abort_signal, make_event_handler())
+                    .await?;
+            match outcome {
+                PrintCommandOutcome::Compacted(result) => {
+                    sent_prompts = sent_prompts.saturating_add(1);
+                    if is_json {
+                        write_print_line(&serde_json::to_string(&serde_json::json!({
+                            "type": "command_result",
+                            "command": command.name(),
+                            "success": true,
+                            "data": { "changed": result.is_some(), "result": result }
+                        }))?);
+                    } else {
+                        write_print_line(if command == PrintCommand::Handoff {
+                            "Context handed off and compacted in place."
+                        } else if result.is_some() {
+                            "Compacted conversation."
+                        } else {
+                            "Nothing to compact in the selected session."
+                        });
+                    }
+                    continue;
+                }
+                PrintCommandOutcome::Retry(content) => {
+                    if is_json {
+                        write_print_line(&serde_json::to_string(&serde_json::json!({
+                            "type": "command_start",
+                            "command": command.name(),
+                            "data": { "rerunning": true }
+                        }))?);
+                    }
+                    print_retry_input(content)
+                }
+            }
+        } else {
+            let text = resources.expand_input(&request.text);
+            if text.trim().is_empty() {
+                continue;
+            }
+            PromptInput::Text {
+                text,
+                keyword_scan_source: Some(request.text),
+            }
+        };
         reset_print_text_stream_state(&text_stream_state);
         let response = run_print_prompt_with_retry(
             session,
@@ -9063,10 +10122,7 @@ async fn run_print_mode(
             max_retries,
             is_json,
             &text_stream_state,
-            PromptInput::Text {
-                text: message,
-                keyword_scan_source: Some(keyword_scan_source),
-            },
+            input,
             failover_ctx,
             &mut failover_state,
         )
@@ -9078,6 +10134,16 @@ async fn run_print_mode(
                 snapshot_print_text_stream_state(&text_stream_state),
                 config,
             )?;
+        }
+        if retry_command {
+            // JSON prompts historically report a provider error in-band.
+            // A requested command must also fail the process for scripts.
+            ensure_print_command_response(&response)?;
+            if is_json {
+                write_print_line(&serde_json::to_string(&serde_json::json!({
+                    "type": "command_result", "command": "retry", "success": true
+                }))?);
+            }
         }
     }
 
@@ -9250,6 +10316,8 @@ fn print_mode_retry_policy(config: &Config, max_retries: u32) -> pi::failover::R
     pi::failover::RetryPolicy {
         max_retries,
         max_failovers_per_turn: config.max_failovers_per_turn(),
+        model_fallback: config.model_fallback_enabled(),
+        fallback_on: config.retry_fallback_on(),
         base_delay_ms: config.retry_base_delay_ms(),
         max_delay_ms: config.retry_max_delay_ms(),
     }
@@ -9469,6 +10537,9 @@ async fn try_print_failover(
     let Some(error_text) = error_text else {
         return Ok(None);
     };
+    if !config.model_fallback_enabled() || !config.retry_fallback_on().allows(error_text) {
+        return Ok(None);
+    }
     let Some(class) = pi::failover::classify_failover(error_text) else {
         return Ok(None);
     };
@@ -9510,9 +10581,16 @@ async fn try_print_failover(
             .thinking_level
             .unwrap_or_default(),
     });
-    let Some(chain) =
-        pi::failover::chain_for(chains, "default", &primary.provider, &primary.model_id)
-    else {
+    let catalog = session
+        .model_registry()
+        .map_or(ctx.available_models, ModelRegistry::models);
+    let Some(chain) = pi::failover::chain_for(
+        chains,
+        "default",
+        &primary.provider,
+        &primary.model_id,
+        catalog,
+    ) else {
         return Ok(None);
     };
     // The walk, the credential check, the provider construction and the
@@ -9612,6 +10690,53 @@ where
     H: Fn() -> EH + Sync,
     EH: Fn(AgentEvent) + Send + Sync + 'static,
 {
+    let prewalk_turn = session.begin_prewalk_turn();
+    let result = run_print_prompt_attempts(
+        session,
+        config,
+        abort_signal,
+        make_event_handler,
+        retry_enabled,
+        max_retries,
+        is_json,
+        text_stream_state,
+        input,
+        failover_ctx,
+        failover_state,
+        &prewalk_turn,
+    )
+    .await;
+    let interrupted = match &result {
+        Ok(message) => matches!(message.stop_reason, StopReason::Error | StopReason::Aborted),
+        Err(_) => true,
+    };
+    session.finish_prewalk_turn(interrupted);
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_print_prompt_attempts<H, EH>(
+    session: &mut AgentSession,
+    config: &Config,
+    abort_signal: &pi::agent::AbortSignal,
+    make_event_handler: &H,
+    retry_enabled: bool,
+    max_retries: u32,
+    is_json: bool,
+    text_stream_state: &Arc<StdMutex<PrintTextStreamState>>,
+    input: PromptInput,
+    failover_ctx: Option<FailoverResolution<'_>>,
+    failover_state: &mut PrintFailoverState,
+    prewalk_turn: &pi::prewalk::PrewalkTurn,
+) -> Result<AssistantMessage>
+where
+    H: Fn() -> EH + Sync,
+    EH: Fn(AgentEvent) + Send + Sync + 'static,
+{
+    // Hooks belong to the logical prompt, not its provider attempts. Capture
+    // their effective base once so a retry or provider swap retains the same
+    // instructions after each attempt restores the session's ordinary prompt.
+    let mut turn_system_prompt = session.agent.system_prompt().map(str::to_string);
     // First attempt.
     let first_result = match &input {
         PromptInput::Text {
@@ -9622,9 +10747,10 @@ where
                 .agent
                 .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
-                .run_text_with_abort(
+                .run_text_with_abort_capturing_prompt(
                     text.clone(),
                     Some(abort_signal.clone()),
+                    &mut turn_system_prompt,
                     make_event_handler(),
                 )
                 .await
@@ -9637,19 +10763,15 @@ where
                 .agent
                 .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
-                .run_with_content_with_abort(
+                .run_with_content_with_abort_capturing_prompt(
                     content.clone(),
                     Some(abort_signal.clone()),
+                    &mut turn_system_prompt,
                     make_event_handler(),
                 )
                 .await
         }
     };
-
-    // Fast path: no retry needed.
-    if !retry_enabled {
-        return first_result.map_err(anyhow::Error::new);
-    }
 
     let mut retry_count: u32 = 0;
     // Set once a fallback chain entry has been installed for this turn; every
@@ -9661,16 +10783,56 @@ where
     let mut current_result = first_result;
 
     loop {
+        if current_result.is_ok() && session.prewalk_handoff_pending() {
+            if retry_count > 0 && is_json {
+                emit_json_event(&AgentEvent::AutoRetryEnd {
+                    success: true,
+                    attempt: retry_count,
+                    final_error: None,
+                });
+            }
+            emit_print_failover_end(is_json, failed_over, session, true);
+            retry_count = 0;
+            failed_over = false;
+            if let Some(target) = session
+                .complete_prewalk_handoff(prewalk_turn, Some(abort_signal))
+                .await?
+            {
+                failover_state.clear();
+                make_event_handler()(AgentEvent::PrewalkSwitched {
+                    provider: target.provider,
+                    model: target.model,
+                    thinking: target.thinking.unwrap_or_default(),
+                });
+            }
+            // The completed tool batch and drained steering are already saved.
+            // Continuing retains the original budgets and effective hook prompt,
+            // even when retries are disabled or text has already been printed.
+            current_result = session
+                .run_continue_with_abort_and_system_prompt(
+                    Some(abort_signal.clone()),
+                    turn_system_prompt.as_deref(),
+                    make_event_handler(),
+                )
+                .await;
+            continue;
+        }
+        if !retry_enabled {
+            return current_result.map_err(anyhow::Error::new);
+        }
         // One policy, shared with RPC and available to the interactive stacks
         // (bd-u2qv4). It decides; everything below is this surface's I/O for
         // the decision — JSON events, the backoff sleep, tail restoration and
         // the chain swap.
         //
-        // The context window is None here, which is print mode's long-standing
-        // behaviour and is preserved deliberately: RPC supplies the real window
-        // and so refuses a SILENT context overflow that print retries to budget
-        // exhaustion. Resolving the window on this path is a behaviour change
-        // and needs its own test.
+        // Resolve the live model again after every swap. A transient-looking
+        // error with an already oversized input cannot recover by resending
+        // the same prompt, and an embedder's compaction threshold is not the
+        // provider's context capacity. Zero means no known capacity.
+        let context_window = session
+            .current_model_entry()
+            .map(|entry| entry.model.context_window)
+            .filter(|window| *window > 0);
         let decision = {
             let progress = pi::failover::TurnProgress {
                 retry_count,
@@ -9684,13 +10846,13 @@ where
                     pi::failover::TurnOutcome::Completed(msg),
                     &progress,
                     &policy,
-                    None,
+                    context_window,
                 ),
                 Err(err) => pi::failover::decide(
                     pi::failover::TurnOutcome::Failed(err),
                     &progress,
                     &policy,
-                    None,
+                    context_window,
                 ),
             }
         };
@@ -9746,7 +10908,11 @@ where
                     return Err(restore_err);
                 }
                 current_result = session
-                    .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
+                    .run_continue_with_abort_and_system_prompt(
+                        Some(abort_signal.clone()),
+                        turn_system_prompt.as_deref(),
+                        make_event_handler(),
+                    )
                     .await;
             }
             Ok(msg) => {
@@ -9801,8 +10967,9 @@ where
                         failovers_this_turn += 1;
                         retry_count = 0;
                         current_result = session
-                            .run_continue_with_abort(
+                            .run_continue_with_abort_and_system_prompt(
                                 Some(abort_signal.clone()),
+                                turn_system_prompt.as_deref(),
                                 make_event_handler(),
                             )
                             .await;
@@ -9902,7 +11069,11 @@ where
                         }
                     }
                     current_result = session
-                        .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
+                        .run_continue_with_abort_and_system_prompt(
+                            Some(abort_signal.clone()),
+                            turn_system_prompt.as_deref(),
+                            make_event_handler(),
+                        )
                         .await;
                 } else {
                     // Failover (bd-cv653.3.2): HTTP/transport errors surface on
@@ -9943,8 +11114,9 @@ where
                         failovers_this_turn += 1;
                         retry_count = 0;
                         current_result = session
-                            .run_continue_with_abort(
+                            .run_continue_with_abort_and_system_prompt(
                                 Some(abort_signal.clone()),
+                                turn_system_prompt.as_deref(),
                                 make_event_handler(),
                             )
                             .await;
@@ -9968,7 +11140,7 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
 async fn run_interactive_mode(
     session: AgentSession,
     initial: Option<InitialMessage>,
@@ -9977,7 +11149,7 @@ async fn run_interactive_mode(
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
-    title_model_entry: Option<ModelEntry>,
+    title_client: Option<Arc<pi::session_title::TitleClient>>,
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
@@ -9989,6 +11161,7 @@ async fn run_interactive_mode(
     btw_client: Option<Arc<pi::btw::BtwClient>>,
     btw_factory: Option<pi::btw::BtwClientFactory>,
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
+    failover: Option<pi::sdk::FailoverOptions>,
 ) -> Result<()> {
     let mut pending = Vec::new();
     if let Some(mut initial) = initial {
@@ -10008,28 +11181,20 @@ async fn run_interactive_mode(
         pending.push(pi::interactive::PendingInput::Text(message));
     }
 
-    let AgentSession {
-        agent,
-        session,
-        extensions: region,
-        ..
-    } = session;
-    // Extract manager for the interactive loop; the region stays alive to
-    let extensions = region.as_ref().map(|r| r.manager().clone());
-    let interactive_result = pi::interactive::run_interactive(
-        agent,
+    // Keep the configured AgentSession intact: classic turns need the same
+    // durable recovery, provider admission and extension ownership as the SDK.
+    pi::interactive::run_interactive(
         session,
         config,
         model_entry,
         model_scope,
         available_models,
-        title_model_entry,
+        title_client,
         pending,
         save_enabled,
         resources,
         resource_cli,
         package_manager,
-        extensions,
         cwd,
         runtime_handle,
         workspace,
@@ -10037,16 +11202,9 @@ async fn run_interactive_mode(
         btw_client,
         btw_factory,
         mcp_manager,
+        failover,
     )
-    .await;
-    // Explicitly shut down extension runtimes so the QuickJS GC can
-    // collect all objects before JS_FreeRuntime asserts an empty gc_obj_list.
-    // Must run even on error — otherwise ExtensionRegion::drop() runs
-    // synchronously and the GC assertion fires.
-    if let Some(ref region) = region {
-        region.shutdown().await;
-    }
-    interactive_result?;
+    .await?;
     Ok(())
 }
 
@@ -10135,8 +11293,352 @@ fn default_export_path(input: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use clap::Parser as _;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn print_mcp_auth_commands_preserve_exact_names_and_use_native_dispatch() {
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp reauth docs  europe"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Reauthenticate("docs  europe".into()))
+        );
+        let cli = cli::Cli::parse_from(["pi", "--mode", "json", "/mcp unauth docs"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Unauthenticate("docs".into()))
+        );
+        assert!(print_mcp_command(&cli, Some("attached context")).is_err());
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp reauth"]);
+        assert!(print_mcp_command(&cli, None).is_err());
+    }
+
+    #[test]
+    fn print_mcp_commands_preserve_exact_server_names() {
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp trust docs  europe"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Trust("docs  europe".into()))
+        );
+        let cli = cli::Cli::parse_from(["pi", "--mode", "json", "/mcp refresh docs"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::Refresh(Some("docs".into())))
+        );
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp"]);
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::List)
+        );
+    }
+
+    #[test]
+    fn print_mcp_commands_reject_mixed_input_before_expansion() {
+        for args in [
+            vec!["pi", "-p", "/mcp trust docs", "@instructions.md"],
+            vec!["pi", "-p", "/mcp deny docs", "another prompt"],
+            vec!["pi", "-p", "/mcp trust docs\nanother line"],
+            vec!["pi", "-p", "/mcp trust"],
+            vec!["pi", "-p", "/mcp", "trust", "docs"],
+            vec!["pi", "-p", "/mcp list unexpected-name"],
+            vec!["pi", "-p", "/mcp unknown-command"],
+        ] {
+            let cli = cli::Cli::parse_from(args);
+            assert!(print_mcp_command(&cli, None).is_err());
+        }
+        let cli = cli::Cli::parse_from(["pi", "-p", "/mcp trust docs"]);
+        assert!(print_mcp_command(&cli, Some("untrusted input")).is_err());
+    }
+
+    #[test]
+    fn print_mcp_commands_do_not_promote_piped_or_attached_text() {
+        let cli = cli::Cli::parse_from(["pi", "-p"]);
+        assert!(
+            print_mcp_command(&cli, Some("/mcp trust docs"))
+                .unwrap()
+                .is_none()
+        );
+        let cli = cli::Cli::parse_from(["pi", "-p", "@mcp-instructions.txt"]);
+        assert!(print_mcp_command(&cli, None).unwrap().is_none());
+        for text in [
+            "Explain /mcp trust docs",
+            "/mcpish trust docs",
+            "/template-that-expands-to-an-operator-command",
+        ] {
+            let cli = cli::Cli::parse_from(["pi", "-p", text]);
+            assert!(print_mcp_command(&cli, None).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn print_mcp_commands_do_not_intercept_other_host_modes() {
+        for args in [
+            vec!["pi", "--mode", "rpc", "/mcp trust docs"],
+            vec!["pi", "--acp", "/mcp deny docs"],
+        ] {
+            let cli = cli::Cli::parse_from(args);
+            assert!(print_mcp_command(&cli, None).unwrap().is_none());
+        }
+    }
+
+    fn run_cli_workdir_test<T>(future: impl std::future::Future<Output = T>) -> T {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        runtime.block_on(Box::pin(future))
+    }
+
+    async fn saved_cli_workdir_fixture(path: &Path, cwd: &Path) -> Session {
+        let mut session = Session::in_memory();
+        session.header.cwd = cwd.to_str().expect("UTF-8 workspace").to_owned();
+        session.header.parent_session = Some("original-parent.jsonl".to_owned());
+        session.session_dir = path.parent().map(Path::to_path_buf);
+        session.path = Some(path.to_path_buf());
+        session.append_model_message(pi::model::Message::User(pi::model::UserMessage {
+            content: pi::model::UserContent::Text("Keep this conversation".to_owned()),
+            timestamp: 1,
+        }));
+        session.save().await.expect("save source session");
+        session
+    }
+
+    #[test]
+    fn cli_saved_workspace_precedes_project_configuration_and_native_open() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let caller = root.path().join("caller");
+            let project = root.path().join("saved-project");
+            let global = root.path().join("global");
+            fs::create_dir_all(caller.join(".pi")).expect("caller workspace");
+            fs::create_dir_all(project.join(".pi")).expect("saved workspace");
+            fs::create_dir(&global).expect("global configuration root");
+            fs::write(
+                caller.join(".pi/settings.json"),
+                r#"{"requestTimeoutSecs":99}"#,
+            )
+            .expect("caller config");
+            fs::write(
+                project.join(".pi/settings.json"),
+                r#"{"requestTimeoutSecs":23}"#,
+            )
+            .expect("saved config");
+            let path = caller.join("saved.jsonl");
+            let original = saved_cli_workdir_fixture(&path, &project).await;
+            let before = fs::read(&path).expect("original bytes");
+            let process_cwd = std::env::current_dir().expect("process cwd");
+            let mut cli =
+                cli::Cli::parse_from(["pi", "--session", "saved.jsonl", "--continue", "--resume"]);
+            let saved = resolve_cli_session_workdir(&mut cli, &caller)
+                .await
+                .expect("resolve saved workspace")
+                .expect("existing session");
+            let cwd = saved.resolve_runtime_cwd(None).expect("runtime cwd");
+            assert_eq!(cwd, project.canonicalize().expect("canonical workspace"));
+            let canonical_path = path.canonicalize().expect("canonical source");
+            assert_eq!(cli.session.as_deref(), canonical_path.to_str());
+            assert!(!cli.resume && !cli.r#continue, "selection must happen once");
+            let config = Config::load_with_roots_and_project_trust(None, &global, &cwd, true)
+                .expect("selected project config");
+            assert_eq!(config.request_timeout_secs, Some(23));
+            let loaded = Session::new(&cli, &config)
+                .await
+                .expect("native session open");
+            saved
+                .check_loaded_session(&loaded)
+                .expect("same original source");
+            assert_eq!(loaded.header.id, original.header.id);
+            assert_eq!(loaded.header.cwd, original.header.cwd);
+            assert_eq!(loaded.header.parent_session, original.header.parent_session);
+            assert_eq!(fs::read(&path).expect("source after discovery"), before);
+            assert_eq!(
+                std::env::current_dir().expect("unchanged process cwd"),
+                process_cwd
+            );
+        });
+    }
+
+    #[test]
+    fn cli_moved_workspace_requires_attachment_and_persists_provenance_before_resume() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let missing = root.path().join("moved-away");
+            let replacement = root.path().join("replacement");
+            fs::create_dir(&replacement).expect("replacement workspace");
+            let path = root.path().join("saved.jsonl");
+            let original = saved_cli_workdir_fixture(&path, &missing).await;
+            let before = fs::read(&path).expect("original bytes");
+            let mut cli = cli::Cli::parse_from(["pi", "--session", "saved.jsonl"]);
+            let saved = resolve_cli_session_workdir(&mut cli, root.path())
+                .await
+                .expect("metadata remains readable")
+                .expect("existing session");
+            assert!(
+                saved
+                    .resolve_runtime_cwd(None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PI_SESSION_WORKDIR_UNAVAILABLE")
+            );
+            assert_eq!(fs::read(&path).expect("unchanged source"), before);
+
+            let mut cli = cli::Cli::parse_from([
+                "pi",
+                "--session",
+                "saved.jsonl",
+                "--session-workdir",
+                "replacement",
+            ]);
+            let saved = resolve_cli_session_workdir(&mut cli, root.path())
+                .await
+                .expect("explicit attachment")
+                .expect("attached metadata");
+            let cwd = replacement.canonicalize().expect("canonical replacement");
+            assert_eq!(
+                saved.resolve_runtime_cwd(None).expect("attached runtime"),
+                cwd
+            );
+            let reopened = Session::open(cli.session.as_deref().expect("selected source"))
+                .await
+                .expect("attachment was persisted before launch");
+            saved
+                .check_loaded_session(&reopened)
+                .expect("fresh observation after save");
+            assert_eq!(reopened.header.id, original.header.id);
+            assert_eq!(reopened.header.cwd, original.header.cwd);
+            assert_eq!(
+                reopened.header.parent_session,
+                original.header.parent_session
+            );
+            assert_eq!(
+                serde_json::to_value(reopened.entries.first()).expect("reopened entry"),
+                serde_json::to_value(original.entries.first()).expect("original entry")
+            );
+            let attachment = reopened
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    pi::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == pi::session_workdir::WORKDIR_BINDING_TYPE =>
+                    {
+                        custom.data.as_ref()
+                    }
+                    _ => None,
+                })
+                .expect("persisted attachment");
+            assert_eq!(attachment["originalCwd"], original.header.cwd);
+            assert_eq!(attachment["previousCwd"], original.header.cwd);
+            assert_eq!(attachment["cwd"], cwd.to_str().expect("UTF-8 replacement"));
+
+            let attached_bytes = fs::read(&path).expect("attached bytes");
+            resolve_cli_session_workdir(&mut cli, root.path())
+                .await
+                .expect("idempotent attach");
+            assert_eq!(
+                fs::read(&path).expect("after repeated attach"),
+                attached_bytes
+            );
+        });
+    }
+
+    #[test]
+    fn cli_attachment_rejects_missing_targets_and_new_session_paths() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let path = root.path().join("saved.jsonl");
+            saved_cli_workdir_fixture(&path, root.path()).await;
+            let before = fs::read(&path).expect("original bytes");
+            let mut cli = cli::Cli::parse_from([
+                "pi",
+                "--session",
+                "saved.jsonl",
+                "--session-workdir",
+                "missing",
+            ]);
+            assert!(
+                resolve_cli_session_workdir(&mut cli, root.path())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(&path).expect("source after rejected target"),
+                before
+            );
+            let mut cli =
+                cli::Cli::parse_from(["pi", "--session", "new.jsonl", "--session-workdir", "."]);
+            assert!(
+                resolve_cli_session_workdir(&mut cli, root.path())
+                    .await
+                    .is_err()
+            );
+            assert!(!root.path().join("new.jsonl").exists());
+
+            let mut cli = cli::Cli::parse_from(["pi", "--session", "new.jsonl"]);
+            assert!(
+                resolve_cli_session_workdir(&mut cli, root.path())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                cli.session.as_deref(),
+                root.path().join("new.jsonl").to_str()
+            );
+            assert!(!root.path().join("new.jsonl").exists());
+        });
+    }
+
+    #[test]
+    fn cli_read_only_and_ephemeral_modes_do_not_require_a_saved_workspace() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            for args in [
+                vec!["pi", "--export", "missing.jsonl"],
+                vec!["pi", "--acp", "--session", "missing.jsonl"],
+                vec!["pi", "--list-models", "--session", "missing.jsonl"],
+                vec!["pi", "--no-session", "--session", "missing.jsonl"],
+            ] {
+                let mut cli = cli::Cli::parse_from(args);
+                assert!(
+                    resolve_cli_session_workdir(&mut cli, root.path())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(!root.path().join("missing.jsonl").exists());
+        });
+    }
+
+    #[test]
+    fn cli_discovery_rejects_a_session_changed_before_native_open() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("tempdir");
+            let path = root.path().join("saved.jsonl");
+            let mut original = saved_cli_workdir_fixture(&path, root.path()).await;
+            let mut cli = cli::Cli::parse_from(["pi", "--session", "saved.jsonl"]);
+            let saved = resolve_cli_session_workdir(&mut cli, root.path())
+                .await
+                .unwrap()
+                .expect("saved observation");
+            original.append_custom_entry("concurrent-update".to_owned(), Some(json!({"v": 1})));
+            original
+                .save()
+                .await
+                .expect("another writer updated the source");
+            let loaded = Session::open(cli.session.as_deref().expect("selected source"))
+                .await
+                .expect("native open sees latest source");
+            assert!(
+                saved
+                    .check_loaded_session(&loaded)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PI_SESSION_WORKDIR_SOURCE_CHANGED")
+            );
+        });
+    }
 
     // Print mode's retry classification moved into `pi::failover` (bd-u2qv4),
     // where RPC and the interactive stacks can reach it. These three aliases
@@ -11096,6 +12598,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_api_key_scope_requires_a_destination_before_automatic_selection() {
+        use clap::Parser as _;
+
+        let mut cli = cli::Cli::parse_from(["pi", "--api-key", "scope-fixture-key"]);
+        cli.provider = None;
+        cli.model = None;
+        for raw_scope in ["", " , \t , "] {
+            let patterns = pi::app::parse_models_arg(raw_scope);
+            let error = validate_startup_api_key_scope(&cli, &patterns)
+                .expect_err("a key without a destination must not select an arbitrary provider");
+            assert!(error.to_string().contains("--provider/--model or --models"));
+        }
+
+        // A nonempty inherited or CLI scope reaches final registry validation,
+        // including when an extension has not registered its models yet.
+        let patterns = vec!["pending-extension/*".to_string()];
+        validate_startup_api_key_scope(&cli, &patterns)
+            .expect("scope availability is checked by the final model resolver");
+
+        cli.provider = Some("openai".to_string());
+        validate_startup_api_key_scope(&cli, &[])
+            .expect("an explicit provider supplies the key destination");
+        cli.provider = None;
+        cli.model = Some("openai/gpt-4o".to_string());
+        validate_startup_api_key_scope(&cli, &[])
+            .expect("an explicit model supplies the key destination");
+        cli.model = None;
+        cli.api_key = Some(" \t ".to_string());
+        validate_startup_api_key_scope(&cli, &[])
+            .expect("a blank key retains ordinary automatic selection");
+    }
+
+    #[test]
+    fn startup_scope_errors_defer_only_for_pending_extension_registration() {
+        use clap::Parser as _;
+
+        let temp = TempDir::new().expect("tempdir");
+        let auth = AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = ModelRegistry::load(&auth, None);
+        let config = Config::default();
+        let bootstrap = build_extension_bootstrap_selection(
+            &config,
+            &registry,
+            &temp.path().join("models.json"),
+        )
+        .expect("native bootstrap model");
+        let mut cli = cli::Cli::parse_from(["pi", "--api-key", "scope-fixture-key"]);
+        cli.provider = None;
+        cli.model = None;
+        let session = pi::session::Session::in_memory();
+        let patterns = vec!["pending-scope-extension/*".to_string()];
+        validate_startup_api_key_scope(&cli, &patterns)
+            .expect("the requested extension scope passes the early key guard");
+        let empty_error = pi::app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &patterns,
+            &registry,
+            &config,
+            temp.path(),
+        )
+        .expect_err("the extension scope is not registered yet");
+        assert!(empty_error.to_string().contains("[MODEL_SCOPE_EMPTY]"));
+
+        let disabled_config = Config {
+            disabled_providers: Some(vec![bootstrap.model_entry.model.provider.clone()]),
+            ..Config::default()
+        };
+        let disabled_patterns = vec![format!(
+            "{}/{}",
+            bootstrap.model_entry.model.provider, bootstrap.model_entry.model.id,
+        )];
+        let disabled_error = pi::app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &disabled_patterns,
+            &registry,
+            &disabled_config,
+            temp.path(),
+        )
+        .expect_err("the current native scope is disabled");
+        assert!(
+            disabled_error
+                .to_string()
+                .contains("[MODEL_SCOPE_DISABLED]")
+        );
+        for error in [&empty_error, &disabled_error] {
+            assert!(should_retry_selection_after_extensions(&cli, error, true));
+            assert!(!should_retry_selection_after_extensions(&cli, error, false));
+        }
+
+        let mut registered = bootstrap.model_entry;
+        registered.model.provider = "pending-scope-extension".to_string();
+        registered.model.id = "scoped".to_string();
+        registered.api_key = Some("scope-fixture-key".to_string());
+        registry.merge_entries(vec![registered]);
+        let scoped = pi::app::resolve_startup_model_scope(
+            &cli,
+            &session,
+            &patterns,
+            &registry,
+            &config,
+            temp.path(),
+        )
+        .expect("registration resolves the requested scope");
+        let selected = pi::app::select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped,
+            temp.path(),
+        )
+        .expect("the registered extension remains the final destination");
+        assert_eq!(
+            selected.model_entry.model.provider,
+            "pending-scope-extension"
+        );
+        assert_eq!(selected.model_entry.model.id, "scoped");
+    }
+
     /// gh #218: an explicit key for an explicit model must not reach for the
     /// stored credentials; everything else still refreshes up front.
     #[test]
@@ -11140,6 +12764,197 @@ mod tests {
             "anthropic/claude-sonnet-4-6"
         ])));
         assert!(startup_oauth_refresh_required(&parse(&[])));
+    }
+
+    #[test]
+    fn startup_oauth_failure_waits_for_the_final_scoped_extension_destination() {
+        use clap::Parser as _;
+
+        let temp = TempDir::new().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.
+        let auth = AuthStorage::empty_at(temp.path().join("auth.json"));
+        let mut registry = ModelRegistry::load(&auth, None);
+        let mut cli = cli::Cli::parse_from(["pi"]);
+        cli.provider = None;
+        cli.model = None;
+        cli.api_key = None;
+        let mut config = Config::default();
+        let bootstrap = build_extension_bootstrap_selection(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture bootstrap must resolve.
+            &config,
+            &registry,
+            &temp.path().join("models.json"),
+        )
+        .expect("native construction model");
+        let refresh = pi::auth::OAuthRefreshReport {
+            failed: vec![pi::auth::OAuthRefreshFailure {
+                provider: bootstrap.model_entry.model.provider.clone(),
+                error: "expired native login".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                &bootstrap.model_entry.model.provider,
+                &[],
+                true,
+            )
+            .is_ok(),
+            "a preliminary native identity must not block extension registration"
+        );
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                &bootstrap.model_entry.model.provider,
+                &[],
+                false,
+            )
+            .is_err(),
+            "the same failed identity must still be rejected when final"
+        );
+
+        // Model registration adds an allowed, credentialed extension row.
+        // Resolve its actual scope/selection before validating the destination.
+        config.disabled_providers = Some(vec![bootstrap.model_entry.model.provider.clone()]);
+        let mut registered = bootstrap.model_entry;
+        registered.model.provider = "startup-oauth-extension".to_string();
+        registered.model.id = "scoped".to_string();
+        registered.model.name = "Scoped extension".to_string();
+        registered.api_key = Some("configured-extension-key".to_string());
+        registry.merge_entries(vec![registered]);
+        let session = pi::session::Session::in_memory();
+        let patterns = vec!["startup-oauth-extension/scoped".to_string()];
+        let scoped = pi::app::resolve_startup_model_scope(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture scope must resolve.
+            &cli,
+            &session,
+            &patterns,
+            &registry,
+            &config,
+            temp.path(),
+        )
+        .expect("allowed registered scope");
+        let selection = pi::app::select_model_and_thinking(
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture selection must resolve.
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped,
+            temp.path(),
+        )
+        .expect("registered extension destination");
+        assert_eq!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            selection.model_entry.model.provider,
+            "startup-oauth-extension"
+        );
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                &selection.model_entry.model.provider,
+                &[],
+                false,
+            )
+            .is_ok(),
+            "an unrelated stale native login must not block the final scoped provider"
+        );
+    }
+
+    #[test]
+    fn final_oauth_validation_requires_a_key_or_matching_extension_auth_override() {
+        use clap::Parser as _;
+
+        let mut cli = cli::Cli::parse_from(["pi"]);
+        let refresh = pi::auth::OAuthRefreshReport {
+            failed: vec![pi::auth::OAuthRefreshFailure {
+                provider: "OPEN-ROUTER".to_string(),
+                error: "expired native login".to_string(),
+            }],
+            ..Default::default()
+        };
+        for key in [None, Some(" \t ")] {
+            cli.api_key = key.map(str::to_string);
+            let error = validate_startup_oauth_refresh(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Rejection is the regression oracle.
+                &cli,
+                &refresh,
+                "openrouter",
+                &[],
+                false,
+            )
+            .expect_err("provider aliases and blank keys cannot evade the final OAuth failure");
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                error
+                    .to_string()
+                    .contains("OAuth token refresh failed for: OPEN-ROUTER")
+            );
+        }
+        cli.api_key = Some(" explicit-run-key ".to_string());
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(&cli, &refresh, "openrouter", &[], false).is_ok()
+        );
+        cli.api_key = None;
+
+        let mut binding = ExtensionProviderBinding {
+            provider: "Open-Router".to_string(),
+            oauth_config: None,
+        };
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                "openrouter",
+                std::slice::from_ref(&binding),
+                false,
+            )
+            .is_err(),
+            "registering a provider without replacement OAuth leaves its native failure relevant"
+        );
+        binding.oauth_config = Some(pi::models::OAuthConfig {
+            auth_url: "https://extension.invalid/authorize".to_string(),
+            token_url: "https://extension.invalid/token".to_string(),
+            client_id: "extension-oauth-fixture".to_string(),
+            scopes: vec!["models:use".to_string()],
+            redirect_uri: None,
+        });
+        assert!(
+            // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+            validate_startup_oauth_refresh(
+                &cli,
+                &refresh,
+                "openrouter",
+                std::slice::from_ref(&binding),
+                false,
+            )
+            .is_ok(),
+            "the selected provider's extension OAuth supersedes its native refresh result"
+        );
+        binding.provider = "unrelated-extension".to_string();
+        for oauth in [binding.oauth_config.clone(), None] {
+            binding.oauth_config = oauth;
+            assert!(
+                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
+                validate_startup_oauth_refresh(
+                    &cli,
+                    &refresh,
+                    "openrouter",
+                    std::slice::from_ref(&binding),
+                    false,
+                )
+                .is_err(),
+                "an unrelated extension cannot suppress the selected provider's native failure"
+            );
+        }
     }
 
     #[test]
@@ -12056,6 +13871,1268 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn headless_commands_require_original_argument_provenance() {
+        for input in [
+            "/compact",
+            "/compact shake",
+            "/retry",
+            "/handoff",
+            "/handoff preserve the migration plan",
+        ] {
+            assert_eq!(parse_print_command(input, false).unwrap(), None);
+        }
+        assert_eq!(
+            parse_print_command(" /retry \n", true).unwrap(),
+            Some(PrintCommand::Retry)
+        );
+        assert_eq!(
+            parse_print_command("/compact shake", true).unwrap(),
+            Some(PrintCommand::Shake)
+        );
+        for input in ["/retrying", "Explain /compact", "/my-template"] {
+            assert_eq!(parse_print_command(input, true).unwrap(), None);
+        }
+        assert_eq!(
+            parse_print_command("/handoff preserve the migration plan", true).unwrap(),
+            Some(PrintCommand::Handoff)
+        );
+        for input in [
+            "/retry extra",
+            "/compact unknown",
+            "/handoff invalid\0focus",
+        ] {
+            let error = parse_print_command(input, true).unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+        }
+        assert!(parse_print_command(&format!("/handoff {}", "x".repeat(4097)), true).is_err());
+        let requests = prepare_print_requests(
+            vec![
+                "/retry".into(),
+                "/retry".into(),
+                "@literal-data".into(),
+                "/compact".into(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.command)
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(PrintCommand::Retry),
+                None,
+                Some(PrintCommand::Compact)
+            ]
+        );
+        assert_eq!(requests[0].text, "/retry");
+        assert_eq!(requests[2].text, "@literal-data");
+    }
+
+    #[test]
+    fn attachment_bytes_cannot_become_commands_and_attached_commands_cannot_drop_files() {
+        let directory = TempDir::new().expect("input directory");
+        fs::write(directory.path().join("input.txt"), "/retry\n").expect("fixture");
+        let workspace = pi::workspace::WorkspaceHandle::single(directory.path());
+        for (mut messages, piped, should_refuse) in [
+            (Vec::<String>::new(), false, false),
+            (vec!["/retry".to_string()], true, false),
+            (vec!["/retry".to_string()], false, true),
+            (vec!["/handoff keep the plan".to_string()], false, true),
+        ] {
+            let initial = pi::app::prepare_initial_message(
+                directory.path(),
+                &["input.txt".to_string()],
+                &mut messages,
+                false,
+                &workspace,
+            )
+            .unwrap()
+            .expect("file input");
+            assert!(initial.text.contains("/retry"));
+            assert_eq!(
+                validate_print_attachment_command(&initial, piped).is_err(),
+                should_refuse
+            );
+        }
+        let mut messages = vec!["/retry".to_string(), "/compact".to_string()];
+        let initial = pi::app::prepare_initial_message(
+            directory.path(),
+            &["input.txt".to_string()],
+            &mut messages,
+            false,
+            &workspace,
+        )
+        .unwrap()
+        .expect("file and piped input");
+        validate_print_attachment_command(&initial, true).expect("piped data is not a command");
+        let requests = prepare_print_requests(messages, false).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].command, Some(PrintCommand::Compact));
+    }
+
+    #[derive(Default)]
+    enum HeadlessCommandBehavior {
+        #[default]
+        Complete,
+        Text(String),
+        Reject,
+        Empty,
+        MessageTruncated,
+        DoneTruncated,
+        ToolCall,
+        MissingTerminal,
+        Cancel(AbortHandle),
+        EditSession(Arc<Mutex<Session>>),
+    }
+
+    #[derive(Default)]
+    struct HeadlessCommandProvider {
+        requests: StdMutex<Vec<serde_json::Value>>,
+        metadata: StdMutex<Vec<serde_json::Value>>,
+        behavior: HeadlessCommandBehavior,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl pi::provider::Provider for HeadlessCommandProvider {
+        fn name(&self) -> &str {
+            "headless-command-fixture"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &pi::provider::Context<'_>,
+            options: &pi::provider::StreamOptions,
+        ) -> pi::error::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+            >,
+        > {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(&context.messages).unwrap());
+            // ToolDef is not Serialize; the names show which tools were offered.
+            let tools: Vec<&str> = context
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            self.metadata.lock().unwrap().push(json!({
+                "system": context.system_prompt,
+                "tools": tools,
+                "sessionId": options.session_id,
+                "promptCacheKey": options.prompt_cache_key,
+                "maxTokens": options.max_tokens,
+                "providerHook": options.before_provider_request.is_some(),
+            }));
+            match &self.behavior {
+                HeadlessCommandBehavior::Reject => {
+                    return Err(pi::error::Error::api("Handoff synthesis rejected"));
+                }
+                HeadlessCommandBehavior::Cancel(handle) => {
+                    handle.abort();
+                    return Ok(Box::pin(futures::stream::pending()));
+                }
+                HeadlessCommandBehavior::EditSession(stored) => {
+                    let cx = pi::agent_cx::AgentCx::for_request();
+                    stored.lock(cx.cx()).await.unwrap().append_message(
+                        pi::session::SessionMessage::User {
+                            content: pi::model::UserContent::Text("A newer authored turn".into()),
+                            timestamp: Some(0),
+                        },
+                    );
+                }
+                _ => {}
+            }
+            let mut message = AssistantMessage {
+                content: vec![ContentBlock::Text(pi::model::TextContent::new(
+                    "Retained summary",
+                ))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: pi::model::Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            match &self.behavior {
+                HeadlessCommandBehavior::Text(text) => {
+                    message.content = vec![ContentBlock::Text(pi::model::TextContent::new(text))];
+                }
+                HeadlessCommandBehavior::Empty => message.content.clear(),
+                HeadlessCommandBehavior::MessageTruncated => {
+                    message.stop_reason = StopReason::Length;
+                }
+                HeadlessCommandBehavior::ToolCall => {
+                    message
+                        .content
+                        .push(ContentBlock::ToolCall(pi::model::ToolCall {
+                            id: "unexpected-handoff-tool".into(),
+                            name: "write".into(),
+                            arguments: json!({"path": "should-not-exist.txt", "content": "bad"}),
+                            thought_signature: None,
+                        }));
+                }
+                _ => {}
+            }
+            let mut events = vec![Ok(pi::model::StreamEvent::Start {
+                partial: message.clone(),
+            })];
+            if !matches!(&self.behavior, HeadlessCommandBehavior::MissingTerminal) {
+                events.push(Ok(pi::model::StreamEvent::Done {
+                    reason: if matches!(&self.behavior, HeadlessCommandBehavior::DoneTruncated) {
+                        StopReason::Length
+                    } else {
+                        StopReason::Stop
+                    },
+                    message,
+                }));
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn headless_command_session(
+        provider: &Arc<HeadlessCommandProvider>,
+        stored: Session,
+        save_enabled: bool,
+        compaction_enabled: bool,
+    ) -> AgentSession {
+        headless_command_session_with_config(
+            provider,
+            stored,
+            save_enabled,
+            compaction_enabled,
+            AgentConfig::default(),
+        )
+    }
+
+    fn headless_command_session_with_config(
+        provider: &Arc<HeadlessCommandProvider>,
+        stored: Session,
+        save_enabled: bool,
+        compaction_enabled: bool,
+        config: AgentConfig,
+    ) -> AgentSession {
+        let mut agent = Agent::new(
+            Arc::clone(provider) as Arc<dyn pi::provider::Provider>,
+            ToolRegistry::new(&[], Path::new("."), None),
+            config,
+        );
+        agent.set_model_accepts_images(true);
+        agent.replace_messages(stored.to_messages_for_current_path());
+        AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(stored)),
+            save_enabled,
+            ResolvedCompactionSettings {
+                enabled: compaction_enabled,
+                context_window_tokens: 128,
+                reserve_tokens: 16,
+                keep_recent_tokens: 8,
+                ..ResolvedCompactionSettings::default()
+            },
+        )
+    }
+
+    fn headless_compaction_history() -> Session {
+        let mut stored = Session::in_memory();
+        for text in [
+            "older context ".repeat(300),
+            "prior decisions ".repeat(300),
+            "continue".to_string(),
+        ] {
+            stored.append_message(pi::session::SessionMessage::User {
+                content: pi::model::UserContent::Text(text),
+                timestamp: Some(0),
+            });
+        }
+        stored
+    }
+
+    #[test]
+    fn headless_retry_preserves_native_input_and_the_abandoned_branch_on_disk() {
+        run_cli_workdir_test(async {
+            let directory = TempDir::new().expect("session directory");
+            let path = directory.path().join("headless.jsonl");
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let content = pi::model::UserContent::Blocks(vec![
+                ContentBlock::Text(pi::model::TextContent::new("Read this image")),
+                ContentBlock::Image(pi::model::ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+                ContentBlock::Media(pi::model::MediaContent {
+                    data: "YXVkaW8=".to_string(),
+                    mime_type: "audio/wav".to_string(),
+                    name: Some("voice.wav".to_string()),
+                }),
+                ContentBlock::Text(pi::model::TextContent::new("Keep the ordered context")),
+            ]);
+            let mut stored = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            stored.path = Some(path.clone());
+            let old_user = stored.append_message(pi::session::SessionMessage::User {
+                content: content.clone(),
+                timestamp: Some(0),
+            });
+            stored.save().await.unwrap();
+            let mut session = headless_command_session(&provider, stored, true, false);
+            let (_abort, signal) = AbortHandle::new();
+            let outcome =
+                execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
+                    .await
+                    .unwrap();
+            let PrintCommandOutcome::Retry(recovered) = outcome else {
+                panic!("native retry input")
+            };
+            assert_eq!(
+                serde_json::to_value(&recovered).unwrap(),
+                serde_json::to_value(&content).unwrap()
+            );
+            assert!(provider.requests.lock().unwrap().is_empty());
+            assert!(session.agent.messages().is_empty());
+            let response = run_print_recovery_fixture(&mut session, print_retry_input(recovered))
+                .await
+                .unwrap();
+            ensure_print_command_response(&response).unwrap();
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert!(
+                reopened.get_entry(&old_user).is_some(),
+                "abandoned branch is retained"
+            );
+            let users = reopened
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry,
+                        pi::session::SessionEntry::Message(entry)
+                            if matches!(entry.message, pi::session::SessionMessage::User { .. }))
+                })
+                .count();
+            assert_eq!(
+                users, 2,
+                "the repeated turn is a sibling, not a destructive replacement"
+            );
+            let active = reopened.to_messages_for_current_path();
+            let pi::model::Message::User(user) = &active[0] else {
+                panic!("active user")
+            };
+            assert_eq!(
+                serde_json::to_value(&user.content).unwrap(),
+                serde_json::to_value(content).unwrap()
+            );
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(!requests[0].to_string().contains("/retry"));
+        });
+    }
+
+    #[test]
+    fn headless_retry_does_not_promote_expanded_text_into_authored_keywords() {
+        run_cli_workdir_test(async {
+            let text = "ultrathink from an expanded template";
+            for content in [
+                pi::model::UserContent::Text(text.to_string()),
+                pi::model::UserContent::Blocks(vec![ContentBlock::Text(
+                    pi::model::TextContent::new(text),
+                )]),
+            ] {
+                let provider = Arc::new(HeadlessCommandProvider::default());
+                let mut stored = Session::in_memory();
+                stored.append_message(pi::session::SessionMessage::User {
+                    content,
+                    timestamp: Some(0),
+                });
+                let mut session = headless_command_session(&provider, stored, false, false);
+                let (_abort, signal) = AbortHandle::new();
+                let outcome =
+                    execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
+                        .await
+                        .unwrap();
+                let PrintCommandOutcome::Retry(recovered) = outcome else {
+                    panic!("native retry input")
+                };
+                run_print_recovery_fixture(&mut session, print_retry_input(recovered))
+                    .await
+                    .unwrap();
+                let cx = pi::agent_cx::AgentCx::for_request();
+                {
+                    let stored = session.session.lock(cx.cx()).await.unwrap();
+                    assert!(!stored.entries.iter().any(|entry| {
+                        matches!(entry,
+                            pi::session::SessionEntry::Custom(entry)
+                                if entry.custom_type == "magic_keyword")
+                    }));
+                }
+                // Positive control: a freshly authored occurrence still works.
+                run_print_recovery_fixture(
+                    &mut session,
+                    PromptInput::Text {
+                        text: text.to_string(),
+                        keyword_scan_source: Some(text.to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                assert!(stored.entries.iter().any(|entry| {
+                    matches!(entry,
+                        pi::session::SessionEntry::Custom(entry)
+                            if entry.custom_type == "magic_keyword")
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn headless_compaction_runs_native_maintenance_instead_of_a_user_prompt() {
+        run_cli_workdir_test(async {
+            for command in [PrintCommand::Compact, PrintCommand::Shake] {
+                let provider = Arc::new(HeadlessCommandProvider::default());
+                let mut session =
+                    headless_command_session(&provider, headless_compaction_history(), false, true);
+                let (_abort, signal) = AbortHandle::new();
+                let outcome = execute_print_command(&mut session, command, "", &signal, |_| {})
+                    .await
+                    .unwrap();
+                assert!(matches!(outcome, PrintCommandOutcome::Compacted(Some(_))));
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                assert!(
+                    stored
+                        .entries
+                        .iter()
+                        .any(|entry| { matches!(entry, pi::session::SessionEntry::Compaction(_)) })
+                );
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(
+                    requests.len(),
+                    usize::from(command == PrintCommand::Compact)
+                );
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| !request.to_string().contains("/compact"))
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn headless_handoff_persists_in_place_and_preserves_the_native_recent_turn() {
+        run_cli_workdir_test(async {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("handoff.jsonl");
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let mut stored = headless_compaction_history();
+            stored.path = Some(path.clone());
+            stored.session_dir = Some(directory.path().to_path_buf());
+            stored.header.parent_session = Some("original-parent.jsonl".into());
+            stored.set_name("Migration work");
+            let content = pi::model::UserContent::Blocks(vec![
+                ContentBlock::Text(pi::model::TextContent::new("Keep these exact inputs")),
+                ContentBlock::Image(pi::model::ImageContent {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                }),
+                ContentBlock::Media(pi::model::MediaContent {
+                    data: "YXVkaW8=".into(),
+                    mime_type: "audio/wav".into(),
+                    name: Some("voice.wav".into()),
+                }),
+            ]);
+            let kept_user = stored.append_message(pi::session::SessionMessage::User {
+                content: content.clone(),
+                timestamp: Some(0),
+            });
+            stored.append_message(pi::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(pi::model::ToolCall {
+                        id: "completed-read".into(),
+                        name: "read".into(),
+                        arguments: json!({"path": "migration.md"}),
+                        thought_signature: None,
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    ..AssistantMessage::default()
+                },
+            });
+            stored.append_message(pi::session::SessionMessage::ToolResult {
+                tool_call_id: "completed-read".into(),
+                tool_name: "read".into(),
+                content: vec![ContentBlock::Text(pi::model::TextContent::new(
+                    "Completed migration evidence",
+                ))],
+                details: None,
+                is_error: false,
+                timestamp: Some(0),
+            });
+            stored.save().await.unwrap();
+            let original_id = stored.header.id.clone();
+            let original_leaf = stored.leaf_id().map(str::to_string);
+            let original_entries = serde_json::to_value(&stored.entries).unwrap();
+            let original_count = stored.entries.len();
+            let mut session = headless_command_session(&provider, stored, true, false);
+            session.set_compaction_context_window(128_000);
+            let options = session.agent.stream_options_mut();
+            options.session_id = Some("primary-transport".into());
+            options.prompt_cache_key = Some("primary-cache".into());
+            options.max_tokens = Some(8192);
+            options.before_provider_request =
+                Some(pi::provider::BeforeProviderRequestHook::new(|_| {
+                    Box::pin(async { None })
+                }));
+            let (_abort, signal) = AbortHandle::new();
+            let outcome = execute_print_command(
+                &mut session,
+                PrintCommand::Handoff,
+                "preserve migration decisions and next steps",
+                &signal,
+                |_| {},
+            )
+            .await
+            .unwrap();
+            let PrintCommandOutcome::Compacted(Some(result)) = outcome else {
+                panic!("handoff must report its installed result")
+            };
+            assert_eq!(result["details"]["mode"], "handoff");
+            assert_eq!(result["firstKeptEntryId"], kept_user);
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(reopened.header.id, original_id);
+            assert_eq!(
+                reopened.header.parent_session.as_deref(),
+                Some("original-parent.jsonl")
+            );
+            assert_eq!(reopened.path.as_deref(), Some(path.as_path()));
+            assert_eq!(reopened.entries.len(), original_count + 1);
+            assert_eq!(
+                serde_json::to_value(&reopened.entries[..original_count]).unwrap(),
+                original_entries,
+                "all original history and branch metadata remain archived",
+            );
+            let pi::session::SessionEntry::Compaction(entry) = reopened.entries.last().unwrap()
+            else {
+                panic!("durable compaction entry")
+            };
+            assert_eq!(entry.base.parent_id, original_leaf);
+            assert_eq!(entry.details.as_ref().unwrap()["mode"], "handoff");
+            let active = reopened.to_messages_for_current_path();
+            assert!(active.iter().any(|message| matches!(message,
+                pi::model::Message::User(user)
+                    if serde_json::to_value(&user.content).unwrap()
+                        == serde_json::to_value(&content).unwrap()
+            )));
+            let active_json = serde_json::to_string(&active).unwrap();
+            assert!(active_json.contains("Retained summary"));
+            assert!(active_json.contains("Completed migration evidence"));
+            assert!(!active_json.contains("older context "));
+            assert!(!active_json.contains("/handoff"));
+            {
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(
+                    requests[0]
+                        .to_string()
+                        .contains("preserve migration decisions and next steps")
+                );
+                assert!(!requests[0].to_string().contains("YXVkaW8="));
+                let metadata = provider.metadata.lock().unwrap();
+                assert_eq!(metadata[0]["tools"], json!([]));
+                assert_ne!(metadata[0]["sessionId"], "primary-transport");
+                assert!(
+                    metadata[0]["sessionId"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty())
+                );
+                assert!(metadata[0]["promptCacheKey"].is_null());
+                assert_eq!(metadata[0]["maxTokens"], 256);
+                assert_eq!(metadata[0]["providerHook"], false);
+            }
+            assert_eq!(
+                session.agent.stream_options().session_id.as_deref(),
+                Some("primary-transport")
+            );
+            run_print_recovery_fixture(
+                &mut session,
+                PromptInput::Text {
+                    text: "Continue from this checkpoint".into(),
+                    keyword_scan_source: Some("Continue from this checkpoint".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let next_request = requests[1].to_string();
+            assert!(next_request.contains("Retained summary"));
+            assert!(next_request.contains("aGVsbG8="));
+            assert!(next_request.contains("YXVkaW8="));
+            assert!(next_request.contains("Completed migration evidence"));
+            assert!(!next_request.contains("older context "));
+        });
+    }
+
+    #[test]
+    fn headless_handoff_failed_or_incomplete_synthesis_never_falls_back_or_changes_disk() {
+        run_cli_workdir_test(async {
+            for behavior in [
+                HeadlessCommandBehavior::Reject,
+                HeadlessCommandBehavior::Empty,
+                HeadlessCommandBehavior::MessageTruncated,
+                HeadlessCommandBehavior::DoneTruncated,
+                HeadlessCommandBehavior::ToolCall,
+                HeadlessCommandBehavior::MissingTerminal,
+            ] {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("failed-handoff.jsonl");
+                let provider = Arc::new(HeadlessCommandProvider {
+                    behavior,
+                    ..Default::default()
+                });
+                let mut stored = headless_compaction_history();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(directory.path().to_path_buf());
+                stored.save().await.unwrap();
+                let before = fs::read(&path).unwrap();
+                let old_leaf = stored.leaf_id().map(str::to_string);
+                let old_entries = serde_json::to_value(&stored.entries).unwrap();
+                let mut session = headless_command_session(&provider, stored, true, true);
+                assert!(pi::compaction::requires_forced_local_compaction(
+                    pi::compaction::estimate_model_context_tokens(session.agent.messages()),
+                    session.compaction_settings(),
+                ));
+                let (_abort, signal) = AbortHandle::new();
+                let error =
+                    execute_print_command(&mut session, PrintCommand::Handoff, "", &signal, |_| {})
+                        .await
+                        .unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+                assert_eq!(provider.requests.lock().unwrap().len(), 1);
+                assert_eq!(fs::read(&path).unwrap(), before);
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                assert_eq!(stored.leaf_id(), old_leaf.as_deref());
+                assert_eq!(serde_json::to_value(&stored.entries).unwrap(), old_entries);
+            }
+        });
+    }
+
+    #[test]
+    fn headless_handoff_cancellation_and_changed_source_refuse_installation() {
+        run_cli_workdir_test(async {
+            let (abort, signal) = AbortHandle::new();
+            let provider = Arc::new(HeadlessCommandProvider {
+                behavior: HeadlessCommandBehavior::Cancel(abort),
+                ..Default::default()
+            });
+            let stored = headless_compaction_history();
+            let old_entries = serde_json::to_value(&stored.entries).unwrap();
+            let mut session = headless_command_session(&provider, stored, false, false);
+            let error =
+                execute_print_command(&mut session, PrintCommand::Handoff, "", &signal, |_| {})
+                    .await
+                    .unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+            let cx = pi::agent_cx::AgentCx::for_request();
+            assert_eq!(
+                serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries)
+                    .unwrap(),
+                old_entries,
+            );
+
+            let stored = Arc::new(Mutex::new(headless_compaction_history()));
+            let provider = Arc::new(HeadlessCommandProvider {
+                behavior: HeadlessCommandBehavior::EditSession(Arc::clone(&stored)),
+                ..Default::default()
+            });
+            let agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn pi::provider::Provider>,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            let mut session = AgentSession::new(
+                agent,
+                Arc::clone(&stored),
+                false,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    keep_recent_tokens: 8,
+                    ..Default::default()
+                },
+            );
+            let (_abort, signal) = AbortHandle::new();
+            let error =
+                execute_print_command(&mut session, PrintCommand::Handoff, "", &signal, |_| {})
+                    .await
+                    .unwrap_err();
+            assert!(error.to_string().contains("source changed"));
+            let stored = stored.lock(cx.cx()).await.unwrap();
+            assert!(
+                !stored
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, pi::session::SessionEntry::Compaction(_)))
+            );
+            assert!(
+                serde_json::to_string(&stored.entries)
+                    .unwrap()
+                    .contains("A newer authored turn")
+            );
+        });
+    }
+
+    #[test]
+    fn headless_handoff_applies_privacy_to_focus_source_and_saved_summary() {
+        run_cli_workdir_test(async {
+            for mode in ["obfuscate", "block"] {
+                let provider = Arc::new(HeadlessCommandProvider {
+                    behavior: HeadlessCommandBehavior::Text("ACME-123456 and ACME-654321".into()),
+                    ..Default::default()
+                });
+                let mut stored = Session::in_memory();
+                for text in [
+                    "ACME-123456 was used during earlier work",
+                    "Continue the current task with all of the preserved context",
+                ] {
+                    stored.append_message(pi::session::SessionMessage::User {
+                        content: pi::model::UserContent::Text(text.into()),
+                        timestamp: Some(0),
+                    });
+                }
+                let original = serde_json::to_value(&stored.entries).unwrap();
+                let mut session = headless_command_session_with_config(
+                    &provider,
+                    stored,
+                    false,
+                    false,
+                    AgentConfig {
+                        secrets: Some(pi::secrets::SecretsSettings {
+                            mode: Some(mode.into()),
+                            extra_patterns: Some(vec![r"ACME-[0-9]{6}".into()]),
+                        }),
+                        ..Default::default()
+                    },
+                );
+                let (_abort, signal) = AbortHandle::new();
+                let result = execute_print_command(
+                    &mut session,
+                    PrintCommand::Handoff,
+                    "Consider ACME-654321",
+                    &signal,
+                    |_| {},
+                )
+                .await;
+                let cx = pi::agent_cx::AgentCx::for_request();
+                let stored = session.session.lock(cx.cx()).await.unwrap();
+                if mode == "block" {
+                    assert!(result.unwrap_err().to_string().contains("PI_SECRET_BLOCK"));
+                    assert!(provider.requests.lock().unwrap().is_empty());
+                    assert_eq!(serde_json::to_value(&stored.entries).unwrap(), original);
+                } else {
+                    let PrintCommandOutcome::Compacted(Some(result)) = result.unwrap() else {
+                        panic!("privacy-screened handoff")
+                    };
+                    let requests = provider.requests.lock().unwrap();
+                    assert_eq!(requests.len(), 1);
+                    let request = requests[0].to_string();
+                    let summary = result["summary"].as_str().unwrap();
+                    for secret in ["ACME-123456", "ACME-654321"] {
+                        assert!(!request.contains(secret));
+                        assert!(!summary.contains(secret));
+                    }
+                    assert_eq!(
+                        serde_json::to_value(&stored.entries[..2]).unwrap(),
+                        original,
+                        "privacy projection must not rewrite original evidence",
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn headless_handoff_honors_hook_cancellation_and_refuses_replacement_summaries() {
+        run_cli_workdir_test(async {
+            for response in [
+                json!(false),
+                json!({"compaction": {
+                    "summary": "Unscreened extension summary", "firstKeptEntryId": "unknown"
+                }}),
+            ] {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("handoff-hook.native.json");
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&json!({
+                        "id": "handoff-hook", "name": "handoff-hook", "version": "1.0.0",
+                        "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                        "eventHooks": ["session_before_compact"],
+                        "eventResponses": {"session_before_compact": response}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let manager = pi::extensions::ExtensionManager::new();
+                manager
+                    .set_native_runtime(NativeRustExtensionRuntimeHandle::start().await.unwrap());
+                manager
+                    .load_native_extensions(vec![
+                        pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path)
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
+                let provider = Arc::new(HeadlessCommandProvider::default());
+                let stored = headless_compaction_history();
+                let old_entries = serde_json::to_value(&stored.entries).unwrap();
+                let mut session = headless_command_session(&provider, stored, false, false);
+                session.extensions = Some(pi::extensions::ExtensionRegion::new(manager));
+                let (_abort, signal) = AbortHandle::new();
+                let error = execute_print_command(
+                    &mut session,
+                    PrintCommand::Handoff,
+                    "Keep decisions",
+                    &signal,
+                    |_| {},
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+                assert!(provider.requests.lock().unwrap().is_empty());
+                let cx = pi::agent_cx::AgentCx::for_request();
+                assert_eq!(
+                    serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries)
+                        .unwrap(),
+                    old_entries,
+                );
+                session.extensions.as_ref().unwrap().shutdown().await;
+            }
+        });
+    }
+
+    #[test]
+    fn headless_compaction_extension_cancellation_fails_without_dispatch_or_mutation() {
+        run_cli_workdir_test(async {
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let stored = headless_compaction_history();
+            let old_leaf = stored.leaf_id().map(str::to_string);
+            let mut session = headless_command_session(&provider, stored, false, true);
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("cancel-compact.native.json");
+            let descriptor = json!({
+                "id": "cancel-compact", "name": "cancel-compact", "version": "1.0.0",
+                "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                "eventHooks": ["session_before_compact"],
+                "eventResponses": {"session_before_compact": false}
+            });
+            fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+            let manager = pi::extensions::ExtensionManager::new();
+            manager.set_native_runtime(NativeRustExtensionRuntimeHandle::start().await.unwrap());
+            manager
+                .load_native_extensions(vec![
+                    pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path).unwrap(),
+                ])
+                .await
+                .unwrap();
+            session.extensions = Some(pi::extensions::ExtensionRegion::new(manager));
+            let (_abort, signal) = AbortHandle::new();
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let error = execute_print_command(
+                &mut session,
+                PrintCommand::Compact,
+                "",
+                &signal,
+                move |event| captured.lock().unwrap().push(event),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+            assert!(provider.requests.lock().unwrap().is_empty());
+            assert!(events.lock().unwrap().iter().any(|event| {
+                matches!(event, AgentEvent::AutoCompactionEnd { aborted: true, .. })
+            }));
+            let cx = pi::agent_cx::AgentCx::for_request();
+            let stored = session.session.lock(cx.cx()).await.unwrap();
+            assert_eq!(stored.leaf_id(), old_leaf.as_deref());
+            assert!(
+                !stored
+                    .entries
+                    .iter()
+                    .any(|entry| { matches!(entry, pi::session::SessionEntry::Compaction(_)) })
+            );
+            drop(stored);
+            session.extensions.as_ref().unwrap().shutdown().await;
+        });
+    }
+
+    #[test]
+    fn headless_command_refusals_and_cancellation_do_not_dispatch() {
+        run_cli_workdir_test(async {
+            let provider = Arc::new(HeadlessCommandProvider::default());
+            let mut session =
+                headless_command_session(&provider, Session::in_memory(), false, false);
+            let (abort, signal) = AbortHandle::new();
+            for command in [
+                PrintCommand::Compact,
+                PrintCommand::Retry,
+                PrintCommand::Handoff,
+            ] {
+                let error = execute_print_command(&mut session, command, "", &signal, |_| {})
+                    .await
+                    .unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+            }
+            let mut single_turn = Session::in_memory();
+            single_turn.append_message(pi::session::SessionMessage::User {
+                content: pi::model::UserContent::Text("One large authored turn ".repeat(300)),
+                timestamp: Some(0),
+            });
+            let mut single_session = headless_command_session(&provider, single_turn, false, false);
+            let error = execute_print_command(
+                &mut single_session,
+                PrintCommand::Handoff,
+                "",
+                &signal,
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("Nothing safe to hand off"));
+            abort.abort();
+            assert!(
+                execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
+                    .await
+                    .is_err()
+            );
+            assert!(session.agent.messages().is_empty());
+            assert!(provider.requests.lock().unwrap().is_empty());
+            let failed = AssistantMessage {
+                stop_reason: StopReason::Error,
+                error_message: Some("provider refused retry".to_string()),
+                ..AssistantMessage::default()
+            };
+            let error = ensure_print_command_response(&failed).unwrap_err();
+            assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+        });
+    }
+
+    struct PrintRecoveryProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: StdMutex<Vec<Option<String>>>,
+        input_tokens: u64,
+        transport_error: bool,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl pi::provider::Provider for PrintRecoveryProvider {
+        fn name(&self) -> &str {
+            "print-recovery"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &pi::provider::Context<'_>,
+            _options: &pi::provider::StreamOptions,
+        ) -> pi::error::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+            >,
+        > {
+            self.prompts
+                .lock()
+                .expect("capture print prompt")
+                .push(context.system_prompt.as_deref().map(str::to_string));
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 && self.transport_error {
+                return Err(pi::error::Error::api("server error"));
+            }
+            let failed = call == 0;
+            let message = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: pi::model::Usage {
+                    input: self.input_tokens,
+                    ..pi::model::Usage::default()
+                },
+                stop_reason: if failed {
+                    StopReason::Error
+                } else {
+                    StopReason::Stop
+                },
+                stop_details: None,
+                error_message: failed.then(|| "server error".to_string()),
+                timestamp: 0,
+            };
+            let terminal = if failed {
+                pi::model::StreamEvent::Error {
+                    reason: StopReason::Error,
+                    error: message.clone(),
+                }
+            } else {
+                pi::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: message.clone(),
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(pi::model::StreamEvent::Start { partial: message }),
+                Ok(terminal),
+            ])))
+        }
+    }
+
+    fn print_recovery_session(provider: &Arc<PrintRecoveryProvider>) -> AgentSession {
+        let mut agent = Agent::new(
+            Arc::clone(provider) as Arc<dyn pi::provider::Provider>,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig {
+                system_prompt: Some("ordinary-system".to_string()),
+                ..AgentConfig::default()
+            },
+        );
+        agent.set_model_accepts_images(true);
+        let mut stored = Session::in_memory();
+        stored.header.provider = Some("print-recovery".to_string());
+        stored.header.model_id = Some("test-model".to_string());
+        AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(stored)),
+            false,
+            ResolvedCompactionSettings {
+                enabled: false,
+                ..ResolvedCompactionSettings::default()
+            },
+        )
+    }
+
+    async fn run_print_recovery_fixture(
+        session: &mut AgentSession,
+        input: PromptInput,
+    ) -> Result<AssistantMessage> {
+        let config = Config {
+            retry: Some(pi::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(1),
+                base_delay_ms: Some(0),
+                max_delay_ms: Some(0),
+                ..pi::config::RetrySettings::default()
+            }),
+            ..Config::default()
+        };
+        let (_abort, signal) = AbortHandle::new();
+        run_print_prompt_with_retry(
+            session,
+            &config,
+            &signal,
+            &|| |_| {},
+            true,
+            1,
+            true,
+            &Arc::new(StdMutex::new(PrintTextStreamState::default())),
+            input,
+            None,
+            &mut PrintFailoverState::default(),
+        )
+        .await
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_recovery_preserves_hook_prompt_without_leaking_into_the_next_turn() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(Box::pin(async {
+            for transport_error in [false, true] {
+                for with_image in [false, true] {
+                    for override_prompt in [Some("hook-system"), Some(""), None] {
+                        let provider = Arc::new(PrintRecoveryProvider {
+                            calls: std::sync::atomic::AtomicUsize::new(0),
+                            prompts: StdMutex::new(Vec::new()),
+                            input_tokens: 0,
+                            transport_error,
+                        });
+                        let mut session = print_recovery_session(&provider);
+                        let root = tempfile::tempdir().expect("extension tempdir");
+                        let path = root.path().join("turn-prompt.native.json");
+                        let mut response = json!({"messages": [{
+                            "customType": "print-prompt-hook", "content": "hook ran once",
+                            "display": false
+                        }]});
+                        if let Some(prompt) = override_prompt {
+                            response["systemPrompt"] = json!(prompt);
+                        }
+                        let descriptor = json!({
+                            "id": "print-prompt-hook", "name": "print-prompt-hook",
+                            "version": "1.0.0", "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                            "eventHooks": ["before_agent_start"],
+                            "eventResponses": {"before_agent_start": response}
+                        });
+                        fs::write(&path, serde_json::to_vec(&descriptor).expect("encode extension"))
+                            .expect("write extension");
+                        let manager = pi::extensions::ExtensionManager::new();
+                        manager.set_native_runtime(
+                            NativeRustExtensionRuntimeHandle::start()
+                                .await
+                                .expect("native runtime"),
+                        );
+                        manager
+                            .load_native_extensions(vec![
+                                pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path)
+                                    .expect("native extension spec"),
+                            ])
+                            .await
+                            .expect("load extension");
+                        session.extensions = Some(pi::extensions::ExtensionRegion::new(manager));
+                        let input = if with_image {
+                            PromptInput::Content {
+                                content: vec![
+                                    ContentBlock::Text(pi::model::TextContent::new("first turn")),
+                                    ContentBlock::Image(pi::model::ImageContent {
+                                        data: "aGVsbG8=".to_string(),
+                                        mime_type: "image/png".to_string(),
+                                    }),
+                                ],
+                                keyword_scan_source: None,
+                            }
+                        } else {
+                            PromptInput::Text {
+                                text: "first turn".to_string(),
+                                keyword_scan_source: None,
+                            }
+                        };
+                        let result = run_print_recovery_fixture(&mut session, input)
+                            .await
+                            .expect("recovered turn");
+                        assert_eq!(result.stop_reason, StopReason::Stop);
+                        let expected = Some(override_prompt.unwrap_or("ordinary-system").to_string());
+                        assert_eq!(
+                            *provider.prompts.lock().expect("recorded prompts"),
+                            vec![expected.clone(), expected],
+                            "transport_error={transport_error}, image={with_image}, override={override_prompt:?}"
+                        );
+                        assert_eq!(session.agent.system_prompt(), Some("ordinary-system"));
+                        let cx = pi::agent_cx::AgentCx::for_request();
+                        let hook_count = session
+                            .session
+                            .lock(cx.cx())
+                            .await
+                            .expect("session lock")
+                            .to_messages_for_current_path()
+                            .into_iter()
+                            .filter(|message| matches!(
+                                message, pi::model::Message::Custom(custom)
+                                    if custom.custom_type == "print-prompt-hook"
+                            ))
+                            .count();
+                        assert_eq!(hook_count, 1, "recovery must not replay start hooks");
+                        let _extension = session.extensions.take();
+                        run_print_recovery_fixture(
+                            &mut session,
+                            PromptInput::Text {
+                                text: "next turn".to_string(),
+                                keyword_scan_source: None,
+                            },
+                        )
+                        .await
+                        .expect("next turn");
+                        assert_eq!(
+                            provider.prompts.lock().expect("next prompt").last(),
+                            Some(&Some("ordinary-system".to_string()))
+                        );
+                        assert_eq!(session.agent.system_prompt(), Some("ordinary-system"));
+                    }
+                }
+            }
+        }));
+    }
+
+    #[test]
+    fn print_recovery_uses_live_model_capacity_for_silent_overflow() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(Box::pin(async {
+            for (capacity, tokens, expected_calls) in [
+                (Some(8_192), 8_193, 1),
+                (Some(8_192), 8_192, 2),
+                (Some(0), 8_193, 2),
+                (None, 8_193, 2),
+            ] {
+                let provider = Arc::new(PrintRecoveryProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    prompts: StdMutex::new(Vec::new()),
+                    input_tokens: tokens,
+                    transport_error: false,
+                });
+                let mut session = print_recovery_session(&provider);
+                let root = tempfile::tempdir().expect("auth tempdir");
+                if let Some(capacity) = capacity {
+                    let auth = AuthStorage::empty_at(root.path().join("auth.json"));
+                    let mut registry = ModelRegistry::load(&auth, None);
+                    let mut entry = pi::models::ad_hoc_model_entry("openai", "test-model")
+                        .expect("model entry");
+                    entry.model.provider = "print-recovery".to_string();
+                    entry.model.context_window = capacity;
+                    entry.api_key = Some("fixture-key".to_string());
+                    registry.merge_entries(vec![entry]);
+                    session.set_model_registry(registry);
+                }
+                let result = run_print_recovery_fixture(
+                    &mut session,
+                    PromptInput::Text {
+                        text: "hello".to_string(),
+                        keyword_scan_source: None,
+                    },
+                )
+                .await
+                .expect("classified turn");
+                assert_eq!(
+                    provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                    expected_calls,
+                    "capacity={capacity:?}, input tokens={tokens}"
+                );
+                assert_eq!(
+                    result.stop_reason,
+                    if expected_calls == 1 {
+                        StopReason::Error
+                    } else {
+                        StopReason::Stop
+                    }
+                );
+            }
+        }));
+    }
+
     struct PersistencePoisonProvider {
         session: Arc<Mutex<Session>>,
         poison_path: PathBuf,
@@ -12698,6 +15775,103 @@ mod tests {
                             )
                     ))
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_policy_keeps_declared_provider_ownership() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let entry = |provider: &str, model_id: &str| {
+                let mut entry =
+                    pi::models::ad_hoc_model_entry("openrouter", model_id).expect("fixture model");
+                entry.model.provider = provider.to_string();
+                entry.model.base_url = format!("https://{provider}.example.test/v1");
+                entry.api_key = Some("routing-fixture-key".to_string());
+                entry
+            };
+            for (provider, other_provider) in
+                [("openrouter", "open-router"), ("open-router", "openrouter")]
+            {
+                for reverse in [false, true] {
+                    for own_policy in [false, true] {
+                        let primary = entry(provider, "vendor/shared");
+                        let mut other = entry(other_provider, "vendor/shared");
+                        other.api_key = None;
+                        let fallback = entry("pi268-rescue", "fallback");
+                        let mut catalog = vec![primary.clone(), other, fallback.clone()];
+                        if reverse {
+                            catalog.reverse();
+                        }
+                        let mut registry = ModelRegistry::default();
+                        registry.merge_extension_entries(catalog).expect("catalog");
+                        let available_models = vec![primary.clone(), fallback];
+                        let runtime_provider =
+                            providers::create_provider(&primary, None).expect("provider");
+                        let agent = Agent::new(
+                            runtime_provider,
+                            ToolRegistry::new(&[], Path::new("."), None),
+                            AgentConfig::default(),
+                        );
+                        let mut stored = Session::in_memory();
+                        stored.set_model_header(
+                            Some(provider.to_string()),
+                            Some("vendor/shared".to_string()),
+                            None,
+                        );
+                        let store = Arc::new(Mutex::new(stored));
+                        let mut session = AgentSession::new(
+                            agent,
+                            Arc::clone(&store),
+                            false,
+                            ResolvedCompactionSettings::default(),
+                        );
+                        session.set_model_registry(registry);
+                        let policy_provider = if own_policy { provider } else { other_provider };
+                        let config = Config {
+                            retry: Some(pi::config::RetrySettings {
+                                fallback_chains: Some(std::collections::HashMap::from([(
+                                    format!(" {policy_provider} / VENDOR/SHARED "),
+                                    vec!["pi268-rescue/fallback".to_string()],
+                                )])),
+                                ..Default::default()
+                            }),
+                            ..Config::default()
+                        };
+                        let auth = AuthStorage::empty_at(PathBuf::from("pi268-policy-auth.json"));
+                        let mut state = PrintFailoverState::new(&config);
+                        let result = try_print_failover(
+                            &mut session,
+                            &config,
+                            Some(FailoverResolution {
+                                available_models: &available_models,
+                                auth: &auth,
+                                cli_api_key: None,
+                            }),
+                            &mut state,
+                            Some("503 service unavailable"),
+                            false,
+                            false,
+                            None,
+                            0,
+                        )
+                        .await
+                        .expect("resolve policy");
+                        assert_eq!(result.is_some(), own_policy);
+                        let expected = if own_policy { "pi268-rescue" } else { provider };
+                        assert_eq!(session.agent.provider().name(), expected);
+                        let cx = pi::agent_cx::AgentCx::for_request();
+                        let stored = store.lock(cx.cx()).await.expect("stored session");
+                        assert_eq!(stored.header.provider.as_deref(), Some(expected));
+                        assert_eq!(state.primary().is_some(), own_policy);
+                        if !own_policy {
+                            assert!(stored.entries.is_empty());
+                            assert_eq!(state.chain_position(), 0);
+                        }
+                    }
+                }
+            }
         });
     }
 

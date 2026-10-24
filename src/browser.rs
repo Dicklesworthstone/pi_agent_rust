@@ -12,17 +12,19 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 mod cdp;
 mod dialog;
 mod download;
 mod exports;
 mod frames;
+mod history;
 mod interaction;
 mod launch;
 mod mock;
 mod policy;
+mod session;
+mod storage;
 
 pub use launch::BrowserLaunchOptions;
 
@@ -70,9 +72,7 @@ pub struct BrowserSettings {
 pub struct BrowserTool {
     cwd: PathBuf,
     mock_mode: Option<bool>,
-    mock_state: Mutex<mock::State>,
-    /// An owned guard keeps the serialized CDP/managed-process lifetime Send.
-    live_state: Arc<asupersync::sync::Mutex<cdp::Session>>,
+    sessions: session::Sessions,
     cdp_endpoint: Option<String>,
     launch_options: Option<BrowserLaunchOptions>,
     domain_allowlist: Option<Vec<String>>,
@@ -83,8 +83,7 @@ impl BrowserTool {
         Self {
             cwd: cwd.to_path_buf(),
             mock_mode: None,
-            mock_state: Mutex::new(mock::State::default()),
-            live_state: Arc::new(asupersync::sync::Mutex::new(cdp::Session::default())),
+            sessions: session::Sessions::default(),
             cdp_endpoint: None,
             launch_options: None,
             domain_allowlist: None,
@@ -107,7 +106,7 @@ impl BrowserTool {
     }
 
     /// Select managed launch from trusted host code, overriding the environment.
-    /// Stop an already-running browser before changing connection configuration.
+    /// Stop an already-running browser before changing its connection configuration.
     #[must_use]
     pub fn with_launch_options(mut self, options: BrowserLaunchOptions) -> Self {
         self.launch_options = Some(options);
@@ -158,33 +157,84 @@ impl Tool for BrowserTool {
     fn description(&self) -> &str {
         "Chromium automation with an owned isolated browser, or explicit loopback attachment \
          through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
-         frame discovery and frame-scoped inspection/input, workspace file uploads, JavaScript dialogs, \
-         screenshots and PDF export. start launches or attaches; status never launches; stop only \
-         stops a Pi-owned browser. Failures are errors, never simulated successes. Selecting \
-         upload files exposes them to page scripts."
+         native back/forward/reload history traversal with destination policy checks, \
+         structured option selection and checked-state control, frame discovery and frame-scoped \
+         inspection/input, workspace file uploads, JavaScript dialogs, screenshots and PDF export. \
+         fill also supports date/time/month/week/datetime-local, opaque #RRGGBB color and numeric range inputs using validated DOM value setters and untrusted input/change events, not native keys. Existing values are no-ops; invalid min/max/step or handler-reverted values fail without replay. Ordinary text input still uses native insertion with original-node focus checks. \
+         download clicks once and captures one source-frame-matched transfer up to 100 MiB into a new workspace file; optional frame requires explicit tab and selector. Extra transfers, changed documents and invalid progress fail without publication or replay. \
+         Downloads also support existing tabs in CDP-created browser contexts. Context identity is derived from the selected tab, never a caller override; capture and recovery use that original context. Unknown profiles fail rather than fall back. Failed recovery blocks later browser work; cleanup is best effort, not rollback. \
+         Generated data: exports and blob: exports with an allowed HTTP(S) creator are supported under the same source checks. Download URLs are capped at 64 KiB; payloads, Blob handles and query/fragment fields are redacted in results. Opaque blob:null origins remain unsupported. \
+         Storage-state actions require an explicit tab and private workspace state_path; files contain plaintext credentials, never returned inline. \
+         Attach diagnostics to an action to capture console output and uncaught exceptions before \
+         and after it; diagnostics.network:true also correlates request failures, HTTP status and redirects. \
+         Use action:diagnostics to observe an explicit tab without triggering work. \
+         start launches or attaches; status never launches; stop only stops a Pi-owned browser. \
+         Browser state is conversation-owned; switching back reuses its tabs. release discards only \
+         this conversation's browser state and requests owned-process cleanup, never stopping an \
+         externally attached browser. Four namespaces are retained without automatic eviction. \
+         Failures are errors, never simulated successes. Selecting upload files exposes them to page scripts. \
+         Semantic selectors support text/, label/, placeholder/, testid/, alt/, title/ and role/<role>[name=\"...\" exact]; ambiguous matches are refused. \
+         click accepts left/middle/right buttons, left double-clicks and modifier keys; sequences never replay after interruption. Dispatch acknowledgement does not verify the application's outcome. \
+         batch executes ordered native calls under one conversation lease and total deadline, preserving partial results and stopping at the first error without replay. \
+         wait_for supports visible/hidden/attached/detached, optional rendered text and a sampled stable_ms interval; waits pin the current document and never send input. \
+         click/type/fill/press/hover/drag may include wait_after to observe a same-document postcondition after that one input, without replay or a new timeout. \
+         hover moves the native pointer without clicking. drag moves from selector to target_selector with a held left button; both original nodes must remain in the same main document and viewport. An explicit tab is required. No synthetic drag events, implicit drop acceptance, cross-frame drag, autoscroll or replay."
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "required": ["action"],
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
-                             "list_frames", "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
-                             "scroll", "wait_for", "upload", "download", "screenshot", "print_pdf",
-                             "handle_dialog"],
-                    "description": "Browser action; ordinary actions lazily start the managed browser"
+                             "list_frames", "snapshot", "ax_tree", "evaluate", "back", "forward", "reload", "click", "hover", "drag", "type", "fill", "press",
+                             "scroll", "wait_for", "select_option", "set_checked", "upload", "download", "screenshot", "print_pdf",
+                             "handle_dialog", "diagnostics", "release"],
+                    "description": "Browser action; ordinary actions lazily start the managed browser. release accepts only action and timeout_ms: discard this conversation's state and request owned-browser cleanup; attached pages/processes remain open."
                 },
-                "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
+                "tab": {"type": "string", "description": "Tab name or target ID from list_tabs; default: active tab. Existing CDP-created context tabs are supported without a context-ID argument. New open names still create default-context tabs."},
                 "frame": {"type": "string", "maxLength": 256,
-                          "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree, evaluate, click, type, fill, press, scroll or wait_for to that frame for this call only. Scoped press and scroll also require selector. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Out-of-process frames and frame-scoped uploads/downloads, exports, navigation and dialog responses are not supported."},
+                          "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree, evaluate, click, type, fill, press, scroll, wait_for, select_option, set_checked, upload or download to that frame for this call only, including nested out-of-process frames. Scoped press, scroll and file transfers also require selector. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Cross-process click/scroll and download triggers project through embedding content quads and verify ancestor hit tests before native page input; occluded, invalid or pinch-zoomed geometry is rejected. Uploads expose private workspace copies to the original file input immediately and retain the same path/byte limits. Downloads require a matching source-frame event and unchanged document through publication; extra transfers fail. Frame-scoped exports, navigation and dialog responses are not supported."},
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
                 "script": {"type": "string", "description": "JavaScript expression for evaluate; frame-scoped evaluation uses an isolated DOM world, not the page's JavaScript globals"},
-                "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1. Frame references require the same tab and frame; frame-scoped press/scroll require a selector."},
-                "text": {"type": "string", "description": "Text for type/fill"},
+                "selector": {"type": "string", "description": "CSS or snapshot @eN; also text/, label/, placeholder/, testid/, alt/, title/ and role/button[name=\"Save\" exact]. Semantic selectors are case-sensitive, bounded to 16 KiB and require one matching element; text-like names normalize whitespace and match substrings, testid matches data-testid exactly. Role/label use Chromium accessible names, not field values. Semantic selectors work on click/hover/drag/type/fill/press/wait_for/select_option/set_checked/upload and frame-scoped scroll, not inspection/export/download actions. Hover/drag require an explicit main-document tab and reject frame. Frame references require the same tab and frame; scoped press/scroll require selector."},
+                "text": {"type": "string", "description": "Literal input for type/fill. Specialized fill only: HTML date/time/month/week/datetime-local strings, opaque #RRGGBB color without alpha/colorspace attributes, or a finite decimal range value. Empty clears date/time controls, not color/range. At most 4096 UTF-16 code units for specialized values; min/max/step violations fail before mutation. Uses DOM setters and untrusted events, verifies retained canonical value, reports input_method/input_type/changed/value_normalized without echoing field values. type does not append to these specialized controls. wait_for optionally matches nonempty rendered text up to 16 KiB, without reading input/textarea values."},
+                "state": {"type":"string","enum":["visible","hidden","attached","detached"],"description":"wait_for only; default visible. hidden means absent or not rendered visibly. attached/detached test DOM connection. Non-visible states require CSS or a known snapshot reference; semantic lookup omits hidden nodes. Navigation fails rather than proving absence."},
+                "text_match": {"type":"string","enum":["contains","exact"],"description":"wait_for with text only; default contains. Case-sensitive normalized rendered DOM text; excludes input/textarea values and hidden descendants. Not regular expressions. Text requires visible or attached state."},
+                "stable_ms": {"type":"integer","minimum":0,"maximum":10000,"default":0,"description":"wait_for only. Require matching sampled observations on the same node (or absence) for this interval. A mismatch or replacement resets it; timeout_ms still bounds the whole call. Not continuous observation or a guarantee about the next action."},
+                "wait_after": interaction::wait::after_schema(),
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
+                "button": {"type":"string","enum":["left","middle","right"],"default":"left","description":"click only: native pointer button. Right opens native page context menus where supported; middle can open links in another tab. Existing tool approvals still apply."},
+                "click_count": {"type":"integer","enum":[1,2],"default":1,"description":"click only: 2 sends a native left double-click (two press/release pairs with increasing clickCount). Right/middle require 1. A changed document or detached original node stops remaining input; completed effects are not undone or retried."},
+                "modifiers": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","enum":["Alt","Control","Meta","Shift"]},"description":"click/hover/drag only: modifier flags on each native pointer event, not sticky keyboard presses. Distinct names only. Defaults to []."},
+                "target_selector": {"type":"string","minLength":1,"maxLength":65536,"description":"drag only: destination CSS, snapshot @eN or semantic selector in the source's main document. Requires explicit tab, a different original node, points at least 8 CSS pixels apart, and both endpoints visible together after source scrolling. Fixed endpoint geometry; no cross-frame target or active autoscroll. Native HTML drag/drop and custom pointer handlers retain their ordinary page behavior. DataTransfer is not read or invented; acceptance of a drop is not implied by dispatch acknowledgement."},
+                "drag_steps": {"type":"integer","minimum":1,"maximum":64,"default":12,"description":"drag only: bounded interpolated held-pointer moves. A final repeated destination move gives native dragover a chance to run; never repeats the press/drop. Separate from batch steps."},
+                "duration_ms": {"type":"integer","minimum":0,"maximum":5000,"default":300,"description":"drag only: requested movement pacing span, not a new timeout. Protocol and ownership checks can take longer; the original timeout_ms bounds the whole call. 0 adds no pacing sleep."},
+                "diagnostics": {
+                    "type": "object", "additionalProperties": false,
+                    "description": "Opt-in native console/exception capture around a main-document action, or options for action:diagnostics. Requires an explicit tab. Records only admitted main-world contexts; includes buffered console entries when Chromium supplies them. Object previews/getters are never read. Free-form console text can contain application secrets. Bounded latest records appear in details.diagnostics and text; failures remain errors and work is never replayed. Unsupported with frame, lifecycle, handle_dialog, uploads, downloads or exports. No persistent/background subscription.",
+                    "properties": {
+                        "network": {"type":"boolean","default":false,"description":"Also capture admitted main-frame HTTP request hops, responses, redirects and loading failures on this connection. Query/fragment fields, headers, cookies and bodies are omitted; no interception, response-body fetch or network-idle guarantee. Pending requests remain pending at capture end. max_events also bounds a separate 64-KiB latest request tail."},
+                        "settle_ms": {"type":"integer","minimum":0,"maximum":10000,"default":250,"description":"Fixed receive window after success; shares timeout_ms, never extends it. 0 stops at action completion. Not a network-idle guarantee."},
+                        "max_events": {"type":"integer","minimum":1,"maximum":200,"default":100,"description":"Maximum latest console records, also bounded to 64 KiB; dropped records are counted."}
+                    }
+                },
+                "checked": {"type":"boolean", "description":"set_checked: required desired state for a native checkbox/radio input. Already-matching state is a no-op; otherwise uses one native click and verifies the same node. Cannot uncheck a selected radio; choose another in its group. Mixed/indeterminate and custom ARIA controls are rejected. Requires selector; no implicit dialog consent or retry."},
+                "options": {
+                    "type": "array", "maxItems": 100,
+                    "description": "select_option: required full selection for an ordinary HTML select. Each item specifies exactly one literal value, exact DOM label, or zero-based index. Missing, ambiguous, duplicate and disabled options fail before mutation. [] clears; multiple entries require a multiple select. At most 64 KiB of selector text. Uses DOM selectedness setters and input/change events, not trusted native mouse selection; verifies retained results on the same node.",
+                    "items": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {
+                            "value": {"type":"string"},
+                            "label": {"type":"string"},
+                            "index": {"type":"integer", "minimum":0, "maximum":4095}
+                        },
+                        "oneOf": [{"required":["value"]}, {"required":["label"]}, {"required":["index"]}]
+                    }
+                },
                 "accept": {"type": "boolean", "description": "handle_dialog: required explicit choice; true accepts, false dismisses the selected tab's current JavaScript dialog. Requires an explicit tab; never replays the triggering action."},
                 "prompt_text": {"type": "string", "description": "handle_dialog: exact prompt answer, at most 64 KiB. Only with accept=true; omit to send no promptText override."},
                 "dialog_response": {
@@ -200,8 +250,8 @@ impl Tool for BrowserTool {
                     }
                 },
                 "files": {"type": "array", "maxItems": 10, "items": {"type": "string"},
-                          "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. At most 20 MiB per call."},
-                "output_path": {"type": "string", "description": "New workspace-relative artifact destination; screenshot requires .png, print_pdf requires .pdf, download keeps any extension; existing files are never overwritten"},
+                          "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. Optional frame requires an explicit tab and targets that exact file input. At most 20 MiB per call and 64 MiB retained per conversation; selected files are exposed immediately to page scripts."},
+                "output_path": {"type": "string", "description": "New workspace-relative artifact destination; screenshot requires .png, print_pdf requires .pdf, download keeps any extension; existing files are never overwritten. download accepts CSS or snapshot selector and an optional explicit frame, captures at most 100 MiB, restores deny before publication and reports the source frame_id and derived browser_context. Existing CDP-created contexts are supported; failed context recovery blocks subsequent browser work. HTTP(S), bounded data: and HTTP(S)-creator blob: resources are supported; results expose a redacted url plus url_kind and url_redacted, not inline resource bytes or Blob handles."},
                 "full_page": {"type": "boolean", "description": "screenshot: capture beyond the viewport (default false)"},
                 "landscape": {"type": "boolean", "description": "print_pdf: landscape paper orientation (default false)"},
                 "print_background": {"type": "boolean", "description": "print_pdf: include background graphics (default true)"},
@@ -211,7 +261,9 @@ impl Tool for BrowserTool {
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120_000,
                                "description": "Whole-operation deadline, including launch, connection and lock wait"}
             }
-        })
+        });
+        session::batch::extend_schema(&mut schema);
+        storage::parameters(schema)
     }
 
     fn effects(&self) -> ToolEffects {
@@ -221,46 +273,76 @@ impl Tool for BrowserTool {
             .union(ToolEffects::process())
     }
 
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.sessions.bind(scope);
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
         args: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let action = required(&args, "action")?;
+        self.sessions.execute(self, &args).await
+    }
+}
+
+impl BrowserTool {
+    /// The session owner chooses the namespace, never an argument from the model.
+    /// Keep all backend validation, deadlines and process ownership in the native path.
+    async fn execute_in_namespace(
+        &self,
+        namespace: &session::Namespace,
+        args: &Value,
+    ) -> Result<ToolOutput> {
+        let action = required(args, "action")?;
+        let semantic_selector = interaction::selectors::validate_input(args)?;
+        let configured_pointer = interaction::pointer::validate_input(args)?;
+        let configured_wait = interaction::wait::validate_input(args)?;
         if self.is_mock() {
-            if matches!(
-                action,
-                "start"
-                    | "status"
-                    | "stop"
-                    | "list_frames"
-                    | "upload"
-                    | "download"
-                    | "print_pdf"
-                    | "handle_dialog"
-            ) || args.get("frame").is_some()
+            if storage::is_action(action)
+                || semantic_selector
+                || configured_pointer
+                || configured_wait
+                || matches!(
+                    action,
+                    "start"
+                        | "status"
+                        | "stop"
+                        | "list_frames"
+                        | "back"
+                        | "forward"
+                        | "reload"
+                        | "upload"
+                        | "download"
+                        | "print_pdf"
+                        | "handle_dialog"
+                        | "diagnostics"
+                )
+                || interaction::forms::is_action(action)
+                || args.get("frame").is_some()
                 || args.get("full_page").is_some()
                 || args.get("dialog_response").is_some()
+                || args.get("diagnostics").is_some()
             {
                 return Err(Error::tool(
                     "browser",
-                    "browser lifecycle, frames, file uploads, dialogs and page exports require the native backend",
+                    "browser lifecycle, storage state, frames, structured forms, file uploads, dialogs and page exports require the native backend",
                 ));
             }
-            return self
+            return namespace
                 .mock_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute(&self.cwd, self.domain_allowlist.as_deref(), &args);
+                .execute(&self.cwd, self.domain_allowlist.as_deref(), args);
         }
         cdp::execute(
-            &self.live_state,
+            &namespace.live_state,
             self.cdp_endpoint.as_deref(),
             self.launch_options.as_ref(),
             &self.cwd,
             self.domain_allowlist.as_deref(),
-            &args,
+            args,
         )
         .await
     }

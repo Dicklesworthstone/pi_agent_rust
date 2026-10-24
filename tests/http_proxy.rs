@@ -1,16 +1,21 @@
 //! End-to-end proxy wiring for the HTTP client (#210).
 //!
-//! No external network: a loopback `TcpListener` plays the proxy, so the test
-//! proves the client actually dials the configured proxy, speaks absolute-form
-//! for `http://` targets, and forwards the response back to the caller.
+//! Loopback HTTP peers prove which endpoint receives the request and whether
+//! the wire uses origin-form or proxy absolute-form. Every peer is bounded and
+//! joined, including when a routing assertion panics.
 
 mod common;
 
 use pi::http::client::Client;
 use pi::http::proxy::{HttpSettings, ProxyConfig, install};
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The proxy configuration is process-global, so these tests must not overlap.
 fn proxy_guard() -> MutexGuard<'static, ()> {
@@ -20,8 +25,23 @@ fn proxy_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Settings that pin exactly one proxy and ignore the ambient environment, so
-/// the test is independent of the machine it runs on.
+struct RestoreProxy(ProxyConfig);
+
+impl RestoreProxy {
+    fn install(config: ProxyConfig) -> Self {
+        let restore = Self(pi::http::proxy::active());
+        install(config);
+        restore
+    }
+}
+
+impl Drop for RestoreProxy {
+    fn drop(&mut self) {
+        install(std::mem::take(&mut self.0));
+    }
+}
+
+/// Settings that pin exactly one proxy and ignore the ambient environment.
 fn pinned_settings(port: u16) -> HttpSettings {
     HttpSettings {
         proxy: Some(format!("http://user:pass@127.0.0.1:{port}")),
@@ -30,127 +50,245 @@ fn pinned_settings(port: u16) -> HttpSettings {
     }
 }
 
-/// Accept one connection, read the request head, reply with a fixed body, and
-/// report the request line + headers back to the test.
-fn spawn_fake_proxy(listener: TcpListener, sender: mpsc::Sender<Vec<String>>) {
-    // ubs:ignore detached on purpose — the thread ends with its one connection
-    // and the test synchronizes through the channel, not a JoinHandle.
-    std::thread::spawn(move || {
-        let Ok((stream, _)) = listener.accept() else {
-            return;
-        };
-        let mut reader = BufReader::new(stream);
-        let mut head = Vec::new();
-        loop {
-            let mut line = String::new();
-            // EOF and a read error both end the head; nothing else to collect.
-            let Ok(read) = reader.read_line(&mut line) else {
-                break;
-            };
-            if read == 0 {
-                break;
-            }
-            let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-            if trimmed.is_empty() {
-                break;
-            }
-            head.push(trimmed);
-        }
-        let mut stream = reader.into_inner();
-        let body = b"proxied-ok";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.write_all(body);
-        let _ = stream.flush();
-        let _ = sender.send(head);
-    });
+struct HttpPeer {
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<io::Result<Option<Vec<String>>>>>,
 }
 
-/// The configured proxy receives the request (absolute-form, with credentials)
-/// and its response reaches the caller — the origin host is never dialed.
+impl HttpPeer {
+    fn spawn(listener: TcpListener, body: &'static str) -> Self {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + PEER_TIMEOUT;
+            loop {
+                if stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => return serve_peer(stream, body, &stopped).map(Some),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut self) -> io::Result<Option<Vec<String>>> {
+        self.stop.store(true, Ordering::Release);
+        self.worker
+            .take()
+            .expect("peer worker remains owned")
+            .join()
+            .map_err(|_| io::Error::other("HTTP peer panicked"))?
+    }
+}
+
+impl Drop for HttpPeer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn serve_peer(mut stream: TcpStream, body: &str, stop: &AtomicBool) -> io::Result<Vec<String>> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+    stream.set_write_timeout(Some(PEER_TIMEOUT))?;
+    let deadline = Instant::now() + PEER_TIMEOUT;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let head_end = loop {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "HTTP peer stopped"));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "request ended before its headers",
+                ));
+            }
+            Ok(count) => {
+                if bytes.len().saturating_add(count) > 16 * 1024 {
+                    return Err(io::Error::other("request headers exceed fixture limit"));
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let head = std::str::from_utf8(&bytes[..head_end])
+        .map_err(io::Error::other)?
+        .split("\r\n")
+        .map(str::to_string)
+        .collect();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    Ok(head)
+}
+
+fn request(url: String) -> pi::error::Result<(u16, String)> {
+    common::run_async(async move {
+        let client = Client::new();
+        let response = client.get(&url).timeout(PEER_TIMEOUT).send().await?;
+        Ok((response.status(), response.text().await?))
+    })
+}
+
+/// A loopback proxy must still carry requests whose destination is remote.
 #[test]
 fn http_request_goes_through_the_configured_proxy() {
     let _guard = proxy_guard();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake proxy");
     let port = listener.local_addr().expect("addr").port();
-    let (tx, rx) = mpsc::channel();
-    spawn_fake_proxy(listener, tx);
-
-    let (config, warnings) = ProxyConfig::resolve(Some(&pinned_settings(port)), &|_name| None);
+    let proxy = HttpPeer::spawn(listener, "proxied-ok");
+    let (config, warnings) = ProxyConfig::resolve(Some(&pinned_settings(port)), &|_| None);
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-    assert!(!config.is_empty(), "proxy must be configured");
-    install(config);
+    let _restore = RestoreProxy::install(config);
 
-    // `example.invalid` is guaranteed not to resolve (RFC 6761), so a request
-    // that succeeds proves the proxy hop was used rather than a direct dial.
-    let body = common::run_async(async move {
-        let client = Client::new();
-        let response = client
-            .get("http://example.invalid/api/test?x=1")
-            .send()
-            .await
-            .expect("request through proxy");
-        assert_eq!(response.status(), 200);
-        response.text().await.expect("body")
-    });
-    assert_eq!(body, "proxied-ok");
-
-    let head = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("fake proxy received a request");
+    // A successful response for this unresolvable origin proves proxy routing.
+    let result = request("http://example.invalid/api/test?x=1".to_string());
+    let head = proxy.finish().expect("join proxy").expect("proxy request");
+    assert_eq!(
+        result.expect("proxied response"),
+        (200, "proxied-ok".to_string())
+    );
     assert_eq!(
         head.first().map(String::as_str),
-        Some("GET http://example.invalid/api/test?x=1 HTTP/1.1"),
-        "expected absolute-form request line: {head:?}"
+        Some("GET http://example.invalid/api/test?x=1 HTTP/1.1")
     );
-    assert!(
-        head.iter().any(|line| line == "Host: example.invalid"),
-        "origin Host header must be preserved: {head:?}"
-    );
+    assert!(head.iter().any(|line| line == "Host: example.invalid"));
     assert!(
         head.iter()
-            .any(|line| line == "Proxy-Authorization: Basic dXNlcjpwYXNz"),
-        "proxy credentials must be sent: {head:?}"
+            .any(|line| line == "Proxy-Authorization: Basic dXNlcjpwYXNz")
     );
-
-    install(ProxyConfig::default());
 }
 
-/// A `noProxy` match sends the request direct — proven by the request failing
-/// to resolve `example.invalid` instead of reaching the listener.
+#[derive(Clone, Copy)]
+enum ExpectedRoute {
+    Direct,
+    Proxy,
+}
+
+fn assert_loopback_route(expected: ExpectedRoute, configure: impl FnOnce(u16) -> ProxyConfig) {
+    let _guard = proxy_guard();
+    let origin_listener = TcpListener::bind("127.0.0.1:0").expect("bind local model");
+    let origin_address = origin_listener.local_addr().expect("origin address");
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_port = proxy_listener.local_addr().expect("proxy address").port();
+    let origin = HttpPeer::spawn(origin_listener, "origin-ok");
+    let proxy = HttpPeer::spawn(proxy_listener, "proxied-ok");
+    let _restore = RestoreProxy::install(configure(proxy_port));
+    let url = format!("http://{origin_address}/v1/models?x=1");
+    let result = request(url.clone());
+    let origin_head = origin.finish().expect("join origin");
+    let proxy_head = proxy.finish().expect("join proxy");
+    let (status, body) = result.expect("HTTP request completes");
+    assert_eq!(status, 200);
+
+    let (head, request_line) = match expected {
+        ExpectedRoute::Direct => {
+            assert_eq!(body, "origin-ok");
+            assert!(
+                proxy_head.is_none(),
+                "the proxy must not receive local traffic"
+            );
+            let head = origin_head.expect("local model received the request");
+            assert!(
+                !head.iter().any(|line| {
+                    line.to_ascii_lowercase()
+                        .starts_with("proxy-authorization:")
+                }),
+                "proxy credentials must not reach the local model: {head:?}"
+            );
+            (head, "GET /v1/models?x=1 HTTP/1.1".to_string())
+        }
+        ExpectedRoute::Proxy => {
+            assert_eq!(body, "proxied-ok");
+            assert!(
+                origin_head.is_none(),
+                "the origin must not be dialed directly"
+            );
+            let head = proxy_head.expect("proxy received the request");
+            assert!(
+                head.iter()
+                    .any(|line| line == "Proxy-Authorization: Basic dXNlcjpwYXNz")
+            );
+            (head, format!("GET {url} HTTP/1.1"))
+        }
+    };
+    assert_eq!(head.first(), Some(&request_line));
+    assert!(
+        head.iter()
+            .any(|line| line == &format!("Host: {origin_address}")),
+        "the origin Host header must survive routing: {head:?}"
+    );
+}
+
+#[test]
+fn local_model_request_bypasses_explicit_proxy_by_default() {
+    for scheme in ["http", "socks5", "socks5h"] {
+        assert_loopback_route(ExpectedRoute::Direct, |port| {
+            let mut settings = pinned_settings(port);
+            settings.proxy = Some(format!("{scheme}://user:pass@127.0.0.1:{port}"));
+            ProxyConfig::resolve(Some(&settings), &|_| None).0
+        });
+    }
+}
+
+#[test]
+fn local_model_request_bypasses_ambient_proxy_by_default() {
+    assert_loopback_route(ExpectedRoute::Direct, |port| {
+        let endpoint = format!("http://user:pass@127.0.0.1:{port}");
+        ProxyConfig::resolve(None, &|name| {
+            (name == "ALL_PROXY").then(|| endpoint.clone())
+        })
+        .0
+    });
+}
+
+#[test]
+fn explicit_loopback_proxy_opt_in_uses_proxy_wire_format() {
+    assert_loopback_route(ExpectedRoute::Proxy, |port| {
+        let mut settings = pinned_settings(port);
+        settings.proxy_loopback = Some(true);
+        ProxyConfig::resolve(Some(&settings), &|_| None).0
+    });
+}
+
 #[test]
 fn no_proxy_host_bypasses_the_proxy() {
-    let _guard = proxy_guard();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake proxy");
-    let port = listener.local_addr().expect("addr").port();
-    let (tx, rx) = mpsc::channel();
-    spawn_fake_proxy(listener, tx);
-
-    let mut settings = pinned_settings(port);
-    settings.no_proxy = Some(vec!["example.invalid".to_string()]);
-    let (config, _warnings) = ProxyConfig::resolve(Some(&settings), &|_name| None);
-    install(config);
-
-    let result = common::run_async(async move {
-        let client = Client::new();
-        client
-            .get("http://example.invalid/api/test")
-            .send()
-            .await
-            .map(|_| ())
+    assert_loopback_route(ExpectedRoute::Direct, |port| {
+        let mut settings = pinned_settings(port);
+        settings.proxy_loopback = Some(true);
+        settings.no_proxy = Some(vec!["127.0.0.1".to_string()]);
+        ProxyConfig::resolve(Some(&settings), &|_| None).0
     });
-    assert!(
-        result.is_err(),
-        "a bypassed host must be dialed directly (and fail to resolve)"
-    );
-    assert!(
-        rx.recv_timeout(std::time::Duration::from_millis(200))
-            .is_err(),
-        "the proxy must not have been contacted"
-    );
-
-    install(ProxyConfig::default());
 }

@@ -355,8 +355,18 @@ Each standalone CLI invocation starts a new process, so its in-memory cache is
 fresh. The five-minute cache only avoids repeat discovery calls made within one
 long-lived process by SDK/library users; `--refresh-models` bypasses that cache.
 
+Discovery also reads usable `supported_reasoning_levels` advertisements, including
+`metadata.supported_reasoning_levels` and entries shaped as `{"effort":"high"}`.
+Nested metadata takes precedence. Pi preserves the advertised tiers through the
+cache and persisted catalog, constrains the model's thinking choices to those
+tiers, and sends the selected effort through the provider's request format.
+The recognized tiers are `off` (also advertised as `none`), `minimal`, `low`,
+`medium`, `high`, `xhigh`, and `max`. Missing, empty, or unusable advertisements
+leave existing model capabilities intact. Your configured thinking level remains
+authoritative; discovery does not select a server-advertised default effort.
+
 Persistence is opt-in. The v2 `~/.pi/agent/models.fetched.json` schema stores
-provider/model IDs, the fetch timestamp, and a non-secret SHA-256 identity
+provider/model IDs, optional bounded reasoning tiers, the fetch timestamp, and a non-secret SHA-256 identity
 binding membership to the provider, API, query-free endpoint, auth-header
 mode, recognized credential-query ordered name/presence shape, and
 request-header name/presence shape that produced it. Pi never persists a static fallback, API
@@ -408,7 +418,7 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
   `xdev list/describe/run/promote`): `ast_grep`, `ast_edit`, `lsp`,
   `debug`, `manage_skill` — plus the memory-bank tools (`retain`,
   `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is
-  `local`
+  `local` or `cass` (local memory plus read-only project history)
 - **Default-enabled**: `jobs` (background bash job control) and `hub` (PTY
   service supervision), alongside the essential tier. The default `--tools`
   list names 19 tools; the registry always adds `manage_skill` and, when any
@@ -456,6 +466,17 @@ least eight recent ones. Set `PI_JOBS_ARTIFACT_RETENTION=preserve` to keep
 every log instead; Pi then refuses new background jobs once the budget is
 full. Job snapshots report the applied policy, removed-file count, and
 reclaimed bytes in `artifactCleanup`.
+
+Hub service logs retain the first 16 MiB of raw output per run. Pi continues
+draining the service after that limit or an artifact write failure, so live
+tail logs, readiness checks, and PTY input continue working. `logs`, `ps`, and
+`describe` report `logCapture` byte counts, truncation, I/O errors, and output
+drain state separately from process status; incremental reads also report
+evicted lines. The cap applies to each artifact, not the total across runs.
+`detached: true` skips session-exit cleanup, but the PTY and its supervisor
+still belong to the current Pi process: cross-process reattachment and
+survival after that host process exits are not implemented.
+
 Per-tool exposure is configurable via `tools.loadMode.<name>` set to
 `essential`, `discoverable`, or `off`; an explicit `--tools` list always
 wins:
@@ -479,6 +500,15 @@ Agent definitions are Markdown files in `$PI_CODING_AGENT_DIR/agents/*.md`
 definitions. The process inherits the parent's provider, router, authentication,
 and model-registry environment, including `PI_CODING_AGENT_DIR`.
 
+Children choose their model in this order: the agent definition's `model:` pin,
+the configured `task` role (or `smol` fallback), then the parent's active provider
+and model. Each request captures the parent selection once, including any
+manual switch or failover already in effect; queued children, chain steps,
+schema retries, and explicit revivals retain that selection. Children resolve
+credentials from their inherited environment and existing authentication
+configuration. Credentials supplied only to the parent's CLI or in memory are
+not copied into child arguments or new environment variables.
+
 ```markdown
 ---
 name: scout
@@ -501,12 +531,45 @@ stderr details, and are killed/reaped if the parent is cancelled. Child agents
 receive the declared tool allowlist; the default child allowlist deliberately
 excludes `subagent` to prevent accidental recursive delegation.
 
+With per-task `isolation: "worktree"`, a parallel batch captures each source
+workspace before launching children, including staged, unstaged, and untracked
+files. Queued children and corrective retries use that same baseline. Accepted
+patches apply after execution in task order; conflicts and cancelled work remain
+in their worktrees for inspection. `isoApply: "keep"` retains a result without
+applying it, and `isoApply: "drop"` discards its worktree after reporting the patch.
+
 In interactive mode, `/tan <work>` starts the same task-role child machinery
 without interrupting the main conversation. The child runs in the current
 directory, appears in `hub agent roster` with `kind=tan`, and sends its bounded
 completion summary through the follow-up queue at the next idle turn boundary.
 Because `/tan` inherits the delegation safety gate, it is available only when
-the opt-in `subagent` tool is enabled.
+the opt-in `subagent` tool is enabled. It captures the same model precedence when
+the command is submitted, so a later parent model switch does not retarget it.
+
+Native children include `hub` in their default tool set and can exchange messages
+with other children of the same parent Pi process. Agent definitions with an
+explicit tool allowlist must include `hub` to enable this capability. A child's
+`hub` call with `{"op":"agent","action":"roster"}` returns its authenticated
+`selfId` and the parent's child roster. Use those run IDs as recipients:
+
+```json
+{"op":"agent","action":"send","name":"receiver-1","text":"The parser change is ready."}
+{"op":"agent","action":"inbox"}
+{"op":"agent","action":"send","name":"parent","text":"I found a blocking dependency."}
+```
+
+Sibling messages enter the recipient's steering queue between turns and remain
+available in its inbox. The parent reads child reports with
+`{"op":"agent","action":"inbox","name":"parent"}`. Inbox pages return
+`nextCursor`, `hasMore`, and `oldestCursor`; pass `nextCursor` as
+`cursor` to request later messages. Each recipient retains its latest 64
+messages, so clients can use `oldestCursor` to detect that earlier messages
+have fallen outside retention.
+
+The parent authenticates the child's sender identity. Children can read their
+own inbox, list peers, and send to a live sibling or the parent; transcript,
+steering, kill, and revival controls remain on the parent surface. The local
+connection closes when its owning child run ends or is cancelled.
 
 ### Session Management
 
@@ -563,6 +626,26 @@ Pi runs in four modes, each suited to different workflows:
 | **Print** | `pi -p "..."` | Single response to stdout, no TUI, scriptable |
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
+
+**ACP live steering.** The initialize response advertises
+`_meta.steering.supported: true`. Editors can send `_session/steering` with
+`sessionId` and the same `prompt` content blocks as `session/prompt` while a
+turn is running. Text, images, and embedded references retain their native
+form. Set `_meta.steering.queue` to `"followUp"` to request delivery after the
+current model turn; the default `"steering"` lane delivers at the next native
+steering boundary. Steering cancels that session's open permission dialog via
+`$/cancel_request`; a follow-up leaves the dialog open.
+
+The response is `{"outcome":"injected","queue":"steering"}` (or
+`"followUp"`) when the native agent claims the input. This acknowledges
+handoff, not completed execution or durable storage. Idle input, and input
+still unclaimed when its owning turn ends or is cancelled, returns
+`"promptRequired"` so the editor can submit it as a new `session/prompt`.
+Unclaimed responses follow the original prompt's terminal response and cleanup;
+unclaimed input is never carried into a different prompt. The per-turn queue
+holds at most 100 requests and 8 MiB; each request is limited to 128 blocks,
+4 MiB for serialized content and request ID together, and 256 KiB of authored prose.
+An overflowing queue returns `"failed"` without accepting the input.
 
 **Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
@@ -880,11 +963,16 @@ pi [OPTIONS] [MESSAGE]...
 pi                              # Start interactive session
 pi "Hello"                      # Start with message
 pi @file.rs "Explain this"      # Include file as context
+pi @voice.wav @clip.mp4 "Compare these recordings"
 pi -p "Quick question"          # Print mode (no session)
 ```
 
 Interactive file references:
+
 - Type `@relative/path` in the editor to attach a file’s contents (autocomplete inserts the `@` form).
+- Images and supported audio/video files become native attachments in file-argument order. Audio/video extensions are `.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, and `.m4a` (case-insensitive), with a 5 MiB per-file limit. Oversized files produce a visible notice and empty files are skipped.
+- File arguments use the current workspace roots, including roots added with `--add-dir` or `/add-dir`; `/remove-dir` revokes subsequent attachment reads. CLI startup files and messages are submitted by both terminal frontends, and FTUI `/retry` retains the original attachment bytes.
+- Gemini-family providers receive native audio/video. Providers without that transport receive a visible media-omission label; session history retains the attachment. See [native RPC content](docs/rpc.md#chat) and [SDK native prompts](docs/sdk.md#native-image-audio-and-video-prompts).
 
 ### Options
 
@@ -956,7 +1044,7 @@ pi migrate ~/.pi/agent/sessions
 
 - `update-index` refreshes extension index metadata used by `search` and `info`.
 - `search` and `info` let you discover and inspect extension metadata without leaving the CLI.
-- `doctor` checks config, directories, auth, shell setup, sessions, swarm coordination readiness, and extension compatibility. `pi doctor --only swarm --format json` also reports cgroup CPU quota, cpuset size, NUMA topology, cgroup memory limits, target/tmp headroom, and recommended concurrency budgets before large multi-agent runs.
+- `pi doctor` checks ordinary installation health: config, directories, auth, shell setup, and sessions. Swarm coordination diagnostics are opt-in with `--only swarm` (or a comma-separated selection including `swarm`); they require development infrastructure such as Beads, Agent Mail, RCH, and build scratch space. `pi doctor --only swarm --format json` reports cgroup CPU quota, cpuset size, NUMA topology, cgroup memory limits, target/tmp headroom, and recommended concurrency budgets before large multi-agent runs. These explicit checks remain strict and fail closed on operational hazards. Text, JSON, and markdown reports use the same selected findings and exit with status 1 when any selected check fails; warnings and informational findings exit 0. Supplying an extension path checks extension compatibility by default.
 - `swarm-progress` evaluates a normalized progress SLO snapshot and emits advisory JSON/text only; it does not mutate Beads, git, Agent Mail, RCH, validation broker slots, runpacks, or source files. Operator workflow, privacy boundaries, degraded Agent Mail/RCH interpretation, stale-Beads handling, and no-open-work convergence guidance lives in [docs/swarm-operations-runbook.md#progress-slo-operator-workflow](docs/swarm-operations-runbook.md#progress-slo-operator-workflow).
 - `migrate` validates or creates the v2 session sidecar format for faster resume on larger histories.
 
@@ -1023,7 +1111,8 @@ Resolution order for a request, first match wins:
 1. A bypass match — `http.no_proxy` in settings.json, else `NO_PROXY` /
    `no_proxy`. Entries follow the usual convention: `*` bypasses everything,
    `example.com` or `.example.com` matches the domain and its subdomains, and
-   `example.com:8443` restricts the match to that port.
+   `example.com:8443` restricts the match to that port. Loopback destinations
+   also bypass the proxy by default, unless `http.proxyLoopback` is enabled.
 2. `http.https_proxy` / `http.http_proxy` (scheme-specific settings).
 3. `http.proxy` (both schemes).
 4. `PI_HTTPS_PROXY` / `PI_HTTP_PROXY`.
@@ -1036,12 +1125,18 @@ turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
 `PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. Proxy
 endpoints may be `http://`, `socks5://` (local DNS) or `socks5h://` (DNS on the
 proxy), with optional username/password authentication; SOCKS credentials are
-not encrypted on the hop to the proxy. There is no automatic loopback bypass:
-requests to local model servers (Ollama, LM Studio) go through the proxy too
-unless `localhost` and `127.0.0.1` are in `NO_PROXY` or `http.noProxy`. An
-unusable ambient value
-(e.g. an `https://` or `socks4://` endpoint) is skipped with a warning rather
-than failing requests.
+not encrypted on the hop to the proxy. Requests to `localhost` (case-insensitive,
+with an optional trailing dot), literal IPv4 addresses in `127.0.0.0/8`, and
+IPv6 `::1` or IPv4-mapped loopback addresses go directly to the local server.
+This keeps Ollama and LM Studio reachable when a global proxy is configured.
+Pi makes this decision without DNS lookups; private-network addresses and other
+hostnames retain the configured proxy routing.
+
+To intentionally send loopback destinations through the proxy, such as to reach
+a service on the proxy host or capture local traffic, set
+`"http": { "proxyLoopback": true }`. Explicit `NO_PROXY` / `http.noProxy`
+matches still take precedence. An unusable ambient value (e.g. an `https://`
+or `socks4://` endpoint) is skipped with a warning rather than failing requests.
 
 The `bash` tool's child environment overrides advertise only HTTP proxy
 endpoints (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase
@@ -1054,6 +1149,8 @@ This preserves existing `curl`/`git` SOCKS configuration without forcing tools
 that lack SOCKS support to use it through HTTP-specific variables. A SOCKS
 proxy set only in Pi settings or `PI_*_PROXY` does not configure child tools;
 use their standard proxy environment variables or their own configuration.
+The automatic loopback bypass applies to Pi's own HTTP requests; child tools
+continue to follow their own proxy and bypass configuration.
 
 ### Configuration Precedence
 
@@ -1155,7 +1252,7 @@ Provider-count rule: Pi has 11 native provider implementation modules. Those mod
 2. **Streaming-first**: Custom SSE parser, no blocking on responses
 3. **Process tree management**: `sysinfo` crate ensures no orphaned processes
 4. **Structured errors**: `thiserror` with specific error types per component
-5. **Size-budgeted release profile**: LTO + strip + `opt-level = "z"` for budget-compliant shipping artifacts
+5. **Size-budgeted release profile**: LTO + strip + `opt-level = "z"` for the size budget; published binaries use the speed-optimized `dist` profile (`opt-level = 3`)
 
 ### asupersync Context vs TypeScript Pi (pi-mono)
 
@@ -1856,6 +1953,13 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/reload` | Reload skills/prompts/themes/extensions from disk |
 | `/exit` (`/quit`, `/q`) or `Ctrl+C` | Exit Pi |
 
+**Live stream rules:** `/rules` manages corrections enforced during generation
+on every native agent surface. Matching assistant text or thinking interrupts
+the response before its tool calls execute, adds the rule's directive, and
+retries within a three-correction turn budget. Project rules require workspace
+trust; triggered corrections survive compaction on their active branch. See
+[Stream rules](docs/stream-rules.md) for configuration and examples.
+
 ### RPC Protocol
 
 The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin/stdout for programmatic integration. Each line is a self-contained JSON object.
@@ -2038,15 +2142,21 @@ Input: { "path": "src/lib.rs", "old": "fn foo()", "new": "fn bar()" }
 
 ### grep
 
-Search file contents:
+Search files, internal documents, or a web page:
 
-```
-Input: { "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+```json
+{ "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+{ "pattern": "critical|warning", "path": "agent://reviewer/findings;local://review-notes", "ignoreCase": true }
+{ "pattern": "migration", "path": "skill://release/references/checklist.md" }
+{ "pattern": "deprecated", "path": "https://example.com/changelog" }
+{ "pattern": "data-version", "path": "https://example.com/changelog:raw", "literal": true }
 ```
 
-- Regex patterns supported
-- Context lines before/after matches
-- Respects .gitignore
+- Regex and literal matching, case folding, and merged context lines work across all sources. Each result identifies its source and line number.
+- Filesystem searches respect `.gitignore` and workspace boundaries. `hashline: true` provides edit anchors for filesystem results.
+- Internal documents use the same resolver as `read`, including accepted `agent://` results and JSON fields, skills, prompts, scratch notes, merge conflicts, PRs, issues, and SSH documents. Pending or rejected child output retains its normal access restrictions. Separate up to 16 internal URLs with semicolons; filesystem paths and HTTP URLs use separate calls.
+- HTTP(S) searches use reader text by default; append `:raw` to search the fetched source. Semicolons inside an HTTP URL remain part of that URL. The existing `read.urlAllowPrivateTargets` setting governs private-network access, with the same redirect checks as `read`. PR, issue, SSH, and conflict lookups retain their process effects for execution approval.
+- The match limit applies across the entire resource list. Resource searches accept up to 10,000 matches and 10 MiB per document; output still truncates at 1 MiB and 500 characters per line. Results report skipped resources and partial source documents. `glob` and `hashline` apply to filesystem searches; virtual document line numbers are search locations.
 
 ### find
 
@@ -2173,6 +2283,12 @@ Default release builds keep heavyweight extras opt-in; use `--features full`
 when you need the image, clipboard, wasm, jemalloc, and syntax-highlighting
 extras in one build.
 
+Published binaries (GitHub Releases, the installer, `pi self-update`) are built
+by DSR with `--profile dist`. It inherits every setting above and sets
+`opt-level = 3`, so the binaries people download are optimized for speed and are
+larger than a `release` build. The `binary_size_release` budget keeps measuring
+the `release` profile.
+
 ### Benchmark Evidence vs Shipping Artifacts
 
 Pi separates performance evidence artifacts from distributable release artifacts:
@@ -2180,8 +2296,8 @@ Pi separates performance evidence artifacts from distributable release artifacts
 - **Benchmark evidence artifacts** (PERF-3X and certification inputs) are produced by
   `scripts/perf/orchestrate.sh` and `scripts/bench_extension_workloads.sh`, and must carry
   run provenance (`correlation_id`) plus profile labels (for example `build_profile=perf`).
-- **Shipping artifacts** (end-user binaries) are built with Cargo `release` profile and
-  distributed via GitHub Releases + installer paths.
+- **Shipping artifacts** (end-user binaries) are built with the Cargo `dist` profile
+  (`release` with `opt-level = 3`) and distributed via GitHub Releases + installer paths.
 
 Policy implication: release/size artifacts alone are not valid evidence for global performance
 claims. Performance claims must cite benchmark evidence bundles with reproducible provenance.

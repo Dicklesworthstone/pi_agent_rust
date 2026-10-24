@@ -45,13 +45,14 @@ fn lexical_output_path(path: &str) -> Result<()> {
 }
 
 pub(super) fn validate(args: &Value) -> Result<()> {
+    super::frames::validate(args)?;
     let object = args
         .as_object()
         .ok_or_else(|| error("download arguments must be an object"))?;
     for field in object.keys() {
         if !matches!(
             field.as_str(),
-            "action" | "tab" | "selector" | "output_path" | "timeout_ms"
+            "action" | "tab" | "frame" | "selector" | "output_path" | "timeout_ms"
         ) {
             return Err(error(format!("unsupported download parameter: {field}")));
         }
@@ -89,14 +90,89 @@ fn safe_filename(value: &str) -> String {
     }
 }
 
-fn first_new(cdp: &Cdp, before: &BTreeSet<String>) -> Result<Option<DownloadRecord>> {
+/// Frame IDs alone survive navigation. Keep the document and URL, while the
+/// active CDP scope additionally pins every ancestor and renderer incarnation.
+#[derive(Debug, PartialEq, Eq)]
+struct Source {
+    frame_id: String,
+    loader_id: String,
+    url: String,
+}
+
+impl Source {
+    fn parse(frame: &Value, scoped: bool, allowlist: Option<&[String]>) -> Result<Self> {
+        let field = |name: &str, limit: usize| {
+            frame[name]
+                .as_str()
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= limit
+                        && !value.chars().any(char::is_control)
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| error("download source has an invalid document identity"))
+        };
+        let source = Self {
+            frame_id: field("id", 256)?,
+            loader_id: field("loaderId", 256)?,
+            url: field("url", 64 * 1024)?,
+        };
+        // frame_document has already revalidated the scoped ancestry. srcdoc
+        // inherits it; an unscoped root cannot invent the same exemption.
+        if !scoped || source.url != "about:srcdoc" {
+            policy::check_navigation(&source.url, allowlist)
+                .map_err(|_| error("download source is blocked by browser URL policy"))?;
+        }
+        Ok(source)
+    }
+
+    async fn read(owner: &AgentCx, cdp: &mut Cdp, allowlist: Option<&[String]>) -> Result<Self> {
+        cdp.check_download_context(owner).await?;
+        let frame = cdp.frame_document(owner).await?;
+        Self::parse(&frame, cdp.frame_selected(), allowlist)
+    }
+
+    async fn check(
+        &self,
+        owner: &AgentCx,
+        cdp: &mut Cdp,
+        allowlist: Option<&[String]>,
+    ) -> Result<()> {
+        if Self::read(owner, cdp, allowlist).await? != *self {
+            return Err(error(
+                "download source navigated or changed; no artifact was published",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn admit_record(record: &DownloadRecord, source: &Source) -> Result<()> {
+    if record.frame_id != source.frame_id {
+        return Err(error(
+            "download came from a different frame; no artifact was published",
+        ));
+    }
+    validate_download_guid(&record.guid)
+}
+
+fn first_new(
+    cdp: &Cdp,
+    before: &BTreeSet<String>,
+    source: &Source,
+) -> Result<Option<DownloadRecord>> {
+    cdp.check_download_events()?;
     let fresh = cdp.downloads_since(before);
     if fresh.len() > 1 {
         return Err(error(
             "one download action started multiple transfers; none was published",
         ));
     }
-    Ok(fresh.into_iter().next())
+    let record = fresh.into_iter().next();
+    if let Some(record) = &record {
+        admit_record(record, source)?;
+    }
+    Ok(record)
 }
 
 fn validate_download_guid(guid: &str) -> Result<()> {
@@ -197,6 +273,8 @@ struct DownloadRequest<'a> {
     selector: &'a str,
     explicit: Option<&'a crate::artifact_output::OutputTarget>,
     allowlist: Option<&'a [String]>,
+    source: &'a Source,
+    before: &'a BTreeSet<String>,
 }
 
 async fn capture_download(
@@ -210,38 +288,40 @@ async fn capture_download(
     Vec<u8>,
     crate::artifact_output::OutputTarget,
 )> {
-    let before = cdp.download_ids();
+    req.source.check(owner, cdp, req.allowlist).await?;
+    if first_new(cdp, req.before, req.source)?.is_some() {
+        return Err(error(
+            "a download started before the requested click; input was not sent",
+        ));
+    }
     let click_args = json!({"action":"click","selector":req.selector});
     interaction::execute(owner, cdp, req.tab, req.refs, &click_args).await?;
 
     let mut start = None;
     for _ in 0..MAX_WAIT_EVENTS {
-        if let Some(record) = first_new(cdp, &before)? {
+        if let Some(record) = first_new(cdp, req.before, req.source)? {
             start = Some(record);
             break;
         }
         cdp.pump_event(owner).await?;
     }
     let start = start.ok_or_else(|| error("click produced no download event"))?;
-    validate_download_guid(&start.guid)?;
-    if let Err(failure) = policy::check_navigation(&start.url, req.allowlist) {
-        let _ = cdp
-            .browser_command(owner, "Browser.cancelDownload", json!({"guid":start.guid}))
-            .await;
-        return Err(failure);
-    }
+    // Resource URLs have a separate contract from navigation: client-side
+    // exports may be Blob/data resources in this already-admitted document.
+    policy::download_url(&start.url, req.allowlist)?;
 
     let mut final_record = None;
     for _ in 0..MAX_WAIT_EVENTS {
-        let record = cdp
-            .download_record(&start.guid)
+        // Recheck the complete set, not only the first GUID. A second download
+        // can begin while the accepted one is still streaming.
+        let record = first_new(cdp, req.before, req.source)?
             .ok_or_else(|| error("download tracking state disappeared"))?;
+        if record.guid != start.guid {
+            return Err(error("download transfer identity changed"));
+        }
         if record.received_bytes > MAX_DOWNLOAD_BYTES_F64
             || record.total_bytes > MAX_DOWNLOAD_BYTES_F64
         {
-            let _ = cdp
-                .browser_command(owner, "Browser.cancelDownload", json!({"guid":start.guid}))
-                .await;
             return Err(error("download exceeded the 100 MiB capture budget"));
         }
         match record.state.as_str() {
@@ -256,6 +336,8 @@ async fn capture_download(
     }
     let final_record = final_record
         .ok_or_else(|| error("download did not complete within the CDP event budget"))?;
+    req.source.check(owner, cdp, req.allowlist).await?;
+    cdp.check_download_events()?;
     owner
         .checkpoint()
         .map_err(|_| error("download cancelled before reading completed bytes"))?;
@@ -269,6 +351,18 @@ async fn capture_download(
     Ok((start, final_record, bytes, target))
 }
 
+async fn cancel_new(owner: &AgentCx, cdp: &mut Cdp, before: &BTreeSet<String>) {
+    // These transfers started on this connection during our temporary capture
+    // window. Never cancel a GUID that predated the window. Cleanup remains
+    // bounded by the original operation's deadline/cancellation and map limit.
+    for record in cdp.downloads_since(before) {
+        let _ = cdp
+            .download_command(owner, "Browser.cancelDownload", json!({"guid":record.guid}))
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 pub(super) async fn execute(
     owner: &AgentCx,
     cdp: &mut Cdp,
@@ -285,6 +379,9 @@ pub(super) async fn execute(
         .and_then(Value::as_str)
         .map(|path| crate::artifact_output::resolve_new(cwd, path, "browser"))
         .transpose()?;
+    let source = Source::read(owner, cdp, allowlist).await?;
+    cdp.check_download_events()?;
+    let before = cdp.download_ids();
     let directory = tempfile::Builder::new()
         .prefix("pi-browser-download-")
         .tempdir()?;
@@ -292,17 +389,6 @@ pub(super) async fn execute(
         .path()
         .to_str()
         .ok_or_else(|| error("private download directory path is not UTF-8"))?;
-    cdp.browser_command(
-        owner,
-        "Browser.setDownloadBehavior",
-        json!({
-            "behavior":"allowAndName",
-            "downloadPath":download_path,
-            "eventsEnabled":true
-        }),
-    )
-    .await?;
-
     let req = DownloadRequest {
         cwd,
         tab,
@@ -310,46 +396,79 @@ pub(super) async fn execute(
         selector,
         explicit: explicit.as_ref(),
         allowlist,
+        source: &source,
+        before: &before,
     };
-    let capture = capture_download(owner, cdp, directory.path(), &req).await;
+    let capture = async {
+        // Include enablement in the cleanup scope: an error reply or transport
+        // failure need not mean Chromium rejected the policy change.
+        cdp.download_command(
+            owner,
+            "Browser.setDownloadBehavior",
+            json!({
+                "behavior":"allowAndName",
+                "downloadPath":download_path,
+                "eventsEnabled":true
+            }),
+        )
+        .await?;
+        capture_download(owner, cdp, directory.path(), &req).await
+    }
+    .await;
 
-    // Ordinary errors attempt to return to deny. If outer cancellation drops
-    // this future, Session leaves its policy marker false so the next operation
-    // re-applies deny before doing anything else.
+    // Ordinary errors attempt to return to deny in the same browser context.
+    // If cancellation drops this future, Session retains that original context
+    // and restores its policy before any subsequent browser action.
     let reset = cdp
-        .browser_command(
+        .download_command(
             owner,
             "Browser.setDownloadBehavior",
             json!({"behavior":"deny","eventsEnabled":true}),
         )
         .await;
 
-    let (start, progress, bytes, target) = capture?;
-    reset.map_err(|failure| {
-        error(format!(
-            "download completed but browser download policy could not be restored: {failure}"
-        ))
-    })?;
-    owner
-        .checkpoint()
-        .map_err(|_| error("download cancelled before publication"))?;
-    crate::artifact_output::publish(&target, &bytes, "browser")?;
+    let result = async {
+        let (start, progress, bytes, target) = capture?;
+        reset.map_err(|_| {
+            error("download policy could not be restored; no artifact was published")
+        })?;
+        source.check(owner, cdp, allowlist).await?;
+        if first_new(cdp, &before, &source)?.is_none()
+            || cdp.download_record(&progress.guid).as_ref() != Some(&progress)
+        {
+            return Err(error(
+                "download changed before publication; no artifact was published",
+            ));
+        }
+        let resource = policy::download_url(&start.url, allowlist)?;
+        owner
+            .checkpoint()
+            .map_err(|_| error("download cancelled before publication"))?;
+        crate::artifact_output::publish(&target, &bytes, "browser")?;
 
-    Ok(output(
-        format!(
-            "Downloaded {} bytes from {} to {}",
-            bytes.len(),
-            start.url,
-            target.path().display()
-        ),
-        json!({
-            "action":"download","tab":tab,"selector":selector,
-            "saved_path":target.path().display().to_string(),
-            "url":start.url,"suggested_filename":start.suggested_filename,
-            "size_bytes":bytes.len(),"received_bytes":progress.received_bytes,
-            "backend":"cdp"
-        }),
-    ))
+        Ok(output(
+            format!(
+                "Downloaded {} bytes from {} to {}",
+                bytes.len(),
+                resource.display_url,
+                target.path().display()
+            ),
+            json!({
+                "action":"download","tab":tab,"selector":selector,
+                "saved_path":target.path().display().to_string(),
+                "url":resource.display_url,"url_kind":resource.kind,
+                "url_redacted":resource.redacted,"suggested_filename":start.suggested_filename,
+                "size_bytes":bytes.len(),"received_bytes":progress.received_bytes,
+                "frame_id":source.frame_id,"backend":"cdp",
+                "browser_context":cdp.download_context_metadata()
+            }),
+        ))
+    }
+    .await;
+    if result.is_err() {
+        cancel_new(owner, cdp, &before).await;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -359,6 +478,7 @@ mod tests {
     fn completed_record(guid: &str, received_bytes: f64) -> DownloadRecord {
         DownloadRecord {
             guid: guid.into(),
+            frame_id: "frame-1".into(),
             url: "https://example.com/file".into(),
             suggested_filename: "file".into(),
             state: "completed".into(),
@@ -368,10 +488,57 @@ mod tests {
     }
 
     #[test]
+    fn download_source_requires_a_complete_allowed_document() {
+        let frame = json!({"id":"frame-1","loaderId":"loader-1","url":"https://example.com/"});
+        let rules = vec!["example.com".to_string()];
+        assert!(Source::parse(&frame, false, Some(&rules)).is_ok());
+        for field in ["id", "loaderId", "url"] {
+            for value in [Value::Null, json!(""), json!("PRIVATE-CANARY\n")] {
+                let mut invalid = frame.clone();
+                invalid[field] = value;
+                let error = Source::parse(&invalid, false, Some(&rules)).unwrap_err();
+                assert!(!error.to_string().contains("PRIVATE-CANARY"));
+            }
+        }
+        let mut inherited = frame;
+        inherited["url"] = json!("about:srcdoc");
+        assert!(Source::parse(&inherited, true, Some(&rules)).is_ok());
+        assert!(Source::parse(&inherited, false, Some(&rules)).is_err());
+        inherited["url"] = json!("https://blocked.test/PRIVATE-CANARY");
+        let error = Source::parse(&inherited, true, Some(&rules)).unwrap_err();
+        assert!(!error.to_string().contains("PRIVATE-CANARY"));
+    }
+
+    #[test]
+    fn identical_download_urls_do_not_authorize_another_frame() {
+        let source = Source::parse(
+            &json!({"id":"frame-1","loaderId":"loader-1","url":"https://example.com/"}),
+            false,
+            None,
+        )
+        .unwrap();
+        let mut record = completed_record("job", 7.0);
+        assert!(admit_record(&record, &source).is_ok());
+        record.frame_id = "other-tab-private-frame".into();
+        let error = admit_record(&record, &source).unwrap_err();
+        assert!(!error.to_string().contains("other-tab-private-frame"));
+        record.frame_id = source.frame_id.clone();
+        record.guid = "../outside".into();
+        assert!(admit_record(&record, &source).is_err());
+    }
+
+    #[test]
     fn parameters_and_filenames_fail_closed() {
         assert!(validate(&json!({"action":"download","selector":"#link"})).is_ok());
+        assert!(
+            validate(&json!({"action":"download","tab":"app","frame":"child","selector":"#link"}))
+                .is_ok()
+        );
         for args in [
             json!({"action":"download"}),
+            json!({"action":"download","frame":"child","selector":"#link"}),
+            json!({"action":"download","tab":"app","frame":null,"selector":"#link"}),
+            json!({"action":"download","tab":"app","frame":"child","selector":"#link","dialog_response":{}}),
             json!({"action":"download","selector":"#x","files":[]}),
             json!({"action":"download","selector":"#x","output_path":"../escape.bin"}),
             json!({"action":"download","selector":"#x","output_path":"/tmp/escape.bin"}),

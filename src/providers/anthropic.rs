@@ -418,7 +418,7 @@ fn anthropic_effort_for_level(
     if let Some(map) = compat.and_then(|c| c.thinking_level_map.as_ref())
         && let Some(mapped) = map.get(level.to_string().as_str())
     {
-        return Some(mapped.clone());
+        return mapped.clone();
     }
     match level {
         ThinkingLevel::Off => None,
@@ -1099,15 +1099,24 @@ where
             }
             Some(ContentBlock::ToolCall(tc)) => {
                 if let Some(accum) = self.tool_accums.remove(&index) {
-                    let arguments: serde_json::Value = match serde_json::from_str(&accum.json) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                raw = %accum.json,
-                                "Failed to parse tool arguments as JSON"
-                            );
-                            serde_json::Value::Null
+                    // Final tool arguments are execution authority. Validate
+                    // the original JSON before Value can erase duplicate keys.
+                    // Empty input remains a sentinel so the transport can
+                    // distinguish "no deltas" from an observed empty fragment.
+                    let arguments = if accum.json.trim().is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        match super::openai::parse_final_tool_arguments(&accum.json) {
+                            Ok(arguments) => arguments,
+                            Err(reason) => {
+                                // Arguments may contain credentials, commands,
+                                // or file contents; never echo them in logs.
+                                tracing::warn!(
+                                    reason,
+                                    "Rejected invalid or ambiguous tool arguments"
+                                );
+                                serde_json::Value::Null
+                            }
                         }
                     };
                     let tool_call = ToolCall {
@@ -2193,7 +2202,7 @@ mod tests {
     #[test]
     fn test_build_request_thinking_level_map_overrides_effort() {
         let mut map = HashMap::new();
-        map.insert("xhigh".to_string(), "max".to_string());
+        map.insert("xhigh".to_string(), Some("max".to_string()));
         let compat = CompatConfig {
             thinking_level_map: Some(map),
             ..CompatConfig::default()
@@ -2212,6 +2221,22 @@ mod tests {
                 .and_then(|c| c.effort.as_deref()),
             Some("max"),
             "thinkingLevelMap xhigh->max must win over the default xhigh"
+        );
+    }
+
+    #[test]
+    fn nullable_effort_map_suppresses_explicitly_unsupported_tier() {
+        let compat = CompatConfig {
+            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), None)])),
+            ..CompatConfig::default()
+        };
+        assert_eq!(
+            anthropic_effort_for_level(ThinkingLevel::XHigh, Some(&compat)),
+            None
+        );
+        assert_eq!(
+            anthropic_effort_for_level(ThinkingLevel::High, Some(&compat)),
+            Some("high".to_string())
         );
     }
 

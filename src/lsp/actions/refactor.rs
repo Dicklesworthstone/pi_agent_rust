@@ -13,6 +13,7 @@ use crate::lsp::client::{DocumentSnapshot, try_path_to_uri, uri_to_path};
 use crate::lsp::edits::{FileEvidence, PreparedEdit, WorkspaceEditPlan};
 use std::sync::Arc;
 
+mod directory;
 mod formatting;
 mod prepare;
 mod versions;
@@ -103,7 +104,7 @@ impl RefactorSnapshot {
                     }
                     FileOp::Rename {
                         old_path, new_path, ..
-                    } => old_path == path || new_path == path,
+                    } => path.starts_with(old_path) || path.starts_with(new_path),
                 });
             if touched {
                 if current.get(path).is_none_or(|document| {
@@ -194,11 +195,35 @@ fn append_move(raw: Value, old_uri: &str, new_uri: &str) -> Result<Value> {
 /// Static registrations apply to the original file being renamed. Globs use
 /// native paths, not percent-encoded URI text. No filesystem traversal occurs.
 fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Result<bool> {
+    Ok(file_operation_filters(capabilities, operation)?
+        .iter()
+        .any(|filter| filter.matches(path, false)))
+}
+
+struct FileOperationFilter {
+    scheme_matches: bool,
+    directory: Option<bool>,
+    matcher: globset::GlobMatcher,
+}
+
+impl FileOperationFilter {
+    fn matches(&self, path: &Path, directory: bool) -> bool {
+        self.scheme_matches
+            && self.directory.is_none_or(|kind| kind == directory)
+            && self.matcher.is_match(path)
+    }
+}
+
+/// Compile once per registration, not once per member of a directory tree.
+fn file_operation_filters(
+    capabilities: &Value,
+    operation: &str,
+) -> Result<Vec<FileOperationFilter>> {
     let Some(options) = capabilities
         .pointer("/workspace/fileOperations")
         .and_then(|operations| operations.get(operation))
     else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let invalid = || {
         tool_err(
@@ -213,7 +238,7 @@ fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Re
     if filters.len() > 128 {
         return Err(invalid());
     }
-    let mut matched = false;
+    let mut compiled = Vec::with_capacity(filters.len());
     for filter in filters {
         let scheme_matches = match filter.get("scheme") {
             None => true,
@@ -226,10 +251,10 @@ fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Re
             .and_then(Value::as_str)
             .filter(|glob| glob.len() <= 4096)
             .ok_or_else(invalid)?;
-        let file_matches = match pattern.get("matches") {
-            None => true,
-            Some(Value::String(kind)) if kind == "file" => true,
-            Some(Value::String(kind)) if kind == "folder" => false,
+        let directory = match pattern.get("matches") {
+            None => None,
+            Some(Value::String(kind)) if kind == "file" => Some(false),
+            Some(Value::String(kind)) if kind == "folder" => Some(true),
             _ => return Err(invalid()),
         };
         let ignore_case = match pattern.get("options") {
@@ -248,9 +273,13 @@ fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Re
             .build()
             .map_err(|_| invalid())?
             .compile_matcher();
-        matched |= scheme_matches && file_matches && matcher.is_match(path);
+        compiled.push(FileOperationFilter {
+            scheme_matches,
+            directory,
+            matcher,
+        });
     }
-    Ok(matched)
+    Ok(compiled)
 }
 
 impl LspTool {
@@ -392,18 +421,29 @@ impl LspTool {
             .as_deref()
             .filter(|path| !path.is_empty())
             .ok_or_else(|| tool_err("LSP_USAGE", "rename_file requires a nonempty newFile"))?;
-        let owner = AgentCx::for_current_or_request();
         let requested = resolve_tool_path(file, &self.cwd);
         let metadata = std::fs::symlink_metadata(&requested)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            return self
+                .run_rename_group(input, &requested, new_file, true)
+                .await;
+        }
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(tool_err(
                 "LSP_FILE_UNREADABLE",
-                "rename_file requires a regular file, not a directory or symlink",
+                "rename_file requires a regular file or directory, not a symlink or special file",
             ));
         }
         let old_path = requested.canonicalize()?;
+        if self.registry.specs_for_file(&old_path).len() > 1 {
+            return self
+                .run_rename_group(input, &requested, new_file, false)
+                .await;
+        }
+        let budget = prepare::Budget::new(self.request_timeout(input));
+        budget.remaining()?;
         let hash = file_hash(&old_path)?;
-        let (old_uri, entry) = self.synced(&old_path).await?;
+        let (old_uri, entry) = budget.synchronize(self, &old_path).await?;
         let snapshot = RefactorSnapshot::capture(&entry, &old_path, hash)?;
         // Use a canonical base without creating parents. Scope validation
         // rejects traversal and symlink components, including dangling targets.
@@ -427,16 +467,17 @@ impl LspTool {
                 .call(
                     "workspace/willRenameFiles",
                     params.clone(),
-                    self.request_timeout(input),
+                    budget.remaining()?,
                 )
                 .await?
         } else {
             Value::Null
         };
+        budget.remaining()?;
         let combined = append_move(edit, &old_uri, &new_uri)?;
+        let prepared = self.prepare_refactor(&entry, &combined, &snapshot)?;
+        budget.remaining()?;
         if input.apply == Some(false) {
-            crate::lsp::refactor_preview::check_owner(&owner)?;
-            let prepared = self.prepare_refactor(&entry, &combined, &snapshot)?;
             return self.cache_refactor(
                 &entry,
                 prepared,
@@ -444,12 +485,14 @@ impl LspTool {
                 json!({"action":"rename_file","from":display_path(&old_path,&self.cwd),
                     "to":display_path(&new_path,&self.cwd),"willRenameFiles":will}),
                 did.then_some(params),
-                &owner,
+                &budget.owner,
             );
         }
         // One transaction computes import updates AND the move before any
         // target changes. A late destination conflict cannot strand imports.
-        let outcome = self.apply_refactor(&entry, &combined, &snapshot, &owner)?;
+        let result = prepared.commit(|| budget.verify(&entry, &snapshot));
+        self.invalidate_refactor(&entry);
+        let outcome = result?;
         let warning = Self::notify_refactor_move(&entry, did.then_some(params));
         let updates: Vec<_> = outcome
             .files_changed

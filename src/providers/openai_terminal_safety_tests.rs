@@ -52,6 +52,75 @@ fn tool_end_count(state: &TestState) -> usize {
 }
 
 #[test]
+fn terminal_parser_rejects_duplicate_decoded_keys_recursively() {
+    for raw in [
+        r#"{"path":"first","path":"second"}"#,
+        r#"{"path":"first","pa\u0074h":"second"}"#,
+        r#"{"nested":{"x":1,"x":2}}"#,
+        r#"{"items":[{"safe":1},{"x":1,"x":2}]}"#,
+    ] {
+        assert_eq!(
+            parse_final_tool_arguments(raw).unwrap_err(),
+            "arguments contain duplicate JSON object keys"
+        );
+    }
+}
+
+#[test]
+fn terminal_parser_allows_same_key_in_distinct_objects() {
+    let raw = r#"{"left":{"path":"a"},"right":{"path":"b"},"items":[{"x":1},{"x":2}]}"#;
+    assert_eq!(
+        parse_final_tool_arguments(raw).unwrap(),
+        json!({"left":{"path":"a"},"right":{"path":"b"},"items":[{"x":1},{"x":2}]})
+    );
+}
+
+#[test]
+fn duplicate_argument_rejects_the_entire_parallel_tool_batch() {
+    let mut state = state();
+    feed(
+        &mut state,
+        tool_delta(0, "good", "read", r#"{"path":"kept"}"#),
+        None,
+    );
+    feed(
+        &mut state,
+        tool_delta(1, "bad", "write", r#"{"path":"one","path":"two"}"#),
+        Some("tool_calls"),
+    );
+    assert_eq!(tool_end_count(&state), 0);
+    let message = done_message(&mut state);
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicate JSON object keys"))
+    );
+    for block in message.content {
+        if let ContentBlock::ToolCall(call) = block {
+            assert!(call.arguments.is_null());
+        }
+    }
+}
+
+#[test]
+fn duplicate_argument_diagnostic_does_not_echo_private_payload() {
+    let raw = r#"{"private-key":"private-first","private-key":"private-second"}"#;
+    let mut state = state();
+    feed(
+        &mut state,
+        tool_delta(0, "call", "write", raw),
+        Some("tool_calls"),
+    );
+    let error = done_message(&mut state).error_message.unwrap();
+    assert!(error.contains("duplicate JSON object keys"));
+    for secret in ["private-key", "private-first", "private-second"] {
+        assert!(!error.contains(secret));
+    }
+}
+
+#[test]
 fn terminal_parser_rejects_incomplete_or_non_object_arguments() {
     for raw in [
         "{",
@@ -163,6 +232,110 @@ fn invalid_parallel_call_prevents_all_tool_end_events() {
             assert!(call.arguments.is_null());
         }
     }
+}
+
+#[test]
+fn malformed_tool_identities_reject_the_whole_wire_batch() {
+    for (id, name, diagnostic) in [
+        (None, Some("write"), "ID is empty"),
+        (Some(""), Some("write"), "ID is empty"),
+        (Some(" \t"), Some("write"), "ID is empty"),
+        (Some("other"), None, "name is empty"),
+        (Some("other"), Some(""), "name is empty"),
+        (Some("other"), Some(" \n"), "name is empty"),
+        (Some("private-call-id"), Some("write"), "ID is duplicated"),
+    ] {
+        for finish_reason in [Some("tool_calls"), Some("stop"), None] {
+            let mut state = state();
+            feed(&mut state, json!({"content": "partial explanation"}), None);
+            feed(
+                &mut state,
+                tool_delta(2, "private-call-id", "read", r#"{"path":"kept"}"#),
+                None,
+            );
+            feed(
+                &mut state,
+                json!({"tool_calls": [{
+                    "index": 9,
+                    "id": id,
+                    "function": {"name": name, "arguments": r#"{"token":"private-argument"}"#}
+                }]}),
+                finish_reason,
+            );
+            state
+                .process_event(
+                    r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}"#,
+                )
+                .unwrap();
+            let message = done_message(&mut state);
+            assert_eq!(message.stop_reason, StopReason::Error);
+            assert_eq!(tool_end_count(&state), 0);
+            let error = message.error_message.as_deref().expect("identity error");
+            assert!(error.contains("index 9"));
+            assert!(error.contains(diagnostic), "{error}");
+            assert!(!error.contains("private-call-id"));
+            assert!(!error.contains("private-argument"));
+            assert_eq!(message.usage.input, 12);
+            assert_eq!(message.usage.output, 3);
+            assert_eq!(message.usage.total_tokens, 15);
+            assert!(matches!(
+                &message.content[0],
+                ContentBlock::Text(text) if text.text == "partial explanation"
+            ));
+            assert_eq!(message.content.len(), 3);
+            for block in &message.content[1..] {
+                assert!(matches!(
+                    block,
+                    ContentBlock::ToolCall(call) if call.arguments.is_null()
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn tool_identities_may_finish_after_the_opening_delta() {
+    let mut state = state();
+    feed(
+        &mut state,
+        json!({"tool_calls": [{"index": 4, "function": {"arguments": "{"}}]}),
+        None,
+    );
+    feed(&mut state, tool_delta(4, "call-", "re", ""), None);
+    feed(
+        &mut state,
+        tool_delta(4, "four", "ad", r#""path":"complete"}"#),
+        Some("tool_calls"),
+    );
+    let message = done_message(&mut state);
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    assert_eq!(tool_end_count(&state), 1);
+    assert!(matches!(
+        &message.content[0],
+        ContentBlock::ToolCall(call)
+            if call.id == "call-four" && call.name == "read"
+                && call.arguments == json!({"path": "complete"})
+    ));
+}
+
+#[test]
+fn identity_validation_does_not_replace_the_provider_error() {
+    let mut state = state();
+    state
+        .process_event(r#"{"error":{"message":"original provider failure"}}"#)
+        .unwrap();
+    feed(
+        &mut state,
+        tool_delta(1, "", "read", "{}"),
+        Some("tool_calls"),
+    );
+    let message = done_message(&mut state);
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(tool_end_count(&state), 0);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("original provider failure")
+    );
 }
 
 #[test]

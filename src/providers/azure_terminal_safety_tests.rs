@@ -94,6 +94,114 @@ fn invalid_parallel_call_rejects_the_entire_batch() {
 }
 
 #[test]
+fn malformed_tool_identities_reject_the_whole_wire_batch() {
+    for (id, name, diagnostic) in [
+        (None, Some("write"), "ID is empty"),
+        (Some(""), Some("write"), "ID is empty"),
+        (Some(" \t"), Some("write"), "ID is empty"),
+        (Some("other"), None, "name is empty"),
+        (Some("other"), Some(""), "name is empty"),
+        (Some("other"), Some(" \n"), "name is empty"),
+        (Some("call-2"), Some("write"), "ID is duplicated"),
+    ] {
+        for finish_reason in [Some("tool_calls"), Some("stop"), None] {
+            let mut state = state();
+            feed(&mut state, json!({"content": "partial explanation"}), None);
+            feed(&mut state, tool_delta(2, r#"{"path":"kept"}"#), None);
+            feed(
+                &mut state,
+                json!({"tool_calls": [{
+                    "index": 9,
+                    "id": id,
+                    "function": {"name": name, "arguments": r#"{"token":"private-argument"}"#}
+                }]}),
+                finish_reason,
+            );
+            state
+                .process_event(
+                    r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}"#,
+                )
+                .unwrap();
+            let message = done_message(&mut state);
+            assert_eq!(message.stop_reason, StopReason::Error);
+            assert_eq!(tool_end_count(&state), 0);
+            let error = message.error_message.as_deref().expect("identity error");
+            assert!(error.contains("index 9"));
+            assert!(error.contains(diagnostic), "{error}");
+            assert!(!error.contains("call-2"));
+            assert!(!error.contains("private-argument"));
+            assert_eq!(message.usage.input, 12);
+            assert_eq!(message.usage.output, 3);
+            assert_eq!(message.usage.total_tokens, 15);
+            assert!(matches!(
+                &message.content[0],
+                ContentBlock::Text(text) if text.text == "partial explanation"
+            ));
+            assert_eq!(message.content.len(), 3);
+            for block in &message.content[1..] {
+                assert!(matches!(
+                    block,
+                    ContentBlock::ToolCall(call) if call.arguments.is_null()
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn tool_identities_may_finish_after_the_opening_delta() {
+    let mut state = state();
+    feed(
+        &mut state,
+        json!({"tool_calls": [{"index": 4, "function": {"arguments": "{"}}]}),
+        None,
+    );
+    feed(
+        &mut state,
+        json!({"tool_calls": [{"index": 4, "id": "call-", "function": {"name": "re"}}]}),
+        None,
+    );
+    feed(
+        &mut state,
+        json!({"tool_calls": [{
+            "index": 4,
+            "id": "four",
+            "function": {"name": "ad", "arguments": r#""path":"complete"}"#}
+        }]}),
+        Some("tool_calls"),
+    );
+    let message = done_message(&mut state);
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    assert_eq!(tool_end_count(&state), 1);
+    assert!(matches!(
+        &message.content[0],
+        ContentBlock::ToolCall(call)
+            if call.id == "call-four" && call.name == "read"
+                && call.arguments == json!({"path": "complete"})
+    ));
+}
+
+#[test]
+fn identity_validation_does_not_replace_the_provider_error() {
+    let mut state = state();
+    state
+        .process_event(r#"{"error":{"message":"original provider failure"}}"#)
+        .unwrap();
+    feed(
+        &mut state,
+        json!({"tool_calls": [{"index": 1, "id": "", "function": {"name": "read", "arguments": "{}"}}]}),
+        Some("tool_calls"),
+    );
+    let message = done_message(&mut state);
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(tool_end_count(&state), 0);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("original provider failure")
+    );
+}
+
+#[test]
 fn sparse_interleaved_calls_are_finalized_with_original_ids() {
     let mut state = state();
     feed(&mut state, tool_delta(8, r#"{"path":"a"#), None);

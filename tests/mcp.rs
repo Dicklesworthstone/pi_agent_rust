@@ -2128,7 +2128,7 @@ mod fixture_lanes {
                 .all(|tool| tool.name().starts_with("mcp__extension-pending__")),
             "targeted mounting must not re-append another server's wrappers"
         );
-        let mounted = handle.mount_mcp_server_tools_if_absent("extension-pending");
+        let mounted = handle.refresh_mcp_server_tools("extension-pending");
         assert!(
             mounted > 0,
             "the first runtime mount must add the selected server"
@@ -2141,7 +2141,7 @@ mod fixture_lanes {
             "the live SDK Agent must receive runtime-trusted wrappers"
         );
         assert_eq!(
-            handle.mount_mcp_server_tools_if_absent("extension-pending"),
+            handle.refresh_mcp_server_tools("extension-pending"),
             0,
             "repeating trust/test must not duplicate live Agent tools"
         );

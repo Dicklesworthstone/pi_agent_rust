@@ -8,10 +8,15 @@ use crate::error::{Error, Result};
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
+mod ax_state;
+pub(super) mod forms;
 mod frame_input;
+pub(super) mod pointer;
+pub(super) mod selectors;
+mod text_input;
 pub(super) mod upload;
+pub(super) mod wait;
 
 const ELEMENT_FUNCTION: &str = include_str!("dom.js");
 const MAX_ELEMENTS: usize = 200;
@@ -27,6 +32,15 @@ pub(super) struct Document {
 pub(super) struct References {
     document: Option<Document>,
     nodes: BTreeMap<String, u64>,
+    observation: Option<ax_state::SnapshotMemory>,
+}
+
+impl References {
+    fn observation_for(&self, document: &Document) -> Option<&ax_state::SnapshotMemory> {
+        (self.document.as_ref() == Some(document))
+            .then_some(self.observation.as_ref())
+            .flatten()
+    }
 }
 
 async fn document(owner: &AgentCx, cdp: &mut Cdp) -> Result<Document> {
@@ -35,6 +49,13 @@ async fn document(owner: &AgentCx, cdp: &mut Cdp) -> Result<Document> {
         frame: required(&frame, "id")?.into(),
         loader: required(&frame, "loaderId")?.into(),
     })
+}
+
+struct CollectedSnapshot {
+    elements: Vec<BrowserElementRef>,
+    references: References,
+    states: BTreeMap<String, ax_state::Observation>,
+    truncated: bool,
 }
 
 /// Walks the accessibility tree, describes each element and assigns stable
@@ -48,7 +69,7 @@ async fn collect_elements(
     previous: Option<&References>,
     doc: &Document,
     next_ref: &mut u64,
-) -> Result<(Vec<BrowserElementRef>, References, bool)> {
+) -> Result<CollectedSnapshot> {
     let old_ids: BTreeMap<u64, &String> = previous
         .filter(|refs| refs.document.as_ref() == Some(doc))
         .map(|refs| refs.nodes.iter().map(|(name, id)| (*id, name)).collect())
@@ -56,8 +77,10 @@ async fn collect_elements(
     let mut refs = References {
         document: Some(doc.clone()),
         nodes: BTreeMap::new(),
+        observation: None,
     };
     let mut elements = Vec::new();
+    let mut states = BTreeMap::new();
     let mut seen = BTreeSet::new();
     let mut truncated = false;
     for node in nodes {
@@ -103,6 +126,7 @@ async fn collect_elements(
             format!("@e{}", *next_ref)
         };
         refs.nodes.insert(id.clone(), backend_id);
+        states.insert(id.clone(), ax_state::project(node));
         // Accessible names are useful context. Do not copy editable values or
         // password contents into the transcript as a side effect of inspection.
         let text = node["name"]["value"]
@@ -119,7 +143,12 @@ async fn collect_elements(
             selector: id,
         });
     }
-    Ok((elements, refs, truncated))
+    Ok(CollectedSnapshot {
+        elements,
+        references: refs,
+        states,
+        truncated,
+    })
 }
 
 pub(super) async fn snapshot(
@@ -142,8 +171,12 @@ pub(super) async fn snapshot(
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::tool("browser", "accessibility tree has no nodes"))?;
-    let (elements, refs, truncated) =
-        collect_elements(owner, cdp, nodes, previous, &doc, next_ref).await?;
+    let CollectedSnapshot {
+        elements,
+        references: mut refs,
+        states,
+        truncated,
+    } = collect_elements(owner, cdp, nodes, previous, &doc, next_ref).await?;
     let metadata = cdp
         .evaluate(owner, "({url: location.href, title: document.title})")
         .await?;
@@ -155,21 +188,32 @@ pub(super) async fn snapshot(
     }
     let url = required(&metadata, "url")?.to_owned();
     let title = required(&metadata, "title")?.to_owned();
+    let observation =
+        ax_state::SnapshotMemory::capture(&elements, &states, &url, &title, truncated);
+    let changes = observation.compare(previous.and_then(|refs| refs.observation_for(&doc)));
+    // The caller installs these references only after snapshot succeeds.
+    // Failed collection/navigation cannot advance the retained baseline.
+    refs.observation = Some(observation);
     let lines = elements
         .iter()
         .map(|e| {
             format!(
-                "- [{}] <{}> (role: {}) {}",
+                "- [{}] <{}> (role: {}) {}{}",
                 e.ref_id,
                 e.tag,
                 e.role,
-                json!(e.text)
+                json!(e.text),
+                states
+                    .get(&e.ref_id)
+                    .map(ax_state::Observation::suffix)
+                    .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     let summary = format!(
-        "Page Snapshot for [{tab}] {title:?}:\n{lines}{}",
+        "Page Snapshot for [{tab}] {title:?}:\n{}{lines}{}",
+        changes.summary(),
         if truncated {
             "\n[Snapshot truncated]"
         } else {
@@ -190,6 +234,8 @@ pub(super) async fn snapshot(
     let mut details = json!({
         "snapshot": snapshot, "truncated": truncated, "backend": "cdp",
         "reference_scope": reference_scope, "frame_id": doc.frame,
+        "element_states": states, "state_schema": "pi.browser.ax-state.v1",
+        "snapshot_changes": changes,
     });
     if include_tree {
         // Return the actual accessibility tree, bounded independently of the
@@ -197,7 +243,8 @@ pub(super) async fn snapshot(
         let tree: Vec<_> = nodes.iter().take(MAX_AX_NODES).map(|node| json!({
             "nodeId": node["nodeId"], "parentId": node["parentId"], "childIds": node["childIds"],
             "role": node["role"], "name": node["name"], "ignored": node["ignored"],
-            "backendDOMNodeId": node["backendDOMNodeId"]
+            "backendDOMNodeId": node["backendDOMNodeId"],
+            "state_observation": ax_state::project(node)
         })).collect();
         details["ax_tree"] = json!({"nodes": tree, "truncated": nodes.len() > MAX_AX_NODES});
     }
@@ -229,6 +276,9 @@ async fn resolve(
                 "unknown or expired element reference; take a new snapshot",
             )
         });
+    }
+    if let Some(locator) = selectors::parse(selector)? {
+        return selectors::resolve(owner, cdp, &locator).await;
     }
     if cdp.frame_selected() {
         return frame_input::resolve(owner, cdp, selector).await;
@@ -315,7 +365,6 @@ async fn element_call(
     evaluation_value(&response?)
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) async fn execute(
     owner: &AgentCx,
     cdp: &mut Cdp,
@@ -323,32 +372,42 @@ pub(super) async fn execute(
     refs: Option<&References>,
     args: &Value,
 ) -> Result<ToolOutput> {
-    let action = required(args, "action")?;
-    let scoped = cdp.frame_selected();
-    if scoped && matches!(action, "press" | "type" | "fill") {
-        cdp.command(owner, "Page.bringToFront", json!({})).await?;
+    let Some(condition) = wait::after_condition(args)? else {
+        return execute_input(owner, cdp, tab, refs, args).await;
+    };
+    // Pin before the trigger. Only an explicit same-origin destination can
+    // authorize observing a replacement document; waiting never replays input.
+    let expected = document(owner, cdp).await?;
+    let navigation = wait::navigation::prepare(owner, cdp, &condition, &expected).await?;
+    let result = execute_input(owner, cdp, tab, refs, args).await?;
+    if result.is_error {
+        return Ok(result);
     }
-    if action == "press" {
-        if let Some(selector) = args.get("selector").and_then(Value::as_str) {
-            let id = resolve(owner, cdp, selector, refs)
-                .await?
-                .ok_or_else(|| Error::tool("browser", "selector did not match an element"))?;
-            element_call(owner, cdp, id, "focus", json!({})).await?;
-            if scoped {
-                frame_input::ensure_focus(owner, cdp, id).await?;
-            }
-        } else if scoped {
-            return Err(Error::tool(
-                "browser",
-                "frame-scoped keypress requires a selector",
-            ));
-        }
-        let key = required(args, "key")?;
-        press(owner, cdp, key).await?;
-        return Ok(output(
-            format!("Dispatched keypress {key} in tab {tab}"),
-            json!({"action": action, "key": key, "tab": tab, "backend": "cdp"}),
-        ));
+    let readiness = match navigation {
+        Some(navigation) => navigation.finish(owner, cdp, tab, &condition).await,
+        None => wait::execute_pinned(owner, cdp, tab, refs, &condition, &expected, None).await,
+    };
+    Ok(wait::after_result(result, readiness))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_input(
+    owner: &AgentCx,
+    cdp: &mut Cdp,
+    tab: &str,
+    refs: Option<&References>,
+    args: &Value,
+) -> Result<ToolOutput> {
+    let action = required(args, "action")?;
+    if pointer::is_gesture(action) {
+        return pointer::gesture(owner, cdp, tab, refs, args).await;
+    }
+    if matches!(action, "press" | "type" | "fill") {
+        return text_input::execute(owner, cdp, tab, refs, args).await;
+    }
+    let scoped = cdp.frame_selected();
+    if scoped && matches!(action, "click" | "scroll") {
+        cdp.command(owner, "Page.bringToFront", json!({})).await?;
     }
     if action == "scroll" {
         let x = delta(args, "delta_x", 0.0)?;
@@ -401,17 +460,7 @@ pub(super) async fn execute(
     }
     let selector = required(args, "selector")?;
     if action == "wait_for" {
-        loop {
-            if let Some(id) = resolve(owner, cdp, selector, refs).await?
-                && element_call(owner, cdp, id, "visible", json!({})).await? == true
-            {
-                return Ok(output(
-                    format!("Selector {selector} is visible in tab {tab}"),
-                    json!({"selector": selector, "found": true, "backend": "cdp"}),
-                ));
-            }
-            owner.time().sleep(Duration::from_millis(100)).await;
-        }
+        return wait::execute(owner, cdp, tab, refs, args).await;
     }
     let id = resolve(owner, cdp, selector, refs)
         .await?
@@ -423,63 +472,8 @@ pub(super) async fn execute(
     )
     .await?;
     match action {
-        "click" => {
-            let (x, y) = if scoped {
-                let (x, y) = frame_input::click_point(owner, cdp, id).await?;
-                (f64::from(x), f64::from(y))
-            } else {
-                let point = element_call(owner, cdp, id, "point", json!({})).await?;
-                let x = point["x"]
-                    .as_f64()
-                    .filter(|v| v.is_finite())
-                    .ok_or_else(|| {
-                        Error::tool("browser", "element has no clickable x coordinate")
-                    })?;
-                let y = point["y"]
-                    .as_f64()
-                    .filter(|v| v.is_finite())
-                    .ok_or_else(|| {
-                        Error::tool("browser", "element has no clickable y coordinate")
-                    })?;
-                (x, y)
-            };
-            for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
-                cdp.command(owner, "Input.dispatchMouseEvent", json!({"type": kind, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": 1})).await?;
-            }
-            Ok(output(
-                format!("Clicked element {selector} in tab {tab}"),
-                json!({"action": action, "selector": selector, "tab": tab, "backend": "cdp"}),
-            ))
-        }
-        "type" | "fill" => {
-            let text = required(args, "text")?;
-            element_call(owner, cdp, id, "edit", json!({"replace": action == "fill"})).await?;
-            if scoped {
-                frame_input::ensure_focus(owner, cdp, id).await?;
-            }
-            if text.is_empty() && action == "fill" {
-                press(owner, cdp, "Backspace").await?;
-            } else if !text.is_empty() {
-                cdp.command(owner, "Input.insertText", json!({"text": text}))
-                    .await?;
-            }
-            if scoped {
-                document(owner, cdp).await?;
-            }
-            if action == "fill"
-                && element_call(owner, cdp, id, "verify_fill", json!({"text": text})).await? != true
-            {
-                return Err(Error::tool(
-                    "browser",
-                    "field did not retain the requested text; the page may have rejected or transformed the input",
-                ));
-            }
-            let count = text.chars().count();
-            Ok(output(
-                format!("Dispatched text input to {selector} in tab {tab} ({count} chars)"),
-                json!({"action": action, "selector": selector, "char_count": count, "backend": "cdp"}),
-            ))
-        }
+        "click" => pointer::click(owner, cdp, tab, id, args).await,
+        "hover" => pointer::hover(owner, cdp, tab, id, args).await,
         _ => Err(Error::tool(
             "browser",
             format!("unsupported input action: {action}"),
@@ -583,24 +577,53 @@ pub(super) fn key_event(key: &str) -> Result<Value> {
     Ok(event)
 }
 
-async fn press(owner: &AgentCx, cdp: &mut Cdp, key: &str) -> Result<()> {
-    let mut event = key_event(key)?;
-    event["type"] = json!("keyDown");
-    cdp.command(owner, "Input.dispatchKeyEvent", event.clone())
-        .await?;
-    let object = event
-        .as_object_mut()
-        .ok_or_else(|| Error::tool("browser", "invalid key event"))?;
-    object.remove("text");
-    object.remove("commands");
-    event["type"] = json!("keyUp");
-    cdp.command(owner, "Input.dispatchKeyEvent", event).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_comparisons_require_the_same_document_incarnation() {
+        let document = Document {
+            frame: "main".into(),
+            loader: "old".into(),
+        };
+        let references = References {
+            document: Some(document.clone()),
+            nodes: BTreeMap::new(),
+            observation: Some(ax_state::SnapshotMemory::capture(
+                &[],
+                &BTreeMap::new(),
+                "",
+                "",
+                false,
+            )),
+        };
+        assert!(references.observation_for(&document).is_some());
+        assert!(
+            references
+                .observation_for(&Document {
+                    loader: "new".into(),
+                    ..document.clone()
+                })
+                .is_none()
+        );
+        assert!(
+            references
+                .observation_for(&Document {
+                    frame: "other".into(),
+                    ..document
+                })
+                .is_none()
+        );
+        assert!(
+            References::default()
+                .observation_for(&Document {
+                    frame: "main".into(),
+                    loader: "old".into()
+                })
+                .is_none()
+        );
+    }
 
     #[test]
     fn key_chords_preserve_modifiers_without_inserting_shortcut_text() {

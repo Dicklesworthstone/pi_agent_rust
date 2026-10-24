@@ -18,6 +18,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::{self, BoxStream};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 const DEFAULT_USER_AGENT: &str = concat!("pi_agent_rust/", env!("CARGO_PKG_VERSION"));
@@ -211,11 +212,31 @@ fn timeout_error_message(url: &str, duration: std::time::Duration) -> String {
     msg
 }
 
+pub(crate) type TransportResponse = (
+    u16,
+    Vec<(String, String)>,
+    BoxStream<'static, std::io::Result<Vec<u8>>>,
+);
+
+/// A host-selected provider transport. Extensions cannot install one on the
+/// general HTTP client; their outbound requests still use the policy bridge.
+#[async_trait::async_trait]
+pub(crate) trait HttpTransport: std::fmt::Debug + Send + Sync {
+    async fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<TransportResponse>;
+}
+
 #[derive(Debug, Clone)]
 pub struct Client {
     tls: std::result::Result<TlsConnector, String>,
     user_agent: String,
     vcr: Option<VcrRecorder>,
+    transport: Option<Arc<dyn HttpTransport>>,
 }
 
 /// Process-global cache of the built TLS connector.
@@ -319,6 +340,7 @@ impl Client {
             tls,
             user_agent,
             vcr: None,
+            transport: None,
         }
     }
 
@@ -334,6 +356,14 @@ impl Client {
         RequestBuilder::new(self, Method::Delete, url)
     }
 
+    pub fn put(&self, url: &str) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, Method::Put, url)
+    }
+
+    pub fn patch(&self, url: &str) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, Method::Patch, url)
+    }
+
     #[must_use]
     pub fn with_vcr(mut self, recorder: VcrRecorder) -> Self {
         self.vcr = Some(recorder);
@@ -342,6 +372,12 @@ impl Client {
 
     pub const fn vcr(&self) -> Option<&VcrRecorder> {
         self.vcr.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn with_transport(mut self, transport: Arc<dyn HttpTransport>) -> Self {
+        self.transport = Some(transport);
+        self
     }
 }
 
@@ -355,7 +391,9 @@ impl Default for Client {
 enum Method {
     Delete,
     Get,
+    Patch,
     Post,
+    Put,
 }
 
 impl Method {
@@ -363,7 +401,9 @@ impl Method {
         match self {
             Self::Delete => "DELETE",
             Self::Get => "GET",
+            Self::Patch => "PATCH",
             Self::Post => "POST",
+            Self::Put => "PUT",
         }
     }
 }
@@ -602,6 +642,39 @@ async fn send_parts(
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
+    if let Some(transport) = &client.transport {
+        // Match native request framing while keeping proxy credentials and
+        // caller-supplied transport headers out of the extension handler.
+        let mut effective_headers = Vec::with_capacity(headers.len() + 3);
+        for (name, value) in headers {
+            validate_request_header(name, value)?;
+            if [
+                "host",
+                "content-length",
+                "transfer-encoding",
+                "proxy-authorization",
+                "user-agent",
+            ]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            {
+                continue;
+            }
+            effective_headers.push((name.clone(), value.clone()));
+        }
+        effective_headers.push(("Host".to_string(), host_header_value(&parsed)));
+        effective_headers.push(("Content-Length".to_string(), body.len().to_string()));
+        effective_headers.push((
+            "User-Agent".to_string(),
+            sanitize_header_value(
+                header_value(headers, "user-agent").unwrap_or(&client.user_agent),
+            ),
+        ));
+        // A scoped transport failure is final; it never falls back to a socket.
+        return transport
+            .send(method.as_str(), url, &effective_headers, body)
+            .await;
+    }
     // The same resolved endpoint governs connection establishment and HTTP
     // serialization. SOCKS5 tunnels both schemes; only a plain HTTP proxy
     // uses absolute-form requests and Proxy-Authorization on the HTTP hop.
@@ -707,12 +780,12 @@ fn wrap_stream_with_idle_timeout(
         return stream;
     };
 
-    Box::pin(futures::stream::unfold(
-        (stream, start_time, timeout),
-        |(mut stream, mut last_activity, timeout)| async move {
+    let wrapped =
+        futures::stream::unfold(Some((stream, start_time, timeout)), |state| async move {
             use asupersync::time::{sleep, wall_now};
             use futures::future::{Either, FutureExt, select};
 
+            let (mut stream, last_activity, timeout) = state?;
             let asupersync_now = asupersync::Cx::current()
                 .and_then(|cx| cx.timer_driver())
                 .map_or_else(wall_now, |timer| timer.now());
@@ -720,37 +793,48 @@ fn wrap_stream_with_idle_timeout(
             let elapsed =
                 std::time::Duration::from_nanos(asupersync_now.duration_since(last_activity));
             if elapsed >= timeout {
+                // Release the transport (and any virtual-provider cancellation
+                // guard) before returning the terminal error to the consumer.
+                drop(stream);
                 return Some((
                     Err(std::io::Error::other(
                         "Request timed out reading body stream",
                     )),
-                    (stream, last_activity, timeout),
+                    None,
                 ));
             }
 
             let remaining = timeout.checked_sub(elapsed).unwrap_or_default();
-            let sleep_fut = sleep(asupersync_now, remaining).fuse();
-            let next_fut = stream.next().fuse();
-            futures::pin_mut!(sleep_fut, next_fut);
+            // End both the losing timer and the borrowing read future before
+            // moving or dropping the body. A caller may keep this wrapper
+            // alive after receiving an error; it must not keep the I/O alive.
+            let item = {
+                let sleep_fut = sleep(asupersync_now, remaining).fuse();
+                let next_fut = stream.next().fuse();
+                futures::pin_mut!(sleep_fut, next_fut);
+                match select(next_fut, sleep_fut).await {
+                    Either::Left((item, _)) => item,
+                    Either::Right(_) => Some(Err(std::io::Error::other(
+                        "Request timed out reading body stream",
+                    ))),
+                }
+            };
 
-            match select(next_fut, sleep_fut).await {
-                Either::Left((Some(res), _)) => {
+            match item {
+                Some(Ok(bytes)) => {
                     let now = asupersync::Cx::current()
                         .and_then(|cx| cx.timer_driver())
                         .map_or_else(wall_now, |timer| timer.now());
-                    last_activity = now;
-                    Some((res, (stream, last_activity, timeout)))
+                    Some((Ok(bytes), Some((stream, now, timeout))))
                 }
-                Either::Left((None, _)) => None,
-                Either::Right(_) => Some((
-                    Err(std::io::Error::other(
-                        "Request timed out reading body stream",
-                    )),
-                    (stream, last_activity, timeout),
-                )),
+                Some(Err(error)) => {
+                    drop(stream);
+                    Some((Err(error), None))
+                }
+                None => None,
             }
-        },
-    ))
+        });
+    Box::pin(wrapped.fuse())
 }
 
 impl Response {
@@ -1729,6 +1813,48 @@ mod tests {
     #[test]
     fn method_as_str_post() {
         assert_eq!(Method::Post.as_str(), "POST");
+    }
+
+    /// All mutation verbs must survive both native wire framing and cassette
+    /// recording. In particular, a deployment PATCH or DELETE is never POST.
+    #[test]
+    fn deployment_methods_preserve_wire_and_recorded_request_identity() {
+        let client = Client::new();
+        let url = "https://relay.example/v1/deployments/fixture?scope=test";
+        let parsed = ParsedUrl::parse(url).expect("fixture URL");
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        for (builder, expected) in [
+            (client.get(url), "GET"),
+            (client.post(url), "POST"),
+            (client.put(url), "PUT"),
+            (client.patch(url), "PATCH"),
+            (client.delete(url), "DELETE"),
+        ] {
+            for body in [b"".as_slice(), b"{\"enabled\":true}".as_slice()] {
+                let wire = String::from_utf8(build_request_bytes(
+                    builder.method,
+                    &parsed,
+                    "fixture-agent",
+                    &headers,
+                    body,
+                    None,
+                ))
+                .expect("request headers");
+                assert!(wire.starts_with(&format!(
+                    "{expected} /v1/deployments/fixture?scope=test HTTP/1.1\r\n"
+                )));
+                assert!(wire.contains(&format!("Content-Length: {}\r\n", body.len())));
+                assert_eq!(wire.matches("Content-Length:").count(), 1);
+                let recorded = build_recorded_request(builder.method, url, &headers, body);
+                assert_eq!(recorded.method, expected);
+                assert_eq!(recorded.url, url);
+                if body.is_empty() {
+                    assert!(recorded.body.is_none());
+                } else {
+                    assert_eq!(recorded.body, Some(json!({"enabled": true})));
+                }
+            }
+        }
     }
 
     // ── is_retryable_not_connected (#106 / #66 / asupersync#35) ─────────
@@ -3063,10 +3189,187 @@ mod tests {
             .map_or_else(asupersync::time::wall_now, |timer| timer.now())
     }
 
+    #[derive(Default)]
+    struct IdleStreamCounters {
+        polls: std::sync::atomic::AtomicUsize,
+        drops: std::sync::atomic::AtomicUsize,
+    }
+
+    struct TrackedIdleBody {
+        inner: ByteStream,
+        counters: Arc<IdleStreamCounters>,
+    }
+
+    impl Stream for TrackedIdleBody {
+        type Item = std::io::Result<Vec<u8>>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.counters
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.as_mut().poll_next(cx)
+        }
+    }
+
+    impl Drop for TrackedIdleBody {
+        fn drop(&mut self) {
+            self.counters
+                .drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn tracked_idle_body(inner: ByteStream) -> (ByteStream, Arc<IdleStreamCounters>) {
+        let counters = Arc::new(IdleStreamCounters::default());
+        let body = TrackedIdleBody {
+            inner,
+            counters: Arc::clone(&counters),
+        };
+        (Box::pin(body), counters)
+    }
+
+    fn assert_idle_body_released_and_fused(stream: &mut ByteStream, counters: &IdleStreamCounters) {
+        use futures::FutureExt as _;
+        use std::sync::atomic::Ordering;
+
+        // Assert before another poll: the returned error must not retain a
+        // socket or extension cancellation guard until the caller reads again.
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+        let polls = counters.polls.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(matches!(stream.next().now_or_never(), Some(None)));
+        }
+        assert_eq!(counters.polls.load(Ordering::SeqCst), polls);
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn idle_expired_before_read_releases_unpolled_body() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::pending()));
+            let mut stream =
+                wrap_stream_with_idle_timeout(body, Some((now(), std::time::Duration::ZERO)));
+            let error = stream
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("timeout");
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "Request timed out reading body stream");
+            assert_eq!(counters.polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_timer_winning_pending_read_releases_body_before_error() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::pending()));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_millis(50))),
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("timeout");
+            assert_eq!(error.to_string(), "Request timed out reading body stream");
+            assert!(counters.polls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_transport_error_releases_body_and_never_reads_later_data() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "peer reset",
+                )),
+                Ok(b"must not be read after failure".to_vec()),
+            ])));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_secs(30))),
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("terminal item")
+                .expect_err("reset");
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+            assert_eq!(error.to_string(), "peer reset");
+            assert_eq!(counters.polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_successful_eof_releases_body_and_stays_fused() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![Ok(
+                b"last chunk".to_vec(),
+            )])));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_secs(30))),
+            );
+            assert_eq!(
+                stream.next().await.expect("chunk").expect("bytes"),
+                b"last chunk"
+            );
+            assert!(stream.next().await.is_none());
+            assert_eq!(counters.polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_idle_body_released_and_fused(&mut stream, &counters);
+        });
+    }
+
+    #[test]
+    fn idle_pending_read_is_cancelled_when_wrapper_is_dropped() {
+        use futures::FutureExt as _;
+        use std::sync::atomic::Ordering;
+
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::pending()));
+            let mut stream = wrap_stream_with_idle_timeout(
+                body,
+                Some((now(), std::time::Duration::from_secs(30))),
+            );
+            assert!(stream.next().now_or_never().is_none());
+            assert_eq!(counters.drops.load(Ordering::SeqCst), 0);
+            drop(stream);
+            assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn disabled_idle_timeout_preserves_underlying_stream_semantics() {
+        asupersync::test_utils::run_test(|| async {
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![
+                Err(std::io::Error::other("fixture error")),
+                Ok(b"underlying continuation".to_vec()),
+            ])));
+            let mut stream = wrap_stream_with_idle_timeout(body, None);
+            assert!(stream.next().await.expect("first item").is_err());
+            assert_eq!(
+                stream.next().await.expect("second item").expect("bytes"),
+                b"underlying continuation"
+            );
+            assert!(stream.next().await.is_none());
+            drop(stream);
+            assert_eq!(counters.drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
     /// Build the wrapped stream *inside* the runtime (so `now()` and the
     /// wrapper's clock agree) and collect items, stopping after the first
-    /// error: the wrapper keeps reporting the timeout on every poll after
-    /// it fires, and a consumer that kept polling would be the bug.
+    /// error as production collectors do. Separate lifecycle regressions keep
+    /// the wrapper alive and verify that terminal reads cannot retain I/O.
     fn drain(build: impl FnOnce() -> ByteStream + Send + 'static) -> Vec<std::io::Result<Vec<u8>>> {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()

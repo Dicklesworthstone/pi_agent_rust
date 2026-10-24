@@ -27,7 +27,7 @@ pub(super) struct Budget {
 }
 
 impl Budget {
-    fn new(timeout: Duration) -> Self {
+    pub(super) fn new(timeout: Duration) -> Self {
         Self {
             owner: AgentCx::for_current_or_request(),
             started: Instant::now(),
@@ -40,7 +40,47 @@ impl Budget {
         self.timeout
             .checked_sub(self.started.elapsed())
             .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| tool_err("LSP_TIMEOUT", "symbol rename request budget expired"))
+            .ok_or_else(|| tool_err("LSP_TIMEOUT", "rename request budget expired"))
+    }
+
+    pub(super) async fn synchronize(
+        &self,
+        tool: &LspTool,
+        path: &Path,
+    ) -> Result<(String, Arc<ServerEntry>)> {
+        let now = self
+            .owner
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let (uri, entry) = asupersync::time::timeout(
+            now,
+            self.remaining()?,
+            tool.synced_with_timeout(path, self.remaining()?),
+        )
+        .await
+        .map_err(|_| {
+            tool_err(
+                "LSP_TIMEOUT",
+                "rename server startup exceeded the request budget",
+            )
+        })??;
+        entry
+            .client
+            .ensure_open_documents_synced(self.remaining()?)
+            .await?;
+        self.remaining()?;
+        Ok((uri, entry))
+    }
+
+    pub(super) fn verify(&self, entry: &ServerEntry, snapshot: &RefactorSnapshot) -> Result<()> {
+        self.remaining()?;
+        if !entry.client.is_alive() {
+            return Err(tool_err("LSP_TRANSPORT_CLOSED", "rename connection closed"));
+        }
+        snapshot.verify_request_source(entry)?;
+        self.remaining()?;
+        Ok(())
     }
 }
 
@@ -224,13 +264,7 @@ pub(super) struct Request {
 
 impl Request {
     pub(super) fn verify(&self) -> Result<()> {
-        self.budget.remaining()?;
-        if !self.entry.client.is_alive() {
-            return Err(tool_err("LSP_TRANSPORT_CLOSED", "rename connection closed"));
-        }
-        self.snapshot.verify_request_source(&self.entry)?;
-        self.budget.remaining()?;
-        Ok(())
+        self.budget.verify(&self.entry, &self.snapshot)
     }
 
     pub(super) async fn prepare(&self) -> Result<Option<Target>> {
@@ -281,19 +315,7 @@ impl LspTool {
                 "rename position is not an exact zero-based UTF-16 boundary",
             ));
         }
-        let now = budget
-            .owner
-            .cx()
-            .timer_driver()
-            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        let (uri, entry) = asupersync::time::timeout(now, budget.remaining()?, self.synced(&path))
-            .await
-            .map_err(|_| {
-                tool_err(
-                    "LSP_TIMEOUT",
-                    "rename server startup exceeded the request budget",
-                )
-            })??;
+        let (uri, entry) = budget.synchronize(self, &path).await?;
         let snapshot = RefactorSnapshot::capture(&entry, &path, content_hash_for_drift(&text))?;
         if snapshot.source_text.as_ref() != text.as_str() {
             return Err(tool_err(

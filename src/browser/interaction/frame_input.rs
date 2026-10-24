@@ -1,8 +1,8 @@
 //! Frame-local DOM lookup and verified page-viewport input coordinates.
 //!
-//! The CDP connection stays attached to the page target. Same-process frame
-//! nodes are resolved in their isolated world; input still uses native page
-//! events. Never reuse frame-local getBoundingClientRect coordinates for them.
+//! Nodes are resolved in their isolated world; input uses native page events.
+//! Remote renderer candidates are projected through every embedding boundary.
+//! Never reuse frame-local getBoundingClientRect coordinates for page input.
 
 use super::{Cdp, document, element_call};
 use crate::agent_cx::AgentCx;
@@ -236,6 +236,27 @@ fn candidate(value: &Value, width: f64, height: f64) -> Result<Option<(i32, i32)
     Ok(Some(pixel))
 }
 
+/// Quads and native input use viewport coordinates, but Chromium's DOM hit
+/// test takes document coordinates. Do not add scroll offsets to the actual
+/// mouse/wheel event, or a correct hit test would still dispatch elsewhere.
+fn hit_test_point(viewport: &Value, x: i32, y: i32) -> Result<(i32, i32)> {
+    let coordinate = |key: &str, pixel: i32| {
+        let offset = viewport[key]
+            .as_f64()
+            .filter(|value| value.is_finite() && value.abs() <= MAX_COORDINATE)
+            .ok_or_else(|| error("browser returned an invalid viewport scroll offset"))?;
+        let value = (f64::from(pixel) + offset).round();
+        if !value.is_finite() || value.abs() > 2.0 * MAX_COORDINATE {
+            return Err(error("browser hit-test coordinate exceeds its limit"));
+        }
+        // The explicit limit above is far inside i32's range. Signed offsets
+        // are valid for RTL documents; never clamp them to an unrelated node.
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(value as i32)
+    };
+    Ok((coordinate("pageX", x)?, coordinate("pageY", y)?))
+}
+
 async fn contains_hit(owner: &AgentCx, cdp: &mut Cdp, target: u64, hit: u64) -> Result<bool> {
     let context = world(owner, cdp).await?;
     let target = cdp
@@ -284,7 +305,7 @@ async fn contains_hit(owner: &AgentCx, cdp: &mut Cdp, target: u64, hit: u64) -> 
 /// Select a page-viewport point and verify Chromium's hit test there belongs
 /// to this frame and this element (or its composed descendant). Ancestor
 /// overlays, sibling frames and browser coordinate inconsistencies fail closed.
-pub(super) async fn click_point(owner: &AgentCx, cdp: &mut Cdp, id: u64) -> Result<(i32, i32)> {
+pub(super) async fn click_point(owner: &AgentCx, cdp: &mut Cdp, id: u64) -> Result<(f64, f64)> {
     let doc = document(owner, cdp).await?;
     // Retain native element visibility, enabled/inert and local occlusion checks.
     element_call(owner, cdp, id, "point", json!({})).await?;
@@ -314,12 +335,13 @@ pub(super) async fn click_point(owner: &AgentCx, cdp: &mut Cdp, id: u64) -> Resu
         let Some((x, y)) = candidate(quad, width, height)? else {
             continue;
         };
+        let (document_x, document_y) = hit_test_point(viewport, x, y)?;
         let hit = cdp
             .command(
                 owner,
                 "DOM.getNodeForLocation",
                 json!({
-                    "x":x,"y":y,"includeUserAgentShadowDOM":false,"ignorePointerEventsNone":false,
+                    "x":document_x,"y":document_y,"includeUserAgentShadowDOM":false,"ignorePointerEventsNone":false,
                 }),
             )
             .await?;
@@ -334,7 +356,7 @@ pub(super) async fn click_point(owner: &AgentCx, cdp: &mut Cdp, id: u64) -> Resu
             if document(owner, cdp).await? != doc {
                 return Err(error("selected frame navigated before input dispatch"));
             }
-            return Ok((x, y));
+            return crate::browser::frames::project_pointer(owner, cdp, &doc.frame, x, y).await;
         }
     }
     Err(error(
@@ -403,6 +425,55 @@ mod tests {
         assert_eq!(
             remote_id(&json!({"result":{"objectId":"valid"}})).unwrap(),
             "valid"
+        );
+    }
+
+    #[test]
+    fn scrolled_hit_tests_translate_only_the_document_lookup() {
+        let point = candidate(&json!([40, 100, 170, 100, 170, 140, 40, 140]), 405.0, 300.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(point, (105, 120));
+        assert_eq!(
+            hit_test_point(&json!({"pageX": 0, "pageY": 800}), point.0, point.1).unwrap(),
+            (105, 920)
+        );
+        assert_eq!(point, (105, 120), "native input stays in the viewport");
+    }
+
+    #[test]
+    fn hit_tests_preserve_signed_and_fractional_scroll_offsets() {
+        assert_eq!(
+            hit_test_point(&json!({"pageX": -400, "pageY": 20}), 100, 50).unwrap(),
+            (-300, 70),
+        );
+        assert_eq!(
+            hit_test_point(&json!({"pageX": 0.75, "pageY": 1.25}), 100, 50).unwrap(),
+            (101, 51),
+        );
+        assert_eq!(
+            hit_test_point(&json!({"pageX": 0, "pageY": 0}), 100, 50).unwrap(),
+            (100, 50),
+        );
+    }
+
+    #[test]
+    fn hit_tests_reject_untrusted_scroll_metadata_before_dispatch() {
+        for viewport in [
+            json!({}),
+            json!({"pageX": 0}),
+            json!({"pageX": "PRIVATE-CANARY", "pageY": 0}),
+            json!({"pageX": 0, "pageY": null}),
+            json!({"pageX": 1e100, "pageY": 0}),
+            json!({"pageX": 0, "pageY": -1_000_001}),
+        ] {
+            let error = hit_test_point(&viewport, 100, 50).unwrap_err().to_string();
+            assert!(!error.contains("PRIVATE-CANARY"));
+        }
+        assert!(hit_test_point(&json!({"pageX": 0, "pageY": 0}), i32::MAX, 0).is_err());
+        assert_eq!(
+            hit_test_point(&json!({"pageX": -1_000_000, "pageY": 1_000_000}), 0, 0).unwrap(),
+            (-1_000_000, 1_000_000)
         );
     }
 }

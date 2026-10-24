@@ -1,31 +1,45 @@
 //! Persistent JavaScript kernel for the eval tool (bd-cv653.1.4).
 //!
 //! A dedicated OS thread owns a **sync** QuickJS `Runtime` + `Context` — a
-//! separate trust domain from the extension realm (`extensions_js`), with no
-//! module loader and no extension hostcalls. Cells evaluate as scripts (the
+//! separate trust domain from the extension realm (`extensions_js`), with a
+//! workspace-only ES module loader and no extension hostcalls. Cells evaluate as scripts (the
 //! completion value of the last statement returns, REPL-style), `console.*`
-//! output is captured per cell, globals persist across cells, and top-level
-//! promises are settled by pumping pending jobs. Per-cell timeouts use the
-//! QuickJS interrupt handler — the cell aborts but the KERNEL (and its
-//! state) survives, unlike the Python kernel's kill-and-restart.
+//! output streams through an invocation-owned bounded channel, globals persist
+//! across cells, and top-level promises settle by pumping pending jobs.
+//! Per-cell timeouts use the QuickJS interrupt handler. A timeout discards the
+//! realm with an explicit state-loss diagnostic so stale promise continuations
+//! cannot run in a later cell.
 //!
 //! The tool re-entry bridge mirrors the Python design: `tool.read(...)` etc.
 //! block the kernel thread on a channel round-trip that the host resolves
-//! through the same whitelisted tool implementations.
+//! through the invocation's host policy. `tool.call` is awaitable;
+//! timers and promise replies advance while the cell awaits its result.
 
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::time::{Duration, Instant};
+
+mod async_host;
+mod console;
+mod display;
+mod evaluate;
+#[cfg(test)]
+mod evaluation_tests;
+mod modules;
 
 /// A cell request for the kernel thread.
 pub struct JsCellRequest {
     pub code: String,
     pub deadline: Instant,
     pub reply: Sender<JsCellResponse>,
+    pub output: Option<SyncSender<Value>>,
+    pub filename: Option<String>,
+    pub owner: crate::agent_cx::AgentCx,
 }
 
 /// Cell outcome from the kernel thread.
@@ -34,6 +48,8 @@ pub struct JsCellResponse {
     pub console: String,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// Detached JSON snapshots, independently validated by the Tool host.
+    pub displays: Vec<Value>,
 }
 
 /// A tool re-entry request from inside a JS cell.
@@ -47,28 +63,62 @@ pub struct JsKernel {
     requests: Sender<JsCellRequest>,
     pub bridge: Receiver<JsBridgeRequest>,
     pub cells_run: u64,
+    stopped: Arc<AtomicBool>,
 }
 
 impl JsKernel {
+    #[cfg(test)]
     pub fn spawn() -> std::io::Result<Self> {
+        Self::spawn_in(&std::env::current_dir()?)
+    }
+
+    pub fn spawn_in(cwd: &Path) -> std::io::Result<Self> {
+        // Freeze relative workspace spelling now, not on a later worker poll.
+        // Canonicalization and all actual file reads require a cell owner.
+        let workspace = std::path::absolute(cwd)?;
         let (req_tx, req_rx) = std::sync::mpsc::channel::<JsCellRequest>();
         let (bridge_tx, bridge_rx) = std::sync::mpsc::channel::<JsBridgeRequest>();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
         std::thread::Builder::new()
             .name("eval-js-kernel".into())
-            .spawn(move || kernel_thread(&req_rx, &bridge_tx))?;
+            .spawn(move || kernel_thread(&req_rx, &bridge_tx, worker_stopped, workspace))?;
         Ok(Self {
             requests: req_tx,
             bridge: bridge_rx,
             cells_run: 0,
+            stopped,
         })
     }
 
-    /// Submit a cell; the response arrives on the returned receiver. The
-    /// kernel thread exits when the sender side is dropped.
+    /// Raw kernel tests may collect bounded console output without a host.
+    #[cfg(test)]
     pub fn submit(
         &self,
         code: String,
         deadline: Instant,
+    ) -> Result<Receiver<JsCellResponse>, String> {
+        self.submit_with_output(code, deadline, None)
+    }
+
+    /// The output sender belongs to this request alone and closes before its
+    /// final reply. Revoking the kernel also interrupts blocked output delivery.
+    #[cfg(test)]
+    pub fn submit_with_output(
+        &self,
+        code: String,
+        deadline: Instant,
+        output: Option<SyncSender<Value>>,
+    ) -> Result<Receiver<JsCellResponse>, String> {
+        self.submit_source_with_output(code, None, deadline, output)
+    }
+
+    pub fn submit_source_with_output(
+        &self,
+        code: String,
+        filename: Option<String>,
+        deadline: Instant,
+        output: Option<SyncSender<Value>>,
     ) -> Result<Receiver<JsCellResponse>, String> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.requests
@@ -76,19 +126,28 @@ impl JsKernel {
                 code,
                 deadline,
                 reply: reply_tx,
+                output,
+                filename,
+                owner: crate::agent_cx::AgentCx::for_current_or_request(),
             })
             .map_err(|_| String::from("kernel thread gone"))?;
         Ok(reply_rx)
     }
 }
 
+impl Drop for JsKernel {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Deadline cell shared with the interrupt handler.
 #[derive(Clone)]
-struct DeadlineCell(Arc<AtomicU64>);
+struct DeadlineCell(Arc<AtomicU64>, Arc<AtomicBool>);
 
 impl DeadlineCell {
-    fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(u64::MAX)))
+    fn new(stopped: Arc<AtomicBool>) -> Self {
+        Self(Arc::new(AtomicU64::new(u64::MAX)), stopped)
     }
     fn set(&self, deadline: Instant, origin: Instant) {
         let millis = u64::try_from(deadline.saturating_duration_since(origin).as_millis())
@@ -100,99 +159,183 @@ impl DeadlineCell {
     }
     fn expired(&self, origin: Instant) -> bool {
         let budget = self.0.load(Ordering::SeqCst);
-        budget != u64::MAX
-            && u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX) > budget
+        self.1.load(Ordering::SeqCst)
+            || (budget != u64::MAX
+                && u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX) >= budget)
     }
 }
 
-fn kernel_thread(requests: &Receiver<JsCellRequest>, bridge_tx: &Sender<JsBridgeRequest>) {
-    let Ok(runtime) = rquickjs::Runtime::new() else {
-        return;
-    };
-    let Ok(context) = rquickjs::Context::full(&runtime) else {
-        return;
-    };
-
-    let origin = Instant::now();
-    let deadline = DeadlineCell::new();
-    {
-        let deadline = deadline.clone();
-        runtime.set_interrupt_handler(Some(Box::new(move || deadline.expired(origin))));
-    }
-
-    let console: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-
-    // Install the console shim + tool bridge once; globals persist.
-    context.with(|ctx| {
-        install_globals(&ctx, &console, bridge_tx);
-    });
-
-    while let Ok(request) = requests.recv() {
-        deadline.set(request.deadline, origin);
-        console.borrow_mut().clear();
-        let response = run_cell(&context, &runtime, &request, &deadline, origin);
-        deadline.clear();
-        let response = JsCellResponse {
-            console: std::mem::take(&mut *console.borrow_mut()),
-            ..response
+fn kernel_thread(
+    requests: &Receiver<JsCellRequest>,
+    bridge_tx: &Sender<JsBridgeRequest>,
+    stopped: Arc<AtomicBool>,
+    workspace: PathBuf,
+) {
+    // A timed-out realm may still contain promise continuations. Rebuild it
+    // before another cell rather than running old work under a new deadline.
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(runtime) = rquickjs::Runtime::new() else {
+            return;
         };
-        let _ = request.reply.send(response);
+        let modules = modules::ModuleFiles::new(workspace.clone(), Arc::clone(&stopped));
+        runtime.set_loader(modules.clone(), modules.clone());
+        let Ok(context) = rquickjs::Context::full(&runtime) else {
+            return;
+        };
+        let origin = Instant::now();
+        let deadline = DeadlineCell::new(Arc::clone(&stopped));
+        {
+            let deadline = deadline.clone();
+            runtime.set_interrupt_handler(Some(Box::new(move || deadline.expired(origin))));
+        }
+        let console = Rc::new(RefCell::new(console::ConsoleCapture::new()));
+        context.with(|ctx| install_globals(&ctx, &console, bridge_tx, &deadline, origin));
+        if context.with(|ctx| modules.install_reload(&ctx)).is_err() {
+            return;
+        }
+        let Ok(evaluator) = context.with(|ctx| evaluate::Evaluator::new(&ctx)) else {
+            return;
+        };
+        let Ok(host) =
+            context.with(|ctx| async_host::AsyncHost::install(&ctx, Arc::clone(&stopped)))
+        else {
+            return;
+        };
+        let Ok(displays) =
+            context.with(|ctx| display::DisplaySink::install(&ctx, deadline.clone(), origin))
+        else {
+            return;
+        };
+        let mut rebuild = false;
+        while let Ok(mut request) = requests.recv() {
+            if stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            deadline.set(request.deadline, origin);
+            modules.begin(request.owner.clone(), request.deadline);
+            host.begin(request.deadline);
+            displays.begin_with_output(request.output.clone());
+            console.borrow_mut().begin(request.output.take());
+            let mut response = run_cell(
+                &context, &runtime, &request, &deadline, origin, &evaluator, &host, bridge_tx,
+            );
+            let display_error = displays.failure();
+            let display_failed = display_error.is_some();
+            response.displays = displays.finish();
+            let console_result = console.borrow_mut().finish();
+            let console_failed = console_result.is_err();
+            match console_result {
+                Ok(text) => response.console = text,
+                Err(error) => {
+                    response.ok = false;
+                    response.result = None;
+                    response.error = Some(format!("EVAL_CONSOLE_CAPTURE: {error}"));
+                }
+            }
+            if let Some(error) = display_error {
+                // A guest catch cannot hide a disconnected/backpressured
+                // rich stream or make this realm reusable after data loss.
+                response.ok = false;
+                response.result = None;
+                let detail = response.error.take().unwrap_or_default();
+                response.error = Some(format!("EVAL_DISPLAY_STREAM: {error}; {detail}"));
+            }
+            let expired = deadline.expired(origin);
+            if stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            if expired {
+                let detail = response.error.take().unwrap_or_default();
+                response.error = Some(format!(
+                    "EVAL_TIMEOUT: JavaScript cell budget exhausted; {detail}"
+                ));
+            }
+            // Cleanup uses captured built-ins only, not arbitrary guest code.
+            deadline.clear();
+            let cleanup_failed = context.with(|ctx| host.finish(&ctx)).is_err();
+            modules.finish();
+            rebuild = expired
+                || console_failed
+                || display_failed
+                || cleanup_failed
+                || runtime.is_job_pending();
+            if rebuild {
+                response.ok = false;
+                response.result = None;
+                let error = response.error.get_or_insert_with(|| {
+                    "EVAL_ASYNC_INCOMPLETE: unfinished JavaScript work".into()
+                });
+                error
+                    .push_str("; EVAL_STATE_RESET: kernel state discarded, next cell starts fresh");
+            }
+            let _ = request.reply.send(response);
+            if rebuild {
+                break;
+            }
+        }
+        if !rebuild {
+            return;
+        }
+        // Persistent evaluator/host handles drop before context and runtime.
     }
 }
 
 fn install_globals(
     ctx: &rquickjs::Ctx<'_>,
-    console: &Rc<RefCell<String>>,
+    console: &Rc<RefCell<console::ConsoleCapture>>,
     bridge_tx: &Sender<JsBridgeRequest>,
+    deadline: &DeadlineCell,
+    origin: Instant,
 ) {
     use rquickjs::function::Func;
 
     let globals = ctx.globals();
-
-    // console.log / console.error append to the per-cell buffer.
-    let sink = Rc::clone(console);
-    let log = Func::from(
-        move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
-            let mut buffer = sink.borrow_mut();
-            let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
-            buffer.push_str(&parts.join(" "));
-            buffer.push('\n');
-        },
-    );
-    let console_obj = rquickjs::Object::new(ctx.clone()).expect("console object");
-    console_obj.set("log", log).expect("console.log");
-    let sink = Rc::clone(console);
-    let error = Func::from(
-        move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
-            let mut buffer = sink.borrow_mut();
-            let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
-            buffer.push_str(&parts.join(" "));
-            buffer.push('\n');
-        },
-    );
-    console_obj.set("error", error).expect("console.error");
-    globals.set("console", console_obj).expect("console global");
+    console::install(ctx, console, deadline, origin).expect("console globals");
 
     // Low-level bridge: (tool, payloadJson) -> content string. Typed as
     // plain Strings so no JS value lifetimes couple into the closure; the
     // ergonomic `tool.*` API wraps it in JS below.
     let tx = bridge_tx.clone();
+    let deadline = deadline.clone();
     let bridge_fn = Func::from(
         move |ctx: rquickjs::Ctx<'_>, tool: String, payload: String| {
+            if deadline.expired(origin) {
+                return Err(rquickjs::Exception::throw_message(
+                    &ctx,
+                    "EVAL_TIMEOUT: cell owner expired",
+                ));
+            }
             let input: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx.send(JsBridgeRequest {
+            tx.send(JsBridgeRequest {
                 tool,
                 input,
                 reply: reply_tx,
-            });
-            match reply_rx.recv_timeout(Duration::from_secs(120)) {
-                Ok(Ok(content)) => Ok(content),
-                Ok(Err(err)) => Err(rquickjs::Exception::throw_message(&ctx, &err)),
-                Err(_) => Err(rquickjs::Exception::throw_message(
-                    &ctx,
-                    "EVAL_BRIDGE_TIMEOUT: host did not answer",
-                )),
+            })
+            .map_err(|_| {
+                rquickjs::Exception::throw_message(&ctx, "EVAL_BRIDGE_CLOSED: host disconnected")
+            })?;
+            loop {
+                if deadline.expired(origin) {
+                    return Err(rquickjs::Exception::throw_message(
+                        &ctx,
+                        "EVAL_TIMEOUT: tool reply exceeded the cell budget",
+                    ));
+                }
+                match reply_rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(Ok(content)) => return Ok(content),
+                    Ok(Err(err)) => return Err(rquickjs::Exception::throw_message(&ctx, &err)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(rquickjs::Exception::throw_message(
+                            &ctx,
+                            "EVAL_BRIDGE_CLOSED: host disconnected",
+                        ));
+                    }
+                }
             }
         },
     );
@@ -209,12 +352,16 @@ fn install_globals(
         .expect("tool wrapper");
 }
 
+#[allow(clippy::too_many_arguments)] // one invocation owns deadline, evaluator and host reactor
 fn run_cell(
     context: &rquickjs::Context,
     runtime: &rquickjs::Runtime,
     request: &JsCellRequest,
     deadline: &DeadlineCell,
     origin: Instant,
+    evaluator: &evaluate::Evaluator,
+    host: &async_host::AsyncHost,
+    bridge_tx: &Sender<JsBridgeRequest>,
 ) -> JsCellResponse {
     // Phase 1: evaluate. A returned promise is saved as a Persistent so job
     // pumping can happen OUTSIDE Context::with (execute_pending_job inside
@@ -224,47 +371,9 @@ fn run_cell(
         Pending(rquickjs::Persistent<rquickjs::Promise<'static>>),
     }
     let phase1 = context.with(|ctx| {
-        // Script mode first: top-level `const`/`let` bindings persist in the
-        // shared script scope. Top-level await needs JS_EVAL_FLAG_ASYNC
-        // (rquickjs `EvalOptions.promise`) — retry with it on a syntax error
-        // (an `await ...` cell). Bindings made inside an async-mode cell do
-        // NOT persist (documented kernel limitation).
-        let evaluated: rquickjs::Result<rquickjs::Value<'_>> = ctx.eval(request.code.as_bytes());
-        let evaluated = match evaluated {
-            Ok(value) => Ok(value),
-            Err(err) if matches!(&err, rquickjs::Error::Exception) => {
-                // ctx.catch() consumes the pending exception, so capture it
-                // ONCE: it decides retry eligibility AND renders the error.
-                // Top-level await surfaces as a parse-time SyntaxError; ONLY
-                // that earns the async-mode retry — re-running on a runtime
-                // throw would re-execute the whole cell, doubling every side
-                // effect that ran before the throw.
-                let caught = ctx.catch();
-                let is_syntax_error = caught.as_exception().is_some_and(|exception| {
-                    exception
-                        .get::<_, String>("name")
-                        .is_ok_and(|name| name == "SyntaxError")
-                });
-                if is_syntax_error {
-                    let mut options = rquickjs::context::EvalOptions::default();
-                    options.global = true;
-                    options.strict = true;
-                    options.promise = true;
-                    ctx.eval_with_options(request.code.as_bytes(), options)
-                } else {
-                    let detail = caught
-                        .as_exception()
-                        .map_or_else(|| err.to_string(), |exception| format!("{exception}"));
-                    return Phase1::Done(JsCellResponse {
-                        ok: false,
-                        console: String::new(),
-                        result: None,
-                        error: Some(detail),
-                    });
-                }
-            }
-            Err(err) => Err(err),
-        };
+        // Select the grammar before executing any user statements. A runtime
+        // SyntaxError (including JSON.parse failures) never retries the cell.
+        let evaluated = evaluator.evaluate(&ctx, &request.code, request.filename.as_deref());
         match evaluated {
             Err(err) => Phase1::Done(error_response(&ctx, &err)),
             Ok(value) => rquickjs::Promise::from_value(value.clone()).map_or_else(
@@ -277,7 +386,9 @@ fn run_cell(
     let saved = match phase1 {
         Phase1::Done(response) => {
             // Drain microtasks the cell queued (outside with()).
-            while matches!(runtime.execute_pending_job(), Ok(true)) {}
+            if let Some(error) = drain_jobs(runtime, deadline, origin) {
+                return error;
+            }
             return response;
         }
         Phase1::Pending(saved) => saved,
@@ -297,21 +408,37 @@ fn run_cell(
                         console: String::new(),
                         result: None,
                         error: Some(String::from(
-                            "EVAL_TIMEOUT: promise still pending at the cell budget \
-                             (kernel state preserved)",
+                            "EVAL_TIMEOUT: promise still pending at the cell budget",
                         )),
+                        displays: Vec::new(),
                     };
                 }
                 match runtime.execute_pending_job() {
                     Ok(true) => {}
-                    Ok(false) => std::thread::sleep(Duration::from_millis(5)),
-                    Err(_) => break,
+                    Ok(false) => {
+                        let progressed = context.with(|ctx| {
+                            host.pump(&ctx, bridge_tx)
+                                .map_err(|error| error_response(&ctx, &error))
+                        });
+                        match progressed {
+                            Ok(true) => {}
+                            Ok(false) => std::thread::sleep(Duration::from_millis(5)),
+                            Err(response) => return response,
+                        }
+                    }
+                    Err(error) => {
+                        return error
+                            .0
+                            .with(|ctx| error_response(&ctx, &rquickjs::Error::Exception));
+                    }
                 }
             }
             _ => break,
         }
     }
-    while matches!(runtime.execute_pending_job(), Ok(true)) {}
+    if let Some(error) = drain_jobs(runtime, deadline, origin) {
+        return error;
+    }
 
     // Phase 3: extract the settled value.
     context.with(|ctx| {
@@ -321,6 +448,7 @@ fn run_cell(
                 console: String::new(),
                 result: None,
                 error: Some(String::from("EVAL_PROTOCOL: promise restore failed")),
+                displays: Vec::new(),
             };
         };
         match promise.result::<rquickjs::Value<'_>>() {
@@ -331,9 +459,39 @@ fn run_cell(
                 console: String::new(),
                 result: None,
                 error: Some(String::from("EVAL_PROTOCOL: promise never settled")),
+                displays: Vec::new(),
             },
         }
     })
+}
+
+fn drain_jobs(
+    runtime: &rquickjs::Runtime,
+    deadline: &DeadlineCell,
+    origin: Instant,
+) -> Option<JsCellResponse> {
+    loop {
+        if deadline.expired(origin) {
+            return Some(JsCellResponse {
+                ok: false,
+                console: String::new(),
+                result: None,
+                error: Some("EVAL_TIMEOUT: microtasks exceeded the cell budget".into()),
+                displays: Vec::new(),
+            });
+        }
+        match runtime.execute_pending_job() {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                return Some(
+                    error
+                        .0
+                        .with(|ctx| error_response(&ctx, &rquickjs::Error::Exception)),
+                );
+            }
+        }
+    }
 }
 
 fn extract_result<'js>(ctx: &rquickjs::Ctx<'js>, value: &rquickjs::Value<'js>) -> JsCellResponse {
@@ -359,6 +517,7 @@ fn extract_result<'js>(ctx: &rquickjs::Ctx<'js>, value: &rquickjs::Value<'js>) -
         console: String::new(),
         result,
         error: None,
+        displays: Vec::new(),
     }
 }
 
@@ -375,6 +534,7 @@ fn error_response(ctx: &rquickjs::Ctx<'_>, err: &rquickjs::Error) -> JsCellRespo
         console: String::new(),
         result: None,
         error: Some(detail),
+        displays: Vec::new(),
     }
 }
 

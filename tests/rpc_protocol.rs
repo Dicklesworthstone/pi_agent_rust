@@ -96,6 +96,7 @@ fn rpc_rejects_invalid_json_and_missing_type() {
         let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
         let options = RpcOptions {
             config: Config::default(),
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models: Vec::new(),
             scoped_models: Vec::new(),
@@ -170,6 +171,7 @@ fn rpc_errors_on_unknown_command_and_missing_params() {
         let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
         let options = RpcOptions {
             config: Config::default(),
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models: Vec::new(),
             scoped_models: Vec::new(),
@@ -295,6 +297,7 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
         let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
         let options = RpcOptions {
             config: Config::default(),
+            working_directory: None,
             resources: ResourceLoader::empty(false),
             available_models: Vec::new(),
             scoped_models: Vec::new(),
