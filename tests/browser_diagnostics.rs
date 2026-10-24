@@ -1,4 +1,4 @@
-//! Exercise the actual BrowserTool HTTP/WebSocket route, not a simulated browser.
+//! Exercise the actual `BrowserTool` HTTP/WebSocket route, not a simulated browser.
 //! This deterministic protocol peer is not proof of live Chromium behavior.
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
@@ -85,6 +85,7 @@ fn write_frame(socket: &mut TcpStream, value: &Value) {
     socket.write_all(&bytes).unwrap();
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn reply(socket: &mut TcpStream, method: &str, result: Value) -> Value {
     let request = read_frame(socket);
     assert_eq!(request["method"], method);
@@ -102,6 +103,7 @@ fn reply(socket: &mut TcpStream, method: &str, result: Value) -> Value {
     request
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn event(socket: &mut TcpStream, method: &str, params: Value) {
     write_frame(
         socket,
@@ -159,7 +161,7 @@ fn form_action(socket: &mut TcpStream, scenario: Scenario) {
                 "form_select",
                 json!([{"value":"literal 雪"}]),
                 json!({
-                    "multiple":false,"selected":selected.clone(),"changed":true
+                    "multiple":false,"selected":selected,"changed":true
                 }),
             ),
             (
@@ -231,6 +233,7 @@ fn form_action(socket: &mut TcpStream, scenario: Scenario) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one scripted CDP exchange per scenario
 fn peer(scenario: Scenario) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

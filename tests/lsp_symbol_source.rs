@@ -115,6 +115,7 @@ impl Peer {
         })
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn run(&self, extra: Value) -> pi::PiResult<Value> {
         let mut input = json!({"action":"symbols","file":"source.pisource","timeout":5});
         input

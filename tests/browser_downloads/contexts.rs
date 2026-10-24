@@ -57,7 +57,7 @@ enum Recovery {
 }
 
 #[derive(Debug)]
-pub(super) struct Peer {
+pub struct Peer {
     case: Case,
     recovery: Recovery,
     methods: Vec<String>,
@@ -71,7 +71,7 @@ pub(super) struct Peer {
 }
 
 impl Peer {
-    fn new(case: Case, recovery: Recovery) -> Self {
+    const fn new(case: Case, recovery: Recovery) -> Self {
         Self {
             case,
             recovery,
@@ -92,6 +92,7 @@ impl Peer {
 
     /// Return a contextual root reply, or let the existing renderer/download
     /// fixture handle the request. No duplicate DOM or input implementation.
+    #[allow(clippy::too_many_lines)] // one match over every context-scoped CDP method
     pub(super) fn reply(
         &mut self,
         request: &Value,
@@ -101,13 +102,13 @@ impl Peer {
         let method = request["method"].as_str().unwrap();
         let params = &request["params"];
         self.methods.push(method.to_owned());
-        if method.starts_with("Browser.") || method.starts_with("Target.") {
-            if method != "Target.setAutoAttach" {
-                assert!(
-                    request.get("sessionId").is_none(),
-                    "context commands are browser-scoped"
-                );
-            }
+        if (method.starts_with("Browser.") || method.starts_with("Target."))
+            && method != "Target.setAutoAttach"
+        {
+            assert!(
+                request.get("sessionId").is_none(),
+                "context commands are browser-scoped"
+            );
         }
         match method {
             "Browser.setDownloadBehavior" => {

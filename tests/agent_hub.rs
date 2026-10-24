@@ -78,6 +78,7 @@ fn public_reply_wait_times_out_without_consuming_unrelated_messages() {
         let unrelated = hub
             .bus_send("parent", "some-other-worker", "not this reply")
             .unwrap();
+        drop(hub);
         (peer, unrelated)
     };
     asupersync::test_utils::run_test(|| async {

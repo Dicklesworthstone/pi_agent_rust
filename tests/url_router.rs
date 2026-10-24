@@ -306,7 +306,7 @@ fn conflict_write_batch_refuses_partial_admission_and_undoes_all_files() {
     for choices in [
         json!([first.clone(), stale]),
         json!([first.clone(), first.clone()]),
-        json!([first.clone(), absent_base]),
+        json!([first, absent_base]),
     ] {
         block_on_local(tool.execute(
             "refused",
@@ -430,9 +430,9 @@ fn conflict_write_rejects_bad_shapes_before_git_or_filesystem_fallback() {
         json!({"path":"conflict://0/ours","content":"x"}),
         json!({"path":format!("conflict://0/{token}/theirs"),"content":"x"}),
         json!({"path":"conflict://*","conflicts":[]}),
-        json!({"path":"conflict://*","conflicts":[choice.clone()],"content":""}),
+        json!({"path":"conflict://*","conflicts":[choice],"content":""}),
         json!({"path":"conflict://*"}),
-        json!({"path":"conflict://*","conflicts":[choice.clone()],"extra":true}),
+        json!({"path":"conflict://*","conflicts":[choice],"extra":true}),
         json!({"path":format!("conflict://0/{token}"),"content":"x","extra":true}),
         json!({"path":"conflict://*","conflicts":[{
             "index":0,"token":token,"resolution":{"kind":"ours"},"path":"elsewhere"

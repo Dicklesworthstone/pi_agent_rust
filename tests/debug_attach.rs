@@ -53,6 +53,7 @@ fn send(stream: &mut TcpStream, sequence: &mut u64, mut message: Value) {
     stream.write_all(&encode_frame(&message)).unwrap();
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn reply(stream: &mut TcpStream, sequence: &mut u64, request: &Value, body: Value) {
     send(
         stream,

@@ -177,6 +177,7 @@ fn node(id: u64, name: &str, checked: &str) -> Value {
     ]})
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn snapshot(first: bool, loader: &str, final_loader: &str, nodes: Vec<Value>) -> Vec<Step> {
     let mut script = Vec::new();
     if first {

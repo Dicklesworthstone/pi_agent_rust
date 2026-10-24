@@ -1,4 +1,4 @@
-//! Rich display coverage through the actual persistent Python EvalTool.
+//! Rich display coverage through the actual persistent Python `EvalTool`.
 mod common;
 
 use common::TestHarness;
@@ -48,7 +48,7 @@ fn finish(harness: &TestHarness) {
         .log()
         .info("verify", "rich-display assertions passed");
     harness
-        .write_jsonl_logs(&harness.temp_path("display.jsonl"))
+        .write_jsonl_logs(harness.temp_path("display.jsonl"))
         .unwrap();
 }
 

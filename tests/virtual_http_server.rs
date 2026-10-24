@@ -50,14 +50,14 @@ fn load_extension(harness: &common::TestHarness, source: &str) -> ExtensionManag
 fn run_case(name: &str, body: &str) -> Value {
     let harness = common::TestHarness::new(name);
     let source = format!(
-        r#"
+        r"
 import http from 'node:http';
 export default function(pi) {{
     pi.on('agent_start', async () => {{
         {body}
     }});
 }}
-"#
+"
     );
     let manager = load_extension(&harness, &source);
     common::run_async(async move {
@@ -74,7 +74,7 @@ export default function(pi) {{
 fn virtual_http_preserves_request_routing_headers_and_binary_bytes() {
     let result = run_case(
         "virtual_http_binary",
-        r#"
+        r"
         let observed;
         const server = http.createServer((req, res) => {
             const chunks = [];
@@ -92,7 +92,7 @@ fn virtual_http_preserves_request_routing_headers_and_binary_bytes() {
             });
             return { result: { ...observed, status: response.status, header: response.headers.get('x-local'), bytes: Array.from(new Uint8Array(await response.arrayBuffer())) } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -107,7 +107,7 @@ fn virtual_http_preserves_request_routing_headers_and_binary_bytes() {
 fn virtual_http_fetch_settles_at_headers_before_delayed_body() {
     let result = run_case(
         "virtual_http_stream_headers",
-        r#"
+        r"
         let ended = false;
         let finish;
         const server = http.createServer((_req, res) => {
@@ -121,7 +121,7 @@ fn virtual_http_fetch_settles_at_headers_before_delayed_body() {
             finish();
             return { result: { beforeBody, body: await response.text(), ended } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -133,7 +133,7 @@ fn virtual_http_fetch_settles_at_headers_before_delayed_body() {
 fn virtual_http_abort_before_headers_closes_the_actual_request_once() {
     let result = run_case(
         "virtual_http_abort_headers",
-        r#"
+        r"
         let closed = 0;
         const controller = new AbortController();
         const server = http.createServer((_req, res) => {
@@ -147,7 +147,7 @@ fn virtual_http_abort_before_headers_closes_the_actual_request_once() {
                 throw new Error('fetch unexpectedly completed');
             } catch (error) { return { result: { name: error.name, closed } }; }
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(result, json!({"name": "AbortError", "closed": 1}));
 }
@@ -156,7 +156,7 @@ fn virtual_http_abort_before_headers_closes_the_actual_request_once() {
 fn virtual_http_body_cancel_releases_the_producer() {
     let result = run_case(
         "virtual_http_body_cancel",
-        r#"
+        r"
         let closed = false;
         const server = http.createServer((_req, res) => {
             res.on('close', () => { closed = true; });
@@ -171,7 +171,7 @@ fn virtual_http_body_cancel_releases_the_producer() {
             await reader.cancel();
             return { result: { text: new TextDecoder().decode(first.value), closed } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(result, json!({"text": "first", "closed": true}));
 }
@@ -180,7 +180,7 @@ fn virtual_http_body_cancel_releases_the_producer() {
 fn virtual_http_rejects_external_bind_and_bounds_unconsumed_response() {
     let result = run_case(
         "virtual_http_bounds",
-        r#"
+        r"
         let externalDenied = false;
         try { http.createServer(() => {}).listen(28180, '0.0.0.0'); }
         catch (error) { externalDenied = error.message.includes('loopback'); }
@@ -193,7 +193,7 @@ fn virtual_http_rejects_external_bind_and_bounds_unconsumed_response() {
                 return { result: { externalDenied, bounded: false } };
             } catch (error) { return { result: { externalDenied, bounded: error.message.includes('1 MiB') } }; }
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(result, json!({"externalDenied": true, "bounded": true}));
 }
@@ -203,7 +203,7 @@ fn virtual_http_provider_transport_is_derived_from_owned_listener() {
     let harness = common::TestHarness::new("virtual_http_provider_ownership");
     let manager = load_extension(
         &harness,
-        r#"
+        r"
         import http from 'node:http';
         export default async function(pi) {
             const server = http.createServer((_req, res) => res.end('ok'));
@@ -212,7 +212,7 @@ fn virtual_http_provider_transport_is_derived_from_owned_listener() {
             pi.registerProvider('owned', { api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1', models: [model] });
             pi.registerProvider('forged', { api: 'openai-completions', baseUrl: 'https://example.com/v1', virtualHttpServer: 'virtual-http-server-1', models: [model] });
         }
-        "#,
+        ",
     );
     let providers = manager.extension_providers();
     let owned = providers
@@ -236,7 +236,7 @@ fn virtual_http_native_provider_survives_same_origin_restart() {
     let harness = common::TestHarness::new("virtual_http_provider_restart");
     let manager = load_extension(
         &harness,
-        r#"
+        r"
         import http from 'node:http';
         export default function(pi) {
             let generation = 1;
@@ -263,7 +263,7 @@ fn virtual_http_native_provider_survives_same_origin_restart() {
                 return { result: { closed, generation } };
             });
         }
-        "#,
+        ",
     );
     common::run_async(async move {
         let entries = manager.extension_model_entries();
@@ -335,7 +335,7 @@ fn virtual_http_native_provider_survives_same_origin_restart() {
 fn readable_from_web_iterator_break_cancels_virtual_response() {
     let result = run_case(
         "virtual_http_iterator_cancel",
-        r#"
+        r"
         const { Readable } = await import('node:stream');
         let closed = 0;
         const server = http.createServer((_req, res) => {
@@ -355,7 +355,7 @@ fn readable_from_web_iterator_break_cancels_virtual_response() {
             await new Promise(resolve => setTimeout(resolve, 0));
             return { result: { first, closed, destroyed: source.destroyed, listeners: ['data', 'error', 'end', 'close'].map(event => source.listenerCount(event)) } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -367,7 +367,7 @@ fn readable_from_web_iterator_break_cancels_virtual_response() {
 fn virtual_http_response_timeout_cancels_pending_body() {
     let result = run_case(
         "virtual_http_response_timeout",
-        r#"
+        r"
         let timedOut = false;
         let closed = 0;
         const server = http.createServer((_req, res) => {
@@ -381,7 +381,7 @@ fn virtual_http_response_timeout_cancels_pending_body() {
             try { await response.text(); return { result: { unexpected: true } }; }
             catch (error) { return { result: { code: error.code, timedOut, closed } }; }
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,

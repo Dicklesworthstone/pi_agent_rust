@@ -1,13 +1,13 @@
 //! Terminal ownership for node:http relay requests (issue #270).
 //! The shared cases replace only fetch's I/O boundary. The final test also
-//! checks cancellation of a real PiJS streaming hostcall after headers.
+//! checks cancellation of a real `PiJS` streaming hostcall after headers.
 
 use pi::extensions_js::PiJsRuntime;
 use pi::scheduler::{DeterministicClock, HostcallOutcome};
 use serde_json::{Value, json};
 
 // Also executed against the exact embedded module by the Node diagnostic.
-const LIFECYCLE_CASES_JS: &str = r#"
+const LIFECYCLE_CASES_JS: &str = r"
 globalThis.__httpLifecycleCases = async function(http) {
   const savedFetch = globalThis.__pi_fetch_for_node_http;
   const results = [];
@@ -336,7 +336,7 @@ globalThis.__httpLifecycleCases = async function(http) {
   }
   return results;
 };
-"#;
+";
 
 #[test]
 fn node_http_terminal_lifecycle_contract() {
@@ -387,7 +387,7 @@ fn response_callback_failure_cancels_real_streaming_hostcall() {
             .expect("runtime");
         runtime
             .eval(
-                r#"
+                r"
                 globalThis.lifecycleResult = { errors: [], closed: 0 };
                 import('node:http').then(http => {
                     const request = http.get('https://relay.example/stream', () => {
@@ -396,7 +396,7 @@ fn response_callback_failure_cancels_real_streaming_hostcall() {
                     request.on('error', error => lifecycleResult.errors.push(error.message));
                     request.on('close', () => { lifecycleResult.closed++; });
                 });
-                "#,
+                ",
             )
             .await
             .expect("start request");

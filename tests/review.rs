@@ -69,11 +69,11 @@ fn review_git_targets_distinguish_index_commit_branch_and_untracked_changes() {
             .collect()
     ); // ubs:ignore[rust.panic.assert-macros] -- Uncommitted review must include index, working-tree, and untracked files.
     let (_, staged) = CodeReviewer::acquire_diff(repo.path(), Some("staged")).expect("staged"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The real index snapshot is the staged-target oracle.
-    assert_eq!(files_in(&staged), ["first.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Staged review must exclude working-tree-only and untracked changes.
+    assert_eq!(files_in(&staged), std::iter::once("first.rs").collect()); // ubs:ignore[rust.panic.assert-macros] -- Staged review must exclude working-tree-only and untracked changes.
     for target in ["commit:HEAD", "HEAD~1..HEAD"] {
         let (_, hunks) =
             CodeReviewer::acquire_diff(repo.path(), Some(target)).expect("commit selection"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Both explicit commit forms must resolve the valid fixture history.
-        assert_eq!(files_in(&hunks), ["second.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Commit selection must retain only the last commit's changed file.
+        assert_eq!(files_in(&hunks), std::iter::once("second.rs").collect()); // ubs:ignore[rust.panic.assert-macros] -- Commit selection must retain only the last commit's changed file.
         assert!(hunks.iter().all(|hunk| !hunk.content.contains("unstaged"))); // ubs:ignore[rust.panic.assert-macros] -- Commit snapshots must not incorporate later working-tree bytes.
     }
     let (_, branch) = CodeReviewer::acquire_diff(repo.path(), Some("branch:baseline"))
@@ -200,7 +200,7 @@ fn review_commit_target_includes_nonconflicting_merge_changes() {
 
     let (_, hunks) =
         CodeReviewer::acquire_diff(repo.path(), Some("commit:HEAD")).expect("merge commit review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- A valid merge commit must expose its first-parent diff.
-    assert_eq!(files_in(&hunks), ["feature.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Merge review must retain the feature change without repeating first-parent changes.
+    assert_eq!(files_in(&hunks), std::iter::once("feature.rs").collect()); // ubs:ignore[rust.panic.assert-macros] -- Merge review must retain the feature change without repeating first-parent changes.
     assert!(
         hunks
             .iter()

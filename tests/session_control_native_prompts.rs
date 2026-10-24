@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-//! Public controlled-content entrypoints through the native SDK, OpenAI
+//! Public controlled-content entrypoints through the native SDK, `OpenAI`
 //! transport, SSE parser, read tool and session store. Only the remote HTTP
 //! peer is a fixture; no Provider, Agent, Tool or persistence implementation
 //! is replaced. Every socket wait is bounded and the peer is joined on drop.
@@ -66,6 +66,7 @@ fn read_request(stream: &TcpStream) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn event(delta: Value, finish: Value) -> String {
     format!(
         "data: {}\n\n",

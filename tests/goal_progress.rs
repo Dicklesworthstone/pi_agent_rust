@@ -249,6 +249,7 @@ fn unchanged_native_reads_pause_after_two_prompts_with_new_call_ids() {
             "provider must receive native read output"
         );
     }
+    drop(requests);
 }
 
 #[test]

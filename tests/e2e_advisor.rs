@@ -115,6 +115,7 @@ impl PiEnv {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one scripted doer/advisor exchange plus its process wait loop
 fn e2e_advisor_concern_automatically_continues_completed_turn() {
     let harness = TestHarness::new("e2e_advisor_concern_automatically_continues_completed_turn");
     harness

@@ -1,4 +1,4 @@
-//! Borrowed goals use the real SDK, session and OpenAI wire implementation.
+//! Borrowed goals use the real SDK, session and `OpenAI` wire implementation.
 //! The loopback peer supplies protocol responses, not a replacement provider.
 #![recursion_limit = "512"]
 
@@ -254,6 +254,7 @@ fn borrowed_goal_preserves_history_and_allows_an_ordinary_turn_afterwards() {
             .to_string()
             .contains("An ordinary turn after the goal")
     );
+    drop(requests);
 }
 
 #[test]
@@ -443,6 +444,7 @@ fn asynchronous_host_evidence_controls_continuation_and_completion() {
             .to_string()
             .contains("Verify the second deliverable")
     );
+    drop(requests);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! Actual QuickJS -> native Eval bridge integration with a controlled host.
+//! Actual `QuickJS` -> native Eval bridge integration with a controlled host.
 //! These tests do not stand in for Chromium/CDP acceptance.
 
 use pi::error::{Error, Result};
@@ -40,7 +40,7 @@ impl ToolInvocationHost for Host {
     }
 }
 
-fn host() -> Host {
+const fn host() -> Host {
     Host {
         calls: Mutex::new(Vec::new()),
         enabled: AtomicBool::new(true),

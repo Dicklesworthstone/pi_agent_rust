@@ -55,7 +55,7 @@ fn options() -> StreamOptions {
     }
 }
 
-fn user(text: String) -> SessionMessage {
+const fn user(text: String) -> SessionMessage {
     SessionMessage::User {
         content: UserContent::Text(text),
         timestamp: Some(0),
@@ -94,7 +94,7 @@ struct CapturedRequest {
 }
 
 /// Bound both bytes and elapsed time. Socket timeouts are retried against one
-/// deadline; on macOS they may surface as WouldBlock rather than TimedOut.
+/// deadline; on macOS they may surface as `WouldBlock` rather than `TimedOut`.
 fn read_request(stream: &mut TcpStream, deadline: Instant) -> CapturedRequest {
     const LIMIT: usize = 256 * 1024;
     let mut bytes = Vec::new();

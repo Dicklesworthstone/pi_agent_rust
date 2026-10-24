@@ -37,7 +37,7 @@ enum Fault {
     ValueNavigation,
 }
 
-fn value_request(fault: Fault) -> Option<(&'static str, &'static str, &'static str)> {
+const fn value_request(fault: Fault) -> Option<(&'static str, &'static str, &'static str)> {
     match fault {
         Fault::ValueDate
         | Fault::ValueNoop

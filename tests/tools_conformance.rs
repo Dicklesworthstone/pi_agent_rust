@@ -3891,7 +3891,7 @@ mod e2e_read {
                 .iter()
                 .map(|name| (name.as_str(), b"x".as_slice()))
                 .collect();
-            harness.create_file("many.zip", &zip_fixture(&entries));
+            harness.create_file("many.zip", zip_fixture(&entries));
             let tool = pi::tools::ReadTool::new(harness.temp_dir());
             let mut offset = 1_u64;
             let mut actual = Vec::new();
@@ -4502,7 +4502,7 @@ mod e2e_read {
                     "nbformat": 4,
                     "cells": [{"cell_type": "markdown", "source": source}]
                 });
-                harness.create_file(name, &serde_json::to_vec(&notebook).unwrap());
+                harness.create_file(name, serde_json::to_vec(&notebook).unwrap());
                 let output = execute_tool_with_diagnostics(
                     &harness,
                     &tool,

@@ -1,4 +1,4 @@
-//! Public DebugTool terminal lifecycle against a deterministic DAP peer.
+//! Public `DebugTool` terminal lifecycle against a deterministic DAP peer.
 //! Real PTY/process/input/output effects; this peer is not a language debugger.
 #![cfg(unix)]
 #![recursion_limit = "512"]
@@ -58,7 +58,7 @@ fn fixture(root: &Path, mode: &str) -> Option<ToolRegistry> {
         include_str!("../src/debug/terminal/test_adapter.py"),
     )
     .unwrap();
-    std::fs::write(root.join("program.py"), r#"import json, os, sys, time
+    std::fs::write(root.join("program.py"), r"import json, os, sys, time
 from pathlib import Path
 print('TERMINAL_READY', flush=True)
 Path('observed.json').write_text(json.dumps({'tty':[os.isatty(i) for i in (0,1,2)],'argv':sys.argv[1:],
@@ -67,7 +67,7 @@ value = input('input> ')
 Path('received.txt').write_text(value)
 print('RECEIVED:' + value, flush=True)
 while True: time.sleep(.05)
-"#).unwrap();
+").unwrap();
     let tool = DebugTool::new(root, None).with_adapters(vec![AdapterSpec {
         id: "debugpy".into(),
         command_candidates: vec![python.to_str().unwrap().into()],

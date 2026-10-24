@@ -1,6 +1,6 @@
-//! Request/response lifecycle through PiJS's owned virtual HTTP route (#270).
+//! Request/response lifecycle through `PiJS`'s owned virtual HTTP route (#270).
 //! These tests never bind a socket or permit external HTTP. They complement
-//! virtual_http_server's provider ownership and response-stream coverage.
+//! `virtual_http_server`'s provider ownership and response-stream coverage.
 
 mod common;
 
@@ -16,14 +16,14 @@ fn run_case(name: &str, body: &str) -> Value {
     let harness = common::TestHarness::new(name);
     let cwd = harness.temp_dir().to_path_buf();
     let source = format!(
-        r#"
+        r"
 import http from 'node:http';
 export default function(pi) {{
     pi.on('agent_start', async () => {{
         {body}
     }});
 }}
-"#
+"
     );
     let entry = harness.create_file("installed extension/request.mjs", source.as_bytes());
     let spec = JsExtensionLoadSpec::from_entry_path(&entry).expect("load spec");
@@ -60,7 +60,7 @@ export default function(pi) {{
 fn virtual_request_body_honors_pause_and_resume_with_bounded_binary_chunks() {
     let result = run_case(
         "virtual_request_pause",
-        r#"
+        r"
         let incoming, firstChunk;
         const first = new Promise(resolve => { firstChunk = resolve; });
         const chunks = [], sizes = [];
@@ -91,7 +91,7 @@ fn virtual_request_body_honors_pause_and_resume_with_bounded_binary_chunks() {
             return { result: { before, afterFirst, sizes, ends, complete: incoming.complete,
                 intact: received.length === bytes.length && received.every((v, i) => v === bytes[i]) } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -107,7 +107,7 @@ fn virtual_request_body_honors_pause_and_resume_with_bounded_binary_chunks() {
 fn virtual_request_destroy_in_data_never_starts_end_handler_work() {
     let result = run_case(
         "virtual_request_destroy",
-        r#"
+        r"
         let incoming, ends = 0, aborted = 0, closed = 0, responseClosed = 0, socketClosed = 0;
         const server = http.createServer((req, res) => {
             incoming = req;
@@ -129,7 +129,7 @@ fn virtual_request_destroy_in_data_never_starts_end_handler_work() {
             return { result: { rejected, ends, aborted, closed, responseClosed, socketClosed,
                 complete: incoming.complete, remainingCloseListeners: incoming.listenerCount('close') } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -144,7 +144,7 @@ fn virtual_request_destroy_in_data_never_starts_end_handler_work() {
 #[test]
 fn virtual_request_callback_exceptions_are_terminal_and_release_slots() {
     for event in ["data", "end"] {
-        let body = r#"
+        let body = r"
         let failures = 0, closed = 0, aborted = 0, ends = 0;
         const server = http.createServer((req, res) => {
             req.on('aborted', () => { aborted++; });
@@ -163,7 +163,7 @@ fn virtual_request_callback_exceptions_are_terminal_and_release_slots() {
             }
             return { result: { failures, closed, aborted, ends } };
         } finally { server.close(); }
-        "#
+        "
         .replace("'EVENT'", &format!("'{event}'"));
         let result = run_case(&format!("virtual_request_throw_{event}"), &body);
         assert_eq!(
@@ -181,7 +181,7 @@ fn virtual_request_callback_exceptions_are_terminal_and_release_slots() {
 fn virtual_request_early_response_does_not_emit_end_after_rejection() {
     let result = run_case(
         "virtual_request_early_response",
-        r#"
+        r"
         let chunks = 0, ends = 0, incoming;
         const server = http.createServer((req, res) => {
             incoming = req;
@@ -196,7 +196,7 @@ fn virtual_request_early_response_does_not_emit_end_after_rejection() {
             const body = await response.text();
             return { result: { status: response.status, body, chunks, ends, complete: incoming.complete } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -208,7 +208,7 @@ fn virtual_request_early_response_does_not_emit_end_after_rejection() {
 fn virtual_request_body_cancellation_stops_a_paused_upload() {
     let result = run_case(
         "virtual_request_cancel_paused",
-        r#"
+        r"
         let incoming, chunks = 0, ends = 0, closed = 0;
         const server = http.createServer((req, res) => {
             incoming = req; req.pause();
@@ -225,7 +225,7 @@ fn virtual_request_body_cancellation_stops_a_paused_upload() {
             return { result: { chunks, ends, closed, complete: incoming.complete,
                 aborted: incoming.aborted, destroyed: incoming.destroyed } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -237,7 +237,7 @@ fn virtual_request_body_cancellation_stops_a_paused_upload() {
 fn virtual_request_body_decoder_preserves_split_utf8_and_terminal_tail() {
     let result = run_case(
         "virtual_request_utf8",
-        r#"
+        r"
         let seen = '', types = true, ends = 0;
         const bytes = Buffer.concat([Buffer.alloc(16383, 97), Buffer.from('☃🎼é'), Buffer.from([0xe2, 0x82])]);
         const server = http.createServer((req, res) => {
@@ -251,7 +251,7 @@ fn virtual_request_body_decoder_preserves_split_utf8_and_terminal_tail() {
             const text = await response.text();
             return { result: { intact: text === bytes.toString('utf8'), tail: text.slice(-6), types, ends } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(result["intact"], true);
     assert_eq!(result["types"], true);
@@ -263,7 +263,7 @@ fn virtual_request_body_decoder_preserves_split_utf8_and_terminal_tail() {
 fn virtual_response_end_callback_runs_once_for_each_supported_overload() {
     let result = run_case(
         "virtual_response_end_ack",
-        r#"
+        r"
         let callbacks = 0, failures = 0;
         const server = http.createServer((req, res) => {
             const done = error => { callbacks++; if (error) failures++; };
@@ -282,7 +282,7 @@ fn virtual_response_end_callback_runs_once_for_each_supported_overload() {
             await Promise.resolve();
             return { result: { callbacks, failures, bodies } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(result["callbacks"], 4);
     assert_eq!(result["failures"], 0);
@@ -292,7 +292,7 @@ fn virtual_response_end_callback_runs_once_for_each_supported_overload() {
             Vec::<u8>::new(),
             "snowman: ☃".as_bytes(),
             [0, 255, 65],
-            "completed".as_bytes(),
+            b"completed",
         ])
     );
 }
@@ -301,7 +301,7 @@ fn virtual_response_end_callback_runs_once_for_each_supported_overload() {
 fn virtual_response_finish_teardown_preserves_final_sse_bytes() {
     let result = run_case(
         "virtual_response_finish_teardown",
-        r#"
+        r"
         let closed = 0, finished = 0, acknowledgements = 0;
         const expected = 'data: first\n\ndata: [DONE]\n\n';
         const server = http.createServer((req, res) => {
@@ -334,7 +334,7 @@ fn virtual_response_finish_teardown_preserves_final_sse_bytes() {
             await Promise.resolve();
             return { result: { bodies, closed, finished, acknowledgements } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -346,7 +346,7 @@ fn virtual_response_finish_teardown_preserves_final_sse_bytes() {
 fn virtual_response_async_callback_failures_release_active_request_slots() {
     let result = run_case(
         "virtual_response_callback_failure",
-        r#"
+        r"
         let closed = 0, failures = 0;
         const server = http.createServer((req, res) => {
             if (req.url === '/ok') { res.end('recovered'); return; }
@@ -376,7 +376,7 @@ fn virtual_response_async_callback_failures_release_active_request_slots() {
             const response = await fetch('http://127.0.0.1:28180/ok');
             return { result: { closed, failures, recovered: await response.text() } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -388,7 +388,7 @@ fn virtual_response_async_callback_failures_release_active_request_slots() {
 fn virtual_response_cancelled_and_oversized_writes_never_acknowledge_success() {
     let result = run_case(
         "virtual_response_failed_ack",
-        r#"
+        r"
         const errors = [];
         let rejected = 0;
         const server = http.createServer((req, res) => {
@@ -412,7 +412,7 @@ fn virtual_response_cancelled_and_oversized_writes_never_acknowledge_success() {
             return { result: { rejected, count: errors.length,
                 cancelled: errors[0].includes('relay-stopped'), bounded: errors[1].includes('1 MiB') } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,
@@ -424,7 +424,7 @@ fn virtual_response_cancelled_and_oversized_writes_never_acknowledge_success() {
 fn virtual_response_backpressure_streams_more_than_its_queue_limit_without_truncation() {
     let result = run_case(
         "virtual_response_backpressure",
-        r#"
+        r"
         let writes = 0, drains = 0;
         const server = http.createServer((_req, res) => {
             function pump() {
@@ -449,7 +449,7 @@ fn virtual_response_backpressure_streams_more_than_its_queue_limit_without_trunc
             }
             return { result: { count, intact, writes, drains } };
         } finally { server.close(); }
-        "#,
+        ",
     );
     assert_eq!(
         result,

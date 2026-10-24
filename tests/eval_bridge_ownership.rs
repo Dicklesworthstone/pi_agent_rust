@@ -1,4 +1,4 @@
-//! Public EvalTool coverage for cell-owned Python bridge calls.
+//! Public `EvalTool` coverage for cell-owned Python bridge calls.
 #![recursion_limit = "512"]
 
 use pi::eval::EvalTool;
@@ -58,7 +58,7 @@ fn retained_task_cannot_read_with_a_later_cells_authority() {
     run(async {
         let seed = cell(
             &tool,
-            r#"
+            r"
 import asyncio
 ready = asyncio.Event()
 async def late():
@@ -69,7 +69,7 @@ async def late():
         return str(error)
 old_task = asyncio.create_task(late())
 await asyncio.sleep(0)
-"#,
+",
         )
         .await;
         assert!(!seed.is_error, "{}", text(&seed));
@@ -95,14 +95,14 @@ fn copied_worker_context_cannot_race_the_control_reader() {
     run(async {
         let worker = cell(
             &tool,
-            r#"
+            r"
 import asyncio
 try:
     await asyncio.to_thread(tool.read, 'data.txt')
 except Exception as error:
     verdict = str(error)
 verdict
-"#,
+",
         )
         .await;
         assert!(!worker.is_error, "{}", text(&worker));
@@ -124,14 +124,14 @@ fn ordinary_native_tool_denial_preserves_state_and_later_bridge_calls() {
     run(async {
         let denied = cell(
             &tool,
-            r#"
+            r"
 keep = 42
 try:
     await tool.call('bash', {'command':'echo should-not-run'})
 except Exception as error:
     verdict = str(error)
 verdict
-"#,
+",
         )
         .await;
         assert!(!denied.is_error, "{}", text(&denied));

@@ -4,7 +4,7 @@
 #![recursion_limit = "256"]
 
 use pi::sdk::Session;
-use pi::session_recovery::{RecoveryExport, RecoverySelection};
+use pi::session_recovery::{RecoveredEntry, RecoveryExport, RecoverySelection};
 use serde_json::{Value, json};
 
 #[test]
@@ -57,7 +57,7 @@ fn sdk_recovers_and_exports_a_selected_branch_without_media_or_session_mutation(
     assert_eq!(
         report
             .active_path()
-            .map(|entry| entry.id())
+            .map(RecoveredEntry::id)
             .collect::<Vec<_>>(),
         ["root", "answer"]
     );

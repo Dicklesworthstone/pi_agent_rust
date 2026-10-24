@@ -1,4 +1,4 @@
-//! Workspace data imports through the real EvalTool and conversation scope.
+//! Workspace data imports through the real `EvalTool` and conversation scope.
 #![recursion_limit = "256"]
 
 use pi::eval::EvalTool;
@@ -111,12 +111,12 @@ fn typed_analysis_composes_json_and_text_assets_without_another_tool_call() {
     .unwrap();
     std::fs::write(
         dir.path().join("analysis/report.mts"),
-        r#"
+        r"
         import rows from '../rows.json' with {type:'json'};
         import template from './template.md' with {type:'text'};
         export const total: number = rows.reduce((sum: number, row: {n: number}) => sum + row.n, 0);
         export const report: string = template.replace('{{total}}', String(total));
-    "#,
+    ",
     )
     .unwrap();
     let tool = EvalTool::new(dir.path());

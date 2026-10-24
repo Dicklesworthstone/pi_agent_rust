@@ -1,4 +1,4 @@
-//! Opt-in recoverable Python deadlines through the public EvalTool.
+//! Opt-in recoverable Python deadlines through the public `EvalTool`.
 #![recursion_limit = "512"]
 
 use pi::eval::EvalTool;

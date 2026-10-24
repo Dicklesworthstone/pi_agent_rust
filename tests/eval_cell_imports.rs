@@ -139,6 +139,7 @@ fn percent_load_javascript_imports_keep_the_real_importer_directory() {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // TypeScript source, not format args
 fn typed_setup_files_compose_static_code_and_data_imports_in_the_retained_realm() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("analysis")).unwrap();
@@ -154,7 +155,7 @@ fn typed_setup_files_compose_static_code_and_data_imports_in_the_retained_realm(
     .unwrap();
     std::fs::write(dir.path().join("analysis/math.ts"),
         "globalThis.helperLoads=(globalThis.helperLoads||0)+1; export function sum(rows: {n:number}[]): number {return rows.reduce((n,row)=>n+row.n,0)}").unwrap();
-    std::fs::write(dir.path().join("analysis/setup.ts"), r#"
+    std::fs::write(dir.path().join("analysis/setup.ts"), r"
         import rows from './rows.json' with {type:'json'};
         import template from './template.md' with {type:'text'};
         import {sum} from './math.ts';
@@ -164,7 +165,7 @@ fn typed_setup_files_compose_static_code_and_data_imports_in_the_retained_realm(
         const report: Report = {total:sum(rows),text:template.replace('{{total}}',String(sum(rows)))};
         display(report);
         report.total
-    "#).unwrap();
+    ").unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
         let loaded = tool
@@ -215,10 +216,7 @@ fn malformed_loaded_typescript_executes_neither_prefix_nor_imports() {
                 None,
             )
             .await;
-        assert!(match &rejected {
-            Err(_) => true,
-            Ok(output) => output.is_error,
-        });
+        assert!(rejected.as_ref().map_or(true, |output| output.is_error));
         let probe = tool
             .execute(
                 "after-bad-load",

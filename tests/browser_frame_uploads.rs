@@ -302,6 +302,7 @@ fn serve(socket: &mut TcpStream, selected: &str, fault: Fault) -> Observed {
     panic!("upload exhausted protocol fixture budget")
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run(selected: &'static str, fault: Fault, files: Value) -> (Result<ToolOutput>, Observed) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

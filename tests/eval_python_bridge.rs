@@ -1,4 +1,4 @@
-//! Python bridge ownership through the public EvalTool.
+//! Python bridge ownership through the public `EvalTool`.
 #![recursion_limit = "256"]
 
 use pi::eval::EvalTool;

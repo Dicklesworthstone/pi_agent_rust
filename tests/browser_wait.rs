@@ -6,6 +6,7 @@ use pi::browser::{BrowserLaunchOptions, BrowserTool};
 use pi::tools::Tool;
 use serde_json::{Value, json};
 
+#[allow(clippy::needless_pass_by_value)]
 fn log(case: &str, details: Value) {
     eprintln!(
         "{}",
@@ -135,10 +136,10 @@ fn live_waits_follow_replacement_visibility_text_and_frame_scope() {
             "selector":"#password","text":"PRIVATE-CANARY","timeout_ms":700}), None).await.is_err());
         let inputs = call(&tool, json!({"action":"evaluate","tab":"waits","script":"nativeInputs"})).await;
         assert_eq!(inputs["result"], 0);
-        call(&tool, json!({"action":"evaluate","tab":"waits","script":r#"
+        call(&tool, json!({"action":"evaluate","tab":"waits","script":r"
             (()=>{const host=document.createElement('div');host.id='closed';host.textContent='UNRENDERED-CANARY';
                 host.attachShadow({mode:'closed'}).innerHTML='<span>Internal</span>';document.body.append(host);return true})()
-        "#})).await;
+        "})).await;
         assert!(tool.execute("unrendered-shadow-text", json!({"action":"wait_for","tab":"waits",
             "selector":"#closed","text":"UNRENDERED-CANARY","timeout_ms":700}), None).await.is_err());
         call(&tool, json!({"action":"evaluate","tab":"waits","script":r#"
@@ -347,7 +348,7 @@ mod wire {
     }
 
     impl Mode {
-        fn navigation(self) -> bool {
+        const fn navigation(self) -> bool {
             matches!(
                 self,
                 Self::NavDocument
@@ -497,6 +498,8 @@ mod wire {
         (format!("http://{address}"), worker)
     }
 
+    #[allow(clippy::too_many_lines)] // one match over every CDP method the wait peer answers
+    #[allow(clippy::needless_pass_by_value)]
     fn serve_connections(
         listener: &TcpListener,
         mode: Mode,
@@ -535,7 +538,8 @@ mod wire {
                     "Browser.setDownloadBehavior"
                     | "Page.bringToFront"
                     | "Runtime.releaseObject"
-                    | "Input.cancelDragging" => json!({}),
+                    | "Input.cancelDragging"
+                    | "DOM.scrollIntoViewIfNeeded" => json!({}),
                     "Target.getTargets" => json!({"targetInfos":[{"targetId":"page","type":"page",
                         "url":if mode.navigation() {"https://app.example/start"} else {"about:blank"},"title":"Wait fixture"}]}),
                     "Target.attachToTarget" => json!({"sessionId":"session"}),
@@ -567,7 +571,7 @@ mod wire {
                         json!({"nodeId":id})
                     }
                     "DOM.describeNode" => {
-                        json!({"node":{"backendNodeId":params.get("backendNodeId").unwrap_or(&params["nodeId"]),"localName":"div","nodeName":"DIV"}})
+                        json!({"node":{"backendNodeId":params.get("backendNodeId").unwrap_or_else(|| &params["nodeId"]),"localName":"div","nodeName":"DIV"}})
                     }
                     "Accessibility.getFullAXTree" => {
                         assert!(matches!(
@@ -584,7 +588,6 @@ mod wire {
                     "DOM.resolveNode" => {
                         json!({"object":{"objectId":format!("node-{}",params["backendNodeId"])}})
                     }
-                    "DOM.scrollIntoViewIfNeeded" => json!({}),
                     "Runtime.evaluate" if mode.navigation() => {
                         assert!(
                             seen.inputs.len() >= 2,

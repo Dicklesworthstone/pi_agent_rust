@@ -1,4 +1,4 @@
-//! Real offline wheel installs through EvalTool; no package-index dependency.
+//! Real offline wheel installs through `EvalTool`; no package-index dependency.
 //! Run via `dsr quality --tool pi_agent_rust`. Missing Python/pip is explicit.
 #![recursion_limit = "512"]
 
@@ -296,11 +296,11 @@ fn invalid_package_commands_do_not_spawn_and_reset_discards_installed_packages()
 
 #[test]
 fn package_install_uses_the_existing_cell_timeout_and_retires_storage() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
     if !prerequisites(true) {
         return;
     }
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
     let harness = TestHarness::new("eval_packages_timeout");
     let tool = EvalTool::new(&harness.temp_path("."));
     success(&tool, FIXTURES);

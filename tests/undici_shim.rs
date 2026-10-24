@@ -43,7 +43,7 @@ fn undici_named_imports_preserve_freeflow_dispatcher_fallback() {
     let harness = common::TestHarness::new("undici_fallback");
     let manager = load_extension(
         &harness,
-        r#"
+        r"
 import { Agent, fetch, Headers, Response } from 'undici';
 import process from 'node:process';
 
@@ -62,7 +62,7 @@ export default function activate(pi) {
     };
   });
 }
-"#,
+",
     )
     .expect("real named undici imports must load");
     let result = common::run_async(async move {
@@ -95,18 +95,17 @@ fn undici_registration_does_not_enable_arbitrary_npm_packages() {
     let harness = common::TestHarness::new("undici_no_npm_authority");
     let result = load_extension(
         &harness,
-        r#"
+        r"
 import { Agent } from 'undici';
 import unrelated from 'pijs-arbitrary-package-regression-270';
 export default function activate() { void Agent; void unrelated; }
-"#,
+",
     );
-    let error = match result {
-        Ok(_) => panic!(
+    let Err(error) = result else {
+        panic!(
             // ubs:ignore[rust.ownership.panic-macro] -- This test must fail if arbitrary npm resolution succeeds.
             "Registering undici must not enable arbitrary npm resolution"
-        ),
-        Err(error) => error,
+        )
     };
     assert!(
         // ubs:ignore[rust.panic.assert-macros] -- Failure must preserve the existing unsupported-package diagnostic.

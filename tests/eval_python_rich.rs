@@ -1,4 +1,4 @@
-//! Rich Python objects through the public Rust EvalTool and native updates.
+//! Rich Python objects through the public Rust `EvalTool` and native updates.
 //! Optional scientific-library cases are separate from the stdlib-only lane.
 #![recursion_limit = "512"]
 
@@ -83,10 +83,7 @@ fn rich_bundle_reaches_native_update_before_cell_can_complete() {
     let tool = EvalTool::new(dir.path());
     let observed = Arc::new(AtomicBool::new(false));
     let callback_observed = Arc::clone(&observed);
-    let output = run(tool.execute(
-        "rich-progress",
-        json!({
-            "kernel":"python", "timeout_secs":60, "code":r#"
+    let code = r"
 import asyncio
 from pathlib import Path
 class Report:
@@ -102,8 +99,10 @@ for attempt in range(500):
 else:
     raise AssertionError('display did not reach native update before completion')
 42
-"#
-        }),
+";
+    let output = run(tool.execute(
+        "rich-progress",
+        json!({"kernel": "python", "timeout_secs": 60, "code": code}),
         Some(Box::new(move |update| {
             if update.content.iter().any(|block|
             matches!(block, ContentBlock::Text(text) if text.text.contains("native-rich-ready"))
@@ -139,13 +138,13 @@ fn rich_final_expression_preserves_kernel_and_plain_repr_semantics() {
     run(async {
         let first = cell(
             &tool,
-            r#"
+            r"
 class Report:
     def _repr_markdown_(self):
         return '## Rich answer'
 report = Report()
 report
-"#,
+",
         )
         .await;
         assert!(!first.is_error, "{}", text(&first));
@@ -172,14 +171,14 @@ fn invalid_rich_data_keeps_prior_output_without_success_or_state_loss() {
     run(async {
         let failed = cell(
             &tool,
-            r#"
+            r"
 keep = 42
 class Report:
     def _repr_mimebundle_(self, **kwargs):
         return {'image/png': 'not a PNG', 'text/plain': 'must not be used'}
 display({'accepted': True})
 display(Report())
-"#,
+",
         )
         .await;
         assert!(failed.is_error);
@@ -205,7 +204,7 @@ fn retained_task_cannot_invoke_rich_formatters_in_a_later_cell() {
     run(async {
         let seeded = cell(
             &tool,
-            r#"
+            r"
 import asyncio
 ready = asyncio.Event()
 called = []
@@ -222,18 +221,18 @@ async def old():
     return 'unexpected success'
 pending = asyncio.create_task(old())
 await asyncio.sleep(0)
-"#,
+",
         )
         .await;
         assert!(!seeded.is_error, "{}", text(&seeded));
         let later = cell(
             &tool,
-            r#"
+            r"
 ready.set()
 assert 'EVAL_DISPLAY_CLOSED' in await pending
 assert called == []
 display({'current': True})
-"#,
+",
         )
         .await;
         assert!(!later.is_error, "{}", text(&later));
@@ -253,10 +252,7 @@ fn png_representation_becomes_native_image_content_and_live_progress() {
     let tool = EvalTool::new(dir.path());
     let observed = Arc::new(AtomicBool::new(false));
     let callback_observed = Arc::clone(&observed);
-    let output = run(tool.execute(
-        "rich-image",
-        json!({
-            "kernel":"python", "timeout_secs":60, "code":r#"
+    let code = r"
 import struct, zlib
 
 def png_chunk(kind, data):
@@ -270,8 +266,10 @@ class Picture:
     def _repr_png_(self):
         return raster
 Picture()
-"#
-        }),
+";
+    let output = run(tool.execute(
+        "rich-image",
+        json!({"kernel": "python", "timeout_secs": 60, "code": code}),
         Some(Box::new(move |update| {
             if update.content.iter().any(|block|
             matches!(block, ContentBlock::Image(image) if image.mime_type == "image/png")
@@ -312,14 +310,14 @@ fn automatic_pyplot_output_reaches_native_images_and_retains_closed_figure() {
     run(async {
         let first = cell(
             &tool,
-            r#"
+            r"
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 figure, axes = plt.subplots(figsize=(2, 1), dpi=40)
 axes.plot([0, 1], [1, 0])
 plt.show()
-"#,
+",
         )
         .await;
         assert!(!first.is_error, "{}", text(&first));
@@ -360,13 +358,13 @@ fn failed_python_cell_keeps_automatic_plot_and_cleans_its_manager() {
     run(async {
         let failed = cell(
             &tool,
-            r#"
+            r"
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 figure = plt.figure(figsize=(2, 1), dpi=40)
 raise RuntimeError('original plotting cell failed')
-"#,
+",
         )
         .await;
         assert!(failed.is_error);

@@ -1,4 +1,4 @@
-//! Offline package-installation workflows through the public retained EvalTool.
+//! Offline package-installation workflows through the public retained `EvalTool`.
 //! Installs only an inert local wheel into each test's private target directory.
 #![recursion_limit = "512"]
 
@@ -62,7 +62,7 @@ async fn cell(tool: &EvalTool, code: &str) -> ToolOutput {
 
 // Stored wheel, no backend/build/network dependency. A target inside the temp
 // workspace avoids modifying the interpreter running the test suite.
-const WHEEL: &str = r#"
+const WHEEL: &str = r"
 import asyncio, contextvars, os, sys, zipfile
 from pathlib import Path
 workspace = Path.cwd()
@@ -84,7 +84,7 @@ with zipfile.ZipFile('wheel house/pi_eval_package_fixture-0.0.1-py3-none-any.whl
     for name, data in entries.items():
         archive.writestr(name, data)
 os.chdir('elsewhere')
-"#;
+";
 
 const INSTALL: &str = "%pip install --no-index --no-deps --target 'private packages' 'wheel house/pi_eval_package_fixture-0.0.1-py3-none-any.whl'";
 
@@ -107,7 +107,7 @@ fn local_wheel_install_streams_without_replacing_retained_python_state() {
                     "kernel":"python", "code":INSTALL, "timeout_secs":60
                 }),
                 Some(Box::new(move |update| {
-                    collected.lock().unwrap().push(update)
+                    collected.lock().unwrap().push(update);
                 })),
             )
             .await
@@ -124,7 +124,7 @@ fn local_wheel_install_streams_without_replacing_retained_python_state() {
         assert!(!dir.path().join("elsewhere/private packages").exists());
         let retained = cell(
             &tool,
-            r#"
+            r"
 sys.path.insert(0, str(workspace / 'private packages'))
 import pi_eval_package_fixture
 assert pi_eval_package_fixture.VALUE == 42
@@ -134,7 +134,7 @@ assert id(asyncio.get_running_loop()) == original_loop
 assert marker.get() == 'retained'
 assert Path.cwd() == workspace / 'elsewhere'
 display({'installed': pi_eval_package_fixture.VALUE, 'retained': keep['answer']})
-"#,
+",
         )
         .await;
         assert!(!retained.is_error, "{}", text(&retained));
@@ -152,6 +152,7 @@ display({'installed': pi_eval_package_fixture.VALUE, 'retained': keep['answer']}
     assert!(updates.iter().any(|update| update.content.iter().any(
         |block| matches!(block, ContentBlock::Text(text) if text.text.contains("EVAL_PIP_START"))
     )));
+    drop(updates);
 }
 
 #[test]
@@ -262,7 +263,7 @@ backend-path = ["."]
     .unwrap();
     std::fs::write(
         dir.path().join("fixture_backend.py"),
-        r#"
+        r"
 import os, time
 from pathlib import Path
 
@@ -274,7 +275,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     print('PI_PIP_BACKEND_WAITING', flush=True)
     time.sleep(60)
     raise RuntimeError('cancellation failed to stop the build')
-"#,
+",
     )
     .unwrap();
     let tool = EvalTool::new(dir.path());

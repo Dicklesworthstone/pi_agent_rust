@@ -169,6 +169,7 @@ fn reset_reconstructs_workers_and_pools_without_launch_or_replayed_tasks() {
         assert_eq!(calls.len(), 7);
         assert!(calls.iter().all(|call| matches!(call["operation"].as_str(),
             Some("worker_status" | "worker_wait" | "pool_status" | "pool_wait"))));
+        drop(calls);
         assert_eq!(second.details.expect("details")["toolCalls"]["calls"].as_array().expect("receipts").len(), 5);
     });
 }

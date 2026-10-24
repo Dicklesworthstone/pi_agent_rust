@@ -1,4 +1,4 @@
-//! File-backed JavaScript through the public EvalTool, not a separate evaluator.
+//! File-backed JavaScript through the public `EvalTool`, not a separate evaluator.
 #![recursion_limit = "512"]
 
 use pi::eval::EvalTool;

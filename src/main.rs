@@ -3401,7 +3401,7 @@ async fn run(
         match agent_session.arm_prewalk(target).await? {
             Some(target) => eprintln!("Prewalk armed → {}", target.label()),
             None => {
-                eprintln!("Prewalk: nothing to switch; target model and thinking already match")
+                eprintln!("Prewalk: nothing to switch; target model and thinking already match");
             }
         }
     }
@@ -6479,12 +6479,12 @@ async fn handle_review(
         }
     }
 
-    if let Some(threshold_sev) = fail_severity {
-        if report.failing_findings > 0 {
-            return Err(anyhow::anyhow!(
-                "Review failed: findings met or exceeded severity threshold {threshold_sev}"
-            ));
-        }
+    if let Some(threshold_sev) = fail_severity
+        && report.failing_findings > 0
+    {
+        return Err(anyhow::anyhow!(
+            "Review failed: findings met or exceeded severity threshold {threshold_sev}"
+        ));
     }
 
     Ok(())
@@ -10706,10 +10706,9 @@ where
         &prewalk_turn,
     )
     .await;
-    let interrupted = match &result {
-        Ok(message) => matches!(message.stop_reason, StopReason::Error | StopReason::Aborted),
-        Err(_) => true,
-    };
+    let interrupted = result.as_ref().map_or(true, |message| {
+        matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+    });
     session.finish_prewalk_turn(interrupted);
     result
 }
@@ -14239,6 +14238,7 @@ mod tests {
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert!(!requests[0].to_string().contains("/retry"));
+            drop(requests);
         });
     }
 
@@ -14329,6 +14329,7 @@ mod tests {
                         .iter()
                         .all(|request| !request.to_string().contains("/compact"))
                 );
+                drop(requests);
             }
         });
     }
@@ -14452,6 +14453,7 @@ mod tests {
                         .contains("preserve migration decisions and next steps")
                 );
                 assert!(!requests[0].to_string().contains("YXVkaW8="));
+                drop(requests);
                 let metadata = provider.metadata.lock().unwrap();
                 assert_eq!(metadata[0]["tools"], json!([]));
                 assert_ne!(metadata[0]["sessionId"], "primary-transport");
@@ -14480,6 +14482,7 @@ mod tests {
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
             let next_request = requests[1].to_string();
+            drop(requests);
             assert!(next_request.contains("Retained summary"));
             assert!(next_request.contains("aGVsbG8="));
             assert!(next_request.contains("YXVkaW8="));
@@ -14652,6 +14655,7 @@ mod tests {
                     let requests = provider.requests.lock().unwrap();
                     assert_eq!(requests.len(), 1);
                     let request = requests[0].to_string();
+                    drop(requests);
                     let summary = result["summary"].as_str().unwrap();
                     for secret in ["ACME-123456", "ACME-654321"] {
                         assert!(!request.contains(secret));

@@ -153,6 +153,7 @@ fn automatic_foreground_completion_preserves_output_and_exit_status() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)] // inline bash scripts that set, restore and clear shell state
 fn session_shell_restores_native_state_across_tool_rebuilds_without_replay() {
     let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock");
     let case = "session_shell_restores_native_state_across_tool_rebuilds_without_replay";

@@ -126,6 +126,7 @@ const JS_ATTACH: &str = "globalThis.batch = await judgeBatch.attach('batch-fixtu
 const PY_ATTACH: &str = "batch = await judge_batch.attach('batch-fixture')";
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // JS object literals, not format args
 fn both_kernels_replay_unacknowledged_pages_and_advance_only_an_explicit_cursor() {
     for kernel in kernels() {
         let root = tempfile::tempdir().expect("fixture");
@@ -184,6 +185,7 @@ fn reset_reinstalls_the_handle_method_and_accepts_an_externally_saved_cursor() {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // JS object literals, not format args
 fn current_policy_refusal_is_recorded_and_a_retained_handle_cannot_bypass_it() {
     for kernel in kernels() {
         let root = tempfile::tempdir().expect("fixture");
@@ -223,6 +225,7 @@ fn current_policy_refusal_is_recorded_and_a_retained_handle_cannot_bypass_it() {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // JS object literals, not format args
 fn interrupted_evidence_remains_incomplete_and_invalid_guest_cursors_do_not_dispatch() {
     for kernel in kernels() {
         let root = tempfile::tempdir().expect("fixture");

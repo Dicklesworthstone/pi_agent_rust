@@ -50,7 +50,7 @@ fn finish(harness: &TestHarness) {
         .log()
         .info("verify", "live-display assertions passed");
     harness
-        .write_jsonl_logs(&harness.temp_path("live-display.jsonl"))
+        .write_jsonl_logs(harness.temp_path("live-display.jsonl"))
         .unwrap();
 }
 
@@ -64,7 +64,7 @@ fn python_json_and_png_callbacks_unlock_their_own_blocked_cell() {
     let tool = EvalTool::new(&root);
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&events);
-    let gate_root = root.clone();
+    let gate_root = root;
     let callback = Box::new(move |event: ToolUpdate| {
         let details = event.details.as_ref().unwrap();
         assert_eq!(details["status"], "running");
@@ -162,7 +162,7 @@ fn python_rewritten_final_display_discards_kernel_instead_of_replacing_live_data
             "server._DISPLAY_CONTEXT.get().frames[0]['data']['value']='rewritten'"
         )}),
         Some(Box::new(move |event: ToolUpdate| {
-            sink.lock().unwrap().push(event)
+            sink.lock().unwrap().push(event);
         })),
     ))
     .unwrap_err();
@@ -194,7 +194,7 @@ fn python_large_live_json_is_omitted_honestly_but_final_data_is_complete() {
         "large",
         json!({"code":"display({'large':'x'*300000})"}),
         Some(Box::new(move |event: ToolUpdate| {
-            sink.lock().unwrap().push(event)
+            sink.lock().unwrap().push(event);
         })),
     ))
     .unwrap();
@@ -207,6 +207,7 @@ fn python_large_live_json_is_omitted_honestly_but_final_data_is_complete() {
         assert_eq!(details["displays"][0]["previewOmitted"], true);
         assert_eq!(details["displayStream"]["omittedDisplays"], 1);
     }
+    drop(events);
     assert_eq!(
         out.details.as_ref().unwrap()["jsonOutputs"][0]["large"]
             .as_str()
@@ -281,7 +282,7 @@ fn javascript_json_and_png_callbacks_unlock_their_own_blocked_cell() {
     let tool = EvalTool::new(&root);
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&events);
-    let gate_root = root.clone();
+    let gate_root = root;
     let callback = Box::new(move |event: ToolUpdate| {
         let details = event.details.as_ref().unwrap();
         assert_eq!(details["status"], "running");
@@ -329,6 +330,7 @@ fn javascript_json_and_png_callbacks_unlock_their_own_blocked_cell() {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // JS object literals, not format args
 fn javascript_rich_callback_cancellation_retires_state_and_refuses_archive() {
     let harness =
         TestHarness::new("javascript_rich_callback_cancellation_retires_state_and_refuses_archive");
@@ -400,7 +402,7 @@ fn javascript_large_live_json_is_omitted_but_final_snapshot_is_complete() {
             "kernel":"js","code":"display({large:'x'.repeat(300000)})"
         }),
         Some(Box::new(move |event: ToolUpdate| {
-            sink.lock().unwrap().push(event)
+            sink.lock().unwrap().push(event);
         })),
     ))
     .unwrap();
@@ -413,6 +415,7 @@ fn javascript_large_live_json_is_omitted_but_final_snapshot_is_complete() {
         assert_eq!(details["displays"][0]["previewOmitted"], true);
         assert_eq!(details["displayStream"]["omittedDisplays"], 1);
     }
+    drop(events);
     assert_eq!(
         out.details.as_ref().unwrap()["jsonOutputs"][0]["large"]
             .as_str()
@@ -428,6 +431,7 @@ fn javascript_large_live_json_is_omitted_but_final_snapshot_is_complete() {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // JS object literals, not format args
 fn javascript_live_displays_preserve_console_archives_and_ordinary_error_state() {
     let harness = TestHarness::new(
         "javascript_live_displays_preserve_console_archives_and_ordinary_error_state",

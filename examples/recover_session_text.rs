@@ -1,8 +1,8 @@
 //! Source-tree recovery utility; not an additional shipping binary.
 //!
-//! Usage: recover_session_text SOURCE [--active | --branch ID | --json]
-//!        [--output NEW_FILE]
-//!        recover_session_text SOURCE --session-output NEW_SESSION.jsonl
+//! Usage: `recover_session_text` SOURCE [--active | --branch ID | --json]
+//!        [--output `NEW_FILE`]
+//!        `recover_session_text` SOURCE --session-output `NEW_SESSION.jsonl`
 //!        [--branch ID | --root]
 //!
 //! Prefer --output over shell redirection: a shell can truncate a source file
@@ -104,7 +104,7 @@ fn run(args: &Args) -> pi::PiResult<()> {
         match format {
             RecoveryExport::Json => report.write_json(&mut output)?,
             RecoveryExport::Text(selection) => {
-                report.write_selected_text(selection, &mut output)?
+                report.write_selected_text(selection, &mut output)?;
             }
         }
     }

@@ -1,4 +1,4 @@
-//! Reachable EvalTool coverage for JavaScript timers and async host calls.
+//! Reachable `EvalTool` coverage for JavaScript timers and async host calls.
 mod common;
 
 use common::TestHarness;

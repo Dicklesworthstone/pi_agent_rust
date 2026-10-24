@@ -1,4 +1,4 @@
-//! Reload workflows through the public tool and real QuickJS module loader.
+//! Reload workflows through the public tool and real `QuickJS` module loader.
 #![recursion_limit = "512"]
 
 use pi::eval::EvalTool;

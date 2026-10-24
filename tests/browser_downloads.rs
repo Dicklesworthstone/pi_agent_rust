@@ -347,10 +347,10 @@ fn serve_with_context(
                             assert!(!output.exists(), "publication preceded restoration of deny");
                             match fault {
                                 Fault::LateExtra => {
-                                    write_frame(socket, &start("late-job", scene.frame()))
+                                    write_frame(socket, &start("late-job", scene.frame()));
                                 }
                                 Fault::ChangedTerminal => {
-                                    write_frame(socket, &progress("job", "canceled", 7))
+                                    write_frame(socket, &progress("job", "canceled", 7));
                                 }
                                 Fault::ChangedIdentity => {
                                     let mut changed = start("job", scene.frame());
@@ -417,7 +417,7 @@ fn serve_with_context(
                     if configured.insert(session.to_owned()) {
                         match session {
                             "page" => {
-                                write_frame(socket, &attached("page", "remote-session", "remote"))
+                                write_frame(socket, &attached("page", "remote-session", "remote"));
                             }
                             "remote-session" => write_frame(
                                 socket,
