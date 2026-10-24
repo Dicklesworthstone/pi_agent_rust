@@ -210,9 +210,11 @@ fn opened_sidecar_is_read_only(path: &Path) -> Result<bool> {
 /// Serve a read-only open from a private copy of the database and the WAL
 /// family it reads, for a session whose sidecars fsqlite cannot open in place
 /// (`opened_sidecar_is_read_only`). fsqlite rebuilds the WAL index and its
-/// namespace sidecars beside the copy. The WAL family is copied first, so a
-/// checkpoint between the copies only moves committed pages into the database
-/// copy and never drops them.
+/// namespace sidecars beside the copy, which a read-only connection cannot do
+/// ("recovery in progress"), so the copy is opened read-write; callers only
+/// read through it and it is discarded with the connection. The WAL family is
+/// copied first, so a checkpoint between the copies only moves committed pages
+/// into the database copy and never drops them.
 fn open_read_only_snapshot(path: &Path) -> Result<SqliteConnection> {
     let snapshot = tempfile::Builder::new()
         .prefix("pi-session-snapshot-")
@@ -237,7 +239,7 @@ fn open_read_only_snapshot(path: &Path) -> Result<SqliteConnection> {
             Error::session(format!("Failed to snapshot {}: {err}", source.display()))
         })?;
     }
-    let conn = map_sqlite_result(SqliteConnection::open_read_only(&copy))?;
+    let conn = map_sqlite_result(SqliteConnection::open_read_write(&copy))?;
     Ok(SqliteConnection {
         _snapshot: Some(snapshot),
         ..conn
