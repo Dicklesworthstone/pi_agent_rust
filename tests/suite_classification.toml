@@ -195,6 +195,33 @@ files = [
     "gc",
     "sdk_api",
     "sdk_unit",
+    # Added 2026-10-13..23 without registration. Real kernels, real tool and
+    # session paths, temp dirs only; browser files here run live Chromium
+    # only in explicitly selected lanes.
+    "browser_pointer",
+    "browser_semantic_selectors",
+    "doctor_broker_native",
+    "eval_agent_recovery",
+    "eval_async_js",
+    "eval_bridge_ownership",
+    "eval_cell_imports",
+    "eval_data_modules",
+    "eval_display",
+    "eval_file_js",
+    "eval_js_packages",
+    "eval_live_display",
+    "eval_module_reload",
+    "eval_modules",
+    "eval_per_call",
+    "eval_python_bridge",
+    "eval_python_packages",
+    "eval_python_rich",
+    "eval_soft_timeout",
+    "eval_typescript",
+    "session_text_recovery",
+    "undici_shim",
+    "virtual_http_request_body",
+    "virtual_http_server",
 ]
 
 [suite.vcr]
@@ -348,6 +375,29 @@ files = [
     "validation_broker_cli",
     "validation_broker_e2e",
     "web_search_rungs",
+    # Added 2026-10-13..23 without registration. Each drives the production
+    # path against a deterministic loopback protocol peer (CDP, DAP, LSP,
+    # HTTP/SSE, package index), a controlled host, or a saved fixture.
+    "browser_diagnostics",
+    "browser_downloads",
+    "browser_frame_uploads",
+    "browser_snapshot_state",
+    "browser_storage_state",
+    "browser_text_input",
+    "browser_wait",
+    "compaction_privacy_wire",
+    "debug_attach",
+    "debug_sessions",
+    "debug_terminal",
+    "eval_batch_drain_handles",
+    "eval_browser_prelude",
+    "eval_packages",
+    "goal_borrowed",
+    "goal_progress",
+    "lsp_symbol_source",
+    "node_http_lifecycle",
+    "session_control_native_prompts",
+    "url_notebook_read",
 ]
 
 [suite.e2e]

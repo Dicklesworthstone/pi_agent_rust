@@ -234,6 +234,18 @@
           "justification": "Explicit session workdir attachment (bd-yutps): bindings survive JSONL/SQLite save and reopen, and SDK resume binds configuration and real tools to the saved workspace or rejects a mismatched or missing one."
         },
         {
+          "path": "tests/session_text_recovery.rs",
+          "justification": "Session text recovery exercised as an SDK consumer, without internal helpers or credentials."
+        },
+        {
+          "path": "tests/session_control_native_prompts.rs",
+          "justification": "Controlled-content entrypoints through the native SDK, OpenAI transport, SSE parser, read tool and session store; only the remote HTTP peer is a loopback fixture."
+        },
+        {
+          "path": "tests/compaction_privacy_wire.rs",
+          "justification": "Compaction privacy through the native OpenAI-compatible HTTP/SSE boundary; only the remote endpoint is a loopback fixture."
+        },
+        {
           "path": "tests/sse_strict_compliance.rs",
           "justification": "Strict Server-Sent Events parsing and protocol compliance verification."
         },
@@ -1170,6 +1182,22 @@
         {
           "path": "tests/node_http_shim.rs",
           "justification": "HTTP shim behavior coverage."
+        },
+        {
+          "path": "tests/node_http_lifecycle.rs",
+          "justification": "Terminal ownership for node:http relay requests (#270): shared cases replace only fetch's I/O boundary, and the final case cancels a real PiJS streaming hostcall after headers."
+        },
+        {
+          "path": "tests/undici_shim.rs",
+          "justification": "Regression coverage for pi-freeflow's optional Undici dispatcher import."
+        },
+        {
+          "path": "tests/virtual_http_request_body.rs",
+          "justification": "Request-body lifecycle through PiJS's owned virtual HTTP route (#270): pause and resume, destroy, callback errors, early responses, cancellation and split UTF-8, without binding a socket."
+        },
+        {
+          "path": "tests/virtual_http_server.rs",
+          "justification": "Isolated in-process loopback transport for daemon-shaped extensions such as pi-freeflow; no OS listener and no external network."
         },
         {
           "path": "tests/npm_module_stubs.rs",
@@ -2377,6 +2405,154 @@
         {
           "path": "tests/browser_remote_pointer.rs",
           "justification": "Native pointer input (click, scroll) into an out-of-process iframe renderer; a live Chromium scenario that runs only in the DSR browser lane."
+        },
+        {
+          "path": "tests/browser_diagnostics.rs",
+          "justification": "Browser diagnostics through the actual BrowserTool HTTP/WebSocket route against a deterministic CDP peer; not live Chromium."
+        },
+        {
+          "path": "tests/browser_downloads.rs",
+          "justification": "Download admission and publication over real HTTP/WebSocket transport: routing, filesystem bytes and cleanup against a loopback CDP peer."
+        },
+        {
+          "path": "tests/browser_frame_uploads.rs",
+          "justification": "File uploads over real HTTP/WebSocket transport: routing and admission boundaries against a loopback CDP peer."
+        },
+        {
+          "path": "tests/browser_pointer.rs",
+          "justification": "Native pointer input through the public browser tool; the live Chromium scenarios run only in the DSR browser lane."
+        },
+        {
+          "path": "tests/browser_semantic_selectors.rs",
+          "justification": "Semantic locators through the public browser tool; live coverage requires explicit selection in the DSR browser lane."
+        },
+        {
+          "path": "tests/browser_snapshot_state.rs",
+          "justification": "Snapshot workflows through the production HTTP/WebSocket transport, with a peer supplying recorded-shaped accessibility responses."
+        },
+        {
+          "path": "tests/browser_storage_state.rs",
+          "justification": "Native storage-state admission checks, plus an opt-in real authentication round trip."
+        },
+        {
+          "path": "tests/browser_text_input.rs",
+          "justification": "Native text-input transport regressions against a loopback CDP peer."
+        },
+        {
+          "path": "tests/browser_wait.rs",
+          "justification": "Browser wait workflows through the public tool; real Chromium cases require explicit DSR selection."
+        },
+        {
+          "path": "tests/debug_attach.rs",
+          "justification": "Debug-tool loopback attachment against a deterministic DAP peer: registry ownership, configuration before running, and source-mapping validation."
+        },
+        {
+          "path": "tests/debug_sessions.rs",
+          "justification": "Conversation ownership through the real DebugTool registry and DAP transport, with a Python peer simulating an adapter."
+        },
+        {
+          "path": "tests/debug_terminal.rs",
+          "justification": "DebugTool terminal lifecycle with real PTY, process, input and output effects against a deterministic DAP peer."
+        },
+        {
+          "path": "tests/doctor_broker_native.rs",
+          "justification": "Doctor CLI producer and broker consumer exercised together, without swarm tools."
+        },
+        {
+          "path": "tests/eval_agent_recovery.rs",
+          "justification": "QuickJS and Python to native eval host bridge for agent recovery; no live child or model claim."
+        },
+        {
+          "path": "tests/eval_async_js.rs",
+          "justification": "JavaScript timers and async host calls through the reachable EvalTool."
+        },
+        {
+          "path": "tests/eval_batch_drain_handles.rs",
+          "justification": "Eval to native batch drain to invocation host, with controlled job snapshots."
+        },
+        {
+          "path": "tests/eval_bridge_ownership.rs",
+          "justification": "Cell-owned Python bridge calls through the public EvalTool."
+        },
+        {
+          "path": "tests/eval_browser_prelude.rs",
+          "justification": "QuickJS to native eval bridge browser prelude with a controlled host; not Chromium or CDP acceptance."
+        },
+        {
+          "path": "tests/eval_cell_imports.rs",
+          "justification": "Static imports through the public, conversation-owned retained eval tool."
+        },
+        {
+          "path": "tests/eval_data_modules.rs",
+          "justification": "Workspace data imports through the real EvalTool and conversation scope."
+        },
+        {
+          "path": "tests/eval_display.rs",
+          "justification": "Rich display output through the persistent Python EvalTool."
+        },
+        {
+          "path": "tests/eval_file_js.rs",
+          "justification": "File-backed JavaScript through the public EvalTool."
+        },
+        {
+          "path": "tests/eval_js_packages.rs",
+          "justification": "Installed ESM dependencies through the public retained eval tool."
+        },
+        {
+          "path": "tests/eval_live_display.rs",
+          "justification": "Live rich progress through the retained kernels and the public Tool API."
+        },
+        {
+          "path": "tests/eval_module_reload.rs",
+          "justification": "Module reload workflows through the public tool and the real QuickJS module loader."
+        },
+        {
+          "path": "tests/eval_modules.rs",
+          "justification": "Workspace ES modules through the public eval tool, including retained state and file-backed importer origins."
+        },
+        {
+          "path": "tests/eval_packages.rs",
+          "justification": "Offline wheel installs through EvalTool against a loopback package index; no external package index."
+        },
+        {
+          "path": "tests/eval_per_call.rs",
+          "justification": "Native lifecycle of disposable per-call eval interpreters."
+        },
+        {
+          "path": "tests/eval_python_bridge.rs",
+          "justification": "Python bridge ownership through the public EvalTool."
+        },
+        {
+          "path": "tests/eval_python_packages.rs",
+          "justification": "Offline package installation through the retained EvalTool, installing an inert local wheel into each test's private target."
+        },
+        {
+          "path": "tests/eval_python_rich.rs",
+          "justification": "Rich Python objects through the public EvalTool and native updates; optional scientific-library cases are separate from the stdlib-only lane."
+        },
+        {
+          "path": "tests/eval_soft_timeout.rs",
+          "justification": "Opt-in recoverable Python deadlines through the public EvalTool."
+        },
+        {
+          "path": "tests/eval_typescript.rs",
+          "justification": "TypeScript ES modules through the public eval tool."
+        },
+        {
+          "path": "tests/goal_borrowed.rs",
+          "justification": "Borrowed goals through the real SDK, session and OpenAI wire implementation against a loopback protocol peer."
+        },
+        {
+          "path": "tests/goal_progress.rs",
+          "justification": "Native goal continuation through HTTP/SSE and the real read tool against a loopback peer."
+        },
+        {
+          "path": "tests/lsp_symbol_source.rs",
+          "justification": "Native tool-to-stdio semantic definition reads against a Python LSP peer, bound to source."
+        },
+        {
+          "path": "tests/url_notebook_read.rs",
+          "justification": "Public document-converter coverage of a saved Jupyter-format notebook fixture."
         },
         {
           "path": "tests/browser_cdp.rs",

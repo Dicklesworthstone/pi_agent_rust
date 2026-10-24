@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use pi::agent::{Agent, AgentConfig};
 use pi::compaction_snap::{
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SnapFrame, SnapPayload, attach_frames,
-    strip_snapcompact_images,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SnapPayload, attach_frames,
+    render_frames, strip_snapcompact_images,
 };
 use pi::model::{ContentBlock, Message, UserContent, UserMessage};
 use pi::provider::{Context, Provider, StreamOptions};
@@ -64,23 +64,14 @@ fn summary_with_two_frames() -> Message {
         content: UserContent::Text(summary_text),
         timestamp: 42,
     });
+    // Real rendered frames: attachment validates PNG integrity and geometry,
+    // so placeholder bytes would leave the summary text-only.
     let payload = SnapPayload::new(vec![
-        SnapFrame {
-            png: "QUFB".to_string(),
-            width: FRAME_W,
-            height: FRAME_H,
-        },
-        SnapFrame {
-            png: "QkJC".to_string(),
-            width: FRAME_W,
-            height: FRAME_H,
-        },
+        render_frames("[User]: first frame").remove(0),
+        render_frames("[User]: second frame").remove(0),
     ]);
     attach_frames(base, Some(&payload))
 }
-
-const FRAME_W: u32 = 10;
-const FRAME_H: u32 = 10;
 
 fn image_block_count(messages: &[Message]) -> usize {
     messages

@@ -188,17 +188,17 @@ fn base_summary_message() -> Message {
     })
 }
 
-fn frame_stub(data: &str) -> SnapFrame {
-    SnapFrame {
-        png: data.to_string(),
-        width: 10,
-        height: 10,
-    }
+/// A frame from the production renderer. Attachment validates each frame's
+/// PNG integrity and geometry, so placeholder bytes are rejected.
+fn rendered_frame(text: &str) -> SnapFrame {
+    render_frames(text).remove(0)
 }
 
 #[test]
 fn attach_frames_places_images_after_text_block() {
-    let payload = SnapPayload::new(vec![frame_stub("QUFB"), frame_stub("QkJC")]);
+    let first = rendered_frame("[User]: first frame");
+    let expected = first.png.clone();
+    let payload = SnapPayload::new(vec![first, rendered_frame("[User]: second frame")]);
     let attached = attach_frames(base_summary_message(), Some(&payload));
 
     let Message::User(user) = attached else {
@@ -211,7 +211,7 @@ fn attach_frames_places_images_after_text_block() {
     assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text.contains("<summary>")));
     assert!(
         matches!(&blocks[1], ContentBlock::Image(ImageContent { data, mime_type })
-        if data == "QUFB" && mime_type == "image/png")
+        if *data == expected && mime_type == "image/png")
     );
     assert_eq!(user.timestamp, 7, "timestamp preserved from source entry");
 

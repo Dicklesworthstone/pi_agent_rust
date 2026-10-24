@@ -22,6 +22,8 @@ const PROVIDER_SUPPORT_MODULES: &[&str] = &[
     "model_fetch",
     "azure_terminal_safety_tests",
     "openai_terminal_safety_tests",
+    "openai_deepseek",
+    "openai_deepseek_tests",
 ];
 const REQUIRED_ARTIFACT_INVENTORY_AREAS: &[&str] = &[
     "provider_streaming",

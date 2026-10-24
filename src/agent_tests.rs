@@ -4581,7 +4581,7 @@ mod tests {
                     pi.registerProvider("open-router", {
                         api: "openai-completions",
                         baseUrl: "https://newly-registered.example.test/v1",
-                        apiKey: "newly-registered-key",
+                        apiKey: "new-provider-key",
                         models: [{ id: "shared", name: "Shared", contextWindow: 64000, maxTokens: 4096 }]
                     });
                     pi.on("session_start", async (_event, ctx) => {
@@ -4621,7 +4621,7 @@ mod tests {
             assert_eq!(agent_session.agent.provider().name(), "open-router");
             assert_eq!(
                 agent_session.agent.stream_options().api_key.as_deref(),
-                Some("newly-registered-key")
+                Some("new-provider-key")
             );
             assert_eq!(
                 agent_session

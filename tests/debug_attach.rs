@@ -63,14 +63,46 @@ fn reply(stream: &mut TcpStream, sequence: &mut u64, request: &Value, body: Valu
     );
 }
 
+/// How long the peer waits for each request before declaring the client stuck.
+const REQUEST_PATIENCE: Duration = Duration::from_secs(30);
+
+// A read timeout only means "nothing yet". Retry it until one deadline for the
+// whole request, so a slow client is not mistaken for a broken one.
+fn read_patiently(
+    reader: &mut BufReader<TcpStream>,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> usize {
+    loop {
+        match reader.read(buffer) {
+            Ok(read) => return read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "DAP client sent no complete request within {REQUEST_PATIENCE:?}"
+                );
+            }
+            Err(error) => panic!("DAP peer read: {error}"),
+        }
+    }
+}
+
 // A small independent peer parser. Do not import Pi's crate-private decoder
 // or discard its over-read scratch between requests. BufReader retains any
 // buffered bytes beyond this exact header/body for the following request.
 fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Value> {
+    let deadline = Instant::now() + REQUEST_PATIENCE;
     let mut header = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
-        if reader.read(&mut byte).unwrap() == 0 {
+        if read_patiently(reader, &mut byte, deadline) == 0 {
             assert!(header.is_empty(), "EOF during DAP header");
             return None;
         }
@@ -89,7 +121,12 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Value> {
         .unwrap();
     assert!(length > 0 && length <= 2 * 1024 * 1024);
     let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes).unwrap();
+    let mut filled = 0;
+    while filled < length {
+        let read = read_patiently(reader, &mut bytes[filled..], deadline);
+        assert!(read > 0, "EOF during DAP body");
+        filled += read;
+    }
     Some(serde_json::from_slice(&bytes).unwrap())
 }
 
@@ -113,7 +150,7 @@ fn peer(reject_attach: bool) -> (u16, std::thread::JoinHandle<Vec<Value>>) {
             }
         };
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
