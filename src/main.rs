@@ -401,7 +401,8 @@ fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<(cli::Cli, Vec<cli::Ex
                 err.kind(),
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) {
-                err.print()?;
+                // `pi --help | head` closes the pipe on purpose (GH #264).
+                err.print().inspect_err(exit_if_stdout_closed)?;
                 return Ok(None);
             }
             Err(anyhow::Error::new(err))
@@ -798,7 +799,7 @@ fn main_impl() -> Result<()> {
     }
 
     if cli.version {
-        print_version();
+        print_version()?;
         return Ok(());
     }
 
@@ -8171,14 +8172,16 @@ fn handle_doctor(
 /// provenance reads the environment variable, not this line.
 const VERSION_SHA_WIDTH: usize = 9;
 
-fn print_version() {
+fn print_version() -> io::Result<()> {
     let sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
-    println!(
+    writeln!(
+        io::stdout(),
         "pi {} ({} {})",
         env!("CARGO_PKG_VERSION"),
         &sha[..sha.len().min(VERSION_SHA_WIDTH)],
         option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or(""),
-    );
+    )
+    .inspect_err(exit_if_stdout_closed)
 }
 
 fn list_models(registry: &ModelRegistry, pattern: Option<&str>) {

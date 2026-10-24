@@ -1866,6 +1866,38 @@ fn e2e_cli_print_json_ends_quietly_when_its_reader_closes_the_pipe() {
     );
 }
 
+/// GH #264: `pi --help | head -3` printed "Broken pipe (os error 32)" and
+/// exited 1, so `set -o pipefail` scripts that grep the help text failed.
+/// The read end is closed before pi starts, so every write is EPIPE; a reader
+/// that leaves mid-output would only race the pipe buffer.
+#[test]
+fn e2e_cli_help_and_version_end_quietly_when_the_reader_closed_the_pipe() {
+    let harness = CliTestHarness::new("e2e_cli_help_and_version_end_quietly_into_a_closed_pipe");
+    for flag in ["--help", "--version"] {
+        let (reader, writer) = std::io::pipe().expect("create stdout pipe");
+        drop(reader);
+        let output = Command::new(&harness.binary_path)
+            .arg(flag)
+            .envs(harness.env.clone())
+            .current_dir(harness.harness.temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run pi into a closed pipe");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "pi {flag} into a closed pipe exited {:?}; stderr: {stderr}",
+            output.status
+        );
+        assert!(
+            !stderr.contains("Broken pipe"),
+            "pi {flag} reported the closed pipe as an error: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn e2e_cli_fetch_models_does_not_wait_for_stdin_eof() {
     let harness = CliTestHarness::new("e2e_cli_fetch_models_does_not_wait_for_stdin_eof");
