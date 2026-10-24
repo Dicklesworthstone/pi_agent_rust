@@ -642,6 +642,15 @@ assert_is_empty = "allow"
 # the wrong trade; a sibling project on the same build fleet allows it too.
 suboptimal_flops = "allow"
 
+[patch.crates-io]
+# rquickjs-sys 0.12.2 with one quickjs-ng fix: JS_FreeContext freed every
+# module definition while the reactions of an unsettled top-level-await
+# evaluation still referenced it, so a timed-out `await import()` corrupted
+# the heap (malloc abort) when its realm was retired. The two hunks are marked
+# "pi_agent_rust patch" in vendor/rquickjs-sys/quickjs/quickjs.c; the vendored
+# copy keeps only the files its build script compiles.
+rquickjs-sys = { path = "vendor/rquickjs-sys" }
+
 # ---------------------------------------------------------------------------
 # Local development with sibling crates
 # ---------------------------------------------------------------------------
@@ -649,16 +658,16 @@ suboptimal_flops = "allow"
 # rich_rust, charmed-*, and fsqlite. CI builds verify this (no sibling
 # repos are checked out).
 #
-# To develop against LOCAL checkouts of these crates, uncomment the
-# [patch.crates-io] section below. Cargo will use the local paths when they
-# satisfy the version requirement and fall back to crates.io otherwise.
+# To develop against LOCAL checkouts of these crates, uncomment the entries
+# below; they extend the [patch.crates-io] table above. Cargo will use the
+# local paths when they satisfy the version requirement and fall back to
+# crates.io otherwise.
 #
-# IMPORTANT: Do NOT commit this section. To prevent accidental commits:
+# IMPORTANT: Do NOT commit these entries. To prevent accidental commits:
 #   git update-index --skip-worktree Cargo.toml
 # To re-enable tracking:
 #   git update-index --no-skip-worktree Cargo.toml
 #
-# [patch.crates-io]
 # asupersync = { path = "../asupersync" }
 # rich_rust = { path = "../rich_rust" }
 # charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
