@@ -34,7 +34,7 @@ pub struct CompletionRequest {
 
 /// Screened provider input and its original compiled output contract. This
 /// contains only owned data; the launching invocation's callback is not kept.
-pub(crate) struct PreparedCompletion {
+pub struct PreparedCompletion {
     prompt: String,
     system: String,
     max_tokens: Option<u32>,
@@ -43,6 +43,7 @@ pub(crate) struct PreparedCompletion {
 }
 
 impl CompletionRequest {
+    #[allow(clippy::needless_pass_by_value)] // Public API; owned input is its contract.
     pub fn parse(input: Value) -> Result<Self> {
         let fields = input.as_object().ok_or_else(invalid)?;
         if fields
@@ -136,22 +137,19 @@ impl Judge {
         protect: Option<&Protect<'_>>,
     ) -> Result<PreparedCompletion> {
         self.check_image_support(!request.images.is_empty())?;
-        let (system, prompt) = match &request.schema {
-            Some(schema) => {
-                // Screen prompt and schema together: annotations and example
-                // values can contain secrets too. Never validate against a
-                // redacted/weakened contract or send the unscreened original.
-                let envelope = schema.envelope(&request.prompt)?;
-                let [system, envelope] = self.screen(&request.system, &envelope, protect)?;
-                let prompt = schema.screened_prompt(&envelope)?;
-                validate_text(&prompt, &system)?;
-                (schema::json_system(system), envelope)
-            }
-            None => {
-                let [system, prompt] = self.screen(&request.system, &request.prompt, protect)?;
-                validate_text(&prompt, &system)?;
-                (system, prompt)
-            }
+        let (system, prompt) = if let Some(schema) = &request.schema {
+            // Screen prompt and schema together: annotations and example
+            // values can contain secrets too. Never validate against a
+            // redacted/weakened contract or send the unscreened original.
+            let envelope = schema.envelope(&request.prompt)?;
+            let [system, envelope] = self.screen(&request.system, &envelope, protect)?;
+            let prompt = schema.screened_prompt(&envelope)?;
+            validate_text(&prompt, &system)?;
+            (schema::json_system(system), envelope)
+        } else {
+            let [system, prompt] = self.screen(&request.system, &request.prompt, protect)?;
+            validate_text(&prompt, &system)?;
+            (system, prompt)
         };
         Ok(PreparedCompletion {
             prompt,
@@ -189,7 +187,12 @@ impl Judge {
             .as_ref()
             .map(|schema| schema.answer(&text))
             .transpose()?;
-        let mut reply = self.reply("pi.completion.v1", "text", Value::String(text), usage);
+        let mut reply = self.reply(
+            "pi.completion.v1",
+            "text",
+            Value::String(text),
+            usage.as_ref(),
+        );
         if image_count > 0 {
             reply["imageCount"] = Value::from(image_count);
         }

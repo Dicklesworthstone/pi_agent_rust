@@ -114,7 +114,7 @@ impl Sources {
         Ok(sources)
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub(super) const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
@@ -125,7 +125,7 @@ impl Sources {
             .count()
     }
 
-    pub(super) fn inline_bytes(&self) -> usize {
+    pub(super) const fn inline_bytes(&self) -> usize {
         self.inline_bytes
     }
 }

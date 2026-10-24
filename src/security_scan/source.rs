@@ -69,7 +69,7 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     let mut reader = file.take(limit + 1);
-    let mut chunk = [0_u8; 64 * 1024];
+    let mut chunk = vec![0_u8; 64 * 1024];
     loop {
         operation::checkpoint()?;
         let count = reader
@@ -679,9 +679,11 @@ pub fn load_dispositions(project_root: &Path) -> Result<BTreeMap<String, Disposi
     storage::Storage::open(project_root)?.load()
 }
 
-/// Atomically replace a complete validated snapshot. For concurrent individual
-/// decisions use the tool's `disposition` operation, which holds a lock across
-/// read/merge/publication. This SDK snapshot API is intentionally replacement.
+/// Atomically replace a complete validated snapshot.
+///
+/// For concurrent individual decisions use the tool's `disposition` operation,
+/// which holds a lock across read/merge/publication. This SDK snapshot API is
+/// intentionally replacement.
 pub fn save_dispositions(
     project_root: &Path,
     dispositions: &BTreeMap<String, Disposition>,

@@ -74,7 +74,7 @@ pub(super) struct CellSession {
 }
 
 impl CellSession {
-    pub(super) fn new(scope: JobSessionScope, expected: String) -> Self {
+    pub(super) const fn new(scope: JobSessionScope, expected: String) -> Self {
         Self {
             expected,
             scope,
@@ -106,10 +106,7 @@ impl CellSession {
         if let Some(failure) = failure {
             let _ = stop.get_or_insert(failure);
         }
-        match *stop {
-            Some(stop) => Err(stop),
-            None => Ok(()),
-        }
+        stop.map_or(Ok(()), Err)
     }
 
     pub(super) async fn check_tool(&self) -> Result<()> {
@@ -236,10 +233,12 @@ impl EvalTool {
                 &mut *python,
                 incoming.as_mut().and_then(|entry| entry.python.take()),
             );
+            drop(python);
             let previous_javascript = std::mem::replace(
                 &mut *javascript,
                 incoming.as_mut().and_then(|entry| entry.javascript.take()),
             );
+            drop(javascript);
             let previous = retained.active.replace(session_id.to_string());
             // All production runners activate before spawning. Keep an orphan
             // pair separate so even an unowned slot is cleaned up outside locks.

@@ -48,6 +48,7 @@ fn node(id: &str, needs: &[&str]) -> Value {
     json!({"id":id,"needs":needs,"call":{"agent":"worker","task":id}})
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn request(nodes: Vec<Value>) -> Value {
     json!({"async":true,"workflow":nodes,"concurrency":2})
 }

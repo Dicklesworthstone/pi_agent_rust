@@ -30,7 +30,7 @@ const PREFIX: &str = "PI_CONNECT_ERROR[";
 /// Only a validated wire code can construct a diagnostic. Keep the spelling
 /// from the protocol's closed vocabulary; unknown values fail at the adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ConnectCode(&'static str);
+pub struct ConnectCode(&'static str);
 
 impl ConnectCode {
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -70,6 +70,7 @@ fn strip_ascii_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 /// its body must not fall through to transient substring or HTTP guessing.
 /// Only a leading marker after known Error display wrappers counts. A marker
 /// quoted in an HTTP body, request id or model output cannot replace its code.
+#[allow(clippy::option_option)] // outer: is a Connect diagnostic; inner: its recovery class
 pub(super) fn connect_recovery(error_text: &str) -> Option<Option<FailoverClass>> {
     let mut text = error_text.trim_start();
     // Display wrapping is bounded. No search for a marker buried in payload
@@ -101,13 +102,11 @@ pub(super) fn connect_recovery(error_text: &str) -> Option<Option<FailoverClass>
                 return None;
             }
             text = message.trim_start();
-        } else if let Some(rest) = ["API error:", "IO error:", "SSE error:", "Error:"]
-            .iter()
-            .find_map(|prefix| strip_ascii_prefix(text, prefix))
-        {
-            text = rest.trim_start();
         } else {
-            return None;
+            let rest = ["API error:", "IO error:", "SSE error:", "Error:"]
+                .iter()
+                .find_map(|prefix| strip_ascii_prefix(text, prefix))?;
+            text = rest.trim_start();
         }
     }
     None

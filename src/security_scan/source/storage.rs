@@ -344,10 +344,9 @@ impl Storage {
     }
 
     pub(super) fn load(&self) -> Result<BTreeMap<String, Disposition>> {
-        match self.0.read(DISPOSITIONS, STORE_LIMIT)? {
-            Some(bytes) => decode_store(&bytes),
-            None => Ok(BTreeMap::new()),
-        }
+        self.0
+            .read(DISPOSITIONS, STORE_LIMIT)?
+            .map_or_else(|| Ok(BTreeMap::new()), |bytes| decode_store(&bytes))
     }
 
     pub(super) fn save(&self, store: &BTreeMap<String, Disposition>) -> Result<()> {

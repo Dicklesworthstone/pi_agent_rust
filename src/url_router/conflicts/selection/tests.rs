@@ -18,9 +18,9 @@ fn selection_shapes_and_budgets_are_explicit_before_worktree_access() {
         resolution: ConflictResolution::Text("  雪\n".into()),
     };
     let value = serde_json::to_value(&valid).unwrap();
-    let decoded: ConflictChoice = serde_json::from_value(value.clone()).unwrap();
+    let decoded: ConflictChoice = serde_json::from_value(value).unwrap();
     assert!(matches!(decoded.resolution, ConflictResolution::Text(ref text) if text == "  雪\n"));
-    assert!(validate(&[valid.clone()]).is_ok());
+    assert!(validate(std::slice::from_ref(&valid)).is_ok());
     for value in [
         json!({"index":0,"token":"a","resolution":null}),
         json!({"index":0,"token":"a","resolution":{"kind":"shell","value":"ignored"}}),

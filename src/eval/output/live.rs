@@ -27,11 +27,11 @@ pub(super) struct LiveDisplays {
 }
 
 impl LiveDisplays {
-    pub(super) fn is_empty(&self) -> bool {
+    pub(super) const fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(super) const fn len(&self) -> usize {
         self.frames.len()
     }
 

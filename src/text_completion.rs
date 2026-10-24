@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn auxiliary_projection_patterns_cover_primitives_without_erasing_clean_types() {
         let source = serde_json::json!({
-            "number": 731942, "boolean": true, "missing": null,
+            "number": 731_942, "boolean": true, "missing": null,
             "echo": "true", "embedded": "prefix731942suffix",
             "clean": [42, 1.25, false, "ordinary"]
         });
@@ -605,6 +605,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::trivial_regex)] // `obfuscate` takes compiled patterns
     fn auxiliary_block_policy_still_refuses_detected_and_remembered_primitives() {
         let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
             mode: Some("block".to_string()),
@@ -612,7 +613,7 @@ mod tests {
         }));
         for source in [
             serde_json::json!({"api_key": 1_234_567_890_123_456_u64}),
-            serde_json::json!(731942),
+            serde_json::json!(731_942),
             serde_json::json!(true),
             serde_json::json!(null),
         ] {
@@ -628,7 +629,7 @@ mod tests {
             &mut vault,
             &[regex::Regex::new(r"^900123$").unwrap()],
         );
-        let error = redact_json_with_vault(&serde_json::json!(900123), &privacy, &mut vault)
+        let error = redact_json_with_vault(&serde_json::json!(900_123), &privacy, &mut vault)
             .expect_err("remembered values remain blocked without a matching current pattern");
         assert!(error.to_string().contains("PI_SECRET_BLOCK"));
         assert!(!error.to_string().contains(number));

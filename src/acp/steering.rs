@@ -300,6 +300,7 @@ impl Mailbox {
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn input(prompt: Value, queue: &str) -> Input {
         Input::parse(
             &json!({

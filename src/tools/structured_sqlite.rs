@@ -43,7 +43,7 @@ pub(super) struct QueryRequest {
 }
 
 impl QueryRequest {
-    pub(super) fn plain(source_path: String) -> Self {
+    pub(super) const fn plain(source_path: String) -> Self {
         Self {
             source_path,
             table: None,
@@ -57,7 +57,7 @@ impl QueryRequest {
         }
     }
 
-    pub(super) fn has_selectors(&self) -> bool {
+    pub(super) const fn has_selectors(&self) -> bool {
         self.table.is_some() || self.query.is_some() || self.paged
     }
 
@@ -195,7 +195,7 @@ pub(super) fn parse_path(path: &str) -> Result<Option<QueryRequest>> {
                     request.row_offset = value
                         .parse::<u64>()
                         .ok()
-                        .filter(|offset| *offset <= i64::MAX as u64)
+                        .filter(|offset| i64::try_from(*offset).is_ok())
                         .ok_or_else(|| {
                             invalid("row offset must be a non-negative SQLite integer")
                         })?;
@@ -218,8 +218,10 @@ fn decode_component(input: &str) -> Result<String> {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
             let high = (bytes[index + 1] as char).to_digit(16);
             let low = (bytes[index + 2] as char).to_digit(16);
-            if let (Some(high), Some(low)) = (high, low) {
-                output.push((high * 16 + low) as u8);
+            if let (Some(high), Some(low)) = (high, low)
+                && let Ok(byte) = u8::try_from(high * 16 + low)
+            {
+                output.push(byte);
                 index += 3;
                 continue;
             }
@@ -400,15 +402,15 @@ fn open_sidecar(path: &Path, suffix: &str, roots: &[PathBuf]) -> Result<Option<F
 fn ensure_same_source(source: &SourceFile, roots: &[PathBuf]) -> Result<()> {
     let current = super::open_regular_file_within_roots_with(&source.path, roots, || {})
         .map_err(|error| invalid(format!("SQLite source changed while being read: {error}")))?;
-    let original_meta = source.file.metadata().map_err(|error| invalid(error))?;
-    let current_meta = current.metadata().map_err(|error| invalid(error))?;
+    let original_meta = source.file.metadata().map_err(invalid)?;
+    let current_meta = current.metadata().map_err(invalid)?;
     if !super::opened_file_matches_metadata_snapshot(&original_meta, &current_meta) {
         return Err(invalid(
             "SQLite source was replaced while being read; retry",
         ));
     }
-    let current_bytes = super::read_open_file_capped_at(&current, MAX_SNAPSHOT_BYTES as u64)
-        .map_err(|error| invalid(error))?;
+    let current_bytes =
+        super::read_open_file_capped_at(&current, MAX_SNAPSHOT_BYTES as u64).map_err(invalid)?;
     if Sha256::digest(&current_bytes) != Sha256::digest(&source.bytes) {
         return Err(invalid(
             "SQLite source changed while being read; retry after the writer settles",
@@ -478,7 +480,7 @@ fn snapshot(file: File, path: &Path, roots: &[PathBuf]) -> Result<(Vec<u8>, usiz
     )
 }
 
-fn be32(bytes: &[u8], offset: usize) -> u32 {
+const fn be32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([
         bytes[offset],
         bytes[offset + 1],
@@ -488,7 +490,7 @@ fn be32(bytes: &[u8], offset: usize) -> u32 {
 }
 
 fn checksum(bytes: &[u8], little_endian: bool, mut state: [u32; 2]) -> [u32; 2] {
-    for pair in bytes.chunks_exact(8) {
+    for pair in bytes.as_chunks::<8>().0 {
         let word = |offset| {
             let value = [
                 pair[offset],
@@ -522,7 +524,7 @@ fn apply_wal(mut image: Vec<u8>, wal: &[u8]) -> Result<(Vec<u8>, usize)> {
     };
     if !(512..=65536).contains(&page_size)
         || !page_size.is_power_of_two()
-        || image.len() % page_size != 0
+        || !image.len().is_multiple_of(page_size)
     {
         return Err(invalid("invalid SQLite page size or partial database page"));
     }
@@ -582,7 +584,8 @@ fn apply_wal(mut image: Vec<u8>, wal: &[u8]) -> Result<(Vec<u8>, usize)> {
     }
     // Commit frames carry the authoritative size even when page 1 was not
     // rewritten. The imported image no longer has a WAL companion.
-    image[28..32].copy_from_slice(&(committed_pages as u32).to_be_bytes());
+    let size_in_pages = u32::try_from(committed_pages).map_err(invalid)?;
+    image[28..32].copy_from_slice(&size_in_pages.to_be_bytes());
     let counter = image[24..28].to_vec();
     image[92..96].copy_from_slice(&counter);
     Ok((image, committed_frames))
@@ -604,7 +607,7 @@ pub(super) async fn execute(
     };
     let bytes = super::structured_json::run_worker(
         super::structured_json::WorkerKind::Sqlite,
-        serde_json::to_vec(&wire).map_err(|error| invalid(error))?,
+        serde_json::to_vec(&wire).map_err(invalid)?,
     )
     .await?;
     let response: WorkerResponse = serde_json::from_slice(&bytes)
@@ -629,15 +632,15 @@ pub(super) fn run_sqlite_worker() -> i32 {
             .lock()
             .take(150 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| invalid(error))?;
+            .map_err(invalid)?;
         if bytes.len() > 150 * 1024 * 1024 {
             return Err(invalid("SQLite worker input exceeds 150 MiB"));
         }
-        let wire: WorkerRequest = serde_json::from_slice(&bytes).map_err(|error| invalid(error))?;
+        let wire: WorkerRequest = serde_json::from_slice(&bytes).map_err(invalid)?;
         drop(bytes);
         let image = base64::engine::general_purpose::STANDARD
             .decode(&wire.image)
-            .map_err(|error| invalid(error))?;
+            .map_err(invalid)?;
         let WorkerRequest {
             request,
             image: encoded_image,
@@ -697,7 +700,7 @@ fn integer_cell(row: &Row, index: usize) -> Result<i64> {
     }
 }
 
-fn sql_error(error: FrankenError) -> Error {
+fn sql_error(error: &FrankenError) -> Error {
     invalid(format!("query failed: {error}"))
 }
 
@@ -743,21 +746,22 @@ fn render_cell(value: &SqliteValue, truncated: &mut bool) -> String {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    if end != text.len() {
+    if end == text.len() {
+        text
+    } else {
         *truncated = true;
         format!("{}… [cell truncated]", &text[..end])
-    } else {
-        text
     }
 }
 
+#[allow(clippy::future_not_send)] // fsqlite::Connection is Rc-based; driven by block_on
 async fn bounded_rows(
     conn: &Connection,
     sql: &str,
     params: &[SqliteValue],
     limit: usize,
 ) -> Result<QueryRows> {
-    let statement = conn.prepare(sql).await.map_err(sql_error)?;
+    let statement = conn.prepare(sql).await.map_err(|error| sql_error(&error))?;
     let columns = statement.column_names();
     if columns.len() > MAX_COLUMNS {
         return Err(invalid(
@@ -801,10 +805,10 @@ async fn bounded_rows(
             Ok(())
         })
         .await;
-    if let Err(error) = execution {
-        if !stopped || !matches!(error, FrankenError::Abort) {
-            return Err(sql_error(error));
-        }
+    if let Err(error) = execution
+        && (!stopped || !matches!(error, FrankenError::Abort))
+    {
+        return Err(sql_error(&error));
     }
     Ok(result)
 }
@@ -910,16 +914,22 @@ fn next_query(sql: &str, limit: usize, offset: u64) -> Option<String> {
     Some(next)
 }
 
+// One linear pass over the three read shapes (q, listing, table). The fsqlite
+// Connection is Rc-based and its futures are large; the worker drives this
+// with block_on on a dedicated 16 MiB thread.
+#[allow(clippy::too_many_lines, clippy::future_not_send, clippy::large_futures)]
 async fn query_image(
     image: &[u8],
     request: &QueryRequest,
     wal_frames: usize,
 ) -> Result<QueryOutcome> {
     request.validate()?;
-    let conn = Connection::import_bytes(image).await.map_err(sql_error)?;
+    let conn = Connection::import_bytes(image)
+        .await
+        .map_err(|error| sql_error(&error))?;
     conn.execute("PRAGMA query_only = ON")
         .await
-        .map_err(sql_error)?;
+        .map_err(|error| sql_error(&error))?;
     let mut metadata = serde_json::json!({
         "contentType": "sqlite",
         "extractor": "sqlite",
@@ -943,8 +953,8 @@ async fn query_image(
             &conn,
             &format!("SELECT * FROM ({query}) AS pi_read_query LIMIT ?1 OFFSET ?2"),
             &[
-                SqliteValue::Integer((limit + 1) as i64),
-                SqliteValue::Integer(request.row_offset as i64),
+                SqliteValue::Integer(i64::try_from(limit + 1).unwrap_or(i64::MAX)),
+                SqliteValue::Integer(request.row_offset.cast_signed()),
             ],
             limit,
         )
@@ -954,7 +964,7 @@ async fn query_image(
             let next = request
                 .row_offset
                 .checked_add(result.rows.len() as u64)
-                .filter(|offset| *offset <= i64::MAX as u64)
+                .filter(|offset| i64::try_from(*offset).is_ok())
                 .ok_or_else(|| invalid("next row offset exceeds the SQLite integer range"))?;
             // An unpaged query keeps its historical 1000-row ceiling. Its
             // continuation switches to an explicitly bounded page of <=500.
@@ -976,7 +986,7 @@ async fn query_image(
         return query_output(content, metadata);
     }
     let Some(table) = &request.table else {
-        let schema = conn.query("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 501").await.map_err(sql_error)?;
+        let schema = conn.query("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 501").await.map_err(|error| sql_error(&error))?;
         let mut names_truncated = false;
         let mut content =
             String::from("# SQLite tables and views\n\n| Name | Type |\n| --- | --- |\n");
@@ -1004,7 +1014,7 @@ async fn query_image(
         metadata["namesTruncated"] = serde_json::json!(names_truncated);
         return query_output(content, metadata);
     };
-    let table_schema = conn.query_with_params("SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 COLLATE NOCASE LIMIT 2", &[SqliteValue::Text(table.clone().into())]).await.map_err(sql_error)?;
+    let table_schema = conn.query_with_params("SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1 COLLATE NOCASE LIMIT 2", &[SqliteValue::Text(table.clone().into())]).await.map_err(|error| sql_error(&error))?;
     let row = table_schema
         .first()
         .ok_or_else(|| invalid(format!("table or view {table:?} does not exist")))?;
@@ -1016,7 +1026,7 @@ async fn query_image(
     let columns = conn
         .query(&format!("PRAGMA table_info({quoted})"))
         .await
-        .map_err(sql_error)?;
+        .map_err(|error| sql_error(&error))?;
     if columns.len() > MAX_COLUMNS {
         return Err(invalid(
             "table has more than 256 columns; use q to select fewer columns",
@@ -1110,8 +1120,8 @@ async fn query_image(
         (
             sql,
             vec![
-                SqliteValue::Integer((limit + 1) as i64),
-                SqliteValue::Integer(request.row_offset as i64),
+                SqliteValue::Integer(i64::try_from(limit + 1).unwrap_or(i64::MAX)),
+                SqliteValue::Integer(request.row_offset.cast_signed()),
             ],
             limit,
         )
@@ -1154,6 +1164,9 @@ mod tests {
             .unwrap()
     }
 
+    // fsqlite::Connection is Rc-based and its futures are large; tests drive
+    // it with block_on on a dedicated 16 MiB engine thread.
+    #[allow(clippy::future_not_send, clippy::large_futures)]
     async fn image_fixture() -> Vec<u8> {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute_batch(
@@ -1285,6 +1298,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn worker_revalidates_page_bounds_and_shape_before_importing_the_image() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1309,7 +1323,7 @@ mod tests {
                         "must reject before importing invalid image bytes"
                     );
                 }
-            })
+            });
         });
     }
 
@@ -1338,6 +1352,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn native_query_pages_traverse_the_result_once_and_stop_at_exact_boundary() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1378,11 +1393,12 @@ mod tests {
                 assert_eq!(page.metadata["rowCount"], 3);
                 assert_eq!(page.metadata["hasMoreRows"], false);
                 assert!(page.metadata.get("nextQuery").is_none());
-            })
+            });
         });
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn native_query_paging_preserves_inner_limits_ctes_values_and_aggregates() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1433,11 +1449,12 @@ mod tests {
                     assert_eq!(page.metadata["rowCount"], 1, "{sql}");
                     assert_eq!(page.metadata["hasMoreRows"], more, "{sql}");
                 }
-            })
+            });
         });
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn native_empty_and_beyond_end_pages_have_no_continuation() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1456,11 +1473,12 @@ mod tests {
                     assert!(page.metadata.get("nextRowOffset").is_none());
                     assert!(page.metadata.get("nextQuery").is_none());
                 }
-            })
+            });
         });
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn native_long_query_uses_numeric_continuation_without_an_unparseable_selector() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1479,11 +1497,12 @@ mod tests {
                     page.content
                         .contains("Keep q unchanged and set limit=1&offset=1")
                 );
-            })
+            });
         });
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn native_database_browsing_queries_and_full_width_integer_keys() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1557,11 +1576,12 @@ mod tests {
                 let conn = Connection::import_bytes(&image).await.unwrap();
                 let rows = conn.query("SELECT count(*) FROM users").await.unwrap();
                 assert_eq!(integer_cell(&rows[0], 0).unwrap(), 3);
-            })
+            });
         });
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn native_result_capture_limits_rows_and_marks_oversized_cells() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1594,11 +1614,12 @@ mod tests {
                 .unwrap();
                 assert!(result.cells_truncated);
                 assert!(render_rows(&result).unwrap().contains("cell truncated"));
-            })
+            });
         });
     }
 
     #[test]
+    #[allow(clippy::large_futures)] // fsqlite futures; runs on a 16 MiB engine stack
     fn database_metadata_cannot_expand_past_display_bounds() {
         on_engine_thread(|| {
             futures::executor::block_on(async {
@@ -1622,7 +1643,7 @@ mod tests {
                 assert_eq!(output.metadata["cellsTruncated"], true);
                 assert!(output.content.contains("metadata truncated"));
                 assert!(output.content.len() < 100 * 1024);
-            })
+            });
         });
     }
 
@@ -1639,7 +1660,7 @@ mod tests {
         };
         wal[..4].copy_from_slice(&magic.to_be_bytes());
         wal[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
-        wal[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
+        wal[8..12].copy_from_slice(&u32::try_from(page_size).unwrap().to_be_bytes());
         wal[16..24].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let mut state = checksum(&wal[..24], little_endian, [0, 0]);
         wal[24..28].copy_from_slice(&state[0].to_be_bytes());

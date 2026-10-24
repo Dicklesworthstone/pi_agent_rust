@@ -585,6 +585,7 @@ Return ONLY one JSON object with exactly this shape:
 Use P0 for an unconditional critical security/data-loss defect, P1 for a serious bug, P2 for a smaller concrete defect, P3 for a low-impact issue. Confidence must be a number between 0 and 1. Categories are correctness, security, performance, or contract. suggestion is optional. Cite NEW-side line numbers within a supplied hunk; for a deletion with no new lines use its new-side anchor, at least 1. Do not add file names, IDs, a verdict, prose, or extra JSON keys. Return at most 32 findings. An honestly clean review is {"findings":[]}."#;
 
 /// A tool-free reviewer bound to the chosen provider, credentials, and privacy policy.
+///
 /// Requests use isolated contexts and fresh session IDs; they cannot mutate the
 /// parent transcript, execute tools, or fall back to a heuristic success.
 pub struct ModelReviewer {
@@ -1005,7 +1006,7 @@ fn run_review_git(command: &mut Command, allow_difference_status: bool) -> Resul
         ));
     }
     let status = child.wait()?;
-    if !status.success() && !(allow_difference_status && status.code() == Some(1)) {
+    if !(status.success() || (allow_difference_status && status.code() == Some(1))) {
         return Err(Error::validation(format!(
             "PI_REVIEW_GIT: git exited with {status}; check the review target and repository"
         )));
@@ -1279,8 +1280,10 @@ mod model_review_tests {
             assert_eq!(report.stats.files_analyzed, 5); // ubs:ignore[rust.panic.assert-macros] -- Coverage counts all five completed reviewer units.
             assert_eq!(provider.peak.load(Ordering::SeqCst), REVIEW_CONCURRENCY); // ubs:ignore[rust.panic.assert-macros] -- Admission must reach but never exceed the three-request bound.
             assert_eq!(provider.active.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Completion must release every owned provider request.
-            let requests = provider.requests.lock().expect("requests"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Read the mock's synchronized request ledger for isolation checks.
-            let identities: std::collections::HashSet<_> = requests
+            let identities: std::collections::HashSet<_> = provider
+                .requests
+                .lock()
+                .expect("requests") // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Read the mock's synchronized request ledger for isolation checks.
                 .iter()
                 .map(|(_, options)| {
                     assert_eq!(options.api_key.as_deref(), Some("review-fixture-key")); // ubs:ignore[rust.panic.assert-macros] -- Provider authentication must survive request isolation.
@@ -1566,6 +1569,7 @@ impl CodeReviewer {
         Ok((target, hunks))
     }
 
+    #[allow(clippy::too_many_lines)] // one dispatch over hosted, git-range, and worktree targets
     fn acquire_diff_with_coverage(
         cwd: &Path,
         target: Option<&str>,

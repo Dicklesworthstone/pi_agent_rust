@@ -6,6 +6,7 @@
 //! continues under the same request deadline and parent model snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use serde::Serialize;
@@ -269,6 +270,7 @@ impl Plan {
     /// Every graph edge, task shape and workspace option is checked before
     /// discovery, snapshot I/O or launch. Forward references are permitted;
     /// cycles, duplicate edges and mixed request modes are not.
+    #[allow(clippy::too_many_lines)] // One validation pass over nodes, edges and modes.
     pub(super) fn parse(input: &Value) -> Result<Option<Self>> {
         let Some(raw) = input.get("workflow") else {
             decision::reject_misplaced(input)?;
@@ -524,10 +526,10 @@ impl Plan {
                     }
                     continue;
                 }
-                let prepared = match &node.fanout {
-                    Some(expansion) => expansion.tasks(node, &records),
-                    None => node.task_with_inputs(&records).map(|task| vec![task]),
-                };
+                let prepared = node.fanout.as_ref().map_or_else(
+                    || node.task_with_inputs(&records).map(|task| vec![task]),
+                    |expansion| expansion.tasks(node, &records),
+                );
                 match prepared {
                     Ok(prepared) => {
                         if node.fanout.is_some() {
@@ -573,7 +575,7 @@ impl Plan {
                 // The node report keeps the authored assignment, not a second
                 // copy of predecessor data. Native hub/revival state retains
                 // the actual child prompt, including its exact input context.
-                result.task = self.nodes[index].call.task.clone();
+                result.task.clone_from(&self.nodes[index].call.task);
                 match item {
                     Some(item) => records[index].settle_fanout(result, item)?,
                     None => records[index].settle(result, wave),
@@ -591,7 +593,7 @@ impl Plan {
                 record.skip(stop_reason.unwrap_or("not_scheduled"), Vec::new());
             }
         }
-        Ok(report(records, waves_run, stop_reason))
+        Ok(report(&records, waves_run, stop_reason))
     }
 }
 
@@ -740,7 +742,7 @@ impl Record {
         // Native acceptance still controls actual worktree disposition.
         self.state = native_state(&result);
         self.wave = Some(wave);
-        self.hub_id = result.hub_id.clone();
+        self.hub_id.clone_from(&result.hub_id);
         self.native_is_error = Some(result.is_error);
         self.result = Some(result);
     }
@@ -792,7 +794,7 @@ fn native_state(result: &SubagentResult) -> State {
     }
 }
 
-fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> ToolOutput {
+fn report(records: &[Record], waves: usize, stop: Option<&'static str>) -> ToolOutput {
     let accepted = records
         .iter()
         .filter(|record| record.state == State::Accepted)
@@ -812,13 +814,14 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
     let mut content = format!(
         "Subagent workflow: {accepted} accepted, {rejected} rejected, {skipped} skipped, {not_selected} not selected. Completed effects are not rolled back; nodes were not automatically replayed."
     );
-    for record in &records {
-        content.push_str(&format!("\n\n# Workflow node {}\n", record.id));
+    for record in records {
+        let _ = write!(content, "\n\n# Workflow node {}\n", record.id);
         // Providers transmit tool text, not arbitrary details. The parent
         // needs the acceptance verdict and real hub handle to inspect/revive
         // a child without guessing identity from its untrusted prose.
-        content.push_str(&format!(
-            "State: {}; wave: {}; hub: {}\n",
+        let _ = writeln!(
+            content,
+            "State: {}; wave: {}; hub: {}",
             record.state.label(),
             record
                 .wave
@@ -827,20 +830,21 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
                 .hub_id
                 .as_ref()
                 .map_or_else(|| "none".into(), |id| json!(id).to_string())
-        ));
+        );
         if let Some(condition) = record.condition {
-            content.push_str(&format!("Condition: {condition}.\n"));
+            let _ = writeln!(content, "Condition: {condition}.");
         }
         if let Some(result) = &record.result {
             content.push_str(&render_results(std::slice::from_ref(result)));
         } else if let Some(run) = &record.fanout {
             run.render(&mut content);
         } else {
-            content.push_str(&format!(
+            let _ = write!(
+                content,
                 "Not run: {}. Blocked by: {}.",
                 record.skip_reason.unwrap_or("not_scheduled"),
                 record.blocked_by.join(", ")
-            ));
+            );
         }
     }
     ToolOutput {

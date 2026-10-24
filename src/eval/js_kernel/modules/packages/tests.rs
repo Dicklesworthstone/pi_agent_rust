@@ -470,7 +470,7 @@ fn missing_metadata_and_lookup_limits_are_versioned_without_resetting_budgets() 
         );
         assert_eq!(files.reload().unwrap() as usize, generation);
         assert!(
-            manifest(&files, &root, &path, generation as u32)
+            manifest(&files, &root, &path, u32::try_from(generation).unwrap())
                 .unwrap()
                 .is_some()
         );

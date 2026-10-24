@@ -14,6 +14,7 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_LIST_ITEMS: usize = 128;
 
+#[allow(clippy::unnecessary_debug_formatting)] // Debug escapes control characters in file names.
 fn invalid(path: &Path, reason: &str) -> Error {
     Error::tool(
         "subagent",
@@ -415,6 +416,7 @@ fn list(field: &Field<'_>, path: &Path) -> Result<Vec<String>> {
     Ok(values)
 }
 
+#[allow(clippy::too_many_lines)] // One ordered pass over every frontmatter key.
 fn parse(raw: &str, path: &Path, source: AgentSource) -> Result<AgentDefinition> {
     let (header, body) = split_header(raw, path)?;
     let lines: Vec<_> = header.lines().collect();

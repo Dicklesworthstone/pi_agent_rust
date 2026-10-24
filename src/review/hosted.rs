@@ -193,6 +193,7 @@ impl Target {
         )
     }
 
+    #[allow(clippy::too_many_lines)] // one isolated CLI environment per supported forge
     fn configure(
         &self,
         command: &mut Command,

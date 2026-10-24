@@ -103,9 +103,9 @@ impl PyKernel {
                     Error::tool(
                         "eval",
                         format!(
-                            "EVAL_PY_MISSING: selected interpreter {:?} disappeared. \
+                            "EVAL_PY_MISSING: selected interpreter {} disappeared. \
                              No fallback after selection; retry explicitly or set PI_EVAL_PYTHON.",
-                            runtime.executable
+                            runtime.executable.display()
                         ),
                     )
                 } else {
@@ -381,7 +381,7 @@ impl EvalTool {
         let cells_run = kernel.cells_run;
         // Reject the entire rich result before making this realm reusable.
         // On malformed output, dropping the owned kernel revokes its worker.
-        let mut output = display::javascript_response(response, restarted, cells_run)?;
+        let mut output = display::javascript_response(&response, restarted, cells_run)?;
         capture.annotate(&mut output);
         session_guard.check_tool().await?;
         capture.publish(true);
@@ -682,6 +682,7 @@ impl Tool for EvalTool {
         "Eval"
     }
 
+    #[allow(clippy::too_many_lines)] // one long model-facing tool description literal
     fn description(&self) -> &str {
         "Run a Python or JavaScript cell in a persistent kernel. Cells execute \
          one at a time within this session and return the final expression. \

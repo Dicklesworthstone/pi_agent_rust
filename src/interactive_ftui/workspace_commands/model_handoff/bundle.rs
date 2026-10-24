@@ -24,7 +24,7 @@ fn word(input: &str) -> (&str, &str) {
     input
         .trim_start()
         .split_once(char::is_whitespace)
-        .unwrap_or((input.trim_start(), ""))
+        .unwrap_or_else(|| (input.trim_start(), ""))
 }
 
 fn invalid() -> Error {
@@ -41,8 +41,7 @@ impl<'a> Options<'a> {
         if verb != "--model" {
             return Err(invalid());
         }
-        let mut export = None;
-        if word(tail).0 == "--export" {
+        let export = if word(tail).0 == "--export" {
             tail = word(tail).1.trim_start();
             let path = if tail.starts_with('"') {
                 let mut values = serde_json::Deserializer::from_str(tail).into_iter::<String>();
@@ -64,8 +63,10 @@ impl<'a> Options<'a> {
             if !path.is_absolute() || path.file_name().is_none() {
                 return Err(invalid());
             }
-            export = Some(path);
-        }
+            Some(path)
+        } else {
+            None
+        };
         let tail = tail.trim();
         let focus = if tail.is_empty() {
             ""
@@ -109,6 +110,7 @@ pub(super) struct Destination {
 }
 
 impl Destination {
+    #[allow(clippy::needless_pass_by_value)] // used as `Option::map(Destination::prepare)`
     pub fn prepare(path: PathBuf) -> Result<Self> {
         let owner = AgentCx::for_current_or_request();
         authorized(&owner)?;
@@ -206,6 +208,7 @@ impl Publication {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers in sibling modules pass an owned screened source
 pub(super) fn document(
     input: &Snapshot,
     screened_source: Value,

@@ -301,6 +301,7 @@ impl Changes {
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn entry(name: &str, ty: &str, value: Value) -> Value {
         json!({"name":name, "value":{"type":ty, "value":value}})
     }

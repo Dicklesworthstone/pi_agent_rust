@@ -577,6 +577,7 @@ impl Connection {
     }
 
     #[allow(clippy::option_if_let_else)]
+    #[allow(clippy::too_many_lines)] // One bounded read/dispatch/write pass per poll.
     fn poll(&mut self, sender: &str, token: &str, owner: &AgentCx, deadline: Instant) -> bool {
         if Instant::now() >= self.deadline.min(deadline) || owner.checkpoint().is_err() {
             return false;
@@ -626,7 +627,7 @@ impl Connection {
                             match serde_json::from_slice::<Incoming>(&self.input[..end]) {
                                 Ok(Incoming::Result(request)) => {
                                     let response = results::dispatch_authenticated(
-                                        sender, token, request, owner,
+                                        sender, token, &request, owner,
                                     );
                                     match response {
                                         Ok(stream) => {

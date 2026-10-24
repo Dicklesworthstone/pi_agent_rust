@@ -109,9 +109,11 @@ pub fn validate_stream_rules(rules: &[StreamRule]) -> Result<()> {
     Ok(())
 }
 
-/// A host-selected source of ambient stream rules. Workspace instructions are
-/// read only after the host grants project trust; the global directory is the
-/// same explicit root used for settings, including PI_CODING_AGENT_DIR.
+/// A host-selected source of ambient stream rules.
+///
+/// Workspace instructions are read only after the host grants project trust;
+/// the global directory is the same explicit root used for settings, including
+/// PI_CODING_AGENT_DIR.
 #[derive(Debug, Clone)]
 pub struct StreamRuleSource {
     project_root: PathBuf,
@@ -1067,8 +1069,11 @@ mod tests {
                 .contains("LIMIT")
         );
         let path = project.join(".pi/stream-rules.json");
-        fs::write(&path, vec![b' '; (MAX_RULE_FILE_BYTES + 1) as usize])
-            .expect("oversized fixture");
+        fs::write(
+            &path,
+            vec![b' '; usize::try_from(MAX_RULE_FILE_BYTES + 1).unwrap()],
+        )
+        .expect("oversized fixture");
         assert!(
             load_rule_file(&path)
                 .expect_err("oversized file")

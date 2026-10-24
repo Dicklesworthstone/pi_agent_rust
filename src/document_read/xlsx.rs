@@ -611,10 +611,9 @@ fn render_rows(rows: &[Row], output: &mut TextOutput) -> Result<()> {
             if cells
                 .peek()
                 .is_some_and(|(cell_column, _)| cell_column == column)
+                && let Some((_, value)) = cells.next()
             {
-                if let Some((_, value)) = cells.next() {
-                    output.content(value, true)?;
-                }
+                output.content(value, true)?;
             }
             output.append(" |")?;
         }
@@ -627,6 +626,7 @@ fn render_rows(rows: &[Row], output: &mut TextOutput) -> Result<()> {
 mod tests {
     use super::super::{DocumentKind, OFFICE_REL_NS, RELATIONSHIPS_NS, SPREADSHEET_NS, convert};
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Write as _;
     use zip::CompressionMethod;
     use zip::write::SimpleFileOptions;
@@ -761,9 +761,14 @@ mod tests {
 
     #[test]
     fn wide_sheets_use_cell_coordinates_without_rectangular_padding() {
-        let cells: String = (1..=65)
-            .map(|column| format!("<c r=\"{}8\"><v>{column}</v></c>", column_name(column)))
-            .collect();
+        let cells = (1..=65).fold(String::new(), |mut cells, column| {
+            let _ = write!(
+                cells,
+                "<c r=\"{}8\"><v>{column}</v></c>",
+                column_name(column)
+            );
+            cells
+        });
         let worksheet = sheet(&format!("<row r=\"8\">{cells}</row>"));
         let result = convert(&workbook_with_sheet(&worksheet, None), DocumentKind::Xlsx)
             .expect("convert wide sheet");
@@ -830,9 +835,13 @@ mod tests {
     #[test]
     fn shared_string_expansion_and_individual_cell_text_are_bounded() {
         let shared = xml("sst", &format!("<si><t>{}</t></si>", "x".repeat(32_000)));
-        let rows: String = (1..=270)
-            .map(|row| format!("<row r=\"{row}\"><c r=\"A{row}\" t=\"s\"><v>0</v></c></row>"))
-            .collect();
+        let rows = (1..=270).fold(String::new(), |mut rows, row| {
+            let _ = write!(
+                rows,
+                "<row r=\"{row}\"><c r=\"A{row}\" t=\"s\"><v>0</v></c></row>"
+            );
+            rows
+        });
         let bytes = workbook_with_sheet(&sheet(&rows), Some(&shared));
         let error = convert(&bytes, DocumentKind::Xlsx).expect_err("bound shared-string expansion");
         assert!(

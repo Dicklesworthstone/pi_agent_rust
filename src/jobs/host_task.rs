@@ -33,7 +33,7 @@ const TASK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Retain the owner's shutdown generation across asynchronous preflight. A
 /// caller must resolve its live session again after taking this token; if it
 /// changed, dropping the token abandons admission without starting any work.
-pub(crate) struct TaskAdmission(super::SessionSpawnAttempt, Option<Instant>);
+pub struct TaskAdmission(super::SessionSpawnAttempt, Option<Instant>);
 
 impl TaskAdmission {
     /// Freeze the original admission deadline before asynchronous preparation.
@@ -45,7 +45,7 @@ impl TaskAdmission {
     }
 }
 
-pub(crate) fn admit_owned_task(owner_session_id: &str) -> Result<TaskAdmission> {
+pub fn admit_owned_task(owner_session_id: &str) -> Result<TaskAdmission> {
     if owner_session_id.trim().is_empty() {
         return Err(Error::tool(
             "jobs",
@@ -69,7 +69,7 @@ pub(crate) fn admit_owned_task(owner_session_id: &str) -> Result<TaskAdmission> 
 /// fallible preparation belong before this boundary; any returned notice must
 /// already be screened. A rejected owner or stopped task never runs the callback.
 #[allow(clippy::significant_drop_tightening)] // The lock covers both commit and notice.
-pub(crate) fn with_owned_task_progress<T>(
+pub fn with_owned_task_progress<T>(
     owner_session_id: &str,
     id: &str,
     commit: impl FnOnce() -> Result<(T, Option<String>)>,
@@ -103,8 +103,10 @@ pub(crate) fn with_owned_task_progress<T>(
 /// aggregate first; a second projection may not change any field. Preparation
 /// stays outside the global jobs lock, then ownership and cancellation are
 /// checked atomically with publication.
-#[allow(clippy::significant_drop_tightening)]
-pub(crate) fn publish_owned_task_progress(
+// Subagent, eval and test callers outside this module hand over the progress
+// value by move.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
+pub fn publish_owned_task_progress(
     owner_session_id: &str,
     id: &str,
     partial_result: ToolOutput,
@@ -177,7 +179,8 @@ pub(crate) fn publish_owned_task_progress(
 /// Withdraw a previously published observation when later evidence fails the
 /// task's privacy contract. Removal is permitted after cancellation or owner
 /// shutdown starts, but never after the worker has fenced terminal publication.
-pub(crate) fn clear_owned_task_progress(owner_session_id: &str, id: &str) -> Result<()> {
+#[allow(clippy::significant_drop_tightening)] // `job` borrows from the registry guard.
+pub fn clear_owned_task_progress(owner_session_id: &str, id: &str) -> Result<()> {
     let stopped = || {
         Error::tool(
             "jobs",
@@ -214,12 +217,14 @@ pub(crate) fn clear_owned_task_progress(owner_session_id: &str, id: &str) -> Res
 /// before calling. The future must own its inputs and clean up on drop.
 /// Session shutdown, capacity, retention and notifications are shared with
 /// shell jobs. A timeout or cancellation never publishes a success result.
+// Spawning consumes the admission token; its Drop ends the spawn attempt.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::significant_drop_tightening
+    clippy::significant_drop_tightening,
+    clippy::needless_pass_by_value
 )]
-pub(crate) fn spawn_owned_task<F>(
+pub fn spawn_owned_task<F>(
     admission: TaskAdmission,
     label: &str,
     owner: AgentCx,
@@ -545,17 +550,14 @@ impl TaskResources {
         } else {
             protect_result(&result, privacy)
         };
-        let result = match protected {
-            Ok(result) => result,
-            Err(_) => {
-                if matches!(status, JobStatus::Exited | JobStatus::Failed) {
-                    status = JobStatus::Failed;
-                }
-                error_output(
-                    "PI_JOBS_TASK_RESULT_WITHHELD: result exceeded the 1 MiB budget or failed privacy projection; no raw output was retained",
-                )
+        let result = protected.unwrap_or_else(|_| {
+            if matches!(status, JobStatus::Exited | JobStatus::Failed) {
+                status = JobStatus::Failed;
             }
-        };
+            error_output(
+                "PI_JOBS_TASK_RESULT_WITHHELD: result exceeded the 1 MiB budget or failed privacy projection; no raw output was retained",
+            )
+        });
         let encoded = serde_json::to_vec(&result).unwrap_or_default();
         {
             let mut artifact = self
@@ -1044,7 +1046,6 @@ mod tests {
 
     #[test]
     fn shutdown_generation_fences_a_task_waiting_to_enter_admission() {
-        let _guard = super::super::process_test_guard();
         struct RestoreHooks;
         impl Drop for RestoreHooks {
             fn drop(&mut self) {
@@ -1054,6 +1055,7 @@ mod tests {
                     crate::jobs::SpawnBackgroundTestHooks::default();
             }
         }
+        let _guard = super::super::process_test_guard();
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore admission-race fixture requires isolated artifacts
         let owner = owner_id();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();

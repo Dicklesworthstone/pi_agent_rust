@@ -134,9 +134,11 @@ impl Record {
     }
 }
 
-/// A read-only view and optimistic-concurrency token. Not a durable authority
-/// token; obtain a new snapshot after reopening/replacing a session. Objective
-/// and note are intentionally excluded from Debug output.
+/// A read-only view and optimistic-concurrency token.
+///
+/// Not a durable authority token; obtain a new snapshot after
+/// reopening/replacing a session. Objective and note are intentionally excluded
+/// from Debug output.
 #[derive(Clone)]
 pub struct GoalSnapshot {
     record: Record,

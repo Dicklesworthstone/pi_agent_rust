@@ -83,6 +83,7 @@ impl DebugTool {
                 (Some(_), None) => None,
             };
             *session = owners.parked.remove(id);
+            drop(session);
             owners.active = Some(id.to_string());
             retired
         };
@@ -95,6 +96,7 @@ impl DebugTool {
     pub(super) fn require_debug_capacity(&self) -> Result<()> {
         let owners = lock(&self.session_owners);
         let count = owners.parked.len() + usize::from(lock(&self.session).is_some());
+        drop(owners);
         if count >= MAX_DEBUG_SESSIONS {
             return Err(tool_err(
                 "DAP_SESSION_CAPACITY",

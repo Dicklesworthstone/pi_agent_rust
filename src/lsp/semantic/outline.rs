@@ -365,7 +365,7 @@ fn parse<'a>(raw: &'a Value, path: &Path, text: &str, budget: &Budget) -> Result
             match value.get("children") {
                 None | Some(Value::Null) => {}
                 Some(Value::Array(children)) => {
-                    stack.push((children.iter(), Some(index), depth + 1))
+                    stack.push((children.iter(), Some(index), depth + 1));
                 }
                 Some(_) => return Err(malformed("document symbol children must be an array")),
             }

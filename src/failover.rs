@@ -1245,9 +1245,9 @@ pub(crate) fn needs_context_compaction(
         return false;
     }
     if recovery_http_status(&lower) == Some(413)
-        && !input_tokens
+        && input_tokens
             .zip(context_window)
-            .is_some_and(|(tokens, window)| tokens > u64::from(window))
+            .is_none_or(|(tokens, window)| tokens <= u64::from(window))
     {
         return false;
     }

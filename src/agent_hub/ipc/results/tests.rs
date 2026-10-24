@@ -48,7 +48,7 @@ fn wrong_credentials_fail_before_lookup_without_echoing_the_secret() {
                 reference: "does-not-exist".into(),
             },
         };
-        let error = dispatch_authenticated("unregistered", &expected, request, &owner)
+        let error = dispatch_authenticated("unregistered", &expected, &request, &owner)
             .unwrap_err()
             .to_string();
         assert!(error.contains("PI_HUB_IPC_AUTH"));
@@ -137,6 +137,7 @@ pub(super) fn serve(response: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<(
     (address, handle)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn request_response(response: WireResponse) -> Result<ResolvedDoc> {
     let mut response = serde_json::to_vec(&response).unwrap();
     response.push(b'\n');

@@ -56,6 +56,7 @@ impl Stream for Reply {
             if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
                 waiters.push(cx.waker().clone());
             }
+            drop(waiters);
             if !self.gate.open.load(Ordering::Acquire) {
                 return Poll::Pending;
             }
@@ -117,13 +118,13 @@ impl Fixture {
 
 #[async_trait::async_trait]
 impl Provider for Fixture {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "retained-fixture"
     }
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "fixture-stream"
     }
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "fixed-model"
     }
     async fn stream(
@@ -141,12 +142,12 @@ impl Provider for Fixture {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(user.content.clone());
         self.calls.fetch_add(1, Ordering::AcqRel);
-        if let Some(error) = self
+        let queued = self
             .errors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()
-        {
+            .pop_front();
+        if let Some(error) = queued {
             return Err(error);
         }
         let text = self
@@ -240,13 +241,13 @@ mod legacy {
 
     #[async_trait::async_trait]
     impl Provider for ProviderFixture {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "fixture"
         }
-        fn api(&self) -> &str {
+        fn api(&self) -> &'static str {
             "fixture-stream"
         }
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "background-completion"
         }
 
@@ -711,7 +712,6 @@ mod legacy {
         let settings = crate::secrets::SecretsSettings {
             mode: Some("obfuscate".into()),
             extra_patterns: Some(vec!["SESSION-CANARY".into()]),
-            ..Default::default()
         };
         let captured = AuxiliaryPrivacySnapshot::from_privacy(
             crate::text_completion::AuxiliaryPrivacy::from_settings(Some(&settings)),
@@ -733,6 +733,7 @@ mod legacy {
             let prompts = fixture.provider.prompts.lock().unwrap(); // ubs:ignore -- Inspect the fixture recorder after settlement; no await follows this assertion guard.
             assert_eq!(prompts.len(), 1);
             assert!(!prompts[0].contains("SESSION-CANARY"));
+            drop(prompts);
         });
     }
 
@@ -829,7 +830,6 @@ mod legacy {
         let settings = crate::secrets::SecretsSettings {
             mode: Some("obfuscate".into()),
             extra_patterns: Some(vec!["FROZEN-CANARY".into()]),
-            ..Default::default()
         };
         let policy = Mutex::new(AuxiliaryPrivacySnapshot::from_privacy(
             crate::text_completion::AuxiliaryPrivacy::from_settings(Some(&settings)),
@@ -970,6 +970,7 @@ fn bridge_error(error: String) -> Error {
     Error::tool("fixture", error)
 }
 
+#[allow(clippy::needless_pass_by_value)] // wraps the owned bridge reply at every call site
 fn acknowledgment(text: String) -> Result<Value> {
     Ok(serde_json::from_str(&text)?)
 }
@@ -1047,7 +1048,7 @@ fn all_three_native_starts_keep_typed_results_and_session_ownership() -> Result<
             let result = settled.result.ok_or_else(|| Error::tool("fixture", "missing retained result"))?;
             let details = result.details.ok_or_else(|| Error::tool("fixture", "missing model details"))?;
             assert_eq!(details.get("operation"), Some(&json!(operation.name()))); // ubs:ignore -- Operation identity must survive retention.
-            assert!(details.pointer("/judgments/attempts/0/usageKnown") == Some(&json!(true))); // ubs:ignore -- Completed provider usage must be retained outside the guest.
+            assert_eq!(details.pointer("/judgments/attempts/0/usageKnown"), Some(&json!(true))); // ubs:ignore -- Completed provider usage must be retained outside the guest.
             assert!(crate::jobs::wait_async("another-session", &settled.id, Duration::ZERO).await.is_err()); // ubs:ignore -- Foreign owners cannot retrieve the retained result.
             if operation == Operation::Completion {
                 assert_eq!(details.pointer("/result/data/count"), Some(&json!(7))); // ubs:ignore -- Schema-validated completion data remains typed.
@@ -1055,6 +1056,7 @@ fn all_three_native_starts_keep_typed_results_and_session_ownership() -> Result<
                 assert_eq!(harness.host.reads.load(Ordering::Acquire), 1); // ubs:ignore -- The attachment must pass through the launching host's read policy.
                 let contents = harness.provider.contents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 assert!(matches!(contents.first(), Some(UserContent::Blocks(blocks)) if blocks.iter().any(|block| matches!(block, ContentBlock::Image(_))))); // ubs:ignore -- Image evidence must reach the native provider as an image, not encoded prompt text.
+                drop(contents);
             }
         }
         assert_eq!(invocation.receipts.len(), 4); // ubs:ignore -- A two-item batch reserves two attempts beside the single calls.
@@ -1289,10 +1291,11 @@ fn privacy_is_captured_after_reads_and_all_text_discoveries_protect_results() ->
         let ack = acknowledgment(invocation.start_background(&harness.tool, Operation::Batch, batch).await.map_err(bridge_error)?)?;
         let _ = harness.settle(&ack).await?;
         assert_eq!(snapshot_calls.load(Ordering::Acquire), 1); // ubs:ignore -- One frozen privacy projection owns the entire accepted batch.
-        let contents = harness.provider.contents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let encoded = serde_json::to_string(&*contents)?;
+        let encoded = {
+            let contents = harness.provider.contents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            serde_json::to_string(&*contents)?
+        };
         assert!(!encoded.contains("opaque-remembered-value")); // ubs:ignore -- A later secret assignment must also screen an earlier bare value.
-        drop(contents);
         let factory = privacy;
         let mut completion = harness.invocation(&factory)?;
         harness.provider.replies.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back("opaque-output-value".into());
@@ -1633,7 +1636,6 @@ fn progress_and_final_privacy_failures_withdraw_earlier_batch_snapshots() -> Res
             Some(&crate::secrets::SecretsSettings {
                 mode: Some("obfuscate".into()),
                 extra_patterns: Some(vec![pattern.into()]),
-                ..Default::default()
             }),
         ));
         runtime().block_on(async {

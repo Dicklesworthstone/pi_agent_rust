@@ -409,10 +409,13 @@ mod typescript_tests {
 
     #[test]
     fn erased_types_cannot_bypass_the_original_source_budget() {
+        use std::fmt::Write as _;
+
         let dir = tempfile::tempdir().unwrap();
-        let fields = (0..100)
-            .map(|index| format!("field{index}: number;"))
-            .collect::<String>();
+        let fields = (0..100).fold(String::new(), |mut fields, index| {
+            let _ = write!(fields, "field{index}: number;");
+            fields
+        });
         let input = format!("interface Padding {{ {fields} }}\nexport const answer: number = 42;");
         std::fs::write(dir.path().join("types.ts"), &input).unwrap();
         let files = files(dir.path());

@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn log(case: &str, details: Value) {
     eprintln!(
         "{}",

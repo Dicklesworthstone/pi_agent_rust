@@ -100,7 +100,7 @@ fn native_parser_preserves_json_semantics_without_guest_global_helpers() {
     let kernel = JsKernel::spawn_in(dir.path()).unwrap();
     let result = value(
         &kernel,
-        r#"
+        r"
         globalThis.originalParse = JSON.parse;
         JSON.parse = () => { globalThis.usedParse = true; throw new Error('guest parser'); };
         Object.defineProperty(Object.prototype, 'jsonTrap', {set() { globalThis.usedSetter = true; }, configurable:true});
@@ -109,7 +109,7 @@ fn native_parser_preserves_json_semantics_without_guest_global_helpers() {
             Object.getPrototypeOf(data) === Object.prototype, data.__proto__.private,
             Object.is(data.zero, -0), data.a, data.jsonTrap, typeof usedParse, typeof usedSetter];
         delete Object.prototype.jsonTrap; JSON.parse = originalParse; observed
-    "#,
+    ",
     );
     assert_eq!(
         result,
@@ -257,12 +257,12 @@ fn text_defaults_preserve_exact_content_without_guest_constructors_or_execution(
     let kernel = JsKernel::spawn_in(dir.path()).unwrap();
     let result = value(
         &kernel,
-        r#"
+        r"
         globalThis.originalString = String;
         String = () => { globalThis.usedString = true; throw new Error('guest String'); };
         globalThis.asset = (await import('./template.md', {with:{type:'text'}})).default;
         String = originalString; [asset, typeof executed, typeof usedString]
-    "#,
+    ",
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&result).unwrap(),

@@ -15,6 +15,7 @@ impl Wake for WakeCount {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn notification(token: &str, progress: Value) -> Value {
     json!({"jsonrpc":"2.0","method":"notifications/progress",
         "params":{"progressToken":token,"progress":progress}})

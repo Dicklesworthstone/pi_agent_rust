@@ -127,6 +127,7 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn parsed(value: Value) -> LaunchEnvironment {
         serde_json::from_value::<DebugInput>(json!({"action":"launch", "env":value}))
             .unwrap()
@@ -183,8 +184,8 @@ mod tests {
 
     #[test]
     fn malformed_names_values_and_container_shapes_never_echo_payloads() {
-        event("redacted_refusal");
         const SECRET: &str = "PRIVATE_ENV_CANARY";
+        event("redacted_refusal");
         for value in [
             json!(SECRET),
             json!([SECRET]),
@@ -256,8 +257,7 @@ mod tests {
             json!({"A":"x".repeat(MAX_BYTES - 2)}),
             json!({"A":"雪".repeat(MAX_BYTES / 3)}),
             Value::Object(
-                [(String::from("A").repeat(MAX_NAME_BYTES + 1), json!("x"))]
-                    .into_iter()
+                std::iter::once((String::from("A").repeat(MAX_NAME_BYTES + 1), json!("x")))
                     .collect(),
             ),
             Value::Object(

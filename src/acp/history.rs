@@ -1034,7 +1034,7 @@ mod tests {
             ] {
                 in_tx.try_send(request.to_string()).unwrap();
             }
-            super::super::run(options, in_rx, out_tx).await.unwrap();
+            Box::pin(super::super::run(options, in_rx, out_tx)).await.unwrap();
             let messages = out_rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
             assert_eq!(messages.len(), 6);
             assert_eq!(messages[0]["result"]["agentCapabilities"]["loadSession"], true);

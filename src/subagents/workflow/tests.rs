@@ -12,6 +12,7 @@ fn node(id: &str, needs: &[&str]) -> Value {
     json!({"id":id, "needs":needs, "call":{"agent":"worker", "task":id}})
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn plan(nodes: Vec<Value>) -> Plan {
     Plan::parse(&json!({"workflow":nodes})).unwrap().unwrap()
 }
@@ -167,7 +168,7 @@ fn permissive_invalid_results_cannot_become_dependency_evidence() {
     assert_eq!(first.native_is_error, Some(false));
     let mut second = Record::pending(&plan.nodes[1], &plan.nodes);
     second.skip("dependency_failed", vec!["a".into()]);
-    let output = report(vec![first, second], 1, None);
+    let output = report(&[first, second], 1, None);
     assert!(output.is_error);
     let details = output.details.unwrap();
     assert_eq!(details["rejectedNodes"], 1);
@@ -410,7 +411,7 @@ fn text_only_providers_receive_acceptance_and_real_child_handles() {
     let plan = plan(vec![node("source", &[]), node("blocked", &["source"])]);
     let mut records = source_records(&plan, json!(null));
     records[1].skip("dependency_input_missing", vec!["source".into()]);
-    let output = report(records, 1, None);
+    let output = report(&records, 1, None);
     let ContentBlock::Text(text) = &output.content[0] else {
         panic!("text output");
     };
@@ -510,6 +511,7 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
             self.dir.path().join("workspace")
         }
 
+        #[allow(clippy::needless_pass_by_value)]
         fn run(&self, nodes: Vec<Value>) -> ToolOutput {
             self.runtime
                 .block_on(self.tool.execute(

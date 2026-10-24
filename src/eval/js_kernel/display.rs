@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // JS object literal, not a format string
     fn unsupported_json_is_refused_without_calling_serialization_hooks() {
         let kernel = JsKernel::spawn().unwrap();
         assert!(cell(&kernel, "globalThis.called = 0").ok);
@@ -258,6 +259,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // JS object literal, not a format string
     fn captured_intrinsics_do_not_depend_on_replaced_global_helpers() {
         let kernel = JsKernel::spawn().unwrap();
         let response = cell(
@@ -439,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // JS object literal, not a format string
     fn dropping_a_kernel_revokes_live_display_backpressure() {
         let kernel = JsKernel::spawn().unwrap();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -456,8 +459,10 @@ mod tests {
             reply.recv_timeout(Duration::from_secs(5)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
         ));
-        let remaining: Vec<_> = receiver.try_iter().collect();
-        assert!(remaining.len() <= 1, "one bounded queue, no spill producer");
+        assert!(
+            receiver.try_iter().count() <= 1,
+            "one bounded queue, no spill producer"
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)

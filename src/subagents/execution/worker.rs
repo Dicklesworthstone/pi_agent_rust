@@ -20,7 +20,7 @@ pub(in crate::subagents) async fn run(
 ) -> Result<ToolOutput> {
     let reason =
         "PI_SUBAGENT_WORKER_UNSUPPORTED: warm workers require Unix nonblocking process pipes";
-    crate::subagents::worker::finish(&state, Some(reason.to_string()));
+    crate::subagents::worker::finish(&state, Some(reason));
     Err(Error::tool("subagent", reason))
 }
 
@@ -163,7 +163,9 @@ impl Actor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // One ordered launch: hub entry, channel, command, lease.
     fn spawn(&mut self) -> Result<()> {
+        use std::os::unix::process::CommandExt as _;
         self.check()?;
         let capabilities = self.owner.capabilities();
         if !capabilities.io || !capabilities.spawn || !capabilities.time {
@@ -217,7 +219,6 @@ impl Actor {
             )
             .env("PI_SUBAGENT_STEER_FILE", &entry.steer_path)
             .env("PI_SUBAGENT_RUN_ID", &entry.id);
-        use std::os::unix::process::CommandExt as _;
         command.process_group(0);
         self.check()?;
         self.child = Some(
@@ -460,7 +461,7 @@ impl Actor {
             // repeating its effects or discarding the reusable conversation.
             contract.validate(&mut result);
         }
-        let mut output = result_output(vec![result], "worker", false);
+        let mut output = result_output(&[result], "worker", false);
         if let Some(details) = output.details.as_mut() {
             details["sessionIsolation"] = json!("persistent_rpc_worker");
             details["turnId"] = json!(pending.id);
@@ -511,7 +512,7 @@ impl Drop for Actor {
             self.lifecycle.error.clone_from(&self.failure);
         }
         self.hub.settle(&self.lifecycle);
-        crate::subagents::worker::finish(&self.state, self.failure.take());
+        crate::subagents::worker::finish(&self.state, self.failure.take().as_deref());
     }
 }
 
@@ -971,7 +972,7 @@ exec sleep 30
     #[test]
     fn idle_context_telemetry_is_exact_optional_and_rejects_malformed_counters() {
         let response = json!({"type":"response", "id":"ready", "command":"get_state", "success":true,
-            "data":{"isStreaming":false,"isCompacting":false,"contextTokens":0,"contextWindow":128000}});
+            "data":{"isStreaming":false,"isCompacting":false,"contextTokens":0,"contextWindow":128_000}});
         let mut reply = IdleReply::new("ready".to_string());
         reply
             .ingest(&response.to_string(), true)
@@ -989,7 +990,7 @@ exec sleep 30
                 );
             }
         }
-        let mut unknown = response.clone();
+        let mut unknown = response;
         unknown["data"]["contextTokens"] = Value::Null;
         unknown["data"]["contextWindow"] = Value::Null;
         let mut reply = IdleReply::new("ready".to_string());

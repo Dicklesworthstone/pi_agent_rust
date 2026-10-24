@@ -309,6 +309,7 @@ fn binding_log(case: &str) {
     );
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn bound_step(call: Value, bind: Value) -> Value {
     json!({"action":"batch", "steps":[
         {"call":{"action":"snapshot","tab":"app"}}, {"call":call,"bind":bind}
@@ -609,7 +610,7 @@ fn binding_failure_retains_earlier_evidence_and_marks_the_call_not_started() {
             &bindings("selector", "/PRIVATE-CANARY"),
         )
         .unwrap_err();
-    report.binding_failure(1, "click", failure);
+    report.binding_failure(1, "click", &failure);
     let result = report.finish(3);
     assert!(result.is_error);
     assert!(
@@ -637,11 +638,11 @@ fn binding_resolution_does_not_change_the_original_call_timeout_or_cancellation(
     let report = source_report(Some(json!({"value":"#a"})));
     let call = report
         .bind_call(
-            json!({"action":"click","tab":"app","timeout_ms":120000}),
+            json!({"action":"click","tab":"app","timeout_ms":120_000}),
             &bindings("selector", "/value"),
         )
         .unwrap();
-    assert_eq!(call["timeout_ms"], 120000);
+    assert_eq!(call["timeout_ms"], 120_000);
     let owner = AgentCx::for_request();
     let budget = Budget {
         owner,

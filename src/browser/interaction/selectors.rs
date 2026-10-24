@@ -139,7 +139,7 @@ pub(in crate::browser) fn validate_input(args: &Value) -> Result<bool> {
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !matches!(
+    if !(matches!(
         action,
         "click"
             | "hover"
@@ -151,7 +151,7 @@ pub(in crate::browser) fn validate_input(args: &Value) -> Result<bool> {
             | "select_option"
             | "set_checked"
             | "upload"
-    ) && !(action == "scroll" && args.get("frame").is_some())
+    ) || (action == "scroll" && args.get("frame").is_some()))
     {
         return Err(error(
             "BROWSER_SELECTOR_USAGE: semantic selectors require an element input action; scroll requires an explicit frame",

@@ -424,12 +424,12 @@ impl SubagentTool {
         request: SubagentRequest,
         on_update: Option<UpdateCallback>,
     ) -> Result<Vec<SubagentResult>> {
-        Ok(self.prepare_request(request)?.run(on_update).await)
+        Ok(self.prepare_request(&request)?.run(on_update).await)
     }
 
     /// Freeze discovery, model affinity and the original deadline before a
     /// caller transfers execution into a managed background job.
-    fn prepare_request(&self, request: SubagentRequest) -> Result<PreparedRequest> {
+    fn prepare_request(&self, request: &SubagentRequest) -> Result<PreparedRequest> {
         // Capture once, before discovery and queueing. Every parallel task,
         // sequential step and schema-correction retry consumes this budget.
         let deadline = Deadline::for_request(self.timeout, request.timeout_seconds)?;
@@ -438,7 +438,7 @@ impl SubagentTool {
 
     fn prepare_request_with_deadline(
         &self,
-        request: SubagentRequest,
+        request: &SubagentRequest,
         deadline: Deadline,
     ) -> Result<PreparedRequest> {
         let parent_model = self.capture_parent_model();
@@ -682,7 +682,7 @@ impl Tool for SubagentTool {
         let update = on_update.map(Arc::from);
         let mode = request.mode_name()?;
         let results = self.run_request(request, update).await?;
-        Ok(result_output(results, mode, self.structured_results))
+        Ok(result_output(&results, mode, self.structured_results))
     }
 
     fn effects(&self) -> ToolEffects {
@@ -699,12 +699,12 @@ impl Tool for SubagentTool {
     }
 }
 
-fn result_output(results: Vec<SubagentResult>, mode: &str, structured_results: bool) -> ToolOutput {
+fn result_output(results: &[SubagentResult], mode: &str, structured_results: bool) -> ToolOutput {
     let is_error = results.iter().any(|result| result.is_error);
-    let mut content = render_results(&results);
+    let mut content = render_results(results);
     if structured_results {
         content.push_str("\n\n");
-        content.push_str(&structured_result_block(&results));
+        content.push_str(&structured_result_block(results));
     }
     ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new(content))],

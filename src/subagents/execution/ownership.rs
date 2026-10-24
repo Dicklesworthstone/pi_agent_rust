@@ -118,6 +118,7 @@ fn settle_result_in(hub: &Mutex<AgentHubRegistry>, id: &str, result: &SubagentRe
                 let mut hub = poisoned.into_inner();
                 hub.settle(id, status);
                 hub.finish_native_execution(id);
+                drop(hub);
                 return;
             }
         };

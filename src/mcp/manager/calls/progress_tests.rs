@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const PEER: &str = r#"
+const PEER: &str = r"
 import json, pathlib, queue, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -147,7 +147,7 @@ else:
     (root / 'port.tmp').write_text(str(server.server_port))
     (root / 'port.tmp').replace(root / 'port')
     server.serve_forever()
-"#;
+";
 
 struct PeerChild(Child);
 

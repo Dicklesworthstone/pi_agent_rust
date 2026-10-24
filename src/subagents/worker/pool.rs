@@ -12,6 +12,7 @@ use super::{
 use crate::subagents::AgentDefinition;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ struct Item {
     turn: u64,
 }
 
+#[allow(clippy::struct_excessive_bools)] // Independent lifecycle flags read under one lock.
 struct PoolState {
     owner: String,
     id: String,
@@ -86,6 +88,7 @@ fn register(pool: Pool) -> Result<()> {
         pools.remove(retired);
     }
     pools.push_back(pool);
+    drop(pools);
     Ok(())
 }
 
@@ -210,12 +213,13 @@ async fn start(
         usize::try_from(optional_integer(&input, "concurrency", 1, MAX_CHILDREN)?.unwrap_or(4))
             .map_err(|_| invalid("concurrency must be from 1 to 8"))?;
     let timeout = optional_integer(&input, "timeoutSeconds", 1, 86_400)?;
-    let scope: AgentScope = input
-        .get("scope")
-        .map_or(Ok(AgentScope::default()), |value| {
+    let scope: AgentScope = input.get("scope").map_or_else(
+        || Ok(AgentScope::default()),
+        |value| {
             serde_json::from_value(value.clone())
                 .map_err(|_| invalid("scope must be user, project or both"))
-        })?;
+        },
+    )?;
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner)?;
     if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
@@ -476,7 +480,7 @@ fn prepare_batch(
     Ok(Batch {
         base,
         placements,
-        acknowledgment: projected_snapshot_with(value, &policies, privacy)?,
+        acknowledgment: projected_snapshot_with(&value, &policies, privacy)?,
     })
 }
 
@@ -499,6 +503,7 @@ fn ensure_admission(state: &PoolState, count: usize, initial: bool) -> Result<()
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::significant_drop_tightening)] // Pool and member guards span the atomic commit.
 async fn admit(
     tool: &SubagentTool,
     pool: &Pool,
@@ -576,6 +581,7 @@ async fn admit(
     ))
 }
 
+#[allow(clippy::too_many_lines)] // One dispatcher over every pool operation.
 pub(super) async fn execute(
     tool: &SubagentTool,
     input: Value,
@@ -613,7 +619,7 @@ pub(super) async fn execute(
         None
     };
     let timeout_ms = optional_integer(&input, "timeoutMs", 0, 600_000)?
-        .unwrap_or(if drain.is_some() { 0 } else { 30_000 });
+        .unwrap_or_else(|| if drain.is_some() { 0 } else { 30_000 });
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner)?;
     let budget = Deadline::for_request(Some(Duration::from_millis(timeout_ms + 30_000)), None)?;
@@ -747,6 +753,7 @@ fn drain_cursor(pool_id: &str, ids: &[u64]) -> Value {
 /// A cursor is a caller-owned acknowledgment set, never mutable native state.
 /// Later items can be returned while an earlier item is still running. Reads
 /// neither seal admission nor consume results, including after cancellation.
+#[allow(clippy::too_many_lines)] // One locked page build plus its projection identity checks.
 fn drain_snapshot(
     pool: &Pool,
     request: &DrainRequest,
@@ -775,8 +782,12 @@ fn drain_snapshot(
         let mut next = request.acknowledged.clone();
         for (index, item) in state.items.iter().enumerate() {
             let id = u64::try_from(index + 1).map_err(|_| stopped())?;
-            let worker = workers.get(item.worker).ok_or_else(stopped)?;
-            let turn = worker.turns.get(&item.turn).ok_or_else(stopped)?;
+            let turn = workers
+                .get(item.worker)
+                .ok_or_else(stopped)?
+                .turns
+                .get(&item.turn)
+                .ok_or_else(stopped)?;
             let acknowledged = request.acknowledged.binary_search(&id).is_ok();
             if pending(turn.status) {
                 if acknowledged {
@@ -907,7 +918,7 @@ async fn seal(
             recheck_owner(tool, owner, owner_id, budget).await?;
             return snapshot(pool, None, privacy);
         };
-        let acknowledgment = projected_snapshot_with(value, &policies, privacy)?;
+        let acknowledgment = projected_snapshot_with(&value, &policies, privacy)?;
         recheck_owner(tool, owner, owner_id, budget).await?;
         let accepted = crate::jobs::with_owned_task_progress(owner_id, &job_id, || {
             let mut state = pool.lock().map_err(|_| stopped())?;
@@ -923,6 +934,7 @@ async fn seal(
                 return Ok((false, None));
             }
             state.sealed = true;
+            drop(state);
             Ok((true, None))
         });
         match accepted {
@@ -974,7 +986,7 @@ fn pending(status: &str) -> bool {
     matches!(status, "queued" | "running")
 }
 
-fn status(state: &PoolState, terminal: bool) -> &'static str {
+const fn status(state: &PoolState, terminal: bool) -> &'static str {
     if state.closed || terminal {
         if state.closing {
             "cancelled"
@@ -1022,8 +1034,12 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
     let mut completed = 0;
     let mut failed = 0;
     for (index, item) in state.items.iter().enumerate() {
-        let worker = workers.get(item.worker).ok_or_else(stopped)?;
-        let turn = worker.turns.get(&item.turn).ok_or_else(stopped)?;
+        let turn = workers
+            .get(item.worker)
+            .ok_or_else(stopped)?
+            .turns
+            .get(&item.turn)
+            .ok_or_else(stopped)?;
         let id = u64::try_from(index + 1).map_err(|_| stopped())?;
         match turn.status {
             "queued" => queued += 1,
@@ -1064,11 +1080,11 @@ fn snapshot(
         let state = pool.lock().map_err(|_| stopped())?;
         (manifest(&state, selected, false)?, state.privacy.clone())
     };
-    projected_snapshot_with(value, &policies, privacy)
+    projected_snapshot_with(&value, &policies, privacy)
 }
 
 fn projected_snapshot_with(
-    value: Value,
+    value: &Value,
     policies: &[AuxiliaryPrivacySnapshot],
     privacy: &AuxiliaryPrivacySnapshot,
 ) -> Result<ToolOutput> {
@@ -1135,11 +1151,11 @@ fn projected_snapshot_with(
         .and_then(Value::as_array)
     {
         for block in blocks {
-            if block.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(answer) = block.get("text").and_then(Value::as_str) {
-                    text.push('\n');
-                    text.push_str(answer);
-                }
+            if block.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(answer) = block.get("text").and_then(Value::as_str)
+            {
+                text.push('\n');
+                text.push_str(answer);
             }
         }
     } else if let Some(items) = details.get("items").and_then(Value::as_array) {
@@ -1153,7 +1169,7 @@ fn projected_snapshot_with(
                 .get("summary")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            text.push_str(&format!("\n[{id} {state}] {summary}"));
+            let _ = write!(text, "\n[{id} {state}] {summary}");
         }
     }
     let output = ToolOutput {
@@ -1267,6 +1283,7 @@ impl PoolRun {
         if all_closed {
             state.sealed = true;
         }
+        drop(state);
         Ok(all_closed)
     }
 
@@ -1280,7 +1297,7 @@ impl PoolRun {
                 state.privacy.clone(),
             )
         };
-        let mut output = projected_snapshot_with(value, &policies, privacy)?;
+        let mut output = projected_snapshot_with(&value, &policies, privacy)?;
         output.is_error = output
             .details
             .as_ref()
@@ -1293,6 +1310,7 @@ impl PoolRun {
                 return Err(stopped());
             }
             state.closed = true;
+            drop(state);
             Ok(((), None))
         })?;
         self.settled = true;

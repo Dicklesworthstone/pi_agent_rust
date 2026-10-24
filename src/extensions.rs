@@ -18850,7 +18850,7 @@ async fn dispatch_hostcall_http(
 /// A pull-driven HTTP operation. Dropping any state drops the request or body
 /// future, so JS cancellation never leaves a detached network operation.
 enum HttpHostcallStream {
-    Start(HttpConnector, crate::connectors::HostCallPayload),
+    Start(Box<HttpConnector>, crate::connectors::HostCallPayload),
     Body {
         stream: futures::stream::BoxStream<'static, std::io::Result<Vec<u8>>>,
         sequence: u64,
@@ -18860,6 +18860,7 @@ enum HttpHostcallStream {
     Done,
 }
 
+#[allow(clippy::too_many_lines)] // one unfold over the request, body, and terminal states
 fn http_hostcall_stream(
     connector: HttpConnector,
     call: crate::connectors::HostCallPayload,
@@ -18868,7 +18869,7 @@ fn http_hostcall_stream(
     use futures::StreamExt as _;
 
     Box::pin(futures::stream::unfold(
-        HttpHostcallStream::Start(connector, call),
+        HttpHostcallStream::Start(Box::new(connector), call),
         |state| async move {
             match state {
                 HttpHostcallStream::Start(connector, call) => {

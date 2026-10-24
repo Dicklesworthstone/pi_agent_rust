@@ -1,4 +1,5 @@
 //! Content-Length-framed DAP over owned adapter stdio or loopback TCP.
+//!
 //! Connected external adapters are socket-owned, never process-owned.
 //! Dedicated, bounded writer/reader lanes keep blocking I/O off the reactor.
 

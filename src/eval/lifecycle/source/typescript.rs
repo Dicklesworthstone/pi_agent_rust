@@ -11,7 +11,7 @@ use std::path::Path;
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, Span, Spanned};
 use swc_common::{comments::SingleThreadedComments, sync::Lrc};
 use swc_ecma_ast::{
-    Decorator, MetaPropExpr, MetaPropKind, ModuleDecl, ModuleItem, Program, Script,
+    Decorator, EsVersion, MetaPropExpr, MetaPropKind, ModuleDecl, ModuleItem, Program, Script,
     TsExportAssignment, TsImportEqualsDecl, TsType,
 };
 use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
@@ -82,14 +82,15 @@ fn at(cm: &SourceMap, path: &Path, span: Span, message: impl std::fmt::Display) 
     failure(
         "TYPESCRIPT",
         format!(
-            "{:?}:{}:{}: {message}",
-            path,
+            "{}:{}:{}: {message}",
+            path.display(),
             location.line,
             location.col_display + 1,
         ),
     )
 }
 
+#[allow(clippy::too_many_lines)] // one SWC pipeline: parse, screen, strip types, emit
 fn compile(path: &Path, code: String, kind: Kind) -> Result<String> {
     let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
     let file = cm.new_source_file(FileName::Real(path.to_path_buf()).into(), code);
@@ -100,7 +101,7 @@ fn compile(path: &Path, code: String, kind: Kind) -> Result<String> {
             decorators: false,
             ..Default::default()
         }),
-        Default::default(),
+        EsVersion::default(),
         StringInput::from(&*file),
         Some(&comments),
     );
@@ -194,7 +195,7 @@ fn compile(path: &Path, code: String, kind: Kind) -> Result<String> {
         let mut generated = BoundedCode(Vec::new());
         {
             let mut emitter = Emitter {
-                cfg: Default::default(),
+                cfg: swc_ecma_codegen::Config::default(),
                 cm: cm.clone(),
                 comments: Some(&comments),
                 wr: JsWriter::new(cm.clone(), "\n", &mut generated, None),
@@ -214,7 +215,7 @@ struct Unsupported {
 }
 
 impl Unsupported {
-    fn record(&mut self, span: Span, message: &'static str) {
+    const fn record(&mut self, span: Span, message: &'static str) {
         if self.first.is_none() {
             self.first = Some((span, message));
         }

@@ -116,6 +116,7 @@ fn valid_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+#[allow(clippy::too_many_lines)] // registered and file-configured selection share one validation path
 pub(super) fn select(
     cwd: &Path,
     target: Option<&Path>,
@@ -357,6 +358,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn write_config(root: &Path, value: Value) {
         std::fs::write(root.join("dap.json"), serde_json::to_vec(&value).unwrap()).unwrap();
     }
@@ -491,7 +493,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("dap.json"),
-            vec![b' '; MAX_CONFIG_BYTES as usize + 1],
+            vec![b' '; usize::try_from(MAX_CONFIG_BYTES).unwrap() + 1],
         )
         .unwrap();
         assert!(selected(directory.path(), "debugpy").is_err());

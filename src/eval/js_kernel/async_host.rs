@@ -50,7 +50,7 @@ struct State {
 }
 
 impl State {
-    fn new(stopped: Arc<AtomicBool>) -> Self {
+    const fn new(stopped: Arc<AtomicBool>) -> Self {
         Self {
             deadline: None,
             stopped,
@@ -134,7 +134,7 @@ impl State {
         Ok(id)
     }
 
-    fn charge_event(&mut self) -> Result<(), &'static str> {
+    const fn charge_event(&mut self) -> Result<(), &'static str> {
         if self.events >= MAX_EVENTS {
             return Err("EVAL_ASYNC_LIMIT: asynchronous event budget exhausted");
         }

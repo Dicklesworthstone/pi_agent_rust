@@ -52,6 +52,7 @@ fn rubric(value: &Value) -> bool {
 impl JudgmentRequest {
     /// `state` is nonempty text, an object or an array. Questions use the OMP
     /// bool/choice/score rubric shapes. Images and unknown fields are refused.
+    #[allow(clippy::needless_pass_by_value)] // Public API; owned input is its contract.
     pub fn parse(input: Value) -> Result<Self> {
         bounded_json(&input, MAX_BYTES)?;
         let object = input
@@ -315,7 +316,6 @@ pub(super) fn bounded_json(value: &Value, limit: usize) -> Result<String> {
         }
         Ok(())
     }
-    shape(value, 0, &mut 65_536)?;
     struct Bounded {
         data: Vec<u8>,
         limit: usize,
@@ -332,6 +332,7 @@ pub(super) fn bounded_json(value: &Value, limit: usize) -> Result<String> {
             Ok(())
         }
     }
+    shape(value, 0, &mut 65_536)?;
     let mut writer = Bounded {
         data: Vec::new(),
         limit,

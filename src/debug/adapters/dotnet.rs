@@ -86,7 +86,7 @@ fn file_offset(sections: &[u8], rva: u32, size: u32, length: u64) -> Option<u64>
     }
     let end = rva.checked_add(size)?;
     let mut found = None;
-    for section in sections.chunks_exact(SECTION_BYTES) {
+    for section in sections.as_chunks::<SECTION_BYTES>().0 {
         let base = u32_at(section, 12)?;
         let raw_size = u32_at(section, 16)?;
         let virtual_size = u32_at(section, 8)?.max(raw_size);

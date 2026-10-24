@@ -926,6 +926,7 @@ impl DebugInput {
         args
     }
 
+    #[allow(clippy::too_many_lines)] // one flat usage check per request field
     fn validate(&self) -> Result<()> {
         self.remote.validate(self)?;
         if self.env.is_some() && self.action != "launch" {

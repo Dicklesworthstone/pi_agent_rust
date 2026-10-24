@@ -26,14 +26,14 @@ const MAX_READ_OPERATIONS: u64 = 100_000;
 
 /// The outer archive and an optional member selected with `archive.zip:member`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ArchivePath {
+pub struct ArchivePath {
     pub archive_path: String,
     pub member: String,
 }
 
 /// Recognize OMP's archive path syntax without performing filesystem access.
 /// URL routing and trailing line selectors belong to the caller.
-pub(crate) fn parse_path(path: &str) -> Result<Option<ArchivePath>> {
+pub fn parse_path(path: &str) -> Result<Option<ArchivePath>> {
     if path.contains("://") {
         return Ok(None);
     }
@@ -172,7 +172,7 @@ struct ArchiveEntry {
 }
 
 /// Shared native ZIP boundary for archive navigation and Office documents.
-pub(crate) struct ArchiveReader<R> {
+pub struct ArchiveReader<R> {
     archive: ZipArchive<BoundedReader<R>>,
     entries: BTreeMap<String, ArchiveEntry>,
     budget: Rc<Cell<ReadBudget>>,
@@ -318,14 +318,14 @@ fn index_entries<R: Read + Seek>(
 
 /// Rendered archive data for the read tool's existing pagination layer.
 #[derive(Debug)]
-pub(crate) struct ArchiveReadOutcome {
+pub struct ArchiveReadOutcome {
     pub content: String,
     pub member: String,
     pub is_directory: bool,
     pub entry_count: usize,
 }
 
-pub(crate) fn read_open_file(file: File, member: &str) -> Result<ArchiveReadOutcome> {
+pub fn read_open_file(file: File, member: &str) -> Result<ArchiveReadOutcome> {
     read_archive(ArchiveReader::new(file)?, member)
 }
 

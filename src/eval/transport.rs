@@ -251,14 +251,14 @@ pub(super) fn validate_bridge(frame: &Value) -> Result<()> {
         return Err(invalid("ambiguous bridge response"));
     }
     let bridge = &frame["bridge"];
-    if !bridge
+    if bridge
         .get("call")
         .and_then(Value::as_u64)
-        .is_some_and(|id| id > 0)
-        || !bridge
+        .is_none_or(|id| id == 0)
+        || bridge
             .get("tool")
             .and_then(Value::as_str)
-            .is_some_and(|name| !name.is_empty())
+            .is_none_or(str::is_empty)
         || !bridge.get("input").is_some_and(Value::is_object)
     {
         return Err(invalid("malformed bridge request"));

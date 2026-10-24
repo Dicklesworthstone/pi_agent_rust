@@ -14,7 +14,7 @@ pub(super) struct PromptBudget {
 }
 
 impl PromptBudget {
-    pub(super) fn new(remaining: u64) -> Self {
+    pub(super) const fn new(remaining: u64) -> Self {
         Self {
             remaining,
             observed: AtomicU64::new(0),

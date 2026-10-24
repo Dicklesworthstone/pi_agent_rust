@@ -30,10 +30,12 @@ fn questions() -> Value {
     json!({"q":{"type":"bool","instructions":"Does the image support the claim?"}})
 }
 
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers pass owned json! images
 fn single(images: Value) -> Value {
     json!({"state":{"claim":"CANARY-evidence"},"questions":questions(),"images":images})
 }
 
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers pass owned json! images
 fn batch(images: Value) -> Value {
     json!({"states":[{"index":0},{"index":1}],"questions":questions(),"images":images})
 }
@@ -81,13 +83,13 @@ impl Fixture {
 
 #[async_trait::async_trait]
 impl Provider for Fixture {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fixture"
     }
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "fixture-stream"
     }
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "image-judge"
     }
 
@@ -156,8 +158,8 @@ impl ToolInvocationHost for ReadHost {
             return Err(Error::validation("PRIVATE-READ-DIAGNOSTIC"));
         }
         let mut content = vec![ContentBlock::Text(TextContent::new("PRIVATE-READ-NOTE"))];
-        if !matches!(self.mode, ReadMode::Empty)
-            && !(matches!(self.mode, ReadMode::LateBad) && index > 0)
+        if !(matches!(self.mode, ReadMode::Empty)
+            || (matches!(self.mode, ReadMode::LateBad) && index > 0))
         {
             content.push(ContentBlock::Image(image()));
         }
@@ -357,8 +359,7 @@ fn batch_encoded_image_budget_is_independent_from_text_and_rejects_before_reserv
     let image = json!({"type":"image","data":data,"mimeType":"image/gif"});
     let provider = Fixture::new(0);
     let mut accepted = invocation(&provider, None, true);
-    let request =
-        batch(json!({"0":[image.clone(),image.clone()],"1":[image.clone(),image.clone()]}));
+    let request = batch(json!({"0":[image.clone(),image],"1":[image.clone(),image]}));
     let reply = runtime()
         .block_on(accepted.evaluate_batch(Path::new("."), request))
         .expect("exactly 16 MiB of images must not consume the text allowance"); // ubs:ignore[rust.ownership.unwrap-expect] -- The boundary batch validates separate text and image budgets.
@@ -367,7 +368,7 @@ fn batch_encoded_image_budget_is_independent_from_text_and_rejects_before_reserv
 
     let mut rejected = invocation(&provider, None, true);
     let request = json!({"states":[{},{},{}],"questions":questions(),"images":{
-        "0":[image.clone(),image.clone()],"1":[image.clone(),image],"2":[embedded()]
+        "0":[image.clone(),image],"1":[image.clone(),image],"2":[embedded()]
     }});
     let error = runtime()
         .block_on(rejected.evaluate_batch(Path::new("."), request))

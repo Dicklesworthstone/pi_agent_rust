@@ -29,17 +29,16 @@ fn limit() -> crate::error::Error {
 
 impl Mode {
     pub(super) fn parse(item: &Value) -> Result<Self> {
-        match item.get("insertTextMode").filter(|value| !value.is_null()) {
-            None => Ok(Self::AsIs),
-            Some(value) => match value.as_u64() {
+        item.get("insertTextMode")
+            .filter(|value| !value.is_null())
+            .map_or(Ok(Self::AsIs), |value| match value.as_u64() {
                 Some(1) => Ok(Self::AsIs),
                 Some(2) => Ok(Self::Adjust),
                 _ => Err(tool_err(
                     "LSP_COMPLETION_UNSUPPORTED",
                     "completion insertTextMode must be asIs (1) or adjustIndentation (2)",
                 )),
-            },
-        }
+            })
     }
 
     /// Input is already snippet-expanded. Neither the cached server item nor
@@ -231,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // LSP snippet tabstops, not format strings
     fn default_range_snippet_and_auto_import_follow_the_real_preparation_path() {
         let source = "header\n\tfoo\n";
         let defaults =

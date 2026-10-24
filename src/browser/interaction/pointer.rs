@@ -249,14 +249,14 @@ impl<'a> Gesture<'a> {
             _ => return Err(gesture_usage()),
         };
         if fields.keys().any(|field| {
-            !matches!(
+            !(matches!(
                 field.as_str(),
                 "action" | "tab" | "selector" | "modifiers" | "wait_after" | "timeout_ms"
-            ) && !(drag
+            ) || (drag
                 && matches!(
                     field.as_str(),
                     "target_selector" | "drag_steps" | "duration_ms"
-                ))
+                )))
         }) {
             return Err(gesture_usage());
         }
@@ -313,7 +313,7 @@ fn motion(point: (f64, f64), held: bool, modifiers: u8) -> Value {
         // Chromium needs the pressed button as well as its mask for native
         // HTML drag initiation. `none` with buttons:1 only drives pointer events.
         "button":if held { "left" } else { "none" },
-        "buttons":if held { 1 } else { 0 }, "modifiers":modifiers,
+        "buttons":i32::from(held), "modifiers":modifiers,
     })
 }
 
@@ -401,6 +401,7 @@ async fn verify_drag(
 }
 
 #[derive(Default, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)] // serialized attempt/ack counters, one per input phase
 struct GestureProgress {
     moves_acknowledged: u32,
     press_attempted: bool,
@@ -449,6 +450,7 @@ fn gesture_result(
 /// Main-document gestures retain both nodes and their original connection.
 /// No synthetic DragEvents, invented DataTransfer payload, retries or scrolling
 /// while held. The session's existing outer watchdog owns total time and drop.
+#[allow(clippy::too_many_lines)] // one press/move/release sequence with its cleanup paths
 pub(super) async fn gesture(
     owner: &AgentCx,
     cdp: &mut Cdp,
@@ -986,7 +988,7 @@ mod tests {
         for bad in [
             json!({"left":10,"top":20,"right":10,"bottom":60}),
             json!({"left":-1,"top":20,"right":50,"bottom":60}),
-            json!({"left":10,"top":20,"right":50,"bottom":1000001}),
+            json!({"left":10,"top":20,"right":50,"bottom":1_000_001}),
             json!({"left":"10","top":20,"right":50,"bottom":60}),
         ] {
             assert!(Bounds::parse(bad).is_err());

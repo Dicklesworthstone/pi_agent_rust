@@ -179,13 +179,13 @@ impl FixtureProvider {
 }
 #[async_trait::async_trait]
 impl Provider for FixtureProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fixture"
     }
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "fixture-stream"
     }
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "typed-judge"
     }
     async fn stream(
@@ -283,6 +283,7 @@ fn prepared_judgment_owns_screened_evidence_without_dispatch_or_callback() -> Re
     let prompt = prompts.first().expect("one provider request"); // ubs:ignore -- The fixture is expected to record exactly one provider request.
     assert!(prompt.contains("screened replacement")); // ubs:ignore -- Verify the owned screened evidence is the evidence actually sent.
     assert!(!prompt.contains("adds a regression test")); // ubs:ignore -- Unscreened source must not reach the provider.
+    drop(prompts);
     Ok(())
 }
 
@@ -322,6 +323,7 @@ fn prepared_completion_keeps_schema_and_releases_borrowed_privacy() -> Result<()
     let prompts = provider.prompts.lock().expect("provider recorder"); // ubs:ignore -- A poisoned fixture recorder must fail this test.
     let prompt = prompts.first().expect("one provider request"); // ubs:ignore -- A successful completion must record its one request.
     assert!(prompt.contains("screened prompt") && !prompt.contains("original prompt")); // ubs:ignore -- Only screened text may be dispatched after the callback has gone away.
+    drop(prompts);
     Ok(())
 }
 
@@ -410,14 +412,16 @@ fn failed_empty_and_unterminated_streams_have_no_verdict() {
 
 #[test]
 fn tool_calls_in_a_terminal_response_are_never_executed() {
-    let mut message = AssistantMessage::default();
-    message.content = vec![ContentBlock::ToolCall(ToolCall {
-        id: "forbidden".into(),
-        name: "bash".into(),
-        arguments: json!({"command":"no"}),
-        thought_signature: None,
-    })];
-    message.stop_reason = StopReason::Stop;
+    let message = AssistantMessage {
+        content: vec![ContentBlock::ToolCall(ToolCall {
+            id: "forbidden".into(),
+            name: "bash".into(),
+            arguments: json!({"command":"no"}),
+            thought_signature: None,
+        })],
+        stop_reason: StopReason::Stop,
+        ..Default::default()
+    };
     let provider = FixtureProvider::new(vec![StreamEvent::Done {
         reason: StopReason::Stop,
         message,
@@ -454,6 +458,7 @@ fn direct_calls_redact_credentials_before_the_provider() {
     let prompts = provider.prompts.lock().unwrap();
     assert!(!prompts[0].contains(secret));
     assert!(prompts[0].contains("redacted"));
+    drop(prompts);
 }
 
 mod image_evidence {
@@ -515,6 +520,7 @@ mod image_evidence {
                 matches!(block, ContentBlock::Image(image) if image.data == original.data && image.mime_type == original.mime_type)
             ); // ubs:ignore[rust.panic.assert-macros] -- Admission must preserve exact bytes, MIME and ordering without transcoding.
         }
+        drop(contents);
     }
 
     #[test]
@@ -577,6 +583,7 @@ mod image_evidence {
         let prompts = provider.prompts.lock().unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Inspect exactly what the provider received; poison must invalidate the test.
         assert!(!prompts[0].contains(secret)); // ubs:ignore[rust.panic.assert-macros] -- Adding image support cannot weaken existing credential redaction.
         assert!(prompts[0].contains("redacted")); // ubs:ignore[rust.panic.assert-macros] -- The admitted text must carry irreversible redaction.
+        drop(prompts);
     }
 
     #[test]

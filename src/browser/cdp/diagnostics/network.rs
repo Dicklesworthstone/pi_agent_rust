@@ -70,7 +70,7 @@ fn url_shortened(value: &Value) -> bool {
 }
 
 impl Trace {
-    pub(super) fn new(max_events: usize) -> Self {
+    pub(super) const fn new(max_events: usize) -> Self {
         Self {
             hops: VecDeque::new(),
             seen: BTreeSet::new(),

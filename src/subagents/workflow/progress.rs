@@ -7,11 +7,12 @@ use super::{Error, Record, Result, State, ToolOutput, encoded_size};
 use crate::model::{ContentBlock, TextContent};
 use crate::text_completion::AuxiliaryPrivacySnapshot;
 use serde::Serialize;
+use std::fmt::Write as _;
 
 // Leave headroom for the ToolOutput and jobs progress/interruption wrappers.
 const MAX_CHECKPOINT_BYTES: usize = 768 * 1024;
 
-pub(crate) struct Progress {
+pub struct Progress {
     session: String,
     job: String,
     privacy: AuxiliaryPrivacySnapshot,
@@ -19,7 +20,11 @@ pub(crate) struct Progress {
 }
 
 impl Progress {
-    pub(crate) fn new(session: String, job: String, privacy: AuxiliaryPrivacySnapshot) -> Self {
+    pub(crate) const fn new(
+        session: String,
+        job: String,
+        privacy: AuxiliaryPrivacySnapshot,
+    ) -> Self {
         Self {
             session,
             job,
@@ -55,6 +60,7 @@ impl Progress {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_field_names)] // `checkpoint` is a serialized wire field.
 struct Checkpoint<'a> {
     schema: &'static str,
     mode: &'static str,
@@ -115,9 +121,9 @@ fn checkpoint(
         snapshot.pending_nodes,
     );
     for record in records {
-        text.push_str(&format!("\n{}: {}", record.id, record.state.label()));
+        let _ = write!(text, "\n{}: {}", record.id, record.state.label());
         if let Some(id) = &record.hub_id {
-            text.push_str(&format!("; hub {}", serde_json::to_string(id)?));
+            let _ = write!(text, "; hub {}", serde_json::to_string(id)?);
         }
     }
     Ok(ToolOutput {

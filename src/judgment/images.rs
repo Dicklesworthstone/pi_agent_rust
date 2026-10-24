@@ -9,9 +9,9 @@ use crate::model::ImageContent;
 
 use super::failure;
 
-pub(crate) const MAX_JUDGMENT_IMAGES: usize = 4;
-pub(crate) const MAX_JUDGMENT_IMAGE_BYTES: usize = 4_718_592;
-pub(crate) const MAX_JUDGMENT_IMAGE_ENCODED_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_JUDGMENT_IMAGES: usize = 4;
+pub const MAX_JUDGMENT_IMAGE_BYTES: usize = 4_718_592;
+pub const MAX_JUDGMENT_IMAGE_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 // The decoded allowance is divisible by three, so this exact encoded ceiling
 // also bounds every canonical padded base64 payload to the decoded allowance.
 const MAX_ENCODED_IMAGE_BYTES: usize = MAX_JUDGMENT_IMAGE_BYTES / 3 * 4;
@@ -33,7 +33,7 @@ fn limit() -> crate::error::Error {
 /// Native image metadata must match exactly; no MIME sanitization or format
 /// coercion is applied at this boundary. The shared decoder rejects whitespace,
 /// nonstandard alphabets, missing canonical padding and nonzero trailing bits.
-pub(crate) fn validate_image(image: &ImageContent) -> Result<usize> {
+pub fn validate_image(image: &ImageContent) -> Result<usize> {
     if !matches!(
         image.mime_type.as_str(),
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"

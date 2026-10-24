@@ -21,6 +21,7 @@ impl Peer {
         Self::with_settings(startup, hold_initialize, None)
     }
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn with_settings(
         startup: Value,
         hold_initialize: bool,
@@ -79,7 +80,7 @@ impl Peer {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        Some(Self { root, tool, rt })
+        Some(Self { tool, rt, root })
     }
 
     fn source(root: &Path) {
@@ -95,12 +96,14 @@ impl Peer {
         Ok(result.details.unwrap())
     }
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn configure(&self, settings: Value, apply: bool) -> Value {
         self.run(json!({"action":"configure","file":"source.cfgfixture",
             "payload":settings,"apply":apply,"timeout":5}))
             .unwrap()
     }
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn wire(&self, method: &str, params: Value) -> Value {
         self.run(json!({"action":"request","file":"source.cfgfixture",
             "method":method,"payload":params,"timeout":5}))
@@ -108,6 +111,7 @@ impl Peer {
             .clone()
     }
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn reverse(&self, method: &str, params: Value) -> Value {
         self.wire(
             "test/clientRequest",

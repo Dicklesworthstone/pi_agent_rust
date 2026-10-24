@@ -468,7 +468,7 @@ pub(super) fn resolve(
                             format!("./{main}")
                         }
                     } else {
-                        subpath.clone()
+                        subpath
                     };
                     return admitted_target(files, &package_root, &target);
                 }

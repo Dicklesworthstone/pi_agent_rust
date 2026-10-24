@@ -71,6 +71,7 @@ fn history(agent: &AgentSession) -> Value {
     json!({"leaf":session.leaf_id(), "entries":session.entries})
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers build the resolution inline with json!
 fn request(agent: &AgentSession, resolution: Value) -> Value {
     json!({"type":"goal", "op":"pause", "revision":state(agent)["revision"],
         "resolution":resolution})

@@ -102,7 +102,7 @@ fn imported_cwd_and_timeout_reach_trust_setup_tools_and_context() {
     let manager = imported_manager(
         &temp,
         &json!({"mcpServers":{"fixture":{
-            "command":"./serve", "cwd":"server", "timeout":120000
+            "command":"./serve", "cwd":"server", "timeout":120_000
         }}}),
     );
     let entry = manager.entry("fixture").expect("imported server");
@@ -151,9 +151,8 @@ fn imported_cwd_and_timeout_reach_trust_setup_tools_and_context() {
         Some(&manager.inner.cwd)
     );
     assert_ne!(McpManager::lock(&workspace).as_ref(), Some(&server_cwd));
-    let recorded = McpManager::lock(&requests);
     for method in ["initialize", "tools/list", "tools/call", "resources/list"] {
-        let timeouts: Vec<_> = recorded
+        let timeouts: Vec<_> = McpManager::lock(&requests)
             .iter()
             .filter(|(name, _)| name == method)
             .map(|(_, timeout)| *timeout)

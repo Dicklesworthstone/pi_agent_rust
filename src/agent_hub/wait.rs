@@ -25,7 +25,7 @@ struct ReplyWatch {
 
 /// Only the waiting operation owns a strong reference. Dropping a wait never
 /// needs the registry mutex, even when a process is reaped under that mutex.
-pub(crate) struct DependencyHold {
+pub struct DependencyHold {
     waiter: String,
     peers: Vec<String>,
     deadline: Instant,
@@ -105,6 +105,7 @@ pub struct InboxWaitResult {
     pub blocked_peers: Vec<String>,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes `&T`.
 const fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -358,6 +359,7 @@ impl AgentHubRegistry {
         replies
     }
 
+    #[allow(clippy::too_many_lines)] // One locked snapshot of inbox, peers and pending replies.
     pub(super) fn wait_snapshot(
         &self,
         recipient: &str,
@@ -575,10 +577,11 @@ async fn probe_inbox(
 }
 
 /// Wait for messages from one named run, or automatically await unanswered
-/// sends when no peer is named. Other live agents never sustain an automatic
-/// wait. A child can only read its own
-/// authenticated inbox; a root caller reads the parent inbox. An inherited
-/// channel never falls back to a different local registry.
+/// sends when no peer is named.
+///
+/// Other live agents never sustain an automatic wait. A child can only read
+/// its own authenticated inbox; a root caller reads the parent inbox. An
+/// inherited channel never falls back to a different local registry.
 #[allow(clippy::too_many_lines)] // Keep lease ownership and probes in one budgeted scope.
 pub async fn wait_for_replies(
     peer: Option<&str>,

@@ -53,6 +53,7 @@ impl Write for Writer {
         }
         let size = bytes.len().min(self.short);
         record.bytes.extend_from_slice(&bytes[..size]);
+        drop(record);
         if let Some(revoked) = &self.revoke_after {
             revoked.store(true, Ordering::SeqCst);
         }
@@ -79,6 +80,7 @@ fn send(writer: Writer, bytes: &[u8], revoked: &AtomicBool) -> Result<Writer> {
 }
 
 #[test]
+#[allow(clippy::naive_bytecount)] // one short test frame; no bytecount dependency
 fn partial_writes_and_interrupted_syscalls_preserve_exactly_one_frame() {
     let record = Arc::new(Mutex::new(Recorded::default()));
     let mut writer = Writer::new(&record);

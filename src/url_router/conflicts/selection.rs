@@ -70,8 +70,10 @@ fn validate(choices: &[ConflictChoice]) -> Result<()> {
 }
 
 /// Validate every selection against one fresh inventory, then stage all selected
-/// replacements together. The existing transaction owns rollback and recovery.
-/// No Git index update, implicit commit, whole-file replacement or replay occurs.
+/// replacements together.
+///
+/// The existing transaction owns rollback and recovery. No Git index update,
+/// implicit commit, whole-file replacement or replay occurs.
 ///
 /// # Errors
 /// Invalid/duplicate/stale choices and absent base sections fail before mutation.
@@ -86,7 +88,7 @@ pub fn apply_conflict_choices(
 
 /// One validated inventory shared by scope checks, undo capture and staging.
 /// Preparing never mutates a file or the Git index.
-pub(crate) struct PreparedConflicts {
+pub struct PreparedConflicts {
     snapshot: Snapshot,
     choices: Vec<ConflictChoice>,
 }
@@ -162,7 +164,7 @@ impl PreparedConflicts {
 /// Write accepts exact authored text at N/token, or a closed typed batch at *.
 /// Content is always literal, including "@theirs". Invalid shapes and payload
 /// limits are checked before invoking Git.
-pub(crate) fn prepare_conflict_write(cwd: &Path, value: &Value) -> Result<PreparedConflicts> {
+pub fn prepare_conflict_write(cwd: &Path, value: &Value) -> Result<PreparedConflicts> {
     let input = value
         .as_object()
         .ok_or_else(|| fail("INPUT", "write input must be an object"))?;
@@ -254,7 +256,7 @@ pub(super) fn parse_read(reference: &str) -> Result<ReadReference<'_>> {
             .map_or((reference, None), |(path, side)| {
                 (
                     path,
-                    Some(side.trim().strip_prefix('@').unwrap_or(side.trim())),
+                    Some(side.trim().strip_prefix('@').unwrap_or_else(|| side.trim())),
                 )
             });
     let parts: Vec<_> = path.split('/').collect();

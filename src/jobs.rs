@@ -314,18 +314,18 @@ impl JobSnapshot {
     }
 
     fn from_source_best_effort(source: &JobSnapshotSource) -> Self {
-        let (output_tail, output_bytes, output_lines, tail_truncated) = source
-            .tail
-            .try_lock()
-            .map(|tail| {
-                (
-                    tail.text(),
-                    tail.total_bytes,
-                    tail.line_count(),
-                    tail.total_bytes > tail.buf.len(),
-                )
-            })
-            .unwrap_or_else(|_| (String::new(), 0, 0, true));
+        let (output_tail, output_bytes, output_lines, tail_truncated) =
+            source.tail.try_lock().map_or_else(
+                |_| (String::new(), 0, 0, true),
+                |tail| {
+                    (
+                        tail.text(),
+                        tail.total_bytes,
+                        tail.line_count(),
+                        tail.total_bytes > tail.buf.len(),
+                    )
+                },
+            );
         let (artifact_truncated, artifact_error) = source.artifact.try_lock().map_or_else(
             |_| {
                 (
@@ -583,7 +583,7 @@ impl TailBuffer {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len());
         self.newlines = self
             .newlines
-            .saturating_add(chunk.iter().filter(|byte| **byte == b'\n').count());
+            .saturating_add(memchr::memchr_iter(b'\n', chunk).count());
         if let Some(last) = chunk.last() {
             self.last_byte_was_newline = *last == b'\n';
         }
@@ -1672,6 +1672,7 @@ impl Drop for ForegroundJob {
         };
         if job.status.settled() {
             reg.jobs.remove(&self.handle.id);
+            drop(reg);
         } else {
             job.delivery = JobDelivery::Abandoned;
             job.cancel_requested = true;
@@ -6280,6 +6281,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::significant_drop_tightening)] // `job` borrows from the registry guard
     fn promotion_bounds_a_terminal_snapshot_prepared_while_foreground() {
         let _guard = process_test_guard();
         let root = temp_root();

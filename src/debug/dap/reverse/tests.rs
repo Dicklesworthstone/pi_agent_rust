@@ -59,6 +59,7 @@ fn read(peer: &mut BufReader<TcpStream>) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn send(peer: &mut BufReader<TcpStream>, message: Value) {
     let body = serde_json::to_vec(&message).unwrap();
     write!(peer.get_mut(), "Content-Length: {}\r\n\r\n", body.len()).unwrap();

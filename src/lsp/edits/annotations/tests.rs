@@ -187,7 +187,7 @@ fn changes_form_cannot_bypass_required_annotations() {
     let temp = tempfile::tempdir().unwrap();
     let (path, uri) = file(temp.path(), "a.rs");
     let mut raw = workspace(&uri);
-    raw["changes"] = json!({uri.clone():raw["documentChanges"][0]["edits"]});
+    raw["changes"] = json!({uri:raw["documentChanges"][0]["edits"]});
     raw.as_object_mut().unwrap().remove("documentChanges");
     let error = apply_workspace_edit(&parse_workspace_edit(&raw).unwrap(), None).unwrap_err();
     assert!(error.to_string().contains("LSP_EDIT_CONFIRMATION_REQUIRED"));

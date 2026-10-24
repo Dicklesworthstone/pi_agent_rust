@@ -23,6 +23,7 @@ fn join() -> Value {
     json!({"id":"join","needs":["map"],"call":{"agent":"worker","task":"JOIN"}})
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn plan(nodes: Vec<Value>) -> Plan {
     Plan::parse(&json!({"workflow":nodes})).unwrap().unwrap()
 }
@@ -220,7 +221,7 @@ fn empty_maps_complete_without_a_synthetic_child_or_result() {
     record.begin_fanout(0, 1);
     assert_eq!(record.state, State::Accepted);
     assert!(record.result.is_none() && record.hub_id.is_none() && record.native_is_error.is_none());
-    let output = super::super::report(vec![record], 0, None);
+    let output = super::super::report(&[record], 0, None);
     assert!(!output.is_error);
     assert_eq!(
         output.details.unwrap()["nodes"][0]["fanout"]["itemCount"],
@@ -444,6 +445,7 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
     }
 
     impl Fixture {
+        #[allow(clippy::needless_pass_by_value)]
         fn new(data: Value) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let cwd = dir.path().join("workspace");
@@ -475,6 +477,7 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
         fn flag(&self, name: &str) {
             std::fs::write(self.global().join(name), "").unwrap();
         }
+        #[allow(clippy::needless_pass_by_value)]
         fn run(&self, nodes: Vec<Value>) -> crate::tools::ToolOutput {
             self.runtime
                 .block_on(self.tool.execute(

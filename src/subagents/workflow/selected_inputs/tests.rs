@@ -22,6 +22,7 @@ fn joined() -> Value {
     node
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn plan(join: Value) -> Plan {
     Plan::parse(&json!({"workflow":[node("left"),node("right"),join]}))
         .unwrap()
@@ -115,13 +116,13 @@ fn every_pair_of_dependency_states_has_order_independent_fail_closed_selection()
                 match (left, right) {
                     (State::Accepted, State::NotSelected) => assert_eq!(actual, Ok(&json!("left"))),
                     (State::NotSelected, State::Accepted) => {
-                        assert_eq!(actual, Ok(&json!("right")))
+                        assert_eq!(actual, Ok(&json!("right")));
                     }
                     (State::Accepted, State::Accepted) => {
-                        assert_eq!(actual, Err("selected_input_ambiguous"))
+                        assert_eq!(actual, Err("selected_input_ambiguous"));
                     }
                     (State::NotSelected, State::NotSelected) => {
-                        assert_eq!(actual, Err("selected_input_unavailable"))
+                        assert_eq!(actual, Err("selected_input_unavailable"));
                     }
                     _ => assert_eq!(actual, Err("selected_input_dependency_failed")),
                 }

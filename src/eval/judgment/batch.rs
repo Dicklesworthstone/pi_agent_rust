@@ -63,6 +63,12 @@ pub(super) struct Plan {
 
 impl Plan {
     pub(super) fn parse(input: &Value) -> BatchResult<Self> {
+        #[derive(Serialize)]
+        struct BorrowedRequest<'a> {
+            state: &'a Value,
+            questions: &'a Value,
+        }
+
         let fields = input
             .as_object()
             .filter(|fields| {
@@ -126,11 +132,6 @@ impl Plan {
         }) {
             return Err(INVALID.to_string());
         }
-        #[derive(Serialize)]
-        struct BorrowedRequest<'a> {
-            state: &'a Value,
-            questions: &'a Value,
-        }
         let questions = &fields["questions"];
         let mut remaining = MAX_INPUT_BYTES;
         let mut image_bytes = 0_usize;
@@ -172,6 +173,7 @@ fn check_owner(owner: &AgentCx) -> BatchResult<()> {
 }
 
 impl Invocation<'_> {
+    #[allow(clippy::too_many_lines)] // one batch flow: admit, prepare, run bounded workers, aggregate
     pub(super) async fn evaluate_batch(
         &mut self,
         cwd: &Path,

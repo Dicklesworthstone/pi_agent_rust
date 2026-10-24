@@ -7,7 +7,7 @@ use crate::model::{
 use crate::provider::{Context, Provider};
 use crate::tools::Tool;
 use futures::Stream;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,8 +41,7 @@ impl RecordedProvider {
             self.clone(),
             StreamOptions {
                 api_key: Some("host-only-credential".into()),
-                headers: [("X-Host-Binding".into(), "retained-header".into())]
-                    .into_iter()
+                headers: std::iter::once(("X-Host-Binding".into(), "retained-header".into()))
                     .collect(),
                 max_tokens: Some(99),
                 ..StreamOptions::default()
@@ -68,13 +67,13 @@ impl Drop for PendingReply {
 
 #[async_trait::async_trait]
 impl Provider for RecordedProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fixture"
     }
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "fixture-stream"
     }
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "eval-judge"
     }
 
@@ -221,10 +220,10 @@ fn catalog_entry(provider: &str, id: &str, reasoning: bool) -> ModelEntry {
             },
             context_window: 128_000,
             max_tokens: 8_192,
-            headers: Default::default(),
+            headers: HashMap::default(),
         },
         api_key: Some("catalog-owned-key".into()),
-        headers: Default::default(),
+        headers: HashMap::default(),
         auth_header: true,
         compat: None,
         oauth_config: None,
@@ -568,6 +567,7 @@ fn live_privacy_is_applied_to_dynamic_state_and_never_retained_between_cells() {
             .iter()
             .all(|prompt| !prompt.contains("SESSION-CANARY"))
     );
+    drop(prompts);
 }
 
 #[test]

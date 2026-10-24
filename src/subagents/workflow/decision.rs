@@ -60,7 +60,7 @@ pub(super) struct Admission {
 }
 
 impl Admission {
-    fn ready(condition: Option<&'static str>) -> Self {
+    const fn ready(condition: Option<&'static str>) -> Self {
         Self {
             reason: None,
             sources: Vec::new(),
@@ -69,7 +69,7 @@ impl Admission {
         }
     }
 
-    fn stopped(reason: &'static str, sources: Vec<usize>, not_selected: bool) -> Self {
+    const fn stopped(reason: &'static str, sources: Vec<usize>, not_selected: bool) -> Self {
         Self {
             reason: Some(reason),
             sources,

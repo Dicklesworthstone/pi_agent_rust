@@ -9,6 +9,7 @@ use super::{
 };
 use serde::Serialize;
 use serde_json::json;
+use std::fmt::Write as _;
 
 const MAX_ITEMS: usize = 32;
 const MAX_BATCH_SIZE: usize = 128;
@@ -264,29 +265,32 @@ impl Run {
         self.data_unavailable = None;
     }
 
-    pub(super) fn validated_data(&self) -> Option<&Value> {
+    pub(super) const fn validated_data(&self) -> Option<&Value> {
         self.data.as_ref()
     }
 
     pub(super) fn render(&self, content: &mut String) {
-        content.push_str(&format!(
-            "Fan-out: {} item(s); {} native results.\n",
+        let _ = writeln!(
+            content,
+            "Fan-out: {} item(s); {} native results.",
             self.item_count,
             self.items.len()
-        ));
-        content.push_str(&format!(
-            "Typed aggregate: {}.\n",
+        );
+        let _ = writeln!(
+            content,
+            "Typed aggregate: {}.",
             self.data_unavailable.unwrap_or("available")
-        ));
+        );
         for item in &self.items {
-            content.push_str(&format!(
+            let _ = write!(
+                content,
                 "\n## Item {}; state: {}; hub: {}\n",
                 item.index,
                 item.state.label(),
                 item.hub_id
                     .as_ref()
                     .map_or_else(|| "none".into(), |id| json!(id).to_string())
-            ));
+            );
             content.push_str(&render_results(std::slice::from_ref(&item.result)));
         }
     }

@@ -87,6 +87,7 @@ fn gdb_adapter() -> AdapterSpec {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)] // one declarative spec per built-in adapter
 pub fn default_adapters() -> Vec<AdapterSpec> {
     let mut lldb_candidates = vec!["lldb-dap".to_string()];
     for dir in ["/usr/lib", "/usr/local/lib"] {
@@ -215,6 +216,7 @@ pub enum TargetKind {
 }
 
 /// Local package directories are meaningful Go targets, not native binaries.
+///
 /// A compiled Go binary still needs adapter="dlv" because its language cannot
 /// be inferred reliably from its filename. Managed PE targets are recognized
 /// from bounded CLR/metadata headers, not a .dll filename alone.

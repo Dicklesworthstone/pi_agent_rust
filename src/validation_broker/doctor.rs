@@ -140,7 +140,7 @@ impl NativeDoctorEvidence {
                 self.has_failures |= !failures.is_empty();
                 if failures
                     .iter()
-                    .any(|failure| !failure.as_str().is_some_and(|text| !text.trim().is_empty()))
+                    .any(|failure| failure.as_str().is_none_or(|text| text.trim().is_empty()))
                 {
                     self.degraded_reasons
                         .push("doctor_swarm_resource_critical_failures_invalid".to_string());
@@ -175,10 +175,10 @@ impl NativeDoctorEvidence {
             "max_queue_depth",
             "max_rss_bytes",
         ] {
-            if !budgets
+            if budgets
                 .and_then(|budgets| budgets.get(name))
                 .and_then(Value::as_u64)
-                .is_some_and(|value| value > 0)
+                .is_none_or(|value| value == 0)
             {
                 self.degraded_reasons
                     .push(format!("doctor_swarm_resource_budget_{name}_invalid"));

@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
         assert!(!events.iter().any(|event| matches!(
             event,
-            Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error { .. })
+            Ok(StreamEvent::Done { .. } | StreamEvent::Error { .. })
         )));
     }
 

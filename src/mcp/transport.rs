@@ -164,13 +164,15 @@ impl ClientRoots {
             "roots/list" => self.0.get().cloned(),
             _ => None,
         };
-        match result {
-            Some(result) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            None => serde_json::json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": {"code": -32601, "message": "client method is not supported"}
-            }),
-        }
+        result.map_or_else(
+            || {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "client method is not supported"}
+                })
+            },
+            |result| serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )
     }
 }
 
@@ -5020,7 +5022,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
-    const STDIO_ROOTS_PEER: &str = r#"
+    const STDIO_ROOTS_PEER: &str = r"
 import json, sys
 handshake = json.loads(sys.argv[1])
 observed_initialize = None
@@ -5050,7 +5052,7 @@ for line in sys.stdin:
             waiting = frame['id']
         else:
             finish(frame['id'])
-"#;
+";
 
     #[cfg(unix)]
     #[test]

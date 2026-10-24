@@ -79,9 +79,7 @@ impl Fixture {
             self.clone(),
             StreamOptions {
                 api_key: Some("HOST-CREDENTIAL-CANARY".into()),
-                headers: [("X-Host".into(), "fixed-binding".into())]
-                    .into_iter()
-                    .collect(),
+                headers: std::iter::once(("X-Host".into(), "fixed-binding".into())).collect(),
                 max_tokens: Some(99),
                 ..StreamOptions::default()
             },
@@ -146,13 +144,13 @@ impl Stream for Reply {
 
 #[async_trait::async_trait]
 impl Provider for Fixture {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fixture"
     }
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "fixture-stream"
     }
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "batch-judge"
     }
 
@@ -496,6 +494,7 @@ fn per_item_privacy_blocks_only_that_item_and_never_exposes_callback_payloads() 
     assert_eq!(prompts.len(), 2);
     assert!(prompts[0].contains("redacted"));
     assert!(prompts.iter().all(|prompt| !prompt.contains("CANARY")));
+    drop(prompts);
 }
 
 fn code(kernel: &str, request: &Value) -> String {

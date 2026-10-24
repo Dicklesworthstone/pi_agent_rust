@@ -29,7 +29,7 @@ pub(super) struct Header {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Page {
+pub struct Page {
     reference: String,
     offset: usize,
     total_bytes: usize,
@@ -152,7 +152,7 @@ impl Pages {
 
 /// One accepted snapshot belongs to one authenticated connection and reader.
 /// Dropping the connection releases it immediately, even mid-frame.
-pub(crate) struct Transfer {
+pub struct Transfer {
     pages: Pages,
     sender: String,
     identity: (PathBuf, u32),
@@ -176,11 +176,11 @@ impl Transfer {
     }
 
     pub(crate) fn check_reader(&self) -> Result<()> {
-        self.check_identity(current_identity(&self.sender)?)
+        self.check_identity(&current_identity(&self.sender)?)
     }
 
-    fn check_identity(&self, observed: (PathBuf, u32)) -> Result<()> {
-        if observed != self.identity {
+    fn check_identity(&self, observed: &(PathBuf, u32)) -> Result<()> {
+        if *observed != self.identity {
             return Err(ipc_error(
                 "REVOKED",
                 "result reader identity changed during transfer",
@@ -200,7 +200,7 @@ impl Transfer {
         &mut self,
         observed: Result<(PathBuf, u32)>,
     ) -> Result<Option<WireResponse>> {
-        self.check_identity(observed?)?;
+        self.check_identity(&observed?)?;
         Ok(self.pages.next())
     }
 }

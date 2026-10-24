@@ -71,6 +71,7 @@ impl Fixture {
         self.dir.path().join("workspace")
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn run(&self, nodes: Vec<Value>) -> crate::tools::ToolOutput {
         self.runtime
             .block_on(self.tool.execute(

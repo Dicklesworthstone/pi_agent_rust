@@ -211,14 +211,14 @@ impl TerminalHost {
             .name("dap-terminal-owner".into())
             .spawn(move || {
                 worker::run(
-                    request,
-                    workspace,
-                    worker_owner,
-                    connected,
-                    terminal,
+                    &request,
+                    &workspace,
+                    &worker_owner,
+                    &connected,
+                    &terminal,
                     receiver,
                     sender,
-                    capacity,
+                    &capacity,
                 );
             })
             .map_err(|error| {
@@ -264,6 +264,7 @@ impl TerminalHost {
                 "adapter did not obtain a successfully started terminal",
             ));
         }
+        drop(info);
         Ok(())
     }
 

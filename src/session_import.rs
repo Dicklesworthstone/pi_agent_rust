@@ -279,6 +279,7 @@ fn find_imported_session(root: &Path, id: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+#[allow(clippy::too_many_lines)] // one linear validate, convert, and persist pipeline
 fn import_bytes(
     source: ImportSource,
     raw: &[u8],

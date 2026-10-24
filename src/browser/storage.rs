@@ -549,7 +549,7 @@ mod tests {
 
     fn cookie(domain: &str, secure: bool, session: bool) -> Value {
         json!({"name":"session", "value":"PRIVATE-CANARY", "domain":domain, "path":"/",
-            "secure":secure, "httpOnly":true, "session":session, "expires":1900000000.0,
+            "secure":secure, "httpOnly":true, "session":session, "expires":1_900_000_000.0,
             "sameSite":"Lax", "priority":"Medium", "sourceScheme":"Secure", "sourcePort":443})
     }
 
@@ -670,7 +670,7 @@ mod tests {
         assert_eq!(cookies.len(), 2);
         assert!(cookies[0].http_only);
         assert!(cookies[0].expires.is_none());
-        assert_eq!(cookies[1].expires, Some(1900000000.0));
+        assert_eq!(cookies[1].expires, Some(1_900_000_000.0));
         assert!(
             serde_json::to_value(&cookies[0])
                 .unwrap()

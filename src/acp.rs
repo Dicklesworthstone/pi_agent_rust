@@ -396,18 +396,12 @@ impl AcpOutput {
     /// Detach under the output-state lock so admission cannot race a new
     /// permission publication or cancellation of a subsequent prompt.
     fn take_permissions(&self, session_id: &str) -> Vec<PendingPermission> {
-        let mut pending = self
-            .shared
+        self.shared
             .pending_permissions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ids = pending
-            .iter()
-            .filter(|(_, permission)| permission.session_id == session_id)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        ids.into_iter()
-            .filter_map(|key| pending.remove(&key))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extract_if(|_, permission| permission.session_id == session_id)
+            .map(|(_, permission)| permission)
             .collect()
     }
 
@@ -844,7 +838,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
         let _ = writer_done_tx.send(result);
     });
 
-    let result = run(options, in_rx, out_tx).await;
+    let result = Box::pin(run(options, in_rx, out_tx)).await;
     // Prompt settlement can leave final frames queued. The process must keep
     // running until stdout flushes them, or report that delivery is incomplete.
     // A blocked OS write cannot be joined safely on an async worker.
@@ -1195,7 +1189,7 @@ async fn run(
 
                         let spawned = options.runtime_handle.try_spawn(async move {
                             prompt_guard.started = true;
-                            let stop_reason = run_prompt(
+                            let stop_reason = Box::pin(run_prompt(
                                 session_state,
                                 message_content,
                                 mcp_command,
@@ -1203,7 +1197,7 @@ async fn run(
                                 out_tx_prompt.clone(),
                                 prompt_session_id.clone(),
                                 prompt_cx.clone(),
-                            )
+                            ))
                             .await;
 
                             prompt_guard.settled = true;
@@ -3290,7 +3284,7 @@ mod tests {
     ) -> (&'static str, Vec<Value>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
         let tx = AcpOutput::new(tx);
-        let reason = run_prompt(
+        let reason = Box::pin(run_prompt(
             state,
             vec![ContentBlock::Text(TextContent::new("editor prompt"))],
             None,
@@ -3298,7 +3292,7 @@ mod tests {
             tx,
             "editor-session".to_string(),
             AgentCx::for_current_or_request(),
-        )
+        ))
         .await;
         let updates = rx
             .try_iter()
@@ -3432,7 +3426,7 @@ mod tests {
                 "dispatch must not claim native delivery before execution"
             );
             guard.started = true;
-            let reason = run_prompt(
+            let reason = Box::pin(run_prompt(
                 Arc::clone(&state),
                 vec![ContentBlock::Text(TextContent::new("editor prompt"))],
                 None,
@@ -3440,7 +3434,7 @@ mod tests {
                 output.clone(),
                 "editor-session".into(),
                 AgentCx::for_current_or_request(),
-            )
+            ))
             .await;
             guard.settled = true;
             drop(guard);
@@ -3512,7 +3506,7 @@ mod tests {
                 "fallback replies wait until the owning turn retires"
             );
             guard.started = true;
-            let reason = run_prompt(
+            let reason = Box::pin(run_prompt(
                 state,
                 vec![ContentBlock::Text(TextContent::new(
                     "cancelled before start",
@@ -3522,7 +3516,7 @@ mod tests {
                 output.clone(),
                 "editor-session".into(),
                 AgentCx::for_current_or_request(),
-            )
+            ))
             .await;
             guard.settled = true;
             output
@@ -3734,7 +3728,7 @@ mod tests {
                         .begin_prompt("editor-session".into(), abort)
                         .expect("register native prompt");
                     guard.started = true;
-                    let reason = run_prompt(
+                    let reason = Box::pin(run_prompt(
                         Arc::clone(&state),
                         vec![ContentBlock::Text(TextContent::new("editor prompt"))],
                         None,
@@ -3742,7 +3736,7 @@ mod tests {
                         output.clone(),
                         "editor-session".into(),
                         AgentCx::for_current_or_request(),
-                    )
+                    ))
                     .await;
                     guard.settled = true;
 

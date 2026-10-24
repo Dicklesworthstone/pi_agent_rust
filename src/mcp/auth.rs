@@ -81,7 +81,7 @@ enum ObservedLogin {
 }
 
 #[derive(Clone)]
-pub(crate) struct AuthBinding {
+pub struct AuthBinding {
     path: PathBuf,
     identity: String,
     resource: String,
@@ -179,6 +179,7 @@ impl AuthBinding {
                 ));
             }
         }
+        drop(observed);
         Ok(())
     }
 
@@ -319,12 +320,12 @@ impl AuthBinding {
                 }
                 check_owner(&owner)
             });
-            binding.forget_sync(check)
+            binding.forget_sync(&check)
         })
         .await
     }
 
-    fn forget_sync(&self, check: Admission) -> Result<()> {
+    fn forget_sync(&self, check: &Admission) -> Result<()> {
         check()?;
         self.prepare_directory()?;
         let _transaction = crate::file_lock::DirLock::acquire_for(
@@ -395,21 +396,23 @@ impl AuthBinding {
             // Current-Cx guards must not remain in the async state across an
             // await; the owned worker reinstalls this owner on every poll.
             let _admission = owner.cx().clone().set_current_restricted();
-            let _ = runtime
-                .try_spawn(async move {
-                    // Once token rotation has been sent, losing the waiting request
-                    // must not discard its replacement refresh token. Mask only this
-                    // bounded completion task, under the original effect capabilities.
-                    let operation = bounded(binding.refresh(record), Duration::from_secs(120));
-                    let mut operation = std::pin::pin!(operation);
-                    let result = poll_fn(|task| {
-                        let _scope = owner.cx().clone().set_current_restricted();
-                        owner.masked(|| operation.as_mut().poll(task))
+            drop(
+                runtime
+                    .try_spawn(async move {
+                        // Once token rotation has been sent, losing the waiting request
+                        // must not discard its replacement refresh token. Mask only this
+                        // bounded completion task, under the original effect capabilities.
+                        let operation = bounded(binding.refresh(record), Duration::from_secs(120));
+                        let mut operation = std::pin::pin!(operation);
+                        let result = poll_fn(|task| {
+                            let _scope = owner.cx().clone().set_current_restricted();
+                            owner.masked(|| operation.as_mut().poll(task))
+                        })
+                        .await;
+                        let _ = sender.send(result);
                     })
-                    .await;
-                    let _ = sender.send(result);
-                })
-                .map_err(|_| error("RUNTIME", "cannot start the bounded MCP token refresh"))?;
+                    .map_err(|_| error("RUNTIME", "cannot start the bounded MCP token refresh"))?,
+            );
         }
         receiver.await.map_err(|_| {
             error(
@@ -452,7 +455,7 @@ impl AuthBinding {
             ("resource".to_string(), self.resource.clone()),
         ];
         let value = token_request(credentials, &mut fields).await?;
-        let updated_credentials = parse_tokens(value, credentials.clone())?;
+        let updated_credentials = parse_tokens(&value, credentials.clone())?;
         let expected = Some((current.epoch.clone(), current.revision.clone()));
         let updated = Record {
             revision: nonce(),
@@ -493,6 +496,7 @@ impl AuthBinding {
         .await
     }
 
+    #[allow(clippy::too_many_lines)] // one linear PKCE authorization-code flow
     async fn login(
         &self,
         configuration: McpOAuthConfig,
@@ -577,7 +581,7 @@ impl AuthBinding {
             ("resource".to_string(), self.resource.clone()),
         ];
         let value = token_request(&credentials, &mut fields).await?;
-        credentials = parse_tokens(value, credentials)?;
+        credentials = parse_tokens(&value, credentials)?;
         check()?;
         let record = Record {
             version: 1,
@@ -897,6 +901,7 @@ fn bearer_parameters(header: &str) -> Result<HashMap<String, String>> {
     Ok(values)
 }
 
+#[allow(clippy::too_many_lines)] // protected-resource then authorization-server discovery chain
 async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
     let resource_url = checked_url(resource)?;
     check()?;
@@ -1093,10 +1098,10 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
 
 /// An explicit scope, including an empty one, takes precedence over discovery.
 fn configured_scope(configuration: &McpOAuthConfig, metadata: &Metadata) -> Result<Option<String>> {
-    match configuration.scope.as_deref() {
-        Some(scope) => scope_string(scope),
-        None => Ok(metadata.scope.clone()),
-    }
+    configuration
+        .scope
+        .as_deref()
+        .map_or_else(|| Ok(metadata.scope.clone()), scope_string)
 }
 
 fn authorization_prompt<'a>(
@@ -1156,22 +1161,22 @@ fn bind_callback(configuration: &McpOAuthConfig) -> Result<(TcpListener, String)
     listener
         .set_nonblocking(true)
         .map_err(|_| error("CALLBACK", "cannot configure the OAuth loopback callback"))?;
-    let redirect_uri = match &configuration.redirect_uri {
-        Some(redirect) => redirect.clone(),
-        None => {
-            let address = listener
-                .local_addr()
-                .map_err(|_| error("CALLBACK", "cannot read the OAuth callback address"))?;
-            let path = configuration
-                .callback_path
-                .as_deref()
-                .unwrap_or("/oauth/callback");
-            format!("http://127.0.0.1:{}{path}", address.port())
-        }
+    let redirect_uri = if let Some(redirect) = &configuration.redirect_uri {
+        redirect.clone()
+    } else {
+        let address = listener
+            .local_addr()
+            .map_err(|_| error("CALLBACK", "cannot read the OAuth callback address"))?;
+        let path = configuration
+            .callback_path
+            .as_deref()
+            .unwrap_or("/oauth/callback");
+        format!("http://127.0.0.1:{}{path}", address.port())
     };
     Ok((listener, redirect_uri))
 }
 
+#[allow(clippy::too_many_lines)] // configured client, or one dynamic registration exchange
 async fn register_client(
     metadata: &Metadata,
     configuration: &McpOAuthConfig,
@@ -1382,7 +1387,7 @@ async fn token_request(
     .await
 }
 
-fn parse_tokens(value: Value, mut credentials: Credentials) -> Result<Credentials> {
+fn parse_tokens(value: &Value, mut credentials: Credentials) -> Result<Credentials> {
     let token_type = value
         .get("token_type")
         .and_then(Value::as_str)
@@ -1591,7 +1596,7 @@ async fn await_callback(
                 Ok(0) => break,
                 Ok(count) => request.extend_from_slice(&chunk[..count]),
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    pause(Duration::from_millis(10)).await
+                    pause(Duration::from_millis(10)).await;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
@@ -1617,8 +1622,6 @@ async fn await_callback(
 #[cfg(test)]
 mod configured_tests {
     use super::*;
-    use base64::Engine as _;
-    use sha2::Digest as _;
 
     #[derive(Clone)]
     struct CapturedRequest {
@@ -1721,6 +1724,7 @@ mod configured_tests {
         fn captured(&self) -> Vec<CapturedRequest> {
             let failures = self.failures.lock().expect("failure capture");
             assert!(failures.is_empty(), "fixture failures: {failures:?}");
+            drop(failures);
             self.requests.lock().expect("request capture").clone()
         }
     }
@@ -1914,7 +1918,7 @@ mod configured_tests {
                 url::Host::Ipv4(address) => IpAddr::V4(address),
                 url::Host::Ipv6(address) => IpAddr::V6(address),
                 url::Host::Domain("localhost") => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                _ => panic!("callback must remain loopback"),
+                url::Host::Domain(_) => panic!("callback must remain loopback"),
             };
             let address = SocketAddr::new(
                 address,
@@ -1942,6 +1946,7 @@ mod configured_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one login, code exchange and refresh transcript
     fn configured_client_login_bypasses_registration_and_refreshes_with_its_secret() {
         let fixture = OAuthFixture::start(&["client_secret_basic", "client_secret_post"]);
         let temp = tempfile::tempdir().expect("credential directory");
@@ -1986,6 +1991,7 @@ mod configured_tests {
         assert_eq!(authorization.path(), "/authorize");
         let parameters: HashMap<String, String> =
             authorization.query_pairs().into_owned().collect();
+        drop(browser);
         assert_eq!(
             parameters.get("client_id").map(String::as_str),
             Some("configured-client")
@@ -2115,6 +2121,7 @@ mod configured_tests {
             assert_eq!(browser.len(), 1);
             let parameters: HashMap<String, String> =
                 browser[0].query_pairs().into_owned().collect();
+            drop(browser);
             assert_eq!(parameters.get("scope").map(String::as_str), expected_scope);
             assert_eq!(
                 parameters.get("prompt").map(String::as_str),
@@ -2495,7 +2502,7 @@ mod tests {
             drop(attempt.lock().unwrap().take());
             Ok(())
         });
-        assert!(binding.forget_sync(check).is_err());
+        assert!(binding.forget_sync(&check).is_err());
         let persisted = binding.read_sync().unwrap().unwrap();
         assert_eq!(persisted.epoch, original.epoch);
         assert!(!persisted.revoked);
@@ -2585,37 +2592,37 @@ mod tests {
 
     #[test]
     fn token_response_requires_bearer_and_preserves_optional_refresh_token() {
-        assert!(parse_tokens(json!({"token_type":"Bearer"}), credentials()).is_err());
+        assert!(parse_tokens(&json!({"token_type":"Bearer"}), credentials()).is_err());
         assert!(
             parse_tokens(
-                json!({"access_token":"", "token_type":"Bearer"}),
+                &json!({"access_token":"", "token_type":"Bearer"}),
                 credentials()
             )
             .is_err()
         );
         assert!(
             parse_tokens(
-                json!({"access_token":"good", "token_type":"mac"}),
+                &json!({"access_token":"good", "token_type":"mac"}),
                 credentials()
             )
             .is_err()
         );
         assert!(
             parse_tokens(
-                json!({"access_token":"x\r\ny", "token_type":"Bearer"}),
+                &json!({"access_token":"x\r\ny", "token_type":"Bearer"}),
                 credentials()
             )
             .is_err()
         );
         assert!(
             parse_tokens(
-                json!({"access_token":"good", "token_type":"Bearer", "expires_in":0}),
+                &json!({"access_token":"good", "token_type":"Bearer", "expires_in":0}),
                 credentials()
             )
             .is_err()
         );
         let rotated = parse_tokens(
-            json!({
+            &json!({
                 "access_token":"new-access", "token_type":"Bearer", "expires_in":3600,
                 "refresh_token":"rotated-refresh",
             }),
@@ -2624,7 +2631,7 @@ mod tests {
         .unwrap();
         assert_eq!(rotated.refresh_token.as_deref(), Some("rotated-refresh"));
         let unchanged = parse_tokens(
-            json!({"access_token":"new-access", "token_type":"bearer"}),
+            &json!({"access_token":"new-access", "token_type":"bearer"}),
             credentials(),
         )
         .unwrap();

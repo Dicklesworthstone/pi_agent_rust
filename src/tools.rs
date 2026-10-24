@@ -243,9 +243,11 @@ pub trait ToolInvocationHost: Send + Sync {
     ) -> Result<ToolOutput>;
 }
 
-/// Authority borrowed for one native invocation. A background-capable tool
-/// may ask for an owned privacy projection, but cannot retain this context or
-/// use it to extend the lifetime of Agent tool-call authority.
+/// Authority borrowed for one native invocation.
+///
+/// A background-capable tool may ask for an owned privacy projection, but
+/// cannot retain this context or use it to extend the lifetime of Agent
+/// tool-call authority.
 pub struct ToolInvocationContext<'a> {
     pub protect: &'a (dyn for<'p, 's> Fn(&'p [&'s str]) -> Result<Vec<String>> + Send + Sync),
     pub host: Option<&'a dyn ToolInvocationHost>,
@@ -6816,7 +6818,9 @@ fn document_read_output(
             format!("Offset {start} is beyond end of document ({total_lines} lines total)"),
         ));
     }
-    let limit = usize::try_from(input.limit.unwrap_or(DEFAULT_MAX_LINES as i64))
+    let limit = input
+        .limit
+        .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(DEFAULT_MAX_LINES)
         .clamp(1, DEFAULT_MAX_LINES);
     let width = start
@@ -6844,8 +6848,7 @@ fn document_read_output(
                 return Err(Error::tool(
                     "read",
                     format!(
-                        "[DOCUMENT_LINE_LIMIT] Rendered line {start} exceeds the {} byte output limit; read the source with raw=true or inspect it with a format-specific tool",
-                        DEFAULT_MAX_BYTES
+                        "[DOCUMENT_LINE_LIMIT] Rendered line {start} exceeds the {DEFAULT_MAX_BYTES} byte output limit; read the source with raw=true or inspect it with a format-specific tool"
                     ),
                 ));
             }
@@ -8904,7 +8907,7 @@ impl BashTool {
 
     fn annotate_bash_mediation(
         mut output: ToolOutput,
-        warning: &Option<(String, serde_json::Value)>,
+        warning: Option<&(String, serde_json::Value)>,
     ) -> ToolOutput {
         if let Some((rules, payload)) = warning {
             if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
@@ -9071,7 +9074,7 @@ impl Tool for BashTool {
                     &input.command,
                 )? {
                     bash_session::Acquisition::Persistent(transaction) => {
-                        shell_state = Some(transaction)
+                        shell_state = Some(transaction);
                     }
                     bash_session::Acquisition::Temporary(notice) => shell_notice = Some(notice),
                 }
@@ -9201,12 +9204,12 @@ impl Tool for BashTool {
                             details: None,
                             is_error: true,
                         },
-                        &mediation_warning,
+                        mediation_warning.as_ref(),
                     ));
                 }
             };
             return Self::background_start_output(job, false)
-                .map(|output| Self::annotate_bash_mediation(output, &mediation_warning));
+                .map(|output| Self::annotate_bash_mediation(output, mediation_warning.as_ref()));
         }
 
         if shell_state.is_some()
@@ -9241,7 +9244,7 @@ impl Tool for BashTool {
         {
             return Ok(Self::annotate_bash_mediation(
                 Self::annotate_shell_state(output, shell_notice),
-                &mediation_warning,
+                mediation_warning.as_ref(),
             ));
         }
 
@@ -9278,7 +9281,7 @@ impl Tool for BashTool {
         self.bash_result_output(tool_call_id, result).map(|output| {
             Self::annotate_bash_mediation(
                 Self::annotate_shell_state(output, shell_notice),
-                &mediation_warning,
+                mediation_warning.as_ref(),
             )
         })
     }
@@ -15951,7 +15954,7 @@ impl PtyProcessGuard {
         }
     }
 
-    fn process_id(&self) -> Option<u32> {
+    const fn process_id(&self) -> Option<u32> {
         self.process_id
     }
 
@@ -21898,16 +21901,16 @@ mod tests {
             let owner = resolver_owner.clone();
             let mut suspended = false;
             Box::pin(std::future::poll_fn(move |task| {
-                if !suspended {
-                    suspended = true;
-                    task.waker().wake_by_ref();
-                    std::task::Poll::Pending
-                } else {
+                if suspended {
                     owner.cancel_with(
                         asupersync::types::CancelKind::User,
                         Some("cancelled while resolving the session"),
                     );
                     std::task::Poll::Ready(Some("resolver-owner".to_string()))
+                } else {
+                    suspended = true;
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
                 }
             }))
         }));

@@ -202,12 +202,12 @@ mod tests {
         bytes
     }
 
-    fn webp_chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    fn webp_chunk(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut bytes = b"RIFF".to_vec();
         let length = u32::try_from(payload.len()).unwrap();
         bytes.extend_from_slice(&(12 + length + (length & 1)).to_le_bytes());
         bytes.extend_from_slice(b"WEBP");
-        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&kind);
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.extend_from_slice(payload);
         if length & 1 != 0 {
@@ -223,12 +223,12 @@ mod tests {
             ("image/gif", gif_frame(2, 3)),
             (
                 "image/webp",
-                webp_chunk(b"VP8 ", &[0, 0, 0, 0x9d, 1, 0x2a, 2, 0, 3, 0]),
+                webp_chunk(*b"VP8 ", &[0, 0, 0, 0x9d, 1, 0x2a, 2, 0, 3, 0]),
             ),
-            ("image/webp", webp_chunk(b"VP8L", &[0x2f, 1, 0x80, 0, 0])),
+            ("image/webp", webp_chunk(*b"VP8L", &[0x2f, 1, 0x80, 0, 0])),
             (
                 "image/webp",
-                webp_chunk(b"VP8X", &[0, 0, 0, 0, 1, 0, 0, 2, 0, 0]),
+                webp_chunk(*b"VP8X", &[0, 0, 0, 0, 1, 0, 0, 2, 0, 0]),
             ),
         ]
     }
@@ -278,7 +278,7 @@ mod tests {
             dimensions(&encoded(&jpeg_frame(4096, 4096, 0xc2)), "image/jpeg").unwrap(),
             (4096, 4096)
         );
-        let huge = webp_chunk(b"VP8X", &[0, 0, 0, 0, 0xff, 0xff, 0xff, 0, 0, 0]);
+        let huge = webp_chunk(*b"VP8X", &[0, 0, 0, 0, 0xff, 0xff, 0xff, 0, 0, 0]);
         assert!(dimensions(&encoded(&huge), "image/webp").is_err());
     }
 
@@ -290,7 +290,7 @@ mod tests {
         let mut gif = gif_frame(2, 3);
         gif[10] = 0x80;
         assert!(dimensions(&encoded(&gif), "image/gif").is_err());
-        let mut webp = webp_chunk(b"VP8L", &[0x2f, 1, 0x80, 0, 0]);
+        let mut webp = webp_chunk(*b"VP8L", &[0x2f, 1, 0x80, 0, 0]);
         *webp.last_mut().unwrap() = 1;
         assert!(dimensions(&encoded(&webp), "image/webp").is_err());
         webp[4] = 0;

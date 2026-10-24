@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn unicode_and_line_endings_map_to_the_original_bytes() {
         let range = json!({"start":{"line":0,"character":2},"end":{"line":1,"character":1}});
-        let out = render(&chain(&[range.clone()]), "😀x\r\ny\rz", 2, 16).unwrap();
+        let out = render(&chain(std::slice::from_ref(&range)), "😀x\r\ny\rz", 2, 16).unwrap();
         assert_eq!(out["ranges"][0]["range"], range);
         assert_eq!(out["ranges"][0]["text"], "x\r\ny");
         assert_eq!(out["ranges"][0]["byteLength"], 4);
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn malformed_unsigned_coordinates_do_not_become_clamped_ranges() {
-        for number in [json!(-1), json!(1.5), json!("0"), json!(2147483648_u64)] {
+        for number in [json!(-1), json!(1.5), json!("0"), json!(2_147_483_648_u64)] {
             let mut raw = chain(&[span(0, 1)]);
             raw[0]["range"]["start"]["character"] = number;
             assert!(render(&raw, "x", 0, 16).is_err());

@@ -14,6 +14,7 @@ use flate2::write::ZlibEncoder;
 use flate2::{Compression, Crc};
 use serde::Deserialize;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -38,13 +39,13 @@ const MAX_ACTIVE_READS: usize = 2;
 static ACTIVE_READS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum VideoSelector {
+pub enum VideoSelector {
     Frame(u64),
     Time(f64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct VideoReadTarget {
+pub struct VideoReadTarget {
     pub path: String,
     pub selector: Option<VideoSelector>,
 }
@@ -84,7 +85,7 @@ fn demuxer(path: &Path) -> Option<&'static str> {
 
 /// Pure routing: callers check literal existence only within the read scope.
 /// A real filename containing a colon wins over selector interpretation.
-pub(crate) fn parse_target(path: &str, literal_exists: bool) -> Result<Option<VideoReadTarget>> {
+pub fn parse_target(path: &str, literal_exists: bool) -> Result<Option<VideoReadTarget>> {
     if demuxer(Path::new(path)).is_some() {
         return Ok(Some(VideoReadTarget {
             path: path.to_owned(),
@@ -849,14 +850,14 @@ fn compose_sheet(frames: &[Vec<u8>]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((width, height, rgb))
 }
 
-fn png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) -> Result<()> {
+fn png_chunk(png: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) -> Result<()> {
     let length = u32::try_from(data.len())
         .map_err(|_| failure("VIDEO_OUTPUT_LIMIT", "PNG chunk exceeds its size limit."))?;
     png.extend_from_slice(&length.to_be_bytes());
-    png.extend_from_slice(kind);
+    png.extend_from_slice(&kind);
     png.extend_from_slice(data);
     let mut crc = Crc::new();
-    crc.update(kind);
+    crc.update(&kind);
     crc.update(data);
     png.extend_from_slice(&crc.sum().to_be_bytes());
     Ok(())
@@ -886,9 +887,9 @@ fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>> {
     header[4..8].copy_from_slice(&height.to_be_bytes());
     header[8] = 8; // Eight bits per sample.
     header[9] = 2; // Truecolor RGB.
-    png_chunk(&mut png, b"IHDR", &header)?;
-    png_chunk(&mut png, b"IDAT", &compressed)?;
-    png_chunk(&mut png, b"IEND", &[])?;
+    png_chunk(&mut png, *b"IHDR", &header)?;
+    png_chunk(&mut png, *b"IDAT", &compressed)?;
+    png_chunk(&mut png, *b"IEND", &[])?;
     if png.len() > MAX_PNG_BYTES {
         return Err(failure(
             "VIDEO_OUTPUT_LIMIT",
@@ -915,7 +916,7 @@ fn display_time(seconds: f64) -> String {
 /// are detected through length/mtime checks, not claimed to be an immutable
 /// snapshot. Decoder allocation limits are per allocation, not a total RSS cap.
 #[allow(clippy::too_many_lines)] // One lifetime owns the permit, descriptor, deadline, and helpers.
-pub(crate) async fn render_open_file(
+pub async fn render_open_file(
     mut file: File,
     path: PathBuf,
     selector: Option<VideoSelector>,
@@ -983,16 +984,18 @@ pub(crate) async fn render_open_file(
         })?;
         match selection {
             VideoSelector::Frame(index) => {
-                description.push_str(&format!(
-                    "Selected frame: {index} (zero-based decoded frame index).\n"
-                ));
+                let _ = writeln!(
+                    description,
+                    "Selected frame: {index} (zero-based decoded frame index)."
+                );
             }
             VideoSelector::Time(seconds) => {
                 timestamps.push(*seconds);
-                description.push_str(&format!(
-                    "Requested timestamp: {} (first available frame at or after this position).\n",
+                let _ = writeln!(
+                    description,
+                    "Requested timestamp: {} (first available frame at or after this position).",
                     display_time(*seconds)
-                ));
+                );
             }
         }
         (FRAME_EDGE, FRAME_EDGE, frame, 1)
@@ -1018,14 +1021,20 @@ pub(crate) async fn render_open_file(
             }
         }
         let (width, height, rgb) = compose_sheet(&frames)?;
-        description.push_str(&format!(
+        let _ = writeln!(
+            description,
             "Contact sheet: {} frames, {} columns x {} rows; read left-to-right, then top-to-bottom.\n\
-             Requested timestamps: {}.\n",
+             Requested timestamps: {}.",
             frames.len(),
             frames.len().min(3),
             frames.len().div_ceil(3),
-            timestamps.iter().copied().map(display_time).collect::<Vec<_>>().join(", ")
-        ));
+            timestamps
+                .iter()
+                .copied()
+                .map(display_time)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         if info.duration.is_none() {
             description
                 .push_str("Duration is unknown; the preview contains the first available frame.\n");
@@ -1415,19 +1424,19 @@ mod tests {
 
     // An uncompressed two-frame AVI fixture, independent of an encoder binary.
     fn avi_fixture() -> Vec<u8> {
-        fn chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        fn chunk(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
             let mut bytes = kind.to_vec();
             bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             bytes.extend_from_slice(payload);
-            if payload.len() % 2 != 0 {
+            if !payload.len().is_multiple_of(2) {
                 bytes.push(0);
             }
             bytes
         }
-        fn list(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        fn list(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
             let mut bytes = kind.to_vec();
             bytes.extend_from_slice(payload);
-            chunk(b"LIST", &bytes)
+            chunk(*b"LIST", &bytes)
         }
         let mut avih = Vec::new();
         for value in [1_000_000_u32, 16, 0, 0, 2, 0, 1, 16, 2, 2, 0, 0, 0, 0] {
@@ -1449,10 +1458,10 @@ mod tests {
         for value in [0_u32, 16, 0, 0, 0, 0] {
             bitmap.extend_from_slice(&value.to_le_bytes());
         }
-        let mut stream = chunk(b"strh", &strh);
-        stream.extend(chunk(b"strf", &bitmap));
-        let mut header = chunk(b"avih", &avih);
-        header.extend(list(b"strl", &stream));
+        let mut stream = chunk(*b"strh", &strh);
+        stream.extend(chunk(*b"strf", &bitmap));
+        let mut header = chunk(*b"avih", &avih);
+        header.extend(list(*b"strl", &stream));
         let mut movie = Vec::new();
         for bgr in [[0_u8, 0, 255], [0, 255, 0]] {
             let mut frame = Vec::new();
@@ -1461,12 +1470,12 @@ mod tests {
                 frame.extend_from_slice(&bgr);
                 frame.extend_from_slice(&[0, 0]); // Four-byte scanline alignment.
             }
-            movie.extend(chunk(b"00db", &frame));
+            movie.extend(chunk(*b"00db", &frame));
         }
         let mut payload = b"AVI ".to_vec();
-        payload.extend(list(b"hdrl", &header));
-        payload.extend(list(b"movi", &movie));
-        chunk(b"RIFF", &payload)
+        payload.extend(list(*b"hdrl", &header));
+        payload.extend(list(*b"movi", &movie));
+        chunk(*b"RIFF", &payload)
     }
 
     #[test]

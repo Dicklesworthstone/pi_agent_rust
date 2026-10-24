@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 
+#[allow(clippy::needless_pass_by_value)] // call sites pass inline json! values
 fn notebook(cell: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"nbformat":4,"cells":[cell]})).unwrap()
 }

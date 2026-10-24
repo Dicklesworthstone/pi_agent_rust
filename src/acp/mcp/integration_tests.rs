@@ -426,7 +426,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
                 handle,
             );
             let (_, signal) = AbortHandle::new();
-            let reason = crate::acp::run_prompt(
+            let reason = Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
                 text("/mcp trust remote"),
                 Some(Command::Trust("remote".into())),
@@ -434,7 +434,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
                 tx.clone(),
                 id.clone(),
                 cx.clone(),
-            )
+            ))
             .await;
             assert_eq!(reason, "end_turn");
             assert_eq!(
@@ -492,7 +492,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             assert!(client.pending.lock().unwrap().is_empty());
 
             let (_, signal) = AbortHandle::new();
-            crate::acp::run_prompt(
+            Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
                 text("/mcp deny remote"),
                 Some(Command::Deny("remote".into())),
@@ -500,7 +500,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
                 tx,
                 id,
                 cx.clone(),
-            )
+            ))
             .await;
             let before = server.count("tools/call");
             let error = mcp
@@ -710,7 +710,7 @@ fn dispatcher_rejects_invalid_mcp_definition_before_creating_a_session() {
             json!({"jsonrpc":"2.0","id":3,"method":"session/list","params":{}}),
             json!({"jsonrpc":"2.0","method":"exit"}),
         ] { in_tx.try_send(request.to_string()).unwrap(); }
-        crate::acp::run(options, in_rx, out_tx).await.unwrap();
+        Box::pin(crate::acp::run(options, in_rx, out_tx)).await.unwrap();
         let results = out_rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
         assert_eq!(results[0]["result"]["agentCapabilities"]["mcpCapabilities"]["http"], true);
         assert_eq!(results[1]["error"]["code"], crate::acp::INVALID_PARAMS);

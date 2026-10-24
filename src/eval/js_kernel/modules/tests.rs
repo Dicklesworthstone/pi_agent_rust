@@ -266,7 +266,7 @@ fn module_file_and_realm_budgets_reject_before_compilation() {
     std::fs::write(&path, "export default 42;").unwrap();
     let files = files(dir.path());
     let name = files.resolve_path("eval_script", "./module.js").unwrap();
-    let bytes = std::fs::metadata(&path).unwrap().len() as usize;
+    let bytes = usize::try_from(std::fs::metadata(&path).unwrap().len()).unwrap();
     files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - bytes;
     assert_eq!(files.read_module(&name).unwrap().code, "export default 42;");
     assert!(files.read_module(&name).err().unwrap().contains("LIMIT"));

@@ -430,17 +430,14 @@ fn next_proto_field<'a>(
     reader: &mut pb::Reader<'a>,
     remaining_fields: &mut usize,
 ) -> Result<Option<(u32, pb::Field<'a>)>> {
-    match reader.next_field() {
-        Some(field) => {
-            *remaining_fields = remaining_fields
-                .checked_sub(1)
-                .ok_or_else(|| connect::protocol("Cursor protobuf field limit exceeded"))?;
-            Ok(Some(field))
-        }
-        None => {
-            reader.finish()?;
-            Ok(None)
-        }
+    if let Some(field) = reader.next_field() {
+        *remaining_fields = remaining_fields
+            .checked_sub(1)
+            .ok_or_else(|| connect::protocol("Cursor protobuf field limit exceeded"))?;
+        Ok(Some(field))
+    } else {
+        reader.finish()?;
+        Ok(None)
     }
 }
 

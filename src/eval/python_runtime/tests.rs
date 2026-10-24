@@ -382,9 +382,8 @@ fn sdk_constructor_validates_without_spawn_or_global_environment_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let before = std::env::var_os("PI_EVAL_PYTHON");
     for requested in [OsString::new(), OsString::from("./invalid\0python")] {
-        let error = match EvalTool::new_with_python(dir.path(), requested) {
-            Ok(_) => panic!("invalid interpreter accepted"),
-            Err(error) => error,
+        let Err(error) = EvalTool::new_with_python(dir.path(), requested) else {
+            panic!("invalid interpreter accepted");
         };
         assert!(error.to_string().contains("EVAL_PY_INPUT"));
     }

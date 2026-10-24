@@ -20,6 +20,7 @@ struct Participant {
 pub(in crate::lsp) struct RefactorGroup(Vec<Participant>);
 
 impl RefactorGroup {
+    #[allow(clippy::needless_pass_by_value)] // callers hand over a freshly built source list
     pub(in crate::lsp) fn capture(
         sources: Vec<(Arc<ServerEntry>, Option<Value>)>,
         prepared: &PreparedEdit,

@@ -154,7 +154,7 @@ struct Package {
     spine: Vec<String>,
 }
 
-fn metadata_label(tag: Tag) -> Option<&'static str> {
+const fn metadata_label(tag: Tag) -> Option<&'static str> {
     match tag {
         Tag::Title => Some("Title"),
         Tag::Creator => Some("Author"),
@@ -378,6 +378,7 @@ fn compact_table_content(tag: &str, content: &str) -> Result<String> {
     Ok(output.text)
 }
 
+#[allow(clippy::too_many_lines)] // one XHTML visitor plus its bounded htmd handler table
 fn chapter_text(bytes: &[u8]) -> Result<String> {
     use super::Tag::Epub;
     let mut bodies = 0usize;
@@ -489,13 +490,13 @@ fn chapter_text(bytes: &[u8]) -> Result<String> {
                 }
                 let result = if matches!(element.tag, "table" | "tr" | "td" | "th") {
                     let content = handlers.walk_children(element.node).content;
-                    match compact_table_content(element.tag, &content) {
-                        Ok(content) => Some(content.into()),
-                        Err(_) => {
+                    compact_table_content(element.tag, &content).map_or_else(
+                        |_| {
                             handler_overflow.store(true, Ordering::Relaxed);
                             None
-                        }
-                    }
+                        },
+                        |content| Some(content.into()),
+                    )
                 } else {
                     handlers.fallback(element)
                 };
@@ -575,6 +576,7 @@ pub(super) fn convert(bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Write as _;
 
     fn book(manifest: &str, spine: &str, chapters: &[(&str, &str)]) -> Vec<u8> {
@@ -732,9 +734,10 @@ mod tests {
             "<table><thead><tr><th>{header}</th><th>Notes</th><th>Empty</th></tr></thead><tbody>"
         );
         for row in 0..256 {
-            body.push_str(&format!(
+            let _ = write!(
+                body,
                 "<tr><td>row {row}</td><td>first<br/>second | third</td><td/></tr>"
-            ));
+            );
         }
         body.push_str("</tbody></table>");
         let chapter = xhtml(&body);

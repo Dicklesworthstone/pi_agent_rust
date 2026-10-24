@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::needless_pass_by_value)] // call sites pass inline json! values
 fn record(id: &str, parent: Option<&str>, content: Value) -> Value {
     json!({
         "type":"message", "id":id, "parentId":parent,

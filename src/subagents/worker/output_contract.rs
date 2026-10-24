@@ -126,17 +126,14 @@ impl OutputContract {
 
     pub(in crate::subagents) fn validate(&self, result: &mut SubagentResult) {
         result.schema_retries = Some(0);
-        match self.answer(&result.output) {
-            Ok(value) => {
-                result.data = Some(value);
-                result.schema_valid = Some(true);
-            }
-            Err(_) => {
-                result.data = None;
-                result.schema_valid = Some(false);
-                result.validation_errors = Some(vec![OUTPUT.to_owned()]);
-                result.fail(OUTPUT.to_owned());
-            }
+        if let Ok(value) = self.answer(&result.output) {
+            result.data = Some(value);
+            result.schema_valid = Some(true);
+        } else {
+            result.data = None;
+            result.schema_valid = Some(false);
+            result.validation_errors = Some(vec![OUTPUT.to_owned()]);
+            result.fail(OUTPUT.to_owned());
         }
     }
 }
@@ -161,6 +158,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn contract(value: Value) -> OutputContract {
         OutputContract::prepare(Some(&value)).unwrap().unwrap()
     }

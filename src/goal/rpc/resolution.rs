@@ -39,7 +39,7 @@ impl Resolution<'_> {
             | Self::Reconcile { reviewed, .. } => reviewed,
         };
         let current = latest(session)?;
-        if reviewed != revision(session, &current)? {
+        if reviewed != revision(session, current.as_ref())? {
             return Err(failure(
                 "GOAL_STALE",
                 "session, branch or goal changed; get and review it again. Nothing was changed.",

@@ -149,7 +149,6 @@ fn header_counts_and_unbacked_or_ambiguous_rvas_fail_closed() {
 
 #[test]
 fn recognition_reads_only_fixed_headers_even_with_a_huge_declared_file() {
-    event("read_budget");
     struct Counted {
         source: Cursor<Vec<u8>>,
         bytes: usize,
@@ -168,6 +167,7 @@ fn recognition_reads_only_fixed_headers_even_with_a_huge_declared_file() {
             self.source.seek(position)
         }
     }
+    event("read_budget");
     let mut input = Counted {
         source: Cursor::new(image(true)),
         bytes: 0,

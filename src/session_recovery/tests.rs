@@ -6,6 +6,7 @@ pub(super) fn header(leaf: Option<&str>) -> Value {
     serde_json::to_value(header).unwrap()
 }
 
+#[allow(clippy::needless_pass_by_value)] // call sites pass inline json! values
 pub(super) fn user(id: &str, parent: Option<&str>, content: Value) -> Value {
     json!({
         "type":"message", "id":id, "parentId":parent,
@@ -210,7 +211,7 @@ fn media_shaped_objects_outside_native_content_are_not_rewritten() {
         "timestamp":"2026-10-13T00:00:00Z", "customType":"historical-example",
         "data":{"type":"image", "data":"this is example source, not an attachment"}
     });
-    transcript(&path, &header(None), &[row.clone()]);
+    transcript(&path, &header(None), std::slice::from_ref(&row));
     let report = recover_session_text(&path).unwrap();
     assert_eq!(report.entries()[0].record(), &row);
     assert!(report.omissions().is_empty());

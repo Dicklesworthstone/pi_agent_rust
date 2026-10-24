@@ -500,6 +500,7 @@ mod tests {
         header
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn user(id: &str, parent: Option<&str>, content: Value) -> Value {
         json!({
             "type": "message", "id": id, "parentId": parent,
@@ -1071,7 +1072,7 @@ mod tests {
         let tool = SubagentTool::with_paths(
             root.path().to_path_buf(),
             global.path().to_path_buf(),
-            fixture_tool.child_binary.clone(),
+            fixture_tool.child_binary,
         )
         .with_timeout(std::time::Duration::from_secs(5));
         let output = run(

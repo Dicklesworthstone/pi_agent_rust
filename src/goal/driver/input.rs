@@ -100,6 +100,7 @@ impl GoalControl {
         let state = self.lock();
         let mut snapshot = state.turn.as_ref()?.snapshot();
         snapshot.accepting_input &= !state.paused && !state.finished;
+        drop(state);
         Some(snapshot)
     }
 }
@@ -217,7 +218,7 @@ mod tests {
         let turn = handle.prompt_controlled("unused".into(), |_| {});
         let native = turn.control();
         let goal = GoalControl::new();
-        goal.install(native.clone());
+        goal.install(&native);
         let first = goal.follow_up("first").unwrap();
         let original = payload();
         let ids = goal
@@ -276,7 +277,7 @@ mod tests {
         let (mut handle, _) = fixture();
         let turn = handle.prompt_controlled("unused".into(), |_| {});
         let goal = GoalControl::new();
-        goal.install(turn.control());
+        goal.install(&turn.control());
         let id = goal
             .steer_with_content(&payload(), "keep original")
             .unwrap();
@@ -333,7 +334,7 @@ mod tests {
         let (mut handle, _) = fixture();
         let turn = handle.prompt_controlled("unused".into(), |_| {});
         let goal = GoalControl::new();
-        goal.install(turn.control());
+        goal.install(&turn.control());
         let id = goal
             .follow_up_with_content(&payload(), "private authored prose")
             .unwrap();
@@ -369,13 +370,13 @@ mod tests {
         );
         let (mut handle, _) = fixture();
         let first = handle.prompt_controlled("first".into(), |_| {});
-        goal.install(first.control());
+        goal.install(&first.control());
         let old_id = goal.steer("old").unwrap();
         drop(RunGuard(goal.clone()));
         drop(first);
         let second = handle.prompt_controlled("second".into(), |_| {});
         let replacement = GoalControl::new();
-        replacement.install(second.control());
+        replacement.install(&second.control());
         let new_id = replacement.steer("new").unwrap();
         assert!(goal.follow_up_with_content(&payload(), "stale").is_err());
         assert!(goal.retract(new_id).is_none());
@@ -392,7 +393,7 @@ mod tests {
         let (mut handle, _) = fixture();
         let turn = handle.prompt_controlled("unused".into(), |_| {});
         let goal = GoalControl::new();
-        goal.install(turn.control());
+        goal.install(&turn.control());
         let first = goal.steer_with_content(&payload(), "first").unwrap();
         let second = goal.follow_up("second").unwrap();
         drop(RunGuard(goal.clone()));
@@ -533,6 +534,7 @@ mod tests {
         assert!(requests[1].iter().any(|message| {
             matches!(message, Message::User(user) if serde_json::to_value(&user.content).unwrap() == serde_json::to_value(&content).unwrap())
         }));
+        drop(requests);
     }
 
     #[test]
@@ -556,7 +558,7 @@ mod tests {
         assert_eq!(pending[0].id, previous_id);
         same_content(&pending[0].content, &payload());
         let target = handle.prompt_controlled("target".into(), |_| {});
-        goal.install(target.control());
+        goal.install(&target.control());
         let closed = GoalControl::new();
         closed.pause();
         assert!(

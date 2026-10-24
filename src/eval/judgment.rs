@@ -5,6 +5,7 @@
 //! a provider handle. Explicit background starts transfer only prepared,
 //! tool-free requests into the native session-owned jobs registry.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -542,10 +543,10 @@ impl<'p> Invocation<'p> {
             Err(error) => {
                 let mut message = error.to_string();
                 if !self.receipts.is_empty() {
-                    message.push_str(&format!("; EVAL_JUDGMENTS: {receipts}"));
+                    let _ = write!(message, "; EVAL_JUDGMENTS: {receipts}");
                 }
                 if !self.tool_receipts.is_empty() {
-                    message.push_str(&format!("; EVAL_TOOL_CALLS: {tool_receipts}"));
+                    let _ = write!(message, "; EVAL_TOOL_CALLS: {tool_receipts}");
                 }
                 Err(Error::tool("eval", message))
             }
@@ -555,6 +556,7 @@ impl<'p> Invocation<'p> {
 
 // Foreign callback/provider/configuration errors are not authority to echo
 // request state, prompt fragments, authentication headers or command output.
+#[allow(clippy::needless_pass_by_value)] // `map_err` adapter at every call site
 fn public_error(error: Error) -> String {
     let text = error.to_string();
     for code in [

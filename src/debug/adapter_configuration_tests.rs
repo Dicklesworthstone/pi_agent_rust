@@ -27,6 +27,7 @@ fn event(case: &str, phase: &str) {
     );
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn call(tool: &DebugTool, runtime: &asupersync::runtime::Runtime, input: Value) -> Result<Value> {
     let action = input["action"].as_str().unwrap_or("invalid");
     event(action, "dispatch");
@@ -56,6 +57,7 @@ fn fixture(root: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(python))
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn configure(root: &Path, python: &Path, id: &str, mode: &str, launch: Value, attach: Value) {
     let mut definitions = serde_json::Map::new();
     definitions.insert(

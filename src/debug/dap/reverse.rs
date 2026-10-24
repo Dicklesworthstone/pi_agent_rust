@@ -14,10 +14,12 @@ use super::{
 };
 use std::io::Write as _;
 
-/// Return a DAP response body or a refusal. The callback must enforce its own
-/// command/argument policy; registration is not permission to execute code.
-/// Cancelled callbacks are dropped, not detached. Already performed effects
-/// are not rolled back, so callback-owned resources need ordinary RAII cleanup.
+/// Return a DAP response body or a refusal.
+///
+/// The callback must enforce its own command/argument policy; registration is
+/// not permission to execute code. Cancelled callbacks are dropped, not
+/// detached. Already performed effects are not rolled back, so callback-owned
+/// resources need ordinary RAII cleanup.
 pub type ReverseRequestHandler = Arc<
     dyn Fn(String, Value) -> BoxFuture<'static, std::result::Result<Value, String>> + Send + Sync,
 >;
@@ -96,6 +98,7 @@ impl State {
             command: command.to_string(),
             arguments: arguments.clone(),
         });
+        drop(queue);
         Some(true)
     }
 }
@@ -247,6 +250,7 @@ impl Drop for Permit {
             {
                 active.take();
             }
+            drop(active);
             std::mem::take(&mut queue.requests)
         };
         // Queued requests are refused, never inherited by a later window.

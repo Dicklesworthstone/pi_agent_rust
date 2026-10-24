@@ -304,6 +304,7 @@ impl Peer {
         })
     }
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn input(extra: Value) -> Value {
         let mut input = json!({"action":"symbols","file":"source.pioutline","timeout":5});
         input

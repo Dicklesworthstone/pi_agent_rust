@@ -57,8 +57,8 @@ impl Request {
                 .ok_or(INPUT)?,
         };
         let mut seen = 0_u16;
-        let mut manifest = None;
-        if let Some(cursor) = fields.get("cursor").filter(|cursor| !cursor.is_null()) {
+        let cursor = fields.get("cursor").filter(|cursor| !cursor.is_null());
+        let manifest = if let Some(cursor) = cursor {
             let cursor = cursor
                 .as_object()
                 .filter(|cursor| cursor.len() == 4)
@@ -81,7 +81,7 @@ impl Request {
                 }
                 seen |= bit;
             }
-            manifest = match cursor.get("manifest") {
+            match cursor.get("manifest") {
                 Some(Value::Null) if seen == 0 => None,
                 Some(Value::String(value))
                     if value.len() == 64
@@ -92,8 +92,10 @@ impl Request {
                     Some(value.clone())
                 }
                 _ => return Err(CURSOR.into()),
-            };
-        }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             id: id.to_owned(),
             seen,
@@ -158,6 +160,7 @@ struct Cursor<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)] // wire reply; each bool is a distinct JSON field
 struct Reply<'a> {
     schema: &'static str,
     job_id: &'a str,
@@ -173,6 +176,7 @@ struct Reply<'a> {
 }
 
 impl<'a> Observation<'a> {
+    #[allow(clippy::too_many_lines)] // one fail-closed validation pass over the retained job shape
     fn parse(job: &'a Value, request: &Request) -> Result<Self> {
         if job["schema"] != "pi.host_job.v1"
             || job["id"] != request.id
@@ -328,16 +332,16 @@ impl<'a> Observation<'a> {
                 2 => {
                     if item.get("error").is_some()
                         || item["verdict"]["schema"] != "pi.judgment.v1"
-                        || !item["verdict"]["answers"]
+                        || item["verdict"]["answers"]
                             .as_object()
-                            .is_some_and(|answers| !answers.is_empty())
+                            .is_none_or(serde_json::Map::is_empty)
                     {
                         return Err(PROTOCOL.into());
                     }
                 }
                 3 => {
                     if item.get("verdict").is_some()
-                        || !item["error"].as_str().is_some_and(|text| !text.is_empty())
+                        || item["error"].as_str().is_none_or(str::is_empty)
                     {
                         return Err(PROTOCOL.into());
                     }
@@ -424,7 +428,7 @@ impl<'a> Observation<'a> {
             job_failed: !matches!(self.status, "running" | "exited"),
             complete: self.items.is_some() && !self.progress,
             evidence_available: self.items.is_some(),
-            total: self.items.map(|items| items.len()),
+            total: self.items.map(<[Value]>::len),
             settled: self.items.map(|_| self.mask.count_ones()),
             items: delta,
             cursor: Cursor {

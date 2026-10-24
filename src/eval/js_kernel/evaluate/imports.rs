@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use swc_common::{FileName, SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    Expr, ImportDecl, ImportPhase, ImportSpecifier, Lit, MetaPropExpr, MetaPropKind, ModuleDecl,
-    ModuleExportName, ModuleItem, Prop, PropName, PropOrSpread, Stmt,
+    EsVersion, Expr, ImportDecl, ImportPhase, ImportSpecifier, Lit, MetaPropExpr, MetaPropKind,
+    ModuleDecl, ModuleExportName, ModuleItem, Prop, PropName, PropOrSpread, Stmt,
 };
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -199,7 +199,7 @@ pub(super) fn prepare(code: &str) -> Result<Option<String>> {
             import_attributes: true,
             ..Default::default()
         }),
-        Default::default(),
+        EsVersion::default(),
         StringInput::from(&*file),
         None,
     );

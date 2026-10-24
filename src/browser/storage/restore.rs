@@ -337,7 +337,7 @@ mod tests {
         serde_json::from_value(json!({"schema":super::super::SCHEMA,
             "origin":"https://example.com", "cookies":[{
                 "name":"auth", "value":"PRIVATE-CANARY", "domain":"example.com", "path":"/",
-                "secure":true, "httpOnly":true, "sameSite":"Lax", "expires":1900000000.0
+                "secure":true, "httpOnly":true, "sameSite":"Lax", "expires":1_900_000_000.0
             }], "localStorage":[{"name":"token", "value":"STORAGE-CANARY"}]}))
         .unwrap()
     }
@@ -345,8 +345,8 @@ mod tests {
     #[test]
     fn restore_requires_exact_schema_origin_and_nonexpired_cookies() {
         let bytes = state().encode().unwrap();
-        assert!(decode(&bytes, &document(), None, 1800000000.0).is_ok());
-        for time in [1900000000.0, 2000000000.0, f64::NAN, -1.0] {
+        assert!(decode(&bytes, &document(), None, 1_800_000_000.0).is_ok());
+        for time in [1_900_000_000.0, 2_000_000_000.0, f64::NAN, -1.0] {
             assert!(decode(&bytes, &document(), None, time).is_err());
         }
         for origin in [
@@ -356,10 +356,18 @@ mod tests {
         ] {
             let mut changed = state();
             changed.origin = origin.into();
-            assert!(decode(&changed.encode().unwrap(), &document(), None, 1800000000.0).is_err());
+            assert!(
+                decode(
+                    &changed.encode().unwrap(),
+                    &document(),
+                    None,
+                    1_800_000_000.0
+                )
+                .is_err()
+            );
         }
         for bytes in [b"PRIVATE-CANARY".as_slice(), b"{}", b""] {
-            let failure = decode(bytes, &document(), None, 1800000000.0)
+            let failure = decode(bytes, &document(), None, 1_800_000_000.0)
                 .err()
                 .unwrap();
             assert!(!failure.to_string().contains("PRIVATE-CANARY"));

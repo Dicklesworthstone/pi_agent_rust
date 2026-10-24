@@ -23,6 +23,7 @@ struct Node {
     directory_identity: Option<(u64, u64)>,
 }
 
+#[allow(clippy::unnecessary_wraps)] // non-unix targets have no directory identity
 fn directory_identity(metadata: &Metadata) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
@@ -137,9 +138,8 @@ impl DirectoryMove {
             "from":crate::lsp::display_path(&self.old, cwd),
             "to":crate::lsp::display_path(&self.new, cwd),
             "files":self.files().count(),
-            "directories":self.nodes.iter().filter_map(|(path, node)| {
-                node.directory.then(|| crate::lsp::display_path(path, cwd))
-            }).collect::<Vec<_>>(),
+            "directories":self.nodes.iter().filter(|(_, node)| node.directory)
+                .map(|(path, _)| crate::lsp::display_path(path, cwd)).collect::<Vec<_>>(),
             "preservesUneditedFiles":true,
             "preservesDirectoryPermissions":true
         })

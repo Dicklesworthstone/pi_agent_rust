@@ -80,17 +80,17 @@ struct Running {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
-    launch: Launch,
-    workspace: PathBuf,
-    owner: AgentCx,
-    connected: Connected,
-    terminal: Arc<Terminal>,
+    launch: &Launch,
+    workspace: &Path,
+    owner: &AgentCx,
+    connected: &Connected,
+    terminal: &Arc<Terminal>,
     inputs: Receiver<Input>,
     started: futures::channel::oneshot::Sender<std::result::Result<u32, String>>,
-    capacity: Arc<Capacity>,
+    capacity: &Arc<Capacity>,
 ) {
     let result = spawn(
-        &launch, &workspace, &owner, &connected, &terminal, inputs, &capacity,
+        launch, workspace, owner, connected, terminal, inputs, capacity,
     );
     match result {
         Ok(mut running) => {
@@ -107,7 +107,7 @@ pub(super) fn run(
             {
                 terminal.stop.store(true, Ordering::SeqCst);
             }
-            let code = running.child.monitor(&terminal, &connected);
+            let code = running.child.monitor(terminal, connected);
             terminal.ended.store(true, Ordering::SeqCst);
             *lock(&terminal.info) = json!({"state":"settled","pid":pid,"exitCode":code});
         }
@@ -120,6 +120,7 @@ pub(super) fn run(
     }
 }
 
+#[allow(clippy::too_many_lines)] // ordered revocation checks around PTY allocation and spawn
 fn spawn(
     launch: &Launch,
     workspace: &Path,
@@ -219,7 +220,7 @@ fn spawn(
         .name("dap-terminal-input".into())
         .spawn(move || {
             let _capacity = input_capacity;
-            input(writer, inputs, &input_terminal);
+            input(writer, &inputs, &input_terminal);
         })
         .map_err(|error| {
             tool_err(
@@ -257,7 +258,7 @@ fn output(mut reader: Box<dyn Read + Send>, terminal: &Terminal) {
     }
 }
 
-fn input(mut writer: Box<dyn Write + Send>, inputs: Receiver<Input>, terminal: &Terminal) {
+fn input(mut writer: Box<dyn Write + Send>, inputs: &Receiver<Input>, terminal: &Terminal) {
     while !terminal.stop.load(Ordering::SeqCst) && !terminal.ended.load(Ordering::SeqCst) {
         let input = match inputs.recv_timeout(POLL) {
             Ok(input) => input,

@@ -15,7 +15,7 @@ const DATA_SLOT: &str = "pi.eval.module.data";
 struct DataModule;
 
 impl ModuleDef for DataModule {
-    fn declare<'js>(declarations: &Declarations<'js>) -> rquickjs::Result<()> {
+    fn declare(declarations: &Declarations<'_>) -> rquickjs::Result<()> {
         declarations.declare("default")?;
         Ok(())
     }

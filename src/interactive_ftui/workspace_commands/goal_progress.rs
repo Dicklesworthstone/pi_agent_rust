@@ -14,6 +14,7 @@ use crate::interactive::PiMsg;
 use crate::sdk::{EventListeners, SubscriptionId};
 
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // independent display latches guarded by one mutex
 struct DisplayState {
     closed: bool,
     started: bool,
@@ -82,7 +83,7 @@ impl Display {
         &self,
         state: &mut DisplayState,
         messages: Vec<PiMsg>,
-    ) -> Result<(), SendError<PiMsg>> {
+    ) -> Result<(), Box<SendError<PiMsg>>> {
         for message in messages {
             let outgoing = match message {
                 PiMsg::AgentStart => {

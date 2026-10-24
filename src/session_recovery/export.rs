@@ -83,7 +83,7 @@ fn safe_text(writer: &mut impl Write, text: &str, multiline: bool) -> io::Result
         if ch != '\\' && (!unsafe_display(ch) || allowed_layout) {
             continue;
         }
-        writer.write_all(text[start..index].as_bytes())?;
+        writer.write_all(&text.as_bytes()[start..index])?;
         if ch == '\\' {
             writer.write_all(b"\\\\")?;
         } else {
@@ -91,7 +91,7 @@ fn safe_text(writer: &mut impl Write, text: &str, multiline: bool) -> io::Result
         }
         start = index + ch.len_utf8();
     }
-    writer.write_all(text[start..].as_bytes())
+    writer.write_all(&text.as_bytes()[start..])
 }
 
 fn json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
@@ -182,10 +182,10 @@ impl RecoveryReport {
         writeln!(writer, "Source bytes: {}", self.source_bytes)?;
         match selection {
             RecoverySelection::All => {
-                writer.write_all(b"Selection: all records in saved order\n")?
+                writer.write_all(b"Selection: all records in saved order\n")?;
             }
             RecoverySelection::Active => {
-                writer.write_all(b"Selection: saved active path, root first\n")?
+                writer.write_all(b"Selection: saved active path, root first\n")?;
             }
             RecoverySelection::Branch(id) => {
                 writer.write_all(b"Selection: root-to-entry path ending at ")?;

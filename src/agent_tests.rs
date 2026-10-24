@@ -1061,6 +1061,7 @@ mod tests {
                     message,
                     Message::Assistant(_) | Message::ToolResult(_)
                 )));
+                drop(requests);
             }
             {
                 let events = events.lock().expect("events");
@@ -1085,6 +1086,7 @@ mod tests {
                             Message::Custom(custom) if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE
                         ))
                 )));
+                drop(events);
             }
             let path = {
                 let cx = crate::agent_cx::AgentCx::for_request();
@@ -1273,6 +1275,7 @@ mod tests {
             assert!(requests[3].iter().any(|message| matches!(message,
                 Message::Custom(custom) if custom.custom_type == crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE
             )));
+            drop(requests);
             assert!(agent.message_queue.follow_up.is_empty());
         });
     }
@@ -1362,6 +1365,7 @@ mod tests {
                 assert_eq!(ends.len(), 1);
                 assert_eq!(ends[0].0.len(), 2);
                 assert!(ends[0].1.is_some());
+                drop(events);
             }
 
             let rules = serde_json::to_vec(&json!({"version": 1, "rules": [rule_fixture()]}))
@@ -4631,6 +4635,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one fixture run in both catalog orders
     fn failover_keeps_full_catalog_identity_and_exact_admission() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
@@ -4895,6 +4900,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one fixture run in both catalog orders
     fn primary_restore_keeps_full_catalog_identity_and_respects_admission() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
@@ -7042,6 +7048,7 @@ mod tests {
                 json!(later),
                 "an admitted task must not share the Agent's subsequently mutated vault",
             );
+            drop(captures);
         });
     }
 
@@ -9595,6 +9602,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 1,
                 "automatic continuation must not resubmit the authored input"
             );
+            drop(events);
         });
     }
 
@@ -9663,6 +9671,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 events.last(),
                 Some(AgentEvent::AgentEnd { error: Some(error), .. }) if error == "Aborted"
             ));
+            drop(events);
         }));
     }
 
@@ -10081,6 +10090,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end advisor fixture with its full assertions
     fn extension_input_does_not_renew_advisor_continuation_budget() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {

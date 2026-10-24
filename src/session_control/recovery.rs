@@ -106,6 +106,7 @@ impl SessionControlHandle {
                     "this turn no longer accepts input",
                 ));
             }
+            drop(target);
             return Ok(Vec::new());
         }
         // Allocate the complete receipt vector BEFORE any target admission.

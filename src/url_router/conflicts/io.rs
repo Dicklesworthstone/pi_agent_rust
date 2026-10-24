@@ -54,6 +54,7 @@ impl Budget {
     }
 
     pub(super) fn git(&self, cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
+        use std::io::{Seek as _, SeekFrom};
         self.check()?;
         let stdout = tempfile::tempfile()?;
         let stderr = tempfile::tempfile()?;
@@ -90,7 +91,6 @@ impl Budget {
         let _ = child.terminate_and_wait();
         outcome?;
         self.check()?;
-        use std::io::{Seek as _, SeekFrom};
         let mut stdout = stdout;
         stdout.seek(SeekFrom::Start(0))?;
         let mut data = Vec::new();

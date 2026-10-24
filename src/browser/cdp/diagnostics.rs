@@ -190,7 +190,6 @@ fn remote_argument(value: &Value) -> Value {
             }
         }
         "object" if value["subtype"] == "null" => argument["value"] = Value::Null,
-        "undefined" => {}
         _ => {}
     }
     if let Some(representation) = value["unserializableValue"].as_str() {
@@ -312,7 +311,7 @@ impl Capture {
         self.logs.push_back((record, bytes));
     }
 
-    pub(super) fn begin_action(&mut self) {
+    pub(super) const fn begin_action(&mut self) {
         self.action_started = true;
         self.phase = "action";
     }
@@ -612,6 +611,7 @@ pub(super) async fn finish(
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
     fn event(method: &str, params: Value) -> Value {
         json!({"sessionId":"page-session","method":method,"params":params})
     }

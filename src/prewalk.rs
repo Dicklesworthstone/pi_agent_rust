@@ -31,9 +31,10 @@ impl PrewalkTarget {
     }
 }
 
-/// Ownership of a logical turn across native provider attempts. Drivers create
-/// this once, preserve it through retries, and finish it at the user-request
-/// boundary. Session navigation invalidates its captured origin.
+/// Ownership of a logical turn across native provider attempts.
+///
+/// Drivers create this once, preserve it through retries, and finish it at the
+/// user-request boundary. Session navigation invalidates its captured origin.
 pub struct PrewalkTurn {
     pub(crate) origin: crate::extensions::SessionActionOrigin,
 }

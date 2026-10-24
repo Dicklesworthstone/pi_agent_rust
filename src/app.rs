@@ -667,10 +667,10 @@ fn find_registered_default(
     registry: &ModelRegistry,
     scoped: &[ScopedModel],
 ) -> Option<ModelEntry> {
-    let entry = match provider {
-        Some(provider) => registry.find(provider, id),
-        None => registry.find_by_id(id),
-    }?;
+    let entry = provider.map_or_else(
+        || registry.find_by_id(id),
+        |provider| registry.find(provider, id),
+    )?;
     // A provider declared only in scope is still a distinct destination;
     // registry alias normalization must not borrow another provider's model.
     let matches_declared_provider = provider.is_none_or(|provider| {

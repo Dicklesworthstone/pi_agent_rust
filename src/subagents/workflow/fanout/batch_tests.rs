@@ -267,7 +267,7 @@ mod native {
     use crate::subagents::SubagentTool;
     use std::os::unix::fs::PermissionsExt;
 
-    const FIXTURE: &str = r#"#!/usr/bin/env python3
+    const FIXTURE: &str = r"#!/usr/bin/env python3
 import json, pathlib, sys
 prompt = sys.argv[-1]
 kind = prompt.splitlines()[0].removeprefix('Task: ')
@@ -293,7 +293,7 @@ else:
         reports = supplied['reports']
         value = {'count':sum(row['count'] for row in reports), 'sum':sum(row['sum'] for row in reports), 'offsets':[row['offset'] for row in reports]}
 print(json.dumps({'type':'agent_end','messages':[{'role':'assistant','stopReason':'stop','content':[{'type':'text','text':json.dumps(value)}]}]}))
-"#;
+";
 
     fn run(mut input: Value, source: &str) -> Option<(crate::tools::ToolOutput, Vec<Value>)> {
         if !std::process::Command::new("python3")

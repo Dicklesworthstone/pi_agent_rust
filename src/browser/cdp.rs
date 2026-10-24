@@ -898,6 +898,7 @@ impl Session {
         // retained separately: pending File objects can outlive a tab/navigation.
     }
 
+    #[allow(clippy::too_many_lines)] // one ordered stop/attach/launch/handshake transition
     async fn connect(
         &mut self,
         owner: &AgentCx,

@@ -2436,12 +2436,10 @@ impl Agent {
             );
             self.messages.remove(0);
             self.authored_queue_delivery_indices.retain_mut(|index| {
-                if let Some(shifted) = index.checked_sub(1) {
+                index.checked_sub(1).is_some_and(|shifted| {
                     *index = shifted;
                     true
-                } else {
-                    false
-                }
+                })
             });
         }
         self.messages.push(message);
@@ -2793,12 +2791,13 @@ impl Agent {
                 .expect("cache populated above"),
         );
 
-        let mut system_prompt = self.config.system_prompt.as_deref().map(Cow::Borrowed);
-        if self.prewalk_budget.is_some() && self.prewalk.is_some() {
+        let system_prompt = if self.prewalk_budget.is_some() && self.prewalk.is_some() {
             let mut prompt = self.config.system_prompt.clone().unwrap_or_default();
             prompt.push_str("\n\n## Prewalk\nInvestigate the request and plan the implementation before making changes. If the todo tool is available, record a concrete todo list before editing project files. Begin the first real implementation change; the session will automatically hand off after that completed tool batch. Do not stop to announce or request the handoff. For discussion or read-only requests, answer normally without making an artificial edit.");
-            system_prompt = Some(Cow::Owned(prompt));
-        }
+            Some(Cow::Owned(prompt))
+        } else {
+            self.config.system_prompt.as_deref().map(Cow::Borrowed)
+        };
         Context {
             system_prompt,
             messages,
@@ -4719,6 +4718,7 @@ impl Agent {
         Arc::unwrap_or_clone(shared)
     }
 
+    #[allow(clippy::too_many_lines)] // one provider stream attempt, consumed event by event
     async fn stream_assistant_attempt(
         &mut self,
         on_event: AgentEventHandler,
@@ -13388,7 +13388,7 @@ mod abort_tests {
         let admitted = handle.signal();
         assert!(!admitted.is_aborted());
 
-        handle.clone().abort();
+        handle.abort();
         assert!(original.is_aborted());
         assert!(admitted.is_aborted());
 
@@ -16828,6 +16828,7 @@ impl AgentSession {
         .await
     }
 
+    #[allow(clippy::too_many_lines)] // one admitted swap; splitting would scatter the commit point
     async fn restore_primary_swap_admitted(
         &mut self,
         cx: &crate::agent_cx::AgentCx,
@@ -18120,7 +18121,7 @@ impl AgentSession {
     /// post-compaction current path). The estimate ignores retained assistant
     /// `usage`, so stale
     /// pre-compaction usage never inflates it.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one durable append transaction
     async fn apply_compaction_entry(
         &self,
         summary: String,
@@ -18995,6 +18996,7 @@ impl AgentSession {
     /// role resolved a model, review a compact digest and inject the verdict
     /// through the native steering queue. Reserve any automatic continuation
     /// durably before returning; optional provider failures remain isolated.
+    #[allow(clippy::too_many_lines)] // one ordered advise/reserve/inject sequence per turn
     async fn maybe_advise_turn(
         &mut self,
         abort: Option<&AbortSignal>,

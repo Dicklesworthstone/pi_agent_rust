@@ -26,15 +26,18 @@ fn privacy() -> AuxiliaryPrivacySnapshot {
 fn verdict(value: &str) -> Value {
     json!({"schema":"pi.judgment.v1","answers":{"evidence":{"value":value}}})
 }
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers pass owned json! keys
 fn completed(key: Value, value: &str) -> Value {
     json!({"key":key,"status":"completed","verdict":verdict(value)})
 }
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers pass owned json! keys
 fn waiting(key: Value) -> Value {
     json!({"key":key,"status":"running"})
 }
 fn receipts(count: usize) -> Value {
     json!({"schema":"pi.eval.judgments.v1","attempts":vec![json!({});count]})
 }
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers pass owned vec! literals
 fn partial(items: Vec<Value>) -> ToolOutput {
     let count = |state| items.iter().filter(|item| item["status"] == state).count();
     let succeeded = count("completed");
@@ -51,6 +54,7 @@ fn partial(items: Vec<Value>) -> ToolOutput {
         is_error: false,
     }
 }
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers pass owned vec! literals
 fn final_result(items: Vec<Value>) -> ToolOutput {
     let succeeded = items.iter().filter(|item| item["ok"] == true).count();
     let failed = items.len() - succeeded;
@@ -64,6 +68,7 @@ fn final_result(items: Vec<Value>) -> ToolOutput {
         is_error: failed != 0,
     }
 }
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers hand over the output
 fn job(result: Option<ToolOutput>, status: &str) -> Value {
     json!({"schema":"pi.host_job.v1","id":"fixture","command":"eval judgment_batch","status":status,"result":result})
 }
@@ -75,6 +80,7 @@ fn progress(items: Vec<Value>) -> Value {
     };
     job(Some(output), "running")
 }
+#[allow(clippy::needless_pass_by_value)] // callers pass owned json! requests inline
 fn parsed_reply(value: &Value, input: Value) -> Value {
     let request = Request::parse(&input).unwrap();
     serde_json::from_str(
@@ -95,7 +101,7 @@ fn cursor_preflight_rejects_foreign_malformed_and_ambiguous_acknowledgments() {
         json!({"jobId":"a b"}),
         json!({"jobId":"a","extra":1}),
         json!({"jobId":"a","timeoutMs":-1}),
-        json!({"jobId":"a","timeoutMs":600001}),
+        json!({"jobId":"a","timeoutMs":600_001}),
         json!({"jobId":"a","timeoutMs":0.5}),
         json!({"jobId":"a","cursor":{}}),
     ] {
@@ -174,7 +180,7 @@ fn cursor_pins_key_types_order_and_only_settled_items() {
     let mut input = input;
     input["cursor"]["seen"] = json!([1]);
     assert!(Observation::parse(&value, &Request::parse(&input).unwrap()).is_err());
-    let mut duplicate = value.clone();
+    let mut duplicate = value;
     duplicate["result"]["details"]["partialResult"]["details"]["items"][1]["key"] = json!(0);
     assert!(Observation::parse(&duplicate, &request).is_err());
 }

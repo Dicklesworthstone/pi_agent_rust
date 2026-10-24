@@ -97,7 +97,7 @@ impl Request {
         match self {
             Self::Delegation(request) => {
                 let mode = request.mode_name()?;
-                let prepared = tool.prepare_request_with_deadline(request, deadline)?;
+                let prepared = tool.prepare_request_with_deadline(&request, deadline)?;
                 prepared.validate_background()?;
                 Ok(Prepared::Delegation {
                     request: prepared,
@@ -120,7 +120,7 @@ enum Prepared {
 impl Prepared {
     const fn mode(&self) -> &'static str {
         match self {
-            Self::Delegation { mode, .. } => *mode,
+            Self::Delegation { mode, .. } => mode,
             Self::Workflow(_) => "workflow",
         }
     }
@@ -135,7 +135,7 @@ impl Prepared {
                 drop(progress);
                 request.runner = request.runner.into_background();
                 Ok(result_output(
-                    request.run(None).await,
+                    &request.run(None).await,
                     mode,
                     structured_results,
                 ))
@@ -483,7 +483,7 @@ mod tests {
             model.set("provider-before", "model-before");
             tool.bind_model_scope(model.clone());
             let request: SubagentRequest = serde_json::from_value(request()).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- This literal request is the valid snapshot regression input.
-            let prepared = tool.prepare_request(request).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Preparation must capture the authored model and definition.
+            let prepared = tool.prepare_request(&request).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Preparation must capture the authored model and definition.
             prepared.validate_background().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The controlled request must pass the same background preflight.
             model.set("provider-after", "model-after");
             std::fs::write(tool.global_dir.join("agents/worker.md"), // ubs:ignore[rust.ownership.unwrap-expect] -- Deliberately replace the fixture definition after preparation.

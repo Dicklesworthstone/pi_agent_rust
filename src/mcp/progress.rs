@@ -27,9 +27,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A single transport's progress mailboxes. Sharing this across independent
-/// connections would violate request isolation. HTTP session generations must
-/// be supplied both at registration and when receiving a notification.
+/// A single transport's progress mailboxes.
+///
+/// Sharing this across independent connections would violate request
+/// isolation. HTTP session generations must be supplied both at registration
+/// and when receiving a notification.
 ///
 /// Debug output deliberately excludes tokens and server-provided messages.
 pub struct ProgressRegistry {

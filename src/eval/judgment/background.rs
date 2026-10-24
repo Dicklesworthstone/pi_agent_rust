@@ -194,7 +194,7 @@ impl Request {
         Ok((request, text, Duration::from_secs(timeout)))
     }
 
-    fn count(&self) -> usize {
+    const fn count(&self) -> usize {
         match self {
             Self::Batch(plan, options) => plan.items.len() * (options.retries + 1),
             _ => 1,
@@ -297,6 +297,7 @@ impl Invocation<'_> {
             .map_err(|error| operation.admission_error(error))
     }
 
+    #[allow(clippy::too_many_lines)] // one admission sequence: select, prepare, reserve, spawn
     async fn admit_background(
         &mut self,
         tool: &crate::eval::EvalTool,
@@ -588,7 +589,7 @@ fn attempt(index: usize, operation: Operation, outcome: &Result<Value>) -> Value
 fn output(
     operation: Operation,
     result: Value,
-    receipts: Vec<Value>,
+    receipts: &[Value],
     error: Option<String>,
     failed: bool,
     privacy: &AuxiliaryPrivacySnapshot,
@@ -632,12 +633,12 @@ fn output(
         details: Some(details),
         is_error: failed,
     };
-    screen_output(operation, output, privacy)
+    screen_output(operation, &output, privacy)
 }
 
 fn screen_output(
     operation: Operation,
-    output: ToolOutput,
+    output: &ToolOutput,
     privacy: &AuxiliaryPrivacySnapshot,
 ) -> Result<ToolOutput> {
     // Project the complete aggregate, not independent items: a late provider
@@ -645,7 +646,7 @@ fn screen_output(
     // mutate typed data, answer probabilities, keys, receipts or identity and
     // preserve a success/schemaValid claim. Only plain completion text may be
     // redacted in place; every other mutation withholds the structured result.
-    let original = serde_json::to_value(&output)?;
+    let original = serde_json::to_value(output)?;
     let privacy_error = || {
         Error::tool(
             "eval",
@@ -840,7 +841,7 @@ impl BatchProgress {
         })?;
         screen_output(
             Operation::Batch,
-            ToolOutput {
+            &ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(format!(
                     "Background judgment batch progress: {} of {} items finished.",
                     succeeded + failed,
@@ -876,7 +877,7 @@ impl BatchProgress {
                 "retries":self.options.retries, "minOk":self.options.min_ok,
                 "meetsMinimum":succeeded >= self.options.min_ok,
             }),
-            self.receipts,
+            &self.receipts,
             None,
             succeeded < self.options.min_ok,
             privacy,
@@ -931,11 +932,11 @@ impl Prepared {
                 let result = judge.run_prepared_completion(prepared).await;
                 let receipt = attempt(base, operation, &result);
                 match result {
-                    Ok(value) => output(operation, value, vec![receipt], None, false, &privacy),
+                    Ok(value) => output(operation, value, &[receipt], None, false, &privacy),
                     Err(error) => output(
                         operation,
                         Value::Null,
-                        vec![receipt],
+                        &[receipt],
                         Some(operation.error(error)),
                         true,
                         &privacy,
@@ -946,11 +947,11 @@ impl Prepared {
                 let result = judge.run_prepared_judgment(prepared).await;
                 let receipt = attempt(base, operation, &result);
                 match result {
-                    Ok(value) => output(operation, value, vec![receipt], None, false, &privacy),
+                    Ok(value) => output(operation, value, &[receipt], None, false, &privacy),
                     Err(error) => output(
                         operation,
                         Value::Null,
-                        vec![receipt],
+                        &[receipt],
                         Some(operation.error(error)),
                         true,
                         &privacy,

@@ -98,7 +98,7 @@ fn png_dimensions(encoded: &str) -> Result<(u32, u32)> {
 /// Inspect an already byte-bounded image envelope without raster decoding.
 /// Callers own the encoded-byte allowance; these shared checks authenticate
 /// the declared format and bound its canvas, not complete raster validity.
-pub(crate) fn image_dimensions(encoded: &str, mime: &str) -> Result<(u32, u32)> {
+pub fn image_dimensions(encoded: &str, mime: &str) -> Result<(u32, u32)> {
     if mime == "image/png" {
         png_dimensions(encoded)
     } else {
@@ -196,7 +196,7 @@ pub(super) fn python_response(line: &str, restarted: bool, cells_run: u64) -> Re
 }
 
 pub(super) fn javascript_response(
-    response: super::js_kernel::JsCellResponse,
+    response: &super::js_kernel::JsCellResponse,
     restarted: bool,
     cells_run: u64,
 ) -> Result<ToolOutput> {
@@ -276,6 +276,7 @@ fn response_output(
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value)] // test helper; callers build owned json! values inline
     fn output(displays: Value, ok: bool) -> Result<ToolOutput> {
         python_response(
             &json!({"ok":ok, "stdout":"stdout", "stderr":"stderr", "displays":displays,
@@ -364,7 +365,7 @@ mod tests {
         assert!(output(Value::Array(vec![small.clone(); MAX_DISPLAYS]), true).is_ok());
         assert!(output(Value::Array(vec![small; MAX_DISPLAYS + 1]), true).is_err());
         let large = json!({"mimeType":"text/plain","data":"x".repeat(1_500_000)});
-        assert!(output(json!([large.clone(), large.clone()]), true).is_ok());
+        assert!(output(json!([large.clone(), large]), true).is_ok());
         assert!(output(json!([large.clone(), large.clone(), large]), true).is_err());
     }
 
@@ -402,13 +403,7 @@ mod tests {
         for _ in 0..MAX_DEPTH {
             data = json!([data]);
         }
-        assert!(
-            output(
-                json!([{"mimeType":"application/json","data":data.clone()}]),
-                true
-            )
-            .is_ok()
-        );
+        assert!(output(json!([{"mimeType":"application/json","data":data}]), true).is_ok());
         assert!(output(json!([{"mimeType":"application/json","data":[data]}]), true).is_err());
         assert!(
             output(
@@ -470,7 +465,7 @@ mod javascript_tests {
     #[test]
     fn javascript_uses_the_same_host_admission_as_python() {
         let frames = vec![json!({"mimeType":"application/json","data":{"answer":42}})];
-        let js = javascript_response(response(frames.clone()), false, 2).unwrap();
+        let js = javascript_response(&response(frames.clone()), false, 2).unwrap();
         let py = python_response(
             &json!({"ok":true,"stdout":"console","result":"17","displays":frames}).to_string(),
             false,
@@ -497,10 +492,10 @@ mod javascript_tests {
             json!({"mimeType":"image/png","data":"bad"}),
         ] {
             let frames = vec![json!({"mimeType":"text/plain","data":"prefix"}), bad];
-            assert!(javascript_response(response(frames), false, 2).is_err());
+            assert!(javascript_response(&response(frames), false, 2).is_err());
         }
         let over = vec![json!({"mimeType":"application/json","data":0}); MAX_DISPLAYS + 1];
-        assert!(javascript_response(response(over), false, 2).is_err());
+        assert!(javascript_response(&response(over), false, 2).is_err());
     }
 
     #[test]
@@ -509,7 +504,7 @@ mod javascript_tests {
             (false, "console\n17\n"),
             (true, "(js kernel started)\nconsole\n17\n"),
         ] {
-            let output = javascript_response(response(Vec::new()), restarted, 1).unwrap();
+            let output = javascript_response(&response(Vec::new()), restarted, 1).unwrap();
             assert_eq!(output.content.len(), 1);
             assert!(
                 matches!(&output.content[0], ContentBlock::Text(text) if text.text == expected)

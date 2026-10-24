@@ -79,6 +79,7 @@ impl Sessions {
         if retain {
             namespaces.insert(id.to_owned(), Arc::clone(&namespace));
         }
+        drop(namespaces);
         Ok((namespace, false))
     }
 

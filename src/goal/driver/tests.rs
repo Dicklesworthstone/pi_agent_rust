@@ -254,6 +254,7 @@ fn two_native_prompts_preserve_history_and_require_host_completion() {
     assert_eq!(users(&requests[0]), 1);
     assert_eq!(users(&requests[1]), 2);
     assert!(requests[1].to_string().contains("second step"));
+    drop(requests);
 }
 
 #[test]
@@ -448,7 +449,7 @@ fn driver_guard_preserves_unclaimed_native_input_when_run_is_dropped() {
     let mut session = handle("http://127.0.0.1:1/v1", temp.path()).into_controllable();
     let turn = session.prompt("never polled".into(), |_| {}).unwrap();
     let control = GoalControl::new();
-    control.install(turn.control());
+    control.install(&turn.control());
     let guard = RunGuard(control.clone());
     control.follow_up("recover this private input").unwrap();
     drop(turn);

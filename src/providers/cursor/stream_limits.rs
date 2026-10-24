@@ -489,7 +489,7 @@ mod tests {
                     assert!(emitted > 0);
                     return;
                 }
-                other => panic!("unexpected ready stream result: {other:?}"),
+                other @ Poll::Ready(_) => panic!("unexpected ready stream result: {other:?}"),
             }
         }
         panic!("an always-ready consumer never yielded");

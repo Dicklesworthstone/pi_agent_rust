@@ -101,10 +101,8 @@ struct RenameAnchor {
     spec: ServerSpec,
 }
 
-fn pair_count(params: &Option<Value>) -> usize {
-    params
-        .as_ref()
-        .map_or(0, |params| params["files"].as_array().map_or(0, Vec::len))
+fn pair_count(params: Option<&Value>) -> usize {
+    params.map_or(0, |params| params["files"].as_array().map_or(0, Vec::len))
 }
 
 /// Validate each response's wire versions against THAT connection, while the
@@ -193,6 +191,7 @@ impl LspTool {
         Ok((root, selected.into_values().collect()))
     }
 
+    #[allow(clippy::too_many_lines)] // one admission, merge and commit sequence across servers
     pub(super) async fn run_rename_group(
         &self,
         input: &LspInput,
@@ -336,7 +335,7 @@ impl LspTool {
         for operation in &plan.file_ops {
             match operation {
                 super::FileOp::Create { path, .. } | super::FileOp::Delete { path } => {
-                    inside_root(path, &root)?
+                    inside_root(path, &root)?;
                 }
                 super::FileOp::Rename {
                     old_path, new_path, ..
@@ -362,15 +361,15 @@ impl LspTool {
         evidence(&contributors, &responses, &plan)?;
         let servers: Vec<_> = contributors.iter().map(|contributor| json!({
             "server":contributor.entry.spec_name,
-            "willRenamePairs":pair_count(&contributor.will),"didRenamePairs":pair_count(&contributor.did)
+            "willRenamePairs":pair_count(contributor.will.as_ref()),"didRenamePairs":pair_count(contributor.did.as_ref())
         })).collect();
         let will_count: usize = contributors
             .iter()
-            .map(|source| pair_count(&source.will))
+            .map(|source| pair_count(source.will.as_ref()))
             .sum();
         let did_count: usize = contributors
             .iter()
-            .map(|source| pair_count(&source.did))
+            .map(|source| pair_count(source.did.as_ref()))
             .sum();
         let mut metadata = json!({
             "action":"rename_file","directory":directory,

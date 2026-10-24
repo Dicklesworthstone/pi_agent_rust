@@ -29,6 +29,7 @@ pub(super) struct History<'a> {
     excluded: HashSet<usize>,
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent flags read from each source record
 struct Node {
     line: usize,
     id: String,

@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
+#[allow(clippy::struct_field_names)] // fixture provider named for its scripted replies
 struct Replies {
     replies: Mutex<VecDeque<Result<String>>>,
     calls: Mutex<Vec<(String, StreamOptions)>>,
@@ -49,7 +50,8 @@ impl Provider for Replies {
             .lock()
             .unwrap()
             .push((prompt.clone(), options.clone()));
-        if let Some(store) = self.mutate.lock().unwrap().take() {
+        let mutate = self.mutate.lock().unwrap().take();
+        if let Some(store) = mutate {
             store
                 .try_lock()
                 .unwrap()

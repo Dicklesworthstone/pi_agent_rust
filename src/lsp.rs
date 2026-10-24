@@ -390,6 +390,7 @@ impl LspTool {
 
     /// Explicit, connection-local analysis settings. This is not an agent
     /// settings-file edit and does not reuse initializationOptions as settings.
+    #[allow(clippy::too_many_lines)] // one bounded preview-then-apply configuration exchange
     async fn run_configuration(&self, input: &LspInput) -> Result<ToolOutput> {
         let file = input
             .file
@@ -473,7 +474,7 @@ impl LspTool {
         let mut payload = json!({
             "action":"configure","file":display_path(&path,&self.cwd),
             "server":entry.spec_name,"workspace":display_path(entry.client.root(),&self.cwd),
-            "settings":proposed.as_ref().map_or(previous.as_ref(), client::workspace::Settings::value),
+            "settings":proposed.as_ref().map_or_else(|| previous.as_ref(), client::workspace::Settings::value),
             "previousRevision":revision,"revision":u64::MAX,
             "configured":revision != 0,"changed":changed,"applied":false,
             "preview":proposed.is_some() && input.apply != Some(true),

@@ -45,13 +45,13 @@ impl Drop for Pending {
 
 #[async_trait::async_trait]
 impl Provider for Fixture {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "completion-fixture"
     }
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "fixture"
     }
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "host-model"
     }
     async fn stream(
@@ -83,7 +83,7 @@ impl Provider for Fixture {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Reply::Text("answer".into()));
+            .unwrap_or_else(|| Reply::Text("answer".into()));
         let (text, reason) = match reply {
             Reply::Text(text) => (text, StopReason::Stop),
             Reply::BadStop => ("partial".into(), StopReason::Length),
@@ -118,7 +118,7 @@ fn binding(provider: &Arc<Fixture>) -> Judge {
         provider.clone(),
         StreamOptions {
             api_key: Some("HOST-CREDENTIAL".into()),
-            headers: [("X-Host".into(), "fixed".into())].into_iter().collect(),
+            headers: std::iter::once(("X-Host".into(), "fixed".into())).collect(),
             max_tokens: Some(99),
             ..Default::default()
         },
@@ -492,6 +492,7 @@ fn typed_extraction_feeds_native_reads_and_retains_data_in_both_kernels() {
         assert_eq!(envelope["prompt"], request["prompt"]);
         assert_eq!(envelope["schema"], request["schema"]);
         assert!(requests[0].0.contains("exactly one JSON value"));
+        drop(requests);
     }
 }
 

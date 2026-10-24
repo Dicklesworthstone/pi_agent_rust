@@ -10099,7 +10099,15 @@ mod retry_tests {
                         drop(guard);
                         let stored = store.lock(cx.cx()).await.expect("stored session");
                         assert_eq!(stored.header.provider.as_deref(), Some(expected));
-                        if !own_policy {
+                        if own_policy {
+                            let events: Vec<Value> = out_rx
+                                .try_iter()
+                                .map(|line| serde_json::from_str(&line).expect("event JSON"))
+                                .collect();
+                            assert_eq!(events.len(), 1);
+                            assert_eq!(events[0]["type"], "failover_start");
+                            assert_eq!(events[0]["toProvider"], "pi268-rescue");
+                        } else {
                             assert!(stored.entries.is_empty());
                             assert!(out_rx.try_recv().is_err());
                             assert!(
@@ -10110,14 +10118,6 @@ mod retry_tests {
                                     .failover_primary
                                     .is_none()
                             );
-                        } else {
-                            let events: Vec<Value> = out_rx
-                                .try_iter()
-                                .map(|line| serde_json::from_str(&line).expect("event JSON"))
-                                .collect();
-                            assert_eq!(events.len(), 1);
-                            assert_eq!(events[0]["type"], "failover_start");
-                            assert_eq!(events[0]["toProvider"], "pi268-rescue");
                         }
                     }
                 }
@@ -13656,6 +13656,7 @@ mod retry_tests {
             matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
             "runtime admission rejection must answer exactly once"
         );
+        drop(out_tx);
     }
 
     #[test]
@@ -13744,6 +13745,7 @@ mod retry_tests {
             matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
             "factory unwind must answer exactly once"
         );
+        drop(out_tx);
     }
 
     /// A turn that ends without sending its own terminal frame must still
@@ -25432,9 +25434,10 @@ export default function init(pi) {
         let runtime_handle = runtime.handle();
 
         runtime.block_on(async move {
-            let (events, session, metrics_before, _provider_admission) =
-                run_auto_compaction_persistence_case(Session::in_memory(), false, runtime_handle)
-                    .await;
+            let (events, session, metrics_before, _provider_admission) = Box::pin(
+                run_auto_compaction_persistence_case(Session::in_memory(), false, runtime_handle),
+            )
+            .await;
             let end = events
                 .iter()
                 .find(|event| event["type"] == "auto_compaction_end")
@@ -25489,8 +25492,10 @@ export default function init(pi) {
         runtime.block_on(async move {
             let session_root = tempfile::tempdir().expect("tempdir");
             let session = Session::create_with_dir(Some(session_root.path().to_path_buf()));
-            let (events, session, metrics_before, _provider_admission) =
-                run_auto_compaction_persistence_case(session, true, runtime_handle).await;
+            let (events, session, metrics_before, _provider_admission) = Box::pin(
+                run_auto_compaction_persistence_case(session, true, runtime_handle),
+            )
+            .await;
             let end = events
                 .iter()
                 .find(|event| event["type"] == "auto_compaction_end")
@@ -25548,7 +25553,7 @@ export default function init(pi) {
             std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
             let session = Session::create_with_dir(Some(blocked_session_dir));
             let (events, session, metrics_before, provider_admission) =
-                run_auto_compaction_persistence_case(session, true, runtime_handle).await;
+                Box::pin(run_auto_compaction_persistence_case(session, true, runtime_handle)).await;
             let end = events
                 .iter()
                 .find(|event| event["type"] == "auto_compaction_end")

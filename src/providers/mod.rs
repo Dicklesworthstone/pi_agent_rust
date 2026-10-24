@@ -221,20 +221,20 @@ fn extension_http_provider_binding(
     }) else {
         return Ok(None);
     };
-    if !spec
+    if spec
         .get("virtualHttpServer")
         .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty())
+        .is_none_or(str::is_empty)
     {
         return Ok(None);
     }
     // The manager stamps this owner from the actual JS runtime snapshot.
     // The runtime will independently verify the provider's live server binding
     // when each request starts; this marker alone never grants dispatch rights.
-    if !spec
+    if spec
         .get("extension_id")
         .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty())
+        .is_none_or(str::is_empty)
     {
         return Err(Error::config("Virtual HTTP provider has no runtime owner"));
     }
@@ -2043,7 +2043,7 @@ export default function init(pi) {
             .build()
             .expect("runtime build");
         runtime.block_on(async move {
-            let source = r#"
+            let source = r"
 import http from 'node:http';
 export default function activate(pi) {
   const server = http.createServer((req, res) => {
@@ -2069,7 +2069,7 @@ export default function activate(pi) {
     models: [{ id: 'fixture-model', name: 'Fixture', contextWindow: 100, maxTokens: 10, input: ['text'] }]
   });
 }
-"#;
+";
             let (_dir, manager) = load_extension(source, false).await;
             let entries = manager.extension_model_entries();
             let entry = entries
@@ -2116,7 +2116,7 @@ export default function activate(pi) {
             .build()
             .expect("runtime build");
         runtime.block_on(async move {
-            let source = r#"
+            let source = r"
 import http from 'node:http';
 export default function activate(pi) {
   http.createServer((req, res) => {
@@ -2148,7 +2148,7 @@ export default function activate(pi) {
     ]
   });
 }
-"#;
+";
             let (_dir, manager) = load_extension(source, false).await;
             let entries = manager.extension_model_entries();
             assert_eq!(entries.len(), 3);
@@ -2188,7 +2188,7 @@ export default function activate(pi) {
             .build()
             .expect("runtime build");
         runtime.block_on(async move {
-            let source = r#"
+            let source = r"
 import http from 'node:http';
 export default function activate(pi) {
   let cancelled = false;
@@ -2203,7 +2203,7 @@ export default function activate(pi) {
   });
   pi.on('agent_start', () => ({ cancelled }));
 }
-"#;
+";
             let (_dir, manager) = load_extension(source, false).await;
             let entry = manager.extension_model_entries().remove(0);
             let (provider_id, origin) = extension_http_provider_binding(&manager, &entry)

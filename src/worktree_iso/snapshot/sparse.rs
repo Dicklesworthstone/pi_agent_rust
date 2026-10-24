@@ -222,10 +222,11 @@ impl Skipped {
             if record.len() < 3 || record[1] != b' ' {
                 return Err(invalid());
             }
-            if matches!(record[0], b'S' | b's') && absent(repo, &record[2..])? {
-                if wanted.len() >= MAX_SKIPPED_PATHS || !wanted.insert(record[2..].to_vec()) {
-                    return Err(invalid());
-                }
+            if matches!(record[0], b'S' | b's')
+                && absent(repo, &record[2..])?
+                && (wanted.len() >= MAX_SKIPPED_PATHS || !wanted.insert(record[2..].to_vec()))
+            {
+                return Err(invalid());
             }
         }
         let absent = selected_entries(entries, &wanted)?;

@@ -31,7 +31,7 @@ fn word(input: &str) -> (&str, &str) {
     input
         .trim_start()
         .split_once(char::is_whitespace)
-        .unwrap_or((input.trim_start(), ""))
+        .unwrap_or_else(|| (input.trim_start(), ""))
 }
 
 fn path(tail: &mut &str) -> Result<PathBuf> {
@@ -192,6 +192,7 @@ struct Imported {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(clippy::struct_field_names)] // mirrors the bundle's `*Entries` coverage keys
 struct Coverage {
     branch_entries: usize,
     included_entries: usize,
@@ -388,10 +389,10 @@ impl Imported {
 
 fn seed_bytes(context: String, workspace: &Path, digest: &str) -> Result<Vec<u8>> {
     let mut seed = Session::in_memory();
-    seed.header.cwd = workspace
+    workspace
         .to_str()
         .ok_or_else(|| failure("HANDOFF_IMPORT_WORKSPACE"))?
-        .to_owned();
+        .clone_into(&mut seed.header.cwd);
     seed.append_message(SessionMessage::Custom {
         custom_type: "handoff".into(),
         content: context,
@@ -428,11 +429,11 @@ pub(super) fn run(handle: &AgentSessionHandle, args: &str) -> Result<String> {
     authorized(&owner)?;
     let destination = match options.session {
         Some((output, workspace)) => {
-            let canonical = match crate::session_workdir::WorkdirHealth::inspect(&workspace) {
-                crate::session_workdir::WorkdirHealth::Available { canonical_path } => {
-                    canonical_path
-                }
-                _ => return Err(failure("HANDOFF_IMPORT_WORKSPACE")),
+            let crate::session_workdir::WorkdirHealth::Available {
+                canonical_path: canonical,
+            } = crate::session_workdir::WorkdirHealth::inspect(&workspace)
+            else {
+                return Err(failure("HANDOFF_IMPORT_WORKSPACE"));
             };
             Some((bundle::Destination::prepare(output)?, canonical))
         }

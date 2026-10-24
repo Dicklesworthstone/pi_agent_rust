@@ -1733,8 +1733,10 @@ pub fn estimate_entries_context_tokens(entries: &[&SessionEntry]) -> u64 {
 }
 
 /// Estimate the actual provider-visible context, ignoring usage from earlier
-/// requests. A session's full entry path also contains history hidden by
-/// compaction, so it cannot measure whether a recovery made the input smaller.
+/// requests.
+///
+/// A session's full entry path also contains history hidden by compaction, so
+/// it cannot measure whether a recovery made the input smaller.
 #[must_use]
 pub fn estimate_model_context_tokens(messages: &[Message]) -> u64 {
     messages

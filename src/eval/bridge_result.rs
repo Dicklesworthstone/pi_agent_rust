@@ -321,6 +321,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end scenario with inline host and tool fixtures
     fn retained_agent_handles_reach_native_children_and_require_each_cells_host() {
         use crate::error::{Error, Result};
         use crate::tools::{JobsTool, ToolInvocationHost};
@@ -411,7 +412,7 @@ mod tests {
                 .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Both kernels must execute through the real eval runtime.
             runtime.block_on(async {
                 let launch = if kernel == "js" {
-                    r#"globalThis.saved = await agent('finish', {agent:'worker',outputSchema:{type:'object',required:['count'],properties:{count:{type:'integer'}}},schemaMode:'strict'}); saved.id"#
+                    r"globalThis.saved = await agent('finish', {agent:'worker',outputSchema:{type:'object',required:['count'],properties:{count:{type:'integer'}}},schemaMode:'strict'}); saved.id"
                 } else {
                     "saved = await agent('finish', agent='worker', output_schema={'type':'object','required':['count'],'properties':{'count':{'type':'integer'}}}, schema_mode='strict')\nsaved.id"
                 };
@@ -429,7 +430,7 @@ mod tests {
                 assert!(text(&denied).unwrap_err().contains("EVAL_BRIDGE_DENIED")); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Assert the explicit standalone-host refusal.
                 std::fs::write(root.path().join("release"), "continue").unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Release the real child after the cross-cell authority check.
                 let wait = if kernel == "js" {
-                    r#"var completed = await saved.wait(10); if (completed.details.results[0].data.count !== 7) throw Error('missing typed output'); 'native-agent-job-ok'"#
+                    r"var completed = await saved.wait(10); if (completed.details.results[0].data.count !== 7) throw Error('missing typed output'); 'native-agent-job-ok'"
                 } else {
                     "completed = await saved.wait(10)\nassert completed['details']['results'][0]['data']['count'] == 7\n'native-agent-job-ok'"
                 };

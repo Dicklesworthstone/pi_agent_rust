@@ -498,13 +498,11 @@ impl LspRegistry {
             match path {
                 Some(path) => {
                     let specs = self.specs_for_file(path);
-                    let keys: Vec<String> = entries
-                        .iter()
-                        .filter(|(_, entry)| specs.iter().any(|spec| spec.name == entry.spec_name))
-                        .map(|(key, _)| key.clone())
-                        .collect();
-                    keys.into_iter()
-                        .filter_map(|key| entries.remove(&key))
+                    entries
+                        .extract_if(|_, entry| {
+                            specs.iter().any(|spec| spec.name == entry.spec_name)
+                        })
+                        .map(|(_, entry)| entry)
                         .collect()
                 }
                 None => entries.drain().map(|(_, entry)| entry).collect(),

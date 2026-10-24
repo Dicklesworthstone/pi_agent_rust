@@ -288,7 +288,7 @@ impl Judge {
             error,
             retryable: true,
         })?;
-        Ok(self.reply("pi.judgment.v1", "answers", answers, usage))
+        Ok(self.reply("pi.judgment.v1", "answers", answers, usage.as_ref()))
     }
 
     /// One privacy projection covers every text field before either operation can
@@ -409,7 +409,7 @@ impl Judge {
         Ok((answer, usage))
     }
 
-    fn reply(&self, schema: &str, field: &str, value: Value, usage: Option<Usage>) -> Value {
+    fn reply(&self, schema: &str, field: &str, value: Value, usage: Option<&Usage>) -> Value {
         let mut reply = json!({
             "schema": schema,
             "model": format!("{}/{}", self.provider.name(), self.provider.model_id()),

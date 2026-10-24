@@ -826,6 +826,8 @@ impl McpManager {
         .await?
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn retire_authenticated_connection(entry: &Arc<ServerEntry>) {
         let mut current = Self::lock(&entry.transport);
         if let Some(transport) = current.take() {
@@ -1446,6 +1448,7 @@ impl McpManager {
         };
     }
 
+    #[allow(clippy::too_many_lines)] // one admission path for the HTTP, SSE and stdio transports
     async fn spawn_transport(&self, entry: &Arc<ServerEntry>) -> Result<Box<dyn McpTransport>> {
         let config = entry.config.clone();
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
@@ -1816,6 +1819,8 @@ impl McpManager {
             .await;
     }
 
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
     fn invalidate_notified_catalog(entry: &ServerEntry, transport: &Arc<dyn McpTransport>) -> bool {
         if !transport.take_tools_list_changed() {
             return false;

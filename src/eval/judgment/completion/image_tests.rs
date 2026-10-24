@@ -201,6 +201,7 @@ fn native_completion_preserves_images_and_schema_validated_data() {
     for block in &blocks[1..] {
         assert!(matches!(block, ContentBlock::Image(image) if image.data == PNG));
     }
+    drop(requests);
     assert!(!reply.to_string().contains(PNG));
 }
 
@@ -316,6 +317,7 @@ fn host_reads_share_native_receipts_and_preserve_text_privacy() {
     };
     assert_eq!(blocks.len(), 3);
     assert!(matches!(&blocks[0], ContentBlock::Text(text) if text.text == "screened"));
+    drop(requests);
     assert!(!reply.contains(PNG));
     let receipt = serde_json::to_string(&(&call.receipts, &call.tool_receipts)).unwrap();
     assert!(
@@ -452,5 +454,6 @@ fn public_eval_kernels_deliver_images_with_schema_data_and_shared_receipts() {
         let calls = provider.requests.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(matches!(&calls[0], UserContent::Blocks(blocks) if blocks.len() == 2));
+        drop(calls);
     }
 }

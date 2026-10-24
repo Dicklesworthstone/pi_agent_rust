@@ -33,6 +33,7 @@ impl Fixture {
         Self::configured(mode, Some(secondary), true)
     }
 
+    #[allow(clippy::too_many_lines)] // one fixture: scripted servers, workspace and tool wiring
     fn configured(mode: &str, secondary: Option<&str>, same_source: bool) -> Option<Self> {
         let python = ["python3", "python"].into_iter().find(|program| {
             Command::new(program)

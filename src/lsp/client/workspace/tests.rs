@@ -10,6 +10,7 @@ fn fixture() -> (tempfile::TempDir, Workspace) {
     (temp, workspace)
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn seed(workspace: &Workspace, value: Value) {
     let settings = Settings::parse(&value).unwrap();
     LspClient::lock(&workspace.state).settings = settings.0;

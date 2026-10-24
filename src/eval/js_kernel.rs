@@ -17,7 +17,7 @@
 
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -82,7 +82,7 @@ impl JsKernel {
         let worker_stopped = Arc::clone(&stopped);
         std::thread::Builder::new()
             .name("eval-js-kernel".into())
-            .spawn(move || kernel_thread(&req_rx, &bridge_tx, worker_stopped, workspace))?;
+            .spawn(move || kernel_thread(&req_rx, &bridge_tx, &worker_stopped, &workspace))?;
         Ok(Self {
             requests: req_tx,
             bridge: bridge_rx,
@@ -165,11 +165,12 @@ impl DeadlineCell {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one realm lifecycle: build, serve cells, rebuild on taint
 fn kernel_thread(
     requests: &Receiver<JsCellRequest>,
     bridge_tx: &Sender<JsBridgeRequest>,
-    stopped: Arc<AtomicBool>,
-    workspace: PathBuf,
+    stopped: &Arc<AtomicBool>,
+    workspace: &Path,
 ) {
     // A timed-out realm may still contain promise continuations. Rebuild it
     // before another cell rather than running old work under a new deadline.
@@ -180,13 +181,13 @@ fn kernel_thread(
         let Ok(runtime) = rquickjs::Runtime::new() else {
             return;
         };
-        let modules = modules::ModuleFiles::new(workspace.clone(), Arc::clone(&stopped));
+        let modules = modules::ModuleFiles::new(workspace.to_path_buf(), Arc::clone(stopped));
         runtime.set_loader(modules.clone(), modules.clone());
         let Ok(context) = rquickjs::Context::full(&runtime) else {
             return;
         };
         let origin = Instant::now();
-        let deadline = DeadlineCell::new(Arc::clone(&stopped));
+        let deadline = DeadlineCell::new(Arc::clone(stopped));
         {
             let deadline = deadline.clone();
             runtime.set_interrupt_handler(Some(Box::new(move || deadline.expired(origin))));
@@ -200,7 +201,7 @@ fn kernel_thread(
             return;
         };
         let Ok(host) =
-            context.with(|ctx| async_host::AsyncHost::install(&ctx, Arc::clone(&stopped)))
+            context.with(|ctx| async_host::AsyncHost::install(&ctx, Arc::clone(stopped)))
         else {
             return;
         };

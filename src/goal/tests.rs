@@ -36,7 +36,7 @@ fn checkpoint_roundtrip_preserves_unicode_objective_and_all_fields() {
 #[test]
 fn objective_and_budget_validation_rejects_unbounded_work() {
     for text in [
-        "".to_string(),
+        String::new(),
         " \n".to_string(),
         "a".repeat(MAX_TEXT_BYTES + 1),
     ] {

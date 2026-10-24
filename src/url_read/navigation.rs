@@ -51,7 +51,7 @@ fn http_url(input: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn private_v4(ip: Ipv4Addr) -> bool {
+const fn private_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
     ip.is_loopback()
         || ip.is_private()
@@ -67,7 +67,7 @@ fn private_v4(ip: Ipv4Addr) -> bool {
         || a == 192 && b == 0 && c == 0
 }
 
-fn private_v6(ip: Ipv6Addr) -> bool {
+const fn private_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return private_v4(v4);
     }
@@ -264,7 +264,9 @@ impl Route {
 }
 
 /// Resolve known source URLs and redirects under the original effective HTTP
-/// timeout. Explicitly disabled timeouts remain disabled. No auth/cookies are
+/// timeout.
+///
+/// Explicitly disabled timeouts remain disabled. No auth/cookies are
 /// synthesized, and no unsuccessful retrieval becomes a successful placeholder.
 pub async fn fetch(input: &str, policy: SsrfPolicy, mode: UrlReadMode) -> Result<UrlReadOutcome> {
     let route = Route::new(input, policy, mode)?;

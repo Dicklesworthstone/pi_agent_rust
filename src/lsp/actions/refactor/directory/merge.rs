@@ -48,12 +48,6 @@ fn overlap(a: Range, b: Range) -> bool {
 
 /// Bound the combined wire payload before cloning any individual edit strings.
 pub(super) fn admit(raws: &[Value]) -> Result<()> {
-    if raws.is_empty() || raws.len() > MAX_REFACTOR_SERVERS {
-        return Err(tool_err(
-            "LSP_EDIT_LIMIT",
-            "rename requires 1..8 server edit sets",
-        ));
-    }
     struct Limit(usize);
     impl std::io::Write for Limit {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -67,10 +61,17 @@ pub(super) fn admit(raws: &[Value]) -> Result<()> {
             Ok(())
         }
     }
+    if raws.is_empty() || raws.len() > MAX_REFACTOR_SERVERS {
+        return Err(tool_err(
+            "LSP_EDIT_LIMIT",
+            "rename requires 1..8 server edit sets",
+        ));
+    }
     serde_json::to_writer(&mut Limit(crate::lsp::actions::MAX_ACTION_BYTES), raws)
         .map_err(|_| tool_err("LSP_EDIT_LIMIT", "combined import edits exceed 2 MiB"))
 }
 
+#[allow(clippy::too_many_lines)] // one pass that admits, orders and conflict-checks every edit
 pub(super) fn combine(raws: &[Value], root: &Path) -> Result<Merged> {
     admit(raws)?;
     let mut documents: BTreeMap<PathBuf, Vec<Edit>> = BTreeMap::new();
@@ -230,6 +231,7 @@ mod tests {
         (temp, root, uri)
     }
 
+    #[allow(clippy::needless_pass_by_value)] // callers pass vec! temporaries
     fn wire(uri: &str, edits: Vec<Value>) -> Value {
         json!({"changes":{uri:edits}})
     }

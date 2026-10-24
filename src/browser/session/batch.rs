@@ -330,7 +330,7 @@ impl Plan {
                 Err(failure) => {
                     // Keep preceding evidence on a host-side binding failure.
                     // No native call for this step was entered or retried.
-                    report.binding_failure(index, &action, failure);
+                    report.binding_failure(index, &action, &failure);
                     break;
                 }
             };
@@ -495,7 +495,7 @@ impl Report {
         Ok(call)
     }
 
-    fn binding_failure(&mut self, index: usize, action: &str, failure: crate::error::Error) {
+    fn binding_failure(&mut self, index: usize, action: &str, failure: &crate::error::Error) {
         self.stop_reason = Some("binding_error");
         self.steps.push(
             json!({"index":index, "action":action, "outcome":"binding_error",

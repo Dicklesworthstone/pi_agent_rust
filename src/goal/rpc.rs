@@ -23,7 +23,7 @@ mod resolution;
 #[cfg(test)]
 mod resolution_tests;
 
-fn status_name(status: GoalStatus) -> &'static str {
+const fn status_name(status: GoalStatus) -> &'static str {
     match status {
         GoalStatus::Active => "active",
         GoalStatus::Paused => "paused",
@@ -67,7 +67,7 @@ fn result_value(record: Option<&Record>) -> Value {
 // branch/goal can inherit a budget decision. Unchanged saved state has the
 // same receipt after reopening; SDK incarnation checks are intentionally
 // stronger. Live tool authority and execution deadlines are not changed here.
-fn revision(session: &Session, current: &Option<(String, Record)>) -> Result<String> {
+fn revision(session: &Session, current: Option<&(String, Record)>) -> Result<String> {
     if session.header.id.is_empty()
         || session.header.id.len() > 1024
         || session.leaf_id().is_some_and(|id| id.len() > 1024)
@@ -91,10 +91,10 @@ fn revision(session: &Session, current: &Option<(String, Record)>) -> Result<Str
     Ok(receipt)
 }
 
-pub(crate) fn rpc_goal_state(session: &Session) -> Result<Value> {
+pub fn rpc_goal_state(session: &Session) -> Result<Value> {
     let current = latest(session)?;
     let mut value = result_value(current.as_ref().map(|(_, record)| record));
-    value["revision"] = Value::String(revision(session, &current)?);
+    value["revision"] = Value::String(revision(session, current.as_ref())?);
     Ok(value)
 }
 
@@ -148,7 +148,7 @@ fn revised_budget(session: &Session, request: &Value) -> Result<Record> {
             )
         })?;
     let current = latest(session)?;
-    if reviewed != revision(session, &current)? {
+    if reviewed != revision(session, current.as_ref())? {
         return Err(failure(
             "GOAL_STALE",
             "session, branch or goal changed; get and review it again. Nothing was changed.",
@@ -168,7 +168,7 @@ fn require_no_plan_mode(session: &Session) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn rpc_goal_command(
+pub async fn rpc_goal_command(
     agent_session: &mut AgentSession,
     owner: &AgentCx,
     request: &Value,

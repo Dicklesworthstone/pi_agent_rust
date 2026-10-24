@@ -17509,11 +17509,13 @@ pub fn available_virtual_module_names() -> std::collections::BTreeSet<String> {
 /// while avoiding per-tick full-heap scans.
 const UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS: u64 = 32;
 
+type DeferredHostcallFinalizer = Box<dyn FnOnce(&HostcallOutcome)>;
+
 struct DeferredHostcall {
     stream: futures::stream::LocalBoxStream<'static, HostcallOutcome>,
     credit: bool,
     deadline: Option<std::time::Instant>,
-    finalizer: Option<Box<dyn FnOnce(&HostcallOutcome)>>,
+    finalizer: Option<DeferredHostcallFinalizer>,
 }
 
 impl DeferredHostcall {
@@ -34963,6 +34965,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one restart scenario with its full JS fixture
     fn pijs_virtual_http_restart_retains_only_registered_owner_and_origin() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))

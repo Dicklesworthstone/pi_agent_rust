@@ -6255,6 +6255,7 @@ fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
 /// Deliberately narrow: lifecycle, streaming deltas, tool lifecycle, and
 /// error surfacing. Retry/failover/compaction events surface as system notes;
 /// everything else is dropped until its surface is ported.
+#[allow(clippy::too_many_lines)] // one flat match over every agent event kind
 pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
     use crate::agent::AgentEvent as E;
     use crate::model::AssistantMessageEvent as A;
@@ -18165,6 +18166,7 @@ mod tests {
             let calls = provider.calls.lock().unwrap();
             assert_eq!(calls.len(), 1);
             assert!(serde_json::to_string(&calls[0].content).unwrap().contains("preserve migration decisions"));
+            drop(calls);
             assert!(agent_rx.try_recv().is_err());
             eprintln!("{}", serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"native_driver_durability"}));
         }));

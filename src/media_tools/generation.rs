@@ -876,8 +876,7 @@ mod tests {
                 json!({"prompt":"test","output_path":"out.png","include_image":"true"}),
                 None,
             ))
-            .err()
-            .expect("invalid controls must not be silently ignored");
+            .expect_err("invalid controls must not be silently ignored");
         assert!(
             error
                 .to_string()

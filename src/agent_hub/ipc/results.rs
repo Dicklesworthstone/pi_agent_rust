@@ -49,7 +49,7 @@ pub(super) struct WireRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Document {
+pub struct Document {
     reference: String,
     content: String,
     content_type: String,
@@ -72,7 +72,7 @@ impl Document {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", content = "payload", rename_all = "camelCase")]
-pub(crate) enum WireResponse {
+pub enum WireResponse {
     Ok(Document),
     Page(stream::Page),
     Error(String),
@@ -118,7 +118,7 @@ fn check_owner(owner: &AgentCx) -> Result<()> {
 pub(super) fn dispatch_authenticated(
     sender: &str,
     token: &str,
-    request: WireRequest,
+    request: &WireRequest,
     owner: &AgentCx,
 ) -> Result<Transfer> {
     if request.version != VERSION || !matches_token(token, &request.token) {
@@ -171,7 +171,7 @@ fn enforce_document_limit(document: &Document) -> Result<()> {
 
 /// Resolve from the configured immediate parent, never a local fallback.
 /// Ordinary ReadTool line selection applies after a complete response arrives.
-pub(crate) fn resolve_from_env(reference: &str) -> Result<ResolvedDoc> {
+pub fn resolve_from_env(reference: &str) -> Result<ResolvedDoc> {
     reference_valid(reference)?;
     let (address, token) = inherited_endpoint()?
         .ok_or_else(|| ipc_error("CONFIG", "parent result channel is unavailable"))?;
@@ -220,6 +220,7 @@ fn remaining(owner: &AgentCx, deadline: Instant) -> Result<Duration> {
     Ok(remaining)
 }
 
+#[allow(clippy::too_many_lines)] // One nonblocking request/response loop under one deadline.
 fn resolve_at(
     owner: &AgentCx,
     address: SocketAddr,

@@ -284,6 +284,7 @@ pub fn png_encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 
 /// Merge a snapcompact payload into existing compaction details JSON,
 /// preserving all other keys (readFiles, modifiedFiles, mode, …).
+///
 /// Invalid or over-budget archives remove any stale snapcompact value;
 /// unrelated details and the separately stored text summary are preserved.
 #[must_use]
@@ -312,6 +313,7 @@ pub fn payload_to_details(
 }
 
 /// Extract validated snapcompact frames from compaction entry details.
+///
 /// Returns `None` when absent, invalid, or over the local archive budget.
 /// Known fields are borrowed until the complete archive passes count, byte,
 /// geometry and native PNG integrity checks; unknown JSON fields are not cloned.

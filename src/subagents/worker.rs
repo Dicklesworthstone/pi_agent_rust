@@ -44,6 +44,7 @@ struct Turn {
     privacy: Option<AuxiliaryPrivacySnapshot>,
 }
 
+#[allow(clippy::struct_excessive_bools)] // Independent lifecycle flags read under one lock.
 pub(super) struct WorkerState {
     owner: String,
     id: String,
@@ -184,6 +185,7 @@ fn register(state: Shared) -> Result<()> {
         workers.remove(oldest_closed);
     }
     workers.push_back(state);
+    drop(workers);
     Ok(())
 }
 
@@ -218,6 +220,7 @@ impl Drop for FinishGuard {
     }
 }
 
+#[allow(clippy::too_many_lines)] // One ordered admission from input checks to acknowledgment.
 async fn start(
     tool: &SubagentTool,
     input: Value,
@@ -260,12 +263,13 @@ async fn start(
         ));
     }
     let timeout = optional_integer(&input, "timeoutSeconds", 1, 86_400)?;
-    let scope: AgentScope = input
-        .get("scope")
-        .map_or(Ok(AgentScope::default()), |value| {
+    let scope: AgentScope = input.get("scope").map_or_else(
+        || Ok(AgentScope::default()),
+        |value| {
             serde_json::from_value(value.clone())
                 .map_err(|_| invalid("scope must be user, project or both"))
-        })?;
+        },
+    )?;
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner)?;
     if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
@@ -388,6 +392,7 @@ async fn start(
                         return Err(stopped());
                     }
                     state.acknowledged = true;
+                    drop(state);
                     Ok(((), None))
                 })?;
                 Ok(output)
@@ -412,6 +417,7 @@ async fn start(
     }
 }
 
+#[allow(clippy::too_many_lines)] // One dispatcher: send admission, close and the wait loop.
 pub(super) async fn execute(
     tool: &SubagentTool,
     input: Value,
@@ -505,6 +511,7 @@ pub(super) async fn execute(
                     id: turn_id,
                     task: task.clone(),
                 }); // ubs:ignore[rust.collections.clone-in-loop] -- Only the winning bounded admission copies this task into its owned queue; retries have no side effects.
+                drop(state);
                 Ok((true, None))
             })?;
             if admitted {
@@ -618,6 +625,7 @@ fn snapshot(
     projected_snapshot(value, privacy)
 }
 
+#[allow(clippy::needless_pass_by_value)] // Callers hand over freshly built snapshots.
 fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Result<ToolOutput> {
     // Re-screen stored results under the current invocation's policy/vault.
     // A later discovery may be stricter than the snapshot that admitted a turn.
@@ -699,6 +707,7 @@ pub(super) fn next_turn(shared: &Shared) -> Option<PendingTurn> {
     state.started = true;
     let turn = state.queue.pop_front()?;
     state.turns.get_mut(&turn.id)?.status = "running";
+    drop(state);
     Some(turn)
 }
 
@@ -709,11 +718,13 @@ pub(super) fn should_close(shared: &Shared) -> bool {
 }
 
 pub(super) fn observe_idle_context(shared: &Shared, tokens: Option<u64>, window: Option<u64>) {
-    if let Ok(mut state) = shared.lock() {
-        if !state.closed && !state.closing && state.deadline.check().is_ok() {
-            state.context_tokens = tokens;
-            state.context_window = window;
-        }
+    if let Ok(mut state) = shared.lock()
+        && !state.closed
+        && !state.closing
+        && state.deadline.check().is_ok()
+    {
+        state.context_tokens = tokens;
+        state.context_window = window;
     }
 }
 
@@ -799,6 +810,7 @@ pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>
                 if over_budget { WITHHELD } else { &summary }
             )
         });
+        drop(state);
         Ok(((), notice))
     });
     if accepted.is_err() {
@@ -814,7 +826,7 @@ pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>
 /// Called only after the actor's process and pipes have been retired. The
 /// outer future guard supplies cancellation settlement when the actor is
 /// dropped instead of returning. First terminal state wins.
-pub(super) fn finish(shared: &Shared, error: Option<String>) {
+pub(super) fn finish(shared: &Shared, error: Option<&str>) {
     let mut state = shared
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -40,7 +40,8 @@ fn output_callbacks_release_a_pending_operation_without_recreating_it() {
             "python",
             Some(Box::new(move |update: ToolUpdate| {
                 assert_eq!(update.details.unwrap()["output"]["sequence"], 1);
-                if let Some(release) = release.lock().unwrap().take() {
+                let sender = release.lock().unwrap().take();
+                if let Some(release) = sender {
                     release.send(()).unwrap();
                 }
             })),
@@ -271,6 +272,7 @@ fn callback_cancellation_is_checked_before_polling_native_work() {
 /// This is a real Python producer and the production pump, with a controlled
 /// native-boundary delay. It is not a network service or a model fixture.
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end scenario against a live Python producer
 fn actual_python_async_output_unblocks_native_read_and_preserves_final_capture() {
     use std::io::Write as _;
     if !std::process::Command::new("python3")
@@ -301,13 +303,14 @@ fn actual_python_async_output_unblocks_native_read_and_preserves_final_capture()
                     .as_ref()
                     .is_some_and(|details| details["jsonOutputs"] == json!([{"gate":42}]))
                 {
-                    if let Some(release) = release.lock().unwrap().take() {
+                    let sender = release.lock().unwrap().take();
+                    if let Some(release) = sender {
                         release.send(()).unwrap();
                     }
                 }
             })),
         );
-        let code = r#"import asyncio
+        let code = r"import asyncio
 async def work():
     return await tool.call('read', {'path':'source.txt'})
 async def progress():
@@ -318,7 +321,7 @@ async def progress():
 answer, _ = await asyncio.gather(work(), progress())
 assert 'native payload' in answer
 42
-"#;
+";
         writeln!(
             kernel.stdin.as_mut().unwrap(),
             "{}",

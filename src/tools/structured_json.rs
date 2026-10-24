@@ -13,10 +13,11 @@ use jaq_core::data::{DataT, HasLut};
 use jaq_core::load::{Arena, File, Loader};
 use jaq_core::native::{self, bome, v};
 use jaq_core::{Ctx, Lut, RunPtr, Vars};
-use jaq_json::Val;
+use jaq_json::{Rc, Val};
 use jaq_std::ValT as _;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -616,7 +617,7 @@ fn query_funs() -> impl Iterator<Item = native::Fun<QueryData>> {
     let replacements: Box<[native::Filter<RunPtr<QueryData>>]> = Box::new([
         // A Read query is not a credential inspection operation. This also
         // protects explicit worker invocations that bypass the parent's env_clear.
-        ("env", v(0), |_| bome(Ok(Val::Obj(Default::default())))),
+        ("env", v(0), |_| bome(Ok(Val::Obj(Rc::default())))),
         ("input_filename", v(0), |cv| {
             bome(Ok(Val::utf8_str(cv.0.data().source_path.to_owned())))
         }),
@@ -841,19 +842,21 @@ impl<'a> QueryOutput<'a> {
             if !content.is_empty() {
                 content.push('\n');
             }
-            content.push_str(&format!(
+            let _ = write!(
+                content,
                 "[{count}; append {} to continue]",
                 self.selector.continuation(offset)
-            ));
+            );
         } else if self.returned == 0
             && self.remaining.is_none()
             && self.selector.offset.is_some_and(|offset| offset > 0)
         {
-            content.push_str(&format!(
+            let _ = write!(
+                content,
                 "[offset {} is past the last result ({} total)]",
                 self.selector.offset.unwrap_or(0),
                 self.seen
-            ));
+            );
         }
         Ok(RenderedOutput {
             content,
@@ -942,8 +945,8 @@ fn evaluate(selector: &QueryRequest, source: &[u8]) -> std::result::Result<Query
     };
     let args = Val::obj(
         [
-            (Val::utf8_str("positional"), Val::Arr(Default::default())),
-            (Val::utf8_str("named"), Val::Obj(Default::default())),
+            (Val::utf8_str("positional"), Val::Arr(Rc::default())),
+            (Val::utf8_str("named"), Val::Obj(Rc::default())),
         ]
         .into_iter()
         .collect(),
@@ -954,10 +957,8 @@ fn evaluate(selector: &QueryRequest, source: &[u8]) -> std::result::Result<Query
     'inputs: for input in &inputs {
         let input = input?;
         last_input_failed = false;
-        let context = Ctx::<QueryData>::new(
-            data,
-            Vars::new([Val::Obj(Default::default()), args.clone()]),
-        );
+        let context =
+            Ctx::<QueryData>::new(data, Vars::new([Val::Obj(Rc::default()), args.clone()]));
         for item in filter.id.run((context, input)) {
             match item {
                 Ok(value) => {

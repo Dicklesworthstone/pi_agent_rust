@@ -229,6 +229,7 @@ fn invalid_input_and_failed_source_preflight_do_not_activate_another_namespace()
             let retained = tool.retained_sessions.lock().unwrap();
             assert_eq!(retained.active.as_deref(), Some("session-a"));
             assert!(retained.dormant.is_empty());
+            drop(retained);
         }
         select(&scope, "session-a");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "42");
@@ -355,7 +356,7 @@ fn javascript_callback_switch_keeps_partial_output_without_publishing_an_archive
     let (tool, scope) = scoped(dir.path());
     let updates = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&updates);
-    let callback_scope = scope.clone();
+    let callback_scope = scope;
     let callback = Box::new(move |_: crate::tools::ToolUpdate| {
         let _ = seen.fetch_add(1, Ordering::SeqCst);
         select(&callback_scope, "session-b");

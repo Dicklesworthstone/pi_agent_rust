@@ -9,6 +9,7 @@ use crate::model::{ContentBlock, TextContent};
 use crate::tools::{ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 mod archive;
@@ -31,7 +32,7 @@ struct BoundedText {
 }
 
 impl BoundedText {
-    fn new(limit: usize) -> Self {
+    const fn new(limit: usize) -> Self {
         Self {
             head: String::new(),
             tail: VecDeque::new(),
@@ -85,9 +86,10 @@ impl BoundedText {
         let mut text = self.head.clone();
         let omitted = self.omitted();
         if omitted > 0 {
-            text.push_str(&format!(
-                "\n[EVAL_OUTPUT_TRUNCATED: {omitted} UTF-8 bytes omitted]\n"
-            ));
+            let _ = writeln!(
+                text,
+                "\n[EVAL_OUTPUT_TRUNCATED: {omitted} UTF-8 bytes omitted]"
+            );
         }
         text.push_str(&tail);
         text
@@ -281,13 +283,13 @@ impl Capture {
         if let Some(details) = output.details.as_mut() {
             self.displays.annotate(details, true);
         }
-        if self.sequence > 0 {
-            if let Some(Value::Object(details)) = output.details.as_mut() {
-                details.insert(
-                    "output".into(),
-                    self.details(self.stdout.omitted(), self.stderr.omitted(), false),
-                );
-            }
+        if self.sequence > 0
+            && let Some(Value::Object(details)) = output.details.as_mut()
+        {
+            details.insert(
+                "output".into(),
+                self.details(self.stdout.omitted(), self.stderr.omitted(), false),
+            );
         }
     }
 

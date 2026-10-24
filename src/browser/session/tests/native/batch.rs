@@ -164,7 +164,7 @@ fn batch_owner_change_cannot_publish_partial_payload_or_start_the_next_step() {
     let scope = JobSessionScope::fixed("owner-a");
     let changed = scope.clone();
     let (sent, received) = futures::channel::oneshot::channel::<String>();
-    let new_identity = received.map(|result| result.ok()).shared();
+    let new_identity = received.map(std::result::Result::ok).shared();
     let mut completed = evaluate(
         false,
         &["page-a"],
@@ -183,7 +183,7 @@ fn batch_owner_change_cannot_publish_partial_payload_or_start_the_next_step() {
     let mut tool = BrowserTool::new(directory.path())
         .with_mock(false)
         .with_cdp_endpoint(endpoint);
-    tool.bind_job_session_scope(scope.clone());
+    tool.bind_job_session_scope(scope);
     let error = run(tool.execute(
         "batch-owner-change",
         workflow(vec![
@@ -229,9 +229,10 @@ fn batch_holds_the_outer_lease_and_dropping_it_unblocks_queued_work_without_repl
             ]),
             None,
         );
-        let pending = match futures::future::select(pending, arrived).await {
-            futures::future::Either::Right((Ok(()), pending)) => pending,
-            _ => panic!("batch must be awaiting the withheld native reply"),
+        let futures::future::Either::Right((Ok(()), pending)) =
+            futures::future::select(pending, arrived).await
+        else {
+            panic!("batch must be awaiting the withheld native reply");
         };
         let mut queued = tool.execute("queued", eval_call("queuedAfterBatch"), None);
         assert!(futures::poll!(queued.as_mut()).is_pending());

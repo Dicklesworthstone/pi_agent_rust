@@ -819,9 +819,9 @@ mod tests {
                 let out = AcpOutput::new(out);
                 let run = |command| {
                     let (_, signal) = super::super::AbortHandle::new();
-                    super::super::run_prompt(Arc::clone(&state), vec![crate::model::ContentBlock::Text(
+                    Box::pin(super::super::run_prompt(Arc::clone(&state), vec![crate::model::ContentBlock::Text(
                         crate::model::TextContent::new("Observe the tool schema"))], command,
-                        signal, out.clone(), "schema-probe".into(), cx.clone())
+                        signal, out.clone(), "schema-probe".into(), cx.clone()))
                 };
                 assert_eq!(run(Some(Command::Trust("remote".into()))).await, ACP_STOP_REASON_END_TURN);
                 assert_eq!(run(None).await, ACP_STOP_REASON_END_TURN); // Warm the provider schema cache.

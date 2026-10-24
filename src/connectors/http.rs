@@ -786,6 +786,7 @@ mod deployment_method_tests {
     /// Uses the real connector and native client, replacing only the I/O
     /// boundary. No DNS, cloud resources, sockets, or platform skips are needed.
     #[test]
+    #[allow(clippy::significant_drop_tightening)] // `sent` borrows the recorded-calls guard
     fn deployment_methods_preserve_verb_body_headers_and_response_bytes() {
         futures::executor::block_on(async {
             for (input, expected_method) in [

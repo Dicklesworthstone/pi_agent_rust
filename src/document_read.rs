@@ -233,7 +233,7 @@ enum Tag {
     Other,
 }
 
-fn namespace_name(namespace: ResolveResult<'_>) -> Result<&str> {
+fn namespace_name<'a>(namespace: &ResolveResult<'a>) -> Result<&'a str> {
     match namespace {
         ResolveResult::Bound(namespace) if namespace.0.len() <= MAX_XML_NAME_BYTES => {
             Ok(namespace.0)
@@ -319,7 +319,7 @@ fn properties(
         let attribute = attribute.map_err(document_error)?;
         validate_qname(attribute.key.as_ref())?;
         let (namespace, local) = resolver.resolve_attribute(attribute.key);
-        let namespace = namespace_name(namespace)?;
+        let namespace = namespace_name(&namespace)?;
         if !names.insert((namespace.to_owned(), local.as_ref().to_owned())) {
             return Err(document_error("duplicate expanded XML attribute name"));
         }
@@ -359,6 +359,7 @@ fn properties(
     Ok(result)
 }
 
+#[allow(clippy::large_enum_variant)] // transient per-element event; boxing would allocate per tag
 enum XmlEvent<'a> {
     Start(Tag, Properties),
     End(Tag),
@@ -387,7 +388,7 @@ fn visit_xml(
             Event::Start(start) => {
                 validate_qname(start.name().as_ref())?;
                 let (namespace, local) = reader.resolver().resolve_element(start.name());
-                let current = tag(namespace_name(namespace)?, local.as_ref());
+                let current = tag(namespace_name(&namespace)?, local.as_ref());
                 if parents.is_empty() {
                     if root_seen || current != expected_root {
                         return Err(document_error("unexpected or multiple XML document roots"));
@@ -464,7 +465,7 @@ fn visit_xml(
     Err(document_error("XML event budget exceeded"))
 }
 
-fn resolve_named_entity(name: &str, html_entities: bool) -> Option<&'static str> {
+const fn resolve_named_entity(name: &str, html_entities: bool) -> Option<&'static str> {
     if html_entities {
         quick_xml::escape::resolve_html5_entity(name)
     } else {
@@ -531,7 +532,7 @@ enum XmlEncoding {
 }
 
 impl XmlEncoding {
-    fn accepts(self, declaration: &str) -> bool {
+    const fn accepts(self, declaration: &str) -> bool {
         match self {
             Self::Utf8 => declaration.eq_ignore_ascii_case("UTF-8"),
             Self::Utf16Le => {
@@ -550,19 +551,13 @@ fn decode_xml(bytes: &[u8]) -> Result<(Cow<'_, str>, XmlEncoding)> {
     if bytes.len() as u64 > MAX_PART_BYTES {
         return Err(document_error("XML part exceeds 16 MiB"));
     }
-    let (bytes, encoding) = if let Some(bytes) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        (bytes, XmlEncoding::Utf16Le)
-    } else if let Some(bytes) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        (bytes, XmlEncoding::Utf16Be)
-    } else if bytes.starts_with(&[b'<', 0]) {
-        (bytes, XmlEncoding::Utf16Le)
-    } else if bytes.starts_with(&[0, b'<']) {
-        (bytes, XmlEncoding::Utf16Be)
-    } else {
-        (
-            bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes),
-            XmlEncoding::Utf8,
-        )
+    let (bytes, encoding) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, XmlEncoding::Utf16Le),
+        [0xFE, 0xFF, rest @ ..] => (rest, XmlEncoding::Utf16Be),
+        [b'<', 0, ..] => (bytes, XmlEncoding::Utf16Le),
+        [0, b'<', ..] => (bytes, XmlEncoding::Utf16Be),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => (rest, XmlEncoding::Utf8),
+        _ => (bytes, XmlEncoding::Utf8),
     };
     let text = match encoding {
         XmlEncoding::Utf8 => Cow::Borrowed(std::str::from_utf8(bytes).map_err(document_error)?),
@@ -571,10 +566,12 @@ fn decode_xml(bytes: &[u8]) -> Result<(Cow<'_, str>, XmlEncoding)> {
                 return Err(document_error("truncated UTF-16 XML"));
             }
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| match encoding {
-                    XmlEncoding::Utf16Le => u16::from_le_bytes([pair[0], pair[1]]),
-                    _ => u16::from_be_bytes([pair[0], pair[1]]),
+                    XmlEncoding::Utf16Le => u16::from_le_bytes(*pair),
+                    _ => u16::from_be_bytes(*pair),
                 })
                 .collect();
             Cow::Owned(String::from_utf16(&units).map_err(document_error)?)
@@ -586,7 +583,7 @@ fn decode_xml(bytes: &[u8]) -> Result<(Cow<'_, str>, XmlEncoding)> {
     Ok((text, encoding))
 }
 
-fn xml_character(c: char) -> bool {
+const fn xml_character(c: char) -> bool {
     matches!(
         c,
         '\t' | '\n' | '\r'
@@ -624,7 +621,7 @@ fn validate_qname(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn xml_name_start(c: char) -> bool {
+const fn xml_name_start(c: char) -> bool {
     matches!(
         c,
         'A'..='Z' | '_' | 'a'..='z'

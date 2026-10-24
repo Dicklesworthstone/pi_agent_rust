@@ -524,10 +524,9 @@ impl AgentSessionHandle {
         // Also cover failures while preparing a retry/failover. Install the
         // fence before observers receive the logical turn's terminal event.
         let result = fence_session_persistence(&admission, result);
-        let interrupted = match &result {
-            Ok(message) => matches!(message.stop_reason, StopReason::Error | StopReason::Aborted),
-            Err(_) => true,
-        };
+        let interrupted = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
         self.session.finish_prewalk_turn(interrupted);
         turn.finish(&result);
         result

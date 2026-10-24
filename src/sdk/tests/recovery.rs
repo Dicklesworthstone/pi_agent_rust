@@ -1860,7 +1860,7 @@ fn configured_fallback_controls_preserve_retries_and_gate_actual_provider_reques
             }
         );
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), if expected_swap { 1 } else { 0 });
+        assert_eq!(requests.len(), usize::from(expected_swap));
         if expected_swap {
             assert_eq!(requests[0]["model"], "fallback-a");
         }
@@ -1871,7 +1871,7 @@ fn configured_fallback_controls_preserve_retries_and_gate_actual_provider_reques
                 .iter()
                 .filter(|event| event["type"] == "failover_start")
                 .count(),
-            if expected_swap { 1 } else { 0 },
+            usize::from(expected_swap),
         );
         drop(events);
         let messages = run_async(handle.messages()).expect("transcript");
@@ -2231,6 +2231,7 @@ fn prewalk_cross_provider_persists_the_whole_batch_and_retains_hook_prompt_acros
         "strong model stops at the first completed edit batch"
     );
     assert!(source_requests[0].to_string().contains("## Prewalk"));
+    drop(source_requests);
     let target_requests = target.requests.lock().unwrap();
     assert_eq!(target_requests.len(), 2, "target retry stays on the target");
     for request in &*target_requests {
@@ -2257,6 +2258,7 @@ fn prewalk_cross_provider_persists_the_whole_batch_and_retains_hook_prompt_acros
         assert!(request.to_string().contains("native-content-hook"));
         assert!(!request.to_string().contains("## Prewalk"));
     }
+    drop(target_requests);
     let events = events.lock().unwrap();
     for kind in ["agent_start", "agent_end", "prewalk_switched"] {
         assert_eq!(
@@ -2847,6 +2849,7 @@ fn overflow_keeps_native_request_and_large_completed_tool_tail_or_stops_without_
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::significant_drop_tightening)] // `end` borrows the events guard
 fn overflow_rejects_extension_cuts_that_discard_current_input_or_name_unknown_entries() {
     for unknown_cut in [false, true] {
         let dir = tempdir().unwrap();
@@ -3031,6 +3034,7 @@ fn disabled_compaction_and_unsplittable_input_never_reenter_the_provider() {
                 .iter()
                 .all(|event| event["type"] != "auto_compaction_start")
         );
+        drop(events);
         handle.session.ensure_provider_reentry_allowed().unwrap();
     }
 }
@@ -3101,6 +3105,7 @@ fn overflow_compaction_honors_cancellation_before_and_during_summary() {
         assert_eq!(end["aborted"], true);
         assert_eq!(end["willRetry"], false);
         assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        drop(events);
         handle.session.ensure_provider_reentry_allowed().unwrap();
     }
 }

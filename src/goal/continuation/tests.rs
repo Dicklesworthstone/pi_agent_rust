@@ -36,6 +36,7 @@ fn paused(decision: GoalDecision, code: &str) {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)] // takes `decide()` results inline at every call site
 fn continues(decision: GoalDecision) {
     assert!(matches!(decision, GoalDecision::Continue { .. }));
 }

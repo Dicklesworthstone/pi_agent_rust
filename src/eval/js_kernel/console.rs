@@ -51,7 +51,7 @@ pub(super) struct ConsoleCapture {
 }
 
 impl ConsoleCapture {
-    pub(super) fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             capture: None,
             output: None,

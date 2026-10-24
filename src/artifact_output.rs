@@ -182,7 +182,7 @@ fn copy_bounded(
     owner: &crate::agent_cx::AgentCx,
     tool: &str,
 ) -> Result<u64> {
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
         check_owner(owner, tool)?;
@@ -497,8 +497,7 @@ mod tests {
         let target = resolve_new(root.path(), "result.bin", "test").unwrap();
         let owner = crate::agent_cx::AgentCx::for_testing();
         let _current = owner.cx().clone().set_current_restricted();
-        let failure =
-            publish_from_reader(&target, &mut Cancelling(owner.clone()), 10, "test").unwrap_err();
+        let failure = publish_from_reader(&target, &mut Cancelling(owner), 10, "test").unwrap_err();
         assert!(failure.to_string().contains("cancelled"));
         assert!(!target.path().exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

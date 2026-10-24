@@ -131,7 +131,7 @@ fn offsets_lengths_revisions_headers_and_early_completion_are_not_implicit_resta
                 second.header = Some(Header {
                     content_type: "text/plain".into(),
                     metadata: json!({}),
-                })
+                });
             }
             4 => second.done = true,
             _ => second.reference = "other-reader/value".into(),
@@ -155,7 +155,7 @@ fn malformed_first_pages_and_unbounded_headers_fail_before_accumulation() {
             4 => first.fingerprint.clear(),
             _ => {
                 first.header.as_mut().unwrap().metadata =
-                    json!({"oversized":"x".repeat(METADATA_BYTES)})
+                    json!({"oversized":"x".repeat(METADATA_BYTES)});
             }
         }
         let mut collector = Collector::new("peer-1/value");

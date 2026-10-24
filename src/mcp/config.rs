@@ -1042,6 +1042,7 @@ pub(super) fn expand_config_value(raw: &str, cwd: &Path) -> Result<String, Strin
     expand_config_value_with(raw, cwd, |name| std::env::var(name).ok())
 }
 
+#[allow(clippy::literal_string_with_formatting_args)] // ${VAR} config syntax in the error text
 fn expand_config_value_with(
     raw: &str,
     cwd: &Path,
@@ -2773,6 +2774,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // ${VAR:-default} config syntax
     fn config_variables_expand_once_with_no_command_interpretation() {
         let workspace = Path::new("/workspace/project");
         let lookup = |name: &str| match name {
@@ -3074,6 +3076,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // ${env:VAR} config syntax
     fn codex_toml_preserves_disabled_flags_nested_env_and_multiline_arguments() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(

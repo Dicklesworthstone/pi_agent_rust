@@ -298,7 +298,7 @@ async fn prompt(
 ) -> (&'static str, Vec<Value>) {
     let (tx, rx) = std::sync::mpsc::sync_channel(128);
     let tx = AcpOutput::new(tx);
-    let reason = run_prompt(
+    let reason = Box::pin(run_prompt(
         Arc::clone(state),
         content,
         None,
@@ -306,7 +306,7 @@ async fn prompt(
         tx.clone(),
         id.to_string(),
         AgentCx::for_current_or_request(),
-    )
+    ))
     .await;
     // Mirror the dispatcher: the response must follow recovery notices,
     // committed selection updates and the session's final persistence step.

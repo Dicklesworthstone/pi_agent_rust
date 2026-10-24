@@ -59,7 +59,7 @@ struct Snapshot {
 /// The transaction and its temporary files outlive a promoted tool future.
 /// Only the process owner calls `finish`, after the process has been reaped.
 #[derive(Clone)]
-pub(crate) struct ShellTransaction(Arc<TransactionInner>);
+pub struct ShellTransaction(Arc<TransactionInner>);
 
 struct TransactionInner {
     state: Arc<Mutex<SessionState>>,
@@ -82,7 +82,7 @@ struct TransactionCompletion {
 /// A direct runner may hand its child to an asynchronous reaper on Drop or
 /// cancellation. Retain both the lease and private files until that owner has
 /// actually reaped the child, even if the outer tool already requested finish.
-pub(crate) struct ShellProcessLease(ShellTransaction);
+pub struct ShellProcessLease(ShellTransaction);
 
 pub(super) enum Acquisition {
     Persistent(ShellTransaction),
@@ -91,6 +91,7 @@ pub(super) enum Acquisition {
 
 /// Acquire before spawn. Busy calls do not wait on a long-running command and
 /// never import or publish that command's in-flight session state.
+#[allow(clippy::significant_drop_tightening)] // The pool lock covers the lease handoff.
 pub(super) fn acquire(
     session_id: &str,
     initial_cwd: &Path,
@@ -314,6 +315,7 @@ impl TransactionInner {
             .take(u64::try_from(MAX_SNAPSHOT_BYTES + 1).ok()?)
             .read_to_end(&mut bytes)
             .ok()?;
+        drop(capture);
         if bytes.len() > MAX_SNAPSHOT_BYTES {
             tracing::warn!(
                 event = "pi.bash.state",
@@ -592,6 +594,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::used_underscore_binding)] // `_restore` is a keep-alive field; check its mode
     fn shell_state_files_are_private_and_oversized_capture_preserves_prior_state() {
         let root = tempfile::TempDir::new().expect("temporary workspace");
         let original = Arc::new(Snapshot {
@@ -650,6 +653,7 @@ mod tests {
             retained.snapshot.as_ref().expect("prior snapshot"),
             &original
         ));
+        drop(retained);
         assert!(
             !transaction.command().contains("private-value"),
             "state values must not enter process arguments"

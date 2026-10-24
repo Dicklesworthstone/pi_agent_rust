@@ -707,6 +707,7 @@ pub struct ValidationDoctorInput {
 }
 
 /// Normalize legacy preflight checks or a native `pi doctor` report.
+///
 /// Native reports must contain explicit swarm resource and admission evidence;
 /// a healthy consumer-only report is not authority to launch validation work.
 pub fn normalize_doctor_json(

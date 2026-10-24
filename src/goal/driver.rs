@@ -31,9 +31,11 @@ mod input;
 mod tests;
 mod verification;
 
-/// An explicit host decision after a successful native prompt. Evidence text
-/// is an attestation by the host, not proof verified by Pi. A continuation is
-/// bounded and journaled; none is inferred from a completion marker in prose.
+/// An explicit host decision after a successful native prompt.
+///
+/// Evidence text is an attestation by the host, not proof verified by Pi. A
+/// continuation is bounded and journaled; none is inferred from a completion
+/// marker in prose.
 #[derive(Clone)]
 pub enum GoalDecision {
     Continue { instruction: String },
@@ -54,6 +56,7 @@ pub enum GoalRunStop {
 }
 
 /// The last native outcome survives independently of any goal-journal error.
+///
 /// In particular, neither a save failure nor expiry discards a typed provider
 /// error or a partial result. Pending inputs were NOT handed to the agent and
 /// are returned in admission order; this driver never silently replays them.
@@ -89,9 +92,10 @@ struct ControlState {
     verification_waker: Option<std::task::Waker>,
 }
 
-/// A handle for ONE run, including the gaps between its prompts. `pause`
-/// latches across those gaps and requests native abort when a prompt is live.
-/// A handle from a finished/dropped run cannot control a later run.
+/// A handle for ONE run, including the gaps between its prompts.
+///
+/// `pause` latches across those gaps and requests native abort when a prompt
+/// is live. A handle from a finished/dropped run cannot control a later run.
 #[derive(Clone)]
 pub struct GoalControl {
     state: Arc<Mutex<ControlState>>,
@@ -192,7 +196,7 @@ impl GoalControl {
     }
 
     /// Install before polling, then honor any pause racing this publication.
-    fn install(&self, turn: SessionControlHandle) {
+    fn install(&self, turn: &SessionControlHandle) {
         let paused = {
             let mut state = self.lock();
             state.turn = Some(turn.clone());
@@ -273,6 +277,7 @@ impl<F: Future<Output = GoalRunReport>> Future for GoalRun<F> {
 }
 
 /// Owned-session convenience wrapper around the shared borrowed goal driver.
+///
 /// The session remains exclusively borrowed throughout a run; ordinary
 /// lifecycle operations are available through `session_mut` while idle.
 pub struct GoalSession {
@@ -288,7 +293,7 @@ impl AgentSessionHandle {
 }
 
 impl GoalSession {
-    pub fn session_mut(&mut self) -> &mut AgentSessionHandle {
+    pub const fn session_mut(&mut self) -> &mut AgentSessionHandle {
         self.session.session_mut()
     }
 
@@ -399,6 +404,7 @@ impl AgentSessionHandle {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // one journaled prompt/verify loop with a single report
     async fn drive_goal<F>(
         &mut self,
         owner: &AgentCx,
@@ -461,7 +467,7 @@ impl AgentSessionHandle {
                 callback(&callback_control, event);
             });
             let native_control = turn.control();
-            control.install(native_control.clone());
+            control.install(&native_control);
             report.completion = Some(turn.with_deadline(deadline.clone()).await);
             control.retire_turn();
             report.pending = native_control.take_pending();

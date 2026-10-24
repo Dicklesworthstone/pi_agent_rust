@@ -178,6 +178,7 @@ fn porcelain_paths_zero(status: &[u8]) -> Result<Vec<String>, String> {
 
 /// `/commit [--dry-run|-n|plan] [--include-lockfiles]`: split the working
 /// tree's changes into atomic commits, or only show the plan.
+#[allow(clippy::too_many_lines)] // one git inspect/plan/apply flow rendered into a single report
 pub fn commit(cwd: &Path, args: &str) -> Report {
     let args = args.trim();
     let dry_run = args == "dry-run"
@@ -246,11 +247,8 @@ pub fn commit(cwd: &Path, args: &str) -> Report {
         }
         Err(error) => return Report::status(format!("Failed to run git diff: {error}")),
     };
-    let diff = match std::str::from_utf8(&diff_out.stdout) {
-        Ok(diff) => diff,
-        Err(_) => {
-            return Report::status("Git diff is not UTF-8; refusing to plan an incomplete commit.");
-        }
+    let Ok(diff) = std::str::from_utf8(&diff_out.stdout) else {
+        return Report::status("Git diff is not UTF-8; refusing to plan an incomplete commit.");
     };
     let hunks = match crate::commit_split::DiffParser::parse_unified_diff(diff) {
         Ok(hunks) => hunks,
@@ -309,7 +307,10 @@ pub fn commit(cwd: &Path, args: &str) -> Report {
 /// A review owns its screened input and provider while the UI remains responsive.
 pub enum PreparedWorkspaceReview {
     Offline(Report),
-    Model(crate::review::ModelReviewer, crate::review::PreparedReview),
+    Model(
+        Box<crate::review::ModelReviewer>,
+        crate::review::PreparedReview,
+    ),
 }
 
 impl PreparedWorkspaceReview {
@@ -317,14 +318,14 @@ impl PreparedWorkspaceReview {
         match self {
             Self::Offline(report) => report,
             Self::Model(client, request) => match client.review_prepared(request, abort).await {
-                Ok(report) => review_report(report),
+                Ok(report) => review_report(&report),
                 Err(error) => Report::status(format!("Review failed: {error}")),
             },
         }
     }
 }
 
-fn review_report(report: crate::review::ReviewReport) -> Report {
+fn review_report(report: &crate::review::ReviewReport) -> Report {
     Report::card(
         report.format_markdown(),
         format!("{}: {}", report.verdict.badge(), report.summary),
@@ -357,25 +358,25 @@ pub fn prepare_review(
     };
     if offline {
         return crate::review::CodeReviewer::review(cwd, &options)
-            .map(review_report)
+            .map(|report| review_report(&report))
             .map(PreparedWorkspaceReview::Offline);
     }
     let client = crate::review::ModelReviewer::for_agent(agent);
     let request = client.prepare_with_agent(cwd, &options, agent)?;
-    Ok(PreparedWorkspaceReview::Model(client, request))
+    Ok(PreparedWorkspaceReview::Model(Box::new(client), request))
 }
 
 /// Explicit report and preview modes never turn an unrecognized option into
 /// a delivery target. All other authored text is the in-place handoff focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HandoffMode<'a> {
+pub enum HandoffMode<'a> {
     InPlace(&'a str),
     Report(&'a str),
     ModelPreview(&'a str),
     Import(&'a str),
 }
 
-pub(crate) fn handoff_mode(args: &str) -> crate::error::Result<HandoffMode<'_>> {
+pub fn handoff_mode(args: &str) -> crate::error::Result<HandoffMode<'_>> {
     let args = args.trim();
     let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
     match first {
@@ -401,7 +402,7 @@ pub(crate) fn handoff_mode(args: &str) -> crate::error::Result<HandoffMode<'_>> 
 
 /// Both terminal stacks share the native durable transaction. Keep polling it
 /// after cancellation so persistence retains its normal ownership and fence.
-pub(crate) async fn run_in_place_handoff(
+pub async fn run_in_place_handoff(
     handle: &mut crate::sdk::AgentSessionHandle,
     focus: &str,
     abort: &crate::agent::AbortSignal,

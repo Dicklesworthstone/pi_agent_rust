@@ -350,7 +350,7 @@ mod tests {
             .is_err()
         );
         for root in [
-            "".to_string(),
+            String::new(),
             "x\0y".to_string(),
             "x".repeat(MAX_PATH_BYTES + 1),
         ] {
@@ -375,10 +375,17 @@ mod tests {
     /// not by the connected DapTransport; its guard cleans up after failures.
     #[test]
     #[ignore = "requires a real Python/debugpy installation; opt in through DSR"]
+    #[allow(clippy::too_many_lines)] // one end-to-end attach scenario against a live debugpy
     fn live_debugpy_maps_breakpoints_inspects_changes_and_preserves_the_target() {
         use crate::tools::{ProcessCleanupMode, ProcessGuard, Tool, ToolRegistry};
         use std::process::{Command, Stdio};
         use std::time::Instant;
+
+        async fn call(tool: &dyn Tool, input: Value) -> Value {
+            let output = tool.execute("live-attach", input, None).await.unwrap();
+            assert!(!output.is_error, "{output:?}");
+            output.details.unwrap()
+        }
 
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -441,11 +448,6 @@ mod tests {
             DebugTool::new(&local, None).with_adapters(Vec::new()),
         )]);
         let tool = registry.get("debug").unwrap();
-        async fn call(tool: &dyn Tool, input: Value) -> Value {
-            let output = tool.execute("live-attach", input, None).await.unwrap();
-            assert!(!output.is_error, "{output:?}");
-            output.details.unwrap()
-        }
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(1, 8)
             .build()

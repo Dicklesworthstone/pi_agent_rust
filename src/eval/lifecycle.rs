@@ -155,6 +155,8 @@ fn before_execution_stop(stop: CellStop) -> Error {
 }
 
 impl EvalTool {
+    // The execution guard serializes the whole cell, not just its activation.
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     pub(super) async fn execute_cell(
         &self,
         input: Value,
@@ -205,7 +207,7 @@ impl EvalTool {
         // Waiting is asynchronous and consumes no cell runtime budget. The
         // guard releases on success, error, panic, or future abandonment.
         // No FIFO ordering is promised between simultaneous callers.
-        let _execution = wait_owned(&owner, None, self.execution.lock())
+        let execution = wait_owned(&owner, None, self.execution.lock())
             .await
             .map_err(before_execution_stop)?;
         wait_owned(&owner, None, self.require_eval_session(&requested_session))
@@ -238,7 +240,7 @@ impl EvalTool {
         wait_owned(&owner, None, self.require_eval_session(&requested_session))
             .await
             .map_err(before_execution_stop)??;
-        let activation = self.activate_eval_session(&requested_session, &_execution, &owner);
+        let activation = self.activate_eval_session(&requested_session, &execution, &owner);
         let session_guard = CellSession::new(self.session_scope.clone(), requested_session);
         if cell.reset {
             // Drop outside the short slot lock, before starting the next cell.
@@ -732,7 +734,7 @@ mod tests {
                     .await;
                 drop(lease);
             };
-            let (_, output) = futures::join!(
+            let ((), output) = futures::join!(
                 release,
                 tool.execute(
                     "queued",

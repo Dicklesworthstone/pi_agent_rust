@@ -20,7 +20,7 @@ mod io;
 mod parser;
 mod selection;
 
-pub(crate) use selection::prepare_conflict_write;
+pub use selection::prepare_conflict_write;
 pub use selection::{ConflictChoice, ConflictResolution, apply_conflict_choices};
 
 const MAX_FILES: usize = 256;
@@ -282,6 +282,7 @@ pub fn conflict_regions(cwd: &Path) -> Result<Vec<ConflictRegion>> {
 }
 
 /// Resolve one current region while preserving all other bytes and permissions.
+///
 /// This legacy API takes a fresh snapshot; use token-checked choices to guard
 /// an earlier read. No Git index entry is staged and no commit is created.
 ///

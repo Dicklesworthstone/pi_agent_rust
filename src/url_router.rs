@@ -77,10 +77,7 @@ pub fn resolve(path: &str, cwd: &Path) -> Result<ResolvedDoc> {
     if let Some(reference) = path.strip_prefix("skill://") {
         return skills::resolve(reference, cwd);
     }
-    match agent_reference(path)? {
-        Some(reference) => resolve_agent(reference),
-        None => documents::resolve(path, cwd),
-    }
+    agent_reference(path)?.map_or_else(|| documents::resolve(path, cwd), resolve_agent)
 }
 
 /// Resolve with explicit document backend overrides.
@@ -94,10 +91,10 @@ pub fn resolve_with(path: &str, cwd: &Path, options: &ResolveOptions) -> Result<
     if let Some(reference) = path.strip_prefix("skill://") {
         return skills::resolve(reference, cwd);
     }
-    match agent_reference(path)? {
-        Some(reference) => resolve_agent(reference),
-        None => documents::resolve_with(path, cwd, options),
-    }
+    agent_reference(path)?.map_or_else(
+        || documents::resolve_with(path, cwd, options),
+        resolve_agent,
+    )
 }
 
 #[cfg(test)]

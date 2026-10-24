@@ -37,7 +37,7 @@ pub(super) fn apply(
         GoalReconciliation::Drop => GoalStatus::Dropped,
     };
     record.in_flight = false;
-    record.note = evidence.to_owned();
+    evidence.clone_into(&mut record.note);
     Ok(record)
 }
 

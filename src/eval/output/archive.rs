@@ -562,7 +562,7 @@ mod tests {
         let rows = records(path);
         assert_eq!(
             console(&rows, "stdout"),
-            format!("BEGIN-{}-END\n", "界".repeat(500000))
+            format!("BEGIN-{}-END\n", "界".repeat(500_000))
         );
         assert_eq!(rows.last().unwrap()["stdoutBytes"], 1_500_011);
         assert_eq!(rows.last().unwrap()["status"], "success");

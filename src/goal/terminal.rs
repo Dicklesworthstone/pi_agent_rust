@@ -80,6 +80,7 @@ fn text_tail<'a>(remaining: &mut &'a str) -> Result<&'a str> {
     Ok(text)
 }
 
+#[allow(clippy::too_many_lines)] // one bounded token grammar for every /goal subcommand
 fn parse(args: &str) -> Result<Command<'_>> {
     // Bound input before token scanning or allocation, independently of the
     // journal's 16 KiB text limit. No shell parser or file/template expansion.
@@ -199,7 +200,7 @@ fn parse(args: &str) -> Result<Command<'_>> {
 /// incarnation checks are a different API and remain unchanged.
 fn receipt(
     session: &Session,
-    current: &Option<(String, Record)>,
+    current: Option<&(String, Record)>,
     live_plan: PlanMode,
     persistent: bool,
 ) -> Result<String> {
@@ -241,14 +242,15 @@ fn require_no_plan(session: &Session, live: PlanMode) -> Result<()> {
 
 /// Lifecycle-only tests need no control sink. Production supplies one below.
 #[cfg(test)]
-pub(crate) async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<String> {
+pub async fn run(handle: &mut AgentSessionHandle, args: &str) -> Result<String> {
     run_with_control(handle, args, |_| {}).await
 }
 
 /// Publish exactly this invocation's control before polling its native driver.
 /// Invalid/lifecycle commands never publish a control. The host must not treat
 /// this as a durable session control: the handle retires with the run.
-pub(crate) async fn run_with_control(
+#[allow(clippy::too_many_lines)] // one locked review/execute/journal sequence per command
+pub async fn run_with_control(
     handle: &mut AgentSessionHandle,
     args: &str,
     publish_control: impl FnOnce(GoalControl) + Send,
@@ -263,7 +265,7 @@ pub(crate) async fn run_with_control(
         .try_lock_owned()
         .map_err(|_| failure("GOAL_BUSY", "session is busy; retry /goal status when idle"))?;
     let mut current = latest(&session)?;
-    let expected = receipt(&session, &current, live_plan, persistent)?;
+    let expected = receipt(&session, current.as_ref(), live_plan, persistent)?;
     let Command::Change { review, action } = command else {
         return Ok(render(
             current.as_ref().map(|(_, record)| record),
@@ -294,7 +296,7 @@ pub(crate) async fn run_with_control(
             &owner,
             &reviewed,
             requested_steps,
-            Duration::from_secs(15 * 60),
+            Duration::from_mins(15),
             |_control, _event| {},
         )?;
         publish_control(run.control());
@@ -309,7 +311,7 @@ pub(crate) async fn run_with_control(
             .try_lock_owned()
             .map_err(|_| failure("GOAL_BUSY", "session is busy after goal execution"))?;
         let current = latest(&session)?;
-        let review = receipt(&session, &current, live_plan, persistent)?;
+        let review = receipt(&session, current.as_ref(), live_plan, persistent)?;
         let _ = write!(
             output,
             "{}",
@@ -391,7 +393,7 @@ pub(crate) async fn run_with_control(
         current = Some((id, record));
     }
     let persistence = persist(&mut session, &owner, persistent).await;
-    let review = receipt(&session, &current, live_plan, persistent)?;
+    let review = receipt(&session, current.as_ref(), live_plan, persistent)?;
     Ok(format!(
         "{}\n{}",
         persistence_text(&persistence),

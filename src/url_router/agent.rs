@@ -81,7 +81,7 @@ fn cache() -> &'static Mutex<OutputCache> {
 /// Called only after native result acceptance and worktree disposition. The
 /// caller releases the hub mutex first; readers use that same lock order.
 /// Losing optional retention must never undo an already accepted child run.
-pub(crate) fn publish(
+pub fn publish(
     entry: &ChildEntry,
     output: &str,
     data: Option<&Value>,
@@ -233,12 +233,12 @@ fn masked(text: &str) -> String {
     crate::secrets::obfuscate(text, &mut vault, &[]).0
 }
 
-fn document(reference: &str, content: String, content_type: &str, metadata: Value) -> ResolvedDoc {
+fn document(reference: &str, content: &str, content_type: &str, metadata: Value) -> ResolvedDoc {
     ResolvedDoc {
         schema: URL_ROUTER_SCHEMA.to_string(),
         scheme: "agent".to_string(),
         reference: reference.to_string(),
-        content: masked(&content),
+        content: masked(content),
         content_type: content_type.to_string(),
         metadata,
         line_addressable: true,
@@ -272,7 +272,7 @@ fn render(reference: &str, entry: &ChildEntry, encoded: Option<&str>) -> Result<
             // status is useful, but it is not a successfully published output.
             return Ok(document(
                 reference,
-                serde_json::to_string_pretty(&metadata)?,
+                &serde_json::to_string_pretty(&metadata)?,
                 "application/json",
                 metadata,
             ));
@@ -292,7 +292,7 @@ fn render(reference: &str, entry: &ChildEntry, encoded: Option<&str>) -> Result<
         } else {
             snapshot.output
         };
-        return Ok(document(reference, content, "text/markdown", metadata));
+        return Ok(document(reference, &content, "text/markdown", metadata));
     }
     if !entry.status.settled() {
         return Err(error(
@@ -339,7 +339,7 @@ fn render(reference: &str, entry: &ChildEntry, encoded: Option<&str>) -> Result<
         _ => (serde_json::to_string_pretty(selected)?, "application/json"),
     };
     metadata["extracted"] = json!(parsed.segments);
-    Ok(document(reference, content, content_type, metadata))
+    Ok(document(reference, &content, content_type, metadata))
 }
 
 pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
@@ -370,7 +370,7 @@ pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
         let metadata = json!({"total": total, "truncated": truncated, "scope": "parentProcess"});
         return Ok(document(
             reference,
-            serde_json::to_string_pretty(&json!({
+            &serde_json::to_string_pretty(&json!({
                 "agents": entries, "total": total, "truncated": truncated,
             }))?,
             "application/json",

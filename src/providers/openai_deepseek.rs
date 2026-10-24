@@ -179,7 +179,7 @@ struct CodeState {
 }
 
 impl CodeState {
-    fn settle_before(&mut self, character: char) {
+    const fn settle_before(&mut self, character: char) {
         if self.run == 0 || character == self.run_marker {
             return;
         }
@@ -194,7 +194,7 @@ impl CodeState {
         self.run = 0;
     }
 
-    fn advance(&mut self, character: char) {
+    const fn advance(&mut self, character: char) {
         self.settle_before(character);
         if character == '`' || character == '~' {
             self.run += 1;
@@ -348,7 +348,8 @@ fn could_be_marker(text: &str) -> bool {
             }
         }
     }
-    let body = text[1..].strip_prefix('｜').unwrap_or(&text[1..]);
+    let body = &text[1..];
+    let body = body.strip_prefix('｜').unwrap_or(body);
     let normalized = body.trim_end_matches('｜').replace('▁', "_");
     TEMPLATE_NAMES
         .iter()

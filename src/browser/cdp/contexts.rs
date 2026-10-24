@@ -39,7 +39,7 @@ impl Context {
         }
     }
 
-    fn parameters(&self, method: &str, params: Value) -> Result<Value> {
+    fn parameters(&self, method: &str, params: &Value) -> Result<Value> {
         if !matches!(
             method,
             "Browser.setDownloadBehavior" | "Browser.cancelDownload"
@@ -72,7 +72,7 @@ impl Context {
         owner
             .checkpoint()
             .map_err(|_| error("BROWSER_CONTEXT_CANCELLED"))?;
-        cdp.browser_command(owner, method, self.parameters(method, params)?)
+        cdp.browser_command(owner, method, self.parameters(method, &params)?)
             .await
             .map_err(|_| error("BROWSER_CONTEXT_COMMAND: browser context operation failed"))
     }
@@ -345,10 +345,10 @@ mod tests {
             ),
             ("Browser.cancelDownload", json!({"guid":"transfer"})),
         ] {
-            let scoped = context.parameters(method, params.clone()).unwrap();
+            let scoped = context.parameters(method, &params).unwrap();
             assert_eq!(scoped["browserContextId"], "private");
             assert_eq!(
-                Context::Default.parameters(method, params.clone()).unwrap(),
+                Context::Default.parameters(method, &params).unwrap(),
                 params
             );
             for (key, value) in params.as_object().unwrap() {
@@ -360,10 +360,10 @@ mod tests {
     #[test]
     fn context_parameters_do_not_accept_overrides_or_arbitrary_commands() {
         for context in [Context::Default, Context::Named("owned".into())] {
-            assert!(context.parameters("Browser.close", json!({})).is_err());
+            assert!(context.parameters("Browser.close", &json!({})).is_err());
             assert!(
                 context
-                    .parameters("Browser.cancelDownload", Value::Null)
+                    .parameters("Browser.cancelDownload", &Value::Null)
                     .is_err()
             );
             for value in [Value::Null, json!("owned"), json!("other")] {
@@ -371,7 +371,7 @@ mod tests {
                     context
                         .parameters(
                             "Browser.cancelDownload",
-                            json!({
+                            &json!({
                                 "guid":"job", "browserContextId":value,
                             })
                         )

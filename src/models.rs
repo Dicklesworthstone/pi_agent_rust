@@ -2035,8 +2035,10 @@ impl ModelRegistry {
 }
 
 /// Find a catalog entry, preferring its exact declared provider over built-in
-/// alias equivalence. Pass the full catalog before filtering by credentials so
-/// an unavailable declared provider cannot be replaced by an alias's route.
+/// alias equivalence.
+///
+/// Pass the full catalog before filtering by credentials so an unavailable
+/// declared provider cannot be replaced by an alias's route.
 pub fn find_model_entry<'a>(
     models: &'a [ModelEntry],
     provider: &str,
@@ -2117,6 +2119,7 @@ pub fn resolve_model_entry(models: &[ModelEntry], provider: &str, id: &str) -> O
 }
 
 /// Compare resolved destinations without merging separately declared providers.
+///
 /// Native aliases remain equivalent when the catalog does not declare both
 /// spellings independently, including unlisted native model IDs.
 pub fn model_identities_match(

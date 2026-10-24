@@ -489,14 +489,14 @@ impl SseState {
                 };
                 tool_err(code, "legacy SSE stream framing or read failed")
             })?;
-            self.handle_event(event, &mut replies)?;
+            self.handle_event(&event, &replies)?;
         }
     }
 
     fn handle_event(
         self: &Arc<Self>,
-        event: crate::sse::SseEvent,
-        replies: &mut FuturesUnordered<BoxFuture<'static, Result<()>>>,
+        event: &crate::sse::SseEvent,
+        replies: &FuturesUnordered<BoxFuture<'static, Result<()>>>,
     ) -> Result<()> {
         if event.event == "endpoint" {
             let endpoint = endpoint_url(&self.url, &event.data)?;
@@ -526,7 +526,7 @@ impl SseState {
         }
         let value: Value = serde_json::from_str(&event.data)
             .map_err(|_| tool_err("MCP_PROTOCOL", "legacy SSE message contains invalid JSON"))?;
-        match value {
+        match &value {
             Value::Array(messages) if !messages.is_empty() => {
                 for message in messages {
                     self.handle_message(message, replies)?;
@@ -539,8 +539,8 @@ impl SseState {
 
     fn handle_message(
         self: &Arc<Self>,
-        message: Value,
-        replies: &mut FuturesUnordered<BoxFuture<'static, Result<()>>>,
+        message: &Value,
+        replies: &FuturesUnordered<BoxFuture<'static, Result<()>>>,
     ) -> Result<()> {
         let object = message.as_object().ok_or_else(|| {
             tool_err(
@@ -569,7 +569,7 @@ impl SseState {
             }
             let Some(id) = object.get("id") else {
                 if method == "notifications/progress" {
-                    self.progress.publish(&message, 0);
+                    self.progress.publish(message, 0);
                 } else if method == "notifications/tools/list_changed" {
                     self.tools_list_changed.store(true, Ordering::Release);
                 }
@@ -609,13 +609,14 @@ impl SseState {
                 "legacy SSE response preceded dispatch",
             ));
         }
-        let result = validate_jsonrpc_response(&message, waiting.id);
+        let result = validate_jsonrpc_response(message, waiting.id);
         if result.as_ref().is_err_and(|error| !is_server_error(error)) {
             return result.map(|_| ());
         }
         if let Some(waiting) = pending.take() {
             let _ = waiting.response.try_send(result);
         }
+        drop(pending);
         Ok(())
     }
 }
@@ -734,6 +735,7 @@ impl SseState {
             dispatch,
             response: sender,
         });
+        drop(pending);
         Ok(receiver)
     }
 
@@ -1053,6 +1055,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn message(stream: &mut TcpStream, value: Value) {
         event(stream, "message", &value.to_string());
     }
@@ -1073,6 +1076,7 @@ mod tests {
             .expect("redirect response");
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn initialized(id: Value) -> Value {
         json!({
             "jsonrpc": "2.0", "id": id,
@@ -1097,6 +1101,7 @@ mod tests {
             let thread = std::thread::spawn(move || {
                 let mut events: Option<TcpStream> = None;
                 let mut initialize_id = None;
+                #[allow(clippy::collection_is_never_read)] // keeps held POST connections open
                 let mut held_posts = Vec::new();
                 loop {
                     let Ok((mut stream, _)) = listener.accept() else {
@@ -1337,9 +1342,8 @@ mod tests {
         });
         let waker = futures::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
-        let update = match progress.poll_update(&mut context) {
-            std::task::Poll::Ready(Some(update)) => update,
-            _ => panic!("expected routed tool progress"),
+        let std::task::Poll::Ready(Some(update)) = progress.poll_update(&mut context) else {
+            panic!("expected routed tool progress");
         };
         assert_eq!(
             update.details.expect("progress details")["mcpProgress"]["progress"],
@@ -1544,9 +1548,8 @@ mod tests {
                 asupersync::types::CancelKind::User,
                 Some("cancel endpoint wait"),
             );
-            let error = match request.as_mut().poll(&mut context) {
-                std::task::Poll::Ready(Err(error)) => error,
-                _ => panic!("owner cancellation must end an idle endpoint wait immediately"),
+            let std::task::Poll::Ready(Err(error)) = request.as_mut().poll(&mut context) else {
+                panic!("owner cancellation must end an idle endpoint wait immediately");
             };
             assert!(error.to_string().contains("MCP_CANCELLED"), "{error}");
             assert!(!dispatch.may_have_been_sent());

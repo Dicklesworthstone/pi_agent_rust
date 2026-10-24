@@ -4,6 +4,7 @@ use crate::model::TextContent;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[allow(clippy::needless_pass_by_value)] // fixture builder; callers pass owned json! frames
 fn display(sequence: u64, frame: Value) -> Value {
     json!({"id":7,"stream":{"sequence":sequence,"name":"display","display":frame}})
 }
@@ -47,6 +48,7 @@ fn rich_only_progress_is_a_running_replacement_snapshot() {
     assert_eq!(details["jsonOutputs"], json!([{"answer":42}]));
     assert_eq!(details["output"]["sequence"], 0);
     assert_eq!(details["output"]["stdoutBytes"], 0);
+    drop(events);
 }
 
 #[test]
@@ -86,7 +88,7 @@ fn final_rich_values_must_match_the_stream_without_rewriting_console() {
     for frames in [
         json!([]),
         json!([text("rewritten")]),
-        json!([frame.clone(), frame.clone()]),
+        json!([frame.clone(), frame]),
         Value::Null,
     ] {
         let mut response = json!({"stdout":"","stderr":"","outputSequence":1,"displays":frames});
@@ -144,8 +146,7 @@ fn preview_omission_does_not_discard_or_truncate_final_json() {
     assert_eq!(details["displays"][0]["previewOmitted"], true);
     assert_eq!(details["displayStream"]["omittedDisplays"], 1);
     assert!(matches!(&content[0], ContentBlock::Text(text) if text.text.len() < 256));
-    let mut response =
-        json!({"stdout":"","stderr":"","outputSequence":0,"displays":[frame.clone()]});
+    let mut response = json!({"stdout":"","stderr":"","outputSequence":0,"displays":[frame]});
     capture.finish_response(&mut response).unwrap();
     assert_eq!(response["displays"], json!([frame]));
 }

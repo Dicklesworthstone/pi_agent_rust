@@ -18,6 +18,7 @@ struct Step {
     after_reply: Option<Box<dyn FnOnce() + Send>>,
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn step(method: &'static str, params: Value, result: Value) -> Step {
     Step {
         method,
@@ -250,6 +251,7 @@ fn open(first: bool, targets: &[&str], target: &str) -> Vec<Step> {
     script
 }
 
+#[allow(clippy::needless_pass_by_value)] // callers pass json! temporaries
 fn evaluate(
     first: bool,
     targets: &[&str],
@@ -420,7 +422,7 @@ fn result_time_switch_never_publishes_the_previous_conversations_payload() {
     let scope = JobSessionScope::fixed("owner-a");
     let changed = scope.clone();
     let (sent, received) = futures::channel::oneshot::channel::<String>();
-    let new_identity = received.map(|result| result.ok()).shared();
+    let new_identity = received.map(std::result::Result::ok).shared();
     let mut completed = evaluate(
         false,
         &["page-a"],

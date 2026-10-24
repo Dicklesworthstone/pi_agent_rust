@@ -4077,17 +4077,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         plan_state.enter_planning();
         plan_state
             .stash_previous_model(&self.model_entry.model.provider, &self.model_entry.model.id);
-        let model_warning = if let Some(spec) = self
+        let model_warning = self
             .config
             .model_roles
             .as_ref()
             .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
             .map(str::to_string)
-        {
-            self.switch_to_role_spec(&spec, "plan-role").err()
-        } else {
-            None
-        };
+            .and_then(|spec| self.switch_to_role_spec(&spec, "plan-role").err());
         Self::log_plan_transition(&self.session, "planning");
         self.messages.push(ConversationMessage {
             role: MessageRole::System,

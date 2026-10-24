@@ -60,6 +60,19 @@ fn id(value: &Value) -> Result<&str> {
 }
 
 fn table(raw: &Value) -> Result<Option<&Map<String, Value>>> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("change annotation byte limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let Some(value) = raw.get("changeAnnotations") else {
         return Ok(None);
     };
@@ -74,19 +87,6 @@ fn table(raw: &Value) -> Result<Option<&Map<String, Value>>> {
     }
     // Count serialized bytes before cloning, including escaping and any
     // extension metadata. Large unused entries cannot evade admission.
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_sub(bytes.len())
-                .ok_or_else(|| std::io::Error::other("change annotation byte limit"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     serde_json::to_writer(&mut Counter(MAX_ANNOTATION_BYTES), table)
         .map_err(|_| plan_error("LSP_EDIT_LIMIT", "changeAnnotations exceeds 64 KiB"))?;
     for (key, annotation) in table {

@@ -19,12 +19,14 @@ fn source() -> Value {
     value
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn branch(id: &str, expected: Value) -> Value {
     let mut value = node(id, &["source"]);
     value["when"] = json!({"from":"source","pointer":"/verdict","equals":expected});
     value
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn plan(nodes: Vec<Value>) -> Plan {
     Plan::parse(&json!({"workflow":nodes})).unwrap().unwrap()
 }
@@ -176,7 +178,7 @@ fn false_conditions_preserve_nonexecution_in_text_and_structured_reports() {
     records[1].skip_reason = Some("condition_false");
     records[1].condition = Some("not_matched");
     records[1].blocked_by = vec!["source".into()];
-    let output = report(records, 1, None);
+    let output = report(&records, 1, None);
     assert!(!output.is_error);
     let serialized = serde_json::to_string(&output).unwrap();
     assert!(!serialized.contains("EXPECTED-PRIVATE-CANARY"));
@@ -375,6 +377,7 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
                 .unwrap();
             Self { dir, tool, runtime }
         }
+        #[allow(clippy::needless_pass_by_value)]
         fn execute(&self, nodes: Vec<Value>) -> Result<crate::tools::ToolOutput> {
             self.runtime.block_on(self.tool.execute(
                 "decision-native",
