@@ -1633,8 +1633,15 @@ mod tests {
     fn tree_fixture(root: &Path, exit_root: bool) -> (JsonRpcClient, u32, u32) {
         // The helper explicitly inherits stdin as well as stdout/stderr, so
         // killing only the shell cannot unblock any of the three pipe workers.
+        // A background job without job control gets /dev/null as stdin before
+        // its own redirections apply, so under dash `<&0` hands it /dev/null.
+        // After the root exits the stdin pipe then has no reader, and the first
+        // request fails with EPIPE (GH #262). Saving stdin on fd 3 keeps the
+        // real pipe.
         let ending = if exit_root { "exit 0" } else { "wait" };
-        let script = format!("sleep 30 <&0 &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\n{ending}\n");
+        let script = format!(
+            "exec 3<&0\nsleep 30 <&3 3<&- &\nprintf '%s %s\\n' \"$$\" \"$!\" > pids\n{ending}\n"
+        );
         let client = JsonRpcClient::spawn("/bin/sh", &["-c".to_string(), script], &[], root)
             .expect("server tree");
         let (parent, helper) = fixture_pids(root);
@@ -1665,21 +1672,14 @@ mod tests {
             let (client, parent, helper) = tree_fixture(root.path(), exit_root);
             let client = Arc::new(client);
             let retained = Arc::clone(&client);
-            // Once the root has exited, a request is either queued and then
-            // failed by shutdown or refused outright (GH #262). Reaping is
-            // what this test checks, and it must hold in both orders.
-            let response = match client.request("test/pending", Value::Null) {
-                Ok((_, response)) => Some(response),
-                Err(TransportError::Closed(_) | TransportError::Io(_)) if exit_root => None,
-                Err(error) => panic!("request: {error:?}"),
-            };
+            let (_, response) = client
+                .request("test/pending", Value::Null)
+                .expect("request");
             client.shutdown();
-            if let Some(response) = response {
-                assert!(matches!(
-                    response.try_recv(),
-                    Ok(Err(TransportError::Closed(_)))
-                ));
-            }
+            assert!(matches!(
+                response.try_recv(),
+                Ok(Err(TransportError::Closed(_)))
+            ));
             assert!(!retained.is_alive());
             assert!(
                 wait_for_fixture(|| workers_finished(&retained)),
@@ -1937,7 +1937,9 @@ mod tests {
         }
 
         let root = tempfile::tempdir().expect("tempdir");
-        let script = "setsid /bin/sh -c 'printf \"%s\" \"$$\" > escaped; exec sleep 30' <&0 &\nwhile [ ! -s escaped ]; do sleep 0.01; done\nexit 0\n";
+        // fd 3 carries the real stdin past the background job's implicit
+        // /dev/null; see tree_fixture.
+        let script = "exec 3<&0\nsetsid /bin/sh -c 'printf \"%s\" \"$$\" > escaped; exec sleep 30' <&3 3<&- &\nwhile [ ! -s escaped ]; do sleep 0.01; done\nexit 0\n";
         let client = JsonRpcClient::spawn(
             "/bin/sh",
             &["-c".to_string(), script.to_string()],
