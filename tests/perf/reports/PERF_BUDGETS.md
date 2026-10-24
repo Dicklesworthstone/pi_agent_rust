@@ -1,10 +1,10 @@
 # Performance Budgets
 
-> Generated: 2026-09-21T05:56:45.000Z
+> Generated: 2026-10-24T16:33:34.521Z
 
 > Run ID: not set
 
-> Source commit: 9c887d33ca894318f18a1dbabac5e51f4dc07aba
+> Source commit: not bound (dirty tree)
 
 > Strict mode: false
 
@@ -34,6 +34,7 @@ Performance claims are blocked. Blocking reason codes:
 - `correlation_id_missing`
 - `data_contract_failure`
 - `run_id_missing`
+- `source_commit_unbound`
 - `strict_mode_disabled`
 
 ## Startup
