@@ -616,9 +616,13 @@ mod tests {
                 frames.try_recv(),
                 Err(mpsc::TryRecvError::Disconnected)
             ));
-            assert_eq!(
-                writer.write(b"x").expect_err("closed reader fd").kind(),
-                io::ErrorKind::BrokenPipe
+            // See the full-queue test below: a concurrent fork can hold a
+            // copy of the reader until its exec closes it.
+            assert!(
+                wait_until(|| writer
+                    .write(b"x")
+                    .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)),
+                "the retired reader's fd stayed open"
             );
         }
     }
