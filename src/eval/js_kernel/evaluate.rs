@@ -24,12 +24,14 @@ impl Evaluator {
         })
     }
 
+    /// The flag reports QuickJS's async eval mode, whose promise settles to a
+    /// `{ value }` record around the completion value rather than to the value.
     pub(super) fn evaluate<'js>(
         &self,
         ctx: &Ctx<'js>,
         code: &str,
         filename: Option<&str>,
-    ) -> rquickjs::Result<Value<'js>> {
+    ) -> rquickjs::Result<(Value<'js>, bool)> {
         let constructor = self.compile_body.clone().restore(ctx)?;
         // Hashbangs are valid only at the start of a script, not a function
         // body. Remove one from the probe only; evaluate the original bytes.
@@ -69,5 +71,6 @@ impl Evaluator {
         // functions defined by this script and invoked in later cells.
         options.filename = filename.map(str::to_owned);
         ctx.eval_with_options(code.as_bytes(), options)
+            .map(|value| (value, needs_async))
     }
 }

@@ -59,7 +59,8 @@ fn retained_json_modules_follow_conversation_ownership_and_explicit_reset() {
             .await
             .unwrap();
         assert!(!b.is_error, "{}", text(&b));
-        assert_eq!(text(&b).trim(), "1");
+        // Owner b's first cell starts its own kernel.
+        assert_eq!(text(&b).trim(), "(js kernel started)\n1");
         select("data-owner-a");
         let restored = tool
             .execute("restore", json!({"kernel":"js","code":"data.answer"}), None)
@@ -79,7 +80,10 @@ fn retained_json_modules_follow_conversation_ownership_and_explicit_reset() {
             .await
             .unwrap();
         assert!(!reset.is_error, "{}", text(&reset));
-        assert_eq!(text(&reset).trim(), "99");
+        assert_eq!(
+            text(&reset).trim(),
+            "EVAL_STATE_RESET: js state explicitly discarded before this cell.\n(js kernel started)\n99"
+        );
     });
 }
 

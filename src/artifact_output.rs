@@ -161,10 +161,26 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
     if bytes.is_empty() {
         return Err(error(tool, "refusing to publish an empty artifact"));
     }
+    publish_in_memory(target, bytes, false, tool)
+}
+
+/// Like [`publish`], but a zero-byte artifact is published rather than refused.
+/// Only for sources whose emptiness is itself verified, such as a completed
+/// download whose reported byte count matched an actually empty file.
+pub fn publish_allowing_empty(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
+    publish_in_memory(target, bytes, true, tool)
+}
+
+fn publish_in_memory(
+    target: &OutputTarget,
+    bytes: &[u8],
+    allow_empty: bool,
+    tool: &str,
+) -> Result<()> {
     let limit = u64::try_from(bytes.len())
         .map_err(|_| error(tool, "artifact byte count is not representable"))?;
     let mut source = bytes;
-    publish_from_reader(target, &mut source, limit, tool).map(|_| ())
+    publish_reader(target, &mut source, limit, allow_empty, tool).map(|_| ())
 }
 
 fn check_owner(owner: &crate::agent_cx::AgentCx, tool: &str) -> Result<()> {
@@ -174,11 +190,13 @@ fn check_owner(owner: &crate::agent_cx::AgentCx, tool: &str) -> Result<()> {
 }
 
 /// Copy at most `limit` bytes into private staging. Read one extra byte only
-/// to detect overflow; a partial source is never a successful artifact.
+/// to detect overflow; a partial source is never a successful artifact, and an
+/// empty one is refused unless `allow_empty`.
 fn copy_bounded(
     source: &mut dyn Read,
     destination: &mut dyn Write,
     limit: u64,
+    allow_empty: bool,
     owner: &crate::agent_cx::AgentCx,
     tool: &str,
 ) -> Result<u64> {
@@ -201,7 +219,7 @@ fn copy_bounded(
         };
         check_owner(owner, tool)?;
         if read == 0 {
-            if total == 0 {
+            if total == 0 && !allow_empty {
                 return Err(error(tool, "refusing to publish an empty artifact"));
             }
             return Ok(total);
@@ -222,11 +240,22 @@ fn copy_bounded(
 /// commit as [`publish`]. EOF, size admission and sync precede publication.
 /// Cancellation is checked between chunks and before publication, not inside a
 /// blocking syscall; directories created along the way may remain on failure.
-#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+/// An empty reader is refused.
 pub fn publish_from_reader(
     target: &OutputTarget,
     source: &mut dyn Read,
     max_bytes: u64,
+    tool: &str,
+) -> Result<u64> {
+    publish_reader(target, source, max_bytes, false, tool)
+}
+
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+fn publish_reader(
+    target: &OutputTarget,
+    source: &mut dyn Read,
+    max_bytes: u64,
+    allow_empty: bool,
     tool: &str,
 ) -> Result<u64> {
     use rustix::fs::{AtFlags, Mode, OFlags};
@@ -311,7 +340,7 @@ pub fn publish_from_reader(
         name: stage_name.clone(),
     };
     let mut file = std::fs::File::from(stage_fd);
-    let bytes = copy_bounded(source, &mut file, max_bytes, &owner, tool)?;
+    let bytes = copy_bounded(source, &mut file, max_bytes, allow_empty, &owner, tool)?;
     file.sync_all()
         .map_err(|failure| error(tool, format!("cannot write artifact: {failure}")))?;
     check_owner(&owner, tool)?;
@@ -332,10 +361,11 @@ pub fn publish_from_reader(
 }
 
 #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
-pub fn publish_from_reader(
+fn publish_reader(
     target: &OutputTarget,
     source: &mut dyn Read,
     max_bytes: u64,
+    allow_empty: bool,
     tool: &str,
 ) -> Result<u64> {
     let owner = crate::agent_cx::AgentCx::for_current_or_request();
@@ -360,7 +390,7 @@ pub fn publish_from_reader(
     }
     let mut staged = tempfile::NamedTempFile::new_in(&canonical_parent)
         .map_err(|failure| error(tool, format!("cannot stage artifact: {failure}")))?;
-    let bytes = copy_bounded(source, &mut staged, max_bytes, &owner, tool)?;
+    let bytes = copy_bounded(source, &mut staged, max_bytes, allow_empty, &owner, tool)?;
     staged
         .as_file()
         .sync_all()
@@ -427,6 +457,25 @@ mod tests {
         assert_eq!(
             publish_from_reader(&target, &mut &b"1234"[..], 4, "test").unwrap(),
             4
+        );
+    }
+
+    #[test]
+    fn only_the_explicit_variant_publishes_an_empty_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "nested/empty.bin", "test").unwrap();
+        let refused = publish(&target, &[], "test").unwrap_err();
+        assert!(refused.to_string().contains("empty artifact"), "{refused}");
+        assert!(!target.path().exists());
+        publish_allowing_empty(&target, &[], "test").unwrap();
+        assert_eq!(std::fs::read(target.path()).unwrap(), b"");
+        // Still create-only: an existing empty file is not replaced.
+        assert!(publish_allowing_empty(&target, &[], "test").is_err());
+        assert_eq!(
+            std::fs::read_dir(root.path().join("nested"))
+                .unwrap()
+                .count(),
+            1
         );
     }
 

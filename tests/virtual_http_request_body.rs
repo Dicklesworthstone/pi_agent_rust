@@ -256,7 +256,8 @@ fn virtual_request_body_decoder_preserves_split_utf8_and_terminal_tail() {
     assert_eq!(result["intact"], true);
     assert_eq!(result["types"], true);
     assert_eq!(result["ends"], 1);
-    assert!(result["tail"].as_str().expect("tail").ends_with("☃🎼é�"));
+    let tail = result["tail"].as_str().expect("tail");
+    assert!(tail.ends_with("☃🎼é�"), "{tail:?}");
 }
 
 #[test]

@@ -229,6 +229,25 @@ fn worker_candidate(executable: &Path) -> Result<PathBuf> {
             .map(|profile| profile.join(name))
             .ok_or_else(|| invalid("Cannot locate the Pi binary beside the test executable"));
     }
+    // Cargo's build-dir layout runs tests from `<profile>/build/<package>/<hash>/out/`
+    // as `<test>-<hash>`, and uplifts the binary to `<profile>/`.
+    if parent
+        .file_name()
+        .is_some_and(|directory| directory == "out")
+        && let Some(hash) = parent.parent()
+        && let (Some(hash_name), Some(file)) = (hash.file_name(), executable.file_name())
+        && file
+            .to_str()
+            .zip(hash_name.to_str())
+            .is_some_and(|(file, suffix)| file.ends_with(&format!("-{suffix}")))
+        && let Some(build) = hash.parent().and_then(Path::parent)
+        && build
+            .file_name()
+            .is_some_and(|directory| directory == "build")
+        && let Some(profile) = build.parent()
+    {
+        return Ok(profile.join(name));
+    }
     if executable
         .file_name()
         .is_some_and(|file| file == name.as_str())
@@ -1363,6 +1382,18 @@ mod tests {
         assert_eq!(
             worker_candidate(Path::new("/build/target/debug/deps/read_tool-01234567")).unwrap(),
             Path::new("/build/target/debug/pi")
+        );
+        assert_eq!(
+            worker_candidate(Path::new(
+                "/build/target/debug/build/pi_agent_rust/0123abcd/out/read_tool-0123abcd"
+            ))
+            .unwrap(),
+            Path::new("/build/target/debug/pi")
+        );
+        // An application that merely lives in an `out` directory is not a test.
+        assert_eq!(
+            worker_candidate(Path::new("/opt/build/vendor/release/out/embedder")).unwrap(),
+            Path::new("/opt/build/vendor/release/out/pi")
         );
         assert_eq!(
             worker_candidate(Path::new("/app/bin/embedder")).unwrap(),

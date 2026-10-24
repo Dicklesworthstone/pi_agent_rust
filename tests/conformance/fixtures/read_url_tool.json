@@ -50,7 +50,7 @@
     },
     {
       "name": "read_url_surfaces_http_status_failures",
-      "description": "a non-success response fails with the status and final URL instead of converting the error page",
+      "description": "a non-success response fails with a coded HTTP status error instead of converting the error page; the URL is not echoed",
       "requirement_ids": ["READ-URL-HTTP-ERR-1"],
       "input": {
         "path": "http://fixture.invalid/unavailable",
@@ -59,7 +59,7 @@
         "fixtureBody": "temporarily unavailable"
       },
       "expect_error": true,
-      "error_contains": "HTTP 503 fetching http://127.0.0.1",
+      "error_contains": "[URL_READ_HTTP] HTTP 503 fetching document",
       "expected": {}
     }
   ]

@@ -215,7 +215,7 @@ fn metadata_snapshots_permissions_and_budgets_are_realm_owned() {
         first
     );
     files.begin(
-        AgentCx::for_testing(),
+        super::super::owner_without_io(),
         Instant::now() + Duration::from_secs(2),
     );
     assert!(
@@ -448,9 +448,11 @@ fn reloaded_package_exports_keep_older_importers_on_their_snapshot() {
     // not the current generation selected for inline cells and loaded scripts.
     assert_eq!(files.resolve_path(&old, "pkg").unwrap(), old);
     assert_eq!(files.resolve_path(&fresh, "pkg").unwrap(), fresh);
+    // Each generation also looks up the importer's own (absent) workspace
+    // package.json for self-references; absent manifests add no bytes.
     let state = files.0.borrow();
-    assert_eq!(state.packages.lookups, 2);
-    assert_eq!(state.packages.manifests.len(), 2);
+    assert_eq!(state.packages.lookups, 4);
+    assert_eq!(state.packages.manifests.len(), 4);
     assert_eq!(state.packages.bytes, original.len() + replacement.len());
 }
 
@@ -494,7 +496,7 @@ fn missing_metadata_and_lookup_limits_are_versioned_without_resetting_budgets() 
     assert_eq!(state.packages.bytes, 2 * (MAX_MANIFEST_LOOKUPS - 1));
     drop(state);
     files.begin(
-        AgentCx::for_testing(),
+        super::super::owner_without_io(),
         Instant::now() + Duration::from_secs(5),
     );
     assert!(

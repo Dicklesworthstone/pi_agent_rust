@@ -3825,6 +3825,11 @@ fn setup_vcr_anthropic_response(
             }
         }]
     });
+    // Store the request as a recording would: redacted. Playback redacts the
+    // incoming body before matching, so an unredacted template never matches a
+    // tool schema with a sensitive-looking property such as edit's `token`.
+    let mut cassette: pi::vcr::Cassette = serde_json::from_value(cassette).expect("cassette shape");
+    pi::vcr::redact_cassette(&mut cassette);
 
     let cassette_path = cassette_dir.join(format!("{cassette_name}.json"));
     fs::write(
@@ -4193,6 +4198,10 @@ fn run_prewalk_cli(harness: &CliTestHarness, mode: &str, tool_limit: &str) -> Cl
         mode,
         "--prewalk-into",
         "prewalk-target/target:off",
+        // Print and RPC runs have no approval surface, so the default
+        // always-ask mode denies the edit and nothing arms the handoff.
+        "--approval-mode",
+        "write",
         "--tools",
         "read,write",
         "--no-extensions",

@@ -444,7 +444,9 @@ pub(super) async fn execute(
         owner
             .checkpoint()
             .map_err(|_| error("download cancelled before publication"))?;
-        crate::artifact_output::publish(&target, &bytes, "browser")?;
+        // read_completed matched Chromium's byte count against the file, so an
+        // empty result is a genuinely empty download, not a failed capture.
+        crate::artifact_output::publish_allowing_empty(&target, &bytes, "browser")?;
 
         Ok(output(
             format!(

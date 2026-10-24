@@ -87,7 +87,8 @@ fn imported_bindings_follow_conversation_state_and_explicit_reset() {
             .await
             .unwrap();
         assert!(!b.is_error, "{}", text(&b));
-        assert_eq!(text(&b).trim(), "1");
+        // Owner b's first cell starts its own kernel.
+        assert_eq!(text(&b).trim(), "(js kernel started)\n1");
         select("import-owner-a");
         let a = tool
             .execute(
@@ -100,7 +101,10 @@ fn imported_bindings_follow_conversation_state_and_explicit_reset() {
         assert_eq!(text(&a).trim(), "2");
         let reset = tool.execute("reset", json!({"kernel":"js","reset":true,"code":"import * as values from './value.mjs'; values.value"}), None).await.unwrap();
         assert!(!reset.is_error, "{}", text(&reset));
-        assert_eq!(text(&reset).trim(), "1");
+        assert_eq!(
+            text(&reset).trim(),
+            "EVAL_STATE_RESET: js state explicitly discarded before this cell.\n(js kernel started)\n1"
+        );
     });
 }
 
@@ -129,7 +133,7 @@ fn percent_load_javascript_imports_keep_the_real_importer_directory() {
             .await
             .unwrap();
         assert!(!loaded.is_error, "{}", text(&loaded));
-        assert_eq!(text(&loaded).trim(), "42");
+        assert_eq!(text(&loaded).trim(), "(js kernel started)\n42");
         let reused = tool
             .execute("reuse", json!({"kernel":"js","code":"report()"}), None)
             .await
@@ -226,6 +230,10 @@ fn malformed_loaded_typescript_executes_neither_prefix_nor_imports() {
             .await
             .unwrap();
         assert!(!probe.is_error, "{}", text(&probe));
-        assert_eq!(text(&probe).trim(), "[\"undefined\",\"undefined\"]");
+        // The refused load ran no cell, so the probe is the kernel's first.
+        assert_eq!(
+            text(&probe).trim(),
+            "(js kernel started)\n[\"undefined\",\"undefined\"]"
+        );
     });
 }

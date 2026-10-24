@@ -245,7 +245,7 @@ mod tests {
         files.finish();
         assert!(files.reload().unwrap_err().contains("CLOSED"));
         files.begin(
-            AgentCx::for_testing(),
+            super::super::owner_without_io(),
             Instant::now() + Duration::from_secs(5),
         );
         assert!(files.reload().unwrap_err().contains("DENIED"));

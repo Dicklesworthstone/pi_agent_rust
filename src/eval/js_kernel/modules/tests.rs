@@ -152,7 +152,7 @@ fn module_authority_is_refreshed_for_each_kernel_request() {
     let kernel = JsKernel::spawn_in(dir.path()).unwrap();
     succeeds(&kernel, "globalThis.previous = await import('./value.mjs')");
     let receiver = {
-        let owner = AgentCx::for_testing();
+        let owner = owner_without_io();
         let _guard = owner.cx().clone().set_current_restricted();
         kernel
             .submit(
@@ -233,10 +233,7 @@ fn admission_checks_the_active_owner_before_any_file_work() {
     let name = files.resolve_path("eval_script", "./module.js").unwrap();
     files.finish();
     assert!(files.read_module(&name).err().unwrap().contains("CLOSED"));
-    files.begin(
-        AgentCx::for_testing(),
-        Instant::now() + Duration::from_secs(5),
-    );
+    files.begin(owner_without_io(), Instant::now() + Duration::from_secs(5));
     assert!(
         files
             .resolve_path("eval_script", "./missing.js")

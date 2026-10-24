@@ -112,6 +112,51 @@ fn top_level_await_still_executes_once_and_retains_explicit_globals() {
 }
 
 #[test]
+fn top_level_await_results_are_the_completion_value_not_the_async_record() {
+    let kernel = JsKernel::spawn().unwrap();
+    assert_eq!(
+        succeeds(&kernel, "(await Promise.resolve({n: 7})).n")
+            .result
+            .as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        succeeds(&kernel, "await Promise.resolve({value: 1, other: 2})")
+            .result
+            .as_deref(),
+        Some("{\"value\":1,\"other\":2}")
+    );
+    assert_eq!(
+        succeeds(&kernel, "await Promise.resolve(1); undefined").result,
+        None
+    );
+    // A script that merely returns a promise has no async record to unwrap.
+    assert_eq!(
+        succeeds(&kernel, "Promise.resolve({value: 3})")
+            .result
+            .as_deref(),
+        Some("{\"value\":3}")
+    );
+}
+
+#[test]
+fn thrown_primitives_report_their_text_in_sync_and_async_cells() {
+    let kernel = JsKernel::spawn().unwrap();
+    for (code, text) in [
+        ("throw 'CODED: sync refusal'", "CODED: sync refusal"),
+        (
+            "await 1; throw 'CODED: async refusal'",
+            "CODED: async refusal",
+        ),
+        ("throw 42", "42"),
+    ] {
+        let response = cell(&kernel, code);
+        assert!(!response.ok, "{code}");
+        assert_eq!(response.error.as_deref(), Some(text), "{code}");
+    }
+}
+
+#[test]
 fn replacing_function_global_does_not_replace_the_parse_probe() {
     let kernel = JsKernel::spawn().unwrap();
     succeeds(

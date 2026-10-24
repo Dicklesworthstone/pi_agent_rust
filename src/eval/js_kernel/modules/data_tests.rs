@@ -182,12 +182,14 @@ fn scalar_json_values_are_real_default_exports_including_null() {
     for (index, source) in ["null", "true", "0", "\"雪\"", "[1,2]"].iter().enumerate() {
         let name = format!("scalar-{index}.json");
         std::fs::write(dir.path().join(&name), source).unwrap();
+        // A null completion renders as no result, so carry the default in an
+        // object: `{"v":null}` is a real export, `{}` would be a missing one.
         assert_eq!(
             value(
                 &kernel,
-                &format!("(await import('./{name}', {{with:{{type:'json'}}}})).default")
+                &format!("({{v: (await import('./{name}', {{with:{{type:'json'}}}})).default}})")
             ),
-            *source
+            format!("{{\"v\":{source}}}")
         );
     }
 }
@@ -201,10 +203,7 @@ fn json_loads_share_existing_byte_budgets_and_current_owner_admission() {
     files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - 1;
     assert!(files.read_module(&name).err().unwrap().contains("LIMIT"));
     files.0.borrow_mut().source_bytes = 0;
-    files.begin(
-        AgentCx::for_testing(),
-        Instant::now() + Duration::from_secs(5),
-    );
+    files.begin(owner_without_io(), Instant::now() + Duration::from_secs(5));
     assert!(files.read_module(&name).err().unwrap().contains("DENIED"));
     files.begin(AgentCx::for_testing_with_io(), Instant::now());
     assert!(files.read_module(&name).err().unwrap().contains("TIMEOUT"));
@@ -212,7 +211,8 @@ fn json_loads_share_existing_byte_budgets_and_current_owner_admission() {
         AgentCx::for_testing_with_io(),
         Instant::now() + Duration::from_secs(5),
     );
-    std::fs::File::create(&name)
+    // `name` is the module identifier, not a filesystem path.
+    std::fs::File::create(dir.path().join("data.json"))
         .unwrap()
         .set_len(2 * 1024 * 1024 + 1)
         .unwrap();
@@ -458,7 +458,7 @@ fn cached_text_resolution_requires_the_current_cells_io_authority() {
         "\"retained\""
     );
     let receiver = {
-        let owner = AgentCx::for_testing();
+        let owner = owner_without_io();
         let _guard = owner.cx().clone().set_current_restricted();
         kernel
             .submit(

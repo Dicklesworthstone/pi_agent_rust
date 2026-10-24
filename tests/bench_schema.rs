@@ -9955,6 +9955,9 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     if !omit_require_rch_cli {
         command.arg("--require-rch");
     }
+    // The suite itself may run under `RCH_REQUIRE_REMOTE=1`; that must not turn
+    // every case into proof mode. Cases that need it pass it explicitly.
+    command.env_remove("RCH_REQUIRE_REMOTE");
     for (key, value) in extra_env {
         command.env(key, value);
     }

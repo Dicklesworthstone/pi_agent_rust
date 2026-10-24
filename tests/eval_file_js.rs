@@ -261,9 +261,9 @@ fn typed_preparation_refusals_preserve_state_and_cell_sequence_even_with_reset()
         )
         .await
         .unwrap();
+        // Static imports are not here: b2d02c5a8 made them valid in typed loads.
         for rejected in [
             "globalThis.keep = 99; const x: number = ;",
-            "globalThis.keep = 99; import { unused } from './unread.js';",
             "globalThis.keep = 99; export const answer: number = 42;",
             "globalThis.keep = 99; const origin = import.meta.url;",
         ] {

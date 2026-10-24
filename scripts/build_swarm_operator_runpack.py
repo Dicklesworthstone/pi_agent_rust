@@ -19604,6 +19604,8 @@ def build_context_intelligence_closeout_gate_summary(
     main_path = root / "src/main.rs"
     cli_path = root / "src/cli.rs"
     agent_path = root / "src/agent.rs"
+    # agent.rs include!s its unit tests from this file.
+    agent_tests_path = root / "src/agent_tests.rs"
     doctor_path = root / "src/doctor.rs"
     e2e_path = root / "tests/e2e_agent_loop.rs"
     perf_path = root / "tests/perf_budgets.rs"
@@ -19807,10 +19809,10 @@ def build_context_intelligence_closeout_gate_summary(
                     file_contains(agent_path, "prepare_semantic_context_prompt"),
                     file_contains(agent_path, "semantic_context_prompt_shape_for_provider"),
                     file_contains(agent_path, "SEMANTIC_CONTEXT_PROVENANCE_SCHEMA_V1"),
-                    file_contains(agent_path, "semantic_context_bundle_injection_adds_bounded_custom_message_and_session_provenance"),
+                    file_contains(agent_tests_path, "semantic_context_bundle_injection_adds_bounded_custom_message_and_session_provenance"),
                 )
             ),
-            [{"path": "src/agent.rs"}],
+            [{"path": "src/agent.rs"}, {"path": "src/agent_tests.rs"}],
         )
     )
     checklist.append(

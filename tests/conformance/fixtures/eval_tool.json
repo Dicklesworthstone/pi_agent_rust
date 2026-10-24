@@ -47,7 +47,7 @@
         "kernel": "ruby"
       },
       "expect_error": true,
-      "error_contains": "unknown kernel: ruby (python|js)",
+      "error_contains": "unknown variant `ruby`, expected one of `py`, `python`, `javascript`, `js`",
       "expected": {}
     }
   ]

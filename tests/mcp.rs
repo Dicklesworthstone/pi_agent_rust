@@ -1460,6 +1460,8 @@ fn mcp_http_transport_rejects_unsupported_version_and_invisible_session_id() {
     let case = "mcp_http_transport_rejects_unsupported_version_and_invisible_session_id";
     let harness = TestHarness::new(case);
     let server = harness.start_mock_http_server();
+    // 2024-11-05 is supported now that the legacy HTTP+SSE transport exists,
+    // so name a revision this client never implemented.
     server.add_route(
         "POST",
         "/unsupported-version",
@@ -1468,7 +1470,7 @@ fn mcp_http_transport_rejects_unsupported_version_and_invisible_session_id() {
             &json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "result": {"protocolVersion": "2024-11-05", "capabilities": {}}
+                "result": {"protocolVersion": "2024-10-07", "capabilities": {}}
             }),
         ),
     );

@@ -369,7 +369,8 @@ fn run_cell(
     // with() double-borrows the runtime's inner RefCell).
     enum Phase1 {
         Done(JsCellResponse),
-        Pending(rquickjs::Persistent<rquickjs::Promise<'static>>),
+        // The flag marks an async-mode cell, whose promise settles to `{ value }`.
+        Pending(rquickjs::Persistent<rquickjs::Promise<'static>>, bool),
     }
     let phase1 = context.with(|ctx| {
         // Select the grammar before executing any user statements. A runtime
@@ -377,14 +378,14 @@ fn run_cell(
         let evaluated = evaluator.evaluate(&ctx, &request.code, request.filename.as_deref());
         match evaluated {
             Err(err) => Phase1::Done(error_response(&ctx, &err)),
-            Ok(value) => rquickjs::Promise::from_value(value.clone()).map_or_else(
+            Ok((value, wrapped)) => rquickjs::Promise::from_value(value.clone()).map_or_else(
                 |_| Phase1::Done(extract_result(&ctx, &value)),
-                |promise| Phase1::Pending(rquickjs::Persistent::save(&ctx, promise)),
+                |promise| Phase1::Pending(rquickjs::Persistent::save(&ctx, promise), wrapped),
             ),
         }
     });
 
-    let saved = match phase1 {
+    let (saved, wrapped) = match phase1 {
         Phase1::Done(response) => {
             // Drain microtasks the cell queued (outside with()).
             if let Some(error) = drain_jobs(runtime, deadline, origin) {
@@ -392,7 +393,7 @@ fn run_cell(
             }
             return response;
         }
-        Phase1::Pending(saved) => saved,
+        Phase1::Pending(saved, wrapped) => (saved, wrapped),
     };
 
     // Phase 2: pump jobs until the promise settles or the budget expires.
@@ -453,6 +454,13 @@ fn run_cell(
             };
         };
         match promise.result::<rquickjs::Value<'_>>() {
+            Some(Ok(value)) if wrapped => {
+                let completion = value
+                    .as_object()
+                    .and_then(|record| record.get::<_, rquickjs::Value<'_>>("value").ok())
+                    .unwrap_or(value);
+                extract_result(&ctx, &completion)
+            }
             Some(Ok(value)) => extract_result(&ctx, &value),
             Some(Err(err)) => error_response(&ctx, &err),
             None => JsCellResponse {
@@ -524,9 +532,17 @@ fn extract_result<'js>(ctx: &rquickjs::Ctx<'js>, value: &rquickjs::Value<'js>) -
 
 fn error_response(ctx: &rquickjs::Ctx<'_>, err: &rquickjs::Error) -> JsCellResponse {
     let detail = if err.is_exception() {
-        ctx.catch()
-            .as_exception()
-            .map_or_else(|| err.to_string(), |exception| format!("{exception}"))
+        let thrown = ctx.catch();
+        if let Some(exception) = thrown.as_exception() {
+            format!("{exception}")
+        } else if thrown.is_object() {
+            err.to_string()
+        } else {
+            // A thrown primitive, such as the import prelude's coded refusals
+            // or `throw "boom"`. Converting a primitive runs no guest code.
+            rquickjs::Coerced::<String>::from_js(ctx, thrown)
+                .map_or_else(|_| err.to_string(), |text| text.0)
+        }
     } else {
         err.to_string()
     };

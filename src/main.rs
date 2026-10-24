@@ -9849,8 +9849,9 @@ async fn execute_print_command(
                 .await
                 .map(PrintCommandOutcome::Retry),
             PrintCommand::Compact | PrintCommand::Shake | PrintCommand::Handoff => {
+                // A settings refusal, like "nothing to retry": exit 1, not usage.
                 if command != PrintCommand::Handoff && !session.compaction_settings().enabled {
-                    return Err(pi::error::Error::validation(
+                    return Err(pi::error::Error::session(
                         "Compaction is disabled in the current session settings",
                     ));
                 }

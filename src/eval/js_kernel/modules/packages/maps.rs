@@ -570,7 +570,8 @@ mod tests {
     #[test]
     fn pattern_expansion_does_not_bypass_canonical_package_containment() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("outside.mjs"), "globalThis.escape = true;").unwrap();
+        // Not `escape`: that names the built-in global function.
+        std::fs::write(dir.path().join("outside.mjs"), "globalThis.escaped = true;").unwrap();
         let directory = write_package(
             dir.path(),
             "linked",
@@ -585,7 +586,7 @@ mod tests {
         .unwrap();
         let tool = crate::eval::EvalTool::new(dir.path());
         assert!(eval(&tool, "await import('linked/escape')").is_error);
-        assert_eq!(shown(eval(&tool, "display(typeof escape)")), "undefined");
+        assert_eq!(shown(eval(&tool, "display(typeof escaped)")), "undefined");
     }
 
     #[test]
@@ -780,7 +781,7 @@ mod tests {
                 .contains("LIMIT")
         );
         files.begin(
-            AgentCx::for_testing(),
+            super::super::super::owner_without_io(),
             Instant::now() + Duration::from_secs(10),
         );
         assert!(

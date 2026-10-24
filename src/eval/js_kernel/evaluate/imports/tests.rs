@@ -257,9 +257,12 @@ fn guest_prototype_hooks_do_not_run_during_binding_transfer() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("value.mjs"), "export const value=42;").unwrap();
     let kernel = JsKernel::spawn_in(dir.path()).unwrap();
+    // QuickJS's own async-eval completion record is an ordinary `{value}`
+    // object, so fulfilling any async cell consults Object.prototype.then.
+    // Only a transfer object (one carrying `bindings`) may never reach it.
     succeeds(
         &kernel,
-        "Object.prototype.then=function(){globalThis.hookRan=true; throw 'unexpected thenable'}; 1",
+        "Object.prototype.then=function(resolve){if(Object.hasOwn(this,'bindings')){globalThis.hookRan=true; throw 'unexpected thenable'} delete Object.prototype.then; resolve(this)}; 1",
     );
     let imported = cell(&kernel, "import {value} from './value.mjs'; value");
     // Restore before reporting any failure so a prototype hook cannot mask it.

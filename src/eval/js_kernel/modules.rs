@@ -387,6 +387,16 @@ impl Loader for ModuleFiles {
     }
 }
 
+/// Admission reads the owner's capability mask. `AgentCx::for_testing()` grants
+/// every capability, so a denied owner must actually be restricted.
+#[cfg(test)]
+fn owner_without_io() -> AgentCx {
+    let _restriction = asupersync::Cx::for_request()
+        .restrict::<asupersync::cx::cap::CapSet<true, true, true, false, true>>()
+        .set_current_restricted();
+    AgentCx::for_current_or_request()
+}
+
 #[cfg(test)]
 mod tests;
 

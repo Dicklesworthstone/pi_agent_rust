@@ -3,7 +3,7 @@
   "generated_at": "2026-05-14T08:30:00Z",
   "overall": "warn",
   "summary": {
-    "pass": 1,
+    "pass": 2,
     "info": 0,
     "warn": 2,
     "fail": 0
@@ -16,6 +16,62 @@
     }
   ],
   "findings": [
+    {
+      "category": "swarm",
+      "severity": "pass",
+      "title": "Swarm resource preflight ready",
+      "detail": "fixture preflight ready",
+      "data": {
+        "schema": "pi.doctor.swarm_resource_preflight.v1",
+        "critical_failures": [],
+        "source_errors": [],
+        "plan_error": null,
+        "recommended_budgets": {
+          "agent_concurrency": 2,
+          "tool_concurrency": 4,
+          "extension_hostcall_lanes": 2,
+          "rch_verification_fanout": 0,
+          "max_queue_depth": 8,
+          "max_rss_bytes": 1073741824
+        },
+        "tmpfs_headroom": {
+          "expected_root": "/data/tmp/pi_agent_rust_cargo",
+          "warn_available_kb": 10485760,
+          "paths": [
+            {
+              "env_name": "CARGO_TARGET_DIR",
+              "path": "/data/tmp/pi_agent_rust_cargo/fixture/target",
+              "exists": true,
+              "under_expected_root": true,
+              "available_kb": 10485760,
+              "ready": true,
+              "problem": null
+            },
+            {
+              "env_name": "TMPDIR",
+              "path": "/data/tmp/pi_agent_rust_cargo/fixture/tmp",
+              "exists": true,
+              "under_expected_root": true,
+              "available_kb": 10485760,
+              "ready": true,
+              "problem": null
+            }
+          ]
+        }
+      },
+      "fixability": "not_fixable"
+    },
+    {
+      "category": "swarm",
+      "severity": "pass",
+      "title": "Live swarm admission decision: admit",
+      "detail": "fixture admission open",
+      "data": {
+        "schema": "pi.doctor.swarm_admission.v1",
+        "action": "admit"
+      },
+      "fixability": "not_fixable"
+    },
     {
       "category": "swarm",
       "severity": "warn",
