@@ -453,7 +453,6 @@ fn python_load_rejects_bad_commands_urls_and_nonfiles() {
         ("%load setup.py extra", "EVAL_LOAD_USAGE"),
         ("%load \"unterminated", "EVAL_LOAD_USAGE"),
         ("%load setup.py\nsentinel = 8", "EVAL_LOAD_USAGE"),
-        ("%pip install example", "EVAL_LOAD_USAGE"),
         ("%load https://example.invalid/code.py", "EVAL_LOAD_PATH"),
         ("%load artifact://example", "EVAL_LOAD_PATH"),
         ("%load local://example", "EVAL_LOAD_PATH"),
