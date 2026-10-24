@@ -177,7 +177,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["type"], "session");
-        assert_eq!(rows[0]["currentLeaf"], rows[1]["id"]);
+        assert_eq!(rows[0]["leafId"], rows[1]["id"]);
         assert!(rows[1]["parentId"].is_null());
         assert!(run(&args).is_err(), "copy mode is create-only too");
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), copied);
