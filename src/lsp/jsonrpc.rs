@@ -1665,14 +1665,21 @@ mod tests {
             let (client, parent, helper) = tree_fixture(root.path(), exit_root);
             let client = Arc::new(client);
             let retained = Arc::clone(&client);
-            let (_, response) = client
-                .request("test/pending", Value::Null)
-                .expect("request");
+            // Once the root has exited, a request is either queued and then
+            // failed by shutdown or refused outright (GH #262). Reaping is
+            // what this test checks, and it must hold in both orders.
+            let response = match client.request("test/pending", Value::Null) {
+                Ok((_, response)) => Some(response),
+                Err(TransportError::Closed(_) | TransportError::Io(_)) if exit_root => None,
+                Err(error) => panic!("request: {error:?}"),
+            };
             client.shutdown();
-            assert!(matches!(
-                response.try_recv(),
-                Ok(Err(TransportError::Closed(_)))
-            ));
+            if let Some(response) = response {
+                assert!(matches!(
+                    response.try_recv(),
+                    Ok(Err(TransportError::Closed(_)))
+                ));
+            }
             assert!(!retained.is_alive());
             assert!(
                 wait_for_fixture(|| workers_finished(&retained)),
