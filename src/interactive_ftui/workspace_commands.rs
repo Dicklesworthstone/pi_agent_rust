@@ -90,15 +90,18 @@ pub async fn run(
             |manager| render(workspace_reports::plugins(manager)),
         ),
         WorkspaceCommand::Handoff => match workspace_reports::handoff_mode(args) {
-            Ok(workspace_reports::HandoffMode::ModelPreview(options)
-                | workspace_reports::HandoffMode::Import(options)) => {
-                match Box::pin(model_handoff::run(handle, options)).await {
-                    Ok(preview) => PiMsg::System(preview),
-                    Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
-                }
-            }
+            Ok(
+                workspace_reports::HandoffMode::ModelPreview(options)
+                | workspace_reports::HandoffMode::Import(options),
+            ) => match Box::pin(model_handoff::run(handle, options)).await {
+                Ok(preview) => PiMsg::System(preview),
+                Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
+            },
             Ok(workspace_reports::HandoffMode::Report(options)) => {
-                match handle.with_session(|session| workspace_reports::handoff(session, options)).await {
+                match handle
+                    .with_session(|session| workspace_reports::handoff(session, options))
+                    .await
+                {
                     Ok(report) => render(report),
                     Err(error) => PiMsg::AgentError(format!("handoff: {error}")),
                 }
@@ -116,8 +119,11 @@ pub async fn run(
             // continuation; native abort-and-drain still owns cleanup.
             let progress = goal_progress::Observation::attach(handle.listeners(), agent_tx);
             let result = Box::pin(crate::goal::terminal::run_with_control(
-                handle, args, progress.control_publisher(),
-            )).await;
+                handle,
+                args,
+                progress.control_publisher(),
+            ))
+            .await;
             progress.finish();
             match result {
                 Ok(text) => PiMsg::System(text),
@@ -171,16 +177,31 @@ mod tests {
     #[async_trait::async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl crate::provider::Provider for ReviewRouteProvider {
-        fn name(&self) -> &str { "review-route" }
-        fn api(&self) -> &str { "review-route" }
-        fn model_id(&self) -> &str { "mock-model" }
+        fn name(&self) -> &str {
+            "review-route"
+        }
+        fn api(&self) -> &str {
+            "review-route"
+        }
+        fn model_id(&self) -> &str {
+            "mock-model"
+        }
 
         async fn stream(
             &self,
             context: &crate::provider::Context<'_>,
             _: &crate::provider::StreamOptions,
-        ) -> crate::error::Result<std::pin::Pin<Box<dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>>> {
-            use crate::model::{AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent};
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            use crate::model::{
+                AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent,
+            };
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert!(context.tools.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- The actual terminal dispatcher must supply a tool-free reviewer context.
             assert_eq!(context.messages.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- The dispatcher must isolate review input from the live conversation.
@@ -190,7 +211,9 @@ mod tests {
             let event = StreamEvent::Done {
                 reason: StopReason::Stop,
                 message: AssistantMessage {
-                    content: vec![ContentBlock::Text(TextContent::new(r#"{"findings":[{"severity":"P1","confidence":0.95,"lineStart":1,"lineEnd":1,"category":"correctness","title":"Reject the boundary index","rationale":"The new condition accepts index equal to count and then indexes past the end."}]}"#))],
+                    content: vec![ContentBlock::Text(TextContent::new(
+                        r#"{"findings":[{"severity":"P1","confidence":0.95,"lineStart":1,"lineEnd":1,"category":"correctness","title":"Reject the boundary index","rationale":"The new condition accepts index equal to count and then indexes past the end."}]}"#,
+                    ))],
                     ..Default::default()
                 },
             };
@@ -206,39 +229,88 @@ mod tests {
             vec!["config", "user.email", "review@example.invalid"],
             vec!["config", "commit.gpgsign", "false"],
         ] {
-            assert!(std::process::Command::new("git").args(args).current_dir(temp.path()).output().expect("git setup").status.success()); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect,rust.ownership.unwrap-expect] -- Repository initialization must succeed before exercising the dispatcher.
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(temp.path())
+                    .output()
+                    .expect("git setup")
+                    .status
+                    .success()
+            ); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect,rust.ownership.unwrap-expect] -- Repository initialization must succeed before exercising the dispatcher.
         }
-        std::fs::write(temp.path().join("bounds.rs"), "if index < count { use_item(items[index]); }\n").expect("base source"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Seed the valid original source for the real Git diff fixture.
+        std::fs::write(
+            temp.path().join("bounds.rs"),
+            "if index < count { use_item(items[index]); }\n",
+        )
+        .expect("base source"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Seed the valid original source for the real Git diff fixture.
         for args in [vec!["add", "bounds.rs"], vec!["commit", "-m", "base"]] {
-            assert!(std::process::Command::new("git").args(args).current_dir(temp.path()).output().expect("git commit").status.success()); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect,rust.ownership.unwrap-expect] -- A committed baseline is required to distinguish introduced code.
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(temp.path())
+                    .output()
+                    .expect("git commit")
+                    .status
+                    .success()
+            ); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect,rust.ownership.unwrap-expect] -- A committed baseline is required to distinguish introduced code.
         }
-        std::fs::write(temp.path().join("bounds.rs"), "if index <= count { use_item(items[index]); }\n").expect("changed source"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Introduce the exact bounds defect used by the model fixture.
+        std::fs::write(
+            temp.path().join("bounds.rs"),
+            "if index <= count { use_item(items[index]); }\n",
+        )
+        .expect("changed source"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Introduce the exact bounds defect used by the model fixture.
         temp
     }
 
-    fn review_handle(provider: std::sync::Arc<ReviewRouteProvider>, cwd: &Path) -> AgentSessionHandle {
-        let agent = crate::agent::Agent::new(provider, crate::tools::ToolRegistry::new(&[], cwd, None), crate::agent::AgentConfig::default());
+    fn review_handle(
+        provider: std::sync::Arc<ReviewRouteProvider>,
+        cwd: &Path,
+    ) -> AgentSessionHandle {
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], cwd, None),
+            crate::agent::AgentConfig::default(),
+        );
         let session = crate::agent::AgentSession::new(
             agent,
-            std::sync::Arc::new(asupersync::sync::Mutex::new(crate::session::Session::in_memory())),
+            std::sync::Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
             false,
             crate::compaction::ResolvedCompactionSettings::default(),
         );
-        AgentSessionHandle::from_session_with_listeners(session, crate::sdk::EventListeners::default())
+        AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        )
     }
 
     #[test]
     fn review_dispatcher_uses_session_model_and_keeps_offline_explicit() {
         let fixture = review_fixture();
         let provider = std::sync::Arc::new(ReviewRouteProvider {
-            calls: std::sync::atomic::AtomicUsize::new(0), fail: false,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
         });
         let mut handle = review_handle(std::sync::Arc::clone(&provider), fixture.path());
         let original_messages = handle.session().agent.messages().len();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The actual async terminal dispatcher requires its runtime.
-        runtime.block_on(run(WorkspaceCommand::Review, "", &mut handle, fixture.path(), None, None, &sender));
-        let PiMsg::System(report) = receiver.try_recv().expect("review result") else { panic!("review card"); }; // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.ownership.panic-macro] -- Successful dispatch must publish a system report card.
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The actual async terminal dispatcher requires its runtime.
+        runtime.block_on(run(
+            WorkspaceCommand::Review,
+            "",
+            &mut handle,
+            fixture.path(),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::System(report) = receiver.try_recv().expect("review result") else {
+            panic!("review card");
+        }; // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.ownership.panic-macro] -- Successful dispatch must publish a system report card.
         assert!(report.contains("BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- The model's confirmed defect must block the displayed verdict.
         assert!(report.contains("Reject the boundary index")); // ubs:ignore[rust.panic.assert-macros] -- The report must contain the actual provider finding.
         assert!(report.contains("bounds.rs:1")); // ubs:ignore[rust.panic.assert-macros] -- The terminal card must retain the validated actionable location.
@@ -246,29 +318,62 @@ mod tests {
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- One text file must result in one real provider call.
         assert_eq!(handle.session().agent.messages().len(), original_messages); // ubs:ignore[rust.panic.assert-macros] -- The review conversation must not mutate the parent's model context.
 
-        runtime.block_on(run(WorkspaceCommand::Review, "--offline", &mut handle, fixture.path(), None, None, &sender));
-        let PiMsg::System(report) = receiver.try_recv().expect("offline result") else { panic!("offline card"); }; // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.ownership.panic-macro] -- Explicit offline dispatch must still return its labeled report card.
+        runtime.block_on(run(
+            WorkspaceCommand::Review,
+            "--offline",
+            &mut handle,
+            fixture.path(),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::System(report) = receiver.try_recv().expect("offline result") else {
+            panic!("offline card");
+        }; // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.ownership.panic-macro] -- Explicit offline dispatch must still return its labeled report card.
         assert!(report.contains("offline-heuristics")); // ubs:ignore[rust.panic.assert-macros] -- Offline results must be distinguishable from model reviews.
-        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1, "offline must not call the model"); // ubs:ignore[rust.panic.assert-macros] -- The offline invocation must not add any network request.
-        eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"default_dispatcher","outcome":"current model called; transcript unchanged; offline explicit"}));
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "offline must not call the model"
+        ); // ubs:ignore[rust.panic.assert-macros] -- The offline invocation must not add any network request.
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.review.test.v1","case":"default_dispatcher","outcome":"current model called; transcript unchanged; offline explicit"})
+        );
     }
 
     #[test]
     fn review_dispatcher_reports_provider_failure_without_a_ship_verdict() {
         let fixture = review_fixture();
         let provider = std::sync::Arc::new(ReviewRouteProvider {
-            calls: std::sync::atomic::AtomicUsize::new(0), fail: true,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: true,
         });
         let mut handle = review_handle(std::sync::Arc::clone(&provider), fixture.path());
         let (sender, receiver) = std::sync::mpsc::channel();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Exercise provider failure through the actual async dispatcher.
-        runtime.block_on(run(WorkspaceCommand::Review, "", &mut handle, fixture.path(), None, None, &sender));
-        let PiMsg::System(error) = receiver.try_recv().expect("review failure") else { panic!("review failure status"); }; // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.ownership.panic-macro] -- Failed provider execution must produce a visible failure status.
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Exercise provider failure through the actual async dispatcher.
+        runtime.block_on(run(
+            WorkspaceCommand::Review,
+            "",
+            &mut handle,
+            fixture.path(),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::System(error) = receiver.try_recv().expect("review failure") else {
+            panic!("review failure status");
+        }; // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.ownership.panic-macro] -- Failed provider execution must produce a visible failure status.
         assert!(error.contains("Review failed:")); // ubs:ignore[rust.panic.assert-macros] -- The terminal must identify review execution failure.
         assert!(error.contains("mock reviewer unavailable")); // ubs:ignore[rust.panic.assert-macros] -- The provider failure must remain observable.
         assert!(!error.contains("SHIP")); // ubs:ignore[rust.panic.assert-macros] -- Failure must never be converted into a successful verdict.
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Failure must not silently invoke a fallback provider.
-        eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"dispatcher_failure","outcome":"provider failure displayed; no successful verdict"}));
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.review.test.v1","case":"dispatcher_failure","outcome":"provider failure displayed; no successful verdict"})
+        );
     }
 
     #[test]
@@ -301,16 +406,22 @@ mod tests {
         let (submit_tx, submit_rx) = std::sync::mpsc::channel();
         let mut model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
         assert!(model.route_slash_command("/GoAl status"));
-        assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Workspace {
-            command: WorkspaceCommand::Goal,
-            args: "status".to_string(),
-        });
+        assert_eq!(
+            submit_rx.try_recv().unwrap(),
+            UiCommand::Workspace {
+                command: WorkspaceCommand::Goal,
+                args: "status".to_string(),
+            }
+        );
         model.busy = None; // The first command's driver reply ends its busy state.
         assert!(model.route_slash_command("/goalkeeper exact Argument"));
-        assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::ExtensionCommand {
-            name: "goalkeeper".to_string(),
-            args: "exact Argument".to_string(),
-        });
+        assert_eq!(
+            submit_rx.try_recv().unwrap(),
+            UiCommand::ExtensionCommand {
+                name: "goalkeeper".to_string(),
+                args: "exact Argument".to_string(),
+            }
+        );
         assert_eq!(WorkspaceCommand::parse("goal"), None);
     }
 
@@ -325,31 +436,81 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let provider = Arc::new(OpenAIProvider::new("terminal-goal-routing")
-            .with_base_url("http://127.0.0.1:1/v1"));
-        let agent = Agent::new(provider, ToolRegistry::new(&[], Path::new("."), None), AgentConfig::default());
-        let session = AgentSession::new(agent, Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
-            false, ResolvedCompactionSettings::default());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let provider = Arc::new(
+            OpenAIProvider::new("terminal-goal-routing").with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+            false,
+            ResolvedCompactionSettings::default(),
+        );
         let events = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&events);
         let listeners = EventListeners::default();
-        let _ = listeners.subscribe(Arc::new(move |_| { counted.fetch_add(1, Ordering::SeqCst); }));
+        let _ = listeners.subscribe(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
         let mut handle = AgentSessionHandle::from_session_with_listeners(session, listeners);
         let (sender, receiver) = std::sync::mpsc::channel();
-        runtime.block_on(run(WorkspaceCommand::Goal, "status", &mut handle, Path::new("."), None, None, &sender));
-        let PiMsg::System(status) = receiver.try_recv().unwrap() else { panic!("goal status"); };
-        let token = status.lines().find_map(|line| line.strip_prefix("Review: ")).unwrap();
-        runtime.block_on(run(WorkspaceCommand::Goal, &format!("create {token} -- routed objective"),
-            &mut handle, Path::new("."), None, None, &sender));
-        let PiMsg::System(created) = receiver.try_recv().unwrap() else { panic!("goal creation"); };
+        runtime.block_on(run(
+            WorkspaceCommand::Goal,
+            "status",
+            &mut handle,
+            Path::new("."),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::System(status) = receiver.try_recv().unwrap() else {
+            panic!("goal status");
+        };
+        let token = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Review: "))
+            .unwrap();
+        runtime.block_on(run(
+            WorkspaceCommand::Goal,
+            &format!("create {token} -- routed objective"),
+            &mut handle,
+            Path::new("."),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::System(created) = receiver.try_recv().unwrap() else {
+            panic!("goal creation");
+        };
         assert!(created.contains("Memory-only"));
-        assert_eq!(handle.current_goal().unwrap().unwrap().objective(), "routed objective");
-        runtime.block_on(run(WorkspaceCommand::Goal, &format!("drop {token} -- stale queued command"),
-            &mut handle, Path::new("."), None, None, &sender));
-        let PiMsg::AgentError(error) = receiver.try_recv().unwrap() else { panic!("stale receipt refused"); };
+        assert_eq!(
+            handle.current_goal().unwrap().unwrap().objective(),
+            "routed objective"
+        );
+        runtime.block_on(run(
+            WorkspaceCommand::Goal,
+            &format!("drop {token} -- stale queued command"),
+            &mut handle,
+            Path::new("."),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::AgentError(error) = receiver.try_recv().unwrap() else {
+            panic!("stale receipt refused");
+        };
         assert!(error.contains("GOAL_STALE"));
-        assert_eq!(handle.current_goal().unwrap().unwrap().status(), crate::goal::GoalStatus::Active);
+        assert_eq!(
+            handle.current_goal().unwrap().unwrap().status(),
+            crate::goal::GoalStatus::Active
+        );
         assert_eq!(events.load(Ordering::SeqCst), 0);
     }
 }

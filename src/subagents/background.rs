@@ -7,8 +7,8 @@
 
 use super::{
     Deadline, Error, MAX_SUBAGENT_DEPTH, PreparedRequest, RequestMode, Result, SubagentRequest,
-    SubagentTool, Value, compile_output_schema, current_subagent_depth, result_output,
-    seance, workspace, workflow,
+    SubagentTool, Value, compile_output_schema, current_subagent_depth, result_output, seance,
+    workflow, workspace,
 };
 use crate::agent_cx::AgentCx;
 use crate::model::{ContentBlock, TextContent};
@@ -38,10 +38,15 @@ impl PreparedRequest {
             RequestMode::Parallel(tasks) | RequestMode::Chain(tasks) => tasks.as_slice(),
         };
         for task in tasks {
-            let agent = self.agents.get(&task.agent).ok_or_else(|| Error::tool(
-                "subagent",
-                format!("PI_SUBAGENT_BACKGROUND_INPUT: unknown agent {:?}", task.agent),
-            ))?;
+            let agent = self.agents.get(&task.agent).ok_or_else(|| {
+                Error::tool(
+                    "subagent",
+                    format!(
+                        "PI_SUBAGENT_BACKGROUND_INPUT: unknown agent {:?}",
+                        task.agent
+                    ),
+                )
+            })?;
             if task.task.trim().is_empty() {
                 return Err(Error::tool(
                     "subagent",
@@ -49,12 +54,14 @@ impl PreparedRequest {
                 ));
             }
             if let Some(schema) = task.output_schema.as_ref().or(agent.output_schema.as_ref()) {
-                compile_output_schema(schema).map_err(|error| Error::tool(
-                    "subagent", format!("Invalid outputSchema: {error}"),
-                ))?;
+                compile_output_schema(schema).map_err(|error| {
+                    Error::tool("subagent", format!("Invalid outputSchema: {error}"))
+                })?;
             }
         }
-        self.deadline.check().map_err(|error| Error::tool("subagent", error))
+        self.deadline
+            .check()
+            .map_err(|error| Error::tool("subagent", error))
     }
 }
 
@@ -79,7 +86,9 @@ impl Request {
 
     fn deadline(&self, tool: &SubagentTool) -> Result<Deadline> {
         match self {
-            Self::Delegation(request) => Deadline::for_request(tool.timeout, request.timeout_seconds),
+            Self::Delegation(request) => {
+                Deadline::for_request(tool.timeout, request.timeout_seconds)
+            }
             Self::Workflow(plan) => plan.deadline(tool),
         }
     }
@@ -90,7 +99,10 @@ impl Request {
                 let mode = request.mode_name()?;
                 let prepared = tool.prepare_request_with_deadline(request, deadline)?;
                 prepared.validate_background()?;
-                Ok(Prepared::Delegation { request: prepared, mode })
+                Ok(Prepared::Delegation {
+                    request: prepared,
+                    mode,
+                })
             }
             Self::Workflow(plan) => Ok(Prepared::Workflow(plan.prepare(tool, deadline)?)),
         }
@@ -98,7 +110,10 @@ impl Request {
 }
 
 enum Prepared {
-    Delegation { request: PreparedRequest, mode: &'static str },
+    Delegation {
+        request: PreparedRequest,
+        mode: &'static str,
+    },
     Workflow(workflow::PreparedWorkflow),
 }
 
@@ -119,14 +134,21 @@ impl Prepared {
             Self::Delegation { mut request, mode } => {
                 drop(progress);
                 request.runner = request.runner.into_background();
-                Ok(result_output(request.run(None).await, mode, structured_results))
+                Ok(result_output(
+                    request.run(None).await,
+                    mode,
+                    structured_results,
+                ))
             }
             Self::Workflow(plan) => {
                 // Do not start a graph before its progress sink has the actual
                 // native job ID. Abandoned admission cannot leave orphan work.
-                let progress = progress.await.map_err(|_| Error::tool(
-                    "subagent", "PI_WORKFLOW_PROGRESS_ADMISSION: job handoff did not complete",
-                ))?;
+                let progress = progress.await.map_err(|_| {
+                    Error::tool(
+                        "subagent",
+                        "PI_WORKFLOW_PROGRESS_ADMISSION: job handoff did not complete",
+                    )
+                })?;
                 plan.with_progress(progress).run(None).await
             }
         }
@@ -142,18 +164,28 @@ pub(super) async fn resolve_session(
 ) -> Result<String> {
     let mut pending = Box::pin(owner.with_current(scope.session_id()));
     loop {
-        owner.checkpoint().map_err(|_| Error::tool(
-            "subagent", "PI_SUBAGENT_CANCELLED: caller cancelled during owner lookup",
-        ))?;
-        deadline.check().map_err(|error| Error::tool("subagent", error))?;
+        owner.checkpoint().map_err(|_| {
+            Error::tool(
+                "subagent",
+                "PI_SUBAGENT_CANCELLED: caller cancelled during owner lookup",
+            )
+        })?;
+        deadline
+            .check()
+            .map_err(|error| Error::tool("subagent", error))?;
         let time = owner.time();
         let sleep = Box::pin(time.sleep(deadline.remaining().min(Duration::from_millis(20))));
         match futures::future::select(pending, sleep).await {
             futures::future::Either::Left((result, _)) => {
-                owner.checkpoint().map_err(|_| Error::tool(
-                    "subagent", "PI_SUBAGENT_CANCELLED: caller cancelled during owner lookup",
-                ))?;
-                deadline.check().map_err(|error| Error::tool("subagent", error))?;
+                owner.checkpoint().map_err(|_| {
+                    Error::tool(
+                        "subagent",
+                        "PI_SUBAGENT_CANCELLED: caller cancelled during owner lookup",
+                    )
+                })?;
+                deadline
+                    .check()
+                    .map_err(|error| Error::tool("subagent", error))?;
                 return result;
             }
             futures::future::Either::Right(((), operation)) => pending = operation,
@@ -167,9 +199,12 @@ pub(super) async fn start(
     privacy: AuxiliaryPrivacySnapshot,
 ) -> Result<ToolOutput> {
     let owner = AgentCx::for_current_or_request();
-    owner.checkpoint().map_err(|_| Error::tool(
-        "subagent", "PI_SUBAGENT_CANCELLED: caller cancelled before background admission",
-    ))?;
+    owner.checkpoint().map_err(|_| {
+        Error::tool(
+            "subagent",
+            "PI_SUBAGENT_CANCELLED: caller cancelled before background admission",
+        )
+    })?;
     let capabilities = owner.capabilities();
     if !capabilities.io || !capabilities.spawn || !capabilities.time {
         return Err(Error::tool(
@@ -179,7 +214,8 @@ pub(super) async fn start(
     }
     if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
         return Err(Error::tool(
-            "subagent", format!("Refusing nested subagent depth above {MAX_SUBAGENT_DEPTH}"),
+            "subagent",
+            format!("Refusing nested subagent depth above {MAX_SUBAGENT_DEPTH}"),
         ));
     }
     if seance::is_request(&input)? {
@@ -188,7 +224,10 @@ pub(super) async fn start(
             "PI_SUBAGENT_BACKGROUND_INPUT: seance remains foreground; async supports single, tasks, chain or workflow delegation",
         ));
     }
-    if input.get("timeoutSeconds").is_some_and(|value| value.as_u64().is_none()) {
+    if input
+        .get("timeoutSeconds")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
         return Err(Error::tool(
             "subagent",
             "PI_SUBAGENT_INVALID_TIMEOUT: timeoutSeconds must be an integer from 1 to 86400",
@@ -212,9 +251,12 @@ pub(super) async fn start(
             "PI_SUBAGENT_SESSION_CHANGED: owner changed before background admission",
         ));
     }
-    owner.checkpoint().map_err(|_| Error::tool(
-        "subagent", "PI_SUBAGENT_CANCELLED: caller cancelled before background admission",
-    ))?;
+    owner.checkpoint().map_err(|_| {
+        Error::tool(
+            "subagent",
+            "PI_SUBAGENT_CANCELLED: caller cancelled before background admission",
+        )
+    })?;
     let timeout = deadline.remaining();
     let structured_results = tool.structured_results;
     let artifacts = tool.global_dir.join("tool-output-artifacts");
@@ -237,7 +279,9 @@ pub(super) async fn start(
     }
     let progress_notice = if mode == "workflow" {
         " Settled-wave progress is in job.result.details.partialResult; cancellation or timeout preserves the last screened checkpoint. Pending nodes there have unresolved outcomes, not guaranteed absence of side effects."
-    } else { "" };
+    } else {
+        ""
+    };
     Ok(ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new(format!(
             "Background subagent {mode} started as {}. Use jobs wait/cancel with this jobId. Its settled result contains the ordinary native subagent results; completion is also delivered to the owning session.{progress_notice}",
@@ -278,10 +322,12 @@ mod tests {
             let root = tempfile::tempdir().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure to create the isolated fixture invalidates the test.
             let global = root.path().join("global");
             std::fs::create_dir_all(global.join("agents")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Native discovery requires this fixture directory.
-            std::fs::write( // ubs:ignore[rust.ownership.unwrap-expect] -- The authored agent definition is required test input.
+            std::fs::write(
+                // ubs:ignore[rust.ownership.unwrap-expect] -- The authored agent definition is required test input.
                 global.join("agents/worker.md"),
                 "---\nname: worker\ndescription: background fixture\n---\nOriginal definition.\n",
-            ).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- A missing authored definition invalidates native discovery coverage.
+            )
+            .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- A missing authored definition invalidates native discovery coverage.
             let binary = root.path().join("child.sh");
             std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The real child-process regression requires its controlled executable.
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- A non-executable fixture cannot test native process lifecycle.
@@ -296,7 +342,8 @@ mod tests {
             let event = json!({"type":"agent_end","messages":[{
                 "role":"assistant","stopReason":"stop",
                 "content":[{"type":"text","text":text}]
-            }]}).to_string();
+            }]})
+            .to_string();
             format!("printf '%s\\n' '{}'", event.replace('\'', "'\"'\"'"))
         }
 
@@ -307,10 +354,12 @@ mod tests {
         async fn await_marker(path: &std::path::Path) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !path.exists() {
-                assert!(Instant::now() < deadline, "child did not reach its gated fixture"); // ubs:ignore[rust.panic.assert-macros] -- A stuck native fixture must fail within the test deadline.
-                asupersync::time::sleep(
-                    asupersync::time::wall_now(), Duration::from_millis(10),
-                ).await;
+                assert!(
+                    Instant::now() < deadline,
+                    "child did not reach its gated fixture"
+                ); // ubs:ignore[rust.panic.assert-macros] -- A stuck native fixture must fail within the test deadline.
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10))
+                    .await;
             }
         }
 
@@ -322,25 +371,38 @@ mod tests {
                 end(r#"{"count":7}"#),
             );
             let (root, tool, owner) = fixture(&script);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The native lifecycle regression requires a functioning runtime.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The native lifecycle regression requires a functioning runtime.
             runtime.block_on(async {
-                let output = tool.execute("launch", json!({ // ubs:ignore[rust.ownership.unwrap-expect] -- This valid native launch must produce its acknowledgment.
-                    "agent":"worker","task":"typed result","async":true,
-                    "outputSchema":{"type":"object","required":["count"],
-                        "properties":{"count":{"type":"integer"}}},
-                    "schemaMode":"strict",
-                }), None).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure to admit the controlled child is a regression.
+                let output = tool
+                    .execute(
+                        "launch",
+                        json!({ // ubs:ignore[rust.ownership.unwrap-expect] -- This valid native launch must produce its acknowledgment.
+                            "agent":"worker","task":"typed result","async":true,
+                            "outputSchema":{"type":"object","required":["count"],
+                                "properties":{"count":{"type":"integer"}}},
+                            "schemaMode":"strict",
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure to admit the controlled child is a regression.
                 assert!(!output.is_error); // ubs:ignore[rust.panic.assert-macros] -- The valid native launch must succeed before its child is released.
                 let details = output.details.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- A native background acknowledgment must carry its descriptor.
                 assert_eq!(details["schema"], "pi.subagent.background.v1"); // ubs:ignore[rust.panic.assert-macros] -- Assert the public background acknowledgment schema.
                 let id = details["jobId"].as_str().unwrap(); // ubs:ignore[rust.panic.direct-indexing,rust.ownership.unwrap-expect] -- This assertion requires the native acknowledgment's job identifier.
                 await_marker(&root.path().join("launched")).await;
-                let pending = crate::jobs::wait_async(&owner, id, Duration::ZERO).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The owner must be able to poll its admitted native job.
+                let pending = crate::jobs::wait_async(&owner, id, Duration::ZERO)
+                    .await
+                    .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The owner must be able to poll its admitted native job.
                 assert_eq!(pending.status, "running"); // ubs:ignore[rust.panic.assert-macros] -- The unreleased real child must still be running.
                 assert!(pending.result.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Running jobs must not expose a terminal result.
                 assert!(crate::jobs::take_completion_notices(&owner).is_empty()); // ubs:ignore[rust.panic.assert-macros] -- An unfinished child must not publish completion.
                 std::fs::write(root.path().join("release"), "continue").unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Release the controlled child only after its running-state assertions.
-                let settled = crate::jobs::wait_async(&owner, id, Duration::from_secs(10)).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The released child must settle through the real jobs path.
+                let settled = crate::jobs::wait_async(&owner, id, Duration::from_secs(10))
+                    .await
+                    .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The released child must settle through the real jobs path.
                 assert_eq!(settled.status, "exited", "{settled:?}"); // ubs:ignore[rust.panic.assert-macros] -- Releasing the child must yield successful native settlement.
                 let native = settled.result.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- A settled native task must retain its complete output.
                 assert!(!native.is_error); // ubs:ignore[rust.panic.assert-macros] -- The valid typed child output must remain successful.
@@ -358,13 +420,17 @@ mod tests {
         fn background_cancel_reaps_native_child_before_terminal_publication() {
             let _guard = crate::jobs::process_test_guard();
             let (root, tool, owner) = fixture("printf '%s\\n' \"$$\" > child.pid\nexec sleep 30");
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Native cancellation coverage requires an executing runtime.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Native cancellation coverage requires an executing runtime.
             runtime.block_on(async {
                 let output = tool.execute("launch", request(), None).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The child must be admitted before its cancellation is tested.
                 let id = output.details.as_ref().unwrap()["jobId"].as_str().unwrap(); // ubs:ignore[rust.panic.direct-indexing,rust.ownership.unwrap-expect] -- The cancellation regression requires the admitted job's native identifier.
                 await_marker(&root.path().join("child.pid")).await;
                 let pid = std::fs::read_to_string(root.path().join("child.pid")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Read the real child PID written by the gated fixture.
-                let foreign = crate::jobs::cancel_async("another-session", id).await.unwrap_err(); // ubs:ignore[rust.ownership.unwrap-expect] -- Foreign cancellation must fail without affecting the child.
+                let foreign = crate::jobs::cancel_async("another-session", id)
+                    .await
+                    .unwrap_err(); // ubs:ignore[rust.ownership.unwrap-expect] -- Foreign cancellation must fail without affecting the child.
                 assert!(foreign.to_string().contains("PI_JOBS_UNKNOWN_ID")); // ubs:ignore[rust.panic.assert-macros] -- A foreign session must not cancel the owned child.
                 let settled = crate::jobs::cancel_async(&owner, id).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Cancellation by the actual owner must complete.
                 assert_eq!(settled.status, "killed", "{settled:?}"); // ubs:ignore[rust.panic.assert-macros] -- Native cancellation must publish a killed terminal state.
@@ -373,8 +439,12 @@ mod tests {
                     .args(["-0", pid.trim()])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .status().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure to execute the liveness probe invalidates this Unix fixture.
-                assert!(!status.success(), "cancel returned while its child was alive"); // ubs:ignore[rust.panic.assert-macros] -- The real OS child must be reaped before cancellation returns.
+                    .status()
+                    .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure to execute the liveness probe invalidates this Unix fixture.
+                assert!(
+                    !status.success(),
+                    "cancel returned while its child was alive"
+                ); // ubs:ignore[rust.panic.assert-macros] -- The real OS child must be reaped before cancellation returns.
             });
         }
 
@@ -382,7 +452,9 @@ mod tests {
         fn invalid_background_batch_never_starts_a_valid_prefix() {
             let _guard = crate::jobs::process_test_guard();
             let (root, tool, owner) = fixture("touch launched");
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Admission validation must execute through the native async entry point.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Admission validation must execute through the native async entry point.
             runtime.block_on(async {
                 for input in [
                     json!({"tasks":[{"agent":"worker","task":"valid"},{"agent":"missing","task":"bad"}],"async":true}),
@@ -402,7 +474,10 @@ mod tests {
         #[test]
         fn prepared_background_request_keeps_definition_and_model_snapshot() {
             let _guard = crate::jobs::process_test_guard();
-            let script = format!("printf '%s\\n' \"$@\" > arguments\n{}", end("frozen launch"));
+            let script = format!(
+                "printf '%s\\n' \"$@\" > arguments\n{}",
+                end("frozen launch")
+            );
             let (root, mut tool, _owner) = fixture(&script);
             let model = ToolModelScope::default();
             model.set("provider-before", "model-before");
@@ -414,7 +489,9 @@ mod tests {
             std::fs::write(tool.global_dir.join("agents/worker.md"), // ubs:ignore[rust.ownership.unwrap-expect] -- Deliberately replace the fixture definition after preparation.
                 "---\nname: worker\ndescription: changed\nmodel: changed-model\n---\nChanged definition.\n",
             ).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The changed definition is required to exercise snapshot retention.
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Execute the prepared child through the native runner.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Execute the prepared child through the native runner.
             let results = runtime.block_on(prepared.run(None));
             assert!(!results[0].is_error, "{:?}", results[0]); // ubs:ignore[rust.panic.assert-macros] -- The single prepared child must execute with its frozen definition.
             let argv = std::fs::read_to_string(root.path().join("arguments")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The real child records argv as independent snapshot evidence.
@@ -434,12 +511,18 @@ mod tests {
             scope.bind(std::sync::Arc::new(move || {
                 let id = if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     original.clone()
-                } else { "replacement-owner".to_string() };
+                } else {
+                    "replacement-owner".to_string()
+                };
                 Box::pin(async move { Some(id) })
             }));
             tool.bind_job_session_scope(scope);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Session-change refusal must run through native admission.
-            let error = runtime.block_on(tool.execute("switch", request(), None)).unwrap_err(); // ubs:ignore[rust.ownership.unwrap-expect] -- Ownership replacement is intentionally expected to fail.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Session-change refusal must run through native admission.
+            let error = runtime
+                .block_on(tool.execute("switch", request(), None))
+                .unwrap_err(); // ubs:ignore[rust.ownership.unwrap-expect] -- Ownership replacement is intentionally expected to fail.
             assert!(error.to_string().contains("PI_SUBAGENT_SESSION_CHANGED")); // ubs:ignore[rust.panic.assert-macros] -- Session replacement during preflight must fail explicitly.
             assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2); // ubs:ignore[rust.panic.assert-macros] -- Ownership must be checked both before and after preparation.
             assert!(crate::jobs::list(&owner).unwrap().is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Session replacement must not publish a ghost job.
@@ -461,8 +544,11 @@ mod tests {
                 })
             }));
             tool.bind_job_session_scope(scope);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The blocked-resolver fixture requires native cancellation polling.
-            let error = runtime.block_on(owner.with_current(tool.execute("lookup", request(), None))) // ubs:ignore[rust.ownership.unwrap-expect] -- The cancelled resolver must fail rather than allocate a job.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The blocked-resolver fixture requires native cancellation polling.
+            let error = runtime
+                .block_on(owner.with_current(tool.execute("lookup", request(), None))) // ubs:ignore[rust.ownership.unwrap-expect] -- The cancelled resolver must fail rather than allocate a job.
                 .unwrap_err(); // ubs:ignore[rust.ownership.unwrap-expect] -- Cancellation is the expected outcome of this regression.
             assert!(error.to_string().contains("PI_SUBAGENT_CANCELLED")); // ubs:ignore[rust.panic.assert-macros] -- Cancellation must interrupt a pending owner lookup.
             assert!(crate::jobs::list(&session_id).unwrap().is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.ownership.unwrap-expect] -- Cancelled admission must leave no retained job.

@@ -341,9 +341,7 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             });
         }
         AgentEvent::AdvisorNote { level, rationale } => {
-            batcher.send_immediate(PiMsg::SystemNote(format!(
-                "[ADVISOR:{level}] {rationale}"
-            )));
+            batcher.send_immediate(PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}")));
         }
         AgentEvent::MessageUpdate {
             assistant_message_event,
@@ -833,14 +831,17 @@ impl PiApp {
         msg: PiMsg,
         attempts_remaining: u8,
     ) -> Option<Cmd> {
-        if let PiMsg::McpAuthFinished { request_id, message } = msg {
+        if let PiMsg::McpAuthFinished {
+            request_id,
+            message,
+        } = msg
+        {
             if self.mcp_auth_request_id.as_deref() != Some(request_id.as_str()) {
                 return None;
             }
             self.mcp_auth_request_id = None;
-            return self.handle_pi_message_with_session_retry(
-                PiMsg::System(message), attempts_remaining,
-            );
+            return self
+                .handle_pi_message_with_session_retry(PiMsg::System(message), attempts_remaining);
         }
         let (msg, handoff_completion) = match msg {
             PiMsg::HandoffFinished { request_id, event } => {
@@ -861,7 +862,8 @@ impl PiApp {
             {
                 // Background notices cannot release an operator request's
                 // abort handle or admit another foreground operation.
-                self.messages.push(ConversationMessage::new(MessageRole::System, message, None));
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
                 self.scroll_to_bottom();
             }
             PiMsg::AgentStart => {
@@ -1108,9 +1110,17 @@ impl PiApp {
                     // handle, hook dialogs, or foreground admission state.
                     if let Some(message) = time_cap_message {
                         self.pending_inputs_paused_by_time_cap = true;
-                        self.messages.push(ConversationMessage::new(MessageRole::System, message, None));
+                        self.messages.push(ConversationMessage::new(
+                            MessageRole::System,
+                            message,
+                            None,
+                        ));
                     } else if let Some(message) = error_message {
-                        self.messages.push(ConversationMessage::new(MessageRole::System, message, None));
+                        self.messages.push(ConversationMessage::new(
+                            MessageRole::System,
+                            message,
+                            None,
+                        ));
                     }
                     self.refresh_conversation_viewport(follow_tail);
                     return None;
@@ -1289,7 +1299,11 @@ impl PiApp {
                 });
                 self.scroll_to_bottom();
             }
-            PiMsg::ReviewFinished { owner_session_id, request_id, message } => {
+            PiMsg::ReviewFinished {
+                owner_session_id,
+                request_id,
+                message,
+            } => {
                 if self.review_request_id.as_deref() != Some(request_id.as_str()) {
                     return None;
                 }
@@ -1301,13 +1315,20 @@ impl PiApp {
                     }
                     SessionEventOwnership::Busy => {
                         return self.retry_busy_session_event(
-                            PiMsg::ReviewFinished { owner_session_id, request_id, message },
+                            PiMsg::ReviewFinished {
+                                owner_session_id,
+                                request_id,
+                                message,
+                            },
                             attempts_remaining,
                         );
                     }
                 }
                 self.review_request_id = None;
-                return self.handle_pi_message_with_session_retry(PiMsg::System(message), attempts_remaining);
+                return self.handle_pi_message_with_session_retry(
+                    PiMsg::System(message),
+                    attempts_remaining,
+                );
             }
             PiMsg::SessionSystemNote {
                 owner_session_id,
@@ -1466,7 +1487,10 @@ After approving access in the browser, press Enter in Pi to complete login."
                     }
                     SessionEventOwnership::Busy => {
                         let event = PiMsg::ConversationReset {
-                            session_id, messages, usage, status,
+                            session_id,
+                            messages,
+                            usage,
+                            status,
                         };
                         if let Some(request_id) = handoff_completion {
                             if attempts_remaining == 0 {
@@ -1475,14 +1499,14 @@ After approving access in the browser, press Enter in Pi to complete login."
                                 return None;
                             }
                             return self.retry_busy_session_event(
-                                PiMsg::HandoffFinished { request_id, event: Box::new(event) },
+                                PiMsg::HandoffFinished {
+                                    request_id,
+                                    event: Box::new(event),
+                                },
                                 attempts_remaining,
                             );
                         }
-                        return self.retry_busy_session_event(
-                            event,
-                            attempts_remaining,
-                        );
+                        return self.retry_busy_session_event(event, attempts_remaining);
                     }
                 }
                 if handoff_completion.is_some() {
@@ -3005,16 +3029,19 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
 
         if self.mcp_auth_request_id.is_some() {
-            self.status_message = Some(
-                "MCP authentication is still running; Escape cancels it".to_string(),
-            );
+            self.status_message =
+                Some("MCP authentication is still running; Escape cancels it".to_string());
             return;
         }
         if self.handoff_request_id.is_some()
-            || matches!(SlashCommand::parse(trimmed), Some((SlashCommand::Handoff, _)))
+            || matches!(
+                SlashCommand::parse(trimmed),
+                Some((SlashCommand::Handoff, _))
+            )
         {
             self.status_message = Some(
-                "Handoff must finish before submitting another request; Escape cancels it".to_string(),
+                "Handoff must finish before submitting another request; Escape cancels it"
+                    .to_string(),
             );
             return;
         }
@@ -3346,15 +3373,12 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
 
         if self.mcp_auth_request_id.is_some() {
-            self.status_message = Some(
-                "MCP authentication is still running; Escape cancels it".to_string(),
-            );
+            self.status_message =
+                Some("MCP authentication is still running; Escape cancels it".to_string());
             return None;
         }
         if self.handoff_request_id.is_some() {
-            self.status_message = Some(
-                "Handoff is still running; Escape cancels it".to_string(),
-            );
+            self.status_message = Some("Handoff is still running; Escape cancels it".to_string());
             return None;
         }
 
@@ -4074,7 +4098,9 @@ mod stream_delta_batcher_tests {
                 Ok(event) => {
                     let done = matches!(
                         event,
-                        PiMsg::AgentDone { .. } | PiMsg::AgentTimeCap { .. } | PiMsg::AgentError(_)
+                        PiMsg::AgentDone { .. }
+                            | PiMsg::AgentTimeCap { .. }
+                            | PiMsg::AgentError(_)
                             | PiMsg::HandoffFinished { .. }
                     );
                     let _ = app.handle_pi_message(event.clone());
@@ -5483,7 +5509,10 @@ mod stream_delta_batcher_tests {
             Some(ConversationMessage { role: MessageRole::System, content, .. })
                 if content == "[ADVISOR:CONCERN] The fixture omits Unicode input."
         ));
-        assert!(rx.try_recv().is_err(), "one emitted note has one display event");
+        assert!(
+            rx.try_recv().is_err(),
+            "one emitted note has one display event"
+        );
     }
 
     #[test]
@@ -5673,8 +5702,13 @@ mod stream_delta_batcher_tests {
         });
         assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- A current owned completion must settle the review.
         assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Successful completion retires request ownership.
-        assert!(matches!(app.messages.last(), Some(ConversationMessage { content, .. }) if content == "current review report")); // ubs:ignore[rust.panic.assert-macros] -- Only the current review report may reach the transcript.
-        eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"classic_review_ownership","outcome":"stale completions ignored; current completion settles review"}));
+        assert!(
+            matches!(app.messages.last(), Some(ConversationMessage { content, .. }) if content == "current review report")
+        ); // ubs:ignore[rust.panic.assert-macros] -- Only the current review report may reach the transcript.
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.review.test.v1","case":"classic_review_ownership","outcome":"stale completions ignored; current completion settles review"})
+        );
     }
 
     #[test]
@@ -5683,21 +5717,28 @@ mod stream_delta_batcher_tests {
         let path = directory.path().join("classic-handoff.jsonl");
         let state = Arc::new(ContinueProbeState::default());
         let (mut app, mut receiver) = build_test_app_with_session_configuration(
-            Arc::new(ContinueProbeProvider { state: Arc::clone(&state) }),
-            Config::default(), None,
+            Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }),
+            Config::default(),
+            None,
             |session| {
                 let mut stored = session.session.try_lock().unwrap();
                 stored.path = Some(path.clone());
                 stored.session_dir = Some(directory.path().to_path_buf());
                 stored.append_message(SessionMessage::User {
-                    content: UserContent::Text("Earlier authored migration decision".into()), timestamp: None,
+                    content: UserContent::Text("Earlier authored migration decision".into()),
+                    timestamp: None,
                 });
                 // Larger than the normal recent budget, so the native safe
                 // boundary retains this entire current turn without cutting it.
                 stored.append_message(SessionMessage::User {
-                    content: UserContent::Text("retained native tail ".repeat(8192)), timestamp: None,
+                    content: UserContent::Text("retained native tail ".repeat(8192)),
+                    timestamp: None,
                 });
-                session.agent.replace_messages(stored.to_messages_for_current_path());
+                session
+                    .agent
+                    .replace_messages(stored.to_messages_for_current_path());
             },
         );
         let owner = app.session.try_lock().unwrap().header.id.clone();
@@ -5709,42 +5750,65 @@ mod stream_delta_batcher_tests {
         assert!(app.handoff_request_id.is_some());
         assert_eq!(app.agent_state, AgentState::Processing);
         let events = drive_turn(&mut app, &mut receiver);
-        assert!(matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
-            if matches!(event.as_ref(), PiMsg::ConversationReset { .. })));
+        assert!(
+            matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::ConversationReset { .. }))
+        );
         assert_eq!(state.calls.load(Ordering::SeqCst), 1);
         assert_eq!(app.agent_state, AgentState::Idle);
         assert!(app.abort_handle.is_none());
         assert!(app.handoff_request_id.is_none());
         assert!(!app.extension_compacting.load(Ordering::SeqCst));
         assert_eq!(app.messages.len(), 2);
-        assert!(app.status_message.as_deref().unwrap().starts_with("Handoff saved"));
-        let reopened = runtime().block_on(Session::open(path.to_str().unwrap())).unwrap();
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .starts_with("Handoff saved")
+        );
+        let reopened = runtime()
+            .block_on(Session::open(path.to_str().unwrap()))
+            .unwrap();
         assert_eq!(reopened.header.id, owner);
         assert_eq!(reopened.entries.len(), 3);
         assert!(reopened.entries.iter().any(|entry| matches!(entry,
             SessionEntry::Compaction(compaction) if compaction.details.as_ref().unwrap()["mode"] == "handoff")));
-        assert_eq!(serde_json::to_value(app.agent.try_lock().unwrap().messages()).unwrap(),
-            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap());
-        eprintln!("{}", json!({"schema":"pi.handoff.ui.test.v1","case":"classic_native_transaction"}));
+        assert_eq!(
+            serde_json::to_value(app.agent.try_lock().unwrap().messages()).unwrap(),
+            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap()
+        );
+        eprintln!(
+            "{}",
+            json!({"schema":"pi.handoff.ui.test.v1","case":"classic_native_transaction"})
+        );
     }
 
     #[test]
     fn classic_handoff_refusal_releases_busy_and_report_stays_explicit() {
         let state = Arc::new(ContinueProbeState::default());
-        let (mut app, mut receiver) = build_test_app_with_provider(
-            Arc::new(ContinueProbeProvider { state: Arc::clone(&state) }));
+        let (mut app, mut receiver) =
+            build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }));
         let _ = app.submit_message("/handoff --report");
         assert!(app.handoff_request_id.is_none());
         assert_eq!(app.agent_state, AgentState::Idle);
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
         let _ = app.submit_message("/handoff --unknown target");
-        assert!(app.status_message.as_deref().unwrap().contains("Usage: /handoff"));
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Usage: /handoff")
+        );
         assert!(app.handoff_request_id.is_none());
         let _ = app.submit_message("/handoff human is a focus, not a recipient");
         assert!(app.handoff_request_id.is_some());
         let events = drive_turn(&mut app, &mut receiver);
-        assert!(matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
-            if matches!(event.as_ref(), PiMsg::AgentError(message) if message.contains("Nothing safe to hand off"))));
+        assert!(
+            matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::AgentError(message) if message.contains("Nothing safe to hand off")))
+        );
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
         assert_eq!(app.agent_state, AgentState::Idle);
         assert!(app.abort_handle.is_none());
@@ -5767,17 +5831,25 @@ mod stream_delta_batcher_tests {
         let terminal = PiMsg::HandoffFinished {
             request_id: "current-handoff".into(),
             event: Box::new(PiMsg::ConversationReset {
-                session_id: owner, messages: Vec::new(), usage: Usage::default(),
+                session_id: owner,
+                messages: Vec::new(),
+                usage: Usage::default(),
                 status: Some("Handoff saved".into()),
             }),
         };
-        assert!(app.handle_pi_message_with_session_retry(terminal.clone(), 1).is_some());
+        assert!(
+            app.handle_pi_message_with_session_retry(terminal.clone(), 1)
+                .is_some()
+        );
         let _ = app.handle_pi_message(PiMsg::AgentError("unrelated background error".into()));
         let _ = app.handle_pi_message(PiMsg::AgentDone {
-            usage: None, stop_reason: StopReason::Stop, error_message: None,
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
         });
         let _ = app.handle_pi_message(PiMsg::HandoffFinished {
-            request_id: "older-handoff".into(), event: Box::new(PiMsg::System("stale".into())),
+            request_id: "older-handoff".into(),
+            event: Box::new(PiMsg::System("stale".into())),
         });
         assert_eq!(app.handoff_request_id.as_deref(), Some("current-handoff"));
         assert_eq!(app.agent_state, AgentState::Processing);
@@ -5788,21 +5860,35 @@ mod stream_delta_batcher_tests {
         assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
         app.abort_agent();
         assert!(signal.is_aborted());
-        assert!(app.handle_pi_message_with_session_retry(terminal, 0).is_none());
+        assert!(
+            app.handle_pi_message_with_session_retry(terminal, 0)
+                .is_none()
+        );
         assert_eq!(app.agent_state, AgentState::Idle);
         assert!(app.handoff_request_id.is_none());
         assert!(app.abort_handle.is_none());
         assert!(!app.extension_compacting.load(Ordering::SeqCst));
-        assert!(app.status_message.as_deref().unwrap().contains("Handoff saved"));
-        assert!(app.status_message.as_deref().unwrap().contains("display refresh"));
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Handoff saved")
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("display refresh")
+        );
         drop(held);
     }
 
     #[test]
     fn classic_mcp_auth_keeps_ownership_until_its_matching_completion() {
         let state = Arc::new(ContinueProbeState::default());
-        let (mut app, _receiver) = build_test_app_with_provider(
-            Arc::new(ContinueProbeProvider { state: Arc::clone(&state) }));
+        let (mut app, _receiver) = build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+            state: Arc::clone(&state),
+        }));
         let (abort, signal) = AbortHandle::new();
         app.mcp_auth_request_id = Some("current-auth".into());
         app.abort_handle = Some(abort);
@@ -5812,9 +5898,14 @@ mod stream_delta_batcher_tests {
             PiMsg::System("An older MCP test completed".into()),
             PiMsg::AgentError("Unrelated background task failed".into()),
             PiMsg::AgentDone {
-                usage: None, stop_reason: StopReason::Stop, error_message: None,
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
             },
-            PiMsg::McpAuthFinished { request_id: "older-auth".into(), message: "stale".into() },
+            PiMsg::McpAuthFinished {
+                request_id: "older-auth".into(),
+                message: "stale".into(),
+            },
         ] {
             let _ = app.handle_pi_message(notice);
             assert_eq!(app.mcp_auth_request_id.as_deref(), Some("current-auth"));
@@ -5830,7 +5921,8 @@ mod stream_delta_batcher_tests {
         app.abort_agent();
         assert!(signal.is_aborted());
         let _ = app.handle_pi_message(PiMsg::McpAuthFinished {
-            request_id: "current-auth".into(), message: "Authentication cancelled".into(),
+            request_id: "current-auth".into(),
+            message: "Authentication cancelled".into(),
         });
         assert_eq!(app.agent_state, AgentState::Idle);
         assert!(app.mcp_auth_request_id.is_none());

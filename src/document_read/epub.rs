@@ -8,9 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{
-    ArchiveReader, Cursor, HashMap, HashSet, Result, TextOutput, XmlBudget, XmlEvent,
-    MAX_DOCUMENT_BYTES, MAX_OUTPUT_BYTES, MAX_XML_BYTES, decode_xml, document_error, resolve_target,
-    visit_xml,
+    ArchiveReader, Cursor, HashMap, HashSet, MAX_DOCUMENT_BYTES, MAX_OUTPUT_BYTES, MAX_XML_BYTES,
+    Result, TextOutput, XmlBudget, XmlEvent, decode_xml, document_error, resolve_target, visit_xml,
 };
 
 const CONTAINER_NS: &str = "urn:oasis:names:tc:opendocument:xmlns:container";
@@ -102,7 +101,9 @@ fn required(value: Option<String>, label: &str) -> Result<String> {
 
 fn package_target(source: &str, target: &str) -> Result<String> {
     if target.starts_with('/') {
-        return Err(document_error("EPUB resources must use package-relative paths"));
+        return Err(document_error(
+            "EPUB resources must use package-relative paths",
+        ));
     }
     resolve_target(source, target)
 }
@@ -179,7 +180,9 @@ fn read_package(bytes: &[u8]) -> Result<Package> {
         match event {
             XmlEvent::Start(Epub(current @ (Tag::Metadata | Tag::Manifest | Tag::Spine)), _) => {
                 if parents != [Epub(Tag::Package)] || !sections.insert(current) {
-                    return Err(document_error("duplicate or misplaced EPUB package section"));
+                    return Err(document_error(
+                        "duplicate or misplaced EPUB package section",
+                    ));
                 }
             }
             XmlEvent::Start(Epub(Tag::Item), attributes) => {
@@ -224,7 +227,9 @@ fn read_package(bytes: &[u8]) -> Result<Package> {
             }
             XmlEvent::End(Epub(current)) => {
                 if parents == [Epub(Tag::Package), Epub(Tag::Metadata)]
-                    && current_metadata.as_ref().is_some_and(|(active, _, _)| *active == current)
+                    && current_metadata
+                        .as_ref()
+                        .is_some_and(|(active, _, _)| *active == current)
                     && let Some((_, label, output)) = current_metadata.take()
                 {
                     let value = output.text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -238,7 +243,9 @@ fn read_package(bytes: &[u8]) -> Result<Package> {
         Ok(())
     })?;
     if package.manifest.is_empty() || package.spine.is_empty() {
-        return Err(document_error("EPUB requires a manifest and a nonempty reading spine"));
+        return Err(document_error(
+            "EPUB requires a manifest and a nonempty reading spine",
+        ));
     }
     Ok(package)
 }
@@ -344,7 +351,11 @@ fn compact_table_content(tag: &str, content: &str) -> Result<String> {
         "table" => {
             output.append("\n\n")?;
             let mut header_seen = false;
-            for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            for line in content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
                 output.append(line)?;
                 output.append("\n")?;
                 if !header_seen && line.starts_with('|') && line.ends_with('|') {
@@ -396,16 +407,81 @@ fn chapter_text(bytes: &[u8]) -> Result<String> {
             // its non-expanding child traversal. Skipped tags still fall back
             // to the skip handler registered above.
             vec![
-                "html", "head", "body", "a", "img", "ol", "ul", "li", "blockquote",
-                "code", "pre", "strong", "b", "i", "em", "h1", "h2", "h3", "h4",
-                "h5", "h6", "br", "hr", "table", "tr", "td", "th", "thead", "tbody",
-                "tfoot", "caption", "p", "span", "address", "article", "aside", "base",
-                "basefont", "center", "col", "colgroup", "dd", "details", "dialog",
-                "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer",
-                "form", "frame", "frameset", "header", "iframe", "legend", "link",
-                "main", "menu", "menuitem", "nav", "noframes", "optgroup", "option",
-                "param", "script", "search", "section", "style", "summary", "textarea",
-                "title", "track",
+                "html",
+                "head",
+                "body",
+                "a",
+                "img",
+                "ol",
+                "ul",
+                "li",
+                "blockquote",
+                "code",
+                "pre",
+                "strong",
+                "b",
+                "i",
+                "em",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "br",
+                "hr",
+                "table",
+                "tr",
+                "td",
+                "th",
+                "thead",
+                "tbody",
+                "tfoot",
+                "caption",
+                "p",
+                "span",
+                "address",
+                "article",
+                "aside",
+                "base",
+                "basefont",
+                "center",
+                "col",
+                "colgroup",
+                "dd",
+                "details",
+                "dialog",
+                "dir",
+                "div",
+                "dl",
+                "dt",
+                "fieldset",
+                "figcaption",
+                "figure",
+                "footer",
+                "form",
+                "frame",
+                "frameset",
+                "header",
+                "iframe",
+                "legend",
+                "link",
+                "main",
+                "menu",
+                "menuitem",
+                "nav",
+                "noframes",
+                "optgroup",
+                "option",
+                "param",
+                "script",
+                "search",
+                "section",
+                "style",
+                "summary",
+                "textarea",
+                "title",
+                "track",
             ],
             move |handlers: &dyn htmd::element_handler::Handlers, element: htmd::Element<'_>| {
                 if handler_overflow.load(Ordering::Relaxed) {
@@ -450,17 +526,23 @@ fn chapter_text(bytes: &[u8]) -> Result<String> {
         .build();
     let markdown = converter.convert(&html).map_err(document_error)?;
     if render_work.load(Ordering::Relaxed) == usize::MAX {
-        return Err(document_error("EPUB chapter exceeds the 64 MiB render-work limit"));
+        return Err(document_error(
+            "EPUB chapter exceeds the 64 MiB render-work limit",
+        ));
     }
     if render_overflow.load(Ordering::Relaxed) || markdown.len() > MAX_OUTPUT_BYTES {
-        return Err(document_error("EPUB chapter exceeds the 8 MiB rendered-content limit"));
+        return Err(document_error(
+            "EPUB chapter exceeds the 8 MiB rendered-content limit",
+        ));
     }
     Ok(markdown)
 }
 
 pub(super) fn convert(bytes: &[u8]) -> Result<String> {
     if bytes.len() > MAX_DOCUMENT_BYTES {
-        return Err(document_error("EPUB exceeds the 10 MiB compressed document limit"));
+        return Err(document_error(
+            "EPUB exceeds the 10 MiB compressed document limit",
+        ));
     }
     let mut archive = ArchiveReader::new(Cursor::new(bytes))?;
     if archive.read_member("mimetype", 128)? != b"application/epub+zip" {
@@ -521,7 +603,9 @@ mod tests {
     }
 
     fn xhtml(body: &str) -> String {
-        format!(r#"<html xmlns="{XHTML_NS}"><head><title>Hidden title</title></head><body>{body}</body></html>"#)
+        format!(
+            r#"<html xmlns="{XHTML_NS}"><head><title>Hidden title</title></head><body>{body}</body></html>"#
+        )
     }
 
     fn render(bytes: &[u8]) -> Result<String> {
@@ -554,15 +638,28 @@ mod tests {
             r#"<itemref idref="cover"/>"#,
             &[("Book/text part.xhtml", &chapter)],
         );
-        assert!(render(&bytes).expect("fallback").contains("Fallback content."));
+        assert!(
+            render(&bytes)
+                .expect("fallback")
+                .contains("Fallback content.")
+        );
     }
 
     #[test]
     fn broken_missing_and_external_content_never_silently_omit_chapters() {
         let chapter = xhtml("<p>Valid.</p>");
-        for href in ["https://example.org/chapter.xhtml", "../../escape.xhtml", "missing.xhtml"] {
-            let manifest = format!(r#"<item id="a" href="{href}" media-type="application/xhtml+xml"/>"#);
-            let bytes = book(&manifest, r#"<itemref idref="a"/>"#, &[("Book/a.xhtml", &chapter)]);
+        for href in [
+            "https://example.org/chapter.xhtml",
+            "../../escape.xhtml",
+            "missing.xhtml",
+        ] {
+            let manifest =
+                format!(r#"<item id="a" href="{href}" media-type="application/xhtml+xml"/>"#);
+            let bytes = book(
+                &manifest,
+                r#"<itemref idref="a"/>"#,
+                &[("Book/a.xhtml", &chapter)],
+            );
             assert!(render(&bytes).is_err(), "{href}");
         }
         let missing_reference = book(
@@ -600,7 +697,9 @@ mod tests {
             assert!(text.contains("Contents."));
         }
         for invalid in [
-            format!(r#"<!DOCTYPE html [<!ENTITY local "replacement">]><html xmlns="{XHTML_NS}"><body>&local;</body></html>"#),
+            format!(
+                r#"<!DOCTYPE html [<!ENTITY local "replacement">]><html xmlns="{XHTML_NS}"><body>&local;</body></html>"#
+            ),
             format!(r#"<!DOCTYPE html><!DOCTYPE html><html xmlns="{XHTML_NS}"><body/></html>"#),
             format!(r#"<html xmlns="{XHTML_NS}"><body><p>broken</body></html>"#),
             format!(r#"<html xmlns="{XHTML_NS}"><body>&unknown;</body></html>"#),
@@ -645,22 +744,36 @@ mod tests {
             &[("Book/a.xhtml", &chapter)],
         );
         let text = render(&bytes).expect("compact table");
-        assert!(text.contains(&header), "the complete long header is retained");
+        assert!(
+            text.contains(&header),
+            "the complete long header is retained"
+        );
         assert!(text.contains("row 255"), "the final row is retained");
         assert!(text.contains("<br>"), "cell line breaks remain visible");
         assert!(text.contains("&#124;"), "literal pipes cannot split a cell");
-        assert!(text.contains("| --- | --- | --- |"), "all three columns remain");
-        let row = text.lines().find(|line| line.starts_with("| row 255 |")).unwrap();
+        assert!(
+            text.contains("| --- | --- | --- |"),
+            "all three columns remain"
+        );
+        let row = text
+            .lines()
+            .find(|line| line.starts_with("| row 255 |"))
+            .unwrap();
         assert_eq!(row.bytes().filter(|byte| *byte == b'|').count(), 4);
-        assert!(row.ends_with("|  |"), "the final empty cell remains present");
-        assert!(text.len() < 100_000, "the unpadded table must remain compact");
+        assert!(
+            row.ends_with("|  |"),
+            "the final empty cell remains present"
+        );
+        assert!(
+            text.len() < 100_000,
+            "the unpadded table must remain compact"
+        );
     }
 
     #[test]
     fn nested_quotations_have_a_cumulative_render_work_budget() {
-        let ordinary = xhtml(
-            "<blockquote><p>A saved quotation.</p><p>Its second paragraph.</p></blockquote>"
-        );
+        let ordinary =
+            xhtml("<blockquote><p>A saved quotation.</p><p>Its second paragraph.</p></blockquote>");
         let text = chapter_text(ordinary.as_bytes()).expect("ordinary quotation");
         assert!(text.contains("A saved quotation."));
         assert!(text.contains("Its second paragraph."));
@@ -707,12 +820,17 @@ mod tests {
             &[("Book/a.xhtml", &chapter)],
         );
         let out = crate::url_read::convert_bytes(
-            "https://example.org/download", "application/epub+zip", &bytes, false,
-        ).expect("URL EPUB");
+            "https://example.org/download",
+            "application/epub+zip",
+            &bytes,
+            false,
+        )
+        .expect("URL EPUB");
         assert_eq!(out.kind, crate::url_read::UrlContentKind::Epub);
         assert!(out.content.contains("URL book."));
-        assert!(crate::url_read::convert_bytes(
-            "https://example.org/book.epub", "", &bytes, true,
-        ).is_err());
+        assert!(
+            crate::url_read::convert_bytes("https://example.org/book.epub", "", &bytes, true,)
+                .is_err()
+        );
     }
 }

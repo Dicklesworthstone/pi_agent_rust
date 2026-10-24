@@ -25,7 +25,8 @@ fn user(session: &mut Session, text: &str) -> String {
 
 #[test]
 fn checkpoint_roundtrip_preserves_unicode_objective_and_all_fields() {
-    let original = Record::new("实现目标 🦀\nPreserve exact input.", GoalBudget::default()).unwrap();
+    let original =
+        Record::new("实现目标 🦀\nPreserve exact input.", GoalBudget::default()).unwrap();
     let value = serde_json::to_value(&original).unwrap();
     let decoded = decode(&value).unwrap();
     assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
@@ -34,13 +35,26 @@ fn checkpoint_roundtrip_preserves_unicode_objective_and_all_fields() {
 
 #[test]
 fn objective_and_budget_validation_rejects_unbounded_work() {
-    for text in ["".to_string(), " \n".to_string(), "a".repeat(MAX_TEXT_BYTES + 1)] {
+    for text in [
+        "".to_string(),
+        " \n".to_string(),
+        "a".repeat(MAX_TEXT_BYTES + 1),
+    ] {
         assert!(Record::new(&text, GoalBudget::default()).is_err());
     }
     for budget in [
-        GoalBudget { max_prompts: 0, token_budget: 1 },
-        GoalBudget { max_prompts: 1025, token_budget: 1 },
-        GoalBudget { max_prompts: 1, token_budget: 0 },
+        GoalBudget {
+            max_prompts: 0,
+            token_budget: 1,
+        },
+        GoalBudget {
+            max_prompts: 1025,
+            token_budget: 1,
+        },
+        GoalBudget {
+            max_prompts: 1,
+            token_budget: 0,
+        },
     ] {
         assert!(Record::new("work", budget).is_err());
     }
@@ -58,16 +72,25 @@ fn pause_resume_retains_consumed_budgets_and_completion_requires_evidence() {
     assert_eq!(resumed.prompts_started, 3);
     assert_eq!(resumed.tokens_spent, 200);
     assert!(transition(resumed.clone(), Transition::Complete(" ")).is_err());
-    let complete = transition(resumed, Transition::Complete("host verified changed files")).unwrap();
+    let complete =
+        transition(resumed, Transition::Complete("host verified changed files")).unwrap();
     assert_eq!(complete.effective_status(), GoalStatus::Complete);
     assert!(transition(complete, Transition::Resume).is_err());
 }
 
 #[test]
 fn terminal_goals_cannot_be_silently_reactivated_or_rewritten() {
-    for action in [Transition::Drop("no longer needed"), Transition::Complete("verified")] {
+    for action in [
+        Transition::Drop("no longer needed"),
+        Transition::Complete("verified"),
+    ] {
         let terminal = transition(record(), action).unwrap();
-        for next in [Transition::Pause("pause"), Transition::Resume, Transition::Complete("again"), Transition::Drop("again")] {
+        for next in [
+            Transition::Pause("pause"),
+            Transition::Resume,
+            Transition::Complete("again"),
+            Transition::Drop("again"),
+        ] {
             assert!(transition(terminal.clone(), next).is_err());
         }
     }
@@ -102,38 +125,92 @@ fn interrupted_intent_is_paused_and_does_not_authorize_completion_or_replay() {
 #[test]
 fn recorded_usage_includes_intermediate_messages_and_missing_total_fallback() {
     let mut session = Session::in_memory();
-    assistant(&mut session, Usage { total_tokens: 999, ..Usage::default() });
+    assistant(
+        &mut session,
+        Usage {
+            total_tokens: 999,
+            ..Usage::default()
+        },
+    );
     append(&mut session, &record()).unwrap();
-    assistant(&mut session, Usage { input: 10, output: 5, cache_read: 7, cache_write: 3, ..Usage::default() });
-    assistant(&mut session, Usage { total_tokens: 40, input: 20, output: 10, ..Usage::default() });
+    assistant(
+        &mut session,
+        Usage {
+            input: 10,
+            output: 5,
+            cache_read: 7,
+            cache_write: 3,
+            ..Usage::default()
+        },
+    );
+    assistant(
+        &mut session,
+        Usage {
+            total_tokens: 40,
+            input: 20,
+            output: 10,
+            ..Usage::default()
+        },
+    );
     let (_, state) = latest(&session).unwrap().unwrap();
     assert_eq!(state.tokens_spent, 65, "pre-goal usage is not counted");
-    assert_eq!(latest(&session).unwrap().unwrap().1.tokens_spent, 65, "reads do not mutate");
+    assert_eq!(
+        latest(&session).unwrap().unwrap().1.tokens_spent,
+        65,
+        "reads do not mutate"
+    );
     append(&mut session, &state).unwrap();
-    assert_eq!(latest(&session).unwrap().unwrap().1.tokens_spent, 65, "checkpoint does not double-charge");
+    assert_eq!(
+        latest(&session).unwrap().unwrap().1.tokens_spent,
+        65,
+        "checkpoint does not double-charge"
+    );
 }
 
 #[test]
 fn paused_and_terminal_intervals_do_not_charge_unrelated_work() {
-    for action in [Transition::Pause("review"), Transition::Complete("verified"), Transition::Drop("stop")] {
+    for action in [
+        Transition::Pause("review"),
+        Transition::Complete("verified"),
+        Transition::Drop("stop"),
+    ] {
         let mut session = Session::in_memory();
         let mut state = record();
         state.tokens_spent = 55;
         let state = transition(state, action).unwrap();
         append(&mut session, &state).unwrap();
-        assistant(&mut session, Usage { total_tokens: 1000, ..Usage::default() });
+        assistant(
+            &mut session,
+            Usage {
+                total_tokens: 1000,
+                ..Usage::default()
+            },
+        );
         assert_eq!(latest(&session).unwrap().unwrap().1.tokens_spent, 55);
     }
 }
 
 #[test]
 fn accounting_saturates_instead_of_wrapping_to_a_fresh_budget() {
-    assert_eq!(usage_tokens(&Usage { input: u64::MAX, output: 1, ..Usage::default() }), u64::MAX);
+    assert_eq!(
+        usage_tokens(&Usage {
+            input: u64::MAX,
+            output: 1,
+            ..Usage::default()
+        }),
+        u64::MAX
+    );
     let mut session = Session::in_memory();
     let mut state = record();
     state.tokens_spent = 10;
     append(&mut session, &state).unwrap();
-    assistant(&mut session, Usage { total_tokens: u64::MAX, ..Usage::default() });
+    assistant(
+        &mut session,
+        Usage {
+            total_tokens: u64::MAX,
+            ..Usage::default()
+        },
+    );
     let (_, state) = latest(&session).unwrap().unwrap();
     assert_eq!(state.tokens_spent, u64::MAX);
     assert_eq!(state.effective_status(), GoalStatus::BudgetLimited);

@@ -199,8 +199,8 @@ fn warn_mode_preserves_failed_execution_and_legacy_audit_details() {
         if let Some(background) = background {
             input["background"] = json!(background);
         }
-        let output = block_on_local(tool.execute("warn-failure", input, None))
-            .expect("warn execution");
+        let output =
+            block_on_local(tool.execute("warn-failure", input, None)).expect("warn execution");
         assert!(first_text(&output).contains("MEDIATION WARN"));
         let details = output.details.as_ref().expect("warning details");
         assert_eq!(details["mediation"]["schema"], "pi.bash.mediation.v1");
@@ -221,7 +221,12 @@ fn warn_mode_preserves_failed_execution_and_legacy_audit_details() {
             assert!(first_text(&output).contains("Command exited with code 7"));
             assert_eq!(details["schema"], "pi.bash.mediation.v1");
             assert_eq!(details["verdict"], "warn");
-            assert!(!details["hits"].as_array().expect("legacy audit hits").is_empty());
+            assert!(
+                !details["hits"]
+                    .as_array()
+                    .expect("legacy audit hits")
+                    .is_empty()
+            );
             assert!(pi::jobs::take_completion_notices(&owner).is_empty());
         }
     }

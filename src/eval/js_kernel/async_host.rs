@@ -65,7 +65,9 @@ impl State {
 
     fn admit(&self) -> Result<(), &'static str> {
         if self.stopped.load(Ordering::SeqCst)
-            || self.deadline.is_none_or(|deadline| Instant::now() >= deadline)
+            || self
+                .deadline
+                .is_none_or(|deadline| Instant::now() >= deadline)
         {
             return Err("EVAL_TIMEOUT: asynchronous cell owner is no longer active");
         }
@@ -74,12 +76,14 @@ impl State {
 
     fn allocate(&mut self) -> Result<u32, &'static str> {
         self.admit()?;
-        if self.timers.len() + self.calls.len() >= MAX_PENDING
-            || self.operations >= MAX_OPERATIONS
+        if self.timers.len() + self.calls.len() >= MAX_PENDING || self.operations >= MAX_OPERATIONS
         {
             return Err("EVAL_ASYNC_LIMIT: too many pending or scheduled operations");
         }
-        self.next_id = self.next_id.checked_add(1).ok_or("EVAL_ASYNC_LIMIT: ID space exhausted")?;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or("EVAL_ASYNC_LIMIT: ID space exhausted")?;
         self.operations += 1;
         Ok(self.next_id)
     }
@@ -91,15 +95,25 @@ impl State {
         }
         let millis = milliseconds as u64;
         let delay = Duration::from_millis(if repeat { millis.max(1) } else { millis });
-        let due = Instant::now().checked_add(delay).ok_or("EVAL_TIMER_DELAY: deadline overflow")?;
+        let due = Instant::now()
+            .checked_add(delay)
+            .ok_or("EVAL_TIMER_DELAY: deadline overflow")?;
         let id = self.allocate()?;
-        self.timers.insert(id, Timer { due, repeat: repeat.then_some(delay) });
+        self.timers.insert(
+            id,
+            Timer {
+                due,
+                repeat: repeat.then_some(delay),
+            },
+        );
         Ok(id)
     }
 
     fn enqueue(&mut self, tool: String, payload: &str) -> Result<u32, &'static str> {
         self.admit()?;
-        if tool.is_empty() || tool.len() > 128 || payload.len() > MAX_PAYLOAD
+        if tool.is_empty()
+            || tool.len() > 128
+            || payload.len() > MAX_PAYLOAD
             || self.queued_bytes.saturating_add(payload.len()) > MAX_QUEUED_BYTES
         {
             return Err("EVAL_ASYNC_LIMIT: tool request exceeds the queue byte budget");
@@ -111,7 +125,12 @@ impl State {
         }
         let id = self.allocate()?;
         self.queued_bytes += payload.len();
-        self.calls.push_back(Call { id, input: Some((tool, input)), receiver: None, bytes: payload.len() });
+        self.calls.push_back(Call {
+            id,
+            input: Some((tool, input)),
+            receiver: None,
+            bytes: payload.len(),
+        });
         Ok(id)
     }
 
@@ -127,13 +146,17 @@ impl State {
         self.admit()?;
         // At most one asynchronous tool exchange is in flight. The Rust host
         // still owns policy, paths and execution; Promise.all is not a bypass.
-        let reply = self.calls.front().and_then(|call| call.receiver.as_ref()).and_then(|receiver| {
-            match receiver.try_recv() {
+        let reply = self
+            .calls
+            .front()
+            .and_then(|call| call.receiver.as_ref())
+            .and_then(|receiver| match receiver.try_recv() {
                 Ok(reply) => Some(reply),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err("EVAL_BRIDGE_CLOSED: host disconnected".into())),
-            }
-        });
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("EVAL_BRIDGE_CLOSED: host disconnected".into()))
+                }
+            });
         if let Some(reply) = reply {
             self.charge_event()?;
             let call = self.calls.pop_front().expect("reply belongs to front call");
@@ -144,19 +167,32 @@ impl State {
             && let Some((tool, input)) = call.input.take()
         {
             let (reply, receiver) = std::sync::mpsc::channel();
-            bridge.send(JsBridgeRequest { tool, input, reply })
+            bridge
+                .send(JsBridgeRequest { tool, input, reply })
                 .map_err(|_| "EVAL_BRIDGE_CLOSED: host disconnected")?;
             call.receiver = Some(receiver);
         }
-        let next = self.timers.iter().min_by_key(|(id, timer)| (timer.due, **id))
-            .filter(|(_, timer)| timer.due <= Instant::now()).map(|(id, _)| *id);
+        let next = self
+            .timers
+            .iter()
+            .min_by_key(|(id, timer)| (timer.due, **id))
+            .filter(|(_, timer)| timer.due <= Instant::now())
+            .map(|(id, _)| *id);
         if let Some(id) = next {
             self.charge_event()?;
             let timer = self.timers.remove(&id).expect("selected timer exists");
             if let Some(delay) = timer.repeat {
-                let due = Instant::now().checked_add(delay).ok_or("EVAL_TIMER_DELAY: deadline overflow")?;
+                let due = Instant::now()
+                    .checked_add(delay)
+                    .ok_or("EVAL_TIMER_DELAY: deadline overflow")?;
                 // Reinsert before the callback so an interval can clear itself.
-                self.timers.insert(id, Timer { due, repeat: Some(delay) });
+                self.timers.insert(
+                    id,
+                    Timer {
+                        due,
+                        repeat: Some(delay),
+                    },
+                );
             }
             return Ok(Some(Event::Timer(id, timer.repeat.is_some())));
         }
@@ -186,23 +222,36 @@ impl AsyncHost {
         use rquickjs::function::Func;
         let state = Rc::new(RefCell::new(State::new(stopped)));
         let weak = Rc::downgrade(&state);
-        ctx.globals().set("__pi_set_timer", Func::from(move |ctx: Ctx<'_>, ms: f64, repeat: bool| {
-            let state = weak.upgrade().ok_or_else(|| rquickjs::Exception::throw_message(&ctx, "EVAL_ASYNC_CLOSED"))?;
-            let result = state.borrow_mut().schedule(ms, repeat);
-            result.map_err(|error| rquickjs::Exception::throw_message(&ctx, error))
-        }))?;
+        ctx.globals().set(
+            "__pi_set_timer",
+            Func::from(move |ctx: Ctx<'_>, ms: f64, repeat: bool| {
+                let state = weak
+                    .upgrade()
+                    .ok_or_else(|| rquickjs::Exception::throw_message(&ctx, "EVAL_ASYNC_CLOSED"))?;
+                let result = state.borrow_mut().schedule(ms, repeat);
+                result.map_err(|error| rquickjs::Exception::throw_message(&ctx, error))
+            }),
+        )?;
         let weak = Rc::downgrade(&state);
-        ctx.globals().set("__pi_clear_timer", Func::from(move |id: u32| {
-            if let Some(state) = weak.upgrade() {
-                state.borrow_mut().timers.remove(&id);
-            }
-        }))?;
+        ctx.globals().set(
+            "__pi_clear_timer",
+            Func::from(move |id: u32| {
+                if let Some(state) = weak.upgrade() {
+                    state.borrow_mut().timers.remove(&id);
+                }
+            }),
+        )?;
         let weak = Rc::downgrade(&state);
-        ctx.globals().set("__pi_async_call", Func::from(move |ctx: Ctx<'_>, tool: String, payload: String| {
-            let state = weak.upgrade().ok_or_else(|| rquickjs::Exception::throw_message(&ctx, "EVAL_ASYNC_CLOSED"))?;
-            let result = state.borrow_mut().enqueue(tool, &payload);
-            result.map_err(|error| rquickjs::Exception::throw_message(&ctx, error))
-        }))?;
+        ctx.globals().set(
+            "__pi_async_call",
+            Func::from(move |ctx: Ctx<'_>, tool: String, payload: String| {
+                let state = weak
+                    .upgrade()
+                    .ok_or_else(|| rquickjs::Exception::throw_message(&ctx, "EVAL_ASYNC_CLOSED"))?;
+                let result = state.borrow_mut().enqueue(tool, &payload);
+                result.map_err(|error| rquickjs::Exception::throw_message(&ctx, error))
+            }),
+        )?;
         let handlers: rquickjs::Object<'_> = ctx.eval(include_str!("async_host.js"))?;
         ctx.eval::<(), _>(include_str!("browser.js"))?;
         Ok(Self {
@@ -218,10 +267,19 @@ impl AsyncHost {
         state.deadline = Some(deadline);
     }
 
-    pub(super) fn pump(&self, ctx: &Ctx<'_>, bridge: &Sender<JsBridgeRequest>) -> rquickjs::Result<bool> {
-        let event = self.state.borrow_mut().poll(bridge)
+    pub(super) fn pump(
+        &self,
+        ctx: &Ctx<'_>,
+        bridge: &Sender<JsBridgeRequest>,
+    ) -> rquickjs::Result<bool> {
+        let event = self
+            .state
+            .borrow_mut()
+            .poll(bridge)
             .map_err(|error| rquickjs::Exception::throw_message(ctx, error))?;
-        let Some(event) = event else { return Ok(false); };
+        let Some(event) = event else {
+            return Ok(false);
+        };
         let dispatch = self.dispatch.clone().restore(ctx)?;
         match event {
             Event::Timer(id, repeat) => dispatch.call::<_, ()>((id, true, repeat, ""))?,

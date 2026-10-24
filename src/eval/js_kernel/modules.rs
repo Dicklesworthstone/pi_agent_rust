@@ -171,15 +171,22 @@ impl ModuleFiles {
         let parent = base_path
             .parent()
             .ok_or("EVAL_MODULE_BASE: importer has no directory")?;
-        let (requested, package_root) = if relative { (parent.join(name), None) } else {
+        let (requested, package_root) = if relative {
+            (parent.join(name), None)
+        } else {
             let (path, package_root) = packages::resolve(self, &root, parent, name, generation)?;
             (path, Some(package_root))
         };
         let resolved = std::fs::canonicalize(&requested)
             .map_err(|error| format!("EVAL_MODULE_PATH: module unavailable: {error}"))?;
         self.0.borrow().check()?;
-        if package_root.as_ref().is_some_and(|root| !resolved.starts_with(root)) {
-            return Err("EVAL_PACKAGE_PATH: exported target changed outside its package directory".into());
+        if package_root
+            .as_ref()
+            .is_some_and(|root| !resolved.starts_with(root))
+        {
+            return Err(
+                "EVAL_PACKAGE_PATH: exported target changed outside its package directory".into(),
+            );
         }
         if !resolved.starts_with(&root) || module_language(&resolved).is_none() {
             return Err(
@@ -208,7 +215,9 @@ impl ModuleFiles {
                 "EVAL_MODULE_LIMIT: module catalog exhausted; reset JavaScript to clear it".into(),
             );
         }
-        state.versions.remember(identity.clone(), resolved, generation);
+        state
+            .versions
+            .remember(identity.clone(), resolved, generation);
         state.approved.insert(identity.clone());
         Ok(identity)
     }
@@ -247,7 +256,9 @@ impl ModuleFiles {
         }
         let original_bytes = source.code.len();
         if original_bytes > MAX_SOURCE_BYTES.saturating_sub(self.0.borrow().source_bytes) {
-            return Err("EVAL_MODULE_LIMIT: realm source budget exceeds 16 MiB; reset JavaScript".into());
+            return Err(
+                "EVAL_MODULE_LIMIT: realm source budget exceeds 16 MiB; reset JavaScript".into(),
+            );
         }
         if module_language(Path::new(&path)) == Some(ModuleLanguage::TypeScript) {
             // Reuse the same compiler as typed scripts, retaining native ESM
@@ -280,8 +291,10 @@ fn module_language(path: &Path) -> Option<ModuleLanguage> {
         Some("js" | "mjs") => Some(ModuleLanguage::JavaScript),
         Some("ts" | "mts") => Some(ModuleLanguage::TypeScript),
         Some("json") => Some(ModuleLanguage::Json),
-        Some("txt" | "md" | "csv" | "tsv" | "svg" | "html" | "css" | "xml"
-            | "yaml" | "yml" | "toml" | "jsonl" | "ndjson") => Some(ModuleLanguage::Text),
+        Some(
+            "txt" | "md" | "csv" | "tsv" | "svg" | "html" | "css" | "xml" | "yaml" | "yml" | "toml"
+            | "jsonl" | "ndjson",
+        ) => Some(ModuleLanguage::Text),
         _ => None,
     }
 }
@@ -305,7 +318,9 @@ fn validate_attributes(
         } else {
             Err(Exception::throw_message(
                 ctx,
-                &format!("EVAL_MODULE_ATTRIBUTES: data imports require exactly with {{ type: '{kind}' }}"),
+                &format!(
+                    "EVAL_MODULE_ATTRIBUTES: data imports require exactly with {{ type: '{kind}' }}"
+                ),
             ))
         };
     }
@@ -326,11 +341,13 @@ impl Resolver for ModuleFiles {
         name: &str,
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        let resolved = self.resolve_path(base, name)
+        let resolved = self
+            .resolve_path(base, name)
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         // A package subpath can export data without a suffix in its public
         // name. Validate the actual target, including on cached resolution.
-        let path = self.module_path(&resolved)
+        let path = self
+            .module_path(&resolved)
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         validate_attributes(ctx, &path, attributes)?;
         Ok(resolved)
@@ -344,7 +361,8 @@ impl Loader for ModuleFiles {
         name: &str,
         attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, Declared>> {
-        let path = self.module_path(name)
+        let path = self
+            .module_path(name)
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         validate_attributes(ctx, &path, attributes)?;
         let source = self
@@ -357,13 +375,12 @@ impl Loader for ModuleFiles {
             Some(ModuleLanguage::Text) => data::declare_text(ctx, name, &source.code)?,
             _ => Module::declare(ctx.clone(), name, source.code)?,
         };
-        self.0.borrow().check()
+        self.0
+            .borrow()
+            .check()
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         let url = url::Url::from_file_path(&path).map_err(|()| {
-            Exception::throw_message(
-                ctx,
-                "EVAL_MODULE_PATH: cannot represent module file URL",
-            )
+            Exception::throw_message(ctx, "EVAL_MODULE_PATH: cannot represent module file URL")
         })?;
         module.meta()?.set("url", url.as_str())?;
         Ok(module)
@@ -383,23 +400,37 @@ mod typescript_tests {
 
     fn files(root: &Path) -> ModuleFiles {
         let files = ModuleFiles::new(root.to_path_buf(), Arc::new(AtomicBool::new(false)));
-        files.begin(AgentCx::for_testing_with_io(), Instant::now() + Duration::from_secs(10));
+        files.begin(
+            AgentCx::for_testing_with_io(),
+            Instant::now() + Duration::from_secs(10),
+        );
         files
     }
 
     #[test]
     fn erased_types_cannot_bypass_the_original_source_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let fields = (0..100).map(|index| format!("field{index}: number;")).collect::<String>();
+        let fields = (0..100)
+            .map(|index| format!("field{index}: number;"))
+            .collect::<String>();
         let input = format!("interface Padding {{ {fields} }}\nexport const answer: number = 42;");
         std::fs::write(dir.path().join("types.ts"), &input).unwrap();
         let files = files(dir.path());
         let path = files.resolve_path("eval_script", "./types.ts").unwrap();
         files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - input.len() + 1;
-        assert!(files.read_module(&path).err().unwrap().contains("EVAL_MODULE_LIMIT"));
+        assert!(
+            files
+                .read_module(&path)
+                .err()
+                .unwrap()
+                .contains("EVAL_MODULE_LIMIT")
+        );
         files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - input.len();
         let loaded = files.read_module(&path).unwrap();
-        assert!(loaded.code.len() < input.len(), "type declarations should be erased");
+        assert!(
+            loaded.code.len() < input.len(),
+            "type declarations should be erased"
+        );
         assert_eq!(files.0.borrow().source_bytes, MAX_SOURCE_BYTES);
     }
 
@@ -411,8 +442,17 @@ mod typescript_tests {
         let files = files(dir.path());
         let path = files.resolve_path("eval_script", "./enum.ts").unwrap();
         files.0.borrow_mut().source_bytes = MAX_SOURCE_BYTES - input.len();
-        assert!(files.read_module(&path).err().unwrap().contains("EVAL_MODULE_LIMIT"));
-        assert_eq!(files.0.borrow().source_bytes, MAX_SOURCE_BYTES - input.len());
+        assert!(
+            files
+                .read_module(&path)
+                .err()
+                .unwrap()
+                .contains("EVAL_MODULE_LIMIT")
+        );
+        assert_eq!(
+            files.0.borrow().source_bytes,
+            MAX_SOURCE_BYTES - input.len()
+        );
         files.0.borrow_mut().source_bytes = 0;
         let loaded = files.read_module(&path).unwrap();
         assert!(loaded.code.len() > input.len());

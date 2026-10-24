@@ -24,7 +24,10 @@ impl KernelMode {
             None => Ok(Self::Session),
             Some(Value::String(mode)) if mode == "session" => Ok(Self::Session),
             Some(Value::String(mode)) if mode == "per_call" => Ok(Self::PerCall),
-            _ => Err(Error::tool("eval", "EVAL_INPUT: kernel_mode must be session or per_call")),
+            _ => Err(Error::tool(
+                "eval",
+                "EVAL_INPUT: kernel_mode must be session or per_call",
+            )),
         }
     }
 }
@@ -57,7 +60,9 @@ impl EvalTool {
         snapshot_privacy: Option<&super::judgment::SnapshotPrivacy<'_>>,
     ) -> Result<ToolOutput> {
         if KernelMode::parse(&input)? == KernelMode::Session {
-            return self.execute_cell(input, on_update, protect, host, snapshot_privacy).await;
+            return self
+                .execute_cell(input, on_update, protect, host, snapshot_privacy)
+                .await;
         }
         let owner = AgentCx::for_current_or_request();
         let private = self.isolated_executor();
@@ -67,7 +72,9 @@ impl EvalTool {
                 callback(update);
             }) as Update
         });
-        let outcome = private.execute_cell(input, on_update, protect, host, snapshot_privacy).await;
+        let outcome = private
+            .execute_cell(input, on_update, protect, host, snapshot_privacy)
+            .await;
         // Retire even a successful or ordinary-error kernel before handing
         // out the result. Abandonment drops the private executor and checked-
         // out runner too; neither has access to the parent's kernel slots.
@@ -81,7 +88,11 @@ impl EvalTool {
         annotate(&mut output.details);
         // A clean soft stop normally keeps Python's state. This private
         // executor was deliberately retired instead; do not claim reuse.
-        if output.details.as_ref().is_some_and(|d| d["softTimeout"] == true) {
+        if output
+            .details
+            .as_ref()
+            .is_some_and(|d| d["softTimeout"] == true)
+        {
             if let Some(Value::Object(details)) = output.details.as_mut() {
                 details.insert("stateReset".into(), json!(true));
             }

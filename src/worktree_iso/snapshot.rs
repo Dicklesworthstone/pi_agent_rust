@@ -159,8 +159,14 @@ impl Scratch {
         command
             .env("GIT_INDEX_FILE", self.root.join("index"))
             .args([
-                "-c", "core.splitIndex=false", "-c", "core.ignorestat=false",
-                "-c", "core.sparseCheckout=false", "-c", "index.sparse=false",
+                "-c",
+                "core.splitIndex=false",
+                "-c",
+                "core.ignorestat=false",
+                "-c",
+                "core.sparseCheckout=false",
+                "-c",
+                "index.sparse=false",
             ]);
         command
     }
@@ -178,10 +184,7 @@ impl Scratch {
                 &format!("Cannot stage index records: {error}"),
             )
         })?;
-        run(
-            command.stdout(file),
-            "read index records",
-        )?;
+        run(command.stdout(file), "read index records")?;
         let mut bytes = Vec::new();
         File::open(&path)
             .and_then(|file| {
@@ -208,8 +211,14 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         // Remove only our known scratch files, not arbitrary descendants.
         for name in [
-            "index", "index.lock", "parent", "verify", "materialized",
-            "flags", "verify-flags", "skip",
+            "index",
+            "index.lock",
+            "parent",
+            "verify",
+            "materialized",
+            "flags",
+            "verify-flags",
+            "skip",
         ] {
             let _ = fs::remove_file(self.root.join(name));
         }
@@ -261,7 +270,12 @@ impl Snapshot {
         self.checkout_mode.require_current(repo)?;
         run(
             command(repo)
-                .args(["-c", "core.sparseCheckout=false", "-c", "index.sparse=false"])
+                .args([
+                    "-c",
+                    "core.sparseCheckout=false",
+                    "-c",
+                    "index.sparse=false",
+                ])
                 .arg("-c")
                 .arg(hook_setting)
                 .args(["worktree", "add", "-b", branch])
@@ -353,7 +367,11 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
     }
     skipped.verify_source(repo, &scratch)?;
     checkout_mode.require_current(repo)?;
-    Ok(Snapshot { baseline, scratch, checkout_mode })
+    Ok(Snapshot {
+        baseline,
+        scratch,
+        checkout_mode,
+    })
 }
 
 #[cfg(test)]

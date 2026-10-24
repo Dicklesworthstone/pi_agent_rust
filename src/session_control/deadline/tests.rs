@@ -559,10 +559,7 @@ fn early_timer_wake_does_not_replace_native_success_or_error() {
                 &message.content[0],
                 ContentBlock::Text(text) if text.text == "complete answer"
             )),
-            Err(error) => assert!(matches!(
-                error,
-                TurnDeadlineError::Turn(Error::Session(_))
-            )),
+            Err(error) => assert!(matches!(error, TurnDeadlineError::Turn(Error::Session(_)))),
         }
         assert!(timer.is_empty());
     }
@@ -585,7 +582,10 @@ fn owner_cancellation_after_an_early_timer_wake_still_drains_as_cancellation() {
     assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
     assert!(control.snapshot().accepting_input);
     let before = wakes.0.load(Ordering::SeqCst);
-    owner.cancel_with(asupersync::types::CancelKind::User, Some("after early wake"));
+    owner.cancel_with(
+        asupersync::types::CancelKind::User,
+        Some("after early wake"),
+    );
     assert!(wakes.0.load(Ordering::SeqCst) > before);
     assert!(Pin::new(&mut limited).poll(&mut cx).is_pending());
     assert!(!control.snapshot().accepting_input);

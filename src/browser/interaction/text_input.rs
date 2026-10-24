@@ -16,16 +16,22 @@ fn error(message: &'static str) -> Error {
 fn admit_document(value: &Document) -> Result<()> {
     for id in [&value.frame, &value.loader] {
         if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
-            return Err(error("BROWSER_INPUT_DOCUMENT: incomplete document identity"));
+            return Err(error(
+                "BROWSER_INPUT_DOCUMENT: incomplete document identity",
+            ));
         }
     }
     Ok(())
 }
 
 async fn check_document(owner: &AgentCx, cdp: &mut Cdp, expected: &Document) -> Result<()> {
-    owner.checkpoint().map_err(|_| error("BROWSER_INPUT_CANCELLED"))?;
+    owner
+        .checkpoint()
+        .map_err(|_| error("BROWSER_INPUT_CANCELLED"))?;
     if document(owner, cdp).await? != *expected {
-        return Err(error("BROWSER_INPUT_STALE: document changed during input; no replacement target was selected"));
+        return Err(error(
+            "BROWSER_INPUT_STALE: document changed during input; no replacement target was selected",
+        ));
     }
     Ok(())
 }
@@ -43,7 +49,9 @@ fn key_pair(key: &str) -> Result<(Value, Value)> {
     let mut down = key_event(key)?;
     down["type"] = json!("keyDown");
     let mut up = down.clone();
-    let fields = up.as_object_mut().ok_or_else(|| error("invalid key event"))?;
+    let fields = up
+        .as_object_mut()
+        .ok_or_else(|| error("invalid key event"))?;
     fields.remove("text");
     fields.remove("commands");
     up["type"] = json!("keyUp");
@@ -62,8 +70,10 @@ impl ValueFill {
     fn parse(value: Value) -> Result<Self> {
         let result: Self = serde_json::from_value(value)
             .map_err(|_| error("BROWSER_VALUE_PROTOCOL: invalid fill result"))?;
-        if !matches!(result.kind.as_str(), "date" | "time" | "month" | "week" |
-            "datetime-local" | "color" | "range") || result.value.len() > 4096
+        if !matches!(
+            result.kind.as_str(),
+            "date" | "time" | "month" | "week" | "datetime-local" | "color" | "range"
+        ) || result.value.len() > 4096
             || result.value.chars().any(char::is_control)
             || (matches!(result.kind.as_str(), "color" | "range") && result.value.is_empty())
         {
@@ -75,7 +85,10 @@ impl ValueFill {
 
 fn value_result(tab: &str, selector: &str, requested: &str, filled: &ValueFill) -> ToolOutput {
     output(
-        format!("Filled {} control {selector} in tab {tab}; retained value verified using DOM setters, not trusted keyboard input", filled.kind),
+        format!(
+            "Filled {} control {selector} in tab {tab}; retained value verified using DOM setters, not trusted keyboard input",
+            filled.kind
+        ),
         json!({"action":"fill","selector":selector,"tab":tab,"backend":"cdp",
             "input_method":"dom-value","input_type":filled.kind,"changed":filled.changed,
             "value_normalized":filled.value != requested,"char_count":requested.chars().count()}),
@@ -90,13 +103,16 @@ async fn press(owner: &AgentCx, cdp: &mut Cdp, key: &str) -> Result<()> {
         // Keydown may navigate/detach the selected child or return an ambiguous
         // failure. Release the key on the original page, not a replacement child.
         // Scoped operations do not permit implicit/expected dialog handling.
-        cdp.frame_command(owner, &page, "Input.dispatchKeyEvent", up).await
+        cdp.frame_command(owner, &page, "Input.dispatchKeyEvent", up)
+            .await
     } else {
         // Preserve explicit expected-dialog handling for main-document presses.
         cdp.command(owner, "Input.dispatchKeyEvent", up).await
     };
     if pressed.is_err() || released.is_err() {
-        return Err(error("BROWSER_KEY_INTERRUPTED: a key pair was not fully acknowledged; one release was attempted on the original page without replay. Effects may already have occurred"));
+        return Err(error(
+            "BROWSER_KEY_INTERRUPTED: a key pair was not fully acknowledged; one release was attempted on the original page without replay. Effects may already have occurred",
+        ));
     }
     Ok(())
 }
@@ -120,11 +136,14 @@ pub(super) async fn execute(
 
     if action == "press" {
         if let Some(selector) = args.get("selector").and_then(Value::as_str) {
-            let node = resolve(owner, cdp, selector, refs).await?
+            let node = resolve(owner, cdp, selector, refs)
+                .await?
                 .ok_or_else(|| error("selector did not match an element"))?;
             check_document(owner, cdp, &expected).await?;
             if element_call(owner, cdp, node, "focus", json!({})).await? != true {
-                return Err(error("BROWSER_INPUT_FOCUS: control could not receive focus"));
+                return Err(error(
+                    "BROWSER_INPUT_FOCUS: control could not receive focus",
+                ));
             }
             check_focus(owner, cdp, &expected, node).await?;
         } else if cdp.frame_selected() {
@@ -145,40 +164,64 @@ pub(super) async fn execute(
 
     let selector = required(args, "selector")?;
     let text = required(args, "text")?;
-    let node = resolve(owner, cdp, selector, refs).await?
+    let node = resolve(owner, cdp, selector, refs)
+        .await?
         .ok_or_else(|| error("selector did not match an element"))?;
     check_document(owner, cdp, &expected).await?;
-    cdp.command(owner, "DOM.scrollIntoViewIfNeeded", json!({"backendNodeId":node})).await?;
+    cdp.command(
+        owner,
+        "DOM.scrollIntoViewIfNeeded",
+        json!({"backendNodeId":node}),
+    )
+    .await?;
     check_document(owner, cdp, &expected).await?;
     let mut options = json!({"replace":action == "fill"});
-    if action == "fill" { options["text"] = json!(text); }
+    if action == "fill" {
+        options["text"] = json!(text);
+    }
     let prepared = element_call(owner, cdp, node, "edit", options).await?;
     if prepared.is_object() && action == "fill" {
         let filled = ValueFill::parse(prepared)?;
         check_document(owner, cdp, &expected).await?;
         // A separate protocol turn observes microtasks from input/change.
         // Never resolve the selector again or retry a rejected mutation.
-        if element_call(owner, cdp, node, "verify_value", json!({
-            "kind":filled.kind,"value":filled.value,
-        })).await? != true {
-            return Err(error("BROWSER_VALUE_REJECTED: control did not retain the requested fill; no retry"));
+        if element_call(
+            owner,
+            cdp,
+            node,
+            "verify_value",
+            json!({
+                "kind":filled.kind,"value":filled.value,
+            }),
+        )
+        .await?
+            != true
+        {
+            return Err(error(
+                "BROWSER_VALUE_REJECTED: control did not retain the requested fill; no retry",
+            ));
         }
         check_document(owner, cdp, &expected).await?;
         return Ok(value_result(tab, selector, text, &filled));
     }
     if prepared != true {
-        return Err(error("BROWSER_INPUT_EDIT: control rejected edit preparation"));
+        return Err(error(
+            "BROWSER_INPUT_EDIT: control rejected edit preparation",
+        ));
     }
     check_focus(owner, cdp, &expected, node).await?;
     if text.is_empty() && action == "fill" {
         press(owner, cdp, "Backspace").await?;
     } else if !text.is_empty() {
-        cdp.command(owner, "Input.insertText", json!({"text":text})).await?;
+        cdp.command(owner, "Input.insertText", json!({"text":text}))
+            .await?;
     }
     check_document(owner, cdp, &expected).await?;
     if action == "fill" {
         if element_call(owner, cdp, node, "verify_fill", json!({"text":text})).await? != true {
-            return Err(error("field did not retain the requested text; the page may have rejected or transformed the input"));
+            return Err(error(
+                "field did not retain the requested text; the page may have rejected or transformed the input",
+            ));
         }
         check_document(owner, cdp, &expected).await?;
     }
@@ -195,16 +238,27 @@ mod tests {
 
     #[test]
     fn value_fill_results_are_typed_bounded_and_never_fall_back_to_key_input() {
-        for kind in ["date", "time", "month", "week", "datetime-local", "color", "range"] {
+        for kind in [
+            "date",
+            "time",
+            "month",
+            "week",
+            "datetime-local",
+            "color",
+            "range",
+        ] {
             assert!(ValueFill::parse(json!({"kind":kind,"value":"1","changed":true})).is_ok());
         }
-        for invalid in [json!(true), json!({"kind":"date","value":"2026-10-16"}),
+        for invalid in [
+            json!(true),
+            json!({"kind":"date","value":"2026-10-16"}),
             json!({"kind":"text","value":"PRIVATE-CANARY","changed":true}),
             json!({"kind":"date","value":"x".repeat(4097),"changed":true}),
             json!({"kind":"date","value":"PRIVATE-CANARY\n","changed":false}),
             json!({"kind":"color","value":"","changed":false}),
             json!({"kind":"date","value":"","changed":"true"}),
-            json!({"kind":"date","value":"","changed":true,"extra":1})] {
+            json!({"kind":"date","value":"","changed":true,"extra":1}),
+        ] {
             let failure = ValueFill::parse(invalid).unwrap_err().to_string();
             assert!(failure.contains("BROWSER_VALUE_PROTOCOL"));
             assert!(!failure.contains("PRIVATE-CANARY"));
@@ -213,7 +267,11 @@ mod tests {
 
     #[test]
     fn value_fill_output_reports_normalization_without_returning_field_values() {
-        let filled = ValueFill { kind:"datetime-local".into(), value:"PRIVATE-CANARY".into(), changed:false };
+        let filled = ValueFill {
+            kind: "datetime-local".into(),
+            value: "PRIVATE-CANARY".into(),
+            changed: false,
+        };
         let result = value_result("app", "#date", "PRIVATE-CANARY-REQUEST", &filled);
         let details = result.details.unwrap();
         assert_eq!(details["input_method"], "dom-value");
@@ -239,17 +297,31 @@ mod tests {
             assert!(up.get("text").is_none());
             assert!(up.get("commands").is_none());
         }
-        assert_eq!(key_pair("Ctrl+a").unwrap().0["commands"], json!(["selectAll"]));
+        assert_eq!(
+            key_pair("Ctrl+a").unwrap().0["commands"],
+            json!(["selectAll"])
+        );
         assert!(key_pair("Ctrl+").is_err());
     }
 
     #[test]
     fn input_pins_complete_bounded_document_incarnations() {
-        let good = Document { frame: "frame".into(), loader: "loader".into() };
+        let good = Document {
+            frame: "frame".into(),
+            loader: "loader".into(),
+        };
         assert!(admit_document(&good).is_ok());
         for id in [String::new(), "x".repeat(257), "PRIVATE-CANARY\n".into()] {
-            for bad in [Document { frame: id.clone(), ..good.clone() },
-                Document { loader: id.clone(), ..good.clone() }] {
+            for bad in [
+                Document {
+                    frame: id.clone(),
+                    ..good.clone()
+                },
+                Document {
+                    loader: id.clone(),
+                    ..good.clone()
+                },
+            ] {
                 let failure = admit_document(&bad).unwrap_err();
                 assert!(!failure.to_string().contains("PRIVATE-CANARY"));
             }

@@ -123,7 +123,9 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{AssistantMessage, ConnectFrame, ContentBlock, StreamEvent, StreamState, pb};
+    use super::super::{
+        AssistantMessage, ConnectFrame, ContentBlock, StreamEvent, StreamState, pb,
+    };
     use super::*;
     use std::collections::VecDeque;
     use std::future::Future;
@@ -268,7 +270,10 @@ mod tests {
         budget.frame().unwrap();
         assert!(budget.frame().is_err());
         budget
-            .admit(&[ServerEvent::TokenDelta(0), ServerEvent::UsedTokens(0)], None)
+            .admit(
+                &[ServerEvent::TokenDelta(0), ServerEvent::UsedTokens(0)],
+                None,
+            )
             .unwrap();
         assert!(budget.admit(&[ServerEvent::TurnEnded], None).is_err());
     }
@@ -300,7 +305,11 @@ mod tests {
         budget
             .admit(&[thinking("c"), thinking("d")], Some(BlockKind::Text))
             .unwrap();
-        assert!(budget.admit(&[text("e")], Some(BlockKind::Thinking)).is_err());
+        assert!(
+            budget
+                .admit(&[text("e")], Some(BlockKind::Thinking))
+                .is_err()
+        );
     }
 
     #[test]
@@ -349,9 +358,7 @@ mod tests {
         state.pending.clear();
         assert!(state.process_frame(&frame(&[(1, "e")])).is_err());
         assert_eq!(state.partial.content.len(), 2);
-        assert!(
-            matches!(&state.partial.content[0], ContentBlock::Text(text) if text.text == "ab")
-        );
+        assert!(matches!(&state.partial.content[0], ContentBlock::Text(text) if text.text == "ab"));
         assert!(
             matches!(&state.partial.content[1], ContentBlock::Thinking(text) if text.thinking == "cd")
         );
@@ -373,9 +380,7 @@ mod tests {
         state.pending.clear();
         assert!(state.process_frame(&frame(&[(4, "c")])).is_err());
         assert_eq!(state.partial.content.len(), 1);
-        assert!(
-            matches!(&state.partial.content[0], ContentBlock::Text(text) if text.text == "ab")
-        );
+        assert!(matches!(&state.partial.content[0], ContentBlock::Text(text) if text.text == "ab"));
         assert!(state.pending.is_empty());
     }
 
@@ -457,7 +462,11 @@ mod tests {
             let wake = Arc::new(WakeCount::default());
             let waker = futures::task::waker(Arc::clone(&wake));
             let mut next = std::pin::pin!(state.next_event());
-            assert!(next.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             assert!(polls.load(Ordering::SeqCst) > 0);
             assert!(polls.load(Ordering::SeqCst) <= READY_STEPS);
             assert_eq!(wake.0.load(Ordering::SeqCst), 1);
@@ -497,7 +506,11 @@ mod tests {
         {
             let mut next = std::pin::pin!(state.next_event());
             for _ in 0..READY_STEPS * 2 {
-                assert!(next.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert!(
+                    next.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
             }
         }
         assert_eq!(wake.0.load(Ordering::SeqCst), 0);
@@ -525,7 +538,9 @@ mod tests {
                     deltas += 1;
                 }
                 StreamEvent::Done { message, .. } => {
-                    assert!(matches!(&message.content[0], ContentBlock::Text(value) if value.text == text));
+                    assert!(
+                        matches!(&message.content[0], ContentBlock::Text(value) if value.text == text)
+                    );
                     terminals += 1;
                 }
                 _ => {}
@@ -541,7 +556,8 @@ mod tests {
             b"{}".as_slice(),
             br#"{"error":{"code":"unavailable","message":"busy"}}"#.as_slice(),
         ] {
-            let mut wire = super::super::encode_frame(super::super::CONNECT_END_STREAM_FLAG, payload);
+            let mut wire =
+                super::super::encode_frame(super::super::CONNECT_END_STREAM_FLAG, payload);
             wire.extend_from_slice(b"ignored after the valid terminator");
             let mut source = body(vec![Ok(wire)]);
             source.stalled = true;
@@ -549,7 +565,10 @@ mod tests {
             let polls = Arc::clone(&source.polls);
             let mut state = state(Budget::default());
             state.source = Box::pin(source);
-            assert!(matches!(next_ready(&mut state), Some(Ok(StreamEvent::Start { .. }))));
+            assert!(matches!(
+                next_ready(&mut state),
+                Some(Ok(StreamEvent::Start { .. }))
+            ));
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(polls.load(Ordering::SeqCst), 1);
             assert!(state.frames.buf.is_empty());
@@ -566,13 +585,16 @@ mod tests {
     fn every_fatal_stream_path_releases_its_body_and_cannot_publish_done() {
         let bad_flag = vec![4, 0, 0, 0, 0];
         let bad_proto = super::super::encode_frame(0, &[0]);
-        let bad_terminal = super::super::encode_frame(super::super::CONNECT_END_STREAM_FLAG, b"null");
+        let bad_terminal =
+            super::super::encode_frame(super::super::CONNECT_END_STREAM_FLAG, b"null");
         for chunks in [
             vec![Ok(bad_flag)],
             vec![Ok(bad_proto)],
             vec![Ok(bad_terminal)],
             vec![Ok(vec![0])],
-            vec![Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))],
+            vec![Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))],
         ] {
             let source = body(chunks);
             let drops = Arc::clone(&source.drops);
@@ -600,7 +622,11 @@ mod tests {
         let waker = futures::task::noop_waker();
         {
             let mut next = std::pin::pin!(stream.next());
-            assert!(next.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
         }
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(stream);

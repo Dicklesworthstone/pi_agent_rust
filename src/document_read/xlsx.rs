@@ -10,9 +10,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 
 use super::{
-    ArchiveReader, Properties, Relationship, Result, Tag, TextOutput, XmlBudget, XmlEvent,
-    MAX_OUTPUT_BYTES, document_error, is_relationship, read_relationships, relationship_part,
-    visit_xml,
+    ArchiveReader, MAX_OUTPUT_BYTES, Properties, Relationship, Result, Tag, TextOutput, XmlBudget,
+    XmlEvent, document_error, is_relationship, read_relationships, relationship_part, visit_xml,
 };
 
 const MAX_SHEETS: usize = 1024;
@@ -39,8 +38,7 @@ pub(super) fn render(
     output: &mut TextOutput,
 ) -> Result<()> {
     let sheets = workbook_sheets(bytes)?;
-    let relationships =
-        read_relationships(&budget.read(archive, &relationship_part(main_part))?)?;
+    let relationships = read_relationships(&budget.read(archive, &relationship_part(main_part))?)?;
     let shared = read_shared_strings(archive, budget, &relationships, main_part)?;
     let mut visited = HashSet::new();
     let mut limits = SheetLimits::default();
@@ -50,7 +48,9 @@ pub(super) fn render(
             .ok_or_else(|| document_error("worksheet relationship is missing"))?;
         let chart = is_relationship(&relationship.kind, "chartsheet");
         if !chart && !is_relationship(&relationship.kind, "worksheet") {
-            return Err(document_error("sheet ID refers to an unsupported sheet relationship"));
+            return Err(document_error(
+                "sheet ID refers to an unsupported sheet relationship",
+            ));
         }
         let target = relationship.internal_target(main_part)?;
         if !visited.insert(target.clone()) {
@@ -91,7 +91,9 @@ fn workbook_sheets(bytes: &[u8]) -> Result<Vec<Sheet>> {
             }
             XmlEvent::Start(Tag::WorkbookSheet, attributes) => {
                 if parents != [Tag::Workbook, Tag::WorkbookSheets] || sheets.len() >= MAX_SHEETS {
-                    return Err(document_error("invalid sheet list or more than 1024 sheets"));
+                    return Err(document_error(
+                        "invalid sheet list or more than 1024 sheets",
+                    ));
                 }
                 let id = attributes
                     .sheet_id
@@ -111,7 +113,9 @@ fn workbook_sheets(bytes: &[u8]) -> Result<Vec<Sheet>> {
                     || !relationships.insert(relationship_id.clone())
                     || !names.insert(name.to_lowercase())
                 {
-                    return Err(document_error("invalid or duplicate workbook sheet identity"));
+                    return Err(document_error(
+                        "invalid or duplicate workbook sheet identity",
+                    ));
                 }
                 let state = match attributes.sheet_state.as_deref() {
                     None | Some("visible") => None,
@@ -165,7 +169,9 @@ fn shared_strings(bytes: &[u8]) -> Result<Vec<String>> {
         match event {
             XmlEvent::Start(Tag::SharedString, _) => {
                 if parents != [Tag::SharedStrings] || strings.len() >= MAX_SHARED_STRINGS {
-                    return Err(document_error("invalid shared-string list or more than 100000 strings"));
+                    return Err(document_error(
+                        "invalid shared-string list or more than 100000 strings",
+                    ));
                 }
                 current = Some(String::new());
             }
@@ -177,7 +183,9 @@ fn shared_strings(bytes: &[u8]) -> Result<Vec<String>> {
             {
                 total_bytes = total_bytes.saturating_add(text.len());
                 if total_bytes > MAX_OUTPUT_BYTES {
-                    return Err(document_error("shared strings exceed the 8 MiB text budget"));
+                    return Err(document_error(
+                        "shared strings exceed the 8 MiB text budget",
+                    ));
                 }
                 append_cell_text(
                     current
@@ -251,14 +259,18 @@ impl Cell {
         let column = if let Some(reference) = attributes.reference {
             let (column, cell_row) = cell_reference(&reference)?;
             if cell_row != row {
-                return Err(document_error("cell reference does not match its containing row"));
+                return Err(document_error(
+                    "cell reference does not match its containing row",
+                ));
             }
             column
         } else {
             previous_column + 1
         };
         if column <= previous_column || column > MAX_EXCEL_COLUMN {
-            return Err(document_error("duplicate, out-of-order, or out-of-range worksheet cell"));
+            return Err(document_error(
+                "duplicate, out-of-order, or out-of-range worksheet cell",
+            ));
         }
         let kind = match attributes.cell_type.as_deref() {
             None | Some("n") => CellKind::Number,
@@ -289,7 +301,9 @@ impl Cell {
             _ => return Err(document_error("invalid spreadsheet cell content")),
         };
         if std::mem::replace(seen, true) {
-            return Err(document_error("duplicate spreadsheet cell value or formula"));
+            return Err(document_error(
+                "duplicate spreadsheet cell value or formula",
+            ));
         }
         Ok(())
     }
@@ -297,7 +311,9 @@ impl Cell {
     fn saved_value<'a>(&'a self, shared: &'a [String]) -> Result<Cow<'a, str>> {
         if self.kind == CellKind::Inline {
             if self.has_value || self.has_formula {
-                return Err(document_error("inline string has a scalar value or formula"));
+                return Err(document_error(
+                    "inline string has a scalar value or formula",
+                ));
             }
             return Ok(Cow::Borrowed(&self.inline));
         }
@@ -335,27 +351,36 @@ impl Cell {
                 value
             }
             CellKind::String | CellKind::Error | CellKind::Date => value,
-            CellKind::Inline => return Err(document_error("invalid inline spreadsheet cell state")),
+            CellKind::Inline => {
+                return Err(document_error("invalid inline spreadsheet cell state"));
+            }
         };
         Ok(Cow::Borrowed(value))
     }
 }
 
 fn cell_reference(reference: &str) -> Result<(usize, usize)> {
-    let letters = reference.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let letters = reference
+        .bytes()
+        .take_while(u8::is_ascii_alphabetic)
+        .count();
     if letters == 0 || letters > 3 || letters == reference.len() {
         return Err(document_error("invalid spreadsheet cell reference"));
     }
-    let column = reference.as_bytes()[..letters].iter().fold(0_usize, |column, byte| {
-        column * 26 + usize::from(byte.to_ascii_uppercase() - b'A' + 1)
-    });
+    let column = reference.as_bytes()[..letters]
+        .iter()
+        .fold(0_usize, |column, byte| {
+            column * 26 + usize::from(byte.to_ascii_uppercase() - b'A' + 1)
+        });
     let row_text = &reference[letters..];
     if row_text.starts_with('0') || !row_text.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(document_error("invalid spreadsheet cell row reference"));
     }
     let row = row_text.parse::<usize>().map_err(document_error)?;
     if column > MAX_EXCEL_COLUMN || !(1..=MAX_EXCEL_ROW).contains(&row) {
-        return Err(document_error("spreadsheet cell reference exceeds Excel worksheet bounds"));
+        return Err(document_error(
+            "spreadsheet cell reference exceeds Excel worksheet bounds",
+        ));
     }
     Ok((column, row))
 }
@@ -378,7 +403,9 @@ impl Worksheet<'_> {
             parents.last(),
             Some(Tag::CellValue | Tag::CellFormula | Tag::SpreadsheetText)
         ) {
-            return Err(document_error("nested element in spreadsheet scalar content"));
+            return Err(document_error(
+                "nested element in spreadsheet scalar content",
+            ));
         }
         match tag {
             Tag::SheetData => {
@@ -433,7 +460,9 @@ impl Worksheet<'_> {
             |reference| reference.parse::<usize>().map_err(document_error),
         )?;
         if number <= self.previous_row || number > MAX_EXCEL_ROW {
-            return Err(document_error("duplicate, out-of-order, or out-of-range worksheet row"));
+            return Err(document_error(
+                "duplicate, out-of-order, or out-of-range worksheet row",
+            ));
         }
         self.previous_column = 0;
         self.row = Some(Row {
@@ -579,7 +608,10 @@ fn render_rows(rows: &[Row], output: &mut TextOutput) -> Result<()> {
         let mut cells = row.cells.iter().peekable();
         for column in &columns {
             output.append(" ")?;
-            if cells.peek().is_some_and(|(cell_column, _)| cell_column == column) {
+            if cells
+                .peek()
+                .is_some_and(|(cell_column, _)| cell_column == column)
+            {
                 if let Some((_, value)) = cells.next() {
                     output.content(value, true)?;
                 }
@@ -593,8 +625,8 @@ fn render_rows(rows: &[Row], output: &mut TextOutput) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{DocumentKind, OFFICE_REL_NS, RELATIONSHIPS_NS, SPREADSHEET_NS, convert};
+    use super::*;
     use std::io::Write as _;
     use zip::CompressionMethod;
     use zip::write::SimpleFileOptions;
@@ -612,7 +644,8 @@ mod tests {
     }
 
     fn package(workbook: &str, rels: &str, parts: &[(&str, &[u8])]) -> Vec<u8> {
-        let package_rels = relationships(&relationship("main", "officeDocument", "xl/workbook.xml"));
+        let package_rels =
+            relationships(&relationship("main", "officeDocument", "xl/workbook.xml"));
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         let mut entries = vec![
@@ -622,8 +655,12 @@ mod tests {
         ];
         entries.extend_from_slice(parts);
         for (name, contents) in entries {
-            writer.start_file(name, options).expect("start XLSX fixture member");
-            writer.write_all(contents).expect("write XLSX fixture member");
+            writer
+                .start_file(name, options)
+                .expect("start XLSX fixture member");
+            writer
+                .write_all(contents)
+                .expect("write XLSX fixture member");
         }
         writer.finish().expect("finish XLSX fixture").into_inner()
     }
@@ -798,7 +835,11 @@ mod tests {
             .collect();
         let bytes = workbook_with_sheet(&sheet(&rows), Some(&shared));
         let error = convert(&bytes, DocumentKind::Xlsx).expect_err("bound shared-string expansion");
-        assert!(error.to_string().contains("expanded worksheet values exceed 8 MiB"));
+        assert!(
+            error
+                .to_string()
+                .contains("expanded worksheet values exceed 8 MiB")
+        );
 
         let worksheet = sheet(&format!(
             "<row><c t=\"inlineStr\"><is><t>{}</t></is></c></row>",
@@ -842,13 +883,12 @@ mod tests {
 
     #[test]
     fn strict_namespace_and_utf16_worksheet_text_are_supported() {
-        let worksheet = sheet(
-            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>東京 Δ</t></is></c></row>",
-        )
-        .replace(
-            SPREADSHEET_NS,
-            "http://purl.oclc.org/ooxml/spreadsheetml/main",
-        );
+        let worksheet =
+            sheet("<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>東京 Δ</t></is></c></row>")
+                .replace(
+                    SPREADSHEET_NS,
+                    "http://purl.oclc.org/ooxml/spreadsheetml/main",
+                );
         let mut utf16 = vec![0xFF, 0xFE];
         for unit in worksheet.encode_utf16() {
             utf16.extend_from_slice(&unit.to_le_bytes());
@@ -859,11 +899,7 @@ mod tests {
         );
         let rels = relationships(&relationship("sheet", "worksheet", "worksheets/data.xml"));
         let result = convert(
-            &package(
-                &workbook,
-                &rels,
-                &[("xl/worksheets/data.xml", &utf16)],
-            ),
+            &package(&workbook, &rels, &[("xl/worksheets/data.xml", &utf16)]),
             DocumentKind::Xlsx,
         )
         .expect("convert UTF-16 strict worksheet");

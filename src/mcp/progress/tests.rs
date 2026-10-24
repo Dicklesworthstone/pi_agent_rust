@@ -7,8 +7,12 @@ use std::task::Wake;
 struct WakeCount(AtomicUsize);
 
 impl Wake for WakeCount {
-    fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
-    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn notification(token: &str, progress: Value) -> Value {
@@ -27,7 +31,9 @@ fn poll(subscription: &mut ProgressSubscription) -> Poll<Option<ToolUpdate>> {
 }
 
 fn progress(subscription: &mut ProgressSubscription) -> Value {
-    let Poll::Ready(Some(update)) = poll(subscription) else { panic!("expected progress") };
+    let Poll::Ready(Some(update)) = poll(subscription) else {
+        panic!("expected progress")
+    };
     update.details.unwrap()["mcpProgress"].clone()
 }
 
@@ -39,7 +45,11 @@ fn queued_observer_registers_a_waker_but_accepts_no_undispatched_progress() {
     let message = notification(subscription.token(), json!(1));
     let wakes = Arc::new(WakeCount::default());
     let waker = Waker::from(Arc::clone(&wakes));
-    assert!(subscription.poll_update(&mut Context::from_waker(&waker)).is_pending());
+    assert!(
+        subscription
+            .poll_update(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
     registry.publish(&message, 0);
     assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
     assert!(dispatch.claim());
@@ -119,8 +129,14 @@ fn producer_flood_coalesces_and_delivery_has_a_hard_bound() {
     assert_eq!(progress(&mut subscription)["progress"], 9999);
     assert!(poll(&mut subscription).is_pending());
     for offset in 1..MAX_UPDATES {
-        registry.publish(&notification(subscription.token(), json!(10_000 + offset)), 0);
-        assert_eq!(progress(&mut subscription)["deliveryLimited"], offset == MAX_UPDATES - 1);
+        registry.publish(
+            &notification(subscription.token(), json!(10_000 + offset)),
+            0,
+        );
+        assert_eq!(
+            progress(&mut subscription)["deliveryLimited"],
+            offset == MAX_UPDATES - 1
+        );
     }
     registry.publish(&notification(subscription.token(), json!(20_000)), 0);
     assert!(matches!(poll(&mut subscription), Poll::Ready(None)));
@@ -155,7 +171,11 @@ fn dropping_removes_waiters_and_late_tokens_cannot_reach_replacement_work() {
     let old_token = subscription.token().to_string();
     let wakes = Arc::new(WakeCount::default());
     let waker = Waker::from(Arc::clone(&wakes));
-    assert!(subscription.poll_update(&mut Context::from_waker(&waker)).is_pending());
+    assert!(
+        subscription
+            .poll_update(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
     assert_eq!(Arc::strong_count(&wakes), 3);
     drop(subscription);
     assert!(lock(&registry.slots).is_empty());
@@ -169,7 +189,9 @@ fn dropping_removes_waiters_and_late_tokens_cannot_reach_replacement_work() {
 #[test]
 fn capacity_and_counter_exhaustion_never_evict_existing_requests() {
     let registry = Arc::new(ProgressRegistry::default());
-    let mut subscriptions: Vec<_> = (0..MAX_SUBSCRIPTIONS).map(|_| subscribed(&registry, 0)).collect();
+    let mut subscriptions: Vec<_> = (0..MAX_SUBSCRIPTIONS)
+        .map(|_| subscribed(&registry, 0))
+        .collect();
     let dispatch = Arc::new(RequestDispatch::new());
     assert!(registry.subscribe(Arc::clone(&dispatch), 0).is_none());
     assert_eq!(lock(&registry.slots).len(), MAX_SUBSCRIPTIONS);
@@ -187,8 +209,15 @@ fn a_ready_result_wins_over_queued_progress_and_unregisters() {
     let subscription = subscribed(&registry, 0);
     registry.publish(&notification(subscription.token(), json!(100)), 0);
     let callback = |_update| panic!("a result must not be replaced by a progress callback");
-    let mut future = Box::pin(observe(ready(Err::<(), _>("real server error")), Some(subscription), Some(&callback), || true));
-    let result = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+    let mut future = Box::pin(observe(
+        ready(Err::<(), _>("real server error")),
+        Some(subscription),
+        Some(&callback),
+        || true,
+    ));
+    let result = future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
     assert_eq!(result, Poll::Ready(Err("real server error")));
     assert!(lock(&registry.slots).is_empty());
 }
@@ -203,8 +232,18 @@ fn callback_can_reenter_registry_and_a_dropped_observer_cleans_up() {
         drop(subscribed(&registry, 0));
         called.fetch_add(1, Ordering::SeqCst);
     };
-    let mut future = Box::pin(observe(pending::<()>(), Some(subscription), Some(&callback), || true));
-    assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    let mut future = Box::pin(observe(
+        pending::<()>(),
+        Some(subscription),
+        Some(&callback),
+        || true,
+    ));
+    assert!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     assert_eq!(called.load(Ordering::SeqCst), 1);
     drop(future);
     assert!(lock(&registry.slots).is_empty());
@@ -217,8 +256,18 @@ fn revoked_owner_or_generation_suppresses_callbacks_without_inventing_a_result()
     registry.publish(&notification(subscription.token(), json!(10)), 0);
     let current = AtomicBool::new(false);
     let callback = |_update| panic!("stale ownership must suppress progress");
-    let mut future = Box::pin(observe(pending::<()>(), Some(subscription), Some(&callback), || current.load(Ordering::SeqCst)));
-    assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    let mut future = Box::pin(observe(
+        pending::<()>(),
+        Some(subscription),
+        Some(&callback),
+        || current.load(Ordering::SeqCst),
+    ));
+    assert!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     assert!(lock(&registry.slots).is_empty());
 }
 
@@ -228,6 +277,11 @@ fn dropping_an_unpolled_observer_never_polls_the_request() {
     let subscription = subscribed(&registry, 0);
     let callback = |_update| panic!("unpolled callback");
     let operation = poll_fn(|_| -> Poll<()> { panic!("unpolled request") });
-    drop(observe(operation, Some(subscription), Some(&callback), || true));
+    drop(observe(
+        operation,
+        Some(subscription),
+        Some(&callback),
+        || true,
+    ));
     assert!(lock(&registry.slots).is_empty());
 }

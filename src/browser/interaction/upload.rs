@@ -205,11 +205,7 @@ async fn allowed_document(
     admit_document(&frame, cdp.frame_selected(), allowlist)
 }
 
-fn admit_document(
-    frame: &Value,
-    scoped: bool,
-    allowlist: Option<&[String]>,
-) -> Result<Document> {
+fn admit_document(frame: &Value, scoped: bool, allowlist: Option<&[String]>) -> Result<Document> {
     let url = required(frame, "url")?;
     // A scoped srcdoc inherits the embedding document's authority, already
     // checked by frame_document. Never apply that exception to an unscoped root.
@@ -398,13 +394,20 @@ mod tests {
     fn scoped_upload_arguments_keep_path_limits_and_reject_implicit_dialog_consent() {
         let args = json!({"action":"upload","tab":"work","frame":"child",
             "selector":"#file","files":["documents/report.txt"]});
-        assert_eq!(validate(&args).unwrap(), [PathBuf::from("documents/report.txt")]);
+        assert_eq!(
+            validate(&args).unwrap(),
+            [PathBuf::from("documents/report.txt")]
+        );
         for field in ["dialog_response", "diagnostics", "url", "wait_after"] {
             let mut invalid = args.clone();
             invalid[field] = json!({});
             assert!(validate(&invalid).is_err(), "{field}");
         }
-        for files in [json!(["../private"]), json!(["/private"]), json!(vec!["x"; 11])] {
+        for files in [
+            json!(["../private"]),
+            json!(["/private"]),
+            json!(vec!["x"; 11]),
+        ] {
             let mut invalid = args.clone();
             invalid["files"] = files;
             assert!(validate(&invalid).is_err());
@@ -414,12 +417,17 @@ mod tests {
     #[test]
     fn scoped_srcdoc_uses_inherited_admission_not_an_unscoped_root_exception() {
         let srcdoc = json!({"id":"child","loaderId":"child-loader","url":"about:srcdoc"});
-        assert_eq!(admit_document(&srcdoc, true, Some(&[])).unwrap(), Document {
-            frame: "child".into(), loader: "child-loader".into(),
-        });
+        assert_eq!(
+            admit_document(&srcdoc, true, Some(&[])).unwrap(),
+            Document {
+                frame: "child".into(),
+                loader: "child-loader".into(),
+            }
+        );
         assert!(admit_document(&srcdoc, false, Some(&[])).is_err());
         let rules = vec!["example.com".to_owned()];
-        let blocked = json!({"id":"child","loaderId":"child-loader","url":"https://blocked.test/file"});
+        let blocked =
+            json!({"id":"child","loaderId":"child-loader","url":"https://blocked.test/file"});
         assert!(admit_document(&blocked, true, Some(&rules)).is_err());
     }
 
@@ -428,7 +436,12 @@ mod tests {
         let frame = json!({"id":"child","loaderId":"child-loader","url":"about:blank"});
         assert!(admit_document(&frame, false, None).is_ok());
         for key in ["id", "loaderId"] {
-            for value in [Value::Null, json!(""), json!("x".repeat(257)), json!("bad\nidentity")] {
+            for value in [
+                Value::Null,
+                json!(""),
+                json!("x".repeat(257)),
+                json!("bad\nidentity"),
+            ] {
                 let mut invalid = frame.clone();
                 invalid[key] = value;
                 assert!(admit_document(&invalid, true, None).is_err());

@@ -9,7 +9,11 @@ use std::path::Path;
 pub(super) const BRIDGE_NAME: &str = "__pi_complete";
 
 impl Invocation<'_> {
-    pub(super) async fn complete(&mut self, cwd: &Path, mut input: Value) -> Result<String, String> {
+    pub(super) async fn complete(
+        &mut self,
+        cwd: &Path,
+        mut input: Value,
+    ) -> Result<String, String> {
         let selection = self.request_selection(&mut input).map_err(public_error)?;
         let Value::Object(mut fields) = input else {
             return Err("PI_COMPLETION_INPUT: expected completion arguments".into());
@@ -20,10 +24,16 @@ impl Invocation<'_> {
         let request = CompletionRequest::parse(Value::Object(fields)).map_err(public_error)?;
         let images = super::images::Sources::parse(raw_images.as_ref()).map_err(public_error)?;
         if self.judge.is_none() && self.selection.is_none() {
-            return Err("PI_COMPLETION_UNBOUND: supply this cell's judge_model or bind a Judge in the host".into());
+            return Err(
+                "PI_COMPLETION_UNBOUND: supply this cell's judge_model or bind a Judge in the host"
+                    .into(),
+            );
         }
         if self.receipts.len() >= MAX_CALLS {
-            return Err("PI_COMPLETION_LIMIT: completions and judgments share 16 attempts per eval cell".into());
+            return Err(
+                "PI_COMPLETION_LIMIT: completions and judgments share 16 attempts per eval cell"
+                    .into(),
+            );
         }
         let index = self.receipts.len();
         self.receipts.push(json!({
@@ -38,7 +48,8 @@ impl Invocation<'_> {
             self.check_image_reads(images.path_count())?;
             let request = request.with_images(self.load_images(images).await?)?;
             judge.complete_protected(request, self.protect).await
-        }.await;
+        }
+        .await;
         match outcome {
             Ok(reply) => {
                 self.receipts[index] = json!({
@@ -63,12 +74,35 @@ impl Invocation<'_> {
 
 pub(super) fn public_error(error: Error) -> String {
     let text = error.to_string();
-    for code in ["PI_SECRET_BLOCK", "PI_AUXILIARY_INPUT_LIMIT", "PI_AUXILIARY_KEY_COLLISION",
-        "PI_COMPLETION_INPUT", "PI_COMPLETION_SCHEMA", "PI_COMPLETION_PRIVACY", "PI_COMPLETION_RESPONSE"] {
-        if text.contains(code) { return format!("{code}: completion failed; no answer"); }
+    for code in [
+        "PI_SECRET_BLOCK",
+        "PI_AUXILIARY_INPUT_LIMIT",
+        "PI_AUXILIARY_KEY_COLLISION",
+        "PI_COMPLETION_INPUT",
+        "PI_COMPLETION_SCHEMA",
+        "PI_COMPLETION_PRIVACY",
+        "PI_COMPLETION_RESPONSE",
+    ] {
+        if text.contains(code) {
+            return format!("{code}: completion failed; no answer");
+        }
     }
-    for suffix in ["INPUT", "BINDING", "PRIVACY", "PERMISSION", "CANCELLED", "TIMEOUT", "RESPONSE", "PROVIDER",
-        "IMAGE_UNSUPPORTED", "IMAGE_INPUT", "IMAGE_LIMIT", "IMAGE_READ", "IMAGE_HOST", "IMAGE_CALL_LIMIT"] {
+    for suffix in [
+        "INPUT",
+        "BINDING",
+        "PRIVACY",
+        "PERMISSION",
+        "CANCELLED",
+        "TIMEOUT",
+        "RESPONSE",
+        "PROVIDER",
+        "IMAGE_UNSUPPORTED",
+        "IMAGE_INPUT",
+        "IMAGE_LIMIT",
+        "IMAGE_READ",
+        "IMAGE_HOST",
+        "IMAGE_CALL_LIMIT",
+    ] {
         if text.contains(&format!("PI_JUDGE_{suffix}")) {
             return format!("PI_COMPLETION_{suffix}: completion failed; no answer");
         }
@@ -77,6 +111,6 @@ pub(super) fn public_error(error: Error) -> String {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod image_tests;
+#[cfg(test)]
+mod tests;

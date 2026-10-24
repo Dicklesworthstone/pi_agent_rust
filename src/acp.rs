@@ -370,10 +370,8 @@ impl AcpOutput {
         // Publication shares the admission lock with steering/cancel. A
         // cancellation frame can never precede this dialog's request frame.
         if self.sender.try_send(frame).is_err() {
-            self.shared.record_failure(
-                &mut state,
-                "ACP permission request could not be delivered",
-            );
+            self.shared
+                .record_failure(&mut state, "ACP permission request could not be delivered");
             return Err("permission request client disconnected");
         }
         Ok(())
@@ -3367,19 +3365,14 @@ mod tests {
                 .begin_prompt("second".into(), second_abort)
                 .expect("second prompt");
             let (reply_tx, mut reply_rx) = oneshot::channel();
-            output
-                .shared
-                .pending_permissions
-                .lock()
-                .unwrap()
-                .insert(
-                    "approval".into(),
-                    PendingPermission {
-                        session_id: "first".into(),
-                        request_id: json!("approval"),
-                        sender: reply_tx,
-                    },
-                );
+            output.shared.pending_permissions.lock().unwrap().insert(
+                "approval".into(),
+                PendingPermission {
+                    session_id: "first".into(),
+                    request_id: json!("approval"),
+                    sender: reply_tx,
+                },
+            );
 
             assert!(matches!(
                 output.send("overflow".into()),
@@ -3466,9 +3459,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(users.len(), 3);
-            for (user, expected) in users
-                .iter()
-                .zip(["editor prompt", "steered instruction", "next task"])
+            for (user, expected) in
+                users
+                    .iter()
+                    .zip(["editor prompt", "steered instruction", "next task"])
             {
                 assert!(user.contains(expected));
             }
@@ -3501,11 +3495,8 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::sync_channel(16);
             let output = AcpOutput::new(tx);
             let input = |id| {
-                steering::Input::parse(
-                    &json!({ "prompt": "retained by editor" }),
-                    Some(json!(id)),
-                )
-                .unwrap()
+                steering::Input::parse(&json!({ "prompt": "retained by editor" }), Some(json!(id)))
+                    .unwrap()
             };
             output.enqueue_steering("editor-session", input(1));
             let idle: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
@@ -3523,7 +3514,9 @@ mod tests {
             guard.started = true;
             let reason = run_prompt(
                 state,
-                vec![ContentBlock::Text(TextContent::new("cancelled before start"))],
+                vec![ContentBlock::Text(TextContent::new(
+                    "cancelled before start",
+                ))],
                 None,
                 signal,
                 output.clone(),

@@ -28,9 +28,9 @@ pub use reconciliation::GoalReconciliation;
 pub(crate) use rpc::{rpc_goal_command, rpc_goal_state};
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod tests;
 
 const CHECKPOINT_TYPE: &str = "goal_checkpoint";
 const SCHEMA: &str = "pi.goal.checkpoint.v1";
@@ -175,7 +175,9 @@ impl GoalSnapshot {
     }
 
     pub const fn remaining_tokens(&self) -> u64 {
-        self.record.token_budget.saturating_sub(self.record.tokens_spent)
+        self.record
+            .token_budget
+            .saturating_sub(self.record.tokens_spent)
     }
 
     /// True when the saved intent has no settled result. Explicit reconciliation,
@@ -281,7 +283,8 @@ fn usage_tokens(usage: &Usage) -> u64 {
     // Providers normalize cache buckets differently. Count the larger of the
     // supplied total and the component sum instead of trusting a missing total.
     usage.total_tokens.max(
-        usage.input
+        usage
+            .input
             .saturating_add(usage.output)
             .saturating_add(usage.cache_read)
             .saturating_add(usage.cache_write),
@@ -394,8 +397,14 @@ enum Transition<'a> {
     Resume,
     Complete(&'a str),
     Drop(&'a str),
-    Budget { budget: GoalBudget, reason: &'a str },
-    Reconcile { outcome: GoalReconciliation, evidence: &'a str },
+    Budget {
+        budget: GoalBudget,
+        reason: &'a str,
+    },
+    Reconcile {
+        outcome: GoalReconciliation,
+        evidence: &'a str,
+    },
 }
 
 fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
@@ -429,10 +438,18 @@ fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
             budget.validate()?;
             validate_text(reason, "budget revision reason")?;
             if budget.max_prompts < record.prompts_started {
-                return Err(failure("GOAL_BUDGET", "prompt total cannot be less than already started prompts"));
+                return Err(failure(
+                    "GOAL_BUDGET",
+                    "prompt total cannot be less than already started prompts",
+                ));
             }
-            if budget.max_prompts == record.max_prompts && budget.token_budget == record.token_budget {
-                return Err(failure("GOAL_BUDGET", "the proposed total budget is unchanged"));
+            if budget.max_prompts == record.max_prompts
+                && budget.token_budget == record.token_budget
+            {
+                return Err(failure(
+                    "GOAL_BUDGET",
+                    "the proposed total budget is unchanged",
+                ));
             }
             record.max_prompts = budget.max_prompts;
             record.token_budget = budget.token_budget;
@@ -448,7 +465,8 @@ fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
         }
         Transition::Pause(reason) | Transition::Drop(reason) | Transition::Complete(reason) => {
             validate_text(reason, "reason or completion evidence")?;
-            if matches!(action, Transition::Pause(_) | Transition::Complete(_)) && record.in_flight {
+            if matches!(action, Transition::Pause(_) | Transition::Complete(_)) && record.in_flight
+            {
                 return Err(failure(
                     "GOAL_INTERRUPTED",
                     "unfinished work requires explicit reconciliation, resume or drop; pause cannot acknowledge its outcome",
@@ -458,7 +476,9 @@ fn transition(mut record: Record, action: Transition<'_>) -> Result<Record> {
                 Transition::Pause(_) => GoalStatus::Paused,
                 Transition::Drop(_) => GoalStatus::Dropped,
                 Transition::Complete(_) => GoalStatus::Complete,
-                Transition::Resume | Transition::Budget { .. } | Transition::Reconcile { .. } => unreachable!(),
+                Transition::Resume | Transition::Budget { .. } | Transition::Reconcile { .. } => {
+                    unreachable!()
+                }
             };
             record.note = reason.to_string();
         }

@@ -183,19 +183,30 @@ mod tests {
         assert!(Mode::Adjust.text("x\ny", source, position(1, 2)).is_err());
         assert!(Mode::Adjust.text("x\ny", source, position(2, 0)).is_err());
         assert_eq!(
-            Mode::Adjust.text("x\ny", "\u{a0}foo", position(0, 1)).unwrap(),
+            Mode::Adjust
+                .text("x\ny", "\u{a0}foo", position(0, 1))
+                .unwrap(),
             "x\ny"
         );
     }
 
     #[test]
     fn default_as_is_and_single_line_text_remain_borrowed() {
-        for item in [json!({}), json!({"insertTextMode":null}), json!({"insertTextMode":1})] {
-            let actual = Mode::parse(&item).unwrap().text("a\nb", "  x", position(0, 2)).unwrap();
+        for item in [
+            json!({}),
+            json!({"insertTextMode":null}),
+            json!({"insertTextMode":1}),
+        ] {
+            let actual = Mode::parse(&item)
+                .unwrap()
+                .text("a\nb", "  x", position(0, 2))
+                .unwrap();
             assert!(matches!(actual, Cow::Borrowed("a\nb")));
         }
         assert!(matches!(
-            Mode::Adjust.text("one line", "  x", position(0, 2)).unwrap(),
+            Mode::Adjust
+                .text("one line", "  x", position(0, 2))
+                .unwrap(),
             Cow::Borrowed("one line")
         ));
     }
@@ -207,16 +218,23 @@ mod tests {
         assert_eq!(actual.len(), MAX_ITEM_BYTES);
         assert!(actual.ends_with("\n  "));
         let too_large = format!("x{text}");
-        let error = Mode::Adjust.text(&too_large, "  x", position(0, 2)).unwrap_err();
+        let error = Mode::Adjust
+            .text(&too_large, "  x", position(0, 2))
+            .unwrap_err();
         assert!(error.to_string().contains("LSP_COMPLETION_LIMIT"));
         let source = format!("{}x", " ".repeat(1_000_000));
-        assert!(Mode::Adjust.text("x\ny", &source, position(0, 1_000_000)).is_err());
+        assert!(
+            Mode::Adjust
+                .text("x\ny", &source, position(0, 1_000_000))
+                .is_err()
+        );
     }
 
     #[test]
     fn default_range_snippet_and_auto_import_follow_the_real_preparation_path() {
         let source = "header\n\tfoo\n";
-        let defaults = json!({"editRange":range(1, 1, 4), "insertTextMode":2, "insertTextFormat":2});
+        let defaults =
+            json!({"editRange":range(1, 1, 4), "insertTextMode":2, "insertTextFormat":2});
         let raw = json!({"label":"if", "textEditText":"if (${1:ok}) {\n\t${2:call()};\n}$0",
             "additionalTextEdits":[{"range":range(0, 0, 0),"newText":"import x\n$literal\n"}]});
         let cached = item::materialize(&raw, Some(&defaults)).unwrap();
@@ -226,12 +244,21 @@ mod tests {
         let edits = item::edits(&expanded.item, source, position(1, 4), None).unwrap();
         assert_eq!(edits[0]["newText"], "if (ok) {\n\t\tcall();\n\t}");
         assert_eq!(edits[1], raw["additionalTextEdits"][0]);
-        assert_eq!(apply(source, &edits), "import x\n$literal\nheader\n\tif (ok) {\n\t\tcall();\n\t}\n");
-        assert_eq!(cached, saved, "preview must not rewrite the retained server item");
+        assert_eq!(
+            apply(source, &edits),
+            "import x\n$literal\nheader\n\tif (ok) {\n\t\tcall();\n\t}\n"
+        );
+        assert_eq!(
+            cached, saved,
+            "preview must not rewrite the retained server item"
+        );
         let values = snippet::Values::from([("2".into(), "literal$3\nmore".into())]);
         let expanded = snippet::prepare(&cached, Some(&values)).unwrap();
         let edits = item::edits(&expanded.item, source, position(1, 4), None).unwrap();
-        assert_eq!(edits[0]["newText"], "if (ok) {\n\t\tliteral$3\n\tmore;\n\t}");
+        assert_eq!(
+            edits[0]["newText"],
+            "if (ok) {\n\t\tliteral$3\n\tmore;\n\t}"
+        );
         assert_eq!(cached, saved);
     }
 
@@ -262,7 +289,16 @@ mod tests {
         let source = "  foo";
         let mut item = json!({"label":"x", "insertTextMode":2,
             "textEdit":{"range":range(0, 2, 5), "newText":"x\ny"}});
-        for invalid in [json!(0), json!(3), json!(-1), json!(2.0), json!("2"), json!(true), json!({}), json!([])] {
+        for invalid in [
+            json!(0),
+            json!(3),
+            json!(-1),
+            json!(2.0),
+            json!("2"),
+            json!(true),
+            json!({}),
+            json!([]),
+        ] {
             item["insertTextMode"] = invalid;
             assert!(item::edits(&item, source, position(0, 5), None).is_err());
         }

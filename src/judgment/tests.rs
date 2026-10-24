@@ -5,7 +5,6 @@ use futures::Stream;
 use std::pin::Pin;
 use std::sync::Mutex;
 
-
 #[test]
 fn process_wide_auxiliary_gate_caps_and_releases_slots() {
     let gate = AuxiliaryModelGate::new(2);
@@ -51,7 +50,9 @@ fn rejects_missing_extra_and_duplicate_answers() {
         r#"{"safe":0.9,"kind":{"feature":0.25,"test":0.75},"impact":[0.25,0.5,0.25],"extra":0}"#,
         r#"{"safe":0.1,"safe":0.9,"kind":{"feature":0.25,"test":0.75},"impact":[0.25,0.5,0.25]}"#,
         r#"{"safe":0.9,"kind":{"feature":0.25,"test":0.75,"test":0.75},"impact":[0.25,0.5,0.25]}"#,
-        "```json\n{}\n```", "{} trailing", "null",
+        "```json\n{}\n```",
+        "{} trailing",
+        "null",
     ] {
         assert!(request().answers(answer).is_err(), "accepted {answer}");
     }
@@ -60,17 +61,31 @@ fn rejects_missing_extra_and_duplicate_answers() {
 #[test]
 fn refuses_probability_coercion_and_partial_distributions() {
     let base: Value = serde_json::from_str(ANSWER).unwrap();
-    for probability in [json!(true), json!("0.5"), json!(-0.1), json!(1.1), Value::Null] {
+    for probability in [
+        json!(true),
+        json!("0.5"),
+        json!(-0.1),
+        json!(1.1),
+        Value::Null,
+    ] {
         let mut answer = base.clone();
         answer["safe"] = probability;
         assert!(request().answers(&answer.to_string()).is_err());
     }
-    for choice in [json!({"feature":0.1,"test":0.1}), json!({"feature":0.5,"other":0.5}), json!({"feature":1})] {
+    for choice in [
+        json!({"feature":0.1,"test":0.1}),
+        json!({"feature":0.5,"other":0.5}),
+        json!({"feature":1}),
+    ] {
         let mut answer = base.clone();
         answer["kind"] = choice;
         assert!(request().answers(&answer.to_string()).is_err());
     }
-    for score in [json!([0.5,0.5]), json!([1,1,1]), json!({"0":0.5,"1":0.5,"2":0})] {
+    for score in [
+        json!([0.5, 0.5]),
+        json!([1, 1, 1]),
+        json!({"0":0.5,"1":0.5,"2":0}),
+    ] {
         let mut answer = base.clone();
         answer["impact"] = score;
         assert!(request().answers(&answer.to_string()).is_err());
@@ -79,7 +94,9 @@ fn refuses_probability_coercion_and_partial_distributions() {
 
 #[test]
 fn stable_ties_and_degenerate_distributions() {
-    let answers = request().answers(r#"{"safe":0,"kind":{"test":0.5,"feature":0.5},"impact":[0,0,1]}"#).unwrap();
+    let answers = request()
+        .answers(r#"{"safe":0,"kind":{"test":0.5,"feature":0.5},"impact":[0,0,1]}"#)
+        .unwrap();
     assert_eq!(answers["kind"]["choice"], "feature");
     assert_eq!(answers["kind"]["confidence"], 0.0);
     assert_eq!(answers["impact"]["score"], 2.0);
@@ -89,9 +106,12 @@ fn stable_ties_and_degenerate_distributions() {
 #[test]
 fn preflight_rejects_unsupported_state_and_rubric_shapes() {
     for state in [Value::Null, json!(0), json!(true), json!(" ")] {
-        assert!(JudgmentRequest::parse(json!({"state":state,"questions":{
-            "q":{"type":"bool","instructions":"valid"}
-        }})).is_err());
+        assert!(
+            JudgmentRequest::parse(json!({"state":state,"questions":{
+                "q":{"type":"bool","instructions":"valid"}
+            }}))
+            .is_err()
+        );
     }
     for question in [
         json!({"type":"bool","instructions":""}),
@@ -113,13 +133,21 @@ fn preflight_bounds_utf8_shape_and_text_without_echoing_input() {
     let error = JudgmentRequest::parse(json!({"state":huge,"questions":{}})).unwrap_err();
     assert!(!error.to_string().contains("CANARY"));
     let mut nested = json!({});
-    for _ in 0..33 { nested = json!([nested]); }
-    assert!(JudgmentRequest::parse(json!({"state":nested,"questions":{
-        "q":{"type":"bool","instructions":"valid"}
-    }})).is_err());
-    assert!(JudgmentRequest::parse(json!({"state":{},"questions":{
-        "q":{"type":"bool","instructions":"x".repeat(4097)}
-    }})).is_err());
+    for _ in 0..33 {
+        nested = json!([nested]);
+    }
+    assert!(
+        JudgmentRequest::parse(json!({"state":nested,"questions":{
+            "q":{"type":"bool","instructions":"valid"}
+        }}))
+        .is_err()
+    );
+    assert!(
+        JudgmentRequest::parse(json!({"state":{},"questions":{
+            "q":{"type":"bool","instructions":"x".repeat(4097)}
+        }}))
+        .is_err()
+    );
 }
 
 #[test]
@@ -141,20 +169,35 @@ struct FixtureProvider {
 }
 impl FixtureProvider {
     fn new(events: Vec<StreamEvent>) -> Arc<Self> {
-        Arc::new(Self { events: Mutex::new(Some(events)), prompts: Mutex::new(Vec::new()),
-            contents: Mutex::new(Vec::new()), tokens: Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            events: Mutex::new(Some(events)),
+            prompts: Mutex::new(Vec::new()),
+            contents: Mutex::new(Vec::new()),
+            tokens: Mutex::new(Vec::new()),
+        })
     }
 }
 #[async_trait::async_trait]
 impl Provider for FixtureProvider {
-    fn name(&self) -> &str { "fixture" }
-    fn api(&self) -> &str { "fixture-stream" }
-    fn model_id(&self) -> &str { "typed-judge" }
-    async fn stream(&self, context: &Context<'_>, options: &StreamOptions)
-        -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+    fn name(&self) -> &str {
+        "fixture"
+    }
+    fn api(&self) -> &str {
+        "fixture-stream"
+    }
+    fn model_id(&self) -> &str {
+        "typed-judge"
+    }
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         assert!(context.tools.is_empty());
         assert_eq!(context.messages.len(), 1);
-        let Message::User(message) = &context.messages[0] else { panic!("expected user state"); };
+        let Message::User(message) = &context.messages[0] else {
+            panic!("expected user state");
+        };
         let text = match &message.content {
             UserContent::Text(text) => text,
             UserContent::Blocks(blocks) => match blocks.first() {
@@ -165,16 +208,24 @@ impl Provider for FixtureProvider {
         self.prompts.lock().unwrap().push(text.clone());
         self.contents.lock().unwrap().push(message.content.clone()); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- The test fixture must fail on a poisoned recording lock rather than lose the provider-bound evidence.
         self.tokens.lock().unwrap().push(options.max_tokens);
-        let events = self.events.lock().unwrap().take().expect("provider was retried");
+        let events = self
+            .events
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provider was retried");
         Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
     }
 }
 fn done(answer: &str, reason: StopReason) -> StreamEvent {
-    StreamEvent::Done { reason, message: AssistantMessage {
-        content: vec![ContentBlock::Text(TextContent::new(answer))],
-        stop_reason: reason,
-        ..Default::default()
-    }}
+    StreamEvent::Done {
+        reason,
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new(answer))],
+            stop_reason: reason,
+            ..Default::default()
+        },
+    }
 }
 fn runtime() -> asupersync::runtime::Runtime {
     asupersync::runtime::RuntimeBuilder::new().build().unwrap()
@@ -183,10 +234,19 @@ fn runtime() -> asupersync::runtime::Runtime {
 #[test]
 fn complete_terminal_answer_is_authoritative_and_has_provenance() {
     let provider = FixtureProvider::new(vec![
-        StreamEvent::TextDelta {content_index:0,delta:"incomplete preview".into()},
+        StreamEvent::TextDelta {
+            content_index: 0,
+            delta: "incomplete preview".into(),
+        },
         done(ANSWER, StopReason::Stop),
     ]);
-    let judge = Judge::new(provider.clone(), StreamOptions { max_tokens: Some(90_000), ..Default::default() });
+    let judge = Judge::new(
+        provider.clone(),
+        StreamOptions {
+            max_tokens: Some(90_000),
+            ..Default::default()
+        },
+    );
     let result = runtime().block_on(judge.evaluate(request())).unwrap();
     assert_eq!(result["model"], "fixture/typed-judge");
     assert_eq!(result["api"], "fixture-stream");
@@ -202,12 +262,21 @@ fn prepared_judgment_owns_screened_evidence_without_dispatch_or_callback() -> Re
     let prepared = {
         let replacement = String::from("screened replacement");
         let protect = |parts: &[&str]| -> Result<Vec<String>> {
-            Ok(parts.iter().map(|part| part.replace("adds a regression test", &replacement)).collect())
+            Ok(parts
+                .iter()
+                .map(|part| part.replace("adds a regression test", &replacement))
+                .collect())
         };
         judge.prepare_judgment(request(), Some(&protect))?
     };
     // The captured string and privacy callback no longer exist at dispatch.
-    assert!(provider.prompts.lock().expect("provider recorder").is_empty()); // ubs:ignore -- This fixture must prove preparation performs no provider I/O.
+    assert!(
+        provider
+            .prompts
+            .lock()
+            .expect("provider recorder")
+            .is_empty()
+    ); // ubs:ignore -- This fixture must prove preparation performs no provider I/O.
     let result = runtime().block_on(judge.run_prepared_judgment(prepared))?;
     assert_eq!(result["answers"]["safe"]["bool"], 0.9); // ubs:ignore -- The prepared path must retain typed answer validation.
     let prompts = provider.prompts.lock().expect("provider recorder"); // ubs:ignore -- A poisoned fixture recorder cannot supply reliable request evidence.
@@ -224,17 +293,32 @@ fn prepared_completion_keeps_schema_and_releases_borrowed_privacy() -> Result<()
     let prepared = {
         let replacement = String::from("screened prompt");
         let protect = |parts: &[&str]| -> Result<Vec<String>> {
-            Ok(parts.iter().map(|part| part.replace("original prompt", &replacement)).collect())
+            Ok(parts
+                .iter()
+                .map(|part| part.replace("original prompt", &replacement))
+                .collect())
         };
-        judge.prepare_completion(CompletionRequest::parse(json!({
-            "prompt":"original prompt", "schema":{"type":"null"}, "max_tokens":7,
-        }))?, Some(&protect))?
+        judge.prepare_completion(
+            CompletionRequest::parse(json!({
+                "prompt":"original prompt", "schema":{"type":"null"}, "max_tokens":7,
+            }))?,
+            Some(&protect),
+        )?
     };
-    assert!(provider.prompts.lock().expect("provider recorder").is_empty()); // ubs:ignore -- Schema and privacy preparation must finish before provider I/O.
+    assert!(
+        provider
+            .prompts
+            .lock()
+            .expect("provider recorder")
+            .is_empty()
+    ); // ubs:ignore -- Schema and privacy preparation must finish before provider I/O.
     let result = runtime().block_on(judge.run_prepared_completion(prepared))?;
     assert_eq!(result.get("data"), Some(&Value::Null)); // ubs:ignore -- Explicit schema-valid null must survive the owned completion path.
     assert_eq!(result["schemaValid"], true); // ubs:ignore -- The original schema must still validate the terminal answer.
-    assert_eq!(*provider.tokens.lock().expect("token recorder"), vec![Some(7)]); // ubs:ignore -- The requested output ceiling must survive preparation.
+    assert_eq!(
+        *provider.tokens.lock().expect("token recorder"),
+        vec![Some(7)]
+    ); // ubs:ignore -- The requested output ceiling must survive preparation.
     let prompts = provider.prompts.lock().expect("provider recorder"); // ubs:ignore -- A poisoned fixture recorder must fail this test.
     let prompt = prompts.first().expect("one provider request"); // ubs:ignore -- A successful completion must record its one request.
     assert!(prompt.contains("screened prompt") && !prompt.contains("original prompt")); // ubs:ignore -- Only screened text may be dispatched after the callback has gone away.
@@ -246,15 +330,35 @@ fn preparation_rejects_changed_contracts_before_any_provider_dispatch() -> Resul
     let provider = FixtureProvider::new(vec![]);
     let judge = Judge::new(provider.clone(), StreamOptions::default());
     let change_rubric = |parts: &[&str]| -> Result<Vec<String>> {
-        Ok(parts.iter().map(|part| part.replace("\"safe\"", "\"changed\"")).collect())
+        Ok(parts
+            .iter()
+            .map(|part| part.replace("\"safe\"", "\"changed\""))
+            .collect())
     };
-    assert!(judge.prepare_judgment(request(), Some(&change_rubric)).is_err()); // ubs:ignore -- Changed question identity must refuse admission.
+    assert!(
+        judge
+            .prepare_judgment(request(), Some(&change_rubric))
+            .is_err()
+    ); // ubs:ignore -- Changed question identity must refuse admission.
     let change_schema = |parts: &[&str]| -> Result<Vec<String>> {
-        Ok(parts.iter().map(|part| part.replace("\"null\"", "\"string\"")).collect())
+        Ok(parts
+            .iter()
+            .map(|part| part.replace("\"null\"", "\"string\""))
+            .collect())
     };
     let request = CompletionRequest::parse(json!({"prompt":"classify", "schema":{"type":"null"}}))?;
-    assert!(judge.prepare_completion(request, Some(&change_schema)).is_err()); // ubs:ignore -- A changed output contract must never be sent to a provider.
-    assert!(provider.prompts.lock().expect("provider recorder").is_empty()); // ubs:ignore -- Rejected preparation must not perform a provider call.
+    assert!(
+        judge
+            .prepare_completion(request, Some(&change_schema))
+            .is_err()
+    ); // ubs:ignore -- A changed output contract must never be sent to a provider.
+    assert!(
+        provider
+            .prompts
+            .lock()
+            .expect("provider recorder")
+            .is_empty()
+    ); // ubs:ignore -- Rejected preparation must not perform a provider call.
     Ok(())
 }
 
@@ -264,7 +368,9 @@ fn prepared_completion_still_rejects_terminal_schema_violation() -> Result<()> {
     let judge = Judge::new(provider.clone(), StreamOptions::default());
     let request = CompletionRequest::parse(json!({"prompt":"classify", "schema":{"type":"null"}}))?;
     let prepared = judge.prepare_completion(request, None)?;
-    let error = runtime().block_on(judge.run_prepared_completion(prepared)).expect_err("schema violation"); // ubs:ignore -- A complete but schema-invalid answer must fail.
+    let error = runtime()
+        .block_on(judge.run_prepared_completion(prepared))
+        .expect_err("schema violation"); // ubs:ignore -- A complete but schema-invalid answer must fail.
     assert!(error.to_string().contains("PI_COMPLETION_RESPONSE")); // ubs:ignore -- Owned execution must preserve the existing response error contract.
     assert_eq!(provider.prompts.lock().expect("provider recorder").len(), 1); // ubs:ignore -- Invalid output must not cause a retry or repair request.
     Ok(())
@@ -284,11 +390,20 @@ fn failed_empty_and_unterminated_streams_have_no_verdict() {
         vec![done(ANSWER, StopReason::Length)],
         vec![done(ANSWER, StopReason::Refusal)],
         vec![done("", StopReason::Stop)],
-        vec![StreamEvent::TextDelta { content_index:0, delta:ANSWER.into() }],
+        vec![StreamEvent::TextDelta {
+            content_index: 0,
+            delta: ANSWER.into(),
+        }],
         vec![done("not JSON", StopReason::Stop)],
     ] {
         let provider = FixtureProvider::new(events);
-        assert!(runtime().block_on(Judge::new(provider.clone(), StreamOptions::default()).evaluate(request())).is_err());
+        assert!(
+            runtime()
+                .block_on(
+                    Judge::new(provider.clone(), StreamOptions::default()).evaluate(request())
+                )
+                .is_err()
+        );
         assert_eq!(provider.prompts.lock().unwrap().len(), 1);
     }
 }
@@ -297,11 +412,21 @@ fn failed_empty_and_unterminated_streams_have_no_verdict() {
 fn tool_calls_in_a_terminal_response_are_never_executed() {
     let mut message = AssistantMessage::default();
     message.content = vec![ContentBlock::ToolCall(ToolCall {
-        id:"forbidden".into(), name:"bash".into(), arguments:json!({"command":"no"}), thought_signature:None,
+        id: "forbidden".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"no"}),
+        thought_signature: None,
     })];
     message.stop_reason = StopReason::Stop;
-    let provider = FixtureProvider::new(vec![StreamEvent::Done { reason:StopReason::Stop, message }]);
-    assert!(runtime().block_on(Judge::new(provider, StreamOptions::default()).evaluate(request())).is_err());
+    let provider = FixtureProvider::new(vec![StreamEvent::Done {
+        reason: StopReason::Stop,
+        message,
+    }]);
+    assert!(
+        runtime()
+            .block_on(Judge::new(provider, StreamOptions::default()).evaluate(request()))
+            .is_err()
+    );
 }
 
 #[test]
@@ -309,7 +434,9 @@ fn invocation_privacy_blocks_before_provider_admission() {
     let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
     let judge = Judge::new(provider.clone(), StreamOptions::default());
     let protect = |_parts: &[&str]| -> Result<Vec<String>> { Err(failure("PI_SECRET_BLOCK")) };
-    let error = runtime().block_on(judge.evaluate_protected(request(), Some(&protect))).unwrap_err();
+    let error = runtime()
+        .block_on(judge.evaluate_protected(request(), Some(&protect)))
+        .unwrap_err();
     assert!(error.to_string().contains("PI_SECRET_BLOCK"));
     assert!(provider.prompts.lock().unwrap().is_empty());
 }
@@ -321,7 +448,9 @@ fn direct_calls_redact_credentials_before_the_provider() {
     let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
     value["state"] = json!({"API_KEY":secret,"echo":secret});
     let request = JudgmentRequest::parse(value).unwrap();
-    runtime().block_on(Judge::new(provider.clone(), StreamOptions::default()).evaluate(request)).unwrap();
+    runtime()
+        .block_on(Judge::new(provider.clone(), StreamOptions::default()).evaluate(request))
+        .unwrap();
     let prompts = provider.prompts.lock().unwrap();
     assert!(!prompts[0].contains(secret));
     assert!(prompts[0].contains("redacted"));
@@ -335,7 +464,10 @@ mod image_evidence {
     const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
     fn image() -> ImageContent {
-        ImageContent { data: PNG.to_string(), mime_type: "image/png".to_string() }
+        ImageContent {
+            data: PNG.to_string(),
+            mime_type: "image/png".to_string(),
+        }
     }
 
     // An envelope fixture, deliberately not a claim that every payload is a
@@ -363,7 +495,10 @@ mod image_evidence {
         let text = original.encoded().unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- A validated fixture request must encode before attachment.
         let request = original.with_images(expected.to_vec()).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Controlled PNG/GIF envelopes must be admitted.
         assert!(request.has_images()); // ubs:ignore[rust.panic.assert-macros] -- The host must detect the image capability requirement.
-        assert_eq!(request.image_bytes(), expected.iter().map(|image| image.data.len()).sum::<usize>()); // ubs:ignore[rust.panic.assert-macros] -- Batch charging uses the exact encoded attachment sizes.
+        assert_eq!(
+            request.image_bytes(),
+            expected.iter().map(|image| image.data.len()).sum::<usize>()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Batch charging uses the exact encoded attachment sizes.
         assert_eq!(request.encoded().unwrap(), text); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Attaching images must not enlarge or contaminate the text privacy envelope.
         let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
         let judge = Judge::new(provider.clone(), StreamOptions::default()).with_image_support(true);
@@ -376,7 +511,9 @@ mod image_evidence {
         assert_eq!(blocks.len(), 3); // ubs:ignore[rust.panic.assert-macros] -- Exactly one screened text block precedes the two evidence images.
         assert!(matches!(&blocks[0], ContentBlock::Text(text) if !text.text.contains(PNG))); // ubs:ignore[rust.panic.assert-macros] -- Image payloads must never be rendered into prompt text.
         for (block, original) in blocks[1..].iter().zip(expected) {
-            assert!(matches!(block, ContentBlock::Image(image) if image.data == original.data && image.mime_type == original.mime_type)); // ubs:ignore[rust.panic.assert-macros] -- Admission must preserve exact bytes, MIME and ordering without transcoding.
+            assert!(
+                matches!(block, ContentBlock::Image(image) if image.data == original.data && image.mime_type == original.mime_type)
+            ); // ubs:ignore[rust.panic.assert-macros] -- Admission must preserve exact bytes, MIME and ordering without transcoding.
         }
     }
 
@@ -385,7 +522,10 @@ mod image_evidence {
         let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
         let judge = Judge::new(provider.clone(), StreamOptions::default());
         assert!(judge.check_image_support(false).is_ok()); // ubs:ignore[rust.panic.assert-macros] -- A text request never requires image capability.
-        for binding in [judge.clone(), judge.with_image_support(true).with_image_support(false)] {
+        for binding in [
+            judge.clone(),
+            judge.with_image_support(true).with_image_support(false),
+        ] {
             let request = request().with_images(vec![image()]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Valid image evidence isolates the capability rejection.
             let error = runtime().block_on(binding.evaluate(request)).unwrap_err(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- An unsupported binding must fail without silently dropping evidence.
             assert!(error.to_string().contains("PI_JUDGE_IMAGE_UNSUPPORTED")); // ubs:ignore[rust.panic.assert-macros] -- Callers need a named capability refusal rather than a text-only verdict.
@@ -395,12 +535,21 @@ mod image_evidence {
 
     #[test]
     fn empty_images_preserve_text_only_binding_and_wire_shape() {
-        let request = request().with_images(vec![image()]).unwrap().with_images(Vec::new()).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Replacing attachments with an empty validated collection must remove image authority requirements.
+        let request = request()
+            .with_images(vec![image()])
+            .unwrap()
+            .with_images(Vec::new())
+            .unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Replacing attachments with an empty validated collection must remove image authority requirements.
         assert!(!request.has_images()); // ubs:ignore[rust.panic.assert-macros] -- Empty collections remain ordinary text judgments.
         assert_eq!(request.image_bytes(), 0); // ubs:ignore[rust.panic.assert-macros] -- Removed evidence must not keep charging the batch image budget.
         let provider = FixtureProvider::new(vec![done(ANSWER, StopReason::Stop)]);
-        runtime().block_on(Judge::new(provider.clone(), StreamOptions::default()).evaluate(request)).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- The default text binding must remain usable after empty-image admission.
-        assert!(matches!(&provider.contents.lock().unwrap()[0], UserContent::Text(_))); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- No-image calls retain the existing wire representation; losing the capture must fail this assertion.
+        runtime()
+            .block_on(Judge::new(provider.clone(), StreamOptions::default()).evaluate(request))
+            .unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- The default text binding must remain usable after empty-image admission.
+        assert!(matches!(
+            &provider.contents.lock().unwrap()[0],
+            UserContent::Text(_)
+        )); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- No-image calls retain the existing wire representation; losing the capture must fail this assertion.
     }
 
     #[test]
@@ -412,13 +561,18 @@ mod image_evidence {
             Err(failure("PI_SECRET_BLOCK"))
         };
         let blocked = request().with_images(vec![image()]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Valid evidence ensures the privacy callback is the only refusal.
-        let error = runtime().block_on(judge.evaluate_protected(blocked, Some(&protect))).unwrap_err(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Block mode must refuse before sending either text or images.
+        let error = runtime()
+            .block_on(judge.evaluate_protected(blocked, Some(&protect)))
+            .unwrap_err(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Block mode must refuse before sending either text or images.
         assert!(error.to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore[rust.panic.assert-macros] -- The existing text privacy refusal remains authoritative.
         assert!(provider.contents.lock().unwrap().is_empty()); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- A blocked request cannot leak an image; poisoned capture state cannot be accepted as evidence of no call.
         let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
         let mut value: Value = serde_json::from_str(&request().encoded().unwrap()).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Controlled typed input is extended with a known credential-shaped fixture.
         value["state"] = json!({"API_KEY":secret,"echo":secret});
-        let redacted = JudgmentRequest::parse(value).unwrap().with_images(vec![image()]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Known-secret text and valid image evidence must reach the ordinary privacy projection.
+        let redacted = JudgmentRequest::parse(value)
+            .unwrap()
+            .with_images(vec![image()])
+            .unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Known-secret text and valid image evidence must reach the ordinary privacy projection.
         runtime().block_on(judge.evaluate(redacted)).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Redaction, unlike block mode, should preserve usable evidence.
         let prompts = provider.prompts.lock().unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Inspect exactly what the provider received; poison must invalidate the test.
         assert!(!prompts[0].contains(secret)); // ubs:ignore[rust.panic.assert-macros] -- Adding image support cannot weaken existing credential redaction.
@@ -428,15 +582,41 @@ mod image_evidence {
     #[test]
     fn image_admission_rejects_malformed_metadata_base64_and_unbounded_canvas() {
         let mut cases = vec![
-            ImageContent { data: "CANARY-private-image-data".to_string(), mime_type: "image/png".to_string() },
-            ImageContent { data: String::new(), mime_type: "image/png".to_string() },
-            ImageContent { data: PNG.trim_end_matches('=').to_string(), mime_type: "image/png".to_string() },
-            ImageContent { data: format!("{PNG}\n"), mime_type: "image/png".to_string() },
-            ImageContent { data: PNG.replace("ggg==", "ggh=="), mime_type: "image/png".to_string() },
-            gif(14, 0, 1), gif(14, 16_385, 1), gif(14, 4097, 4096),
+            ImageContent {
+                data: "CANARY-private-image-data".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+            ImageContent {
+                data: String::new(),
+                mime_type: "image/png".to_string(),
+            },
+            ImageContent {
+                data: PNG.trim_end_matches('=').to_string(),
+                mime_type: "image/png".to_string(),
+            },
+            ImageContent {
+                data: format!("{PNG}\n"),
+                mime_type: "image/png".to_string(),
+            },
+            ImageContent {
+                data: PNG.replace("ggg==", "ggh=="),
+                mime_type: "image/png".to_string(),
+            },
+            gif(14, 0, 1),
+            gif(14, 16_385, 1),
+            gif(14, 4097, 4096),
         ];
-        for mime in ["image/jpeg", "image/svg+xml", "IMAGE/PNG", "image/png; charset=utf-8", "image/png\u{1b}"] {
-            cases.push(ImageContent { data: PNG.to_string(), mime_type: mime.to_string() });
+        for mime in [
+            "image/jpeg",
+            "image/svg+xml",
+            "IMAGE/PNG",
+            "image/png; charset=utf-8",
+            "image/png\u{1b}",
+        ] {
+            cases.push(ImageContent {
+                data: PNG.to_string(),
+                mime_type: mime.to_string(),
+            });
         }
         for image in cases {
             let error = validate_image(&image).unwrap_err(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Every case violates a different input envelope invariant.
@@ -448,11 +628,29 @@ mod image_evidence {
     #[test]
     fn image_count_decoded_and_aggregate_encoded_allowances_are_independent() {
         let boundary_image = gif(MAX_JUDGMENT_IMAGE_BYTES, 1, 1);
-        assert_eq!(validate_image(&boundary_image).unwrap(), MAX_JUDGMENT_IMAGE_BYTES / 3 * 4); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Exact decoded allowance is admitted without changing bytes.
+        assert_eq!(
+            validate_image(&boundary_image).unwrap(),
+            MAX_JUDGMENT_IMAGE_BYTES / 3 * 4
+        ); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Exact decoded allowance is admitted without changing bytes.
         let oversized = gif(MAX_JUDGMENT_IMAGE_BYTES + 1, 1, 1);
-        assert!(validate_image(&oversized).unwrap_err().to_string().contains("PI_JUDGE_IMAGE_LIMIT")); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- A single additional decoded byte must exceed the per-image allowance.
-        assert!(request().with_images(vec![boundary_image.clone(), boundary_image]).unwrap_err().to_string().contains("PI_JUDGE_IMAGE_LIMIT")); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Two individually admissible images cannot exceed the aggregate request allowance.
-        assert!(request().with_images(vec![image(); MAX_JUDGMENT_IMAGES + 1]).is_err()); // ubs:ignore[rust.panic.assert-macros] -- Count admission is independent of byte size.
+        assert!(
+            validate_image(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("PI_JUDGE_IMAGE_LIMIT")
+        ); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- A single additional decoded byte must exceed the per-image allowance.
+        assert!(
+            request()
+                .with_images(vec![boundary_image.clone(), boundary_image])
+                .unwrap_err()
+                .to_string()
+                .contains("PI_JUDGE_IMAGE_LIMIT")
+        ); // ubs:ignore[rust.panic.assert-macros,rust.panic.unwrap,rust.ownership.unwrap-expect] -- Two individually admissible images cannot exceed the aggregate request allowance.
+        assert!(
+            request()
+                .with_images(vec![image(); MAX_JUDGMENT_IMAGES + 1])
+                .is_err()
+        ); // ubs:ignore[rust.panic.assert-macros] -- Count admission is independent of byte size.
         let half = gif(3 * 1024 * 1024, 1, 1);
         let request = request().with_images(vec![half.clone(), half]).unwrap(); // ubs:ignore[rust.panic.unwrap,rust.ownership.unwrap-expect] -- Two 4 MiB encoded envelopes exactly fill the aggregate allowance.
         assert_eq!(request.image_bytes(), MAX_JUDGMENT_IMAGE_ENCODED_BYTES); // ubs:ignore[rust.panic.assert-macros] -- Aggregate charging is based on encoded bytes, not decoded bytes or image count.

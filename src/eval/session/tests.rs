@@ -20,15 +20,21 @@ fn select(scope: &JobSessionScope, id: &str) {
 }
 
 fn text(output: &ToolOutput) -> String {
-    output.content.iter().filter_map(|block| match block {
-        crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    }).collect()
+    output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn cell(tool: &dyn Tool, language: &str, code: &str) -> ToolOutput {
-    let output = tool.execute("cell", json!({"kernel":language,"code":code}), None)
-        .await.unwrap();
+    let output = tool
+        .execute("cell", json!({"kernel":language,"code":code}), None)
+        .await
+        .unwrap();
     assert!(!output.is_error, "{}", text(&output));
     output
 }
@@ -41,10 +47,15 @@ fn scoped(dir: &std::path::Path) -> (EvalTool, JobSessionScope) {
 }
 
 fn python_available() -> bool {
-    let available = std::process::Command::new("python3").arg("--version")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().is_ok_and(|status| status.success());
-    if !available { eprintln!("Skipping Python session case: python3 unavailable"); }
+    let available = std::process::Command::new("python3")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !available {
+        eprintln!("Skipping Python session case: python3 unavailable");
+    }
     available
 }
 
@@ -77,14 +88,19 @@ fn actual_registry_binding_isolates_and_restores_lexical_javascript_state() {
 
 #[test]
 fn python_namespaces_and_both_languages_survive_switch_back_independently() {
-    if !python_available() { return; }
+    if !python_available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let (tool, scope) = scoped(dir.path());
     run(async {
         cell(&tool, "python", "secret = 42").await;
         cell(&tool, "js", "const secret = 43").await;
         select(&scope, "session-b");
-        assert_eq!(text(&cell(&tool, "python", "'secret' in globals()").await).trim(), "False");
+        assert_eq!(
+            text(&cell(&tool, "python", "'secret' in globals()").await).trim(),
+            "False"
+        );
         cell(&tool, "python", "secret = 99").await;
         cell(&tool, "js", "const secret = 100").await;
         select(&scope, "session-a");
@@ -103,17 +119,31 @@ fn reset_and_ordinary_failure_touch_only_the_selected_session() {
     run(async {
         cell(&tool, "js", "globalThis.keep = 42").await;
         select(&scope, "session-b");
-        let failed = tool.execute("error", json!({
-            "kernel":"js", "code":"globalThis.keep = 9; throw new Error('expected')"
-        }), None).await.unwrap();
+        let failed = tool
+            .execute(
+                "error",
+                json!({
+                    "kernel":"js", "code":"globalThis.keep = 9; throw new Error('expected')"
+                }),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(failed.is_error);
         select(&scope, "session-a");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "42");
         select(&scope, "session-b");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "9");
-        let reset = tool.execute("reset", json!({
-            "kernel":"js", "code":"typeof keep", "reset":true
-        }), None).await.unwrap();
+        let reset = tool
+            .execute(
+                "reset",
+                json!({
+                    "kernel":"js", "code":"typeof keep", "reset":true
+                }),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(!reset.is_error);
         assert!(text(&reset).contains("undefined"));
         assert_eq!(reset.details.unwrap()["cell"], 1);
@@ -129,16 +159,23 @@ fn queued_cell_cannot_follow_a_session_switch_or_apply_its_reset() {
     run(async {
         cell(&tool, "js", "globalThis.keep = 42").await;
         let lease = tool.execution.lock().await;
-        let mut queued = tool.execute("queued", json!({
-            "kernel":"js", "code":"globalThis.keep = 99", "reset":true
-        }), None);
+        let mut queued = tool.execute(
+            "queued",
+            json!({
+                "kernel":"js", "code":"globalThis.keep = 99", "reset":true
+            }),
+            None,
+        );
         assert!(futures::poll!(queued.as_mut()).is_pending());
         select(&scope, "session-b");
         drop(lease);
         let error = queued.await.unwrap_err();
         assert!(error.to_string().contains("EVAL_SESSION_CHANGED"));
         assert!(tool.execution.try_lock().is_some());
-        assert_eq!(tool.retained_sessions.lock().unwrap().active.as_deref(), Some("session-a"));
+        assert_eq!(
+            tool.retained_sessions.lock().unwrap().active.as_deref(),
+            Some("session-a")
+        );
         select(&scope, "session-a");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "42");
     });
@@ -157,9 +194,13 @@ fn missing_or_oversized_identity_refuses_before_admission_without_state_loss() {
             } else {
                 select(&scope, &"x".repeat(MAX_SESSION_ID_BYTES + 1));
             }
-            let mut request = tool.execute("no-owner", json!({
-                "kernel":"js", "code":"", "reset":true
-            }), None);
+            let mut request = tool.execute(
+                "no-owner",
+                json!({
+                    "kernel":"js", "code":"", "reset":true
+                }),
+                None,
+            );
             match futures::poll!(request.as_mut()) {
                 std::task::Poll::Ready(Err(error)) => {
                     assert!(error.to_string().contains("EVAL_SESSION_UNAVAILABLE"));
@@ -207,8 +248,14 @@ fn idle_cache_is_bounded_lru_and_evicted_sessions_restart_explicitly() {
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "0");
         select(&scope, "new-session");
         let fresh = cell(&tool, "js", "typeof keep").await;
-        assert_eq!(fresh.details.unwrap()["kernelSession"]["idleNamespaceEvicted"], true);
-        assert_eq!(tool.retained_sessions.lock().unwrap().dormant.len(), MAX_RETAINED_SESSIONS - 1);
+        assert_eq!(
+            fresh.details.unwrap()["kernelSession"]["idleNamespaceEvicted"],
+            true
+        );
+        assert_eq!(
+            tool.retained_sessions.lock().unwrap().dormant.len(),
+            MAX_RETAINED_SESSIONS - 1
+        );
         select(&scope, "s0");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "0");
         select(&scope, "s1");
@@ -246,11 +293,18 @@ fn dropping_a_queued_reset_does_not_rotate_the_namespace_cache() {
         cell(&tool, "js", "const keep = 42").await;
         select(&scope, "session-b");
         let lease = tool.execution.lock().await;
-        let mut queued = tool.execute("dropped", json!({"kernel":"js", "code":"", "reset":true}), None);
+        let mut queued = tool.execute(
+            "dropped",
+            json!({"kernel":"js", "code":"", "reset":true}),
+            None,
+        );
         assert!(futures::poll!(queued.as_mut()).is_pending());
         drop(queued);
         drop(lease);
-        assert_eq!(tool.retained_sessions.lock().unwrap().active.as_deref(), Some("session-a"));
+        assert_eq!(
+            tool.retained_sessions.lock().unwrap().active.as_deref(),
+            Some("session-a")
+        );
         select(&scope, "session-a");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "42");
     });
@@ -265,16 +319,23 @@ fn quiet_active_javascript_stops_without_touching_the_new_sessions_kernel() {
         select(&scope, "session-b");
         cell(&tool, "js", "const keep = 99").await;
         select(&scope, "session-a");
-        let mut active = tool.execute("active", json!({
-            "kernel":"js", "code":"await sleep(60000)", "timeout_secs":2
-        }), None);
+        let mut active = tool.execute(
+            "active",
+            json!({
+                "kernel":"js", "code":"await sleep(60000)", "timeout_secs":2
+            }),
+            None,
+        );
         assert!(futures::poll!(active.as_mut()).is_pending());
         assert!(tool.execution.try_lock().is_none());
         select(&scope, "session-b");
         let stopped = active.await.unwrap();
         assert!(stopped.is_error);
         assert!(text(&stopped).contains("EVAL_SESSION_CHANGED"));
-        assert_eq!(stopped.details.as_ref().unwrap()["errorKind"], "sessionChanged");
+        assert_eq!(
+            stopped.details.as_ref().unwrap()["errorKind"],
+            "sessionChanged"
+        );
         assert_eq!(stopped.details.as_ref().unwrap()["stateReset"], true);
         assert!(tool.execution.try_lock().is_some());
         let preserved = cell(&tool, "js", "keep").await;
@@ -299,22 +360,36 @@ fn javascript_callback_switch_keeps_partial_output_without_publishing_an_archive
         let _ = seen.fetch_add(1, Ordering::SeqCst);
         select(&callback_scope, "session-b");
     });
-    let output = run(tool.execute("switch", json!({
-        "kernel":"js", "code":"console.log('original-session-progress'); await sleep(60000)",
-        "timeout_secs":2, "output_path":"interrupted.jsonl"
-    }), Some(callback))).unwrap();
+    let output = run(tool.execute(
+        "switch",
+        json!({
+            "kernel":"js", "code":"console.log('original-session-progress'); await sleep(60000)",
+            "timeout_secs":2, "output_path":"interrupted.jsonl"
+        }),
+        Some(callback),
+    ))
+    .unwrap();
     assert!(output.is_error);
     assert!(text(&output).contains("EVAL_SESSION_CHANGED"));
     assert!(text(&output).contains("original-session-progress"));
-    assert_eq!(output.details.as_ref().unwrap()["errorKind"], "sessionChanged");
-    assert_eq!(updates.load(Ordering::SeqCst), 1, "no running update after ownership loss");
+    assert_eq!(
+        output.details.as_ref().unwrap()["errorKind"],
+        "sessionChanged"
+    );
+    assert_eq!(
+        updates.load(Ordering::SeqCst),
+        1,
+        "no running update after ownership loss"
+    );
     assert!(!dir.path().join("interrupted.jsonl").exists());
     assert_eq!(text(&run(cell(&tool, "js", "42"))).trim(), "42");
 }
 
 #[test]
 fn python_callback_switch_refuses_the_next_bridge_and_preserves_other_namespaces() {
-    if !python_available() { return; }
+    if !python_available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("input.txt"), "read-gate").unwrap();
     let (tool, scope) = scoped(dir.path());
@@ -330,10 +405,17 @@ fn python_callback_switch_refuses_the_next_bridge_and_preserves_other_namespaces
         });
         // The Python child cannot create after-read until its native read
         // bridge returns. Output delivery must revoke that bridge first.
-        let error = tool.execute("switch", json!({"kernel":"python", "code":concat!(
+        let error = tool
+            .execute(
+                "switch",
+                json!({"kernel":"python", "code":concat!(
             "from pathlib import Path\nprint('switch-before-read', flush=True)\n",
             "tool.read('input.txt')\nPath('after-read').write_text('unexpected')"
-        ), "timeout_secs":2}), Some(callback)).await.unwrap_err();
+        ), "timeout_secs":2}),
+                Some(callback),
+            )
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("EVAL_SESSION_CHANGED"));
         assert!(error.to_string().contains("switch-before-read"));
         assert!(!dir.path().join("after-read").exists());
@@ -353,18 +435,28 @@ fn unavailable_identity_during_execution_fails_closed_and_releases_admission() {
     let (tool, scope) = scoped(dir.path());
     run(async {
         cell(&tool, "js", "const keep = 42").await;
-        let mut active = tool.execute("active", json!({
-            "kernel":"js", "code":"await sleep(60000)", "timeout_secs":2
-        }), None);
+        let mut active = tool.execute(
+            "active",
+            json!({
+                "kernel":"js", "code":"await sleep(60000)", "timeout_secs":2
+            }),
+            None,
+        );
         assert!(futures::poll!(active.as_mut()).is_pending());
         scope.bind(Arc::new(|| Box::pin(async { None })));
         let output = active.await.unwrap();
         assert!(output.is_error);
         assert!(text(&output).contains("EVAL_SESSION_UNAVAILABLE"));
-        assert_eq!(output.details.as_ref().unwrap()["errorKind"], "sessionUnavailable");
+        assert_eq!(
+            output.details.as_ref().unwrap()["errorKind"],
+            "sessionUnavailable"
+        );
         assert!(tool.execution.try_lock().is_some());
         select(&scope, "session-a");
-        assert_eq!(text(&cell(&tool, "js", "typeof keep").await).trim(), "\"undefined\"");
+        assert_eq!(
+            text(&cell(&tool, "js", "typeof keep").await).trim(),
+            "\"undefined\""
+        );
     });
 }
 
@@ -384,9 +476,13 @@ fn active_cell_deadline_includes_a_resolver_that_becomes_permanently_pending() {
     }));
     run(async {
         cell(&tool, "js", "const keep = 42").await;
-        let mut active = tool.execute("blocked-owner", json!({
-            "kernel":"js", "code":"await sleep(60000)", "timeout_secs":1
-        }), None);
+        let mut active = tool.execute(
+            "blocked-owner",
+            json!({
+                "kernel":"js", "code":"await sleep(60000)", "timeout_secs":1
+            }),
+            None,
+        );
         assert!(futures::poll!(active.as_mut()).is_pending());
         blocked.store(true, Ordering::SeqCst);
         let output = active.await.unwrap();
@@ -395,7 +491,10 @@ fn active_cell_deadline_includes_a_resolver_that_becomes_permanently_pending() {
         assert_eq!(output.details.as_ref().unwrap()["errorKind"], "timeout");
         assert!(tool.execution.try_lock().is_some());
         blocked.store(false, Ordering::SeqCst);
-        assert_eq!(text(&cell(&tool, "js", "typeof keep").await).trim(), "\"undefined\"");
+        assert_eq!(
+            text(&cell(&tool, "js", "typeof keep").await).trim(),
+            "\"undefined\""
+        );
     });
 }
 

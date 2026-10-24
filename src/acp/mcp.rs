@@ -524,10 +524,12 @@ mod tests {
     fn disabled_host_refuses_definitions_before_parsing() {
         let cwd = Path::new("/not-opened");
         assert!(parse_servers(&json!({}), cwd, true).unwrap().is_none());
-        assert!(parse_servers(&json!({"mcpServers": []}), cwd, true)
-            .unwrap()
-            .unwrap()
-            .is_empty());
+        assert!(
+            parse_servers(&json!({"mcpServers": []}), cwd, true)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
         for supplied in [json!([{"not": "a server"}]), json!(null), json!("bad")] {
             let error = parse_servers(&json!({"mcpServers": supplied}), cwd, true)
                 .expect_err("host isolation wins before definition validation");
@@ -995,7 +997,10 @@ mod tests {
             ("/mcp test remote", Command::Test("remote".into())),
             ("/mcp reauth remote", Command::Reauth("remote".into())),
             ("/mcp unauth remote", Command::Unauth("remote".into())),
-            ("/mcp reauth remote  service", Command::Reauth("remote  service".into())),
+            (
+                "/mcp reauth remote  service",
+                Command::Reauth("remote  service".into()),
+            ),
         ] {
             assert_eq!(
                 command_from_prompt(&[json!({"type":"text","text":text})]).unwrap(),
@@ -1076,12 +1081,20 @@ mod tests {
     fn operator_inspection_never_exposes_connection_secrets() {
         let root = tempfile::tempdir().unwrap();
         let state = prepare(root.path(), root.path(), http_servers(root.path())).unwrap();
-        let text = runtime().block_on(execute(&state, Command::Inspect("remote".into()), Arc::new(|_| {})));
+        let text = runtime().block_on(execute(
+            &state,
+            Command::Inspect("remote".into()),
+            Arc::new(|_| {}),
+        ));
         assert!(text.contains("HTTP"));
         assert!(text.contains("1 headers"));
         assert!(!text.contains("PRIVATE-HEADER-VALUE"));
         assert!(!text.contains("https://"));
-        let denied = runtime().block_on(execute(&state, Command::Deny("remote".into()), Arc::new(|_| {})));
+        let denied = runtime().block_on(execute(
+            &state,
+            Command::Deny("remote".into()),
+            Arc::new(|_| {}),
+        ));
         assert!(denied.contains("Denied"));
         assert_eq!(state.manager.list()[0].trust, "denied");
         assert_eq!(state.manager.list()[0].tools, 0);

@@ -3539,16 +3539,19 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             || self.bash_running
             || self.agent.try_lock().is_err()
         {
-            self.status_message = Some(
-                "Handoff is available after the current request finishes".to_string(),
-            );
+            self.status_message =
+                Some("Handoff is available after the current request finishes".to_string());
             return None;
         }
-        let Some(owner_session_id) = self.session.try_lock().ok()
-            .map(|session| session.header.id.clone()) else {
-                self.status_message = Some("Handoff unavailable: session is busy".to_string());
-                return None;
-            };
+        let Some(owner_session_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone())
+        else {
+            self.status_message = Some("Handoff unavailable: session is busy".to_string());
+            return None;
+        };
         let request_id = uuid::Uuid::new_v4().to_string();
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.handoff_request_id = Some(request_id.clone());
@@ -3562,13 +3565,22 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             let cx = Cx::for_request();
             let event = match OwnedMutexGuard::lock(owner, &cx).await {
                 Ok(mut owner) => {
-                    match owner.handle.with_session(|session| session.header.id.clone()).await {
+                    match owner
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await
+                    {
                         Ok(current) if current == owner_session_id => {
                             super::workspace_reports::run_in_place_handoff(
-                                &mut owner.handle, &focus, &abort_signal,
-                            ).await
+                                &mut owner.handle,
+                                &focus,
+                                &abort_signal,
+                            )
+                            .await
                         }
-                        Ok(_) => PiMsg::AgentError("Handoff cancelled: the session changed before it started".to_string()),
+                        Ok(_) => PiMsg::AgentError(
+                            "Handoff cancelled: the session changed before it started".to_string(),
+                        ),
                         Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
                     }
                 }
@@ -3577,9 +3589,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             // Drop the Agent owner before the UI applies its terminal reset.
             // Delivery uses a fresh context even after owner cancellation.
             let _ = enqueue_pi_event(
-                &event_tx, &Cx::for_request(),
-                PiMsg::HandoffFinished { request_id, event: Box::new(event) },
-            ).await;
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::HandoffFinished {
+                    request_id,
+                    event: Box::new(event),
+                },
+            )
+            .await;
         });
         self.scroll_to_bottom();
         None
@@ -3976,10 +3993,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
     pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
-            self.status_message = Some("Review is available after the current request finishes".to_string());
+            self.status_message =
+                Some("Review is available after the current request finishes".to_string());
             return None;
         }
-        let prepared = self.agent.try_lock().map_err(|_| pi::error::Error::validation("agent is busy"))
+        let prepared = self
+            .agent
+            .try_lock()
+            .map_err(|_| pi::error::Error::validation("agent is busy"))
             .and_then(|agent| super::workspace_reports::prepare_review(&self.cwd, args, &agent));
         let request = match prepared {
             Ok(request) => request,
@@ -3988,7 +4009,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 return None;
             }
         };
-        let owner = self.session.try_lock().ok().map(|session| session.header.id.clone());
+        let owner = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone());
         let Some(owner_session_id) = owner else {
             self.status_message = Some("Review unavailable: session is busy".to_string());
             return None;
@@ -3998,15 +4023,22 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         self.review_request_id = Some(request_id.clone());
         self.abort_handle = Some(abort_handle);
         self.agent_state = AgentState::Processing;
-        self.status_message = Some("Reviewing text changes with the current model (Esc to cancel)...".to_string());
+        self.status_message =
+            Some("Reviewing text changes with the current model (Esc to cancel)...".to_string());
         let event_tx = self.event_tx.clone();
         self.runtime_handle.spawn(async move {
             let report = request.run(Some(&abort_signal)).await;
             let message = report.card.unwrap_or(report.status);
             let _ = crate::interactive::enqueue_pi_event(
-                &event_tx, &Cx::for_request(),
-                PiMsg::ReviewFinished { owner_session_id, request_id, message },
-            ).await;
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::ReviewFinished {
+                    owner_session_id,
+                    request_id,
+                    message,
+                },
+            )
+            .await;
         });
         self.scroll_to_bottom();
         None
@@ -4400,8 +4432,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         };
         let trimmed = args.trim();
-        if let Some((verb @ ("reauth" | "unauth"), name)) =
-            trimmed.split_once(char::is_whitespace)
+        if let Some((verb @ ("reauth" | "unauth"), name)) = trimmed.split_once(char::is_whitespace)
         {
             return self.mcp_handle_auth(&manager, verb, name.trim());
         }

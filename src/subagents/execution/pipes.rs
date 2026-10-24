@@ -46,7 +46,10 @@ impl<R: Read> FramedPipe<R> {
     /// `None` means no complete frame this slice, not necessarily EOF. Retain
     /// partial bytes across WouldBlock, including a split multibyte character.
     /// CRLF, empty lines and a final unterminated frame match `read_frame`.
-    pub(super) fn next_frame(&mut self, chunks_left: &mut usize) -> Result<Option<Vec<u8>>, &'static str> {
+    pub(super) fn next_frame(
+        &mut self,
+        chunks_left: &mut usize,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
         while *chunks_left > 0 {
             let Some(reader) = self.reader.as_mut() else {
                 return Ok(None);

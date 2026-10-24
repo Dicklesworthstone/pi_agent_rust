@@ -69,7 +69,9 @@ impl Selection {
         };
         if let Some(arguments) = arguments.as_object_mut() {
             for (key, value) in defaults {
-                arguments.entry(key.clone()).or_insert_with(|| value.clone());
+                arguments
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
             }
         }
     }
@@ -81,22 +83,37 @@ pub(super) fn validate_request(
     action: &str,
     remote: bool,
 ) -> Result<()> {
-    let Some(path) = path else { return Ok(()); };
+    let Some(path) = path else {
+        return Ok(());
+    };
     if !matches!(action, "launch" | "attach") || remote {
-        return Err(tool_err("DAP_USAGE", "adapterConfig is local launch/pid-attach only"));
+        return Err(tool_err(
+            "DAP_USAGE",
+            "adapterConfig is local launch/pid-attach only",
+        ));
     }
-    if path.is_empty() || path.len() > 4096 || path.contains('\0')
-        || !Path::new(path).components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+    if path.is_empty()
+        || path.len() > 4096
+        || path.contains('\0')
+        || !Path::new(path)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
         || adapter.is_none_or(|id| !valid_id(id))
     {
-        return Err(tool_err("DAP_USAGE", "adapterConfig requires a workspace-relative path without parent traversal and an explicit adapter ID"));
+        return Err(tool_err(
+            "DAP_USAGE",
+            "adapterConfig requires a workspace-relative path without parent traversal and an explicit adapter ID",
+        ));
     }
     Ok(())
 }
 
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64
-        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 pub(super) fn select(
@@ -107,8 +124,12 @@ pub(super) fn select(
     registered: &[AdapterSpec],
 ) -> Result<Selection> {
     let Some(config) = config else {
-        let adapter = adapters::select_adapter(target, requested, registered)
-            .ok_or_else(|| tool_err("DAP_ADAPTER_MISSING", "no matching registered debug adapter is available"))?;
+        let adapter = adapters::select_adapter(target, requested, registered).ok_or_else(|| {
+            tool_err(
+                "DAP_ADAPTER_MISSING",
+                "no matching registered debug adapter is available",
+            )
+        })?;
         adapters::dotnet::require_built_target(&adapter, target)?;
         return Ok(Selection::registered(adapter));
     };
@@ -120,20 +141,30 @@ pub(super) fn select(
     let path = std::fs::canonicalize(root.join(config))
         .map_err(|_| tool_err("DAP_CONFIG", "cannot resolve adapterConfig"))?;
     if !path.starts_with(&root) {
-        return Err(tool_err("DAP_CONFIG", "adapterConfig resolves outside the debugger workspace"));
+        return Err(tool_err(
+            "DAP_CONFIG",
+            "adapterConfig resolves outside the debugger workspace",
+        ));
     }
     let metadata = std::fs::metadata(&path)
         .map_err(|_| tool_err("DAP_CONFIG", "cannot inspect adapterConfig"))?;
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
-        return Err(tool_err("DAP_CONFIG", "adapterConfig must be a regular file of at most 64 KiB"));
+        return Err(tool_err(
+            "DAP_CONFIG",
+            "adapterConfig must be a regular file of at most 64 KiB",
+        ));
     }
     let file = std::fs::File::open(&path)
         .map_err(|_| tool_err("DAP_CONFIG", "cannot open adapterConfig"))?;
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return Err(tool_err("DAP_CONFIG", "adapterConfig is not a regular file"));
+        return Err(tool_err(
+            "DAP_CONFIG",
+            "adapterConfig is not a regular file",
+        ));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| tool_err("DAP_CONFIG", "cannot read adapterConfig"))?;
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err(tool_err("DAP_CONFIG", "adapterConfig exceeds 64 KiB"));
@@ -141,14 +172,27 @@ pub(super) fn select(
     let mut document: Document = serde_json::from_slice(&bytes)
         // Do not echo configuration text or serde's offending value: it may
         // contain credentials in arguments, env or adapter-specific defaults.
-        .map_err(|_| tool_err("DAP_CONFIG", "invalid dap.json: expected an adapters object with supported typed fields"))?;
-    if document.adapters.is_empty() || document.adapters.len() > MAX_ADAPTERS
+        .map_err(|_| {
+            tool_err(
+                "DAP_CONFIG",
+                "invalid dap.json: expected an adapters object with supported typed fields",
+            )
+        })?;
+    if document.adapters.is_empty()
+        || document.adapters.len() > MAX_ADAPTERS
         || document.adapters.keys().any(|id| !valid_id(id))
     {
-        return Err(tool_err("DAP_CONFIG", "dap.json requires 1..=64 adapters with valid IDs"));
+        return Err(tool_err(
+            "DAP_CONFIG",
+            "dap.json requires 1..=64 adapters with valid IDs",
+        ));
     }
-    let definition = document.adapters.remove(id)
-        .ok_or_else(|| tool_err("DAP_CONFIG", "selected adapter is not defined in adapterConfig"))?;
+    let definition = document.adapters.remove(id).ok_or_else(|| {
+        tool_err(
+            "DAP_CONFIG",
+            "selected adapter is not defined in adapterConfig",
+        )
+    })?;
     validate_definition(id, &definition)?;
     let inherited = adapters::select_adapter(None, Some(id), registered);
     let mut adapter = inherited.unwrap_or_else(|| AdapterSpec {
@@ -162,9 +206,15 @@ pub(super) fn select(
         let command = if Path::new(&command).is_relative()
             && (command.contains('/') || (cfg!(windows) && command.contains('\\')))
         {
-            root.join(command).to_str().ok_or_else(|| {
-                tool_err("DAP_CONFIG", "configured command path must be representable as UTF-8")
-            })?.to_owned()
+            root.join(command)
+                .to_str()
+                .ok_or_else(|| {
+                    tool_err(
+                        "DAP_CONFIG",
+                        "configured command path must be representable as UTF-8",
+                    )
+                })?
+                .to_owned()
         } else {
             command
         };
@@ -177,7 +227,8 @@ pub(super) fn select(
         return Err(tool_err("DAP_CONFIG", "a new adapter requires command"));
     }
     adapters::dotnet::require_built_target(&adapter, target)?;
-    let accepts_directory_program = definition.accepts_directory_program
+    let accepts_directory_program = definition
+        .accepts_directory_program
         .unwrap_or(adapter.id == "dlv");
     tracing::info!(target: "debug", reason_code = "dap_config_selected", adapter_id = id,
         "Explicit workspace adapter configuration selected");
@@ -190,36 +241,91 @@ pub(super) fn select(
 }
 
 fn validate_definition(id: &str, definition: &Definition) -> Result<()> {
-    if definition.command.as_ref().is_some_and(|value| value.trim().is_empty() || value.len() > 4096 || value.contains('\0'))
-        || definition.args.as_ref().is_some_and(|args| args.len() > MAX_ARGUMENTS || args.iter().any(|arg| arg.len() > 16 * 1024 || arg.contains('\0')))
-        || [&definition.languages, &definition.file_types, &definition.root_markers].iter()
-            .any(|values| values.len() > 128 || values.iter().any(|value| value.is_empty() || value.len() > 4096 || value.contains('\0')))
+    if definition
+        .command
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 4096 || value.contains('\0'))
+        || definition.args.as_ref().is_some_and(|args| {
+            args.len() > MAX_ARGUMENTS
+                || args
+                    .iter()
+                    .any(|arg| arg.len() > 16 * 1024 || arg.contains('\0'))
+        })
+        || [
+            &definition.languages,
+            &definition.file_types,
+            &definition.root_markers,
+        ]
+        .iter()
+        .any(|values| {
+            values.len() > 128
+                || values
+                    .iter()
+                    .any(|value| value.is_empty() || value.len() > 4096 || value.contains('\0'))
+        })
     {
-        return Err(tool_err("DAP_CONFIG", "invalid or oversized adapter command, arguments or metadata"));
+        return Err(tool_err(
+            "DAP_CONFIG",
+            "invalid or oversized adapter command, arguments or metadata",
+        ));
     }
-    if definition.connect_mode.as_deref().is_some_and(|mode| {
-        mode != if id == "dlv" { "tcp" } else { "stdio" }
-    }) {
-        return Err(tool_err("DAP_UNSUPPORTED", "configured adapters use stdio; only the built-in Delve profile supports owned TCP"));
+    if definition
+        .connect_mode
+        .as_deref()
+        .is_some_and(|mode| mode != if id == "dlv" { "tcp" } else { "stdio" })
+    {
+        return Err(tool_err(
+            "DAP_UNSUPPORTED",
+            "configured adapters use stdio; only the built-in Delve profile supports owned TCP",
+        ));
     }
     // OMP's older CodeLLDB definition supplies --port 0. Merely declaring
     // connectMode=stdio does not undo that argv choice: fail before spawn,
     // rather than hanging the native reader on a TCP server's stdout.
-    if id == "codelldb" && definition.args.as_ref().is_some_and(|args| {
-        args.iter().any(|arg| arg == "--" || matches!(
-            arg.split('=').next().unwrap_or(arg),
-            "--port" | "--connect" | "--multi-session"
-        ))
-    }) {
-        return Err(tool_err("DAP_UNSUPPORTED", "CodeLLDB uses native stdio; remove port, connect and multi-session arguments from adapterConfig"));
+    if id == "codelldb"
+        && definition.args.as_ref().is_some_and(|args| {
+            args.iter().any(|arg| {
+                arg == "--"
+                    || matches!(
+                        arg.split('=').next().unwrap_or(arg),
+                        "--port" | "--connect" | "--multi-session"
+                    )
+            })
+        })
+    {
+        return Err(tool_err(
+            "DAP_UNSUPPORTED",
+            "CodeLLDB uses native stdio; remove port, connect and multi-session arguments from adapterConfig",
+        ));
     }
     for defaults in [&definition.launch_defaults, &definition.attach_defaults] {
-        if defaults.len() > 128 || defaults.keys().any(|key| matches!(key.as_str(),
-            "program" | "args" | "cwd" | "pid" | "processId" | "mode" | "output"
-            | "stopOnEntry" | "stopAtBeginningOfMainSubprogram" | "stopAtEntry" | "console"
-            | "runInTerminal" | "redirectOutput" | "subProcess" | "request" | "type"
-        )) {
-            return Err(tool_err("DAP_CONFIG", "adapter defaults cannot replace caller identity, execution mode, launch artifacts or terminal ownership"));
+        if defaults.len() > 128
+            || defaults.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "program"
+                        | "args"
+                        | "cwd"
+                        | "pid"
+                        | "processId"
+                        | "mode"
+                        | "output"
+                        | "stopOnEntry"
+                        | "stopAtBeginningOfMainSubprogram"
+                        | "stopAtEntry"
+                        | "console"
+                        | "runInTerminal"
+                        | "redirectOutput"
+                        | "subProcess"
+                        | "request"
+                        | "type"
+                )
+            })
+        {
+            return Err(tool_err(
+                "DAP_CONFIG",
+                "adapter defaults cannot replace caller identity, execution mode, launch artifacts or terminal ownership",
+            ));
         }
     }
     Ok(())
@@ -236,7 +342,9 @@ pub(super) fn set_stop_on_entry(adapter: &str, arguments: &mut Value, stop: Opti
         } else if adapter == "netcoredbg" && arguments.get("program").is_some() {
             // netcoredbg does not read stopOnEntry. In particular, false must
             // replace the native true default instead of adding an ignored key.
-            if let Some(object) = arguments.as_object_mut() { object.remove("stopOnEntry"); }
+            if let Some(object) = arguments.as_object_mut() {
+                object.remove("stopOnEntry");
+            }
             arguments["stopAtEntry"] = Value::Bool(stop);
         } else {
             arguments["stopOnEntry"] = Value::Bool(stop);
@@ -265,14 +373,23 @@ mod tests {
     fn explicit_selection_inherits_registered_arguments_and_merges_only_defaults() {
         logged("inherit_and_merge");
         let directory = tempfile::tempdir().unwrap();
-        write_config(directory.path(), json!({"adapters":{"debugpy":{
-            "command":"./venv/bin/python", "launchDefaults":{"justMyCode":false},
-            "attachDefaults":{"logToFile":false}
-        }}}));
+        write_config(
+            directory.path(),
+            json!({"adapters":{"debugpy":{
+                "command":"./venv/bin/python", "launchDefaults":{"justMyCode":false},
+                "attachDefaults":{"logToFile":false}
+            }}}),
+        );
         let selection = selected(directory.path(), "debugpy").unwrap();
         assert_eq!(selection.adapter.adapter_args, ["-m", "debugpy.adapter"]);
-        assert_eq!(Path::new(&selection.adapter.command_candidates[0]),
-            directory.path().canonicalize().unwrap().join("venv/bin/python"));
+        assert_eq!(
+            Path::new(&selection.adapter.command_candidates[0]),
+            directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("venv/bin/python")
+        );
         let mut launch = json!({"program":"app.py","args":["a b"],"cwd":"workspace"});
         selection.apply_defaults("launch", &mut launch);
         assert_eq!(launch["justMyCode"], false);
@@ -287,10 +404,13 @@ mod tests {
     fn custom_adapters_are_literal_and_never_selected_implicitly() {
         logged("explicit_literal");
         let directory = tempfile::tempdir().unwrap();
-        write_config(directory.path(), json!({"adapters":{"custom":{
-            "command":"/opt/debug adapter", "args":["a b","$(no-shell)",""],
-            "acceptsDirectoryProgram":true,"connectMode":"stdio"
-        }}}));
+        write_config(
+            directory.path(),
+            json!({"adapters":{"custom":{
+                "command":"/opt/debug adapter", "args":["a b","$(no-shell)",""],
+                "acceptsDirectoryProgram":true,"connectMode":"stdio"
+            }}}),
+        );
         let selection = selected(directory.path(), "custom").unwrap();
         assert_eq!(selection.adapter.command_candidates, ["/opt/debug adapter"]);
         assert_eq!(selection.adapter.adapter_args, ["a b", "$(no-shell)", ""]);
@@ -315,8 +435,17 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         for mode in ["tcp", "socket", "invalid"] {
-            write_config(directory.path(), json!({"adapters":{"custom":{"command":"adapter","connectMode":mode}}}));
-            assert!(selected(directory.path(), "custom").err().unwrap().to_string().contains("DAP_UNSUPPORTED"));
+            write_config(
+                directory.path(),
+                json!({"adapters":{"custom":{"command":"adapter","connectMode":mode}}}),
+            );
+            assert!(
+                selected(directory.path(), "custom")
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("DAP_UNSUPPORTED")
+            );
         }
     }
 
@@ -324,16 +453,34 @@ mod tests {
     fn configuration_cannot_redirect_host_owned_startup_fields() {
         logged("owned_fields");
         let directory = tempfile::tempdir().unwrap();
-        for key in ["program","cwd","args","pid","processId","mode","output",
-            "stopOnEntry","stopAtBeginningOfMainSubprogram","stopAtEntry","console","runInTerminal",
-            "redirectOutput","subProcess","request","type"] {
+        for key in [
+            "program",
+            "cwd",
+            "args",
+            "pid",
+            "processId",
+            "mode",
+            "output",
+            "stopOnEntry",
+            "stopAtBeginningOfMainSubprogram",
+            "stopAtEntry",
+            "console",
+            "runInTerminal",
+            "redirectOutput",
+            "subProcess",
+            "request",
+            "type",
+        ] {
             for field in ["launchDefaults", "attachDefaults"] {
                 let mut definition = json!({"command":"adapter"});
                 let mut forbidden = Map::new();
                 forbidden.insert(key.to_owned(), json!("forbidden"));
                 definition[field] = Value::Object(forbidden);
                 write_config(directory.path(), json!({"adapters":{"custom":definition}}));
-                assert!(selected(directory.path(), "custom").is_err(), "accepted {field}.{key}");
+                assert!(
+                    selected(directory.path(), "custom").is_err(),
+                    "accepted {field}.{key}"
+                );
             }
         }
     }
@@ -342,15 +489,28 @@ mod tests {
     fn invalid_and_oversized_configuration_never_falls_back_or_echoes_secrets() {
         logged("invalid_and_bounded");
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("dap.json"), vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        std::fs::write(
+            directory.path().join("dap.json"),
+            vec![b' '; MAX_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
         assert!(selected(directory.path(), "debugpy").is_err());
-        write_config(directory.path(), json!({"adapters":{"debugpy":{"args":"SECRET-CONFIG-CANARY"}}}));
-        let error = selected(directory.path(), "debugpy").err().unwrap().to_string();
+        write_config(
+            directory.path(),
+            json!({"adapters":{"debugpy":{"args":"SECRET-CONFIG-CANARY"}}}),
+        );
+        let error = selected(directory.path(), "debugpy")
+            .err()
+            .unwrap()
+            .to_string();
         assert!(error.contains("DAP_CONFIG"));
         assert!(!error.contains("SECRET-CONFIG-CANARY"));
         write_config(directory.path(), json!({"adapters":{"custom":{}}}));
         assert!(selected(directory.path(), "custom").is_err());
-        write_config(directory.path(), json!({"adapters":{"custom":{"command":"adapter","args":["bad\u{0000}arg"]}}}));
+        write_config(
+            directory.path(),
+            json!({"adapters":{"custom":{"command":"adapter","args":["bad\u{0000}arg"]}}}),
+        );
         assert!(selected(directory.path(), "custom").is_err());
     }
 
@@ -358,10 +518,21 @@ mod tests {
     fn codelldb_rejects_tcp_mode_arguments_even_when_config_claims_stdio() {
         logged("codelldb_transport_arguments");
         let directory = tempfile::tempdir().unwrap();
-        for argument in ["--port", "--port=0", "--connect", "--connect=5000", "--multi-session", "--multi-session=true", "--"] {
-            write_config(directory.path(), json!({"adapters":{"codelldb":{
-                "command":"adapter", "args":[argument], "connectMode":"stdio"
-            }}}));
+        for argument in [
+            "--port",
+            "--port=0",
+            "--connect",
+            "--connect=5000",
+            "--multi-session",
+            "--multi-session=true",
+            "--",
+        ] {
+            write_config(
+                directory.path(),
+                json!({"adapters":{"codelldb":{
+                    "command":"adapter", "args":[argument], "connectMode":"stdio"
+                }}}),
+            );
             let error = selected(directory.path(), "codelldb").err().unwrap();
             assert!(error.to_string().contains("DAP_UNSUPPORTED"));
         }
@@ -371,14 +542,41 @@ mod tests {
     fn codelldb_command_only_override_keeps_native_stdio_and_custom_ids_are_not_restricted() {
         logged("codelldb_profile_inheritance");
         let directory = tempfile::tempdir().unwrap();
-        write_config(directory.path(), json!({"adapters":{"codelldb":{"command":"./adapter"}}}));
-        assert!(selected(directory.path(), "codelldb").unwrap().adapter.adapter_args.is_empty());
-        write_config(directory.path(), json!({"adapters":{"codelldb":{
-            "command":"adapter", "args":["--liblldb","/opt/LLDB library"]
-        }}}));
-        assert_eq!(selected(directory.path(), "codelldb").unwrap().adapter.adapter_args, ["--liblldb", "/opt/LLDB library"]);
-        write_config(directory.path(), json!({"adapters":{"custom":{"command":"adapter","args":["--port","0"]}}}));
-        assert_eq!(selected(directory.path(), "custom").unwrap().adapter.adapter_args, ["--port", "0"]);
+        write_config(
+            directory.path(),
+            json!({"adapters":{"codelldb":{"command":"./adapter"}}}),
+        );
+        assert!(
+            selected(directory.path(), "codelldb")
+                .unwrap()
+                .adapter
+                .adapter_args
+                .is_empty()
+        );
+        write_config(
+            directory.path(),
+            json!({"adapters":{"codelldb":{
+                "command":"adapter", "args":["--liblldb","/opt/LLDB library"]
+            }}}),
+        );
+        assert_eq!(
+            selected(directory.path(), "codelldb")
+                .unwrap()
+                .adapter
+                .adapter_args,
+            ["--liblldb", "/opt/LLDB library"]
+        );
+        write_config(
+            directory.path(),
+            json!({"adapters":{"custom":{"command":"adapter","args":["--port","0"]}}}),
+        );
+        assert_eq!(
+            selected(directory.path(), "custom")
+                .unwrap()
+                .adapter
+                .adapter_args,
+            ["--port", "0"]
+        );
     }
 
     #[cfg(unix)]
@@ -387,8 +585,15 @@ mod tests {
         logged("symlink_boundary");
         let directory = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        write_config(outside.path(), json!({"adapters":{"custom":{"command":"adapter"}}}));
-        std::os::unix::fs::symlink(outside.path().join("dap.json"), directory.path().join("dap.json")).unwrap();
+        write_config(
+            outside.path(),
+            json!({"adapters":{"custom":{"command":"adapter"}}}),
+        );
+        std::os::unix::fs::symlink(
+            outside.path().join("dap.json"),
+            directory.path().join("dap.json"),
+        )
+        .unwrap();
         assert!(selected(directory.path(), "custom").is_err());
     }
 }

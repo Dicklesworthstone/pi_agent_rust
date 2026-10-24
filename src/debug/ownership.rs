@@ -29,10 +29,16 @@ impl DebugTool {
     /// Shallow snapshots preserve the same tool and must not rebind it here.
     pub(super) fn bind_debug_scope(&mut self, scope: JobSessionScope) {
         self.session_scope = scope;
-        let session = self.session.get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        let owners = std::mem::take(self.session_owners.get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner));
+        let session = self
+            .session
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let owners = std::mem::take(
+            self.session_owners
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         // DAP transport/process cleanup runs without a slot/map mutex held.
         drop(session);
         drop(owners);
@@ -41,7 +47,10 @@ impl DebugTool {
     pub(super) async fn debug_owner(&self, owner: &AgentCx) -> Result<String> {
         let id = identity::resolve(&self.session_scope, owner).await?;
         if id.len() > MAX_OWNER_BYTES {
-            return Err(tool_err("DAP_SESSION_UNAVAILABLE", "agent session identity exceeds 1024 bytes"));
+            return Err(tool_err(
+                "DAP_SESSION_UNAVAILABLE",
+                "agent session identity exceeds 1024 bytes",
+            ));
         }
         Ok(id)
     }

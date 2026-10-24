@@ -1443,9 +1443,9 @@ fn run_rpc_mcp_auth(
                 let guard = OwnedMutexGuard::lock(session, &owner)
                     .await
                     .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                let manager = guard
-                    .mcp_manager()
-                    .ok_or_else(|| Error::validation("MCP discovery is disabled for this session"))?;
+                let manager = guard.mcp_manager().ok_or_else(|| {
+                    Error::validation("MCP discovery is disabled for this session")
+                })?;
                 (manager, guard.agent.shared_tools())
             };
             let cleanup_manager = Arc::clone(&manager);
@@ -6245,8 +6245,7 @@ async fn preserve_terminal_rpc_state(
                 &timestamp,
                 bound_parent_id.as_deref(),
             )?;
-            if reset_advisor_on_authored_input
-                && in_flight.delivery.keyword_scan_source().is_some()
+            if reset_advisor_on_authored_input && in_flight.delivery.keyword_scan_source().is_some()
             {
                 parent_id = Some(crate::agent::append_advisor_input_reset(
                     &mut candidate,
@@ -15441,7 +15440,9 @@ fn session_state(
         .provider
         .as_deref()
         .zip(session.header.model_id.as_deref())
-        .and_then(|(provider, model_id)| model_entry_for_provider_and_id(provider, model_id, models));
+        .and_then(|(provider, model_id)| {
+            model_entry_for_provider_and_id(provider, model_id, models)
+        });
     let model = model_entry.map(rpc_model_from_entry);
     let context_tokens =
         crate::compaction::estimate_model_context_tokens(&session.to_messages_for_current_path());
@@ -17406,11 +17407,17 @@ mod tests {
                 .map(|line| parse_response(&line))
                 .collect::<Vec<_>>();
             assert_eq!(
-                events.iter().filter(|event| event["type"] == "auto_compaction_start").count(),
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_compaction_start")
+                    .count(),
                 1,
             );
             assert_eq!(
-                events.iter().filter(|event| event["type"] == "auto_compaction_end").count(),
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_compaction_end")
+                    .count(),
                 1,
             );
             assert!(events.iter().all(|event| event["type"] != "agent_end"));
@@ -17485,10 +17492,14 @@ mod tests {
                     .send(&cx, json!({"id": "h", "type": "handoff"}).to_string())
                     .await
                     .unwrap();
-                asupersync::time::timeout(wall_now(), Duration::from_secs(10), entered_rx.recv(&cx))
-                    .await
-                    .expect("handoff provider starts")
-                    .unwrap();
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    entered_rx.recv(&cx),
+                )
+                .await
+                .expect("handoff provider starts")
+                .unwrap();
                 let state = send_recv(
                     &in_tx,
                     &out_rx,
@@ -17521,7 +17532,9 @@ mod tests {
                 let mut ended = false;
                 let handoff = loop {
                     let frame = parse_response(
-                        &recv_line(&out_rx, "handoff terminal failure").await.unwrap(),
+                        &recv_line(&out_rx, "handoff terminal failure")
+                            .await
+                            .unwrap(),
                     );
                     match frame["type"].as_str() {
                         Some("auto_compaction_end") => {
@@ -17547,21 +17560,21 @@ mod tests {
                 assert_eq!(state["data"]["isCompacting"], false);
                 drop(in_tx);
             };
-            let (result, ()) = futures::future::join(
-                Box::pin(run(agent_session, options, in_rx, out_tx)),
-                client,
-            )
-            .await;
+            let (result, ()) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
             result.expect("cancelled handoff does not poison the session");
             assert_eq!(
                 serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap(),
                 before,
             );
-            assert!(out_rx
-                .lock()
-                .unwrap()
-                .try_iter()
-                .all(|line| parse_response(&line)["type"] != "agent_end"));
+            assert!(
+                out_rx
+                    .lock()
+                    .unwrap()
+                    .try_iter()
+                    .all(|line| parse_response(&line)["type"] != "agent_end")
+            );
         }));
     }
 
@@ -17573,7 +17586,10 @@ mod tests {
                 true,
             )
             .unwrap(),
-            ("remote  service".to_string(), Some("native-public-client".to_string())),
+            (
+                "remote  service".to_string(),
+                Some("native-public-client".to_string())
+            ),
         );
         assert_eq!(
             parse_mcp_auth_request(&json!({"server": "日本語 server"}), false).unwrap(),
@@ -17594,9 +17610,13 @@ mod tests {
         ] {
             assert!(parse_mcp_auth_request(&invalid, true).is_err(), "{invalid}");
         }
-        assert!(parse_mcp_auth_request(
-            &json!({"server": "remote", "clientId": "public-client"}), false,
-        ).is_err());
+        assert!(
+            parse_mcp_auth_request(
+                &json!({"server": "remote", "clientId": "public-client"}),
+                false,
+            )
+            .is_err()
+        );
         for command in ["mcp_reauth", "mcp_unauth"] {
             assert!(!command_resumes_rpc_agent(command, &json!({}), None));
             assert!(!command_can_queue_while_rpc_agent_streams(command));
@@ -17609,7 +17629,8 @@ mod tests {
             .build()
             .unwrap();
         for reauth in [true, false] {
-            let session = handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+            let session =
+                handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
             let compacting = Arc::new(AtomicBool::new(true));
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
             let future = run_rpc_mcp_auth(
@@ -17645,7 +17666,8 @@ mod tests {
             .expect("runtime");
         let runtime_handle = runtime.handle();
         runtime.block_on(Box::pin(async move {
-            let session = handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+            let session =
+                handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
             let compacting = Arc::new(AtomicBool::new(true));
             let abort_slot = Arc::new(asupersync::sync::Mutex::new(None));
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
@@ -17671,7 +17693,13 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(frames.len(), 1);
             assert_err(&frames[0], "mcp_reauth");
-            assert!(frames[0]["error"].as_str().unwrap().to_lowercase().contains("abort"));
+            assert!(
+                frames[0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("abort")
+            );
             assert_eq!(frames[0]["id"], "already-aborted");
         }));
     }
@@ -17694,12 +17722,17 @@ mod tests {
                 });
                 let session = handoff_agent_session(Session::in_memory(), false, provider);
                 let inner = Arc::clone(&session.session);
-                let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
                 let (in_tx, in_rx) = mpsc::channel(4);
-                in_tx.send(
-                    &asupersync::Cx::for_testing(),
-                    json!({"id": "auth", "type": command, "server": "remote  service"}).to_string(),
-                ).await.unwrap();
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        json!({"id": "auth", "type": command, "server": "remote  service"})
+                            .to_string(),
+                    )
+                    .await
+                    .unwrap();
                 drop(in_tx);
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
                 Box::pin(run(session, options, in_rx, out_tx))
@@ -17712,7 +17745,12 @@ mod tests {
                 assert_eq!(frames.len(), 1, "operator auth emits no agent lifecycle");
                 assert_err(&frames[0], command);
                 assert_eq!(frames[0]["id"], "auth");
-                assert!(frames[0]["error"].as_str().unwrap().contains("MCP discovery is disabled"));
+                assert!(
+                    frames[0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("MCP discovery is disabled")
+                );
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 assert!(inner.try_lock().unwrap().entries.is_empty());
             }));
@@ -17776,7 +17814,8 @@ mod tests {
                 let agent_session = handoff_agent_session(stored, persistence_failure, provider);
                 let inner = Arc::clone(&agent_session.session);
                 let gate = agent_session.provider_admission_gate();
-                let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
                 let (in_tx, in_rx) = mpsc::channel(4);
                 in_tx
                     .send(
@@ -17807,10 +17846,12 @@ mod tests {
                 assert_err(responses[0], "handoff");
                 assert!(responses[0]["errorHints"].is_object());
                 assert!(events.iter().all(|event| event["type"] != "agent_end"));
-                assert!(events
-                    .iter()
-                    .filter(|event| event["type"] == "auto_compaction_end")
-                    .all(|event| event.get("result").is_none_or(Value::is_null)));
+                assert!(
+                    events
+                        .iter()
+                        .filter(|event| event["type"] == "auto_compaction_end")
+                        .all(|event| event.get("result").is_none_or(Value::is_null))
+                );
                 assert_eq!(
                     serde_json::to_value(&inner.try_lock().unwrap().entries).unwrap(),
                     before,
@@ -24086,11 +24127,13 @@ export default function init(pi) {
             .entries_for_current_path()
             .into_iter()
             .filter_map(|entry| match entry {
-                SessionEntry::Custom(custom) if custom.custom_type == "advisor_continuation" => custom
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("count"))
-                    .and_then(Value::as_u64),
+                SessionEntry::Custom(custom) if custom.custom_type == "advisor_continuation" => {
+                    custom
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("count"))
+                        .and_then(Value::as_u64)
+                }
                 _ => None,
             })
             .collect()
@@ -24164,7 +24207,11 @@ export default function init(pi) {
                     inner.path = Some(path.clone());
                 }
                 assert_eq!(
-                    shared_state.lock(&cx).await.expect("retained queue").pending_count(),
+                    shared_state
+                        .lock(&cx)
+                        .await
+                        .expect("retained queue")
+                        .pending_count(),
                     1
                 );
                 assert_eq!(
@@ -24242,7 +24289,11 @@ export default function init(pi) {
                     Some(Arc::new(move || {
                         let delivery = Arc::clone(&delivery);
                         Box::pin(async move {
-                            delivery.lock().expect("leased input").take().unwrap_or_default()
+                            delivery
+                                .lock()
+                                .expect("leased input")
+                                .take()
+                                .unwrap_or_default()
                         })
                     })),
                     None,
@@ -24269,14 +24320,16 @@ export default function init(pi) {
                     stop_reason: StopReason::ToolUse,
                     ..AssistantMessage::default()
                 })));
-                agent.add_message(Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
-                    tool_call_id: "completed-effect".to_string(),
-                    tool_name: "read".to_string(),
-                    content: vec![ContentBlock::Text(TextContent::new("completed output"))],
-                    details: None,
-                    is_error: false,
-                    timestamp: 2,
-                })));
+                agent.add_message(Message::ToolResult(Arc::new(
+                    crate::model::ToolResultMessage {
+                        tool_call_id: "completed-effect".to_string(),
+                        tool_name: "read".to_string(),
+                        content: vec![ContentBlock::Text(TextContent::new("completed output"))],
+                        details: None,
+                        is_error: false,
+                        timestamp: 2,
+                    },
+                )));
                 let inner_session = Arc::new(asupersync::sync::Mutex::new(stored));
                 let mut agent_session = AgentSession::new(
                     agent,
@@ -24305,7 +24358,10 @@ export default function init(pi) {
                 let messages = reopened.to_messages_for_current_path();
                 assert_eq!(messages.len(), 4, "one input and one completed tool pair");
                 assert_eq!(
-                    messages.iter().filter(|message| matches!(message, Message::User(_))).count(),
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count(),
                     2,
                     "the in-flight lease must not duplicate its recovered user message"
                 );

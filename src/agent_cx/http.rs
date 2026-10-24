@@ -120,7 +120,7 @@ impl<'a> AgentHttpRequest<'a> {
 
     /// Disable the transport timeout, not the owner's cancellation boundary.
     #[must_use]
-    pub fn no_timeout(mut self, ) -> Self {
+    pub fn no_timeout(mut self) -> Self {
         self.request = self.request.no_timeout();
         self
     }
@@ -577,7 +577,10 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(body.stream.is_none());
         assert!(body.cancellation.is_none());
-        assert!(matches!(Pin::new(&mut body).poll_next(&mut task), Poll::Ready(None)));
+        assert!(matches!(
+            Pin::new(&mut body).poll_next(&mut task),
+            Poll::Ready(None)
+        ));
         drop(body);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(Cx::current().unwrap().budget(), parent.budget());
@@ -601,9 +604,10 @@ mod tests {
 
     #[test]
     fn transport_error_racing_cancellation_keeps_its_original_diagnostic() {
-        let (mut body, polls, drops) = racing_body(Poll::Ready(Some(Err(
-            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "original reset"),
-        ))));
+        let (mut body, polls, drops) = racing_body(Poll::Ready(Some(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "original reset",
+        )))));
         let mut task = Context::from_waker(Waker::noop());
         let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_next(&mut task) else {
             panic!("native failure must be preserved");
@@ -613,13 +617,17 @@ mod tests {
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(body.cancellation.is_none());
-        assert!(matches!(Pin::new(&mut body).poll_next(&mut task), Poll::Ready(None)));
+        assert!(matches!(
+            Pin::new(&mut body).poll_next(&mut task),
+            Poll::Ready(None)
+        ));
     }
 
     #[test]
     fn precancelled_body_never_polls_the_transport() {
         let (mut body, polls, drops) = racing_body(Poll::Ready(Some(Ok(vec![1, 2, 3]))));
-        body.owner.cancel_with(asupersync::types::CancelKind::User, Some("before read"));
+        body.owner
+            .cancel_with(asupersync::types::CancelKind::User, Some("before read"));
         let mut task = Context::from_waker(Waker::noop());
         let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_next(&mut task) else {
             panic!("read must not be admitted");
@@ -632,7 +640,10 @@ mod tests {
     #[test]
     fn cancelled_poller_cannot_cancel_an_unrelated_body_owner() {
         let parent = Cx::for_request();
-        parent.cancel_with(asupersync::types::CancelKind::User, Some("unrelated caller"));
+        parent.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("unrelated caller"),
+        );
         let _parent_guard = parent.set_current_restricted();
         let mut body = OwnedBody::new(
             AgentCx::for_request(),
@@ -643,7 +654,10 @@ mod tests {
             panic!("only the captured owner controls this body");
         };
         assert_eq!(bytes, [0, 255, 1]);
-        assert!(matches!(Pin::new(&mut body).poll_next(&mut task), Poll::Ready(None)));
+        assert!(matches!(
+            Pin::new(&mut body).poll_next(&mut task),
+            Poll::Ready(None)
+        ));
         assert!(Cx::current().unwrap().is_cancel_requested());
     }
 
@@ -660,7 +674,10 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(matches!(Pin::new(&mut sse).poll_next(&mut task), Poll::Ready(None)));
+        assert!(matches!(
+            Pin::new(&mut sse).poll_next(&mut task),
+            Poll::Ready(None)
+        ));
     }
 
     struct ReadyBody {
@@ -696,7 +713,11 @@ mod tests {
             reads: Arc::clone(&reads),
             drops: Arc::clone(&drops),
         };
-        (Box::pin(OwnedBody::new(owner, Box::pin(native))), reads, drops)
+        (
+            Box::pin(OwnedBody::new(owner, Box::pin(native))),
+            reads,
+            drops,
+        )
     }
 
     #[test]
@@ -705,10 +726,8 @@ mod tests {
             .map(|index| vec![u8::try_from(index % 256).unwrap(), 0, 255])
             .collect();
         let expected: Vec<_> = chunks.iter().flatten().copied().collect();
-        let (body, reads, drops) = ready_body(
-            AgentCx::for_request(),
-            chunks.into_iter().map(Ok).collect(),
-        );
+        let (body, reads, drops) =
+            ready_body(AgentCx::for_request(), chunks.into_iter().map(Ok).collect());
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&counter));
         let mut task = Context::from_waker(&waker);
@@ -733,13 +752,18 @@ mod tests {
         // Finite fixture: without the yield this fails, rather than hanging.
         let (body, reads, drops) = ready_body(
             owner.clone(),
-            (0..BODY_CHUNKS_PER_YIELD * 4).map(|_| Ok(Vec::new())).collect(),
+            (0..BODY_CHUNKS_PER_YIELD * 4)
+                .map(|_| Ok(Vec::new()))
+                .collect(),
         );
         let mut collect = Box::pin(collect_body_limited(body, 0));
         let mut task = Context::from_waker(Waker::noop());
         assert!(collect.as_mut().poll(&mut task).is_pending());
         assert_eq!(reads.load(Ordering::SeqCst), BODY_CHUNKS_PER_YIELD);
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel empty body"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel empty body"),
+        );
         let Poll::Ready(Err(error)) = collect.as_mut().poll(&mut task) else {
             panic!("cancellation must retire the body before another native read");
         };
@@ -764,14 +788,18 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let (empty, _, _) = ready_body(AgentCx::for_request(), Vec::new());
         let mut empty = Box::pin(collect_body_limited(empty, 0));
-        assert!(matches!(empty.as_mut().poll(&mut task), Poll::Ready(Ok(bytes)) if bytes.is_empty()));
+        assert!(
+            matches!(empty.as_mut().poll(&mut task), Poll::Ready(Ok(bytes)) if bytes.is_empty())
+        );
     }
 
     #[test]
     fn overflow_after_a_yield_is_not_partial_success_and_releases_the_body() {
         let (body, reads, drops) = ready_body(
             AgentCx::for_request(),
-            (0..BODY_CHUNKS_PER_YIELD + 2).map(|_| Ok(vec![42])).collect(),
+            (0..BODY_CHUNKS_PER_YIELD + 2)
+                .map(|_| Ok(vec![42]))
+                .collect(),
         );
         let mut collect = Box::pin(collect_body_limited(body, BODY_CHUNKS_PER_YIELD));
         let mut task = Context::from_waker(Waker::noop());
@@ -787,7 +815,10 @@ mod tests {
     #[test]
     fn transport_error_after_a_yield_is_not_lost_or_replaced_with_eof() {
         let mut chunks: Vec<_> = (0..BODY_CHUNKS_PER_YIELD).map(|_| Ok(Vec::new())).collect();
-        chunks.push(Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "body reset")));
+        chunks.push(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "body reset",
+        )));
         let (body, reads, drops) = ready_body(AgentCx::for_request(), chunks);
         let mut collect = Box::pin(collect_body_limited(body, 0));
         let mut task = Context::from_waker(Waker::noop());
@@ -805,7 +836,9 @@ mod tests {
         let owner = AgentCx::for_request();
         let (body, _, drops) = ready_body(
             owner.clone(),
-            (0..BODY_CHUNKS_PER_YIELD * 2).map(|_| Ok(Vec::new())).collect(),
+            (0..BODY_CHUNKS_PER_YIELD * 2)
+                .map(|_| Ok(Vec::new()))
+                .collect(),
         );
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&counter));
@@ -815,18 +848,25 @@ mod tests {
         drop(collect);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let before = counter.0.load(Ordering::SeqCst);
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("after collection drop"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("after collection drop"),
+        );
         assert_eq!(counter.0.load(Ordering::SeqCst), before);
     }
 
     #[test]
     fn joined_canceller_runs_before_a_ready_body_is_fully_collected() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
         runtime.block_on(async {
             let (body, reads, drops) = ready_body(
                 owner.clone(),
-                (0..BODY_CHUNKS_PER_YIELD * 4).map(|_| Ok(Vec::new())).collect(),
+                (0..BODY_CHUNKS_PER_YIELD * 4)
+                    .map(|_| Ok(Vec::new()))
+                    .collect(),
             );
             let collect = collect_body_limited(body, 0);
             let cancel = async {

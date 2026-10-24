@@ -9,14 +9,18 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn run<F: std::future::Future>(future: F) -> F::Output {
-    asupersync::runtime::RuntimeBuilder::current_thread().blocking_threads(1, 8)
-        .build().expect("workflow checkpoint test runtime").block_on(future)
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 8)
+        .build()
+        .expect("workflow checkpoint test runtime")
+        .block_on(future)
 }
 
 fn end(text: &str) -> String {
     let event = json!({"type":"agent_end", "messages":[{
         "role":"assistant", "stopReason":"stop", "content":[{"type":"text","text":text}]
-    }]}).to_string();
+    }]})
+    .to_string();
     format!("printf '%s\\n' '{}'", event.replace('\'', "'\"'\"'"))
 }
 
@@ -24,12 +28,15 @@ fn fixture(script: &str) -> (tempfile::TempDir, SubagentTool, String) {
     let root = tempfile::tempdir().expect("isolated checkpoint workspace");
     let global = root.path().join("global");
     std::fs::create_dir_all(global.join("agents")).expect("agent directory");
-    std::fs::write(global.join("agents/worker.md"),
-        "---\nname: worker\ndescription: checkpoint fixture\n---\nDo the assigned work.\n")
-        .expect("agent definition");
+    std::fs::write(
+        global.join("agents/worker.md"),
+        "---\nname: worker\ndescription: checkpoint fixture\n---\nDo the assigned work.\n",
+    )
+    .expect("agent definition");
     let child = root.path().join("child.sh");
     std::fs::write(&child, format!("#!/bin/sh\nset -eu\n{script}\n")).expect("child script");
-    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).expect("executable child");
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700))
+        .expect("executable child");
     let session = format!("workflow-checkpoint-{}", uuid::Uuid::new_v4());
     let mut tool = SubagentTool::with_paths(root.path().to_path_buf(), global, child)
         .with_timeout(Duration::from_secs(20));
@@ -46,21 +53,33 @@ fn request(nodes: Vec<Value>) -> Value {
 }
 
 async fn launch(tool: &SubagentTool, input: Value) -> String {
-    let output = tool.execute("checkpoint", input, None).await.expect("graph admission");
+    let output = tool
+        .execute("checkpoint", input, None)
+        .await
+        .expect("graph admission");
     assert!(!output.is_error);
-    output.details.expect("job receipt")["jobId"].as_str().expect("job ID").to_owned()
+    output.details.expect("job receipt")["jobId"]
+        .as_str()
+        .expect("job ID")
+        .to_owned()
 }
 
 async fn marker(path: &Path) {
     let until = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
-        assert!(Instant::now() < until, "child marker absent: {}", path.display());
+        assert!(
+            Instant::now() < until,
+            "child marker absent: {}",
+            path.display()
+        );
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
     }
 }
 
 async fn settled(session: &str, id: &str) -> JobSnapshot {
-    let snapshot = crate::jobs::wait_async(session, id, Duration::from_secs(10)).await.expect("job wait");
+    let snapshot = crate::jobs::wait_async(session, id, Duration::from_secs(10))
+        .await
+        .expect("job wait");
     assert_ne!(snapshot.status, "running");
     snapshot
 }
@@ -76,7 +95,8 @@ fn partial(snapshot: &JobSnapshot, wrapper: &str) -> Value {
 }
 
 fn staged_script() -> String {
-    format!(r#"
+    format!(
+        r#"
 for task do :; done
 case "$task" in
   'Task: seed') printf 'accepted\n' > accepted.txt; {} ;;
@@ -84,7 +104,11 @@ case "$task" in
   'Task: tail') touch tail.ran; {} ;;
   *) exit 19 ;;
 esac
-"#, end("41"), end("42"), end("done"))
+"#,
+        end("41"),
+        end("42"),
+        end("done")
+    )
 }
 
 fn staged_request() -> Value {
@@ -94,9 +118,16 @@ fn staged_request() -> Value {
 }
 
 fn git(root: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git").current_dir(root).args(args)
-        .output().expect("fixture git command");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .expect("fixture git command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -107,12 +138,18 @@ fn accepted_worktree_wave_is_inspectable_before_dependants_finish() {
     let storage = tempfile::tempdir().expect("independent agent storage");
     let global = storage.path().join("global");
     std::fs::create_dir_all(global.join("agents")).expect("external definitions");
-    std::fs::copy(tool.global_dir.join("agents/worker.md"), global.join("agents/worker.md"))
-        .expect("copy controlled definition");
+    std::fs::copy(
+        tool.global_dir.join("agents/worker.md"),
+        global.join("agents/worker.md"),
+    )
+    .expect("copy controlled definition");
     tool.global_dir = global;
     git(root.path(), &["init", "-b", "main"]);
     git(root.path(), &["config", "user.name", "Checkpoint fixture"]);
-    git(root.path(), &["config", "user.email", "checkpoint@example.invalid"]);
+    git(
+        root.path(),
+        &["config", "user.email", "checkpoint@example.invalid"],
+    );
     std::fs::write(root.path().join("tracked.txt"), "baseline\n").expect("baseline");
     git(root.path(), &["add", "tracked.txt"]);
     git(root.path(), &["commit", "-m", "fixture baseline"]);
@@ -122,7 +159,9 @@ fn accepted_worktree_wave_is_inspectable_before_dependants_finish() {
     run(async {
         let id = launch(&tool, input).await;
         marker(&root.path().join("hold.pid")).await;
-        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO).await.expect("live snapshot");
+        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO)
+            .await
+            .expect("live snapshot");
         let notices = crate::jobs::take_completion_notices(&session);
         std::fs::write(root.path().join("release"), "go").expect("release native child");
         let final_job = settled(&session, &id).await;
@@ -138,9 +177,16 @@ fn accepted_worktree_wave_is_inspectable_before_dependants_finish() {
         assert!(evidence["nodes"][0]["hubId"].as_str().is_some());
         assert_eq!(evidence["nodes"][1]["result"], Value::Null);
         assert!(notices.is_empty(), "checkpoints are not completion notices");
-        assert_eq!(std::fs::read_to_string(root.path().join("accepted.txt")).expect("accepted edit"), "accepted\n");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("accepted.txt")).expect("accepted edit"),
+            "accepted\n"
+        );
         assert_eq!(final_job.status, "exited");
-        let report = final_job.result.expect("terminal native report").details.expect("graph report");
+        let report = final_job
+            .result
+            .expect("terminal native report")
+            .details
+            .expect("graph report");
         assert_eq!(report["schema"], "pi.subagent.workflow.v1");
         assert_eq!(report["acceptedNodes"], 3);
         assert!(report.get("partialResult").is_none());
@@ -155,11 +201,18 @@ fn cancellation_preserves_settled_evidence_without_inventing_unfinished_results(
     run(async {
         let id = launch(&tool, staged_request()).await;
         marker(&root.path().join("hold.pid")).await;
-        let before = crate::jobs::wait_async(&session, &id, Duration::ZERO).await.expect("before cancellation");
-        let stopped = crate::jobs::cancel_async(&session, &id).await.expect("owned cancellation");
+        let before = crate::jobs::wait_async(&session, &id, Duration::ZERO)
+            .await
+            .expect("before cancellation");
+        let stopped = crate::jobs::cancel_async(&session, &id)
+            .await
+            .expect("owned cancellation");
         assert_eq!(stopped.status, "killed");
         assert!(stopped.result.as_ref().expect("cancelled result").is_error);
-        assert_eq!(partial(&stopped, "pi.host_job.interrupted.v1"), partial(&before, "pi.host_job.progress.v1"));
+        assert_eq!(
+            partial(&stopped, "pi.host_job.interrupted.v1"),
+            partial(&before, "pi.host_job.progress.v1")
+        );
         let evidence = partial(&stopped, "pi.host_job.interrupted.v1");
         for index in [1, 2] {
             assert_eq!(evidence["nodes"][index]["state"], "pending");
@@ -167,11 +220,21 @@ fn cancellation_preserves_settled_evidence_without_inventing_unfinished_results(
             assert_eq!(evidence["nodes"][index]["result"], Value::Null);
         }
         assert!(!root.path().join("tail.ran").exists());
-        assert!(root.path().join("accepted.txt").exists(), "cancellation is not rollback");
+        assert!(
+            root.path().join("accepted.txt").exists(),
+            "cancellation is not rollback"
+        );
         let pid = std::fs::read_to_string(root.path().join("hold.pid")).expect("real child PID");
-        let live = std::process::Command::new("kill").args(["-0", pid.trim()])
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().expect("PID liveness probe");
-        assert!(!live.success(), "native child must be reaped before terminal cancellation");
+        let live = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("PID liveness probe");
+        assert!(
+            !live.success(),
+            "native child must be reaped before terminal cancellation"
+        );
         let again = settled(&session, &id).await;
         assert_eq!(partial(&again, "pi.host_job.interrupted.v1"), evidence);
     });
@@ -200,7 +263,8 @@ fn original_deadline_retains_checkpoint_and_never_launches_later_waves() {
 #[test]
 fn an_independent_failure_is_visible_in_progress_without_ending_the_whole_job() {
     let _guard = crate::jobs::process_test_guard();
-    let script = format!(r#"
+    let script = format!(
+        r#"
 for task do :; done
 case "$task" in
   'Task: bad') exit 23 ;;
@@ -209,13 +273,26 @@ case "$task" in
   'Task: hold') touch holding; while [ ! -f release ]; do sleep 0.02; done; {} ;;
   *) exit 19 ;;
 esac
-"#, end("accepted peer"), end("done"));
+"#,
+        end("accepted peer"),
+        end("done")
+    );
     let (root, tool, session) = fixture(&script);
     run(async {
-        let id = launch(&tool, request(vec![node("bad", &[]), node("good", &[]),
-            node("blocked", &["bad"]), node("hold", &["good"])] )).await;
+        let id = launch(
+            &tool,
+            request(vec![
+                node("bad", &[]),
+                node("good", &[]),
+                node("blocked", &["bad"]),
+                node("hold", &["good"]),
+            ]),
+        )
+        .await;
         marker(&root.path().join("holding")).await;
-        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO).await.expect("mixed wave checkpoint");
+        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO)
+            .await
+            .expect("mixed wave checkpoint");
         std::fs::write(root.path().join("release"), "go").expect("release independent work");
         let final_job = settled(&session, &id).await;
         assert_eq!(observed.status, "running");
@@ -226,7 +303,11 @@ esac
         assert_eq!(evidence["nodes"][0]["state"], "rejected");
         assert_eq!(evidence["nodes"][0]["result"]["isError"], true);
         assert_eq!(final_job.status, "failed");
-        let report = final_job.result.expect("final report").details.expect("workflow report");
+        let report = final_job
+            .result
+            .expect("final report")
+            .details
+            .expect("workflow report");
         assert_eq!(report["skippedNodes"], 1);
         assert_eq!(report["nodes"][2]["state"], "skipped");
         assert!(!root.path().join("forbidden").exists());
@@ -236,7 +317,8 @@ esac
 #[test]
 fn settled_fanout_and_deliberate_exclusions_are_not_flattened_or_lost() {
     let _guard = crate::jobs::process_test_guard();
-    let script = format!(r#"
+    let script = format!(
+        r#"
 for task do :; done
 case "$task" in
   'Task: source') {} ;;
@@ -245,7 +327,11 @@ case "$task" in
   'Task: join') touch holding; while [ ! -f release ]; do sleep 0.02; done; {} ;;
   *) exit 19 ;;
 esac
-"#, end("[1,2]"), end("7"), end("done"));
+"#,
+        end("[1,2]"),
+        end("7"),
+        end("done")
+    );
     let (root, tool, session) = fixture(&script);
     let mut source = node("source", &[]);
     source["call"]["outputSchema"] = json!({"type":"array","items":{"type":"integer"}});
@@ -259,15 +345,20 @@ esac
     run(async {
         let id = launch(&tool, request(vec![source, item, excluded, join])).await;
         marker(&root.path().join("holding")).await;
-        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO).await.expect("fanout checkpoint");
+        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO)
+            .await
+            .expect("fanout checkpoint");
         std::fs::write(root.path().join("release"), "go").expect("release join");
         assert_eq!(settled(&session, &id).await.status, "exited");
         let evidence = partial(&observed, "pi.host_job.progress.v1");
         assert_eq!(evidence["checkpoint"], 2);
         assert_eq!(evidence["notSelectedNodes"], 1);
-        assert_eq!(evidence["nodes"][1]["fanout"]["data"], json!([7,7]));
+        assert_eq!(evidence["nodes"][1]["fanout"]["data"], json!([7, 7]));
         assert_eq!(evidence["nodes"][1]["hubId"], Value::Null);
-        for item in evidence["nodes"][1]["fanout"]["items"].as_array().expect("native item records") {
+        for item in evidence["nodes"][1]["fanout"]["items"]
+            .as_array()
+            .expect("native item records")
+        {
             assert_eq!(item["state"], "accepted");
             assert!(item["hubId"].as_str().is_some());
         }
@@ -280,7 +371,8 @@ esac
 #[test]
 fn empty_fanout_checkpoints_do_not_invent_executed_waves_or_children() {
     let _guard = crate::jobs::process_test_guard();
-    let script = format!(r#"
+    let script = format!(
+        r#"
 for task do :; done
 case "$task" in
   'Task: source') {} ;;
@@ -288,16 +380,21 @@ case "$task" in
   'Task: join') touch holding; while [ ! -f release ]; do sleep 0.02; done; {} ;;
   *) exit 19 ;;
 esac
-"#, end("[]"), end("done"));
+"#,
+        end("[]"),
+        end("done")
+    );
     let (root, tool, session) = fixture(&script);
     let mut source = node("source", &[]);
     source["call"]["outputSchema"] = json!({"type":"array"});
     let mut item = node("item", &["source"]);
     item["forEach"] = json!({"from":"source","pointer":"","as":"item","maxItems":2});
     run(async {
-        let id = launch(&tool, request(vec![source, item, node("join", &["item"])] )).await;
+        let id = launch(&tool, request(vec![source, item, node("join", &["item"])])).await;
         marker(&root.path().join("holding")).await;
-        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO).await.expect("empty expansion checkpoint");
+        let observed = crate::jobs::wait_async(&session, &id, Duration::ZERO)
+            .await
+            .expect("empty expansion checkpoint");
         std::fs::write(root.path().join("release"), "go").expect("release join");
         assert_eq!(settled(&session, &id).await.status, "exited");
         let evidence = partial(&observed, "pi.host_job.progress.v1");
@@ -314,7 +411,8 @@ esac
 #[test]
 fn changed_privacy_evidence_withdraws_previous_checkpoint_and_stops_dependants() {
     let _guard = crate::jobs::process_test_guard();
-    let script = format!(r#"
+    let script = format!(
+        r#"
 for task do :; done
 case "$task" in
   'Task: seed') {} ;;
@@ -322,16 +420,26 @@ case "$task" in
   'Task: tail') touch forbidden; {} ;;
   *) exit 19 ;;
 esac
-"#, end("41"), end(r#"{"value":"WORKFLOW-PRIVATE-CANARY"}"#), end("done"));
+"#,
+        end("41"),
+        end(r#"{"value":"WORKFLOW-PRIVATE-CANARY"}"#),
+        end("done")
+    );
     let (root, tool, session) = fixture(&script);
     let settings = crate::secrets::SecretsSettings {
-        extra_patterns: Some(vec!["WORKFLOW-PRIVATE-CANARY".into()]), ..Default::default()
+        extra_patterns: Some(vec!["WORKFLOW-PRIVATE-CANARY".into()]),
+        ..Default::default()
     };
     let tool = tool.with_secrets_settings(Some(&settings));
     let mut private = node("private", &["seed"]);
-    private["call"]["outputSchema"] = json!({"type":"object","properties":{"value":{"const":"WORKFLOW-PRIVATE-CANARY"}}});
+    private["call"]["outputSchema"] =
+        json!({"type":"object","properties":{"value":{"const":"WORKFLOW-PRIVATE-CANARY"}}});
     run(async {
-        let id = launch(&tool, request(vec![node("seed", &[]), private, node("tail", &["private"])] )).await;
+        let id = launch(
+            &tool,
+            request(vec![node("seed", &[]), private, node("tail", &["private"])]),
+        )
+        .await;
         let stopped = settled(&session, &id).await;
         assert_eq!(stopped.status, "failed");
         let output = stopped.result.expect("explicit publication failure");
@@ -341,7 +449,9 @@ esac
         assert!(!wire.contains("WORKFLOW-PRIVATE-CANARY"));
         assert!(!wire.contains("partialResult"));
         assert!(!root.path().join("forbidden").exists());
-        for entry in std::fs::read_dir(root.path().join("global/tool-output-artifacts/jobs")).expect("job artifacts") {
+        for entry in std::fs::read_dir(root.path().join("global/tool-output-artifacts/jobs"))
+            .expect("job artifacts")
+        {
             let path = entry.expect("artifact entry").path();
             if path.is_file() {
                 let bytes = std::fs::read(path).expect("artifact bytes");
@@ -354,26 +464,35 @@ esac
 #[test]
 fn oversized_complete_evidence_is_not_truncated_into_a_successful_checkpoint() {
     let _guard = crate::jobs::process_test_guard();
-    let script = format!(r#"
+    let script = format!(
+        r#"
 for task do :; done
 case "$task" in
   'Task: left'|'Task: right') cat large.jsonl ;;
   'Task: tail') touch forbidden; {} ;;
   *) exit 19 ;;
 esac
-"#, end("done"));
+"#,
+        end("done")
+    );
     let (root, tool, session) = fixture(&script);
     let text = serde_json::to_string(&"z".repeat(200_000)).expect("large schema-valid string");
     let event = json!({"type":"agent_end","messages":[{
         "role":"assistant","stopReason":"stop","content":[{"type":"text","text":text}]
-    }]}).to_string();
-    std::fs::write(root.path().join("large.jsonl"), format!("{event}\n")).expect("bounded native output fixture");
+    }]})
+    .to_string();
+    std::fs::write(root.path().join("large.jsonl"), format!("{event}\n"))
+        .expect("bounded native output fixture");
     let mut left = node("left", &[]);
     left["call"]["outputSchema"] = json!({"type":"string"});
     let mut right = node("right", &[]);
     right["call"]["outputSchema"] = json!({"type":"string"});
     run(async {
-        let id = launch(&tool, request(vec![left, right, node("tail", &["left","right"])] )).await;
+        let id = launch(
+            &tool,
+            request(vec![left, right, node("tail", &["left", "right"])]),
+        )
+        .await;
         let stopped = settled(&session, &id).await;
         assert_eq!(stopped.status, "failed");
         let output = stopped.result.expect("bounded failure result");

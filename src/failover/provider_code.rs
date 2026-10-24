@@ -34,11 +34,7 @@ pub(crate) struct ConnectCode(&'static str);
 
 impl ConnectCode {
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        CODES
-            .iter()
-            .copied()
-            .find(|code| *code == value)
-            .map(Self)
+        CODES.iter().copied().find(|code| *code == value).map(Self)
     }
 
     pub(crate) fn diagnostic(self, message: &str) -> String {
@@ -354,10 +350,7 @@ mod tests {
                     );
                 }
             }
-            let text = diagnostic(
-                code,
-                &Error::session_persistence("save failed").to_string(),
-            );
+            let text = diagnostic(code, &Error::session_persistence("save failed").to_string());
             let message = message(&text);
             let error = Error::provider("cursor", &text);
             for outcome in [

@@ -74,7 +74,10 @@ impl<F> VerificationWait<F> {
         future: F,
     ) -> Result<Self> {
         let timer = owner.timer_driver().ok_or_else(|| {
-            super::failure("GOAL_VERIFIER_TIMER", "goal verification requires its owner's timer")
+            super::failure(
+                "GOAL_VERIFIER_TIMER",
+                "goal verification requires its owner's timer",
+            )
         })?;
         Ok(Self {
             owner: owner.clone(),
@@ -90,7 +93,9 @@ impl<F> VerificationWait<F> {
 
     fn stop(&self) -> Option<GoalRunStop> {
         interruption(&self.owner, &self.deadline, &self.control).or_else(|| {
-            self.timer_fired.load(Ordering::SeqCst).then_some(GoalRunStop::Deadline)
+            self.timer_fired
+                .load(Ordering::SeqCst)
+                .then_some(GoalRunStop::Deadline)
         })
     }
 
@@ -120,9 +125,14 @@ impl<F: Future<Output = Result<GoalDecision>>> Future for VerificationWait<F> {
         let registered = cx.waker().clone();
         let old = this.control.lock().verification_waker.replace(registered);
         drop(old);
-        let cancelled = this.cancellation.as_mut()
+        let cancelled = this
+            .cancellation
+            .as_mut()
             .is_some_and(|wait| wait.as_mut().poll(cx).is_ready());
-        if let Some(stop) = cancelled.then_some(GoalRunStop::Cancelled).or_else(|| this.stop()) {
+        if let Some(stop) = cancelled
+            .then_some(GoalRunStop::Cancelled)
+            .or_else(|| this.stop())
+        {
             this.retire();
             return Poll::Ready(Err(stop));
         }
@@ -143,7 +153,12 @@ impl<F: Future<Output = Result<GoalDecision>>> Future for VerificationWait<F> {
             return Poll::Ready(Err(stop));
         }
 
-        let outcome = this.future.as_mut().expect("unfinished verifier").as_mut().poll(cx);
+        let outcome = this
+            .future
+            .as_mut()
+            .expect("unfinished verifier")
+            .as_mut()
+            .poll(cx);
         // A non-preemptible poll or callback can pause or cross the deadline.
         // Even a Ready(Complete) must lose to that observed interruption.
         if let Some(stop) = this.stop() {
@@ -177,7 +192,10 @@ where
     F: Future<Output = Result<GoalDecision>> + Send,
 {
     if let Some(stop) = interruption(owner, deadline, control) {
-        return (pause_decision("run interrupted; inspect native completion before resuming"), Some(stop));
+        return (
+            pause_decision("run interrupted; inspect native completion before resuming"),
+            Some(stop),
+        );
     }
     let Some(Ok(message)) = report.completion.as_ref() else {
         let stop = match report.completion.as_ref() {
@@ -185,18 +203,30 @@ where
             Some(Err(TurnDeadlineError::OwnerCancelled { .. })) => GoalRunStop::Cancelled,
             _ => GoalRunStop::NativeFailure,
         };
-        return (pause_decision("native prompt failed; inspect completion before resuming"), Some(stop));
+        return (
+            pause_decision("native prompt failed; inspect completion before resuming"),
+            Some(stop),
+        );
     };
     if crate::agent::time_cap_marker(message).is_some() {
         // A native cap can return a successful synthetic boundary message.
         // Starting another goal prompt would reset the cap and resume work.
-        return (pause_decision("native run-time cap reached; explicit review required"), Some(GoalRunStop::Paused));
+        return (
+            pause_decision("native run-time cap reached; explicit review required"),
+            Some(GoalRunStop::Paused),
+        );
     }
     if !successful(message) {
-        return (pause_decision("native prompt did not produce a successful final answer"), Some(GoalRunStop::NativeFailure));
+        return (
+            pause_decision("native prompt did not produce a successful final answer"),
+            Some(GoalRunStop::NativeFailure),
+        );
     }
     if !report.pending.is_empty() {
-        return (pause_decision("unclaimed user input returned to host"), Some(GoalRunStop::Paused));
+        return (
+            pause_decision("unclaimed user input returned to host"),
+            Some(GoalRunStop::Paused),
+        );
     }
 
     // Own only the last successful response, never a clone of the whole
@@ -207,15 +237,26 @@ where
         Err(error) => Ok(Err(error)),
     };
     let decision = match outcome {
-        Err(stop) => return (pause_decision("run interrupted during host verification"), Some(stop)),
+        Err(stop) => {
+            return (
+                pause_decision("run interrupted during host verification"),
+                Some(stop),
+            );
+        }
         Ok(Err(error)) => {
             report.error = Some(error);
-            return (pause_decision("host verification failed; inspect the run report"), Some(GoalRunStop::Failed));
+            return (
+                pause_decision("host verification failed; inspect the run report"),
+                Some(GoalRunStop::Failed),
+            );
         }
         Ok(Ok(decision)) => decision,
     };
     if let Some(stop) = interruption(owner, deadline, control) {
-        return (pause_decision("run interrupted after host verification"), Some(stop));
+        return (
+            pause_decision("run interrupted after host verification"),
+            Some(stop),
+        );
     }
     let (text, stop) = match &decision {
         GoalDecision::Continue { instruction } => (instruction, None),
@@ -224,7 +265,10 @@ where
     };
     if let Err(error) = super::validate_text(text, "host verdict") {
         report.error = Some(error);
-        return (pause_decision("host verdict was empty or oversized"), Some(GoalRunStop::Failed));
+        return (
+            pause_decision("host verdict was empty or oversized"),
+            Some(GoalRunStop::Failed),
+        );
     }
     (decision, stop)
 }
@@ -258,7 +302,9 @@ mod tests {
 
     fn run<F: Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
-            .build().expect("runtime").block_on(future)
+            .build()
+            .expect("runtime")
+            .block_on(future)
     }
 
     // Scheduler probes use the production wait, real timer driver and owner
@@ -277,20 +323,31 @@ mod tests {
             };
             let timer = owner.timer_driver().unwrap();
             let before = timer.pending_count();
-            let mut wait = Box::pin(VerificationWait::new(&owner, &deadline, &control, future).unwrap());
+            let mut wait =
+                Box::pin(VerificationWait::new(&owner, &deadline, &control, future).unwrap());
             let old = Arc::new(WakeCount::default());
             let new = Arc::new(WakeCount::default());
             let old_waker = Waker::from(Arc::clone(&old));
             let new_waker = Waker::from(Arc::clone(&new));
-            assert!(wait.as_mut().poll(&mut Context::from_waker(&old_waker)).is_pending());
-            assert!(wait.as_mut().poll(&mut Context::from_waker(&new_waker)).is_pending());
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(&old_waker))
+                    .is_pending()
+            );
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(&new_waker))
+                    .is_pending()
+            );
             let old_before = old.0.load(Ordering::SeqCst);
             let new_before = new.0.load(Ordering::SeqCst);
             assert!(control.pause());
             assert!(new.0.load(Ordering::SeqCst) > new_before);
             assert_eq!(old.0.load(Ordering::SeqCst), old_before);
-            assert!(matches!(wait.as_mut().poll(&mut Context::from_waker(&new_waker)),
-                Poll::Ready(Err(GoalRunStop::Paused))));
+            assert!(matches!(
+                wait.as_mut().poll(&mut Context::from_waker(&new_waker)),
+                Poll::Ready(Err(GoalRunStop::Paused))
+            ));
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert!(control.lock().verification_waker.is_none());
             assert_eq!(timer.pending_count(), before);
@@ -304,16 +361,32 @@ mod tests {
             let owner = AgentCx::for_current_or_request();
             let deadline = TurnDeadline::after(&owner, Duration::from_secs(30)).unwrap();
             let control = GoalControl::new();
-            let mut wait = Box::pin(VerificationWait::new(&owner, &deadline, &control,
-                std::future::pending::<Result<GoalDecision>>()).unwrap());
+            let mut wait = Box::pin(
+                VerificationWait::new(
+                    &owner,
+                    &deadline,
+                    &control,
+                    std::future::pending::<Result<GoalDecision>>(),
+                )
+                .unwrap(),
+            );
             let wakes = Arc::new(WakeCount::default());
             let waker = Waker::from(Arc::clone(&wakes));
-            assert!(wait.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             let before = wakes.0.load(Ordering::SeqCst);
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("stop verification"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("stop verification"),
+            );
             assert!(wakes.0.load(Ordering::SeqCst) > before);
-            assert!(matches!(wait.as_mut().poll(&mut Context::from_waker(&waker)),
-                Poll::Ready(Err(GoalRunStop::Cancelled))));
+            assert!(matches!(
+                wait.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Err(GoalRunStop::Cancelled))
+            ));
             assert!(wait.cancellation.is_none());
             assert!(wait.timer_handle.is_none());
             assert!(control.lock().verification_waker.is_none());
@@ -326,15 +399,29 @@ mod tests {
             let owner = AgentCx::for_current_or_request();
             let deadline = TurnDeadline::after(&owner, Duration::from_secs(30)).unwrap();
             let control = GoalControl::new();
-            let mut wait = Box::pin(VerificationWait::new(&owner, &deadline, &control,
-                std::future::pending::<Result<GoalDecision>>()).unwrap());
+            let mut wait = Box::pin(
+                VerificationWait::new(
+                    &owner,
+                    &deadline,
+                    &control,
+                    std::future::pending::<Result<GoalDecision>>(),
+                )
+                .unwrap(),
+            );
             let wakes = Arc::new(WakeCount::default());
             let waker = Waker::from(Arc::clone(&wakes));
-            assert!(wait.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             drop(wait);
             let before = wakes.0.load(Ordering::SeqCst);
             assert!(control.pause());
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("after verifier drop"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("after verifier drop"),
+            );
             assert_eq!(wakes.0.load(Ordering::SeqCst), before);
             assert!(control.lock().verification_waker.is_none());
         });
@@ -345,7 +432,10 @@ mod tests {
         struct ObserveTime(Arc<AtomicBool>);
         impl Drop for ObserveTime {
             fn drop(&mut self) {
-                self.0.store(AgentCx::for_current_or_request().capabilities().time, Ordering::SeqCst);
+                self.0.store(
+                    AgentCx::for_current_or_request().capabilities().time,
+                    Ordering::SeqCst,
+                );
             }
         }
         run(async {
@@ -357,14 +447,23 @@ mod tests {
                 let _guard = guard;
                 std::future::pending::<Result<GoalDecision>>().await
             };
-            let wait = VerificationWait::new(&owner, &deadline, &GoalControl::new(), future).unwrap();
-            let _restricted = owner.cx().clone()
-                .restrict::<asupersync::cx::cap::None>().set_current_restricted();
+            let wait =
+                VerificationWait::new(&owner, &deadline, &GoalControl::new(), future).unwrap();
+            let _restricted = owner
+                .cx()
+                .clone()
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
             assert!(!AgentCx::for_current_or_request().capabilities().time);
             drop(wait);
-            assert!(seen.load(Ordering::SeqCst), "drop must install the verifier's original owner");
-            assert!(!AgentCx::for_current_or_request().capabilities().time,
-                "the caller's restriction must be restored after drop");
+            assert!(
+                seen.load(Ordering::SeqCst),
+                "drop must install the verifier's original owner"
+            );
+            assert!(
+                !AgentCx::for_current_or_request().capabilities().time,
+                "the caller's restriction must be restored after drop"
+            );
         });
     }
 }

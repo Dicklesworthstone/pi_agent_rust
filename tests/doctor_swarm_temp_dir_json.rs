@@ -170,8 +170,7 @@ fn consumer_doctor_defaults_exclude_swarm_even_in_beads_checkout() -> TestResult
 fn consumer_doctor_explicit_swarm_remains_fail_closed() -> TestResult {
     for only in ["swarm", "coordination", "leases", "config,swarm"] {
         for format in ["text", "json", "markdown"] {
-            let run =
-                run_consumer_doctor(&["--only", only, "--format", format], None, false)?;
+            let run = run_consumer_doctor(&["--only", only, "--format", format], None, false)?;
             let output = run.output;
             require_eq(&output.status.code(), &Some(1), "swarm exit")?;
             let stdout = String::from_utf8(output.stdout)?;
@@ -179,7 +178,11 @@ fn consumer_doctor_explicit_swarm_remains_fail_closed() -> TestResult {
                 let report: Value = serde_json::from_str(&stdout)?;
                 require_report_exit(&report, output.status.code())?;
                 let preflight = finding_by_schema(&report, SWARM_RESOURCE_PREFLIGHT_SCHEMA)?;
-                require_eq(field_str(preflight, "severity")?, "fail", "strict preflight")?;
+                require_eq(
+                    field_str(preflight, "severity")?,
+                    "fail",
+                    "strict preflight",
+                )?;
                 require_eq(field_str(&report, "overall")?, "fail", "overall")?;
                 let findings = field(&report, "findings")?
                     .as_array()
@@ -204,8 +207,14 @@ fn consumer_doctor_explicit_swarm_remains_fail_closed() -> TestResult {
                 )?;
                 require_text_exit(&stdout, output.status.code())?;
             } else {
-                require(stdout.contains("## Swarm Coordination"), "swarm markdown section")?;
-                require(stdout.contains("**Overall: FAIL**"), "swarm markdown failure")?;
+                require(
+                    stdout.contains("## Swarm Coordination"),
+                    "swarm markdown section",
+                )?;
+                require(
+                    stdout.contains("**Overall: FAIL**"),
+                    "swarm markdown failure",
+                )?;
             }
         }
     }
@@ -286,7 +295,10 @@ fn consumer_doctor_fix_does_not_probe_or_repair_swarm() -> TestResult {
             "consumer fix preserves coordination state",
         )?;
         let stdout = String::from_utf8(run.output.stdout)?;
-        require(!stdout.contains("Swarm Coordination"), "no implicit swarm section")?;
+        require(
+            !stdout.contains("Swarm Coordination"),
+            "no implicit swarm section",
+        )?;
         if args.contains(&"json") {
             let report: Value = serde_json::from_str(&stdout)?;
             require_report_exit(&report, run.output.status.code())?;
@@ -357,7 +369,9 @@ fn consumer_doctor_explicit_swarm_keeps_coordination_failures_with_fix() -> Test
                     "mixed selection includes config",
                 )?;
                 require(
-                    findings.iter().all(|f| f["category"] == "config" || f["category"] == "swarm"),
+                    findings
+                        .iter()
+                        .all(|f| f["category"] == "config" || f["category"] == "swarm"),
                     "mixed selection excludes unrelated checks",
                 )?;
             } else {
@@ -372,7 +386,10 @@ fn consumer_doctor_explicit_swarm_keeps_coordination_failures_with_fix() -> Test
                 if format == "text" {
                     require_text_exit(&stdout, run.output.status.code())?;
                 } else {
-                    require(stdout.contains("**Overall: FAIL**"), "markdown failure summary")?;
+                    require(
+                        stdout.contains("**Overall: FAIL**"),
+                        "markdown failure summary",
+                    )?;
                 }
             }
         }
@@ -386,7 +403,11 @@ fn consumer_doctor_selection_ignores_unselected_ordinary_failures() -> TestResul
     let cases: &[(&str, &str, &[&str])] = &[
         ("settings.json", "auth", &["auth"]),
         ("auth.json", "config", &["config"]),
-        ("settings.json", "directories,authentication", &["dirs", "auth"]),
+        (
+            "settings.json",
+            "directories,authentication",
+            &["dirs", "auth"],
+        ),
     ];
     for &(broken_file, only, categories) in cases {
         let run = run_consumer_doctor(
@@ -394,7 +415,11 @@ fn consumer_doctor_selection_ignores_unselected_ordinary_failures() -> TestResul
             Some(broken_file),
             true,
         )?;
-        require_eq(&run.output.status.code(), &Some(0), "unselected failure exit")?;
+        require_eq(
+            &run.output.status.code(),
+            &Some(0),
+            "unselected failure exit",
+        )?;
         require(
             run.probed_tools.is_empty(),
             "ordinary selection must not launch probes",
@@ -405,7 +430,10 @@ fn consumer_doctor_selection_ignores_unselected_ordinary_failures() -> TestResul
             .as_array()
             .ok_or("findings array")?;
         for category in categories {
-            require(findings.iter().any(|f| f["category"] == *category), *category)?;
+            require(
+                findings.iter().any(|f| f["category"] == *category),
+                *category,
+            )?;
         }
         for finding in findings {
             require(
@@ -428,7 +456,11 @@ fn consumer_doctor_extension_selection_does_not_enable_environment_checks() -> T
         let mut args = selection;
         args.extend(["--format", "json"]);
         let run = run_consumer_doctor(&args, Some("settings.json"), true)?;
-        require_eq(&run.output.status.code(), &Some(code), "extension selection exit")?;
+        require_eq(
+            &run.output.status.code(),
+            &Some(code),
+            "extension selection exit",
+        )?;
         require(
             run.probed_tools.is_empty(),
             "extension selection must not launch probes",
@@ -459,7 +491,10 @@ fn consumer_doctor_formats_agree_on_counts_and_exit_codes() -> TestResult {
         )?;
         let report: Value = serde_json::from_slice(&json_run.output.stdout)?;
         require_report_exit(&report, json_run.output.status.code())?;
-        require(json_run.probed_tools.is_empty(), "JSON must not launch swarm probes")?;
+        require(
+            json_run.probed_tools.is_empty(),
+            "JSON must not launch swarm probes",
+        )?;
         let summary = field(&report, "summary")?;
         let overall = field_str(&report, "overall")?.to_ascii_uppercase();
         let counts = format!(
@@ -593,7 +628,11 @@ fn require_report_exit(report: &Value, exit_code: Option<i32>) -> TestResult {
         // Informational findings do not make the installation unhealthy.
         "pass"
     };
-    require_eq(field_str(report, "overall")?, overall, "overall from findings")?;
+    require_eq(
+        field_str(report, "overall")?,
+        overall,
+        "overall from findings",
+    )?;
     require_eq(
         &exit_code,
         &Some(i32::from(counts[3] > 0)),
@@ -609,12 +648,14 @@ fn require_text_exit(stdout: &str, exit_code: Option<i32>) -> TestResult {
         .ok_or("missing doctor text summary")?;
     let failed = summary.starts_with("Overall: FAIL (");
     require(
-        failed
-            || summary.starts_with("Overall: PASS (")
-            || summary.starts_with("Overall: WARN ("),
+        failed || summary.starts_with("Overall: PASS (") || summary.starts_with("Overall: WARN ("),
         format!("unrecognized doctor text summary: {summary}"),
     )?;
-    require_eq(&exit_code, &Some(i32::from(failed)), "text report exit code")
+    require_eq(
+        &exit_code,
+        &Some(i32::from(failed)),
+        "text report exit code",
+    )
 }
 
 fn run_doctor_json(env_overrides: &[(&str, Option<&str>)]) -> TestResult<Value> {

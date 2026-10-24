@@ -87,7 +87,8 @@ pub(super) fn parse_path(path: &str) -> Result<Option<QueryRequest>> {
         .split('&')
         .filter_map(|field| field.split_once('='))
         .collect::<Vec<_>>();
-    let Some((_, encoded_query)) = fields.iter().find(|(key, _)| matches!(*key, "q" | "query")) else {
+    let Some((_, encoded_query)) = fields.iter().find(|(key, _)| matches!(*key, "q" | "query"))
+    else {
         return Ok(None);
     };
     if encoded_query.is_empty() {
@@ -97,11 +98,18 @@ pub(super) fn parse_path(path: &str) -> Result<Option<QueryRequest>> {
     if query.len() > MAX_QUERY_BYTES {
         return Err(invalid("JSON query filter exceeds 16 KiB"));
     }
-    let parameter = |key: &str| fields.iter().find(|(name, _)| *name == key).map(|(_, value)| *value);
-    let flag = |key: &str| parameter(key).is_some_and(|value| {
-        let value = decode_query(value);
-        value == "1" || value.eq_ignore_ascii_case("true")
-    });
+    let parameter = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| *value)
+    };
+    let flag = |key: &str| {
+        parameter(key).is_some_and(|value| {
+            let value = decode_query(value);
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+    };
     let count = |key: &str, minimum: usize| {
         parameter(key)
             .and_then(|value| decode_query(value).parse::<usize>().ok())
@@ -192,7 +200,9 @@ impl WorkerPermit {
                 (count < MAX_ACTIVE_WORKERS).then_some(count + 1)
             })
             .map(|_| Self)
-            .map_err(|_| invalid("Four structured-data queries are already running; retry when one finishes"))
+            .map_err(|_| {
+                invalid("Four structured-data queries are already running; retry when one finishes")
+            })
     }
 }
 
@@ -206,14 +216,22 @@ impl Drop for WorkerPermit {
 /// test executables live in `target/<profile>/deps`, beside the built Pi binary.
 fn worker_candidate(executable: &Path) -> Result<PathBuf> {
     let name = format!("pi{}", std::env::consts::EXE_SUFFIX);
-    let parent = executable.parent().ok_or_else(|| invalid("Cannot locate the Pi query worker"))?;
-    if parent.file_name().is_some_and(|directory| directory == "deps") {
+    let parent = executable
+        .parent()
+        .ok_or_else(|| invalid("Cannot locate the Pi query worker"))?;
+    if parent
+        .file_name()
+        .is_some_and(|directory| directory == "deps")
+    {
         return parent
             .parent()
             .map(|profile| profile.join(name))
             .ok_or_else(|| invalid("Cannot locate the Pi binary beside the test executable"));
     }
-    if executable.file_name().is_some_and(|file| file == name.as_str()) {
+    if executable
+        .file_name()
+        .is_some_and(|file| file == name.as_str())
+    {
         Ok(executable.to_path_buf())
     } else {
         // Embedders can install Pi beside their application without introducing
@@ -231,7 +249,12 @@ struct WorkerGuard {
 
 impl WorkerGuard {
     const fn new(child: AgentChild) -> Self {
-        Self { child: Some(child), writer: None, stdout: None, stderr: None }
+        Self {
+            child: Some(child),
+            writer: None,
+            stdout: None,
+            stderr: None,
+        }
     }
 }
 
@@ -293,11 +316,15 @@ fn capture_stderr(mut pipe: impl io::Read) -> io::Result<Vec<u8>> {
 #[allow(clippy::too_many_lines)]
 pub(super) async fn run_worker(kind: WorkerKind, request: Vec<u8>) -> Result<Vec<u8>> {
     if request.len() > kind.input_limit() {
-        return Err(invalid("Structured-data worker request exceeds its input limit"));
+        return Err(invalid(
+            "Structured-data worker request exceeds its input limit",
+        ));
     }
     let owner = AgentCx::for_current_or_request();
     if !owner.capabilities().io || !owner.capabilities().spawn || !owner.capabilities().time {
-        return Err(invalid("Structured-data queries require I/O, subprocess, and timer capabilities"));
+        return Err(invalid(
+            "Structured-data queries require I/O, subprocess, and timer capabilities",
+        ));
     }
     owner.checkpoint().map_err(|_| Error::Aborted)?;
     let _permit = WorkerPermit::acquire()?;
@@ -321,30 +348,49 @@ pub(super) async fn run_worker(kind: WorkerKind, request: Vec<u8>) -> Result<Vec
         command.env("SystemRoot", root);
     }
     let mut guard = WorkerGuard::new(command.spawn()?);
-    let child = guard.child.as_mut().ok_or_else(|| invalid("Missing query worker child"))?;
-    let mut stdin = child.take_stdin().ok_or_else(|| invalid("Missing query worker stdin"))?;
-    let stdout = child.take_stdout().ok_or_else(|| invalid("Missing query worker stdout"))?;
-    let stderr = child.take_stderr().ok_or_else(|| invalid("Missing query worker stderr"))?;
+    let child = guard
+        .child
+        .as_mut()
+        .ok_or_else(|| invalid("Missing query worker child"))?;
+    let mut stdin = child
+        .take_stdin()
+        .ok_or_else(|| invalid("Missing query worker stdin"))?;
+    let stdout = child
+        .take_stdout()
+        .ok_or_else(|| invalid("Missing query worker stdout"))?;
+    let stderr = child
+        .take_stderr()
+        .ok_or_else(|| invalid("Missing query worker stderr"))?;
     let exceeded = Arc::new(AtomicBool::new(false));
-    guard.writer = Some(std::thread::Builder::new().name("pi-query-input".into()).spawn(move || {
-        stdin.write_all(&request)
-    })?);
+    guard.writer = Some(
+        std::thread::Builder::new()
+            .name("pi-query-input".into())
+            .spawn(move || stdin.write_all(&request))?,
+    );
     let reader_exceeded = Arc::clone(&exceeded);
-    guard.stdout = Some(std::thread::Builder::new().name("pi-query-output".into()).spawn(move || {
-        capture_stdout(stdout, &reader_exceeded)
-    })?);
-    guard.stderr = Some(std::thread::Builder::new().name("pi-query-errors".into()).spawn(move || {
-        capture_stderr(stderr)
-    })?);
+    guard.stdout = Some(
+        std::thread::Builder::new()
+            .name("pi-query-output".into())
+            .spawn(move || capture_stdout(stdout, &reader_exceeded))?,
+    );
+    guard.stderr = Some(
+        std::thread::Builder::new()
+            .name("pi-query-errors".into())
+            .spawn(move || capture_stderr(stderr))?,
+    );
     let status = loop {
         owner.checkpoint().map_err(|_| Error::Aborted)?;
         if exceeded.load(Ordering::Acquire) {
-            return Err(invalid("Structured-data query worker exceeded the 32 MiB response limit"));
+            return Err(invalid(
+                "Structured-data query worker exceeded the 32 MiB response limit",
+            ));
         }
         if started.elapsed() >= WORKER_TIMEOUT {
             return Err(invalid("Structured-data query timed out after 30 seconds"));
         }
-        if let Some(status) = guard.child.as_mut()
+        if let Some(status) = guard
+            .child
+            .as_mut()
             .ok_or_else(|| invalid("Missing query worker child"))?
             .try_wait()?
         {
@@ -355,13 +401,19 @@ pub(super) async fn run_worker(kind: WorkerKind, request: Vec<u8>) -> Result<Vec
     let stdout = join_pipe(guard.stdout.take(), "stdout")?;
     let stderr = join_pipe(guard.stderr.take(), "stderr")?;
     if exceeded.load(Ordering::Acquire) {
-        return Err(invalid("Structured-data query worker exceeded the 32 MiB response limit"));
+        return Err(invalid(
+            "Structured-data query worker exceeded the 32 MiB response limit",
+        ));
     }
     if !status.success() {
         let diagnostics = String::from_utf8_lossy(&stderr);
         return Err(invalid(format!(
             "Structured-data query worker stopped ({status}); the query may have exceeded its memory or stack limit{}{}",
-            if diagnostics.trim().is_empty() { "" } else { ": " },
+            if diagnostics.trim().is_empty() {
+                ""
+            } else {
+                ": "
+            },
             diagnostics.trim(),
         )));
     }
@@ -390,10 +442,19 @@ pub(super) fn set_worker_limits() -> io::Result<()> {
         }
         let lower = |resource, ceiling| {
             let old = getrlimit(resource);
-            let limit = old.current.unwrap_or(ceiling)
-                .min(old.maximum.unwrap_or(ceiling)).min(ceiling);
-            setrlimit(resource, Rlimit { current: Some(limit), maximum: Some(limit) })
-                .map_err(io::Error::from)
+            let limit = old
+                .current
+                .unwrap_or(ceiling)
+                .min(old.maximum.unwrap_or(ceiling))
+                .min(ceiling);
+            setrlimit(
+                resource,
+                Rlimit {
+                    current: Some(limit),
+                    maximum: Some(limit),
+                },
+            )
+            .map_err(io::Error::from)
         };
         lower(Resource::As, MAX_WORKER_MEMORY)?;
         lower(Resource::Cpu, WORKER_TIMEOUT.as_secs())?;
@@ -421,8 +482,7 @@ pub(super) async fn execute(selector: QueryRequest, source: Vec<u8>) -> Result<Q
         source_base64: base64::engine::general_purpose::STANDARD.encode(source),
     };
     let bytes = run_worker(WorkerKind::Json, serde_json::to_vec(&request)?).await?;
-    serde_json::from_slice::<std::result::Result<QueryOutcome, String>>(&bytes)?
-        .map_err(invalid)
+    serde_json::from_slice::<std::result::Result<QueryOutcome, String>>(&bytes)?.map_err(invalid)
 }
 
 pub(super) fn run_json_worker() -> i32 {
@@ -450,7 +510,9 @@ pub(super) fn run_json_worker() -> i32 {
 
 fn read_json_worker_request() -> std::result::Result<WorkerRequest, String> {
     let mut input = Vec::new();
-    io::stdin().lock().take((MAX_JSON_REQUEST + 1) as u64)
+    io::stdin()
+        .lock()
+        .take((MAX_JSON_REQUEST + 1) as u64)
         .read_to_end(&mut input)
         .map_err(|error| format!("Cannot read JSON query request: {error}"))?;
     if input.len() > MAX_JSON_REQUEST {
@@ -466,14 +528,19 @@ struct BoundedWriter {
 
 impl BoundedWriter {
     const fn new(limit: usize) -> Self {
-        Self { bytes: Vec::new(), limit }
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
     }
 }
 
 impl io::Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-            return Err(io::Error::other("JSON query output exceeds its capture limit; narrow the filter or page the results"));
+            return Err(io::Error::other(
+                "JSON query output exceeds its capture limit; narrow the filter or page the results",
+            ));
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -499,9 +566,13 @@ impl io::Write for DiagnosticTail {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() >= MAX_DIAGNOSTIC_BYTES {
             self.bytes.clear();
-            self.bytes.extend_from_slice(&bytes[bytes.len() - MAX_DIAGNOSTIC_BYTES..]);
+            self.bytes
+                .extend_from_slice(&bytes[bytes.len() - MAX_DIAGNOSTIC_BYTES..]);
         } else {
-            let discard = self.bytes.len().saturating_add(bytes.len())
+            let discard = self
+                .bytes
+                .len()
+                .saturating_add(bytes.len())
                 .saturating_sub(MAX_DIAGNOSTIC_BYTES);
             self.bytes.drain(..discard);
             self.bytes.extend_from_slice(bytes);
@@ -570,9 +641,17 @@ fn query_funs() -> impl Iterator<Item = native::Fun<QueryData>> {
         ("totsv", v(0), |cv| bome(tabular_value(&cv.1, true))),
     ]);
     jaq_core::funs()
-        .chain(jaq_std::funs().filter(|(name, _, _)| !matches!(*name, "env" | "debug_empty" | "stderr_empty")))
+        .chain(
+            jaq_std::funs()
+                .filter(|(name, _, _)| !matches!(*name, "env" | "debug_empty" | "stderr_empty")),
+        )
         .chain(jaq_json::funs())
-        .chain(jaq_std::input::funs().into_vec().into_iter().map(native::run))
+        .chain(
+            jaq_std::input::funs()
+                .into_vec()
+                .into_iter()
+                .map(native::run),
+        )
         .chain(replacements.into_vec().into_iter().map(native::run))
 }
 
@@ -581,7 +660,11 @@ fn tabular_value(value: &Val, tsv: bool) -> jaq_json::ValR {
         .map_err(|error| jaq_json::Error::str(format_args!("Cannot format row: {error}")))
         .and_then(|row| {
             let mut output = BoundedWriter::new(MAX_OUTPUT_BYTES);
-            let result = if tsv { row.write_tsv(&mut output) } else { row.write_csv(&mut output) };
+            let result = if tsv {
+                row.write_tsv(&mut output)
+            } else {
+                row.write_csv(&mut output)
+            };
             result.map_err(jaq_json::Error::str)?;
             Ok(Val::utf8_str(output.bytes))
         })
@@ -652,7 +735,9 @@ impl<'a> QueryOutput<'a> {
 
     fn write_value(&mut self, value: &Val) -> std::result::Result<(), String> {
         if self.returned > 0 {
-            self.output.write_all(b"\n").map_err(|error| error.to_string())?;
+            self.output
+                .write_all(b"\n")
+                .map_err(|error| error.to_string())?;
         }
         let result = if self.selector.raw {
             if let Some(bytes) = value.as_utf8_bytes() {
@@ -680,7 +765,10 @@ impl<'a> QueryOutput<'a> {
     /// Return false after one complete lookahead result proves a page is full.
     fn accept(&mut self, value: Val) -> std::result::Result<bool, String> {
         let index = self.seen;
-        self.seen = self.seen.checked_add(1).ok_or_else(|| "JSON result count overflow".to_owned())?;
+        self.seen = self
+            .seen
+            .checked_add(1)
+            .ok_or_else(|| "JSON result count overflow".to_owned())?;
         if self.selector.limit.is_none() {
             self.write_value(&value)?;
             return Ok(true);
@@ -715,9 +803,21 @@ impl<'a> QueryOutput<'a> {
         if let Some(first) = self.first.take() {
             if let Val::Arr(values) = first {
                 let offset = self.selector.offset.unwrap_or(0);
-                let count = values.len().saturating_sub(offset).min(self.selector.limit.unwrap_or(100));
-                let page = Val::Arr(values.iter().skip(offset).take(count).cloned().collect::<Vec<_>>().into());
-                self.write_json(&page).map_err(|error| format!("JSON array page exceeds 5 MiB: {error}"))?;
+                let count = values
+                    .len()
+                    .saturating_sub(offset)
+                    .min(self.selector.limit.unwrap_or(100));
+                let page = Val::Arr(
+                    values
+                        .iter()
+                        .skip(offset)
+                        .take(count)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+                self.write_json(&page)
+                    .map_err(|error| format!("JSON array page exceeds 5 MiB: {error}"))?;
                 self.returned = count;
                 let remaining = values.len().saturating_sub(offset).saturating_sub(count);
                 self.has_more = remaining > 0;
@@ -727,15 +827,33 @@ impl<'a> QueryOutput<'a> {
             }
         }
         let mut content = String::from_utf8_lossy(&self.output.bytes).into_owned();
-        let next_offset = self.has_more.then(|| self.selector.offset.unwrap_or(0).saturating_add(self.returned));
+        let next_offset = self.has_more.then(|| {
+            self.selector
+                .offset
+                .unwrap_or(0)
+                .saturating_add(self.returned)
+        });
         if let Some(offset) = next_offset {
-            let count = self.remaining.map_or_else(|| "more results".to_owned(), |count| format!("{count} more items"));
+            let count = self.remaining.map_or_else(
+                || "more results".to_owned(),
+                |count| format!("{count} more items"),
+            );
             if !content.is_empty() {
                 content.push('\n');
             }
-            content.push_str(&format!("[{count}; append {} to continue]", self.selector.continuation(offset)));
-        } else if self.returned == 0 && self.remaining.is_none() && self.selector.offset.is_some_and(|offset| offset > 0) {
-            content.push_str(&format!("[offset {} is past the last result ({} total)]", self.selector.offset.unwrap_or(0), self.seen));
+            content.push_str(&format!(
+                "[{count}; append {} to continue]",
+                self.selector.continuation(offset)
+            ));
+        } else if self.returned == 0
+            && self.remaining.is_none()
+            && self.selector.offset.is_some_and(|offset| offset > 0)
+        {
+            content.push_str(&format!(
+                "[offset {} is past the last result ({} total)]",
+                self.selector.offset.unwrap_or(0),
+                self.seen
+            ));
         }
         Ok(RenderedOutput {
             content,
@@ -767,22 +885,37 @@ fn evaluate(selector: &QueryRequest, source: &[u8]) -> std::result::Result<Query
     if selector.query.len() > MAX_QUERY_BYTES {
         return Err("JSON query filter exceeds 16 KiB".into());
     }
-    if selector.limit.is_some_and(|limit| limit == 0 || limit > 1000)
+    if selector
+        .limit
+        .is_some_and(|limit| limit == 0 || limit > 1000)
         || selector.offset.is_some() != selector.limit.is_some()
     {
-        return Err("Invalid JSON query pagination; use an offset and a limit from 1 through 1000".into());
+        return Err(
+            "Invalid JSON query pagination; use an offset and a limit from 1 through 1000".into(),
+        );
     }
     std::str::from_utf8(source).map_err(|error| format!("JSON input is not UTF-8: {error}"))?;
     check_source_depth(source)?;
-    let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
+    let defs = jaq_core::defs()
+        .chain(jaq_std::defs())
+        .chain(jaq_json::defs());
     // Loader::new refuses module I/O. Data imports use a separate callback and
     // must be refused explicitly before the compiler assumes imported values.
     let loader = Loader::new(defs);
     let arena = Arena::default();
-    let modules = loader.load(&arena, File { code: selector.query.as_str(), path: () })
+    let modules = loader
+        .load(
+            &arena,
+            File {
+                code: selector.query.as_str(),
+                path: (),
+            },
+        )
         .map_err(|errors| bounded_error("Failed to parse JSON query", &errors))?;
-    jaq_core::load::import(&modules, |_| Err("JSON Read queries cannot import files".to_owned()))
-        .map_err(|errors| bounded_error("Failed to load JSON query", &errors))?;
+    jaq_core::load::import(&modules, |_| {
+        Err("JSON Read queries cannot import files".to_owned())
+    })
+    .map_err(|errors| bounded_error("Failed to load JSON query", &errors))?;
     let filter = jaq_core::Compiler::default()
         .with_funs(query_funs())
         .with_global_vars(["$ENV", "$ARGS"])
@@ -807,17 +940,24 @@ fn evaluate(selector: &QueryRequest, source: &[u8]) -> std::result::Result<Query
         diagnostics: &diagnostics,
         source_path: &selector.source_path,
     };
-    let args = Val::obj([
-        (Val::utf8_str("positional"), Val::Arr(Default::default())),
-        (Val::utf8_str("named"), Val::Obj(Default::default())),
-    ].into_iter().collect());
+    let args = Val::obj(
+        [
+            (Val::utf8_str("positional"), Val::Arr(Default::default())),
+            (Val::utf8_str("named"), Val::Obj(Default::default())),
+        ]
+        .into_iter()
+        .collect(),
+    );
     let mut output = QueryOutput::new(selector);
     let mut last_input_failed = false;
     let mut runtime_errors = 0_usize;
     'inputs: for input in &inputs {
         let input = input?;
         last_input_failed = false;
-        let context = Ctx::<QueryData>::new(data, Vars::new([Val::Obj(Default::default()), args.clone()]));
+        let context = Ctx::<QueryData>::new(
+            data,
+            Vars::new([Val::Obj(Default::default()), args.clone()]),
+        );
         for item in filter.id.run((context, input)) {
             match item {
                 Ok(value) => {
@@ -830,7 +970,10 @@ fn evaluate(selector: &QueryRequest, source: &[u8]) -> std::result::Result<Query
                         last_input_failed = code != 0;
                         if code != 0 {
                             runtime_errors += 1;
-                            let _ = writeln!(diagnostics.borrow_mut(), "JSON query halted with code {code}");
+                            let _ = writeln!(
+                                diagnostics.borrow_mut(),
+                                "JSON query halted with code {code}"
+                            );
                         }
                         break 'inputs;
                     }
@@ -840,7 +983,10 @@ fn evaluate(selector: &QueryRequest, source: &[u8]) -> std::result::Result<Query
                         if let Ok(error) = exception.get_err() {
                             let _ = writeln!(diagnostics.borrow_mut(), "{error}");
                         } else {
-                            let _ = writeln!(diagnostics.borrow_mut(), "Unexpected JSON query control flow");
+                            let _ = writeln!(
+                                diagnostics.borrow_mut(),
+                                "Unexpected JSON query control flow"
+                            );
                         }
                         break;
                     }
@@ -857,7 +1003,9 @@ fn evaluate(selector: &QueryRequest, source: &[u8]) -> std::result::Result<Query
     } else {
         format!("[jq stderr: {diagnostic_text}]\n{}", rendered.content)
     };
-    let next_path = rendered.next_offset.map(|offset| format!("{}{}", selector.source_path, selector.continuation(offset)));
+    let next_path = rendered
+        .next_offset
+        .map(|offset| format!("{}{}", selector.source_path, selector.continuation(offset)));
     Ok(QueryOutcome {
         content,
         is_error: last_input_failed,
@@ -908,7 +1056,8 @@ mod tests {
     #[test]
     fn selectors_preserve_arithmetic_percent_and_optional_operators() {
         let arithmetic = parse_path("local://data.JSON?q=.items[]? | .n + 1&raw=true")
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert_eq!(arithmetic.source_path, "local://data.JSON");
         assert_eq!(arithmetic.query, ".items[]? | .n + 1");
         assert!(arithmetic.raw);
@@ -916,14 +1065,20 @@ mod tests {
         let modulo = parse_path("numbers.json?q=. % 3").unwrap().unwrap();
         assert_eq!(modulo.query, ". % 3");
         let decoded = parse_path("events.ndjson?query=.name%20%2B%20%22a%26b%22&compact=1")
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert_eq!(decoded.query, ".name + \"a&b\"");
         assert!(decoded.compact);
     }
 
     #[test]
     fn ordinary_paths_remain_ordinary_reads_and_pages_are_opt_in() {
-        for path in ["data.json", "file.txt?q=.", "data.json?raw=true", "data.json?q="] {
+        for path in [
+            "data.json",
+            "file.txt?q=.",
+            "data.json?raw=true",
+            "data.json?q=",
+        ] {
             assert!(parse_path(path).unwrap().is_none(), "{path}");
         }
         let offset = parse_path("data.json?q=.&offset=0").unwrap().unwrap();
@@ -936,23 +1091,57 @@ mod tests {
     #[test]
     fn full_filters_support_arithmetic_projection_grouping_and_definitions() {
         let source = r#"[{"kind":"a","amount":2},{"kind":"b","amount":7},{"kind":"a","amount":3}]"#;
-        let grouped = query("group_by(.kind) | map({kind: .[0].kind, total: (map(.amount) | add)})", source);
-        assert_eq!(grouped.content, r#"[{"kind":"a","total":5},{"kind":"b","total":7}]"#);
-        let projected = query(".[] | select(.amount >= 3) | {label: (.kind + \"!\"), value: (.amount * 2)}", source);
-        assert_eq!(projected.content, "{\"label\":\"b!\",\"value\":14}\n{\"label\":\"a!\",\"value\":6}");
-        assert_eq!(query("def scale($n): map(. * $n); scale(3)", "[1,2,3]").content, "[3,6,9]");
-        assert_eq!(query("reduce .[] as $n (0; . + $n)", "[1,2,3]").content, "6");
-        assert_eq!(query("(.a += 2) | if .a > 3 then .a else 0 end", "{\"a\":2}").content, "4");
+        let grouped = query(
+            "group_by(.kind) | map({kind: .[0].kind, total: (map(.amount) | add)})",
+            source,
+        );
+        assert_eq!(
+            grouped.content,
+            r#"[{"kind":"a","total":5},{"kind":"b","total":7}]"#
+        );
+        let projected = query(
+            ".[] | select(.amount >= 3) | {label: (.kind + \"!\"), value: (.amount * 2)}",
+            source,
+        );
+        assert_eq!(
+            projected.content,
+            "{\"label\":\"b!\",\"value\":14}\n{\"label\":\"a!\",\"value\":6}"
+        );
+        assert_eq!(
+            query("def scale($n): map(. * $n); scale(3)", "[1,2,3]").content,
+            "[3,6,9]"
+        );
+        assert_eq!(
+            query("reduce .[] as $n (0; . + $n)", "[1,2,3]").content,
+            "6"
+        );
+        assert_eq!(
+            query("(.a += 2) | if .a > 3 then .a else 0 end", "{\"a\":2}").content,
+            "4"
+        );
     }
 
     #[test]
     fn native_formats_and_regular_expressions_are_available() {
         let mut selector = request("[.name, .count] | @csv");
         selector.raw = true;
-        assert_eq!(evaluate(&selector, br#"{"name":"a,b","count":2}"#).unwrap().content, "\"a,b\",2");
+        assert_eq!(
+            evaluate(&selector, br#"{"name":"a,b","count":2}"#)
+                .unwrap()
+                .content,
+            "\"a,b\",2"
+        );
         selector.query = "[.name, .count] | @tsv".into();
-        assert_eq!(evaluate(&selector, br#"{"name":"a\tb","count":2}"#).unwrap().content, "a\\tb\t2");
-        assert_eq!(query("map(select(test(\"^a\")))", r#"["alpha","beta","atom"]"#).content, r#"["alpha","atom"]"#);
+        assert_eq!(
+            evaluate(&selector, br#"{"name":"a\tb","count":2}"#)
+                .unwrap()
+                .content,
+            "a\\tb\t2"
+        );
+        assert_eq!(
+            query("map(select(test(\"^a\")))", r#"["alpha","beta","atom"]"#).content,
+            r#"["alpha","atom"]"#
+        );
         assert_eq!(query("\"a b\" | @uri", "null").content, "\"a%20b\"");
     }
 
@@ -962,7 +1151,10 @@ mod tests {
         selector.offset = Some(0);
         selector.limit = Some(2);
         let output = evaluate(&selector, br#"{"ids":[12345678901234567890,1.0,3]}"#).unwrap();
-        assert_eq!(output.content, "[12345678901234567890,1.0]\n[1 more items; append ?q=.ids&compact=true&limit=2&offset=2 to continue]");
+        assert_eq!(
+            output.content,
+            "[12345678901234567890,1.0]\n[1 more items; append ?q=.ids&compact=true&limit=2&offset=2 to continue]"
+        );
         assert_eq!(output.metadata["pagination"]["remaining"], 1);
         assert_eq!(output.metadata["returned"], 2);
     }
@@ -971,10 +1163,16 @@ mod tests {
     fn raw_output_preserves_trailing_spaces_and_embedded_newlines() {
         let mut selector = request("\"first\\nsecond  \"");
         selector.raw = true;
-        assert_eq!(evaluate(&selector, b"null").unwrap().content, "first\nsecond  ");
+        assert_eq!(
+            evaluate(&selector, b"null").unwrap().content,
+            "first\nsecond  "
+        );
         selector.offset = Some(0);
         selector.limit = Some(1);
-        assert_eq!(evaluate(&selector, b"null").unwrap().content, "first\nsecond  ");
+        assert_eq!(
+            evaluate(&selector, b"null").unwrap().content,
+            "first\nsecond  "
+        );
     }
 
     #[test]
@@ -996,9 +1194,15 @@ mod tests {
         selector.offset = Some(1);
         selector.limit = Some(1);
         let output = evaluate(&selector, b"[1,2]\n[3,4]\n[5,6]\n").unwrap();
-        assert_eq!(output.content, "[3,4]\n[more results; append ?q=.&compact=true&limit=1&offset=2 to continue]");
+        assert_eq!(
+            output.content,
+            "[3,4]\n[more results; append ?q=.&compact=true&limit=1&offset=2 to continue]"
+        );
         assert_eq!(output.metadata["returned"], 1);
-        assert_eq!(output.metadata["pagination"]["remaining"], serde_json::Value::Null);
+        assert_eq!(
+            output.metadata["pagination"]["remaining"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -1029,8 +1233,18 @@ mod tests {
 
     #[test]
     fn inputs_consumes_the_shared_jsonl_stream_once() {
-        assert_eq!(query("(., inputs) | .n", "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").content, "1\n2\n3");
-        assert_eq!(query("[., inputs] | map(.n) | add", "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").content, "6");
+        assert_eq!(
+            query("(., inputs) | .n", "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").content,
+            "1\n2\n3"
+        );
+        assert_eq!(
+            query(
+                "[., inputs] | map(.n) | add",
+                "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n"
+            )
+            .content,
+            "6"
+        );
     }
 
     #[test]
@@ -1051,7 +1265,10 @@ mod tests {
         assert!(output.content.contains("DEBUG"));
         assert!(output.content.ends_with("\n\"ok\""));
         assert!(!output.is_error);
-        assert_eq!(query("[env, $ENV, $ARGS.named]", "null").content, "[{},{},{}]");
+        assert_eq!(
+            query("[env, $ENV, $ARGS.named]", "null").content,
+            "[{},{},{}]"
+        );
         assert_eq!(query("input_filename", "null").content, "\"fixture.json\"");
     }
 
@@ -1063,28 +1280,60 @@ mod tests {
         let failed = query("\"explanation\" | halt_error(7)", "null");
         assert!(failed.is_error);
         assert!(failed.content.contains("explanation"));
-        assert_eq!(query("try error(\"boom\") catch .", "null").content, "\"boom\"");
+        assert_eq!(
+            query("try error(\"boom\") catch .", "null").content,
+            "\"boom\""
+        );
     }
 
     #[test]
     fn invalid_input_filters_and_external_imports_fail_descriptively() {
-        assert!(evaluate(&request("invalid [[["), b"null").unwrap_err().contains("parse JSON query"));
-        assert!(evaluate(&request("missing_function"), b"null").unwrap_err().contains("compile JSON query"));
-        assert!(evaluate(&request("."), b"{\"broken\":]").unwrap_err().contains("Invalid JSON input"));
+        assert!(
+            evaluate(&request("invalid [[["), b"null")
+                .unwrap_err()
+                .contains("parse JSON query")
+        );
+        assert!(
+            evaluate(&request("missing_function"), b"null")
+                .unwrap_err()
+                .contains("compile JSON query")
+        );
+        assert!(
+            evaluate(&request("."), b"{\"broken\":]")
+                .unwrap_err()
+                .contains("Invalid JSON input")
+        );
         let module = evaluate(&request("include \"outside\"; ."), b"null").unwrap_err();
         assert!(module.contains("module loading not supported"));
-        let data = evaluate(&request("import \"outside\" as $secret; $secret"), b"null").unwrap_err();
+        let data =
+            evaluate(&request("import \"outside\" as $secret; $secret"), b"null").unwrap_err();
         assert!(data.contains("cannot import files"));
     }
 
     #[test]
     fn parser_and_output_bounds_fail_before_unbounded_capture() {
-        let nested = format!("{}null{}", "[".repeat(MAX_JSON_DEPTH + 1), "]".repeat(MAX_JSON_DEPTH + 1));
-        assert!(evaluate(&request("."), nested.as_bytes()).unwrap_err().contains("256 levels"));
+        let nested = format!(
+            "{}null{}",
+            "[".repeat(MAX_JSON_DEPTH + 1),
+            "]".repeat(MAX_JSON_DEPTH + 1)
+        );
+        assert!(
+            evaluate(&request("."), nested.as_bytes())
+                .unwrap_err()
+                .contains("256 levels")
+        );
         let oversized = vec![b' '; MAX_INPUT_BYTES + 1];
-        assert!(evaluate(&request("."), &oversized).unwrap_err().contains("10 MiB"));
+        assert!(
+            evaluate(&request("."), &oversized)
+                .unwrap_err()
+                .contains("10 MiB")
+        );
         let large_string = format!("\"{}\"", "x".repeat(3 * 1024 * 1024));
-        assert!(evaluate(&request(". + ."), large_string.as_bytes()).unwrap_err().contains("5 MiB"));
+        assert!(
+            evaluate(&request(". + ."), large_string.as_bytes())
+                .unwrap_err()
+                .contains("5 MiB")
+        );
         assert!(check_source_depth(br#"{"text":"[[[[[\\\"{{{{"}"#).is_ok());
     }
 
@@ -1095,7 +1344,9 @@ mod tests {
         assert!(output.write_all(b"5678").is_err());
         assert_eq!(output.bytes, b"1234");
         let mut diagnostics = DiagnosticTail::default();
-        diagnostics.write_all(&vec![b'x'; MAX_DIAGNOSTIC_BYTES * 2]).unwrap();
+        diagnostics
+            .write_all(&vec![b'x'; MAX_DIAGNOSTIC_BYTES * 2])
+            .unwrap();
         diagnostics.write_all(b"last error").unwrap();
         assert_eq!(diagnostics.bytes.len(), MAX_DIAGNOSTIC_BYTES);
         assert!(diagnostics.text().ends_with("last error"));
@@ -1104,16 +1355,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_resolution_never_reexecutes_a_test_harness_or_searches_path() {
-        assert_eq!(worker_candidate(Path::new("/app/bin/pi")).unwrap(), Path::new("/app/bin/pi"));
-        assert_eq!(worker_candidate(Path::new("/build/target/debug/deps/read_tool-01234567")).unwrap(), Path::new("/build/target/debug/pi"));
-        assert_eq!(worker_candidate(Path::new("/app/bin/embedder")).unwrap(), Path::new("/app/bin/pi"));
+        assert_eq!(
+            worker_candidate(Path::new("/app/bin/pi")).unwrap(),
+            Path::new("/app/bin/pi")
+        );
+        assert_eq!(
+            worker_candidate(Path::new("/build/target/debug/deps/read_tool-01234567")).unwrap(),
+            Path::new("/build/target/debug/pi")
+        );
+        assert_eq!(
+            worker_candidate(Path::new("/app/bin/embedder")).unwrap(),
+            Path::new("/app/bin/pi")
+        );
     }
 
     #[test]
     fn worker_requires_the_captured_capabilities_before_process_lookup() {
         let restricted = asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
         let _guard = restricted.set_current_restricted();
-        let error = futures::executor::block_on(run_worker(WorkerKind::Json, Vec::new())).unwrap_err();
+        let error =
+            futures::executor::block_on(run_worker(WorkerKind::Json, Vec::new())).unwrap_err();
         assert!(error.to_string().contains("capabilities"));
     }
 }

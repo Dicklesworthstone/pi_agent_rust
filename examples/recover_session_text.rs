@@ -20,8 +20,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use clap::Parser;
 use pi::sdk::Session;
@@ -54,7 +54,10 @@ struct Args {
 
 fn entry_id(value: &str) -> Result<String, String> {
     if value.trim().is_empty() || value.len() > 1024 {
-        return Err("branch ID must be nonempty and at most 1024 UTF-8 bytes; use --root for a new path".into());
+        return Err(
+            "branch ID must be nonempty and at most 1024 UTF-8 bytes; use --root for a new path"
+                .into(),
+        );
     }
     Ok(value.to_string())
 }
@@ -67,13 +70,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run(args: &Args) -> pi::PiResult<()> {
     if let Some(output) = &args.session_output {
-        let selected = if args.root { Some("") } else { args.branch.as_deref() };
+        let selected = if args.root {
+            Some("")
+        } else {
+            args.branch.as_deref()
+        };
         let id = Session::fork_recovered_text(&args.source, output, selected)?;
         // The file has already been published. A closed diagnostic stream must
         // not turn that success into an error suggesting nothing was created.
         // Print only a generated UUID, not an unescaped caller-supplied path.
-        let _ = writeln!(std::io::stderr().lock(),
-            "Created text-only recovery session {id}. Resume the new file with pi --session.");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "Created text-only recovery session {id}. Resume the new file with pi --session."
+        );
         return Ok(());
     }
     let report = Session::recover_text(&args.source)?;
@@ -94,7 +103,9 @@ fn run(args: &Args) -> pi::PiResult<()> {
         let mut output = stdout.lock();
         match format {
             RecoveryExport::Json => report.write_json(&mut output)?,
-            RecoveryExport::Text(selection) => report.write_selected_text(selection, &mut output)?,
+            RecoveryExport::Text(selection) => {
+                report.write_selected_text(selection, &mut output)?
+            }
         }
     }
     Ok(())
@@ -111,8 +122,14 @@ mod tests {
         assert!(args.session_output.is_none());
         assert!(!args.root && !args.active && !args.json);
         let args = Args::try_parse_from([
-            "recover", "source.jsonl", "--session-output", "copy.jsonl", "--branch", "chosen",
-        ]).unwrap();
+            "recover",
+            "source.jsonl",
+            "--session-output",
+            "copy.jsonl",
+            "--branch",
+            "chosen",
+        ])
+        .unwrap();
         assert_eq!(args.session_output, Some(PathBuf::from("copy.jsonl")));
         assert_eq!(args.branch.as_deref(), Some("chosen"));
     }
@@ -145,12 +162,19 @@ mod tests {
         std::fs::write(&source, &original).unwrap();
         let copy = directory.path().join("copy.jsonl");
         let args = Args::try_parse_from([
-            "recover", source.to_str().unwrap(), "--session-output", copy.to_str().unwrap(), "--root",
-        ]).unwrap();
+            "recover",
+            source.to_str().unwrap(),
+            "--session-output",
+            copy.to_str().unwrap(),
+            "--root",
+        ])
+        .unwrap();
         run(&args).unwrap();
         let copied = std::fs::read_to_string(&copy).unwrap();
-        let rows: Vec<serde_json::Value> = copied.lines()
-            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let rows: Vec<serde_json::Value> = copied
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["type"], "session");
         assert_eq!(rows[0]["currentLeaf"], rows[1]["id"]);
@@ -160,10 +184,16 @@ mod tests {
 
         let output = directory.path().join("report.json");
         let args = Args::try_parse_from([
-            "recover", source.to_str().unwrap(), "--json", "--output", output.to_str().unwrap(),
-        ]).unwrap();
+            "recover",
+            source.to_str().unwrap(),
+            "--json",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
         run(&args).unwrap();
-        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(report["schema"], "pi.session_text_recovery.v1");
         assert_eq!(std::fs::read(source).unwrap(), original);
     }

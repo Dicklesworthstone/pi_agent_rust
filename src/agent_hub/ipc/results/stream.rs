@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use super::{Document, MAX_COMPLETE_BYTES, MAX_DOCUMENT_BYTES, WireResponse, current_identity, enforce_document_limit, ipc_error};
+use super::{
+    Document, MAX_COMPLETE_BYTES, MAX_DOCUMENT_BYTES, WireResponse, current_identity,
+    enforce_document_limit, ipc_error,
+};
 use crate::error::Result;
 
 const PAGE_BYTES: usize = 16 * 1024;
@@ -40,7 +43,10 @@ pub(crate) struct Page {
 /// Shared byte counting includes escaping and metadata, but never creates a
 /// second encoded copy of a large source just to decide whether it fits.
 pub(super) fn encoded_size(value: &impl Serialize, limit: usize) -> Option<usize> {
-    struct Counter { used: usize, limit: usize }
+    struct Counter {
+        used: usize,
+        limit: usize,
+    }
     impl io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if bytes.len() > self.limit.saturating_sub(self.used) {
@@ -49,7 +55,9 @@ pub(super) fn encoded_size(value: &impl Serialize, limit: usize) -> Option<usize
             self.used += bytes.len();
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     let mut count = Counter { used: 0, limit };
     serde_json::to_writer(&mut count, value).ok()?;
@@ -63,7 +71,9 @@ fn fingerprint(document: &Document) -> Result<String> {
             self.0.update(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     let mut sink = Sink(Sha256::new());
     serde_json::to_writer(&mut sink, document)?;
@@ -71,10 +81,14 @@ fn fingerprint(document: &Document) -> Result<String> {
 }
 
 fn validate_metadata(content_type: &str, metadata: &Value) -> Result<()> {
-    if content_type.len() > 128 || !metadata.is_object()
+    if content_type.len() > 128
+        || !metadata.is_object()
         || encoded_size(metadata, METADATA_BYTES).is_none()
     {
-        return Err(ipc_error("RESULT_LIMIT", "agent result metadata exceeds its bounds"));
+        return Err(ipc_error(
+            "RESULT_LIMIT",
+            "agent result metadata exceeds its bounds",
+        ));
     }
     Ok(())
 }
@@ -92,8 +106,17 @@ impl Pages {
         enforce_document_limit(&document)?;
         validate_metadata(&document.content_type, &document.metadata)?;
         let complete = encoded_size(&document, MAX_COMPLETE_BYTES).is_some();
-        let fingerprint = if complete { String::new() } else { fingerprint(&document)? };
-        Ok(Self { document: Some(document), fingerprint, cursor: 0, complete })
+        let fingerprint = if complete {
+            String::new()
+        } else {
+            fingerprint(&document)?
+        };
+        Ok(Self {
+            document: Some(document),
+            fingerprint,
+            cursor: 0,
+            complete,
+        })
     }
 
     fn next(&mut self) -> Option<WireResponse> {
@@ -104,17 +127,25 @@ impl Pages {
         let total = document.content.len();
         let start = self.cursor;
         let mut end = start.saturating_add(PAGE_BYTES).min(total);
-        while !document.content.is_char_boundary(end) { end -= 1; }
+        while !document.content.is_char_boundary(end) {
+            end -= 1;
+        }
         let page = Page {
-            reference: document.reference.clone(), offset: start, total_bytes: total,
-            fingerprint: self.fingerprint.clone(), content: document.content[start..end].to_string(),
+            reference: document.reference.clone(),
+            offset: start,
+            total_bytes: total,
+            fingerprint: self.fingerprint.clone(),
+            content: document.content[start..end].to_string(),
             done: end == total,
             header: (start == 0).then(|| Header {
-                content_type: document.content_type.clone(), metadata: document.metadata.clone(),
+                content_type: document.content_type.clone(),
+                metadata: document.metadata.clone(),
             }),
         };
         self.cursor = end;
-        if page.done { self.document = None; }
+        if page.done {
+            self.document = None;
+        }
         Some(WireResponse::Page(page))
     }
 }
@@ -137,7 +168,11 @@ impl std::fmt::Debug for Transfer {
 
 impl Transfer {
     pub(crate) fn new(document: Document, sender: &str, identity: (PathBuf, u32)) -> Result<Self> {
-        Ok(Self { pages: Pages::new(document)?, sender: sender.to_string(), identity })
+        Ok(Self {
+            pages: Pages::new(document)?,
+            sender: sender.to_string(),
+            identity,
+        })
     }
 
     pub(crate) fn check_reader(&self) -> Result<()> {
@@ -146,17 +181,25 @@ impl Transfer {
 
     fn check_identity(&self, observed: (PathBuf, u32)) -> Result<()> {
         if observed != self.identity {
-            return Err(ipc_error("REVOKED", "result reader identity changed during transfer"));
+            return Err(ipc_error(
+                "REVOKED",
+                "result reader identity changed during transfer",
+            ));
         }
         Ok(())
     }
 
     pub(crate) fn next_response(&mut self) -> Result<Option<WireResponse>> {
-        if self.pages.document.is_none() { return Ok(None); }
+        if self.pages.document.is_none() {
+            return Ok(None);
+        }
         self.next_with_identity(current_identity(&self.sender))
     }
 
-    fn next_with_identity(&mut self, observed: Result<(PathBuf, u32)>) -> Result<Option<WireResponse>> {
+    fn next_with_identity(
+        &mut self,
+        observed: Result<(PathBuf, u32)>,
+    ) -> Result<Option<WireResponse>> {
         self.check_identity(observed?)?;
         Ok(self.pages.next())
     }
@@ -178,12 +221,19 @@ pub(super) struct Collector<'a> {
 
 impl<'a> Collector<'a> {
     pub(super) const fn new(reference: &'a str) -> Self {
-        Self { reference, partial: None, finished: false }
+        Self {
+            reference,
+            partial: None,
+            finished: false,
+        }
     }
 
     pub(super) fn push(&mut self, response: WireResponse) -> Result<Option<Document>> {
         if self.finished {
-            return Err(ipc_error("PROTOCOL", "data followed the completed agent result"));
+            return Err(ipc_error(
+                "PROTOCOL",
+                "data followed the completed agent result",
+            ));
         }
         let outcome = self.push_inner(response);
         if outcome.is_err() {
@@ -198,11 +248,17 @@ impl<'a> Collector<'a> {
             WireResponse::Error(error) => Err(crate::error::Error::tool("read", error)),
             WireResponse::Ok(document) => {
                 if self.partial.is_some() || document.reference != self.reference {
-                    return Err(ipc_error("PROTOCOL", "parent returned a mismatched result document"));
+                    return Err(ipc_error(
+                        "PROTOCOL",
+                        "parent returned a mismatched result document",
+                    ));
                 }
                 validate_metadata(&document.content_type, &document.metadata)?;
                 if encoded_size(&document, MAX_COMPLETE_BYTES).is_none() {
-                    return Err(ipc_error("RESULT_LIMIT", "complete result reply exceeds 128 KiB; paging is required"));
+                    return Err(ipc_error(
+                        "RESULT_LIMIT",
+                        "complete result reply exceeds 128 KiB; paging is required",
+                    ));
                 }
                 self.finished = true;
                 Ok(Some(document))
@@ -212,45 +268,81 @@ impl<'a> Collector<'a> {
     }
 
     fn push_page(&mut self, page: Page) -> Result<Option<Document>> {
-        if page.reference != self.reference || page.total_bytes > MAX_DOCUMENT_BYTES
-            || page.total_bytes == 0 || page.content.is_empty() || page.content.len() > PAGE_BYTES
-            || page.fingerprint.len() != 64 || !page.fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+        if page.reference != self.reference
+            || page.total_bytes > MAX_DOCUMENT_BYTES
+            || page.total_bytes == 0
+            || page.content.is_empty()
+            || page.content.len() > PAGE_BYTES
+            || page.fingerprint.len() != 64
+            || !page.fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
         {
-            return Err(ipc_error("PROTOCOL", "invalid agent result page bounds or identity"));
+            return Err(ipc_error(
+                "PROTOCOL",
+                "invalid agent result page bounds or identity",
+            ));
         }
         if self.partial.is_none() {
-            let header = page.header.ok_or_else(|| ipc_error("PROTOCOL", "first result page has no header"))?;
+            let header = page
+                .header
+                .ok_or_else(|| ipc_error("PROTOCOL", "first result page has no header"))?;
             if page.offset != 0 {
-                return Err(ipc_error("PROTOCOL", "first result page does not begin at zero"));
+                return Err(ipc_error(
+                    "PROTOCOL",
+                    "first result page does not begin at zero",
+                ));
             }
             validate_metadata(&header.content_type, &header.metadata)?;
             self.partial = Some(Partial {
                 document: Document {
-                    reference: page.reference, content: String::new(),
-                    content_type: header.content_type, metadata: header.metadata,
+                    reference: page.reference,
+                    content: String::new(),
+                    content_type: header.content_type,
+                    metadata: header.metadata,
                 },
-                fingerprint: page.fingerprint.clone(), total: page.total_bytes,
+                fingerprint: page.fingerprint.clone(),
+                total: page.total_bytes,
             });
         } else if page.header.is_some() {
-            return Err(ipc_error("PROTOCOL", "result header changed after the first page"));
+            return Err(ipc_error(
+                "PROTOCOL",
+                "result header changed after the first page",
+            ));
         }
-        let partial = self.partial.as_mut().expect("first page installs a partial result");
-        if partial.document.content.len() != page.offset || partial.total != page.total_bytes
+        let partial = self
+            .partial
+            .as_mut()
+            .expect("first page installs a partial result");
+        if partial.document.content.len() != page.offset
+            || partial.total != page.total_bytes
             || partial.fingerprint != page.fingerprint
             || page.content.len() > partial.total.saturating_sub(page.offset)
         {
-            return Err(ipc_error("PROTOCOL", "result pages are inconsistent, duplicated or out of order"));
+            return Err(ipc_error(
+                "PROTOCOL",
+                "result pages are inconsistent, duplicated or out of order",
+            ));
         }
         let end = page.offset + page.content.len();
         if page.done != (end == partial.total) {
-            return Err(ipc_error("PROTOCOL", "result completion does not match its declared length"));
+            return Err(ipc_error(
+                "PROTOCOL",
+                "result completion does not match its declared length",
+            ));
         }
         partial.document.content.push_str(&page.content);
-        if !page.done { return Ok(None); }
-        let partial = self.partial.take().expect("completed page has a partial result");
+        if !page.done {
+            return Ok(None);
+        }
+        let partial = self
+            .partial
+            .take()
+            .expect("completed page has a partial result");
         enforce_document_limit(&partial.document)?;
         if fingerprint(&partial.document)? != partial.fingerprint {
-            return Err(ipc_error("PROTOCOL", "agent result fingerprint does not match its complete payload"));
+            return Err(ipc_error(
+                "PROTOCOL",
+                "agent result fingerprint does not match its complete payload",
+            ));
         }
         self.finished = true;
         Ok(Some(partial.document))

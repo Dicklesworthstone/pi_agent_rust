@@ -50,8 +50,12 @@ const MAX_HTTP_SSE_EVENT_IDS: usize = 4096;
 /// Preferred MCP protocol revision, matching OMP's current handshake.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 /// Revisions whose shared handshake, tools, resources, and prompts we support.
-const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
-    &[MCP_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"];
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
+    MCP_PROTOCOL_VERSION,
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 fn tool_err(code: &str, message: impl Into<String>) -> Error {
     Error::tool("mcp", format!("[{code}] {}", message.into()))
@@ -1030,8 +1034,8 @@ impl McpStdioClient {
         // ownership to a worker, while the child is still guarded locally.
         #[cfg(unix)]
         let (stdin, stdout, stderr) = {
-            let pipes = cancellable_stdio::prepare(stdin, stdout, stderr, &alive)
-                .map_err(|error| {
+            let pipes =
+                cancellable_stdio::prepare(stdin, stdout, stderr, &alive).map_err(|error| {
                     alive.store(false, Ordering::SeqCst);
                     kill_tree_once(pid, &tree_cleanup_state);
                     let _ = child_guard.kill();
@@ -1979,7 +1983,10 @@ impl HttpTransport {
             Some(binding) => binding.authorization_header(true).await,
             None => Ok(None),
         };
-        if result.as_ref().is_err_and(super::manager::is_authentication_error) {
+        if result
+            .as_ref()
+            .is_err_and(super::manager::is_authentication_error)
+        {
             self.authentication_failed.store(true, Ordering::Release);
         }
         result
@@ -2585,10 +2592,13 @@ impl HttpTransport {
         match result {
             Err(error)
                 if is_session_expired(&error)
-                    || super::manager::is_authentication_error(&error) => Err(tool_err(
-                "MCP_DELIVERY_INDETERMINATE",
-                "server rejected the client response inside an already-accepted SSE request; the original request may have completed and was not replayed",
-            )),
+                    || super::manager::is_authentication_error(&error) =>
+            {
+                Err(tool_err(
+                    "MCP_DELIVERY_INDETERMINATE",
+                    "server rejected the client response inside an already-accepted SSE request; the original request may have completed and was not replayed",
+                ))
+            }
             result => result.map(|_| ()),
         }
     }
@@ -2745,10 +2755,8 @@ impl HttpTransport {
                 if method == "notifications/progress" {
                     self.progress.publish(&value, wire_state.generation);
                 } else if method == "notifications/tools/list_changed" {
-                    self.tools_list_changed_generation.store(
-                        wire_state.generation.wrapping_add(1),
-                        Ordering::Release,
-                    );
+                    self.tools_list_changed_generation
+                        .store(wire_state.generation.wrapping_add(1), Ordering::Release);
                 }
                 return Ok(None);
             };
@@ -6069,9 +6077,8 @@ for line in sys.stdin:
     #[test]
     fn streamable_http_dropped_initialize_future_aborts_without_cancellation() {
         let server = DripBodyHttpServer::start(500, "Internal Server Error");
-        let transport = std::sync::Arc::new(
-            HttpTransport::new(&server.url(), Vec::new()).expect("transport"),
-        );
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
         let runtime = runtime_for_tests();
         runtime.block_on(async {
             let initialize = Box::pin(transport.request(
@@ -6103,9 +6110,8 @@ for line in sys.stdin:
     #[test]
     fn streamable_http_dropped_initialized_future_aborts_without_cancellation() {
         let server = DripBodyHttpServer::start(500, "Internal Server Error");
-        let transport = std::sync::Arc::new(
-            HttpTransport::new(&server.url(), Vec::new()).expect("transport"),
-        );
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
         transport
             .capture_initialize_state(
                 &initialize_success_body(),

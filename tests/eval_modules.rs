@@ -10,8 +10,12 @@ use pi::tools::{Tool, ToolOutput};
 use serde_json::{Value, json};
 
 fn run(tool: &EvalTool, input: Value) -> ToolOutput {
-    asupersync::runtime::RuntimeBuilder::current_thread().blocking_threads(1, 8)
-        .build().unwrap().block_on(tool.execute("module-cell", input, None)).unwrap()
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 8)
+        .build()
+        .unwrap()
+        .block_on(tool.execute("module-cell", input, None))
+        .unwrap()
 }
 
 fn json_output(output: &ToolOutput) -> &Value {
@@ -33,17 +37,38 @@ fn loaded_scripts_import_relative_to_their_source_even_in_later_cells() {
     let root = harness.temp_path(".");
     std::fs::create_dir(root.join("analysis")).unwrap();
     std::fs::write(root.join("values.mjs"), "export const answer = -1;").unwrap();
-    std::fs::write(root.join("analysis/values.mjs"), "export const answer = 42;").unwrap();
-    std::fs::write(root.join("analysis/setup.js"),
-        "async function answerLater() { return (await import('./values.mjs')).answer; }").unwrap();
+    std::fs::write(
+        root.join("analysis/values.mjs"),
+        "export const answer = 42;",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("analysis/setup.js"),
+        "async function answerLater() { return (await import('./values.mjs')).answer; }",
+    )
+    .unwrap();
     let tool = EvalTool::new(&root);
-    let loaded = run(&tool, json!({"kernel":"js", "code":"%load analysis/setup.js"}));
+    let loaded = run(
+        &tool,
+        json!({"kernel":"js", "code":"%load analysis/setup.js"}),
+    );
     assert!(!loaded.is_error, "{:?}", loaded.content);
-    assert!(loaded.details.as_ref().unwrap()["sourcePath"].as_str().unwrap().ends_with("setup.js"));
-    let result = run(&tool, json!({"kernel":"js", "code":"display(await answerLater())"}));
+    assert!(
+        loaded.details.as_ref().unwrap()["sourcePath"]
+            .as_str()
+            .unwrap()
+            .ends_with("setup.js")
+    );
+    let result = run(
+        &tool,
+        json!({"kernel":"js", "code":"display(await answerLater())"}),
+    );
     assert_eq!(json_output(&result), 42);
     // Inline imports still use the workspace, not the last loaded directory.
-    let result = run(&tool, json!({"kernel":"js", "code":"display((await import('./values.mjs')).answer)"}));
+    let result = run(
+        &tool,
+        json!({"kernel":"js", "code":"display((await import('./values.mjs')).answer)"}),
+    );
     assert_eq!(json_output(&result), -1);
     finish(&harness);
 }
@@ -78,13 +103,28 @@ fn imported_async_code_uses_real_bridge_displays_and_native_error_contract() {
     std::fs::write(root.join("worker.mjs"),
         "await sleep(1); const text = await tool.call('read', {path:'input.txt'}); display({matched:text.includes('module-bridge-payload')}); export const done = true;").unwrap();
     let tool = EvalTool::new(&root);
-    let result = run(&tool, json!({"kernel":"js", "code":"await import('./worker.mjs')"}));
+    let result = run(
+        &tool,
+        json!({"kernel":"js", "code":"await import('./worker.mjs')"}),
+    );
     assert_eq!(json_output(&result), &json!({"matched":true}));
-    std::fs::write(root.join("failure.mjs"), "throw new Error('module failure');").unwrap();
-    let result = run(&tool, json!({"kernel":"js", "code":"await import('./failure.mjs')"}));
+    std::fs::write(
+        root.join("failure.mjs"),
+        "throw new Error('module failure');",
+    )
+    .unwrap();
+    let result = run(
+        &tool,
+        json!({"kernel":"js", "code":"await import('./failure.mjs')"}),
+    );
     assert!(result.is_error);
-    assert!(result.content.iter().any(|block| matches!(block, ContentBlock::Text(text) if text.text.contains("module failure"))));
-    let result = run(&tool, json!({"kernel":"js", "code":"display((await import('./worker.mjs')).done)"}));
+    assert!(result.content.iter().any(
+        |block| matches!(block, ContentBlock::Text(text) if text.text.contains("module failure"))
+    ));
+    let result = run(
+        &tool,
+        json!({"kernel":"js", "code":"display((await import('./worker.mjs')).done)"}),
+    );
     assert_eq!(json_output(&result), true);
     finish(&harness);
 }

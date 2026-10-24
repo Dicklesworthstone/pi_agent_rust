@@ -6,8 +6,8 @@
 //! neither a forged header nor compressed input controls an output allocation.
 
 use super::{
-    FRAME_WIDTH, MAX_FRAME_HEIGHT, PNG_SIGNATURE, SNAPCOMPACT_DETAILS_SCHEMA, SnapFrame, SnapLimits,
-    SnapPayload, crc32,
+    FRAME_WIDTH, MAX_FRAME_HEIGHT, PNG_SIGNATURE, SNAPCOMPACT_DETAILS_SCHEMA, SnapFrame,
+    SnapLimits, SnapPayload, crc32,
 };
 use base64::Engine as _;
 use serde_json::Value;
@@ -105,7 +105,10 @@ pub(super) fn parse_payload(value: &Value, limits: SnapLimits) -> Result<SnapPay
 
 /// Public payload fields also permit direct SDK construction, so attachment
 /// and persistence must not rely on callers having used the JSON reader.
-pub(super) fn validate_payload(payload: &SnapPayload, limits: SnapLimits) -> Result<(), ReplayError> {
+pub(super) fn validate_payload(
+    payload: &SnapPayload,
+    limits: SnapLimits,
+) -> Result<(), ReplayError> {
     if payload.schema != SNAPCOMPACT_DETAILS_SCHEMA {
         return Err(ReplayError::Schema);
     }
@@ -200,7 +203,8 @@ fn valid_scanlines(idat: &[u8], width: u32, height: u32) -> bool {
         let Some(input) = idat.get(offset..) else {
             return false;
         };
-        let Ok(status) = decoder.decompress(input, &mut buffer, flate2::FlushDecompress::None) else {
+        let Ok(status) = decoder.decompress(input, &mut buffer, flate2::FlushDecompress::None)
+        else {
             return false;
         };
         let after_in = decoder.total_in();
@@ -238,7 +242,9 @@ mod tests {
         SNAPCOMPACT_DETAILS_KEY, attach_frames, frames_from_details, payload_to_details, png_chunk,
         png_encode,
     };
-    use crate::model::{ContentBlock, ImageContent, Message, TextContent, UserContent, UserMessage};
+    use crate::model::{
+        ContentBlock, ImageContent, Message, TextContent, UserContent, UserMessage,
+    };
     use serde_json::json;
     use std::io::Write;
 
@@ -305,7 +311,10 @@ mod tests {
         let empty = SnapPayload::new(Vec::new());
         assert!(validate_payload(&empty, SnapLimits::default()).is_ok());
         assert_eq!(
-            parse_payload(&json!({"schema":"foreign","frames":[]}), SnapLimits::default()),
+            parse_payload(
+                &json!({"schema":"foreign","frames":[]}),
+                SnapLimits::default()
+            ),
             Err(ReplayError::Schema)
         );
         assert!(frames_from_details(None).is_none());
@@ -469,7 +478,10 @@ mod tests {
         let original = frame(1, 1);
         let mut doubled = compress(&[0, 42, 42, 42]);
         doubled.extend_from_slice(&compress(&[]));
-        assert_eq!(validate(with_idat(&original, &doubled)), Err(ReplayError::Png));
+        assert_eq!(
+            validate(with_idat(&original, &doubled)),
+            Err(ReplayError::Png)
+        );
         for raw in [vec![0; 3], vec![0; 5], vec![0; 1024 * 1024]] {
             assert_eq!(
                 validate(with_idat(&original, &compress(&raw))),
@@ -484,9 +496,9 @@ mod tests {
         let mut raw = vec![0u8; 14];
         raw[7] = 5;
         assert_eq!(
-                validate(with_idat(&original, &compress(&raw))),
-                Err(ReplayError::Png)
-            );
+            validate(with_idat(&original, &compress(&raw))),
+            Err(ReplayError::Png)
+        );
         raw[7] = 4;
         assert!(validate(with_idat(&original, &compress(&raw))).is_ok());
     }

@@ -24,7 +24,9 @@ fn relative_file(raw: &str) -> Result<PathBuf> {
         || raw.chars().any(char::is_control)
         || raw.ends_with('/')
     {
-        return Err(scan_error("expected a bounded, control-free relative file path"));
+        return Err(scan_error(
+            "expected a bounded, control-free relative file path",
+        ));
     }
     let mut normalized = PathBuf::new();
     for component in Path::new(raw).components() {
@@ -42,7 +44,10 @@ fn relative_file(raw: &str) -> Result<PathBuf> {
 
 pub(super) fn report_path(raw: &str) -> Result<PathBuf> {
     let path = relative_file(raw)?;
-    if path.extension().is_none_or(|extension| extension != "sarif") {
+    if path
+        .extension()
+        .is_none_or(|extension| extension != "sarif")
+    {
         return Err(scan_error("source report paths must end in .sarif"));
     }
     Ok(path)
@@ -57,20 +62,29 @@ fn decode_store(bytes: &[u8]) -> Result<BTreeMap<String, Disposition>> {
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("a bounded map of unique source finding decisions")
         }
-        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
             let mut store = BTreeMap::new();
             while let Some((identity, decision)) = map.next_entry::<String, Disposition>()? {
                 if store.len() >= MAX_FINDINGS || store.insert(identity, decision).is_some() {
-                    return Err(serde::de::Error::custom("duplicate or excessive dispositions"));
+                    return Err(serde::de::Error::custom(
+                        "duplicate or excessive dispositions",
+                    ));
                 }
             }
             Ok(store)
         }
     }
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    let store = serde::de::Deserializer::deserialize_map(&mut decoder, UniqueStore)
-        .map_err(|_| scan_error("corrupt disposition store; existing decisions were not changed"))?;
-    decoder.end().map_err(|_| scan_error("trailing data in disposition store"))?;
+    let store =
+        serde::de::Deserializer::deserialize_map(&mut decoder, UniqueStore).map_err(|_| {
+            scan_error("corrupt disposition store; existing decisions were not changed")
+        })?;
+    decoder
+        .end()
+        .map_err(|_| scan_error("trailing data in disposition store"))?;
     validate_store(&store)?;
     Ok(store)
 }
@@ -81,11 +95,16 @@ fn validate_store(store: &BTreeMap<String, Disposition>) -> Result<()> {
     }
     for (identity, entry) in store {
         if !super::lowercase_hex(identity, 16)
-            || !matches!(entry.status.as_str(), "false-positive" | "accepted" | "fixed")
+            || !matches!(
+                entry.status.as_str(),
+                "false-positive" | "accepted" | "fixed"
+            )
             || entry.reason.trim().is_empty()
             || entry.reason.len() > 2048
         {
-            return Err(scan_error("invalid disposition identity, status or bounded reason"));
+            return Err(scan_error(
+                "invalid disposition identity, status or bounded reason",
+            ));
         }
     }
     Ok(())
@@ -131,11 +150,16 @@ mod platform {
                     let Component::Normal(name) = part else {
                         return Err(std::io::Error::other("invalid relative parent"));
                     };
-                    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+                    let flags =
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
                     let next = match rustix::fs::openat(&directory, name, flags, Mode::empty()) {
                         Ok(next) => next,
                         Err(rustix::io::Errno::NOENT) if create => {
-                            match rustix::fs::mkdirat(&directory, name, Mode::from_bits_truncate(0o700)) {
+                            match rustix::fs::mkdirat(
+                                &directory,
+                                name,
+                                Mode::from_bits_truncate(0o700),
+                            ) {
                                 Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                                 Err(error) => return Err(error.into()),
                             }
@@ -155,7 +179,11 @@ mod platform {
             let parent = match self.parent(&path, false) {
                 Ok(parent) => parent,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(_) => return Err(scan_error("cannot open report parent without following links")),
+                Err(_) => {
+                    return Err(scan_error(
+                        "cannot open report parent without following links",
+                    ));
+                }
             };
             let file = match rustix::fs::openat(
                 &parent,
@@ -167,12 +195,15 @@ mod platform {
                 Err(rustix::io::Errno::NOENT) => return Ok(None),
                 Err(_) => return Err(scan_error("cannot open report without following links")),
             };
-            let metadata = file.metadata().map_err(|_| scan_error("cannot inspect report"))?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| scan_error("cannot inspect report"))?;
             if !metadata.is_file() || metadata.len() > limit {
                 return Err(scan_error("report must be a bounded regular file"));
             }
             let mut bytes = Vec::new();
-            file.take(limit + 1).read_to_end(&mut bytes)
+            file.take(limit + 1)
+                .read_to_end(&mut bytes)
                 .map_err(|_| scan_error("report read failed"))?;
             if bytes.len() as u64 > limit {
                 return Err(scan_error("report grew beyond its byte budget"));
@@ -191,7 +222,8 @@ mod platform {
             {
                 return Err(scan_error("invalid source persistence request"));
             }
-            let parent = self.parent(&path, true)
+            let parent = self
+                .parent(&path, true)
                 .map_err(|_| scan_error("cannot pin report parent without following links"))?;
             let name = path.file_name().expect("validated file name");
             if replace {
@@ -203,21 +235,31 @@ mod platform {
             }
             let staging = format!(".pi-source-{}.tmp", uuid::Uuid::new_v4());
             let descriptor = rustix::fs::openat(
-                &parent, staging.as_str(),
+                &parent,
+                staging.as_str(),
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::from_bits_truncate(0o600),
-            ).map_err(|_| scan_error("cannot create private source staging file"))?;
-            let _stage = Stage { parent: &parent, name: &staging };
+            )
+            .map_err(|_| scan_error("cannot create private source staging file"))?;
+            let _stage = Stage {
+                parent: &parent,
+                name: &staging,
+            };
             let mut file = File::from(descriptor);
-            file.write_all(bytes).and_then(|()| file.sync_all())
-                .map_err(|_| scan_error("source staging write/sync failed; destination unchanged"))?;
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| {
+                    scan_error("source staging write/sync failed; destination unchanged")
+                })?;
             super::super::operation::publish(|| {
                 let result = if replace {
                     rustix::fs::renameat(&parent, staging.as_str(), &parent, name)
                 } else {
                     rustix::fs::linkat(&parent, staging.as_str(), &parent, name, AtFlags::empty())
                 };
-                result.map_err(|_| scan_error("source report publication failed; no file was truncated"))
+                result.map_err(|_| {
+                    scan_error("source report publication failed; no file was truncated")
+                })
             })
         }
 
@@ -226,18 +268,31 @@ mod platform {
         pub(super) fn lock_store(&self) -> Result<(Self, File)> {
             check_owner()?;
             let path = Path::new(".pi/security-dispositions.lock");
-            let parent = self.parent(path, true)
+            let parent = self
+                .parent(path, true)
                 .map_err(|_| scan_error("cannot pin disposition directory"))?;
             let descriptor = rustix::fs::openat(
-                &parent, "security-dispositions.lock",
-                OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                &parent,
+                "security-dispositions.lock",
+                OFlags::RDWR
+                    | OFlags::CREATE
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK,
                 Mode::from_bits_truncate(0o600),
-            ).map_err(|_| scan_error("cannot open disposition lock"))?;
+            )
+            .map_err(|_| scan_error("cannot open disposition lock"))?;
             let file = File::from(descriptor);
-            if !file.metadata().map_err(|_| scan_error("cannot inspect disposition lock"))?.is_file() {
+            if !file
+                .metadata()
+                .map_err(|_| scan_error("cannot inspect disposition lock"))?
+                .is_file()
+            {
                 return Err(scan_error("disposition lock must be a regular file"));
             }
-            file.try_lock().map_err(|_| scan_error("disposition store is busy or cannot be locked; retry the operation"))?;
+            file.try_lock().map_err(|_| {
+                scan_error("disposition store is busy or cannot be locked; retry the operation")
+            })?;
             check_owner()?;
             // Keep this .pi identity for the entire read/modify/write, not
             // just the lock open. A renamed parent cannot switch maps midway.
@@ -245,7 +300,10 @@ mod platform {
         }
     }
 
-    struct Stage<'a> { parent: &'a OwnedFd, name: &'a str }
+    struct Stage<'a> {
+        parent: &'a OwnedFd,
+        name: &'a str,
+    }
     impl Drop for Stage<'_> {
         fn drop(&mut self) {
             let _ = rustix::fs::unlinkat(self.parent, self.name, AtFlags::empty());
@@ -258,20 +316,32 @@ mod platform {
     use super::*;
     pub(super) struct Root;
     fn unsupported<T>() -> Result<T> {
-        Err(scan_error("confined source persistence requires supported Unix descriptor APIs"))
+        Err(scan_error(
+            "confined source persistence requires supported Unix descriptor APIs",
+        ))
     }
     #[allow(clippy::unused_self)]
     impl Root {
-        pub(super) fn open(_path: &Path) -> Result<Self> { unsupported() }
-        pub(super) fn read(&self, _path: &str, _limit: u64) -> Result<Option<Vec<u8>>> { unsupported() }
-        pub(super) fn publish(&self, _path: &str, _bytes: &[u8], _replace: bool) -> Result<()> { unsupported() }
-        pub(super) fn lock_store(&self) -> Result<(Self, std::fs::File)> { unsupported() }
+        pub(super) fn open(_path: &Path) -> Result<Self> {
+            unsupported()
+        }
+        pub(super) fn read(&self, _path: &str, _limit: u64) -> Result<Option<Vec<u8>>> {
+            unsupported()
+        }
+        pub(super) fn publish(&self, _path: &str, _bytes: &[u8], _replace: bool) -> Result<()> {
+            unsupported()
+        }
+        pub(super) fn lock_store(&self) -> Result<(Self, std::fs::File)> {
+            unsupported()
+        }
     }
 }
 
 pub(super) struct Storage(platform::Root);
 impl Storage {
-    pub(super) fn open(path: &Path) -> Result<Self> { Ok(Self(platform::Root::open(path)?)) }
+    pub(super) fn open(path: &Path) -> Result<Self> {
+        Ok(Self(platform::Root::open(path)?))
+    }
 
     pub(super) fn load(&self) -> Result<BTreeMap<String, Disposition>> {
         match self.0.read(DISPOSITIONS, STORE_LIMIT)? {
@@ -313,7 +383,8 @@ impl Storage {
 
     pub(super) fn read_report(&self, raw: &str) -> Result<Vec<u8>> {
         let path = report_path(raw)?;
-        self.0.read(path.to_str().expect("UTF-8 request"), MAX_SOURCE_BYTES)?
+        self.0
+            .read(path.to_str().expect("UTF-8 request"), MAX_SOURCE_BYTES)?
             .ok_or_else(|| scan_error("source baseline is missing"))
     }
 

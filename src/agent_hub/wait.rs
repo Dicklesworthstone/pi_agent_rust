@@ -141,8 +141,15 @@ impl AgentHubRegistry {
         child: &str,
         remaining: Duration,
     ) -> Result<Arc<DependencyHold>> {
-        if self.entries.get(child).is_none_or(|entry| entry.status.settled()) {
-            return Err(wait_error("PEER", "the awaited native child is unavailable"));
+        if self
+            .entries
+            .get(child)
+            .is_none_or(|entry| entry.status.settled())
+        {
+            return Err(wait_error(
+                "PEER",
+                "the awaited native child is unavailable",
+            ));
         }
         self.prune_wait_holds()?;
         let deadline = Instant::now()
@@ -234,7 +241,8 @@ impl AgentHubRegistry {
             .get(&hold.waiter)
             .is_some_and(|cursor| *cursor > reply.cursor)
             || (reply.all_senders
-                && self.dropped_reply_tracking_through
+                && self
+                    .dropped_reply_tracking_through
                     .get(&hold.waiter)
                     .is_some_and(|cursor| *cursor > reply.cursor));
         if ready || history_lost {
@@ -243,7 +251,8 @@ impl AgentHubRegistry {
         if reply.all_senders {
             // Other concurrent tools may add unanswered sends while this
             // wait is open. Every current live alternative can wake it.
-            return self.pending_replies
+            return self
+                .pending_replies
                 .get(&hold.waiter)
                 .into_iter()
                 .flat_map(|pending| pending.keys())
@@ -681,7 +690,10 @@ pub async fn wait_for_replies(
                     && (has_code(&error, "PI_HUB_IPC_BUSY:")
                         || has_code(&error, "PI_HUB_WAIT_BUSY:"))
                 {
-                    owner.time().sleep(Duration::from_millis(10).min(remaining)).await;
+                    owner
+                        .time()
+                        .sleep(Duration::from_millis(10).min(remaining))
+                        .await;
                     continue;
                 }
                 return expired_probe(error, remaining, last_pending);

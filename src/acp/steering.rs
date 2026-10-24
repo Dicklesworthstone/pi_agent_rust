@@ -261,7 +261,10 @@ impl Mailbox {
         if !state.accepting {
             return None;
         }
-        let position = state.pending.iter().position(|input| input.queue == queue)?;
+        let position = state
+            .pending
+            .iter()
+            .position(|input| input.queue == queue)?;
         let input = state.pending.remove(position)?;
         state.bytes -= input.bytes;
         Some(input)

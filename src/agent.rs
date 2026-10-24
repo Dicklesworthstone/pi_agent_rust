@@ -63,10 +63,10 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -3562,7 +3562,8 @@ impl Agent {
     /// distinguish authored input from generated user-role messages.
     fn consume_queued_delivery(&mut self, delivery: QueuedAgentMessage) -> Message {
         if delivery.keyword_scan_source().is_some() {
-            self.authored_queue_delivery_indices.push(self.messages.len());
+            self.authored_queue_delivery_indices
+                .push(self.messages.len());
         }
         delivery.into_message()
     }
@@ -4622,11 +4623,13 @@ impl Agent {
                 .process_chunk(delta, StreamChannel::Thinking),
             StreamEvent::Start { partial } => self.check_stream_rule_snapshot(partial),
             StreamEvent::Done { reason, message }
-                if !matches!(reason, StopReason::Error | StopReason::Aborted | StopReason::Refusal)
-                    && !matches!(
-                        message.stop_reason,
-                        StopReason::Error | StopReason::Aborted | StopReason::Refusal
-                    ) =>
+                if !matches!(
+                    reason,
+                    StopReason::Error | StopReason::Aborted | StopReason::Refusal
+                ) && !matches!(
+                    message.stop_reason,
+                    StopReason::Error | StopReason::Aborted | StopReason::Refusal
+                ) =>
             {
                 // A provider may send only a terminal snapshot, or replace its
                 // streamed text at the terminal. Check that authoritative
@@ -4984,13 +4987,8 @@ impl Agent {
                     },
                     _ => None,
                 };
-                let message = self.close_stream_rule_attempt(
-                    &rule,
-                    retry,
-                    partial,
-                    sent_start,
-                    &on_event,
-                );
+                let message =
+                    self.close_stream_rule_attempt(&rule, retry, partial, sent_start, &on_event);
                 // Returning drops the provider stream before the next attempt
                 // can open. No terminal tool snapshot reaches the executor.
                 return Ok(AssistantStreamAttempt::RuleInterrupted {
@@ -5916,13 +5914,20 @@ impl Agent {
 
     async fn check_invocation_session(&self, expected: Option<&str>) -> Result<()> {
         if let Some(expected) = expected {
-            crate::agent_cx::AgentCx::for_current_or_request().checkpoint()
+            crate::agent_cx::AgentCx::for_current_or_request()
+                .checkpoint()
                 .map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
             let current = self.job_session_scope.session_id().await.map_err(|_| {
-                Error::tool("eval", "EVAL_SESSION_UNAVAILABLE: nested tool owner unavailable")
+                Error::tool(
+                    "eval",
+                    "EVAL_SESSION_UNAVAILABLE: nested tool owner unavailable",
+                )
             })?;
             if current != expected {
-                return Err(Error::tool("eval", "EVAL_SESSION_CHANGED: nested tool no longer owns the current session"));
+                return Err(Error::tool(
+                    "eval",
+                    "EVAL_SESSION_CHANGED: nested tool no longer owns the current session",
+                ));
             }
         }
         Ok(())
@@ -6290,7 +6295,11 @@ impl Agent {
     /// validation produces the named errors); `promote` moves the tool into
     /// the live schema and invalidates the def cache. Returns `None` for
     /// `list`/`describe` (the XdevTool handles those itself).
-    async fn dispatch_xdev(&self, tool_call: &ToolCall, on_event: AgentEventHandler) -> Option<ToolOutput> {
+    async fn dispatch_xdev(
+        &self,
+        tool_call: &ToolCall,
+        on_event: AgentEventHandler,
+    ) -> Option<ToolOutput> {
         let args = &tool_call.arguments;
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         match action {
@@ -6333,11 +6342,16 @@ impl Agent {
                     )
                 };
                 let mut output = inner
-                    .execute_with_invocation(&tool_call.id, inner_args, None, crate::tools::ToolInvocationContext {
-                        protect: &protect,
-                        host: Some(&host),
-                        snapshot_privacy: &snapshot_privacy,
-                    })
+                    .execute_with_invocation(
+                        &tool_call.id,
+                        inner_args,
+                        None,
+                        crate::tools::ToolInvocationContext {
+                            protect: &protect,
+                            host: Some(&host),
+                            snapshot_privacy: &snapshot_privacy,
+                        },
+                    )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
                 output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
@@ -6533,15 +6547,21 @@ impl Agent {
         // renew eval's tool-call authority or acquire its kernel recursively.
         let context = crate::tools::ToolInvocationContext {
             protect: &protect,
-            host: if expected_session.is_none() { Some(&host) } else { None },
+            host: if expected_session.is_none() {
+                Some(&host)
+            } else {
+                None
+            },
             snapshot_privacy: &snapshot_privacy,
         };
-        let outcome = tool.execute_with_invocation(
-            &tool_call.id,
-            tool_call.arguments.clone(),
-            Some(Box::new(update_callback)),
-            context,
-        ).await;
+        let outcome = tool
+            .execute_with_invocation(
+                &tool_call.id,
+                tool_call.arguments.clone(),
+                Some(Box::new(update_callback)),
+                context,
+            )
+            .await;
         match outcome {
             Ok(output) => {
                 let is_error = output.is_error;
@@ -6737,15 +6757,29 @@ impl<'a> AgentToolInvocationHost<'a> {
 
     async fn check_session(&self, expected: &str) -> Result<()> {
         if self.revoked.load(Ordering::Acquire) {
-            return Err(Error::tool("eval", "EVAL_SESSION_CHANGED: invocation host was revoked"));
+            return Err(Error::tool(
+                "eval",
+                "EVAL_SESSION_CHANGED: invocation host was revoked",
+            ));
         }
-        let current = self.agent.job_session_scope.session_id().await.map_err(|_| {
-            self.revoked.store(true, Ordering::Release);
-            Error::tool("eval", "EVAL_SESSION_UNAVAILABLE: invocation host owner unavailable")
-        })?;
+        let current = self
+            .agent
+            .job_session_scope
+            .session_id()
+            .await
+            .map_err(|_| {
+                self.revoked.store(true, Ordering::Release);
+                Error::tool(
+                    "eval",
+                    "EVAL_SESSION_UNAVAILABLE: invocation host owner unavailable",
+                )
+            })?;
         if current != expected {
             self.revoked.store(true, Ordering::Release);
-            return Err(Error::tool("eval", "EVAL_SESSION_CHANGED: invocation host cannot follow a session switch"));
+            return Err(Error::tool(
+                "eval",
+                "EVAL_SESSION_CHANGED: invocation host cannot follow a session switch",
+            ));
         }
         Ok(())
     }
@@ -6790,16 +6824,26 @@ impl crate::tools::ToolInvocationHost for AgentToolInvocationHost<'_> {
         // registered discoverable tools can be called by their actual names.
         // Rejecting all wrappers here also prevents xdev -> xdev -> eval.
         if matches!(call.name.as_str(), "eval" | "xdev") || call.name.starts_with("__pi_") {
-            return Err(Error::tool("eval", "EVAL_BRIDGE_RECURSION: eval and dispatch wrappers cannot be called from a cell; call the target tool directly"));
+            return Err(Error::tool(
+                "eval",
+                "EVAL_BRIDGE_RECURSION: eval and dispatch wrappers cannot be called from a cell; call the target tool directly",
+            ));
         }
         if self.agent.tools.snapshot().get(&call.name).is_none() {
-            return Err(Error::tool("eval", "EVAL_BRIDGE_UNAVAILABLE: tool is not enabled in this Agent"));
+            return Err(Error::tool(
+                "eval",
+                "EVAL_BRIDGE_UNAVAILABLE: tool is not enabled in this Agent",
+            ));
         }
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
-        owner.checkpoint().map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
         self.check_session(expected_session).await?;
         let mut event = NestedToolEvent {
-            call: call.clone(), on_event: Arc::clone(&self.on_event), completed: false,
+            call: call.clone(),
+            on_event: Arc::clone(&self.on_event),
+            completed: false,
         };
         (self.on_event)(AgentEvent::ToolExecutionStart {
             tool_call_id: call.id.clone(),
@@ -6807,14 +6851,24 @@ impl crate::tools::ToolInvocationHost for AgentToolInvocationHost<'_> {
             args: call.arguments.clone(),
         });
         // The start callback can switch sessions or cancel the owning turn.
-        self.agent.check_invocation_session(Some(expected_session)).await?;
+        self.agent
+            .check_invocation_session(Some(expected_session))
+            .await?;
         // The outer eval already measures this entire interval. Do not add
         // nested samples to its accumulator and double-count tool latency.
         let latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
-        let (mut output, is_error) = self.agent.execute_tool_in_session(
-            call, Arc::clone(&self.on_event), latency, Some(expected_session),
-        ).await;
-        owner.checkpoint().map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+        let (mut output, is_error) = self
+            .agent
+            .execute_tool_in_session(
+                call,
+                Arc::clone(&self.on_event),
+                latency,
+                Some(expected_session),
+            )
+            .await;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
         self.check_session(expected_session).await?;
         output.is_error = is_error;
         event.finish(&output);
@@ -18016,8 +18070,14 @@ impl AgentSession {
             }
         };
 
-        self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission, None, None)
-            .await
+        self.apply_compaction_result(
+            result,
+            Arc::clone(&on_event),
+            provider_admission,
+            None,
+            None,
+        )
+        .await
     }
 
     fn compaction_runtime_handle(&mut self) -> Result<RuntimeHandle> {
@@ -18130,7 +18190,9 @@ impl AgentSession {
             compaction::estimate_model_context_tokens(&candidate.to_messages_for_current_path());
         if require_reduction
             && tokens_after
-                >= compaction::estimate_model_context_tokens(&session.to_messages_for_current_path())
+                >= compaction::estimate_model_context_tokens(
+                    &session.to_messages_for_current_path(),
+                )
         {
             return Err(Error::api(
                 "Context overflow recovery made no progress; compaction did not reduce the active context",
@@ -18400,8 +18462,7 @@ impl AgentSession {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: result_value,
                     aborted: false,
-                    will_retry: overflow
-                        && !overflow_abort.is_some_and(AbortSignal::is_aborted),
+                    will_retry: overflow && !overflow_abort.is_some_and(AbortSignal::is_aborted),
                     error_message: None,
                 });
                 return Ok(true);
@@ -18442,8 +18503,7 @@ impl AgentSession {
             } else if shake {
                 Ok(compaction::compact_shake(prep, &privacy))
             } else {
-                let compact =
-                    compaction::compact(prep, provider, &stream_options, None, &privacy);
+                let compact = compaction::compact(prep, provider, &stream_options, None, &privacy);
                 if let Some(abort) = overflow_abort {
                     let cancelled = abort.wait();
                     futures::pin_mut!(compact, cancelled);
@@ -19091,11 +19151,7 @@ impl AgentSession {
                     break;
                 }
                 let should_continue = self
-                    .maybe_advise_turn(
-                        abort,
-                        &turn,
-                        continuation < MAX_ADVISOR_CONTINUATIONS,
-                    )
+                    .maybe_advise_turn(abort, &turn, continuation < MAX_ADVISOR_CONTINUATIONS)
                     .await?;
                 if !should_continue || !turn.may_continue(&self.agent, abort) {
                     break;

@@ -29,8 +29,8 @@ pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
 const MAX_TOOL_CALLS: usize = 64;
 
-pub(super) type SnapshotPrivacy<'a> = dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot
-    + Send + Sync + 'a;
+pub(super) type SnapshotPrivacy<'a> =
+    dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot + Send + Sync + 'a;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
@@ -48,33 +48,54 @@ impl Selection {
         if fields.len() != 2 {
             return Err(input_error());
         }
-        let provider = fields.get("provider").and_then(Value::as_str).ok_or_else(input_error)?;
-        let model = fields.get("model").and_then(Value::as_str).ok_or_else(input_error)?;
+        let provider = fields
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or_else(input_error)?;
+        let model = fields
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(input_error)?;
         if [provider, model].into_iter().any(|part| {
-            part.is_empty() || part.len() > 256 || part.trim() != part
+            part.is_empty()
+                || part.len() > 256
+                || part.trim() != part
                 || part.chars().any(char::is_control)
         }) {
             return Err(input_error());
         }
         // Bound borrowed names before making any copy of guest-controlled data.
-        Ok(Self::Named { provider: provider.to_owned(), model: model.to_owned() })
+        Ok(Self::Named {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        })
     }
 
     fn role(value: &Value) -> Option<Self> {
         // Canonical names only: do not trim, normalize an arbitrary string or
         // interpret a provider/model selector supplied by interpreter code.
         let name = value.as_str()?;
-        let role = ModelRole::ALL.into_iter().find(|role| role.as_str() == name)?;
-        Some(Self::Role { role: role.as_str().to_owned() })
+        let role = ModelRole::ALL
+            .into_iter()
+            .find(|role| role.as_str() == name)?;
+        Some(Self::Role {
+            role: role.as_str().to_owned(),
+        })
     }
 }
 
 fn input_error() -> Error {
-    Error::tool("eval", "EVAL_INPUT: judge_model requires either provider and model strings (at most 256 bytes each) or one canonical native role")
+    Error::tool(
+        "eval",
+        "EVAL_INPUT: judge_model requires either provider and model strings (at most 256 bytes each) or one canonical native role",
+    )
 }
 
 fn binding_error() -> Error {
-    Error::tool("judge", "PI_JUDGE_BINDING: selected model, trusted configuration or credentials unavailable; no fallback")
+    Error::tool(
+        "judge",
+        "PI_JUDGE_BINDING: selected model, trusted configuration or credentials unavailable; no fallback",
+    )
 }
 
 /// Strict settings lookup shared by named and role selections. Auxiliary
@@ -87,28 +108,42 @@ fn resolve_entry(
     config: &Config,
     registry: &ModelRegistry,
 ) -> Result<(ModelEntry, Option<crate::model::ThinkingLevel>)> {
-    let scope = config.model_scope_overrides.as_deref()
+    let scope = config
+        .model_scope_overrides
+        .as_deref()
         .and_then(|overrides| crate::failover::best_scope_override(overrides, cwd));
-    let disabled = |provider: &str| crate::failover::provider_is_disabled(
-        config.disabled_providers.as_deref().unwrap_or_default(), scope, provider,
-    );
+    let disabled = |provider: &str| {
+        crate::failover::provider_is_disabled(
+            config.disabled_providers.as_deref().unwrap_or_default(),
+            scope,
+            provider,
+        )
+    };
     let (entry, thinking) = match selection {
         Selection::Named { provider, model } => {
             if disabled(provider) {
                 return Err(binding_error());
             }
-            (registry.find(provider, model).ok_or_else(binding_error)?, None)
+            (
+                registry.find(provider, model).ok_or_else(binding_error)?,
+                None,
+            )
         }
         Selection::Role { role } => {
             let role = ModelRole::from_name(role).ok_or_else(binding_error)?;
-            let spec = config.model_roles.as_ref()
+            let spec = config
+                .model_roles
+                .as_ref()
                 .and_then(|roles| crate::app::role_spec_from_settings(roles, role))
                 .ok_or_else(binding_error)?;
             let target = crate::app::resolve_prewalk_model_spec(spec, config, registry, cwd)
                 .map_err(|_| binding_error())?;
-            let entry = registry.find(&target.provider, &target.model)
+            let entry = registry
+                .find(&target.provider, &target.model)
                 .ok_or_else(binding_error)?;
-            let thinking = target.thinking.map(|level| entry.clamp_thinking_level(level));
+            let thinking = target
+                .thinking
+                .map(|level| entry.clamp_thinking_level(level));
             (entry, thinking)
         }
     };
@@ -124,8 +159,12 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
     let global_dir = Config::global_dir();
     let override_path = std::env::var_os("PI_CONFIG_PATH").map(PathBuf::from);
     let global = Config::load_with_roots_and_project_trust(
-        override_path.as_deref(), &global_dir, cwd, false,
-    ).map_err(|_| binding_error())?;
+        override_path.as_deref(),
+        &global_dir,
+        cwd,
+        false,
+    )
+    .map_err(|_| binding_error())?;
     let trust = crate::workspace_trust::establish(
         cwd,
         &global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
@@ -136,17 +175,23 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
             interactive: false,
         },
         |_| Err(binding_error()),
-    ).map_err(|_| binding_error())?;
+    )
+    .map_err(|_| binding_error())?;
     let config = Config::load_with_roots_and_project_trust(
-        override_path.as_deref(), &global_dir, cwd, trust.trusted,
-    ).map_err(|_| binding_error())?;
+        override_path.as_deref(),
+        &global_dir,
+        cwd,
+        trust.trusted,
+    )
+    .map_err(|_| binding_error())?;
     let mut auth = AuthStorage::load(Config::auth_path()).map_err(|_| binding_error())?;
-    auth.set_command_working_directory(cwd).map_err(|_| binding_error())?;
+    auth.set_command_working_directory(cwd)
+        .map_err(|_| binding_error())?;
     let registry = ModelRegistry::load(&auth, None);
     let (entry, thinking_level) = resolve_entry(cwd, selection, &config, &registry)?;
-    let api_key = crate::models::normalize_api_key_opt(
-        auth.resolve_api_key(&entry.model.provider, None),
-    ).or_else(|| crate::models::normalize_api_key_opt(entry.api_key.clone()));
+    let api_key =
+        crate::models::normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
+            .or_else(|| crate::models::normalize_api_key_opt(entry.api_key.clone()));
     if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
         return Err(binding_error());
     }
@@ -160,7 +205,12 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
     let provider = crate::providers::create_provider_with_auth(&entry, None, Some(&auth))
         .map_err(|_| binding_error())?;
     Ok(Judge::new(provider, options)
-        .with_image_support(entry.model.input.contains(&crate::provider::InputType::Image))
+        .with_image_support(
+            entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        )
         .with_secrets_settings(config.secrets.as_ref()))
 }
 
@@ -189,11 +239,21 @@ impl<'p> Invocation<'p> {
     ) -> Result<Self> {
         let selection = input.get("judge_model").map(Selection::parse).transpose()?;
         if judge.is_some() && selection.is_some() {
-            return Err(Error::tool("eval", "EVAL_INPUT: judge_model cannot replace a host-bound Judge"));
+            return Err(Error::tool(
+                "eval",
+                "EVAL_INPUT: judge_model cannot replace a host-bound Judge",
+            ));
         }
         Ok(Self {
-            judge, selection, resolved: Vec::new(), protect, receipts: Vec::new(),
-            host: None, host_session: None, tool_receipts: Vec::new(), snapshot_privacy: None,
+            judge,
+            selection,
+            resolved: Vec::new(),
+            protect,
+            receipts: Vec::new(),
+            host: None,
+            host_session: None,
+            tool_receipts: Vec::new(),
+            snapshot_privacy: None,
         })
     }
 
@@ -202,7 +262,10 @@ impl<'p> Invocation<'p> {
         self
     }
 
-    pub(super) fn with_snapshot_privacy(mut self, snapshot: Option<&'p SnapshotPrivacy<'p>>) -> Self {
+    pub(super) fn with_snapshot_privacy(
+        mut self,
+        snapshot: Option<&'p SnapshotPrivacy<'p>>,
+    ) -> Self {
         self.snapshot_privacy = snapshot;
         self
     }
@@ -216,12 +279,17 @@ impl<'p> Invocation<'p> {
     /// needs judge_model admission even when each request selects its own role;
     /// this preserves EvalTool's advertised network effects before execution.
     fn request_selection(&self, input: &mut Value) -> Result<Option<Selection>> {
-        let role = input.as_object_mut().and_then(|fields| fields.remove("model"));
+        let role = input
+            .as_object_mut()
+            .and_then(|fields| fields.remove("model"));
         match role {
             None => Ok(self.selection.clone()),
             Some(role) => {
                 let selection = Selection::role(&role).ok_or_else(|| {
-                    Error::tool("judge", "PI_JUDGE_INPUT: model must name a canonical native role")
+                    Error::tool(
+                        "judge",
+                        "PI_JUDGE_INPUT: model must name a canonical native role",
+                    )
                 })?;
                 if self.judge.is_some() {
                     return Err(binding_error());
@@ -263,7 +331,9 @@ impl<'p> Invocation<'p> {
         input: Value,
     ) -> std::result::Result<String, String> {
         let request = super::bridge_result::Request::parse(name, input)?;
-        let output = self.call_host_output(host, request.name, request.args).await?;
+        let output = self
+            .call_host_output(host, request.name, request.args)
+            .await?;
         if request.structured {
             super::bridge_result::structured(&output)
         } else {
@@ -280,10 +350,14 @@ impl<'p> Invocation<'p> {
         name: String,
         args: Value,
     ) -> std::result::Result<ToolOutput, String> {
-        if name.is_empty() || name.len() > 128
-            || name.chars().any(char::is_control) || !args.is_object()
+        if name.is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+            || !args.is_object()
         {
-            return Err("EVAL_BRIDGE_INPUT: expected a bounded tool name and object arguments".into());
+            return Err(
+                "EVAL_BRIDGE_INPUT: expected a bounded tool name and object arguments".into(),
+            );
         }
         if self.tool_receipts.len() >= MAX_TOOL_CALLS {
             return Err("EVAL_BRIDGE_LIMIT: at most 64 host tool calls per cell".into());
@@ -306,12 +380,21 @@ impl<'p> Invocation<'p> {
             "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
         })?;
         let outcome = host.call_tool(call, session).await;
-        let receipt = self.tool_receipts.get_mut(index)
+        let receipt = self
+            .tool_receipts
+            .get_mut(index)
             .and_then(Value::as_object_mut)
             .ok_or_else(|| "EVAL_TOOL_RECEIPT: native call receipt was unavailable".to_string())?;
         match outcome {
             Ok(output) => {
-                receipt.insert("status".into(), json!(if output.is_error { "failed" } else { "completed" }));
+                receipt.insert(
+                    "status".into(),
+                    json!(if output.is_error {
+                        "failed"
+                    } else {
+                        "completed"
+                    }),
+                );
                 receipt.insert("isError".into(), json!(output.is_error));
                 Ok(output)
             }
@@ -323,11 +406,18 @@ impl<'p> Invocation<'p> {
         }
     }
 
-    pub(super) async fn evaluate(&mut self, cwd: &Path, mut input: Value) -> std::result::Result<String, String> {
+    pub(super) async fn evaluate(
+        &mut self,
+        cwd: &Path,
+        mut input: Value,
+    ) -> std::result::Result<String, String> {
         let selection = self.request_selection(&mut input).map_err(public_error)?;
         let (request, images) = images::parse_request(input).map_err(public_error)?;
         if self.judge.is_none() && self.selection.is_none() {
-            return Err("PI_JUDGE_UNBOUND: supply this cell's judge_model or bind a Judge in the host".into());
+            return Err(
+                "PI_JUDGE_UNBOUND: supply this cell's judge_model or bind a Judge in the host"
+                    .into(),
+            );
         }
         if self.receipts.len() >= MAX_CALLS {
             return Err("PI_JUDGE_LIMIT: at most 16 judgment attempts per eval cell".into());
@@ -343,7 +433,9 @@ impl<'p> Invocation<'p> {
             "usage": null,
             "usageKnown": false,
         }));
-        let outcome = self.evaluate_one(cwd, request, images, selection.as_ref()).await;
+        let outcome = self
+            .evaluate_one(cwd, request, images, selection.as_ref())
+            .await;
         match outcome {
             Ok(verdict) => {
                 self.receipts[index] = json!({
@@ -386,7 +478,9 @@ impl<'p> Invocation<'p> {
     // shares the existing provider, never credentials or privacy with a guest.
     async fn bound_judge(&mut self, cwd: &Path, selection: Option<&Selection>) -> Result<Judge> {
         let owner = AgentCx::for_current_or_request();
-        owner.checkpoint().map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
         if !owner.capabilities().io || !owner.capabilities().time {
             return Err(Error::tool("judge", "PI_JUDGE_PERMISSION"));
         }
@@ -410,8 +504,11 @@ impl<'p> Invocation<'p> {
             let _current = resolver_owner.cx().clone().set_current_restricted();
             resolver_owner.checkpoint().map_err(|_| binding_error())?;
             resolve(&cwd, &selected)
-        }).await?;
-        owner.checkpoint().map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
+        })
+        .await?;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
         self.resolved.push((selection.clone(), judge.clone()));
         Ok(judge)
     }
@@ -429,7 +526,10 @@ impl<'p> Invocation<'p> {
             Ok(mut output) => {
                 let details = output.details.get_or_insert_with(|| json!({}));
                 let details = details.as_object_mut().ok_or_else(|| {
-                    Error::tool("eval", "EVAL_JUDGE_RECEIPT: result details are not an object")
+                    Error::tool(
+                        "eval",
+                        "EVAL_JUDGE_RECEIPT: result details are not an object",
+                    )
                 })?;
                 if !self.receipts.is_empty() {
                     details.insert("judgments".into(), receipts);
@@ -458,11 +558,23 @@ impl<'p> Invocation<'p> {
 fn public_error(error: Error) -> String {
     let text = error.to_string();
     for code in [
-        "PI_SECRET_BLOCK", "PI_AUXILIARY_INPUT_LIMIT", "PI_AUXILIARY_KEY_COLLISION",
-        "PI_JUDGE_INPUT", "PI_JUDGE_BINDING", "PI_JUDGE_PRIVACY", "PI_JUDGE_PERMISSION",
-        "PI_JUDGE_CANCELLED", "PI_JUDGE_TIMEOUT", "PI_JUDGE_RESPONSE", "PI_JUDGE_PROVIDER",
-        "PI_JUDGE_IMAGE_UNSUPPORTED", "PI_JUDGE_IMAGE_INPUT", "PI_JUDGE_IMAGE_LIMIT",
-        "PI_JUDGE_IMAGE_READ", "PI_JUDGE_IMAGE_HOST", "PI_JUDGE_IMAGE_CALL_LIMIT",
+        "PI_SECRET_BLOCK",
+        "PI_AUXILIARY_INPUT_LIMIT",
+        "PI_AUXILIARY_KEY_COLLISION",
+        "PI_JUDGE_INPUT",
+        "PI_JUDGE_BINDING",
+        "PI_JUDGE_PRIVACY",
+        "PI_JUDGE_PERMISSION",
+        "PI_JUDGE_CANCELLED",
+        "PI_JUDGE_TIMEOUT",
+        "PI_JUDGE_RESPONSE",
+        "PI_JUDGE_PROVIDER",
+        "PI_JUDGE_IMAGE_UNSUPPORTED",
+        "PI_JUDGE_IMAGE_INPUT",
+        "PI_JUDGE_IMAGE_LIMIT",
+        "PI_JUDGE_IMAGE_READ",
+        "PI_JUDGE_IMAGE_HOST",
+        "PI_JUDGE_IMAGE_CALL_LIMIT",
     ] {
         if text.contains(code) {
             return format!("{code}: judgment failed; no verdict");

@@ -93,7 +93,11 @@ fn session_id_for(source: ImportSource, content: &[u8], selected_leaf: Option<&s
     if source == ImportSource::Claude {
         // Delimit raw bytes from the selected leaf without changing existing
         // Codex revision-2 identities.
-        digest.update(u64::try_from(content.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(
+            u64::try_from(content.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
     }
     digest.update(content);
     if let Some(leaf) = selected_leaf {

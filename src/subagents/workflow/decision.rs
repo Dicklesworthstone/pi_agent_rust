@@ -1,23 +1,36 @@
 //! Typed branch selection over settled native results. This does not approve
 //! tools, interpret guest code, or turn invalid/missing evidence into a verdict.
 
-use super::{BTreeMap, Record, Result, State, Value, encoded_size, identifier, invalid, validate_pointer};
 #[cfg(test)]
 use super::SubagentStatus;
+use super::{
+    BTreeMap, Record, Result, State, Value, encoded_size, identifier, invalid, validate_pointer,
+};
 use serde_json::json;
 
 const MAX_CONDITION_BYTES: usize = 16 * 1024;
 
-pub(super) fn is_field(key: &str) -> bool { matches!(key, "when" | "join") }
+pub(super) fn is_field(key: &str) -> bool {
+    matches!(key, "when" | "join")
+}
 
 pub(super) fn reject_misplaced(input: &Value) -> Result<()> {
-    let has_policy = |value: &Value| value.as_object()
-        .is_some_and(|fields| fields.keys().any(|key| is_field(key)));
-    if has_policy(input) || ["tasks", "chain"].iter().any(|name| {
-        input.get(*name).and_then(Value::as_array)
-            .is_some_and(|entries| entries.iter().any(has_policy))
-    }) {
-        return Err(invalid("decision policy belongs on workflow nodes, not ordinary delegations"));
+    let has_policy = |value: &Value| {
+        value
+            .as_object()
+            .is_some_and(|fields| fields.keys().any(|key| is_field(key)))
+    };
+    if has_policy(input)
+        || ["tasks", "chain"].iter().any(|name| {
+            input
+                .get(*name)
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.iter().any(has_policy))
+        })
+    {
+        return Err(invalid(
+            "decision policy belongs on workflow nodes, not ordinary delegations",
+        ));
     }
     Ok(())
 }
@@ -28,7 +41,10 @@ pub(super) struct Policy {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Join { All, Selected }
+enum Join {
+    All,
+    Selected,
+}
 
 struct Condition {
     from: usize,
@@ -45,74 +61,137 @@ pub(super) struct Admission {
 
 impl Admission {
     fn ready(condition: Option<&'static str>) -> Self {
-        Self { reason: None, sources: Vec::new(), not_selected: false, condition }
+        Self {
+            reason: None,
+            sources: Vec::new(),
+            not_selected: false,
+            condition,
+        }
     }
 
     fn stopped(reason: &'static str, sources: Vec<usize>, not_selected: bool) -> Self {
-        Self { reason: Some(reason), sources, not_selected, condition: None }
+        Self {
+            reason: Some(reason),
+            sources,
+            not_selected,
+            condition: None,
+        }
     }
 }
 
 impl Policy {
-    pub(super) fn parse(entry: &Value, ids: &BTreeMap<String, usize>, needs: &[usize]) -> Result<Self> {
+    pub(super) fn parse(
+        entry: &Value,
+        ids: &BTreeMap<String, usize>,
+        needs: &[usize],
+    ) -> Result<Self> {
         let join = match entry.get("join") {
             None => Join::All,
             Some(value) => {
-                if needs.is_empty() { return Err(invalid("join requires at least one explicit dependency")); }
+                if needs.is_empty() {
+                    return Err(invalid("join requires at least one explicit dependency"));
+                }
                 match value.as_str() {
                     Some("all") => Join::All,
                     Some("selected") => Join::Selected,
-                    _ => return Err(invalid("join must be all or selected; failed dependencies are never optional")),
+                    _ => {
+                        return Err(invalid(
+                            "join must be all or selected; failed dependencies are never optional",
+                        ));
+                    }
                 }
             }
         };
-        let when = entry.get("when").map(|value| {
-            if encoded_size(value, MAX_CONDITION_BYTES).is_none() {
-                return Err(invalid("when exceeds its 16 KiB encoded limit"));
-            }
-            let fields = value.as_object().filter(|fields| fields.len() == 3
-                && fields.contains_key("from") && fields.contains_key("pointer") && fields.contains_key("equals"))
-                .ok_or_else(|| invalid("when requires exactly from, pointer and a literal equals value"))?;
-            let from = ids.get(identifier(&fields["from"])?).copied()
-                .filter(|index| needs.contains(index))
-                .ok_or_else(|| invalid("when must select an explicitly named direct dependency"))?;
-            let pointer = fields["pointer"].as_str().ok_or_else(|| invalid("when pointer must be a JSON pointer string"))?;
-            validate_pointer(pointer)?;
-            Ok(Condition { from, pointer: pointer.to_owned(), equals: fields["equals"].clone() })
-        }).transpose()?;
+        let when = entry
+            .get("when")
+            .map(|value| {
+                if encoded_size(value, MAX_CONDITION_BYTES).is_none() {
+                    return Err(invalid("when exceeds its 16 KiB encoded limit"));
+                }
+                let fields = value
+                    .as_object()
+                    .filter(|fields| {
+                        fields.len() == 3
+                            && fields.contains_key("from")
+                            && fields.contains_key("pointer")
+                            && fields.contains_key("equals")
+                    })
+                    .ok_or_else(|| {
+                        invalid("when requires exactly from, pointer and a literal equals value")
+                    })?;
+                let from = ids
+                    .get(identifier(&fields["from"])?)
+                    .copied()
+                    .filter(|index| needs.contains(index))
+                    .ok_or_else(|| {
+                        invalid("when must select an explicitly named direct dependency")
+                    })?;
+                let pointer = fields["pointer"]
+                    .as_str()
+                    .ok_or_else(|| invalid("when pointer must be a JSON pointer string"))?;
+                validate_pointer(pointer)?;
+                Ok(Condition {
+                    from,
+                    pointer: pointer.to_owned(),
+                    equals: fields["equals"].clone(),
+                })
+            })
+            .transpose()?;
         Ok(Self { when, join })
     }
 
     /// The caller checks this source's effective schema during full-graph
     /// preflight, even when this branch will eventually not be selected.
-    pub(super) fn source(&self) -> Option<usize> { self.when.as_ref().map(|condition| condition.from) }
+    pub(super) fn source(&self) -> Option<usize> {
+        self.when.as_ref().map(|condition| condition.from)
+    }
 
     pub(super) fn evaluate(&self, needs: &[usize], records: &[Record]) -> Admission {
         // Failure wins over intentional exclusion. A mixed join cannot hide a
         // killed/schema-invalid predecessor behind another unselected branch.
-        let failed: Vec<_> = needs.iter().copied().filter(|&index| {
-            records.get(index).is_none_or(|record| !matches!(record.state, State::Accepted | State::NotSelected))
-        }).collect();
-        if !failed.is_empty() { return Admission::stopped("dependency_failed", failed, false); }
-        let excluded: Vec<_> = needs.iter().copied()
-            .filter(|&index| records[index].state == State::NotSelected).collect();
+        let failed: Vec<_> = needs
+            .iter()
+            .copied()
+            .filter(|&index| {
+                records.get(index).is_none_or(|record| {
+                    !matches!(record.state, State::Accepted | State::NotSelected)
+                })
+            })
+            .collect();
+        if !failed.is_empty() {
+            return Admission::stopped("dependency_failed", failed, false);
+        }
+        let excluded: Vec<_> = needs
+            .iter()
+            .copied()
+            .filter(|&index| records[index].state == State::NotSelected)
+            .collect();
         if !excluded.is_empty() && (self.join == Join::All || excluded.len() == needs.len()) {
-            let reason = if self.join == Join::Selected { "no_selected_dependencies" } else { "dependency_not_selected" };
+            let reason = if self.join == Join::Selected {
+                "no_selected_dependencies"
+            } else {
+                "dependency_not_selected"
+            };
             return Admission::stopped(reason, excluded, true);
         }
         // Selected joins wait for the ordinary complete-wave barrier and need
         // at least one accepted predecessor. Only intentional nonselection is
         // optional; this is not an any-success race or failure-recovery path.
-        let Some(condition) = &self.when else { return Admission::ready(None); };
-        let data = records.get(condition.from)
-            .and_then(Record::validated_data);
+        let Some(condition) = &self.when else {
+            return Admission::ready(None);
+        };
+        let data = records.get(condition.from).and_then(Record::validated_data);
         let failure = |reason| {
             let mut admission = Admission::stopped(reason, vec![condition.from], false);
             admission.condition = Some(reason);
             admission
         };
-        let Some(data) = data else { return failure("condition_data_unavailable"); };
-        let Some(actual) = data.pointer(&condition.pointer) else { return failure("condition_value_missing"); };
+        let Some(data) = data else {
+            return failure("condition_data_unavailable");
+        };
+        let Some(actual) = data.pointer(&condition.pointer) else {
+            return failure("condition_value_missing");
+        };
         if actual == &condition.equals {
             Admission::ready(Some("matched"))
         } else {

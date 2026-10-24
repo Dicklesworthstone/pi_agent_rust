@@ -364,7 +364,8 @@ impl DapTransport {
         timeout: Duration,
         handler: ReverseRequestHandler,
     ) -> std::result::Result<Value, DapError> {
-        self.request_inner(command, arguments, timeout, Some(handler)).await
+        self.request_inner(command, arguments, timeout, Some(handler))
+            .await
     }
 
     async fn request_inner(

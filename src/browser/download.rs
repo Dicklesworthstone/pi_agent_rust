@@ -105,7 +105,9 @@ impl Source {
             frame[name]
                 .as_str()
                 .filter(|value| {
-                    !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+                    !value.is_empty()
+                        && value.len() <= limit
+                        && !value.chars().any(char::is_control)
                 })
                 .map(str::to_owned)
                 .ok_or_else(|| error("download source has an invalid document identity"))
@@ -130,9 +132,16 @@ impl Source {
         Self::parse(&frame, cdp.frame_selected(), allowlist)
     }
 
-    async fn check(&self, owner: &AgentCx, cdp: &mut Cdp, allowlist: Option<&[String]>) -> Result<()> {
+    async fn check(
+        &self,
+        owner: &AgentCx,
+        cdp: &mut Cdp,
+        allowlist: Option<&[String]>,
+    ) -> Result<()> {
         if Self::read(owner, cdp, allowlist).await? != *self {
-            return Err(error("download source navigated or changed; no artifact was published"));
+            return Err(error(
+                "download source navigated or changed; no artifact was published",
+            ));
         }
         Ok(())
     }
@@ -140,12 +149,18 @@ impl Source {
 
 fn admit_record(record: &DownloadRecord, source: &Source) -> Result<()> {
     if record.frame_id != source.frame_id {
-        return Err(error("download came from a different frame; no artifact was published"));
+        return Err(error(
+            "download came from a different frame; no artifact was published",
+        ));
     }
     validate_download_guid(&record.guid)
 }
 
-fn first_new(cdp: &Cdp, before: &BTreeSet<String>, source: &Source) -> Result<Option<DownloadRecord>> {
+fn first_new(
+    cdp: &Cdp,
+    before: &BTreeSet<String>,
+    source: &Source,
+) -> Result<Option<DownloadRecord>> {
     cdp.check_download_events()?;
     let fresh = cdp.downloads_since(before);
     if fresh.len() > 1 {
@@ -275,7 +290,9 @@ async fn capture_download(
 )> {
     req.source.check(owner, cdp, req.allowlist).await?;
     if first_new(cdp, req.before, req.source)?.is_some() {
-        return Err(error("a download started before the requested click; input was not sent"));
+        return Err(error(
+            "a download started before the requested click; input was not sent",
+        ));
     }
     let click_args = json!({"action":"click","selector":req.selector});
     interaction::execute(owner, cdp, req.tab, req.refs, &click_args).await?;
@@ -412,12 +429,16 @@ pub(super) async fn execute(
 
     let result = async {
         let (start, progress, bytes, target) = capture?;
-        reset.map_err(|_| error("download policy could not be restored; no artifact was published"))?;
+        reset.map_err(|_| {
+            error("download policy could not be restored; no artifact was published")
+        })?;
         source.check(owner, cdp, allowlist).await?;
         if first_new(cdp, &before, &source)?.is_none()
             || cdp.download_record(&progress.guid).as_ref() != Some(&progress)
         {
-            return Err(error("download changed before publication; no artifact was published"));
+            return Err(error(
+                "download changed before publication; no artifact was published",
+            ));
         }
         let resource = policy::download_url(&start.url, allowlist)?;
         owner
@@ -494,7 +515,8 @@ mod tests {
             &json!({"id":"frame-1","loaderId":"loader-1","url":"https://example.com/"}),
             false,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let mut record = completed_record("job", 7.0);
         assert!(admit_record(&record, &source).is_ok());
         record.frame_id = "other-tab-private-frame".into();
@@ -508,7 +530,10 @@ mod tests {
     #[test]
     fn parameters_and_filenames_fail_closed() {
         assert!(validate(&json!({"action":"download","selector":"#link"})).is_ok());
-        assert!(validate(&json!({"action":"download","tab":"app","frame":"child","selector":"#link"})).is_ok());
+        assert!(
+            validate(&json!({"action":"download","tab":"app","frame":"child","selector":"#link"}))
+                .is_ok()
+        );
         for args in [
             json!({"action":"download"}),
             json!({"action":"download","frame":"child","selector":"#link"}),

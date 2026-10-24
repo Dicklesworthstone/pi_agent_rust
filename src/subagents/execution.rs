@@ -10,9 +10,9 @@
 
 use super::deadline::Deadline;
 use super::{
-    AgentDefinition, LaunchAdmission, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus, SubagentTask,
-    UpdateCallback, append_bounded_line, child_args, child_depth, compile_output_schema,
-    corrective_retry_task, emit_progress, protocol, validate_child_output,
+    AgentDefinition, LaunchAdmission, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus,
+    SubagentTask, UpdateCallback, append_bounded_line, child_args, child_depth,
+    compile_output_schema, corrective_retry_task, emit_progress, protocol, validate_child_output,
 };
 use crate::agent_cx::AgentCx;
 use crate::agent_hub::ChildKind;
@@ -34,9 +34,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod ownership;
-pub(super) mod worker;
 #[cfg(unix)]
 mod pipes;
+pub(super) mod worker;
 use ownership::{HubLease, ProcessLease};
 
 const DRAIN_BATCH: usize = 32;
@@ -105,10 +105,12 @@ impl ChildRunner {
     }
 
     fn public_result(&self, mut result: SubagentResult) -> SubagentResult {
-        let task = self.revival.as_ref().map_or(
-            self.public_task.as_deref(),
-            |(_, launch)| launch.public_task(),
-        );
+        let task = self
+            .revival
+            .as_ref()
+            .map_or(self.public_task.as_deref(), |(_, launch)| {
+                launch.public_task()
+            });
         if let Some(task) = task {
             result.task = task.to_string();
         }
@@ -247,7 +249,8 @@ impl ChildRunner {
         on_update: Option<UpdateCallback>,
     ) -> SubagentResult {
         let update = on_update.as_ref();
-        let result = self.run_pending(agents, task, step, update, None)
+        let result = self
+            .run_pending(agents, task, step, update, None)
             .await
             .finish(update);
         self.public_result(result)
@@ -494,9 +497,9 @@ impl ChildRunner {
         if self.foreground {
             let hold = crate::agent_hub::registry()
                 .lock()
-                .map_err(|_| crate::error::Error::tool(
-                    "subagent", "PI_SUBAGENT_HUB: registry is poisoned",
-                ))
+                .map_err(|_| {
+                    crate::error::Error::tool("subagent", "PI_SUBAGENT_HUB: registry is poisoned")
+                })
                 .and_then(|mut hub| {
                     hub.hold_child_result(&hub_entry.id, self.deadline.remaining())
                 });

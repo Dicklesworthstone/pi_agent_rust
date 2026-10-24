@@ -23,30 +23,42 @@ fn available() -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
-    if !available { eprintln!("Skipping: configured Python unavailable"); }
+    if !available {
+        eprintln!("Skipping: configured Python unavailable");
+    }
     available
 }
 
 fn text(output: &ToolOutput) -> String {
-    output.content.iter().filter_map(|block| match block {
-        ContentBlock::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    }).collect::<Vec<_>>().join("\n")
+    output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn cell(tool: &EvalTool, code: &str) -> ToolOutput {
     tool.execute("bridge", json!({"code":code, "timeout_secs":10}), None)
-        .await.expect("cell transport")
+        .await
+        .expect("cell transport")
 }
 
 #[test]
 fn retained_task_cannot_read_with_a_later_cells_authority() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("secret.txt"), "private-native-payload").unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        let seed = cell(&tool, r#"
+        let seed = cell(
+            &tool,
+            r#"
 import asyncio
 ready = asyncio.Event()
 async def late():
@@ -57,7 +69,9 @@ async def late():
         return str(error)
 old_task = asyncio.create_task(late())
 await asyncio.sleep(0)
-"#).await;
+"#,
+        )
+        .await;
         assert!(!seed.is_error, "{}", text(&seed));
         let later = cell(&tool, "ready.set()\nawait old_task").await;
         assert!(!later.is_error, "{}", text(&later));
@@ -72,19 +86,25 @@ await asyncio.sleep(0)
 
 #[test]
 fn copied_worker_context_cannot_race_the_control_reader() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("data.txt"), "native-payload").unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        let worker = cell(&tool, r#"
+        let worker = cell(
+            &tool,
+            r#"
 import asyncio
 try:
     await asyncio.to_thread(tool.read, 'data.txt')
 except Exception as error:
     verdict = str(error)
 verdict
-"#).await;
+"#,
+        )
+        .await;
         assert!(!worker.is_error, "{}", text(&worker));
         assert!(text(&worker).contains("EVAL_BRIDGE_THREAD"));
         let current = cell(&tool, "tool.read('data.txt')").await;
@@ -95,19 +115,25 @@ verdict
 
 #[test]
 fn ordinary_native_tool_denial_preserves_state_and_later_bridge_calls() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("data.txt"), "native-payload").unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        let denied = cell(&tool, r#"
+        let denied = cell(
+            &tool,
+            r#"
 keep = 42
 try:
     await tool.call('bash', {'command':'echo should-not-run'})
 except Exception as error:
     verdict = str(error)
 verdict
-"#).await;
+"#,
+        )
+        .await;
         assert!(!denied.is_error, "{}", text(&denied));
         assert!(text(&denied).contains("EVAL_BRIDGE_DENIED"));
         let next = cell(&tool, "[keep, tool.read('data.txt')]").await;
@@ -120,7 +146,9 @@ verdict
 
 #[test]
 fn caught_bridge_corruption_cannot_return_a_reusable_kernel() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("data.txt"), "native-payload").unwrap();
     let tool = EvalTool::new(dir.path());
@@ -128,7 +156,10 @@ fn caught_bridge_corruption_cannot_return_a_reusable_kernel() {
         // Deliberate kernel-private access supplies a corrupt reply locally;
         // the host's actual reply remains unread. This exercises the Rust
         // retirement path, not an exception that happens to end the cell.
-        let broken = tool.execute("broken", json!({"code":r#"
+        let broken = tool
+            .execute(
+                "broken",
+                json!({"code":r#"
 import io
 keep = 42
 private = tool.read.__globals__
@@ -142,8 +173,15 @@ try:
 finally:
     private['_REAL_STDIN'] = original
 42
-"#}), None).await.unwrap_err();
-        assert!(broken.to_string().contains("EVAL_BRIDGE_PROTOCOL"), "{broken}");
+"#}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            broken.to_string().contains("EVAL_BRIDGE_PROTOCOL"),
+            "{broken}"
+        );
         assert!(broken.to_string().contains("EVAL_STATE_RESET"), "{broken}");
         let next = cell(&tool, "['keep' in globals(), tool.read('data.txt')]").await;
         assert!(!next.is_error, "{}", text(&next));

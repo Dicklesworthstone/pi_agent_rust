@@ -358,12 +358,18 @@ pub(super) async fn open_wait_channel(
     let now = owner
         .timer_driver()
         .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    let inherited = owner.budget().deadline.map_or(EXCHANGE_TIMEOUT, |deadline| {
-        Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
-    });
+    let inherited = owner
+        .budget()
+        .deadline
+        .map_or(EXCHANGE_TIMEOUT, |deadline| {
+            Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+        });
     let timeout = remaining.min(EXCHANGE_TIMEOUT).min(inherited);
     if timeout.is_zero() {
-        return Err(ipc_error("TIMEOUT", "reply wait expired before acquiring its lease"));
+        return Err(ipc_error(
+            "TIMEOUT",
+            "reply wait expired before acquiring its lease",
+        ));
     }
     // Round the wire lease up; the client still observes the precise budget.
     let wait_ms = u64::try_from(remaining.as_nanos().div_ceil(1_000_000))
@@ -399,10 +405,16 @@ pub(super) async fn open_wait_channel(
         .await
         .map_err(|_| ipc_error("TIMEOUT", "parent wait lease timed out"))??;
     let Reply::Wait { result } = reply else {
-        return Err(ipc_error("PROTOCOL", "parent returned a different wait lease reply"));
+        return Err(ipc_error(
+            "PROTOCOL",
+            "parent returned a different wait lease reply",
+        ));
     };
     if result.peer.as_deref() != peer || result.next_cursor < cursor {
-        return Err(ipc_error("PROTOCOL", "parent returned an inconsistent wait lease"));
+        return Err(ipc_error(
+            "PROTOCOL",
+            "parent returned an inconsistent wait lease",
+        ));
     }
     Ok((result, socket))
 }
@@ -550,7 +562,9 @@ impl Connection {
     }
 
     fn advance_result(&mut self) -> bool {
-        let Some(stream) = self.result_stream.as_mut() else { return false; };
+        let Some(stream) = self.result_stream.as_mut() else {
+            return false;
+        };
         match stream.next_response() {
             Ok(Some(response)) => self.set_response(&response),
             Ok(None) => return false,
@@ -569,14 +583,22 @@ impl Connection {
         }
         // The identity is connection-owned, not supplied by a page cursor.
         // Mid-frame revocation closes the socket; the client discards partials.
-        if self.result_stream.as_ref().is_some_and(|stream| stream.check_reader().is_err()) {
+        if self
+            .result_stream
+            .as_ref()
+            .is_some_and(|stream| stream.check_reader().is_err())
+        {
             return false;
         }
         if let Some(hold) = &self.wait_hold {
             if !hold.active() {
                 return false;
             }
-            if self.output.as_ref().is_some_and(|output| self.written == output.len()) {
+            if self
+                .output
+                .as_ref()
+                .is_some_and(|output| self.written == output.len())
+            {
                 return true;
             }
         }
@@ -609,26 +631,40 @@ impl Connection {
                                     match response {
                                         Ok(stream) => {
                                             self.result_stream = Some(stream);
-                                            if !self.advance_result() { return false; }
+                                            if !self.advance_result() {
+                                                return false;
+                                            }
                                         }
-                                        Err(error) => self.set_response(&results::WireResponse::Error(error.to_string())),
+                                        Err(error) => self.set_response(
+                                            &results::WireResponse::Error(error.to_string()),
+                                        ),
                                     }
                                 }
                                 Ok(Incoming::Message(request)) => {
-                                    let response = dispatch_authenticated(sender, token, request, owner);
+                                    let response =
+                                        dispatch_authenticated(sender, token, request, owner);
                                     self.set_response(&match response {
                                         Ok(reply) => WireResponse::Ok(reply),
                                         Err(error) => WireResponse::Error(error.to_string()),
                                     });
                                 }
                                 Ok(Incoming::Wait(request)) => {
-                                    match acquire_wait_hold(sender, token, request, owner, &self.socket) {
+                                    match acquire_wait_hold(
+                                        sender,
+                                        token,
+                                        request,
+                                        owner,
+                                        &self.socket,
+                                    ) {
                                         Ok((hold, result, duration)) => {
                                             self.wait_hold = Some(hold);
                                             self.deadline = Instant::now() + duration;
-                                            self.set_response(&WireResponse::Ok(Reply::Wait { result }));
+                                            self.set_response(&WireResponse::Ok(Reply::Wait {
+                                                result,
+                                            }));
                                         }
-                                        Err(error) => self.set_response(&WireResponse::Error(error.to_string())),
+                                        Err(error) => self
+                                            .set_response(&WireResponse::Error(error.to_string())),
                                     }
                                 }
                                 Err(_) => self.refuse("PROTOCOL", "invalid request frame"),
@@ -656,8 +692,12 @@ impl Connection {
                     Ok(count) => {
                         self.written += count;
                         if self.written == total {
-                            if self.wait_hold.is_some() { return true; }
-                            if self.advance_result() { continue; }
+                            if self.wait_hold.is_some() {
+                                return true;
+                            }
+                            if self.advance_result() {
+                                continue;
+                            }
                             let _ = self.socket.shutdown(Shutdown::Both);
                             return false;
                         }
@@ -678,16 +718,33 @@ fn acquire_wait_hold(
     request: WireWaitRequest,
     owner: &AgentCx,
     socket: &TcpStream,
-) -> Result<(std::sync::Arc<super::wait::DependencyHold>, super::InboxWaitResult, Duration)> {
+) -> Result<(
+    std::sync::Arc<super::wait::DependencyHold>,
+    super::InboxWaitResult,
+    Duration,
+)> {
     if request.version != VERSION || !matches_token(token, &request.token) {
-        return Err(ipc_error("AUTH", "invalid parent wait credential or protocol version"));
+        return Err(ipc_error(
+            "AUTH",
+            "invalid parent wait credential or protocol version",
+        ));
     }
     let request = request.wait;
-    if request.claimed_from.as_deref().is_some_and(|claimed| claimed != sender) {
-        return Err(ipc_error("SENDER", "waiter does not match the authenticated child"));
+    if request
+        .claimed_from
+        .as_deref()
+        .is_some_and(|claimed| claimed != sender)
+    {
+        return Err(ipc_error(
+            "SENDER",
+            "waiter does not match the authenticated child",
+        ));
     }
     if !(1..=60_000).contains(&request.wait_ms) {
-        return Err(ipc_error("INPUT", "wait lease must be between 1 and 60000 milliseconds"));
+        return Err(ipc_error(
+            "INPUT",
+            "wait lease must be between 1 and 60000 milliseconds",
+        ));
     }
     owner
         .checkpoint()
@@ -709,15 +766,28 @@ fn acquire_wait_in_registry(
     sender: &str,
     request: &WaitRequest,
     channel: TcpStream,
-) -> Result<(std::sync::Arc<super::wait::DependencyHold>, super::InboxWaitResult, Duration)> {
+) -> Result<(
+    std::sync::Arc<super::wait::DependencyHold>,
+    super::InboxWaitResult,
+    Duration,
+)> {
     if hub.control_pid(sender).is_none()
-        || hub.get(sender).is_none_or(|entry| entry.status != ChildStatus::Running)
+        || hub
+            .get(sender)
+            .is_none_or(|entry| entry.status != ChildStatus::Running)
     {
-        return Err(ipc_error("REVOKED", "the waiter no longer owns a live process"));
+        return Err(ipc_error(
+            "REVOKED",
+            "the waiter no longer owns a live process",
+        ));
     }
     let duration = Duration::from_millis(request.wait_ms);
     let hold = hub.begin_reply_wait(
-        sender, request.peer.as_deref(), request.cursor, duration, Some(channel),
+        sender,
+        request.peer.as_deref(),
+        request.cursor,
+        duration,
+        Some(channel),
     )?;
     let result = hub.wait_snapshot(sender, request.peer.as_deref(), request.cursor)?;
     Ok((hold, result, duration))
@@ -881,7 +951,8 @@ mod tests {
                 claimed_from: claimed_from.map(str::to_string),
                 wait_ms,
             },
-        }).expect("encode wait lease");
+        })
+        .expect("encode wait lease");
         frame.push(b'\n');
         frame
     }
@@ -1016,7 +1087,11 @@ mod tests {
     fn wait_socket_rejects_spoofing_invalid_budgets_and_revoked_owners() {
         let (_owner, mut channel) = channel();
         let token = channel.token.clone();
-        let wrong = if token.starts_with('a') { "b".repeat(64) } else { "a".repeat(64) };
+        let wrong = if token.starts_with('a') {
+            "b".repeat(64)
+        } else {
+            "a".repeat(64)
+        };
         for (credential, claimed, wait_ms, code) in [
             (wrong.as_str(), None, 1000, "PI_HUB_IPC_AUTH"),
             (token.as_str(), Some("parent"), 1000, "PI_HUB_IPC_SENDER"),
@@ -1042,9 +1117,8 @@ mod tests {
     #[test]
     fn wait_envelope_cannot_be_combined_with_a_message_operation() {
         let (_owner, mut channel) = channel();
-        let mut value: serde_json::Value = serde_json::from_slice(
-            &wait_wire(&channel.token, None, 1000),
-        ).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&wait_wire(&channel.token, None, 1000)).unwrap();
         value["request"] = serde_json::json!({"action":"send","name":"parent","text":"not sent"});
         let mut frame = serde_json::to_vec(&value).unwrap();
         frame.push(b'\n');
@@ -1061,7 +1135,8 @@ mod tests {
         let peer = hub.register("lease-peer", "answer sender").unwrap();
         hub.mark_running(&sender.id, 10);
         hub.mark_running(&peer.id, 20);
-        hub.bus_send("parent", &peer.id, "private parent report").unwrap();
+        hub.bus_send("parent", &peer.id, "private parent report")
+            .unwrap();
         let owner = AgentCx::for_testing_with_io();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1079,7 +1154,8 @@ mod tests {
                 wait_ms: 60_000,
             },
             connection.socket.try_clone().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result.id, sender.id);
         assert!(result.messages.is_empty());
         connection.wait_hold = Some(hold);
@@ -1088,7 +1164,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut response = Vec::new();
         while !response.ends_with(b"\n") {
-            assert!(Instant::now() < deadline, "wait acknowledgement did not arrive");
+            assert!(
+                Instant::now() < deadline,
+                "wait acknowledgement did not arrive"
+            );
             assert!(connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
             let mut bytes = [0_u8; 4096];
             match client.read(&mut bytes) {
@@ -1106,14 +1185,18 @@ mod tests {
         ));
         assert!(connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
         assert_eq!(
-            hub.wait_snapshot(&peer.id, Some(&sender.id), 0).unwrap().status,
+            hub.wait_snapshot(&peer.id, Some(&sender.id), 0)
+                .unwrap()
+                .status,
             super::super::InboxWaitStatus::PeerBlocked
         );
         owner.set_cancel_requested(true);
         assert!(!connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
         drop(connection);
         assert_eq!(
-            hub.wait_snapshot(&peer.id, Some(&sender.id), 0).unwrap().status,
+            hub.wait_snapshot(&peer.id, Some(&sender.id), 0)
+                .unwrap()
+                .status,
             super::super::InboxWaitStatus::Pending
         );
         assert_eq!(hub.control_pid(&sender.id), Some(10));

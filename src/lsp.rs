@@ -391,53 +391,85 @@ impl LspTool {
     /// Explicit, connection-local analysis settings. This is not an agent
     /// settings-file edit and does not reuse initializationOptions as settings.
     async fn run_configuration(&self, input: &LspInput) -> Result<ToolOutput> {
-        let file = input.file.as_deref()
+        let file = input
+            .file
+            .as_deref()
             .filter(|file| !file.is_empty() && file.len() <= 8192)
             .ok_or_else(|| tool_err("LSP_USAGE", "configure requires an anchor file"))?;
-        if input.position.is_some() || input.line.is_some() || input.symbol.is_some()
-            || input.query.is_some() || input.range.is_some() || input.limit.is_some()
-            || input.resolve.is_some() || input.action_id.is_some() || input.refactor_id.is_some()
-            || input.completion_id.is_some() || input.snippet_values.is_some()
-            || input.hierarchy_id.is_some() || input.only.is_some() || input.after.is_some()
-            || input.new_name.is_some() || input.new_file.is_some()
-            || input.format_options.is_some() || input.method.is_some()
+        if input.position.is_some()
+            || input.line.is_some()
+            || input.symbol.is_some()
+            || input.query.is_some()
+            || input.range.is_some()
+            || input.limit.is_some()
+            || input.resolve.is_some()
+            || input.action_id.is_some()
+            || input.refactor_id.is_some()
+            || input.completion_id.is_some()
+            || input.snippet_values.is_some()
+            || input.hierarchy_id.is_some()
+            || input.only.is_some()
+            || input.after.is_some()
+            || input.new_name.is_some()
+            || input.new_file.is_some()
+            || input.format_options.is_some()
+            || input.method.is_some()
             || (input.payload.is_none() && input.apply.is_some())
         {
-            return Err(tool_err("LSP_USAGE",
-                "configure accepts file, timeout, and optional settings payload; apply requires payload"));
+            return Err(tool_err(
+                "LSP_USAGE",
+                "configure accepts file, timeout, and optional settings payload; apply requires payload",
+            ));
         }
-        let proposed = input.payload.as_ref()
-            .map(client::workspace::Settings::parse).transpose()?;
+        let proposed = input
+            .payload
+            .as_ref()
+            .map(client::workspace::Settings::parse)
+            .transpose()?;
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         let started = std::time::Instant::now();
         let timeout = self.request_timeout(input);
         let remaining = || -> Result<Duration> {
             refactor_preview::check_owner(&owner)?;
-            timeout.checked_sub(started.elapsed()).filter(|left| !left.is_zero())
+            timeout
+                .checked_sub(started.elapsed())
+                .filter(|left| !left.is_zero())
                 .ok_or_else(|| tool_err("LSP_TIMEOUT", "configuration request budget expired"))
         };
         remaining()?;
         let requested = resolve_tool_path(file, &self.cwd);
         let metadata = std::fs::symlink_metadata(&requested)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(tool_err("LSP_FILE_UNREADABLE", "configuration anchor must be a regular nonsymlink file"));
+            return Err(tool_err(
+                "LSP_FILE_UNREADABLE",
+                "configuration anchor must be a regular nonsymlink file",
+            ));
         }
         let path = requested.canonicalize()?;
-        let now = owner.cx().timer_driver()
+        let now = owner
+            .cx()
+            .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        let entry = asupersync::time::timeout(now, remaining()?, self.client_for(&path)).await
+        let entry = asupersync::time::timeout(now, remaining()?, self.client_for(&path))
+            .await
             .map_err(|_| tool_err("LSP_TIMEOUT", "configuration server startup timed out"))??;
         remaining()?;
         if !entry.client.is_alive() {
-            return Err(tool_err("LSP_TRANSPORT_CLOSED", "configuration connection closed"));
+            return Err(tool_err(
+                "LSP_TRANSPORT_CLOSED",
+                "configuration connection closed",
+            ));
         }
         if !path.starts_with(entry.client.root()) {
-            return Err(tool_err("LSP_CONFIGURATION_SCOPE", "configuration anchor is outside the server workspace"));
+            return Err(tool_err(
+                "LSP_CONFIGURATION_SCOPE",
+                "configuration anchor is outside the server workspace",
+            ));
         }
         let (previous, revision) = entry.client.workspace_settings();
-        let changed = proposed.as_ref().is_some_and(|settings| {
-            revision == 0 || settings.value() != previous.as_ref()
-        });
+        let changed = proposed
+            .as_ref()
+            .is_some_and(|settings| revision == 0 || settings.value() != previous.as_ref());
         let mut payload = json!({
             "action":"configure","file":display_path(&path,&self.cwd),
             "server":entry.spec_name,"workspace":display_path(entry.client.root(),&self.cwd),
@@ -451,12 +483,16 @@ impl LspTool {
         // Bound the complete response before any update. Reserve the widest
         // possible revision number, then replace it with the actual revision.
         if serde_json::to_vec(&payload)?.len() > MAX_PAYLOAD_BYTES {
-            return Err(tool_err("LSP_CONFIGURATION_INVALID", "configuration output exceeds its byte budget"));
+            return Err(tool_err(
+                "LSP_CONFIGURATION_INVALID",
+                "configuration output exceeds its byte budget",
+            ));
         }
         remaining()?;
         let (applied, current_revision) = if input.apply == Some(true) {
             let settings = proposed.as_ref().expect("validated configuration payload");
-            let outcome = entry.client
+            let outcome = entry
+                .client
                 .set_workspace_settings_with_timeout(settings, remaining()?)
                 .await?;
             if outcome.0 {
@@ -465,7 +501,9 @@ impl LspTool {
                 self.invalidate_refactor(&entry);
             }
             outcome
-        } else { (false, revision) };
+        } else {
+            (false, revision)
+        };
         payload["revision"] = json!(current_revision);
         payload["configured"] = json!(current_revision != 0);
         payload["applied"] = json!(applied);
@@ -675,7 +713,10 @@ impl Tool for LspTool {
         if input["action"] == "configure"
             && input.get("payload").is_some_and(|value| !value.is_object())
         {
-            return Err(tool_err("LSP_CONFIGURATION_INVALID", "configuration payload must be an object"));
+            return Err(tool_err(
+                "LSP_CONFIGURATION_INVALID",
+                "configuration payload must be an object",
+            ));
         }
         let input: LspInput = serde_json::from_value(input)
             .map_err(|err| tool_err("LSP_USAGE", format!("invalid input: {err}")))?;

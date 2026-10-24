@@ -233,12 +233,7 @@ fn masked(text: &str) -> String {
     crate::secrets::obfuscate(text, &mut vault, &[]).0
 }
 
-fn document(
-    reference: &str,
-    content: String,
-    content_type: &str,
-    metadata: Value,
-) -> ResolvedDoc {
+fn document(reference: &str, content: String, content_type: &str, metadata: Value) -> ResolvedDoc {
     ResolvedDoc {
         schema: URL_ROUTER_SCHEMA.to_string(),
         scheme: "agent".to_string(),
@@ -351,14 +346,13 @@ pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
     if reference.is_empty() {
         let mut roster = crate::agent_hub::registry()
             .lock()
-            .map_err(|_| {
-                error(
-                    "PI_URL_AGENT_HUB_UNAVAILABLE",
-                    "agent registry is poisoned",
-                )
-            })?
+            .map_err(|_| error("PI_URL_AGENT_HUB_UNAVAILABLE", "agent registry is poisoned"))?
             .roster();
-        roster.sort_by(|a, b| b.started_ms.cmp(&a.started_ms).then_with(|| a.id.cmp(&b.id)));
+        roster.sort_by(|a, b| {
+            b.started_ms
+                .cmp(&a.started_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let total = roster.len();
         let entries: Vec<_> = roster
             .into_iter()
@@ -386,12 +380,7 @@ pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
     let parsed = Reference::parse(reference)?;
     let entry = crate::agent_hub::registry()
         .lock()
-        .map_err(|_| {
-            error(
-                "PI_URL_AGENT_HUB_UNAVAILABLE",
-                "agent registry is poisoned",
-            )
-        })?
+        .map_err(|_| error("PI_URL_AGENT_HUB_UNAVAILABLE", "agent registry is poisoned"))?
         .get(parsed.id)
         .ok_or_else(|| {
             error(
@@ -402,7 +391,12 @@ pub(super) fn resolve(reference: &str) -> Result<ResolvedDoc> {
     // Never hold the hub mutex during cache access, decoding or redaction.
     let encoded = cache()
         .lock()
-        .map_err(|_| error("PI_URL_AGENT_OUTPUT_UNAVAILABLE", "result cache is poisoned"))?
+        .map_err(|_| {
+            error(
+                "PI_URL_AGENT_OUTPUT_UNAVAILABLE",
+                "result cache is poisoned",
+            )
+        })?
         .get(&entry);
     render(reference, &entry, encoded.as_deref())
 }
@@ -451,11 +445,15 @@ mod tests {
             assert_eq!(doc.content_type, "text/plain");
         }
         assert_eq!(
-            render("worker-1/empty", &entry, Some(&encoded)).unwrap().content,
+            render("worker-1/empty", &entry, Some(&encoded))
+                .unwrap()
+                .content,
             "null"
         );
         assert_eq!(
-            render("worker-1/count", &entry, Some(&encoded)).unwrap().content,
+            render("worker-1/count", &entry, Some(&encoded))
+                .unwrap()
+                .content,
             "3"
         );
         assert!(
@@ -494,8 +492,13 @@ mod tests {
     #[test]
     fn malformed_paths_do_not_become_filesystem_reads() {
         for path in [
-            "../x", "worker-1/a//b", "worker-1/%", "worker-1/%GG",
-            "worker-1/%FF", "worker-1?secret=x", "all",
+            "../x",
+            "worker-1/a//b",
+            "worker-1/%",
+            "worker-1/%GG",
+            "worker-1/%FF",
+            "worker-1?secret=x",
+            "all",
         ] {
             assert!(Reference::parse(path).is_err(), "{path}");
         }
@@ -510,11 +513,15 @@ mod tests {
         let entry = entry("worker-1", ChildStatus::Done);
         let encoded = snapshot(json!([null, {"0":"object key"}]));
         assert_eq!(
-            render("worker-1/0", &entry, Some(&encoded)).unwrap().content,
+            render("worker-1/0", &entry, Some(&encoded))
+                .unwrap()
+                .content,
             "null"
         );
         assert_eq!(
-            render("worker-1/1/0", &entry, Some(&encoded)).unwrap().content,
+            render("worker-1/1/0", &entry, Some(&encoded))
+                .unwrap()
+                .content,
             "object key"
         );
         for path in ["-1", "+1", "-", "2", "0/child", "184467440737095516160"] {
@@ -600,7 +607,11 @@ mod tests {
         assert!(cache.get(&first).is_none());
         assert_eq!(
             cache.bytes,
-            cache.entries.iter().map(|entry| entry.encoded.len()).sum::<usize>()
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.encoded.len())
+                .sum::<usize>()
         );
         let before = cache.bytes;
         cache.insert(

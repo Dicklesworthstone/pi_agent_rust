@@ -26,7 +26,9 @@ fn authority(owner: &AgentCx) -> Result<()> {
 
 impl State {
     fn permit(&self) -> Result<MutexGuard<'_, bool>> {
-        let permit = self.live.lock()
+        let permit = self
+            .live
+            .lock()
             .map_err(|_| scan_error("source operation publication gate is poisoned"))?;
         if !*permit {
             return Err(scan_error("source request was dropped; operation revoked"));
@@ -44,7 +46,10 @@ impl Request {
     fn new() -> Result<Self> {
         let owner = AgentCx::for_current_or_request();
         authority(&owner)?;
-        Ok(Self(Arc::new(State { owner, live: Mutex::new(true) })))
+        Ok(Self(Arc::new(State {
+            owner,
+            live: Mutex::new(true),
+        })))
     }
 
     fn worker(&self) -> Worker {
@@ -58,7 +63,10 @@ impl Drop for Request {
         // serialization. An already admitted OS commit may finish first; no
         // later publication can be admitted after this Drop returns. This
         // can wait for that foreign syscall and is not a hard-time guarantee.
-        let mut live = self.0.live.lock()
+        let mut live = self
+            .0
+            .live
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *live = false;
     }
@@ -141,7 +149,10 @@ mod tests {
         let called = AtomicBool::new(false);
         let fresh = asupersync::Cx::for_request();
         let _current = fresh.set_current_restricted();
-        let result = worker.run(|| { called.store(true, Ordering::SeqCst); Ok(()) });
+        let result = worker.run(|| {
+            called.store(true, Ordering::SeqCst);
+            Ok(())
+        });
         assert!(result.is_err());
         assert!(!called.load(Ordering::SeqCst));
     }
@@ -164,7 +175,10 @@ mod tests {
         let owner = AgentCx::for_request();
         let _current = owner.cx().clone().set_current_restricted();
         let request = Request::new().unwrap();
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("fixture cancellation"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("fixture cancellation"),
+        );
         assert!(request.worker().run(|| Ok(())).is_err());
     }
 
@@ -172,16 +186,19 @@ mod tests {
     fn synchronous_worker_scope_restores_nested_owners_after_unwinding() {
         let outer = Request::new().unwrap();
         let inner = Request::new().unwrap();
-        outer.worker().run(|| {
-            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _: Result<()> = inner.worker().run(|| panic!("fixture unwind"));
-            }));
-            assert!(failed.is_err());
-            drop(inner);
-            // Inner revocation must not remain installed on a reused thread.
-            checkpoint()?;
-            publish(|| Ok(()))
-        }).unwrap();
+        outer
+            .worker()
+            .run(|| {
+                let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _: Result<()> = inner.worker().run(|| panic!("fixture unwind"));
+                }));
+                assert!(failed.is_err());
+                drop(inner);
+                // Inner revocation must not remain installed on a reused thread.
+                checkpoint()?;
+                publish(|| Ok(()))
+            })
+            .unwrap();
         drop(outer);
         checkpoint().unwrap();
     }
@@ -211,29 +228,43 @@ mod tests {
         for operation in ["default", "export", "disposition"] {
             let dir = tempfile::tempdir().unwrap();
             let storage = Storage::open(dir.path()).unwrap();
-            storage.write_report(None, b"previous complete report").unwrap();
+            storage
+                .write_report(None, b"previous complete report")
+                .unwrap();
             let request = Request::new().unwrap();
             let worker = request.worker();
             let (ready_tx, ready_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            let thread = std::thread::spawn(move || worker.run(|| {
-                ready_tx.send(()).unwrap();
-                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                match operation {
-                    "default" => storage.write_report(None, b"late report"),
-                    "export" => storage.write_report(Some("late.sarif"), b"late report"),
-                    _ => storage.update("0123456789abcdef".into(), super::super::Disposition {
-                        status: "accepted".into(), reason: "late decision".into(), at_ms: 1,
-                    }).map(|_| ()),
-                }
-            }));
+            let thread = std::thread::spawn(move || {
+                worker.run(|| {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    match operation {
+                        "default" => storage.write_report(None, b"late report"),
+                        "export" => storage.write_report(Some("late.sarif"), b"late report"),
+                        _ => storage
+                            .update(
+                                "0123456789abcdef".into(),
+                                super::super::Disposition {
+                                    status: "accepted".into(),
+                                    reason: "late decision".into(),
+                                    at_ms: 1,
+                                },
+                            )
+                            .map(|_| ()),
+                    }
+                })
+            });
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             // Exact ordering, no sleeps: abandonment completes before the
             // blocked worker is allowed to attempt real persistence.
             drop(request);
             resume_tx.send(()).unwrap();
             assert!(thread.join().unwrap().is_err());
-            assert_eq!(std::fs::read(dir.path().join(DEFAULT_REPORT)).unwrap(), b"previous complete report");
+            assert_eq!(
+                std::fs::read(dir.path().join(DEFAULT_REPORT)).unwrap(),
+                b"previous complete report"
+            );
             assert!(!dir.path().join("late.sarif").exists());
             assert!(!dir.path().join(".pi/security-dispositions.json").exists());
         }
@@ -249,12 +280,16 @@ mod tests {
         let observed = Arc::clone(&committed);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let publishing = std::thread::spawn(move || worker.run(|| publish(|| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            observed.store(true, Ordering::SeqCst);
-            Ok(())
-        })));
+        let publishing = std::thread::spawn(move || {
+            worker.run(|| {
+                publish(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        });
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let dropping = std::thread::spawn(move || {
             drop(request);
@@ -279,7 +314,10 @@ mod tests {
         let storage = Storage::open(dir.path()).unwrap();
         storage.write_report(None, b"completed baseline").unwrap();
         let runtime = asupersync::runtime::RuntimeBuilder::new()
-            .worker_threads(2).blocking_threads(1, 8).build().unwrap();
+            .worker_threads(2)
+            .blocking_threads(1, 8)
+            .build()
+            .unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
@@ -294,12 +332,16 @@ mod tests {
             std::future::poll_fn(|cx| {
                 assert!(matches!(future.as_mut().poll(cx), Poll::Pending));
                 Poll::Ready(())
-            }).await;
+            })
+            .await;
             started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             drop(future);
             resume_tx.send(()).unwrap();
             assert!(finished_rx.recv_timeout(Duration::from_secs(10)).unwrap());
         });
-        assert_eq!(std::fs::read(dir.path().join(DEFAULT_REPORT)).unwrap(), b"completed baseline");
+        assert_eq!(
+            std::fs::read(dir.path().join(DEFAULT_REPORT)).unwrap(),
+            b"completed baseline"
+        );
     }
 }

@@ -20,7 +20,8 @@ impl GoalControl {
         content: &UserContent,
         authored_source: &str,
     ) -> Result<InputId> {
-        self.current_turn()?.steer_with_content(content, authored_source)
+        self.current_turn()?
+            .steer_with_content(content, authored_source)
     }
 
     /// Queue native user content for a follow-up in the current native prompt.
@@ -31,7 +32,8 @@ impl GoalControl {
         content: &UserContent,
         authored_source: &str,
     ) -> Result<InputId> {
-        self.current_turn()?.follow_up_with_content(content, authored_source)
+        self.current_turn()?
+            .follow_up_with_content(content, authored_source)
     }
 
     /// Atomically admit a batch to ONE current native turn. Each tuple is
@@ -54,7 +56,10 @@ impl GoalControl {
     /// only after reviewing the prior run's outcome and choosing to resend its
     /// unclaimed input. It is not durable deduplication or permission to replay
     /// already-delivered messages; only native batch admission is atomic.
-    pub fn restore_pending(&self, pending: &mut Vec<PendingInput>) -> Result<Vec<TransferredInput>> {
+    pub fn restore_pending(
+        &self,
+        pending: &mut Vec<PendingInput>,
+    ) -> Result<Vec<TransferredInput>> {
         self.current_turn()?.restore_pending(pending)
     }
 
@@ -74,7 +79,8 @@ impl GoalControl {
         content: &UserContent,
         authored_source: &str,
     ) -> Result<Option<InputId>> {
-        self.current_turn()?.replace_pending_with_content(id, content, authored_source)
+        self.current_turn()?
+            .replace_pending_with_content(id, content, authored_source)
     }
 
     /// Recover exactly one unclaimed input without draining its neighbours.
@@ -100,14 +106,16 @@ impl GoalControl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{GoalDecision, GoalRunStop, RunGuard};
+    use super::*;
     use crate::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
     use crate::agent_cx::AgentCx;
     use crate::compaction::ResolvedCompactionSettings;
     use crate::goal::{GoalBudget, GoalStatus};
-    use crate::model::{AssistantMessage, ContentBlock, ImageContent, MediaContent, Message,
-        StopReason, StreamEvent, TextContent};
+    use crate::model::{
+        AssistantMessage, ContentBlock, ImageContent, MediaContent, Message, StopReason,
+        StreamEvent, TextContent,
+    };
     use crate::provider::{Context, Provider, StreamOptions};
     use crate::sdk::{AgentSessionHandle, EventListeners};
     use crate::session::Session;
@@ -126,16 +134,25 @@ mod tests {
     #[async_trait::async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for Replies {
-        fn name(&self) -> &str { "goal-input-test" }
-        fn api(&self) -> &str { "goal-input-test" }
-        fn model_id(&self) -> &str { "controlled" }
+        fn name(&self) -> &str {
+            "goal-input-test"
+        }
+        fn api(&self) -> &str {
+            "goal-input-test"
+        }
+        fn model_id(&self) -> &str {
+            "controlled"
+        }
 
         async fn stream(
             &self,
             context: &Context<'_>,
             _options: &StreamOptions,
         ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
-            self.requests.lock().unwrap().push(context.messages.to_vec());
+            self.requests
+                .lock()
+                .unwrap()
+                .push(context.messages.to_vec());
             let message = AssistantMessage {
                 content: vec![ContentBlock::Text(TextContent::new("checked"))],
                 stop_reason: StopReason::Stop,
@@ -150,18 +167,34 @@ mod tests {
 
     fn fixture() -> (AgentSessionHandle, Arc<Replies>) {
         let provider = Arc::new(Replies::default());
-        let agent = Agent::new(provider.clone(), ToolRegistry::new(&[], Path::new("."), None), AgentConfig::default());
-        let session = AgentSession::new(agent, Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
-            false, ResolvedCompactionSettings::default());
-        (AgentSessionHandle::from_session_with_listeners(session, EventListeners::default()), provider)
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+            false,
+            ResolvedCompactionSettings::default(),
+        );
+        (
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default()),
+            provider,
+        )
     }
 
     fn payload() -> UserContent {
         UserContent::Blocks(vec![
             ContentBlock::Text(TextContent::new("expanded document; not authored keywords")),
-            ContentBlock::Image(ImageContent { data: "aGVsbG8=".into(), mime_type: "image/png".into() }),
+            ContentBlock::Image(ImageContent {
+                data: "aGVsbG8=".into(),
+                mime_type: "image/png".into(),
+            }),
             ContentBlock::Media(MediaContent {
-                data: "d29ybGQ=".into(), mime_type: "audio/wav".into(), name: Some("clip.wav".into()),
+                data: "d29ybGQ=".into(),
+                mime_type: "audio/wav".into(),
+                name: Some("clip.wav".into()),
             }),
         ])
     }
@@ -171,7 +204,10 @@ mod tests {
     }
 
     fn same_content(left: &UserContent, right: &UserContent) {
-        assert_eq!(serde_json::to_value(left).unwrap(), serde_json::to_value(right).unwrap());
+        assert_eq!(
+            serde_json::to_value(left).unwrap(),
+            serde_json::to_value(right).unwrap()
+        );
     }
 
     #[test]
@@ -184,20 +220,38 @@ mod tests {
         goal.install(native.clone());
         let first = goal.follow_up("first").unwrap();
         let original = payload();
-        let ids = goal.enqueue_batch_with_content(&[
-            (InputKind::Steering, original.clone(), "  authored screenshot  ".into()),
-            (InputKind::FollowUp, UserContent::Text("third".into()), "third".into()),
-        ]).unwrap();
+        let ids = goal
+            .enqueue_batch_with_content(&[
+                (
+                    InputKind::Steering,
+                    original.clone(),
+                    "  authored screenshot  ".into(),
+                ),
+                (
+                    InputKind::FollowUp,
+                    UserContent::Text("third".into()),
+                    "third".into(),
+                ),
+            ])
+            .unwrap();
         assert_eq!(goal.turn_snapshot(), Some(native.snapshot()));
         assert_eq!(native.snapshot().pending_steering, 1);
         assert_eq!(native.snapshot().pending_follow_up, 2);
         let replacement = UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
-            data: "bmV3".into(), mime_type: "image/png".into(),
+            data: "bmV3".into(),
+            mime_type: "image/png".into(),
         })]);
-        let corrected = goal.replace_pending_with_content(ids[0], &replacement, "corrected source").unwrap().unwrap();
+        let corrected = goal
+            .replace_pending_with_content(ids[0], &replacement, "corrected source")
+            .unwrap()
+            .unwrap();
         assert_ne!(corrected, ids[0]);
         assert!(goal.retract(ids[0]).is_none());
-        assert!(goal.replace_pending(ids[0], "stale edit").unwrap().is_none());
+        assert!(
+            goal.replace_pending(ids[0], "stale edit")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(goal.retract(ids[1]).unwrap().text, "third");
         let pending = native.take_pending();
         assert_eq!(pending.len(), 2);
@@ -209,7 +263,10 @@ mod tests {
         same_content(&original, &payload());
         assert!(goal.take_pending().is_empty());
         assert_eq!(goal.turn_snapshot().unwrap().pending_bytes, 0);
-        assert!(provider.requests.lock().unwrap().is_empty(), "queue operations never poll the provider");
+        assert!(
+            provider.requests.lock().unwrap().is_empty(),
+            "queue operations never poll the provider"
+        );
         drop(turn);
     }
 
@@ -220,21 +277,50 @@ mod tests {
         let turn = handle.prompt_controlled("unused".into(), |_| {});
         let goal = GoalControl::new();
         goal.install(turn.control());
-        let id = goal.steer_with_content(&payload(), "keep original").unwrap();
+        let id = goal
+            .steer_with_content(&payload(), "keep original")
+            .unwrap();
         let before = goal.turn_snapshot();
-        assert!(goal.enqueue_batch_with_content(&[
-            (InputKind::FollowUp, UserContent::Text("valid first".into()), "valid".into()),
-            (InputKind::Steering, UserContent::Blocks(Vec::new()), String::new()),
-        ]).is_err());
+        assert!(
+            goal.enqueue_batch_with_content(&[
+                (
+                    InputKind::FollowUp,
+                    UserContent::Text("valid first".into()),
+                    "valid".into()
+                ),
+                (
+                    InputKind::Steering,
+                    UserContent::Blocks(Vec::new()),
+                    String::new()
+                ),
+            ])
+            .is_err()
+        );
         assert_eq!(goal.turn_snapshot(), before);
-        assert!(goal.replace_pending_with_content(id, &UserContent::Blocks(Vec::new()), "invalid").is_err());
+        assert!(
+            goal.replace_pending_with_content(id, &UserContent::Blocks(Vec::new()), "invalid")
+                .is_err()
+        );
         assert_eq!(goal.turn_snapshot(), before);
-        for _ in 0..98 { goal.follow_up("queued").unwrap(); }
+        for _ in 0..98 {
+            goal.follow_up("queued").unwrap();
+        }
         let full = goal.turn_snapshot();
-        assert!(goal.enqueue_batch_with_content(&[
-            (InputKind::FollowUp, UserContent::Text("one".into()), "one".into()),
-            (InputKind::FollowUp, UserContent::Text("two".into()), "two".into()),
-        ]).is_err());
+        assert!(
+            goal.enqueue_batch_with_content(&[
+                (
+                    InputKind::FollowUp,
+                    UserContent::Text("one".into()),
+                    "one".into()
+                ),
+                (
+                    InputKind::FollowUp,
+                    UserContent::Text("two".into()),
+                    "two".into()
+                ),
+            ])
+            .is_err()
+        );
         assert_eq!(goal.turn_snapshot(), full);
         let recovered = goal.retract(id).unwrap();
         assert_eq!(recovered.text, "keep original");
@@ -248,7 +334,9 @@ mod tests {
         let turn = handle.prompt_controlled("unused".into(), |_| {});
         let goal = GoalControl::new();
         goal.install(turn.control());
-        let id = goal.follow_up_with_content(&payload(), "private authored prose").unwrap();
+        let id = goal
+            .follow_up_with_content(&payload(), "private authored prose")
+            .unwrap();
         assert!(goal.pause());
         assert!(!goal.turn_snapshot().unwrap().accepting_input);
         assert!(goal.steer_with_content(&payload(), "late").is_err());
@@ -273,7 +361,12 @@ mod tests {
         event("stale_control");
         let goal = GoalControl::new();
         assert!(goal.turn_snapshot().is_none());
-        assert!(goal.steer_with_content(&payload(), "idle").unwrap_err().to_string().contains("GOAL_INPUT_IDLE"));
+        assert!(
+            goal.steer_with_content(&payload(), "idle")
+                .unwrap_err()
+                .to_string()
+                .contains("GOAL_INPUT_IDLE")
+        );
         let (mut handle, _) = fixture();
         let first = handle.prompt_controlled("first".into(), |_| {});
         goal.install(first.control());
@@ -307,16 +400,28 @@ mod tests {
         let ready = Arc::new(Barrier::new(3));
         let retracting = goal.clone();
         let start = Arc::clone(&ready);
-        let single = std::thread::spawn(move || { start.wait(); retracting.retract(first) });
+        let single = std::thread::spawn(move || {
+            start.wait();
+            retracting.retract(first)
+        });
         let draining = goal.clone();
         let start = Arc::clone(&ready);
-        let all = std::thread::spawn(move || { start.wait(); draining.take_pending() });
+        let all = std::thread::spawn(move || {
+            start.wait();
+            draining.take_pending()
+        });
         ready.wait();
         let mut recovered = all.join().unwrap();
         recovered.extend(single.join().unwrap());
         assert_eq!(recovered.len(), 2);
-        assert_eq!(recovered.iter().filter(|input| input.id == first).count(), 1);
-        assert_eq!(recovered.iter().filter(|input| input.id == second).count(), 1);
+        assert_eq!(
+            recovered.iter().filter(|input| input.id == first).count(),
+            1
+        );
+        assert_eq!(
+            recovered.iter().filter(|input| input.id == second).count(),
+            1
+        );
         assert!(goal.take_pending().is_empty());
     }
 
@@ -324,16 +429,40 @@ mod tests {
     fn end_of_turn_input_reaches_goal_report_intact_without_another_prompt() {
         event("native_goal_report");
         let (mut handle, provider) = fixture();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
-            let created = handle.create_goal(&owner, "inspect work", GoalBudget::default()).await.unwrap();
-            let run = handle.run_goal(&owner, &created.goal, Duration::from_secs(30), |control, event| {
-                if matches!(event, AgentEvent::AgentEnd { .. }) {
-                    control.steer_with_content(&payload(), "user screenshot").unwrap();
-                    control.follow_up_with_content(&UserContent::Text("next task".into()), "next task").unwrap();
-                }
-            }, |_, _| panic!("unclaimed user input must prevent automatic verification/continuation")).unwrap();
+            let created = handle
+                .create_goal(&owner, "inspect work", GoalBudget::default())
+                .await
+                .unwrap();
+            let run = handle
+                .run_goal(
+                    &owner,
+                    &created.goal,
+                    Duration::from_secs(30),
+                    |control, event| {
+                        if matches!(event, AgentEvent::AgentEnd { .. }) {
+                            control
+                                .steer_with_content(&payload(), "user screenshot")
+                                .unwrap();
+                            control
+                                .follow_up_with_content(
+                                    &UserContent::Text("next task".into()),
+                                    "next task",
+                                )
+                                .unwrap();
+                        }
+                    },
+                    |_, _| {
+                        panic!(
+                            "unclaimed user input must prevent automatic verification/continuation"
+                        )
+                    },
+                )
+                .unwrap();
             let control = run.control();
             let report = run.await;
             assert_eq!(report.stop, GoalRunStop::Paused);
@@ -344,7 +473,10 @@ mod tests {
             assert_eq!(report.pending[0].text, "user screenshot");
             same_content(&report.pending[0].content, &payload());
             assert_eq!(report.pending[1].kind, InputKind::FollowUp);
-            assert!(control.take_pending().is_empty(), "report owns the payload exactly once");
+            assert!(
+                control.take_pending().is_empty(),
+                "report owns the payload exactly once"
+            );
             assert!(control.turn_snapshot().is_none());
             assert!(control.retract(report.pending[0].id).is_none());
             assert!(control.is_finished());
@@ -356,19 +488,43 @@ mod tests {
     fn typed_follow_up_is_delivered_through_the_native_goal_prompt() {
         event("native_goal_delivery");
         let (mut handle, provider) = fixture();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let content = UserContent::Blocks(vec![ContentBlock::Text(TextContent::new("expanded follow-up content"))]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let content = UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(
+            "expanded follow-up content",
+        ))]);
         let queued = content.clone();
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
-            let created = handle.create_goal(&owner, "inspect work", GoalBudget::default()).await.unwrap();
-            let report = handle.run_goal(&owner, &created.goal, Duration::from_secs(30), move |control, event| {
-                if matches!(event, AgentEvent::AgentStart { .. }) {
-                    control.follow_up_with_content(&queued, "original authored instruction").unwrap();
-                }
-            }, |_, _| GoalDecision::Pause { reason: "review native outcome".into() }).unwrap().await;
+            let created = handle
+                .create_goal(&owner, "inspect work", GoalBudget::default())
+                .await
+                .unwrap();
+            let report = handle
+                .run_goal(
+                    &owner,
+                    &created.goal,
+                    Duration::from_secs(30),
+                    move |control, event| {
+                        if matches!(event, AgentEvent::AgentStart { .. }) {
+                            control
+                                .follow_up_with_content(&queued, "original authored instruction")
+                                .unwrap();
+                        }
+                    },
+                    |_, _| GoalDecision::Pause {
+                        reason: "review native outcome".into(),
+                    },
+                )
+                .unwrap()
+                .await;
             assert_eq!(report.stop, GoalRunStop::Paused);
-            assert_eq!(report.goal.prompts_started(), 1, "native follow-ups are not extra goal prompts");
+            assert_eq!(
+                report.goal.prompts_started(),
+                1,
+                "native follow-ups are not extra goal prompts"
+            );
             assert!(report.pending.is_empty());
             assert!(report.error.is_none());
         });
@@ -385,18 +541,31 @@ mod tests {
         let (mut handle, provider) = fixture();
         let old = handle.prompt_controlled("old".into(), |_| {});
         let source = old.control();
-        let previous_id = source.follow_up_with_content(&payload(), "recovered image").unwrap();
+        let previous_id = source
+            .follow_up_with_content(&payload(), "recovered image")
+            .unwrap();
         drop(old);
         let mut pending = source.take_pending();
         let goal = GoalControl::new();
-        assert!(goal.restore_pending(&mut pending).unwrap_err().to_string().contains("GOAL_INPUT_IDLE"));
+        assert!(
+            goal.restore_pending(&mut pending)
+                .unwrap_err()
+                .to_string()
+                .contains("GOAL_INPUT_IDLE")
+        );
         assert_eq!(pending[0].id, previous_id);
         same_content(&pending[0].content, &payload());
         let target = handle.prompt_controlled("target".into(), |_| {});
         goal.install(target.control());
         let closed = GoalControl::new();
         closed.pause();
-        assert!(closed.restore_pending(&mut pending).unwrap_err().to_string().contains("GOAL_INPUT_CLOSED"));
+        assert!(
+            closed
+                .restore_pending(&mut pending)
+                .unwrap_err()
+                .to_string()
+                .contains("GOAL_INPUT_CLOSED")
+        );
         assert_eq!(pending[0].id, previous_id);
         let receipts = goal.restore_pending(&mut pending).unwrap();
         assert!(pending.is_empty());
@@ -406,24 +575,44 @@ mod tests {
         let recovered = goal.retract(receipts[0].new_id).unwrap();
         same_content(&recovered.content, &payload());
         assert_eq!(recovered.text, "recovered image");
-        assert!(provider.requests.lock().unwrap().is_empty(), "restoration alone dispatches no prompt");
+        assert!(
+            provider.requests.lock().unwrap().is_empty(),
+            "restoration alone dispatches no prompt"
+        );
     }
 
     #[test]
     fn reviewed_goal_report_inputs_can_be_restored_into_one_later_native_turn() {
         event("goal_report_restoration");
         let (mut handle, provider) = fixture();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let content = UserContent::Blocks(vec![ContentBlock::Text(TextContent::new("retained expanded instruction"))]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let content = UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(
+            "retained expanded instruction",
+        ))]);
         let for_first = content.clone();
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
-            let created = handle.create_goal(&owner, "inspect work", GoalBudget::default()).await.unwrap();
-            let first = handle.run_goal(&owner, &created.goal, Duration::from_secs(30), move |control, event| {
-                if matches!(event, AgentEvent::AgentEnd { .. }) {
-                    control.follow_up_with_content(&for_first, "user instruction to retain").unwrap();
-                }
-            }, |_, _| panic!("unclaimed input must stop verification")).unwrap();
+            let created = handle
+                .create_goal(&owner, "inspect work", GoalBudget::default())
+                .await
+                .unwrap();
+            let first = handle
+                .run_goal(
+                    &owner,
+                    &created.goal,
+                    Duration::from_secs(30),
+                    move |control, event| {
+                        if matches!(event, AgentEvent::AgentEnd { .. }) {
+                            control
+                                .follow_up_with_content(&for_first, "user instruction to retain")
+                                .unwrap();
+                        }
+                    },
+                    |_, _| panic!("unclaimed input must stop verification"),
+                )
+                .unwrap();
             let old_control = first.control();
             let mut report = first.await;
             assert_eq!(report.pending.len(), 1);
@@ -436,12 +625,25 @@ mod tests {
             let source = Arc::clone(&pending);
             let restored = Arc::new(Mutex::new(Vec::new()));
             let receipts = Arc::clone(&restored);
-            let next = handle.run_goal(&owner, &resumed.goal, Duration::from_secs(30), move |control, event| {
-                if matches!(event, AgentEvent::AgentStart { .. }) {
-                    let mappings = control.restore_pending(&mut source.lock().unwrap()).unwrap();
-                    receipts.lock().unwrap().extend(mappings);
-                }
-            }, |_, _| GoalDecision::Pause { reason: "review restored input outcome".into() }).unwrap().await;
+            let next = handle
+                .run_goal(
+                    &owner,
+                    &resumed.goal,
+                    Duration::from_secs(30),
+                    move |control, event| {
+                        if matches!(event, AgentEvent::AgentStart { .. }) {
+                            let mappings = control
+                                .restore_pending(&mut source.lock().unwrap())
+                                .unwrap();
+                            receipts.lock().unwrap().extend(mappings);
+                        }
+                    },
+                    |_, _| GoalDecision::Pause {
+                        reason: "review restored input outcome".into(),
+                    },
+                )
+                .unwrap()
+                .await;
             assert_eq!(next.stop, GoalRunStop::Paused);
             assert_eq!(next.goal.id(), created.goal.id());
             assert_eq!(next.goal.prompts_started(), 2);
@@ -454,7 +656,11 @@ mod tests {
             assert_ne!(receipts[0].new_id, old_id);
         });
         let requests = provider.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3, "one old prompt and one resumed prompt with one restored follow-up");
+        assert_eq!(
+            requests.len(),
+            3,
+            "one old prompt and one resumed prompt with one restored follow-up"
+        );
         assert_eq!(requests.last().unwrap().iter().filter(|message| {
             matches!(message, Message::User(user) if serde_json::to_value(&user.content).unwrap() == serde_json::to_value(&content).unwrap())
         }).count(), 1, "the pending input must be delivered once, not regenerated or duplicated");

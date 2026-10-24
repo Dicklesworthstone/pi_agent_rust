@@ -81,7 +81,8 @@ fn gdb_adapter() -> AdapterSpec {
         command_candidates: vec!["gdb".to_string(), "gdb.exe".to_string()],
         adapter_args: args,
         languages: vec!["rust", "c", "cpp", "binary"],
-        install_hint: "install Python-enabled GDB 16+ with the dap interpreter (17+ on Windows)".to_string(),
+        install_hint: "install Python-enabled GDB 16+ with the dap interpreter (17+ on Windows)"
+            .to_string(),
     }
 }
 
@@ -239,7 +240,9 @@ pub fn classify_target(target: &Path) -> TargetKind {
     match target.extension().and_then(|extension| extension.to_str()) {
         Some("py") => TargetKind::Python,
         Some("go") => TargetKind::Go,
-        Some("cs" | "csx" | "fs" | "fsx" | "csproj" | "fsproj" | "sln" | "slnx") => TargetKind::DotNet,
+        Some("cs" | "csx" | "fs" | "fsx" | "csproj" | "fsproj" | "sln" | "slnx") => {
+            TargetKind::DotNet
+        }
         Some("kt" | "kts") => TargetKind::Kotlin,
         Some("rb" | "rake" | "gemspec") => TargetKind::Ruby,
         Some("php" | "phtml") => TargetKind::Php,
@@ -393,11 +396,11 @@ pub fn attach_arguments(adapter: &AdapterSpec, pid: u32) -> Value {
 }
 
 #[cfg(test)]
-#[path = "adapter_configuration_tests.rs"]
-mod configuration_tests;
-#[cfg(test)]
 #[path = "codelldb_tests.rs"]
 mod codelldb_tests;
+#[cfg(test)]
+#[path = "adapter_configuration_tests.rs"]
+mod configuration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -513,18 +516,42 @@ mod tests {
     #[test]
     fn gdb_profile_is_native_dap_and_suppresses_implicit_startup_code() {
         let adapter = select_adapter(None, Some("gdb"), &[]).unwrap();
-        assert!(adapter.adapter_args.iter().any(|arg| arg == "--interpreter=dap"));
+        assert!(
+            adapter
+                .adapter_args
+                .iter()
+                .any(|arg| arg == "--interpreter=dap")
+        );
         assert!(adapter.adapter_args.iter().any(|arg| arg == "--nx"));
         for command in ["set auto-load off", "set startup-with-shell off"] {
-            assert!(adapter.adapter_args.windows(2).any(|args| args[0] == "-iex" && args[1] == command));
+            assert!(
+                adapter
+                    .adapter_args
+                    .windows(2)
+                    .any(|args| args[0] == "-iex" && args[1] == command)
+            );
         }
-        assert_eq!(adapter.adapter_args.iter().any(|arg| arg == "--binary-output"), cfg!(windows));
-        let launch = launch_arguments(&adapter, Path::new("app"), &["a b".into(), "$(literal)".into()], Path::new("."));
+        assert_eq!(
+            adapter
+                .adapter_args
+                .iter()
+                .any(|arg| arg == "--binary-output"),
+            cfg!(windows)
+        );
+        let launch = launch_arguments(
+            &adapter,
+            Path::new("app"),
+            &["a b".into(), "$(literal)".into()],
+            Path::new("."),
+        );
         assert_eq!(launch["args"], serde_json::json!(["a b", "$(literal)"]));
         assert_eq!(launch["stopAtBeginningOfMainSubprogram"], true);
         assert_eq!(launch["stopOnEntry"], false);
         assert!(launch.get("console").is_none());
-        assert_eq!(attach_arguments(&adapter, 42), serde_json::json!({"pid":42}));
+        assert_eq!(
+            attach_arguments(&adapter, 42),
+            serde_json::json!({"pid":42})
+        );
     }
 
     #[test]

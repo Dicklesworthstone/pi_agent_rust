@@ -780,9 +780,8 @@ fn wrap_stream_with_idle_timeout(
         return stream;
     };
 
-    let wrapped = futures::stream::unfold(
-        Some((stream, start_time, timeout)),
-        |state| async move {
+    let wrapped =
+        futures::stream::unfold(Some((stream, start_time, timeout)), |state| async move {
             use asupersync::time::{sleep, wall_now};
             use futures::future::{Either, FutureExt, select};
 
@@ -834,8 +833,7 @@ fn wrap_stream_with_idle_timeout(
                 }
                 None => None,
             }
-        },
-    );
+        });
     Box::pin(wrapped.fuse())
 }
 
@@ -3314,9 +3312,9 @@ mod tests {
     #[test]
     fn idle_successful_eof_releases_body_and_stays_fused() {
         asupersync::test_utils::run_test(|| async {
-            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![
-                Ok(b"last chunk".to_vec()),
-            ])));
+            let (body, counters) = tracked_idle_body(Box::pin(futures::stream::iter(vec![Ok(
+                b"last chunk".to_vec(),
+            )])));
             let mut stream = wrap_stream_with_idle_timeout(
                 body,
                 Some((now(), std::time::Duration::from_secs(30))),

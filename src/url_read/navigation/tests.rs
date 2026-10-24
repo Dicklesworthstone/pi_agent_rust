@@ -24,10 +24,19 @@ fn structured_sources_resolve_github_and_require_exact_utf8() {
 
 #[test]
 fn github_read_plans_raw_io_not_a_placeholder() {
-    let route = Route::new("https://github.com/team/repo/blob/feat%2Fone/src/a%20b.rs?plain=1#L20",
-        SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
-    assert_eq!(route.current.as_str(), "https://raw.githubusercontent.com/team/repo/feat%2Fone/src/a%20b.rs");
-    let out = route.finish("text/plain", b"fn actual_file() {}\n", false).unwrap();
+    let route = Route::new(
+        "https://github.com/team/repo/blob/feat%2Fone/src/a%20b.rs?plain=1#L20",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::Reader,
+    )
+    .unwrap();
+    assert_eq!(
+        route.current.as_str(),
+        "https://raw.githubusercontent.com/team/repo/feat%2Fone/src/a%20b.rs"
+    );
+    let out = route
+        .finish("text/plain", b"fn actual_file() {}\n", false)
+        .unwrap();
     assert_eq!(out.content, "fn actual_file() {}\n");
     assert_eq!(out.extractor, "github-blob-raw");
     assert_eq!(out.final_url, route.current.as_str());
@@ -39,16 +48,32 @@ fn raw_mode_and_offline_html_conversion_do_not_redirect() {
     let original = "https://github.com/team/repo/blob/main/index.html?plain=1";
     let route = Route::new(original, SsrfPolicy::BlockPrivateTargets, UrlReadMode::Raw).unwrap();
     assert_eq!(route.current.as_str(), original);
-    assert_eq!(route.finish("text/html", b"<h1>original</h1>", false).unwrap().content, "<h1>original</h1>");
-    let converted = crate::url_read::convert_bytes(original, "text/html", b"<main>supplied source</main>", false).unwrap();
+    assert_eq!(
+        route
+            .finish("text/html", b"<h1>original</h1>", false)
+            .unwrap()
+            .content,
+        "<h1>original</h1>"
+    );
+    let converted = crate::url_read::convert_bytes(
+        original,
+        "text/html",
+        b"<main>supplied source</main>",
+        false,
+    )
+    .unwrap();
     assert!(converted.content.contains("supplied source"));
     assert!(!converted.content.contains("fetch the raw"));
 }
 
 #[test]
 fn repository_html_source_is_never_reader_stripped() {
-    let route = Route::new("https://github.com/team/repo/blob/main/index.html",
-        SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
+    let route = Route::new(
+        "https://github.com/team/repo/blob/main/index.html",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::Reader,
+    )
+    .unwrap();
     let html = b"<script>source_only()</script><nav>important markup</nav>";
     let out = route.finish("text/html", html, true).unwrap();
     assert_eq!(out.content.as_bytes(), html);
@@ -58,10 +83,17 @@ fn repository_html_source_is_never_reader_stripped() {
 
 #[test]
 fn only_exact_github_routes_are_synthesized() {
-    for url in ["https://github.com.attacker.invalid/o/r/blob/main/x", "https://github.com:8443/o/r/blob/main/x",
-        "https://github.com/o/r/tree/main/x", "https://github.com/o/r/blob/main", "https://github.com/o/r/blob//x",
-        "https://github.com/o/r/blob/main/", "https://user:secret@github.com/o/r/blob/main/x",
-        "file://github.com/o/r/blob/main/x", "https://github.com/o%2Fx/r/blob/main/x"] {
+    for url in [
+        "https://github.com.attacker.invalid/o/r/blob/main/x",
+        "https://github.com:8443/o/r/blob/main/x",
+        "https://github.com/o/r/tree/main/x",
+        "https://github.com/o/r/blob/main",
+        "https://github.com/o/r/blob//x",
+        "https://github.com/o/r/blob/main/",
+        "https://user:secret@github.com/o/r/blob/main/x",
+        "file://github.com/o/r/blob/main/x",
+        "https://github.com/o%2Fx/r/blob/main/x",
+    ] {
         assert!(github_blob_to_raw(url).is_none(), "mapped {url}");
     }
     assert!(github_blob_to_raw("https://GITHUB.COM:443/o/r/blob/main/a.txt").is_some());
@@ -71,12 +103,7 @@ fn only_exact_github_routes_are_synthesized() {
 fn github_documents_use_native_readers_and_reject_partial_downloads() {
     for extension in ["docx", "pptx", "xlsx", "epub"] {
         let url = format!("https://github.com/team/repo/blob/main/report.{extension}");
-        let route = Route::new(
-            &url,
-            SsrfPolicy::BlockPrivateTargets,
-            UrlReadMode::Reader,
-        )
-        .unwrap();
+        let route = Route::new(&url, SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
         let error = route
             .finish("application/octet-stream", b"partial ZIP", true)
             .expect_err("a partial document archive must not become raw source text");
@@ -128,7 +155,9 @@ fn github_xlsx_sources_render_saved_cells_with_original_coordinates() {
         UrlReadMode::Reader,
     )
     .unwrap();
-    let outcome = route.finish("application/octet-stream", &bytes, false).unwrap();
+    let outcome = route
+        .finish("application/octet-stream", &bytes, false)
+        .unwrap();
     assert_eq!(outcome.kind, UrlContentKind::Xlsx);
     assert_eq!(outcome.extractor, "xlsx");
     assert_eq!(
@@ -173,7 +202,9 @@ fn github_epub_sources_render_book_text_instead_of_zip_bytes() {
         UrlReadMode::Reader,
     )
     .unwrap();
-    let outcome = route.finish("application/octet-stream", &bytes, false).unwrap();
+    let outcome = route
+        .finish("application/octet-stream", &bytes, false)
+        .unwrap();
     assert_eq!(outcome.kind, UrlContentKind::Epub);
     assert_eq!(outcome.extractor, "epub");
     assert_eq!(
@@ -187,26 +218,53 @@ fn github_epub_sources_render_book_text_instead_of_zip_bytes() {
 fn relative_redirects_use_url_reference_semantics() {
     for (base, location, expected) in [
         ("https://a.test", "file", "https://a.test/file"),
-        ("https://a.test/a/b?old=1", "?new=2", "https://a.test/a/b?new=2"),
+        (
+            "https://a.test/a/b?old=1",
+            "?new=2",
+            "https://a.test/a/b?new=2",
+        ),
         ("https://a.test/a/b", "../c", "https://a.test/c"),
         ("https://a.test/a/b", "//b.test/c", "https://b.test/c"),
         ("https://a.test/a/b", "#fragment", "https://a.test/a/b"),
-    ] { assert_eq!(resolve_redirect(base, location).unwrap(), expected); }
+    ] {
+        assert_eq!(resolve_redirect(base, location).unwrap(), expected);
+    }
 }
 
 #[test]
 fn redirect_into_github_uses_the_same_source_resolver() {
-    let mut route = Route::new("https://example.com/file", SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
-    route.follow("https://github.com/o/r/blob/main/data.json").unwrap();
-    assert_eq!(route.current.as_str(), "https://raw.githubusercontent.com/o/r/main/data.json");
+    let mut route = Route::new(
+        "https://example.com/file",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::Reader,
+    )
+    .unwrap();
+    route
+        .follow("https://github.com/o/r/blob/main/data.json")
+        .unwrap();
+    assert_eq!(
+        route.current.as_str(),
+        "https://raw.githubusercontent.com/o/r/main/data.json"
+    );
     assert_eq!(route.redirects, 1);
 }
 
 #[test]
 fn blocked_redirects_never_become_requests_and_errors_do_not_echo_secrets() {
-    for location in ["http://127.1/x?key=do-not-echo", "http://[::ffff:127.0.0.1]/", "http://localhost./",
-        "file:///tmp/x", "https://user:do-not-echo@example.com/x", "https://example.com/\nx"] {
-        let mut route = Route::new("https://example.com/start", SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
+    for location in [
+        "http://127.1/x?key=do-not-echo",
+        "http://[::ffff:127.0.0.1]/",
+        "http://localhost./",
+        "file:///tmp/x",
+        "https://user:do-not-echo@example.com/x",
+        "https://example.com/\nx",
+    ] {
+        let mut route = Route::new(
+            "https://example.com/start",
+            SsrfPolicy::BlockPrivateTargets,
+            UrlReadMode::Reader,
+        )
+        .unwrap();
         let error = route.follow(location).unwrap_err().to_string();
         assert!(!error.contains("do-not-echo"));
     }
@@ -214,19 +272,59 @@ fn blocked_redirects_never_become_requests_and_errors_do_not_echo_secrets() {
 
 #[test]
 fn normalized_loops_and_redirect_budget_are_bounded() {
-    let mut route = Route::new("https://example.com/start", SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
-    assert!(route.follow("#again").unwrap_err().to_string().contains("LOOP"));
-    let mut route = Route::new("https://example.com/start", SsrfPolicy::BlockPrivateTargets, UrlReadMode::Reader).unwrap();
-    for index in 0..MAX_REDIRECTS { route.follow(&format!("/step-{index}")).unwrap(); }
-    assert!(route.follow("/one-too-many").unwrap_err().to_string().contains("LIMIT"));
+    let mut route = Route::new(
+        "https://example.com/start",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::Reader,
+    )
+    .unwrap();
+    assert!(
+        route
+            .follow("#again")
+            .unwrap_err()
+            .to_string()
+            .contains("LOOP")
+    );
+    let mut route = Route::new(
+        "https://example.com/start",
+        SsrfPolicy::BlockPrivateTargets,
+        UrlReadMode::Reader,
+    )
+    .unwrap();
+    for index in 0..MAX_REDIRECTS {
+        route.follow(&format!("/step-{index}")).unwrap();
+    }
+    assert!(
+        route
+            .follow("/one-too-many")
+            .unwrap_err()
+            .to_string()
+            .contains("LIMIT")
+    );
 }
 
 #[test]
 fn literal_host_checks_cover_alternative_ipv4_and_mapped_ipv6() {
-    for url in ["http://127.1/", "http://2130706433/", "http://0x7f000001/", "http://[::ffff:192.168.1.1]/",
-        "http://LOCALHOST./", "http://100.64.0.1/", "http://100.127.255.255/", "http://224.0.0.1/",
-        "http://[ff02::1]/", "http://[2001:db8::1]/"] { assert!(host_is_private_target(url), "{url}"); }
-    for url in ["https://example.com/", "http://100.63.255.255/", "http://100.128.0.1/", "http://100.192.0.1/"] {
+    for url in [
+        "http://127.1/",
+        "http://2130706433/",
+        "http://0x7f000001/",
+        "http://[::ffff:192.168.1.1]/",
+        "http://LOCALHOST./",
+        "http://100.64.0.1/",
+        "http://100.127.255.255/",
+        "http://224.0.0.1/",
+        "http://[ff02::1]/",
+        "http://[2001:db8::1]/",
+    ] {
+        assert!(host_is_private_target(url), "{url}");
+    }
+    for url in [
+        "https://example.com/",
+        "http://100.63.255.255/",
+        "http://100.128.0.1/",
+        "http://100.192.0.1/",
+    ] {
         assert!(!host_is_private_target(url), "{url}");
     }
 }
@@ -263,7 +361,9 @@ fn peer(replies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) 
                     Err(error) => panic!("{error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
                 assert!(request.len() < 32768);
@@ -280,21 +380,36 @@ fn peer(replies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) 
 }
 
 fn run<F: std::future::Future>(future: F) -> F::Output {
-    asupersync::runtime::RuntimeBuilder::current_thread().blocking_threads(1, 8)
-        .build().unwrap().block_on(future)
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 8)
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 fn response(status: &str, headers: &str, body: &str) -> String {
-    format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}", body.len())
+    format!(
+        "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+        body.len()
+    )
 }
 
 #[test]
 fn http_query_redirect_retrieves_literal_final_document() {
     let (base, server) = peer(vec![
         response("302 Found", "Location: ?page=2\r\n", ""),
-        response("200 OK", "Content-Type: text/plain\r\n", "actual document\n界\n"),
+        response(
+            "200 OK",
+            "Content-Type: text/plain\r\n",
+            "actual document\n界\n",
+        ),
     ]);
-    let out = run(fetch(&format!("{base}/document?page=1"), SsrfPolicy::AllowPrivateTargets, UrlReadMode::Reader)).unwrap();
+    let out = run(fetch(
+        &format!("{base}/document?page=1"),
+        SsrfPolicy::AllowPrivateTargets,
+        UrlReadMode::Reader,
+    ))
+    .unwrap();
     assert_eq!(out.content, "actual document\n界\n");
     assert_eq!(out.final_url, format!("{base}/document?page=2"));
     let requests = server.join().unwrap();
@@ -304,10 +419,23 @@ fn http_query_redirect_retrieves_literal_final_document() {
 
 #[test]
 fn http_network_path_redirect_is_followed() {
-    let (destination, body_server) = peer(vec![response("200 OK", "Content-Type: text/plain\r\n", "destination")]);
+    let (destination, body_server) = peer(vec![response(
+        "200 OK",
+        "Content-Type: text/plain\r\n",
+        "destination",
+    )]);
     let target = destination.strip_prefix("http:").unwrap();
-    let (base, redirect_server) = peer(vec![response("307 Temporary Redirect", &format!("Location: {target}/file\r\n"), "")]);
-    let out = run(fetch(&format!("{base}/start"), SsrfPolicy::AllowPrivateTargets, UrlReadMode::Reader)).unwrap();
+    let (base, redirect_server) = peer(vec![response(
+        "307 Temporary Redirect",
+        &format!("Location: {target}/file\r\n"),
+        "",
+    )]);
+    let out = run(fetch(
+        &format!("{base}/start"),
+        SsrfPolicy::AllowPrivateTargets,
+        UrlReadMode::Reader,
+    ))
+    .unwrap();
     assert_eq!(out.content, "destination");
     assert_eq!(out.final_url, format!("{destination}/file"));
     assert_eq!(redirect_server.join().unwrap().len(), 1);
@@ -316,9 +444,19 @@ fn http_network_path_redirect_is_followed() {
 
 #[test]
 fn http_missing_location_and_terminal_error_do_not_report_success() {
-    for reply in [response("302 Found", "", ""), response("404 Not Found", "Content-Type: text/html\r\n", "login") ] {
+    for reply in [
+        response("302 Found", "", ""),
+        response("404 Not Found", "Content-Type: text/html\r\n", "login"),
+    ] {
         let (base, server) = peer(vec![reply]);
-        assert!(run(fetch(&base, SsrfPolicy::AllowPrivateTargets, UrlReadMode::Reader)).is_err());
+        assert!(
+            run(fetch(
+                &base,
+                SsrfPolicy::AllowPrivateTargets,
+                UrlReadMode::Reader
+            ))
+            .is_err()
+        );
         assert_eq!(server.join().unwrap().len(), 1);
     }
 }
@@ -326,8 +464,17 @@ fn http_missing_location_and_terminal_error_do_not_report_success() {
 #[test]
 fn http_raw_mode_keeps_the_wire_page() {
     let html = "<nav>kept</nav><script>source()</script>";
-    let (base, server) = peer(vec![response("200 OK", "Content-Type: text/html\r\n", html)]);
-    let out = run(fetch(&base, SsrfPolicy::AllowPrivateTargets, UrlReadMode::Raw)).unwrap();
+    let (base, server) = peer(vec![response(
+        "200 OK",
+        "Content-Type: text/html\r\n",
+        html,
+    )]);
+    let out = run(fetch(
+        &base,
+        SsrfPolicy::AllowPrivateTargets,
+        UrlReadMode::Raw,
+    ))
+    .unwrap();
     assert_eq!(out.content, html);
     assert_eq!(out.extractor, "raw");
     assert_eq!(server.join().unwrap().len(), 1);

@@ -38,7 +38,10 @@ fn invalid(message: &'static str) -> Error {
 /// Count before copying a request or a typed dependency result. JSON escaping
 /// counts too. The sink never creates a second serialized copy of the payload.
 fn encoded_size(value: &impl Serialize, limit: usize) -> Option<usize> {
-    struct Counter { bytes: usize, limit: usize }
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if bytes.len() > self.limit.saturating_sub(self.bytes) {
@@ -47,7 +50,9 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> Option<usize> {
             self.bytes += bytes.len();
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     let mut counter = Counter { bytes: 0, limit };
     serde_json::to_writer(&mut counter, value).ok()?;
@@ -55,10 +60,18 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> Option<usize> {
 }
 
 fn identifier(value: &Value) -> Result<&str> {
-    value.as_str().filter(|id| {
-        !id.is_empty() && id.len() <= 64
-            && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    }).ok_or_else(|| invalid("node IDs must be 1-64 ASCII letters, digits, underscores or hyphens"))
+    value
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+        .ok_or_else(|| {
+            invalid("node IDs must be 1-64 ASCII letters, digits, underscores or hyphens")
+        })
 }
 
 struct Node {
@@ -81,31 +94,49 @@ fn parse_inputs(
     ids: &BTreeMap<String, usize>,
     needs: &[usize],
 ) -> Result<Vec<Input>> {
-    let Some(value) = value else { return Ok(Vec::new()); };
-    let fields = value.as_object().filter(|fields| fields.len() <= MAX_NODES)
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let fields = value
+        .as_object()
+        .filter(|fields| fields.len() <= MAX_NODES)
         .ok_or_else(|| invalid("inputs must be an object of at most 32 named data references"))?;
     let mut inputs = Vec::with_capacity(fields.len());
     for (name, reference) in fields {
         identifier(&Value::String(name.clone()))?;
-        let reference = reference.as_object().filter(|fields| fields.len() == 2
-            && fields.contains_key("pointer")
-            && (fields.contains_key("from") || fields.contains_key("fromSelected")))
-            .ok_or_else(|| invalid("each input requires pointer and exactly one of from or fromSelected"))?;
+        let reference = reference
+            .as_object()
+            .filter(|fields| {
+                fields.len() == 2
+                    && fields.contains_key("pointer")
+                    && (fields.contains_key("from") || fields.contains_key("fromSelected"))
+            })
+            .ok_or_else(|| {
+                invalid("each input requires pointer and exactly one of from or fromSelected")
+            })?;
         let from = selected_inputs::Source::parse(reference, ids, needs)?;
-        let pointer = reference["pointer"].as_str()
+        let pointer = reference["pointer"]
+            .as_str()
             .ok_or_else(|| invalid("input pointer must be a JSON pointer string"))?;
         validate_pointer(pointer)?;
-        inputs.push(Input { name: name.clone(), from, pointer: pointer.to_owned() });
+        inputs.push(Input {
+            name: name.clone(),
+            from,
+            pointer: pointer.to_owned(),
+        });
     }
     Ok(inputs)
 }
 
 fn validate_pointer(pointer: &str) -> Result<()> {
-    if pointer.len() > 1024 || pointer.chars().any(char::is_control)
+    if pointer.len() > 1024
+        || pointer.chars().any(char::is_control)
         || (!pointer.is_empty() && !pointer.starts_with('/'))
         || pointer.bytes().filter(|byte| *byte == b'/').count() > 32
     {
-        return Err(invalid("input pointer exceeds its bounds or is not a JSON pointer"));
+        return Err(invalid(
+            "input pointer exceeds its bounds or is not a JSON pointer",
+        ));
     }
     let mut bytes = pointer.bytes();
     while let Some(byte) = bytes.next() {
@@ -122,7 +153,10 @@ const INPUT_SUFFIX: &str = "\n</workflow-inputs>";
 impl Node {
     /// Bind only schema-validated data, never provisional output or native
     /// launch controls. Borrow results while encoding; keep no second cache.
-    fn task_with_inputs(&self, records: &[Record]) -> std::result::Result<SubagentTask, &'static str> {
+    fn task_with_inputs(
+        &self,
+        records: &[Record],
+    ) -> std::result::Result<SubagentTask, &'static str> {
         self.task_with_item(records, None)
     }
 
@@ -131,11 +165,15 @@ impl Node {
         records: &[Record],
         item: Option<(&str, &Value)>,
     ) -> std::result::Result<SubagentTask, &'static str> {
-        if self.inputs.is_empty() && item.is_none() { return Ok(self.call.clone()); }
+        if self.inputs.is_empty() && item.is_none() {
+            return Ok(self.call.clone());
+        }
         let mut values = BTreeMap::new();
         for input in &self.inputs {
             let result = input.from.data(records)?;
-            let value = result.pointer(&input.pointer).ok_or("dependency_input_missing")?;
+            let value = result
+                .pointer(&input.pointer)
+                .ok_or("dependency_input_missing")?;
             values.insert(input.name.as_str(), value);
         }
         if let Some((name, value)) = item
@@ -143,12 +181,16 @@ impl Node {
         {
             return Err("fanout_input_collision");
         }
-        let limit = MAX_TASK_BYTES.saturating_sub(self.call.task.len())
+        let limit = MAX_TASK_BYTES
+            .saturating_sub(self.call.task.len())
             .saturating_sub(INPUT_PREFIX.len() + INPUT_SUFFIX.len());
         encoded_size(&values, limit).ok_or("dependency_input_limit")?;
         // Escape '<' during bounded serialization so a value cannot forge the
         // closing delimiter. This is framing, not a prompt-injection sandbox.
-        let mut writer = InputWriter { bytes: Vec::new(), limit };
+        let mut writer = InputWriter {
+            bytes: Vec::new(),
+            limit,
+        };
         serde_json::to_writer(&mut writer, &values).map_err(|_| "dependency_input_limit")?;
         let data = String::from_utf8(writer.bytes).map_err(|_| "dependency_data_unavailable")?;
         let mut task = self.call.clone();
@@ -167,7 +209,11 @@ struct InputWriter {
 impl Write for InputWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         for byte in bytes {
-            let encoded: &[u8] = if *byte == b'<' { b"\\u003c" } else { std::slice::from_ref(byte) };
+            let encoded: &[u8] = if *byte == b'<' {
+                b"\\u003c"
+            } else {
+                std::slice::from_ref(byte)
+            };
             if encoded.len() > self.limit.saturating_sub(self.bytes.len()) {
                 return Err(io::Error::other("workflow input byte limit"));
             }
@@ -175,7 +221,9 @@ impl Write for InputWriter {
         }
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(super) struct Plan {
@@ -205,7 +253,15 @@ impl PreparedWorkflow {
     }
 
     pub(super) async fn run(self, update: Option<UpdateCallback>) -> Result<ToolOutput> {
-        self.plan.run(self.runner, self.agents, self.deadline, update, self.progress).await
+        self.plan
+            .run(
+                self.runner,
+                self.agents,
+                self.deadline,
+                update,
+                self.progress,
+            )
+            .await
     }
 }
 
@@ -222,28 +278,48 @@ impl Plan {
         if encoded_size(input, MAX_REQUEST_BYTES).is_none() {
             return Err(invalid("workflow request exceeds 256 KiB"));
         }
-        let fields = input.as_object().ok_or_else(|| invalid("expected an object"))?;
-        if fields.keys().any(|key| !matches!(key.as_str(),
-            "workflow" | "concurrency" | "timeoutSeconds" | "scope"
-        )) {
-            return Err(invalid("workflow cannot be combined with single, tasks, chain or other top-level task controls"));
+        let fields = input
+            .as_object()
+            .ok_or_else(|| invalid("expected an object"))?;
+        if fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "workflow" | "concurrency" | "timeoutSeconds" | "scope"
+            )
+        }) {
+            return Err(invalid(
+                "workflow cannot be combined with single, tasks, chain or other top-level task controls",
+            ));
         }
-        let entries = raw.as_array().filter(|entries| (1..=MAX_NODES).contains(&entries.len()))
+        let entries = raw
+            .as_array()
+            .filter(|entries| (1..=MAX_NODES).contains(&entries.len()))
             .ok_or_else(|| invalid("workflow requires 1-32 nodes"))?;
         let concurrency = match input.get("concurrency") {
             None => DEFAULT_CONCURRENCY,
-            Some(value) => value.as_u64()
+            Some(value) => value
+                .as_u64()
                 .filter(|value| (1..=super::MAX_PARALLEL_TASKS as u64).contains(value))
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or_else(|| invalid("concurrency must be an integer from 1 to 8"))?,
         };
-        let timeout_seconds = input.get("timeoutSeconds").map(|value| {
-            value.as_u64().filter(|value| (1..=super::deadline::MAX_TIMEOUT_SECS).contains(value))
-                .ok_or_else(|| invalid("timeoutSeconds must be an integer from 1 to 86400"))
-        }).transpose()?;
-        let scope = input.get("scope").map(|value| serde_json::from_value(value.clone())
-            .map_err(|_| invalid("scope must be both, user or project")))
-            .transpose()?.unwrap_or(AgentScope::Both);
+        let timeout_seconds = input
+            .get("timeoutSeconds")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|value| (1..=super::deadline::MAX_TIMEOUT_SECS).contains(value))
+                    .ok_or_else(|| invalid("timeoutSeconds must be an integer from 1 to 86400"))
+            })
+            .transpose()?;
+        let scope = input
+            .get("scope")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| invalid("scope must be both, user or project"))
+            })
+            .transpose()?
+            .unwrap_or(AgentScope::Both);
         let mut ids = BTreeMap::new();
         for (index, entry) in entries.iter().enumerate() {
             let id = identifier(&entry["id"])?;
@@ -253,23 +329,35 @@ impl Plan {
         }
         let mut nodes = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
-            let fields = entry.as_object().ok_or_else(|| invalid("each node must be an object"))?;
-            if fields.keys().any(|key| !matches!(key.as_str(), "id" | "needs" | "call" | "inputs" | "forEach")
-                && !decision::is_field(key)) {
+            let fields = entry
+                .as_object()
+                .ok_or_else(|| invalid("each node must be an object"))?;
+            if fields.keys().any(|key| {
+                !matches!(key.as_str(), "id" | "needs" | "call" | "inputs" | "forEach")
+                    && !decision::is_field(key)
+            }) {
                 return Err(invalid("node contains unsupported workflow fields"));
             }
             let needs = match fields.get("needs") {
                 None => Vec::new(),
                 Some(value) => {
-                    let array = value.as_array().filter(|array| array.len() < MAX_NODES)
-                        .ok_or_else(|| invalid("needs must be an array of at most 31 distinct node IDs"))?;
+                    let array = value
+                        .as_array()
+                        .filter(|array| array.len() < MAX_NODES)
+                        .ok_or_else(|| {
+                            invalid("needs must be an array of at most 31 distinct node IDs")
+                        })?;
                     let mut seen = BTreeSet::new();
                     let mut needs = Vec::with_capacity(array.len());
                     for id in array {
-                        let dependency = ids.get(identifier(id)?).copied()
+                        let dependency = ids
+                            .get(identifier(id)?)
+                            .copied()
                             .ok_or_else(|| invalid("needs names an unknown node"))?;
                         if dependency == index || !seen.insert(dependency) {
-                            return Err(invalid("self dependencies and duplicate edges are not allowed"));
+                            return Err(invalid(
+                                "self dependencies and duplicate edges are not allowed",
+                            ));
                         }
                         needs.push(dependency);
                     }
@@ -281,31 +369,60 @@ impl Plan {
             selected_inputs::validate_join(entry, &inputs)?;
             let decision = decision::Policy::parse(entry, &ids, &needs)?;
             let fanout = fanout::Expansion::parse(fields.get("forEach"), &ids, &needs, &inputs)?;
-            nodes.push(Node { id: identifier(&entry["id"])?.to_owned(), needs, call, inputs, decision, fanout });
+            nodes.push(Node {
+                id: identifier(&entry["id"])?.to_owned(),
+                needs,
+                call,
+                inputs,
+                decision,
+                fanout,
+            });
         }
         fanout::validate_budget(&nodes)?;
         let waves = layers(&nodes)?;
-        Ok(Some(Self { nodes, waves, concurrency, timeout_seconds, scope }))
+        Ok(Some(Self {
+            nodes,
+            waves,
+            concurrency,
+            timeout_seconds,
+            scope,
+        }))
     }
 
     fn validate_definitions(&self, agents: &BTreeMap<String, AgentDefinition>) -> Result<()> {
         for node in &self.nodes {
-            let agent = agents.get(&node.call.agent)
-                .ok_or_else(|| invalid("workflow references an undiscovered agent; no node was launched"))?;
-            if let Some(schema) = node.call.output_schema.as_ref().or(agent.output_schema.as_ref()) {
-                compile_output_schema(schema)
-                    .map_err(|_| invalid("a workflow output schema is invalid; no node was launched"))?;
+            let agent = agents.get(&node.call.agent).ok_or_else(|| {
+                invalid("workflow references an undiscovered agent; no node was launched")
+            })?;
+            if let Some(schema) = node
+                .call
+                .output_schema
+                .as_ref()
+                .or(agent.output_schema.as_ref())
+            {
+                compile_output_schema(schema).map_err(|_| {
+                    invalid("a workflow output schema is invalid; no node was launched")
+                })?;
             }
         }
         for node in &self.nodes {
-            for from in node.inputs.iter().flat_map(|input| input.from.indices().iter().copied()).chain(node.decision.source())
+            for from in node
+                .inputs
+                .iter()
+                .flat_map(|input| input.from.indices().iter().copied())
+                .chain(node.decision.source())
                 .chain(node.fanout.as_ref().map(|expansion| expansion.from))
             {
                 let source = &self.nodes[from].call;
-                let schema = source.output_schema.as_ref()
-                    .or_else(|| agents.get(&source.agent).and_then(|agent| agent.output_schema.as_ref()));
+                let schema = source.output_schema.as_ref().or_else(|| {
+                    agents
+                        .get(&source.agent)
+                        .and_then(|agent| agent.output_schema.as_ref())
+                });
                 if schema.is_none() {
-                    return Err(invalid("every input, condition or forEach source requires an output schema on its call or agent definition"));
+                    return Err(invalid(
+                        "every input, condition or forEach source requires an output schema on its call or agent definition",
+                    ));
                 }
             }
         }
@@ -319,23 +436,46 @@ impl Plan {
     /// Preflight the entire graph before any job handle or child is published.
     /// Keep the caller's original deadline across owner lookup and discovery;
     /// an asynchronous launch must not buy a fresh budget or rediscover files.
-    pub(super) fn prepare(self, tool: &SubagentTool, deadline: Deadline) -> Result<PreparedWorkflow> {
+    pub(super) fn prepare(
+        self,
+        tool: &SubagentTool,
+        deadline: Deadline,
+    ) -> Result<PreparedWorkflow> {
         let parent_model = tool.capture_parent_model();
         let owner = AgentCx::for_current_or_request();
         check_authority(&owner)?;
-        deadline.check().map_err(|message| Error::tool("subagent", message))?;
+        deadline
+            .check()
+            .map_err(|message| Error::tool("subagent", message))?;
         let agents = tool.discover(self.scope)?;
         self.validate_definitions(&agents)?;
         let runner = ChildRunner::new(
-            tool.cwd.clone(), tool.global_dir.clone(), tool.child_binary.clone(),
-            tool.role_model_spec.clone(), crate::agent_hub::ChildKind::Subagent, deadline,
-        ).with_parent_model(parent_model);
+            tool.cwd.clone(),
+            tool.global_dir.clone(),
+            tool.child_binary.clone(),
+            tool.role_model_spec.clone(),
+            crate::agent_hub::ChildKind::Subagent,
+            deadline,
+        )
+        .with_parent_model(parent_model);
         check_authority(&owner)?;
-        deadline.check().map_err(|message| Error::tool("subagent", message))?;
-        Ok(PreparedWorkflow { plan: self, runner, agents, deadline, progress: None })
+        deadline
+            .check()
+            .map_err(|message| Error::tool("subagent", message))?;
+        Ok(PreparedWorkflow {
+            plan: self,
+            runner,
+            agents,
+            deadline,
+            progress: None,
+        })
     }
 
-    pub(super) async fn execute(self, tool: &SubagentTool, update: Option<UpdateCallback>) -> Result<ToolOutput> {
+    pub(super) async fn execute(
+        self,
+        tool: &SubagentTool,
+        update: Option<UpdateCallback>,
+    ) -> Result<ToolOutput> {
         let deadline = self.deadline(tool)?;
         self.prepare(tool, deadline)?.run(update).await
     }
@@ -350,7 +490,11 @@ impl Plan {
     ) -> Result<ToolOutput> {
         let owner = AgentCx::for_current_or_request();
         check_authority(&owner)?;
-        let mut records: Vec<_> = self.nodes.iter().map(|node| Record::pending(node, &self.nodes)).collect();
+        let mut records: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|node| Record::pending(node, &self.nodes))
+            .collect();
         let mut waves_run = 0;
         let mut stop_reason = None;
         for (wave, indices) in self.waves.iter().enumerate() {
@@ -369,9 +513,15 @@ impl Plan {
                 let admission = node.decision.evaluate(&node.needs, &records);
                 records[index].condition = admission.condition;
                 if let Some(reason) = admission.reason {
-                    let blocked = admission.sources.iter().map(|&source| self.nodes[source].id.clone()).collect();
+                    let blocked = admission
+                        .sources
+                        .iter()
+                        .map(|&source| self.nodes[source].id.clone())
+                        .collect();
                     records[index].skip(reason, blocked);
-                    if admission.not_selected { records[index].state = State::NotSelected; }
+                    if admission.not_selected {
+                        records[index].state = State::NotSelected;
+                    }
                     continue;
                 }
                 let prepared = match &node.fanout {
@@ -389,10 +539,13 @@ impl Plan {
                         }
                     }
                     Err(reason) => {
-                        let sources: BTreeSet<_> = node.inputs.iter()
+                        let sources: BTreeSet<_> = node
+                            .inputs
+                            .iter()
                             .flat_map(|input| input.from.indices().iter().copied())
                             .chain(node.fanout.as_ref().map(|expansion| expansion.from))
-                            .map(|from| self.nodes[from].id.clone()).collect();
+                            .map(|from| self.nodes[from].id.clone())
+                            .collect();
                         records[index].skip(reason, sources.into_iter().collect());
                     }
                 }
@@ -406,9 +559,14 @@ impl Plan {
             // This barrier is intentional. All peers use one captured baseline
             // per root; accepted writes settle in authored order before any
             // downstream node can observe them. No alternate spawn/apply path.
-            let results = runner.run_parallel(&agents, tasks, self.concurrency, update.clone()).await;
+            let results = runner
+                .run_parallel(&agents, tasks, self.concurrency, update.clone())
+                .await;
             if results.len() != admitted.len() {
-                return Err(Error::tool("subagent", "PI_WORKFLOW_INTERNAL: native runner returned an incomplete wave; effects may have occurred"));
+                return Err(Error::tool(
+                    "subagent",
+                    "PI_WORKFLOW_INTERNAL: native runner returned an incomplete wave; effects may have occurred",
+                ));
             }
             waves_run += 1;
             for ((index, item), mut result) in admitted.into_iter().zip(results) {
@@ -438,22 +596,34 @@ impl Plan {
 }
 
 fn parse_call(value: &Value) -> Result<SubagentTask> {
-    let fields = value.as_object().ok_or_else(|| invalid("node call must be a native task object"))?;
-    if fields.keys().any(|key| !matches!(key.as_str(),
-        "agent" | "task" | "cwd" | "isolation" | "isoApply" | "outputSchema" | "schemaMode"
-    )) {
+    let fields = value
+        .as_object()
+        .ok_or_else(|| invalid("node call must be a native task object"))?;
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "agent" | "task" | "cwd" | "isolation" | "isoApply" | "outputSchema" | "schemaMode"
+        )
+    }) {
         return Err(invalid("node call contains unsupported native task fields"));
     }
     for key in ["agent", "task"] {
-        if fields.get(key).and_then(Value::as_str)
-            .is_none_or(|text| text.trim().is_empty() || text.len() > MAX_TASK_BYTES || text.contains('\0'))
-        {
-            return Err(invalid("agent and task must be nonempty strings, at most 64 KiB, without NUL bytes"));
+        if fields.get(key).and_then(Value::as_str).is_none_or(|text| {
+            text.trim().is_empty() || text.len() > MAX_TASK_BYTES || text.contains('\0')
+        }) {
+            return Err(invalid(
+                "agent and task must be nonempty strings, at most 64 KiB, without NUL bytes",
+            ));
         }
     }
     workspace::validate_request(value)?;
-    if fields.get("outputSchema").is_some_and(|schema| !schema.is_object() && !schema.is_boolean()) {
-        return Err(invalid("outputSchema must be a JSON Schema object or boolean, not null"));
+    if fields
+        .get("outputSchema")
+        .is_some_and(|schema| !schema.is_object() && !schema.is_boolean())
+    {
+        return Err(invalid(
+            "outputSchema must be a JSON Schema object or boolean, not null",
+        ));
     }
     serde_json::from_value(value.clone()).map_err(|_| invalid("invalid native task arguments"))
 }
@@ -464,11 +634,20 @@ fn layers(nodes: &[Node]) -> Result<Vec<Vec<usize>>> {
     let mut count = 0;
     let mut waves = Vec::new();
     while count < nodes.len() {
-        let ready: Vec<_> = nodes.iter().enumerate()
-            .filter(|(index, node)| !seen[*index] && node.needs.iter().all(|&dependency| seen[dependency]))
-            .map(|(index, _)| index).collect();
-        if ready.is_empty() { return Err(invalid("workflow contains a dependency cycle")); }
-        for &index in &ready { seen[index] = true; }
+        let ready: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| {
+                !seen[*index] && node.needs.iter().all(|&dependency| seen[dependency])
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if ready.is_empty() {
+            return Err(invalid("workflow contains a dependency cycle"));
+        }
+        for &index in &ready {
+            seen[index] = true;
+        }
         count += ready.len();
         waves.push(ready);
     }
@@ -476,17 +655,28 @@ fn layers(nodes: &[Node]) -> Result<Vec<Vec<usize>>> {
 }
 
 fn check_authority(owner: &AgentCx) -> Result<()> {
-    owner.checkpoint().map_err(|_| Error::tool("subagent", "PI_WORKFLOW_CANCELLED: parent is cancelled"))?;
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("subagent", "PI_WORKFLOW_CANCELLED: parent is cancelled"))?;
     let capabilities = owner.capabilities();
     if !capabilities.io || !capabilities.spawn || !capabilities.time {
-        return Err(Error::tool("subagent", "PI_SUBAGENT_PERMISSION: workflow requires I/O, spawn and timer capabilities"));
+        return Err(Error::tool(
+            "subagent",
+            "PI_SUBAGENT_PERMISSION: workflow requires I/O, spawn and timer capabilities",
+        ));
     }
     Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum State { Pending, Accepted, Rejected, Skipped, NotSelected }
+enum State {
+    Pending,
+    Accepted,
+    Rejected,
+    Skipped,
+    NotSelected,
+}
 
 impl State {
     const fn label(self) -> &'static str {
@@ -521,9 +711,21 @@ struct Record {
 impl Record {
     fn pending(node: &Node, nodes: &[Node]) -> Self {
         Self {
-            id: node.id.clone(), needs: node.needs.iter().map(|&index| nodes[index].id.clone()).collect(),
-            state: State::Pending, wave: None, skip_reason: None, blocked_by: Vec::new(),
-            condition: None, hub_id: None, native_is_error: None, result: None, fanout: None,
+            id: node.id.clone(),
+            needs: node
+                .needs
+                .iter()
+                .map(|&index| nodes[index].id.clone())
+                .collect(),
+            state: State::Pending,
+            wave: None,
+            skip_reason: None,
+            blocked_by: Vec::new(),
+            condition: None,
+            hub_id: None,
+            native_is_error: None,
+            result: None,
+            fanout: None,
         }
     }
 
@@ -544,10 +746,17 @@ impl Record {
     }
 
     fn validated_data(&self) -> Option<&Value> {
-        if self.state != State::Accepted { return None; }
-        if let Some(run) = &self.fanout { return run.validated_data(); }
-        self.result.as_ref()
-            .filter(|result| native_state(result) == State::Accepted && result.schema_valid == Some(true))
+        if self.state != State::Accepted {
+            return None;
+        }
+        if let Some(run) = &self.fanout {
+            return run.validated_data();
+        }
+        self.result
+            .as_ref()
+            .filter(|result| {
+                native_state(result) == State::Accepted && result.schema_valid == Some(true)
+            })
             .and_then(|result| result.data.as_ref())
     }
 
@@ -555,27 +764,51 @@ impl Record {
         self.fanout = Some(fanout::Run::new(count));
         self.wave = Some(wave);
         // An empty validated list completes without inventing a native child.
-        self.state = if count == 0 { State::Accepted } else { State::Pending };
+        self.state = if count == 0 {
+            State::Accepted
+        } else {
+            State::Pending
+        };
     }
 
     fn settle_fanout(&mut self, result: SubagentResult, item: usize) -> Result<()> {
-        let run = self.fanout.as_mut().ok_or_else(|| invalid("missing fan-out run"))?;
+        let run = self
+            .fanout
+            .as_mut()
+            .ok_or_else(|| invalid("missing fan-out run"))?;
         self.state = run.settle(result, item)?;
         Ok(())
     }
 }
 
 fn native_state(result: &SubagentResult) -> State {
-    if !result.is_error && matches!(result.status, SubagentStatus::Completed)
+    if !result.is_error
+        && matches!(result.status, SubagentStatus::Completed)
         && result.schema_valid != Some(false)
-    { State::Accepted } else { State::Rejected }
+    {
+        State::Accepted
+    } else {
+        State::Rejected
+    }
 }
 
 fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> ToolOutput {
-    let accepted = records.iter().filter(|record| record.state == State::Accepted).count();
-    let rejected = records.iter().filter(|record| record.state == State::Rejected).count();
-    let skipped = records.iter().filter(|record| record.state == State::Skipped).count();
-    let not_selected = records.iter().filter(|record| record.state == State::NotSelected).count();
+    let accepted = records
+        .iter()
+        .filter(|record| record.state == State::Accepted)
+        .count();
+    let rejected = records
+        .iter()
+        .filter(|record| record.state == State::Rejected)
+        .count();
+    let skipped = records
+        .iter()
+        .filter(|record| record.state == State::Skipped)
+        .count();
+    let not_selected = records
+        .iter()
+        .filter(|record| record.state == State::NotSelected)
+        .count();
     let mut content = format!(
         "Subagent workflow: {accepted} accepted, {rejected} rejected, {skipped} skipped, {not_selected} not selected. Completed effects are not rolled back; nodes were not automatically replayed."
     );
@@ -584,10 +817,17 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
         // Providers transmit tool text, not arbitrary details. The parent
         // needs the acceptance verdict and real hub handle to inspect/revive
         // a child without guessing identity from its untrusted prose.
-        content.push_str(&format!("State: {}; wave: {}; hub: {}\n",
+        content.push_str(&format!(
+            "State: {}; wave: {}; hub: {}\n",
             record.state.label(),
-            record.wave.map_or_else(|| "not started".into(), |wave| wave.to_string()),
-            record.hub_id.as_ref().map_or_else(|| "none".into(), |id| json!(id).to_string())));
+            record
+                .wave
+                .map_or_else(|| "not started".into(), |wave| wave.to_string()),
+            record
+                .hub_id
+                .as_ref()
+                .map_or_else(|| "none".into(), |id| json!(id).to_string())
+        ));
         if let Some(condition) = record.condition {
             content.push_str(&format!("Condition: {condition}.\n"));
         }
@@ -596,8 +836,11 @@ fn report(records: Vec<Record>, waves: usize, stop: Option<&'static str>) -> Too
         } else if let Some(run) = &record.fanout {
             run.render(&mut content);
         } else {
-            content.push_str(&format!("Not run: {}. Blocked by: {}.",
-                record.skip_reason.unwrap_or("not_scheduled"), record.blocked_by.join(", ")));
+            content.push_str(&format!(
+                "Not run: {}. Blocked by: {}.",
+                record.skip_reason.unwrap_or("not_scheduled"),
+                record.blocked_by.join(", ")
+            ));
         }
     }
     ToolOutput {

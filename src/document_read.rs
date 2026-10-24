@@ -77,9 +77,9 @@ pub fn recognize(path: &str, content_type: &str) -> Option<DocumentKind> {
     ) {
         return Some(DocumentKind::Pptx);
     }
-    if media_type.eq_ignore_ascii_case(
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ) {
+    if media_type
+        .eq_ignore_ascii_case("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    {
         return Some(DocumentKind::Xlsx);
     }
     let path = path.split(['?', '#']).next().unwrap_or(path);
@@ -124,7 +124,8 @@ pub fn convert(bytes: &[u8], kind: DocumentKind) -> Result<String> {
             main_part = Some(relationship.internal_target("")?);
         }
     }
-    let main_part = main_part.ok_or_else(|| document_error("missing main document relationship"))?;
+    let main_part =
+        main_part.ok_or_else(|| document_error("missing main document relationship"))?;
     let main_xml = budget.read(&mut archive, &main_part)?;
     let mut output = TextOutput::default();
     match kind {
@@ -139,7 +140,9 @@ pub fn convert(bytes: &[u8], kind: DocumentKind) -> Result<String> {
                     .get(id)
                     .ok_or_else(|| document_error("slide relationship is missing"))?;
                 if !is_relationship(&relationship.kind, "slide") {
-                    return Err(document_error("slide ID refers to a non-slide relationship"));
+                    return Err(document_error(
+                        "slide ID refers to a non-slide relationship",
+                    ));
                 }
                 let target = relationship.internal_target(&main_part)?;
                 if !visited.insert(target.clone()) {
@@ -152,7 +155,13 @@ pub fn convert(bytes: &[u8], kind: DocumentKind) -> Result<String> {
             }
         }
         DocumentKind::Xlsx => {
-            xlsx::render(&main_xml, &main_part, &mut archive, &mut budget, &mut output)?;
+            xlsx::render(
+                &main_xml,
+                &main_part,
+                &mut archive,
+                &mut budget,
+                &mut output,
+            )?;
         }
     }
     while output.text.ends_with('\n') {
@@ -465,10 +474,7 @@ fn resolve_named_entity(name: &str, html_entities: bool) -> Option<&'static str>
     }
 }
 
-fn resolve_reference(
-    reference: &BytesRef<'_>,
-    html_entities: bool,
-) -> Result<Cow<'static, str>> {
+fn resolve_reference(reference: &BytesRef<'_>, html_entities: bool) -> Result<Cow<'static, str>> {
     if let Some(character) = reference.resolve_char_ref().map_err(document_error)? {
         if !xml_character(character) {
             return Err(document_error("invalid XML character reference"));
@@ -646,7 +652,9 @@ struct Relationship {
 impl Relationship {
     fn internal_target(&self, source: &str) -> Result<String> {
         if self.external {
-            return Err(document_error("document content must use internal relationships"));
+            return Err(document_error(
+                "document content must use internal relationships",
+            ));
         }
         resolve_target(source, &self.target)
     }
@@ -728,7 +736,9 @@ fn resolve_target(source: &str, target: &str) -> Result<String> {
             let high = bytes.next().and_then(|c| char::from(c).to_digit(16));
             let low = bytes.next().and_then(|c| char::from(c).to_digit(16));
             let (Some(high), Some(low)) = (high, low) else {
-                return Err(document_error("invalid percent encoding in document target"));
+                return Err(document_error(
+                    "invalid percent encoding in document target",
+                ));
             };
             let byte = u8::try_from(high * 16 + low).map_err(document_error)?;
             if matches!(byte, b'/' | b'\\' | b':' | b'?' | b'#' | b'%') || byte.is_ascii_control() {
@@ -783,7 +793,9 @@ fn presentation_order(bytes: &[u8]) -> Result<Vec<String>> {
             }
             XmlEvent::Start(Tag::SlideId, attributes) => {
                 if parents != [Tag::Presentation, Tag::SlideList] || slides.len() >= MAX_SLIDES {
-                    return Err(document_error("invalid slide list or more than 1024 slides"));
+                    return Err(document_error(
+                        "invalid slide list or more than 1024 slides",
+                    ));
                 }
                 let id = attributes
                     .id
@@ -817,7 +829,9 @@ struct TextOutput {
 impl TextOutput {
     fn append(&mut self, text: &str) -> Result<()> {
         if self.text.len().saturating_add(text.len()) > MAX_OUTPUT_BYTES {
-            return Err(document_error("extracted text exceeds the 8 MiB output limit"));
+            return Err(document_error(
+                "extracted text exceeds the 8 MiB output limit",
+            ));
         }
         self.text.push_str(text);
         Ok(())
@@ -938,7 +952,9 @@ mod tests {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(method);
         for (name, contents) in entries {
-            writer.start_file(*name, options).expect("start fixture member");
+            writer
+                .start_file(*name, options)
+                .expect("start fixture member");
             writer.write_all(contents).expect("write fixture member");
         }
         writer.finish().expect("finish fixture ZIP").into_inner()
@@ -1090,8 +1106,7 @@ mod tests {
         let rels = format!(
             "<Relationships xmlns='{RELATIONSHIPS_NS}'><Relationship Id='main' Type='{STRICT_OFFICE_REL_NS}/officeDocument' Target='/parts/main%20document.xml'/></Relationships>"
         );
-        let xml =
-            word_xml("<w:p><w:r><w:t><![CDATA[Literal <text> & symbols]]></w:t></w:r></w:p>");
+        let xml = word_xml("<w:p><w:r><w:t><![CDATA[Literal <text> & symbols]]></w:t></w:r></w:p>");
         let archive = zip_fixture(
             &[
                 ("_rels/.rels", rels.as_bytes()),
@@ -1113,17 +1128,15 @@ mod tests {
         let rels = slide_relationships(&format!(
             "<Relationship Id='first' Type='{OFFICE_REL_NS}/slide' Target='slides/slide1.xml'/><Relationship Id='second' Type='{OFFICE_REL_NS}/slide' Target='slides/slide2.xml'/><Relationship Id='third' Type='{OFFICE_REL_NS}/slide' Target='/ppt/slides/slide10.xml'/>"
         ));
-        let slide1 = slide_xml(
-            "<p:sp><p:txBody><a:p><a:r><a:t>One</a:t></a:r></a:p></p:txBody></p:sp>",
-        );
+        let slide1 =
+            slide_xml("<p:sp><p:txBody><a:p><a:r><a:t>One</a:t></a:r></a:p></p:txBody></p:sp>");
         let slide2 = slide_xml(
             "<p:sp><p:txBody><a:p><a:r><a:t>Two</a:t></a:r><a:br/><a:r><a:t>next line</a:t></a:r></a:p></p:txBody></p:sp>",
         );
         let slide10 = slide_xml(
             "<p:sp><p:txBody><a:p><a:r><a:t>Ten &amp; 🎼</a:t></a:r></a:p><a:p><a:r><a:t>Paragraph two</a:t></a:r></a:p></p:txBody></p:sp><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>A</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>B</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl>",
         );
-        let orphan =
-            slide_xml("<a:p><a:r><a:t>Orphan slide must not appear</a:t></a:r></a:p>");
+        let orphan = slide_xml("<a:p><a:r><a:t>Orphan slide must not appear</a:t></a:r></a:p>");
         let archive = pptx_fixture(
             &presentation,
             &rels,
@@ -1142,9 +1155,8 @@ mod tests {
 
     #[test]
     fn malformed_xml_entities_and_encoding_are_rejected_without_partial_text() {
-        let valid_prefix = format!(
-            "<w:document xmlns:w='{WORD_NS}'><w:body><w:p><w:r><w:t>valid text"
-        );
+        let valid_prefix =
+            format!("<w:document xmlns:w='{WORD_NS}'><w:body><w:p><w:r><w:t>valid text");
         let suffix = "</w:t></w:r></w:p></w:body></w:document>";
         for xml in [
             valid_prefix.clone(),
@@ -1160,9 +1172,7 @@ mod tests {
             format!(
                 "<!DOCTYPE w:document [<!ENTITY custom SYSTEM 'file:///etc/passwd'>]>{valid_prefix}&custom;{suffix}"
             ),
-            format!(
-                "<?xml version='1.0' encoding='ISO-8859-1'?>{valid_prefix}{suffix}"
-            ),
+            format!("<?xml version='1.0' encoding='ISO-8859-1'?>{valid_prefix}{suffix}"),
             format!("<?xml version='1.0' version='1.1'?>{valid_prefix}{suffix}"),
             format!("<?XML version='1.0'?>{valid_prefix}{suffix}"),
             word_xml("<w:p><w:r><w:t bad:attribute='x'>text</w:t></w:r></w:p>"),
@@ -1177,13 +1187,7 @@ mod tests {
                 "accepted hostile XML: {xml}"
             );
         }
-        assert!(
-            convert(
-                &docx_with_xml(&[0xFF, 0xFE, b'<']),
-                DocumentKind::Docx
-            )
-            .is_err()
-        );
+        assert!(convert(&docx_with_xml(&[0xFF, 0xFE, b'<']), DocumentKind::Docx).is_err());
         assert!(convert(&docx_with_xml(&[0xFF]), DocumentKind::Docx).is_err());
     }
 
@@ -1304,11 +1308,8 @@ mod tests {
                 .to_string()
                 .contains("8 MiB output")
         );
-        let too_large_part =
-            vec![b'x'; usize::try_from(MAX_PART_BYTES).expect("part limit") + 1];
-        assert!(
-            convert(&docx_with_xml(&too_large_part), DocumentKind::Docx).is_err()
-        );
+        let too_large_part = vec![b'x'; usize::try_from(MAX_PART_BYTES).expect("part limit") + 1];
+        assert!(convert(&docx_with_xml(&too_large_part), DocumentKind::Docx).is_err());
     }
 
     #[test]
@@ -1328,8 +1329,7 @@ mod tests {
         assert!(convert(&truncated, DocumentKind::Docx).is_err());
         let empty = word_xml("");
         assert_eq!(
-            convert(&docx_with_xml(empty.as_bytes()), DocumentKind::Docx)
-                .expect("empty document"),
+            convert(&docx_with_xml(empty.as_bytes()), DocumentKind::Docx).expect("empty document"),
             ""
         );
     }
@@ -1356,12 +1356,11 @@ mod xml_name_limit_tests {
             format!("<{oversized}/>"),
             format!(r#"<w:p {oversized}="value"/>"#),
         ] {
-            let xml = format!(
-                r#"<w:document xmlns:w="{WORD_NS}"><w:body>{body}</w:body></w:document>"#
-            );
+            let xml =
+                format!(r#"<w:document xmlns:w="{WORD_NS}"><w:body>{body}</w:body></w:document>"#);
             let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (name, contents) in [
                 ("_rels/.rels", relationships.as_bytes()),
                 ("word/document.xml", xml.as_bytes()),

@@ -286,9 +286,10 @@ impl Actor {
         let id = format!("warm-{}", self.request_sequence);
         let mut request = json!({"id": id, "type": command});
         if let Some(message) = message {
-            let message = self.output_contract.as_ref().map_or_else(
-                || message.to_owned(), |contract| contract.prompt(message),
-            );
+            let message = self
+                .output_contract
+                .as_ref()
+                .map_or_else(|| message.to_owned(), |contract| contract.prompt(message));
             request["message"] = json!(format!("Task: {message}"));
         }
         let mut bytes =
@@ -972,24 +973,36 @@ exec sleep 30
         let response = json!({"type":"response", "id":"ready", "command":"get_state", "success":true,
             "data":{"isStreaming":false,"isCompacting":false,"contextTokens":0,"contextWindow":128000}});
         let mut reply = IdleReply::new("ready".to_string());
-        reply.ingest(&response.to_string(), true).expect("valid context telemetry");
+        reply
+            .ingest(&response.to_string(), true)
+            .expect("valid context telemetry");
         assert_eq!(reply.context_tokens, Some(0));
         assert_eq!(reply.context_window, Some(128_000));
         for field in ["contextTokens", "contextWindow"] {
             for value in [json!(-1), json!(1.5), json!("100"), json!(true), json!({})] {
                 let mut invalid = response.clone();
                 invalid["data"][field] = value;
-                assert!(IdleReply::new("ready".to_string()).ingest(&invalid.to_string(), true).is_err());
+                assert!(
+                    IdleReply::new("ready".to_string())
+                        .ingest(&invalid.to_string(), true)
+                        .is_err()
+                );
             }
         }
         let mut unknown = response.clone();
         unknown["data"]["contextTokens"] = Value::Null;
         unknown["data"]["contextWindow"] = Value::Null;
         let mut reply = IdleReply::new("ready".to_string());
-        reply.ingest(&unknown.to_string(), true).expect("unknown context telemetry");
+        reply
+            .ingest(&unknown.to_string(), true)
+            .expect("unknown context telemetry");
         assert_eq!(reply.context_tokens, None);
         assert_eq!(reply.context_window, None);
         unknown["data"]["contextWindow"] = json!(0);
-        assert!(IdleReply::new("ready".to_string()).ingest(&unknown.to_string(), true).is_err());
+        assert!(
+            IdleReply::new("ready".to_string())
+                .ingest(&unknown.to_string(), true)
+                .is_err()
+        );
     }
 }

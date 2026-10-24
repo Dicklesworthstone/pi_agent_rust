@@ -64,8 +64,12 @@ struct Peer {
 }
 
 fn request(stream: &TcpStream) -> Value {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut length = None;
     let mut total = 0;
@@ -74,7 +78,9 @@ fn request(stream: &TcpStream) -> Value {
         assert!(reader.read_line(&mut line).unwrap() > 0);
         total += line.len();
         assert!(total <= 64 * 1024);
-        if line == "\r\n" { break; }
+        if line == "\r\n" {
+            break;
+        }
         if let Some((key, value)) = line.split_once(':')
             && key.eq_ignore_ascii_case("content-length")
         {
@@ -101,7 +107,9 @@ impl Peer {
             for failure in failures {
                 let until = Instant::now() + Duration::from_secs(15);
                 let mut stream = loop {
-                    if stopping.load(Ordering::SeqCst) { return; }
+                    if stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
                     assert!(Instant::now() < until, "goal wire request deadline");
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
@@ -114,27 +122,49 @@ impl Peer {
                 lock(&captured).push(request(&stream));
                 let (status, content_type, body) = if failure {
                     (
-                        "400 Bad Request", "application/json",
-                        json!({"error":{"message":"goal fixture rejected the request"}}).to_string(),
+                        "400 Bad Request",
+                        "application/json",
+                        json!({"error":{"message":"goal fixture rejected the request"}})
+                            .to_string(),
                     )
                 } else {
                     let event = |delta: Value, reason: Value, usage: Value| {
-                        format!("data: {}\n\n", json!({
-                            "id":"goal-response", "object":"chat.completion.chunk",
-                            "created":0, "model":"goal-fixture",
-                            "choices":[{"index":0,"delta":delta,"finish_reason":reason}],
-                            "usage":usage
-                        }))
+                        format!(
+                            "data: {}\n\n",
+                            json!({
+                                "id":"goal-response", "object":"chat.completion.chunk",
+                                "created":0, "model":"goal-fixture",
+                                "choices":[{"index":0,"delta":delta,"finish_reason":reason}],
+                                "usage":usage
+                            })
+                        )
                     };
-                    let start = event(json!({"role":"assistant","content":"Goal complete!"}), Value::Null, Value::Null);
-                    let end = event(json!({}), json!("stop"), json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}));
-                    ("200 OK", "text/event-stream", format!("{start}{end}data: [DONE]\n\n"))
+                    let start = event(
+                        json!({"role":"assistant","content":"Goal complete!"}),
+                        Value::Null,
+                        Value::Null,
+                    );
+                    let end = event(
+                        json!({}),
+                        json!("stop"),
+                        json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}),
+                    );
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        format!("{start}{end}data: [DONE]\n\n"),
+                    )
                 };
                 write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 stream.flush().unwrap();
             }
         });
-        Self { url, requests, stop, worker: Some(worker) }
+        Self {
+            url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
     }
 }
 
@@ -143,17 +173,23 @@ impl Drop for Peer {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {
             let result = worker.join();
-            if !std::thread::panicking() { result.expect("goal wire peer"); }
+            if !std::thread::panicking() {
+                result.expect("goal wire peer");
+            }
         }
     }
 }
 
 fn complete() -> GoalDecision {
-    GoalDecision::Complete { evidence: "host checked the requested deliverables".into() }
+    GoalDecision::Complete {
+        evidence: "host checked the requested deliverables".into(),
+    }
 }
 
 fn continue_work() -> GoalDecision {
-    GoalDecision::Continue { instruction: "Implement and verify the second step".into() }
+    GoalDecision::Continue {
+        instruction: "Implement and verify the second step".into(),
+    }
 }
 
 #[test]
@@ -164,16 +200,34 @@ fn two_native_prompts_preserve_history_and_require_host_completion() {
     let mut session = handle(&peer.url, temp.path());
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "Implement both steps", GoalBudget::default()).await.unwrap();
+        let created = session
+            .create_goal(&owner, "Implement both steps", GoalBudget::default())
+            .await
+            .unwrap();
         let mut driver = session.into_goal_session();
         let mut verdicts = 0;
-        let run = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| {}, |_, _| {
-            verdicts += 1;
-            if verdicts == 1 { continue_work() } else { complete() }
-        }).unwrap();
+        let run = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| {},
+                |_, _| {
+                    verdicts += 1;
+                    if verdicts == 1 {
+                        continue_work()
+                    } else {
+                        complete()
+                    }
+                },
+            )
+            .unwrap();
         let control = run.control();
         let report = run.await;
-        assert_eq!(verdicts, 2, "assistant prose alone must never complete the objective");
+        assert_eq!(
+            verdicts, 2,
+            "assistant prose alone must never complete the objective"
+        );
         assert_eq!(report.stop, GoalRunStop::Complete);
         assert_eq!(report.goal.status(), GoalStatus::Complete);
         assert_eq!(report.goal.prompts_started(), 2);
@@ -189,7 +243,14 @@ fn two_native_prompts_preserve_history_and_require_host_completion() {
     });
     let requests = lock(&peer.requests);
     assert_eq!(requests.len(), 2);
-    let users = |request: &Value| request["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").count();
+    let users = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .count()
+    };
     assert_eq!(users(&requests[0]), 1);
     assert_eq!(users(&requests[1]), 2);
     assert!(requests[1].to_string().contains("second step"));
@@ -198,8 +259,14 @@ fn two_native_prompts_preserve_history_and_require_host_completion() {
 #[test]
 fn prompt_and_token_limits_stop_without_fabricating_completion() {
     for budget in [
-        GoalBudget { max_prompts: 1, token_budget: 1000 },
-        GoalBudget { max_prompts: 4, token_budget: 15 },
+        GoalBudget {
+            max_prompts: 1,
+            token_budget: 1000,
+        },
+        GoalBudget {
+            max_prompts: 4,
+            token_budget: 15,
+        },
     ] {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -207,14 +274,32 @@ fn prompt_and_token_limits_stop_without_fabricating_completion() {
         let mut session = handle(&peer.url, temp.path());
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
-            let created = session.create_goal(&owner, "more work remains", budget).await.unwrap();
+            let created = session
+                .create_goal(&owner, "more work remains", budget)
+                .await
+                .unwrap();
             let mut driver = session.into_goal_session();
-            let report = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| {}, |_, _| continue_work()).unwrap().await;
+            let report = driver
+                .run_goal(
+                    &owner,
+                    &created.goal,
+                    Duration::from_secs(30),
+                    |_, _| {},
+                    |_, _| continue_work(),
+                )
+                .unwrap()
+                .await;
             assert_eq!(report.stop, GoalRunStop::BudgetLimited);
             assert_eq!(report.goal.status(), GoalStatus::BudgetLimited);
             assert_eq!(report.goal.prompts_started(), 1);
             assert_eq!(report.goal.tokens_spent(), 15);
-            assert!(driver.session_mut().resume_goal(&owner, &report.goal).await.is_err());
+            assert!(
+                driver
+                    .session_mut()
+                    .resume_goal(&owner, &report.goal)
+                    .await
+                    .is_err()
+            );
         });
         assert_eq!(lock(&peer.requests).len(), 1);
     }
@@ -228,9 +313,21 @@ fn native_failure_pauses_without_a_new_driver_retry_or_completion_verdict() {
     let mut session = handle(&peer.url, temp.path());
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "do work", GoalBudget::default()).await.unwrap();
+        let created = session
+            .create_goal(&owner, "do work", GoalBudget::default())
+            .await
+            .unwrap();
         let mut driver = session.into_goal_session();
-        let report = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| {}, |_, _| panic!("failure cannot authorize verification")).unwrap().await;
+        let report = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| {},
+                |_, _| panic!("failure cannot authorize verification"),
+            )
+            .unwrap()
+            .await;
         assert_eq!(report.stop, GoalRunStop::NativeFailure);
         assert_eq!(report.goal.status(), GoalStatus::Paused);
         assert_eq!(report.goal.prompts_started(), 1);
@@ -252,21 +349,44 @@ fn callback_pause_wins_late_complete_and_old_control_cannot_stop_resumed_run() {
     let mut session = handle(&peer.url, temp.path());
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "review each step", GoalBudget::default()).await.unwrap();
+        let created = session
+            .create_goal(&owner, "review each step", GoalBudget::default())
+            .await
+            .unwrap();
         let mut driver = session.into_goal_session();
         let slot = Arc::new(Mutex::new(None::<GoalControl>));
         let callback_slot = Arc::clone(&slot);
-        let run = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| {}, move |_, _| {
-            assert!(lock(&callback_slot).as_ref().unwrap().pause());
-            complete()
-        }).unwrap();
+        let run = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| {},
+                move |_, _| {
+                    assert!(lock(&callback_slot).as_ref().unwrap().pause());
+                    complete()
+                },
+            )
+            .unwrap();
         let old = run.control();
         *lock(&slot) = Some(old.clone());
         let paused = run.await;
         assert_eq!(paused.stop, GoalRunStop::Paused);
         assert_eq!(paused.goal.status(), GoalStatus::Paused);
-        let resumed = driver.session_mut().resume_goal(&owner, &paused.goal).await.unwrap();
-        let run = driver.run_goal(&owner, &resumed.goal, Duration::from_secs(30), |_, _| {}, |_, _| complete()).unwrap();
+        let resumed = driver
+            .session_mut()
+            .resume_goal(&owner, &paused.goal)
+            .await
+            .unwrap();
+        let run = driver
+            .run_goal(
+                &owner,
+                &resumed.goal,
+                Duration::from_secs(30),
+                |_, _| {},
+                |_, _| complete(),
+            )
+            .unwrap();
         assert!(!old.pause());
         assert!(old.follow_up("stale").is_err());
         let report = run.await;
@@ -284,14 +404,33 @@ fn unused_drop_and_prepaused_run_dispatch_nothing_and_leave_no_intent() {
     let mut session = handle("http://127.0.0.1:1/v1", temp.path());
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "unused", GoalBudget::default()).await.unwrap();
+        let created = session
+            .create_goal(&owner, "unused", GoalBudget::default())
+            .await
+            .unwrap();
         let mut driver = session.into_goal_session();
-        let run = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| panic!("unused"), |_, _| panic!("unused")).unwrap();
+        let run = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| panic!("unused"),
+                |_, _| panic!("unused"),
+            )
+            .unwrap();
         let control = run.control();
         drop(run);
         assert!(control.is_finished());
         assert!(!control.pause());
-        let run = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| panic!("paused"), |_, _| panic!("paused")).unwrap();
+        let run = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| panic!("paused"),
+                |_, _| panic!("paused"),
+            )
+            .unwrap();
         assert!(run.control().pause());
         let report = run.await;
         assert_eq!(report.stop, GoalRunStop::Paused);
@@ -329,12 +468,33 @@ fn invalid_host_verdict_pauses_instead_of_looping_or_completing() {
     let mut session = handle(&peer.url, temp.path());
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "test invalid verdict", GoalBudget::default()).await.unwrap();
+        let created = session
+            .create_goal(&owner, "test invalid verdict", GoalBudget::default())
+            .await
+            .unwrap();
         let mut driver = session.into_goal_session();
-        let report = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| {}, |_, _| GoalDecision::Complete { evidence: " ".into() }).unwrap().await;
+        let report = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| {},
+                |_, _| GoalDecision::Complete {
+                    evidence: " ".into(),
+                },
+            )
+            .unwrap()
+            .await;
         assert_eq!(report.stop, GoalRunStop::Failed);
         assert_eq!(report.goal.status(), GoalStatus::Paused);
-        assert!(report.error.as_ref().unwrap().to_string().contains("GOAL_TEXT"));
+        assert!(
+            report
+                .error
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("GOAL_TEXT")
+        );
         assert!(report.completion.as_ref().unwrap().is_ok());
     });
     assert_eq!(lock(&peer.requests).len(), 1);
@@ -347,17 +507,37 @@ fn stale_goal_snapshot_is_refused_before_native_execution() {
     let mut session = handle("http://127.0.0.1:1/v1", temp.path());
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "stale", GoalBudget::default()).await.unwrap();
+        let created = session
+            .create_goal(&owner, "stale", GoalBudget::default())
+            .await
+            .unwrap();
         let _ = session
             .pause_goal(&owner, &created.goal, "host paused")
             .await
             .unwrap();
         let mut driver = session.into_goal_session();
-        let report = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| panic!("stale dispatch"), |_, _| panic!("stale verdict")).unwrap().await;
+        let report = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| panic!("stale dispatch"),
+                |_, _| panic!("stale verdict"),
+            )
+            .unwrap()
+            .await;
         assert_eq!(report.stop, GoalRunStop::Failed);
         assert!(report.error.unwrap().to_string().contains("GOAL_STALE"));
         assert!(report.completion.is_none());
-        assert_eq!(driver.session_mut().current_goal().unwrap().unwrap().prompts_started(), 0);
+        assert_eq!(
+            driver
+                .session_mut()
+                .current_goal()
+                .unwrap()
+                .unwrap()
+                .prompts_started(),
+            0
+        );
     });
 }
 
@@ -375,13 +555,20 @@ fn intent_is_visible_before_dispatch_and_cannot_be_replayed_without_resume() {
 
 #[test]
 fn settlement_never_turns_a_budget_boundary_into_automatic_completion() {
-    let budget = GoalBudget { max_prompts: 1, token_budget: 10 };
+    let budget = GoalBudget {
+        max_prompts: 1,
+        token_budget: 10,
+    };
     let state = prepare_intent(Record::new("work", budget).unwrap()).unwrap();
     let limited = settle_record(state.clone(), continue_work()).unwrap();
     assert_eq!(limited.effective_status(), GoalStatus::BudgetLimited);
     assert!(!limited.in_flight);
     let complete = settle_record(state, complete()).unwrap();
-    assert_eq!(complete.effective_status(), GoalStatus::Complete, "explicit host evidence may complete at the limit");
+    assert_eq!(
+        complete.effective_status(),
+        GoalStatus::Complete,
+        "explicit host evidence may complete at the limit"
+    );
 }
 
 #[test]
@@ -391,7 +578,14 @@ fn only_a_clean_final_assistant_answer_reaches_host_verification() {
         ..AssistantMessage::default()
     };
     assert!(successful(&message));
-    for reason in [StopReason::Length, StopReason::ToolUse, StopReason::Error, StopReason::Aborted, StopReason::Refusal, StopReason::PauseTurn] {
+    for reason in [
+        StopReason::Length,
+        StopReason::ToolUse,
+        StopReason::Error,
+        StopReason::Aborted,
+        StopReason::Refusal,
+        StopReason::PauseTurn,
+    ] {
         let mut bad = message.clone();
         bad.stop_reason = reason;
         assert!(!successful(&bad));
@@ -423,12 +617,26 @@ fn pause_at_the_commit_boundary_cannot_be_overwritten_by_a_prepared_verdict() {
     let mut session = handle("http://127.0.0.1:1/v1", temp.path());
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "pause race", GoalBudget::default()).await.unwrap();
-        let intent = start_attempt(&mut session, &owner, &created.goal).await.unwrap();
+        let created = session
+            .create_goal(&owner, "pause race", GoalBudget::default())
+            .await
+            .unwrap();
+        let intent = start_attempt(&mut session, &owner, &created.goal)
+            .await
+            .unwrap();
         let control = GoalControl::new();
         let deadline = TurnDeadline::after(&owner, Duration::from_secs(30)).unwrap();
         assert!(control.pause());
-        let (settled, late_stop) = settle_attempt(&mut session, &owner, &intent.goal, complete(), &deadline, &control).await.unwrap();
+        let (settled, late_stop) = settle_attempt(
+            &mut session,
+            &owner,
+            &intent.goal,
+            complete(),
+            &deadline,
+            &control,
+        )
+        .await
+        .unwrap();
         assert_eq!(late_stop, Some(GoalRunStop::Paused));
         assert_eq!(settled.goal.status(), GoalStatus::Paused);
         assert!(!settled.goal.interrupted());
@@ -446,10 +654,25 @@ fn unconfirmed_intent_save_stops_before_native_work() {
     let mut session = handle_with_store("http://127.0.0.1:1/v1", temp.path(), store, true);
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "save must succeed first", GoalBudget::default()).await.unwrap();
-        assert!(matches!(created.persistence, GoalPersistence::Unconfirmed { .. }));
+        let created = session
+            .create_goal(&owner, "save must succeed first", GoalBudget::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            created.persistence,
+            GoalPersistence::Unconfirmed { .. }
+        ));
         let mut driver = session.into_goal_session();
-        let report = driver.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| panic!("unsaved dispatch"), |_, _| panic!("unsaved verdict")).unwrap().await;
+        let report = driver
+            .run_goal(
+                &owner,
+                &created.goal,
+                Duration::from_secs(30),
+                |_, _| panic!("unsaved dispatch"),
+                |_, _| panic!("unsaved verdict"),
+            )
+            .unwrap()
+            .await;
         assert_eq!(report.stop, GoalRunStop::PersistenceUnconfirmed);
         assert!(report.completion.is_none());
         assert!(report.goal.interrupted());
@@ -469,9 +692,14 @@ fn native_session_reopen_preserves_interrupted_goal_and_requires_fresh_resume() 
     let mut session = handle_with_store("http://127.0.0.1:1/v1", temp.path(), store, true);
     runtime.block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let created = session.create_goal(&owner, "durable objective", GoalBudget::default()).await.unwrap();
+        let created = session
+            .create_goal(&owner, "durable objective", GoalBudget::default())
+            .await
+            .unwrap();
         assert_eq!(created.persistence, GoalPersistence::Saved);
-        let intent = start_attempt(&mut session, &owner, &created.goal).await.unwrap();
+        let intent = start_attempt(&mut session, &owner, &created.goal)
+            .await
+            .unwrap();
         assert_eq!(intent.persistence, GoalPersistence::Saved);
         let loaded = Session::open(path.to_str().unwrap()).await.unwrap();
         let mut reopened = handle_with_store("http://127.0.0.1:1/v1", temp.path(), loaded, true);

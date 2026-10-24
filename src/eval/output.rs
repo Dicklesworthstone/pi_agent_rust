@@ -32,16 +32,26 @@ struct BoundedText {
 
 impl BoundedText {
     fn new(limit: usize) -> Self {
-        Self { head: String::new(), tail: VecDeque::new(), head_closed: false, total: 0, limit }
+        Self {
+            head: String::new(),
+            tail: VecDeque::new(),
+            head_closed: false,
+            total: 0,
+            limit,
+        }
     }
 
     fn push(&mut self, text: &str) {
-        self.total = self.total.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        self.total = self
+            .total
+            .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
         let mut remaining = text;
         if !self.head_closed {
             let available = (self.limit / 2).saturating_sub(self.head.len());
             let mut end = text.len().min(available);
-            while !text.is_char_boundary(end) { end -= 1; }
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
             self.head.push_str(&text[..end]);
             remaining = &text[end..];
             // Freeze even when a multi-byte scalar leaves a few spare bytes;
@@ -51,17 +61,22 @@ impl BoundedText {
         let tail_limit = self.limit.saturating_sub(self.head.len());
         for byte in remaining.bytes() {
             self.tail.push_back(byte);
-            if self.tail.len() > tail_limit { let _ = self.tail.pop_front(); }
+            if self.tail.len() > tail_limit {
+                let _ = self.tail.pop_front();
+            }
         }
         while self.tail.front().is_some_and(|byte| byte & 0xc0 == 0x80) {
             let _ = self.tail.pop_front();
         }
     }
 
-    fn retained(&self) -> usize { self.head.len() + self.tail.len() }
+    fn retained(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
 
     fn omitted(&self) -> u64 {
-        self.total.saturating_sub(u64::try_from(self.retained()).unwrap_or(u64::MAX))
+        self.total
+            .saturating_sub(u64::try_from(self.retained()).unwrap_or(u64::MAX))
     }
 
     fn render(&self) -> String {
@@ -70,21 +85,33 @@ impl BoundedText {
         let mut text = self.head.clone();
         let omitted = self.omitted();
         if omitted > 0 {
-            text.push_str(&format!("\n[EVAL_OUTPUT_TRUNCATED: {omitted} UTF-8 bytes omitted]\n"));
+            text.push_str(&format!(
+                "\n[EVAL_OUTPUT_TRUNCATED: {omitted} UTF-8 bytes omitted]\n"
+            ));
         }
         text.push_str(&tail);
         text
     }
 
     fn preview(&self) -> (String, u64) {
-        let bytes: Vec<u8> = self.head.bytes().chain(self.tail.iter().copied())
+        let bytes: Vec<u8> = self
+            .head
+            .bytes()
+            .chain(self.tail.iter().copied())
             .skip(self.retained().saturating_sub(PREVIEW_BYTES))
             .skip_while(|byte| byte & 0xc0 == 0x80)
             .collect();
-        let omitted = self.total.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let omitted = self
+            .total
+            .saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let text = String::from_utf8(bytes).expect("preview starts at a UTF-8 scalar boundary");
-        if omitted == 0 { (text, 0) } else {
-            (format!("[EVAL_OUTPUT_PREVIEW: {omitted} earlier UTF-8 bytes omitted]\n{text}"), omitted)
+        if omitted == 0 {
+            (text, 0)
+        } else {
+            (
+                format!("[EVAL_OUTPUT_PREVIEW: {omitted} earlier UTF-8 bytes omitted]\n{text}"),
+                omitted,
+            )
         }
     }
 }
@@ -102,7 +129,10 @@ pub(super) struct Capture {
 }
 
 fn invalid(message: &str) -> Error {
-    Error::tool("eval", format!("EVAL_PROTOCOL: {message}; EVAL_STATE_RESET: selected kernel discarded"))
+    Error::tool(
+        "eval",
+        format!("EVAL_PROTOCOL: {message}; EVAL_STATE_RESET: selected kernel discarded"),
+    )
 }
 
 impl Capture {
@@ -124,7 +154,9 @@ impl Capture {
         if frame.get("id").and_then(Value::as_u64) != Some(expected_id)
             || frame.as_object().is_none_or(|object| object.len() != 2)
         {
-            return Err(invalid("stream belongs to another cell or has ambiguous fields"));
+            return Err(invalid(
+                "stream belongs to another cell or has ambiguous fields",
+            ));
         }
         let stream = &frame["stream"];
         if stream.as_object().is_none_or(|object| object.len() != 3) {
@@ -137,13 +169,20 @@ impl Capture {
             self.dirty = true;
             return Ok(());
         }
-        let sequence = self.sequence.checked_add(1).ok_or_else(|| invalid("output sequence exhausted"))?;
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("output sequence exhausted"))?;
         if stream.get("sequence").and_then(Value::as_u64) != Some(sequence) {
             return Err(invalid("out-of-order or duplicated output frame"));
         }
-        let text = stream.get("text").and_then(Value::as_str)
+        let text = stream
+            .get("text")
+            .and_then(Value::as_str)
             .ok_or_else(|| invalid("stream text must be a string"))?;
-        if text.len() > CHUNK_BYTES { return Err(invalid("stream chunk exceeds 64 KiB")); }
+        if text.len() > CHUNK_BYTES {
+            return Err(invalid("stream chunk exceeds 64 KiB"));
+        }
         let target = match stream.get("name").and_then(Value::as_str) {
             Some("stdout") => &mut self.stdout,
             Some("stderr") => &mut self.stderr,
@@ -152,15 +191,26 @@ impl Capture {
         target.push(text);
         self.sequence = sequence;
         self.dirty |= !text.is_empty();
-        if let Some(archive) = &mut self.archive { archive.record(stream)?; }
+        if let Some(archive) = &mut self.archive {
+            archive.record(stream)?;
+        }
         Ok(())
     }
 
-    pub(super) fn publish(&mut self, force: bool) { self.publish_at(Instant::now(), force); }
+    pub(super) fn publish(&mut self, force: bool) {
+        self.publish_at(Instant::now(), force);
+    }
 
     fn publish_at(&mut self, now: Instant, force: bool) {
-        let Some(callback) = &self.on_update else { return; };
-        if !self.dirty || !force && self.last_update.is_some_and(|last| now.saturating_duration_since(last) < UPDATE_INTERVAL) {
+        let Some(callback) = &self.on_update else {
+            return;
+        };
+        if !self.dirty
+            || !force
+                && self
+                    .last_update
+                    .is_some_and(|last| now.saturating_duration_since(last) < UPDATE_INTERVAL)
+        {
             return;
         }
         let (out, out_omitted) = self.stdout.preview();
@@ -173,7 +223,10 @@ impl Capture {
         }
         self.displays.append(&mut content, &mut details, false);
         // No native mutex or RefCell borrow is held across caller code.
-        callback(ToolUpdate { content, details: Some(details) });
+        callback(ToolUpdate {
+            content,
+            details: Some(details),
+        });
         self.dirty = false;
         self.last_update = Some(now);
     }
@@ -189,7 +242,9 @@ impl Capture {
 
     pub(super) fn finish_response(&self, response: &mut Value) -> Result<()> {
         if response.get("outputSequence").and_then(Value::as_u64) != Some(self.sequence) {
-            return Err(invalid("final output sequence does not match received frames"));
+            return Err(invalid(
+                "final output sequence does not match received frames",
+            ));
         }
         // The stream is the sole source of console bytes. Accepting a second
         // copy in the final response would duplicate or silently replace it.
@@ -198,7 +253,8 @@ impl Capture {
         {
             return Err(invalid("final response duplicates streamed console output"));
         }
-        self.displays.verify(response.get("displays").and_then(Value::as_array))?;
+        self.displays
+            .verify(response.get("displays").and_then(Value::as_array))?;
         response["stdout"] = Value::String(self.stdout.render());
         response["stderr"] = Value::String(self.stderr.render());
         Ok(())
@@ -206,9 +262,14 @@ impl Capture {
 
     /// The native sender closes before publishing the reply; the host drains
     /// that invocation's channel first. No guest text is parsed as protocol.
-    pub(super) fn finish_javascript(&self, response: &mut super::js_kernel::JsCellResponse) -> Result<()> {
+    pub(super) fn finish_javascript(
+        &self,
+        response: &mut super::js_kernel::JsCellResponse,
+    ) -> Result<()> {
         if !response.console.is_empty() {
-            return Err(invalid("JavaScript response duplicates streamed console output"));
+            return Err(invalid(
+                "JavaScript response duplicates streamed console output",
+            ));
         }
         self.displays.verify(Some(&response.displays))?;
         response.console = self.stdout.render();
@@ -222,16 +283,25 @@ impl Capture {
         }
         if self.sequence > 0 {
             if let Some(Value::Object(details)) = output.details.as_mut() {
-                details.insert("output".into(), self.details(self.stdout.omitted(), self.stderr.omitted(), false));
+                details.insert(
+                    "output".into(),
+                    self.details(self.stdout.omitted(), self.stderr.omitted(), false),
+                );
             }
         }
     }
 
     fn partial_output(&self) -> Option<(String, Value)> {
-        if self.stdout.total == 0 && self.stderr.total == 0 { return None; }
+        if self.stdout.total == 0 && self.stderr.total == 0 {
+            return None;
+        }
         let (out, out_omitted) = self.stdout.preview();
         let (err, err_omitted) = self.stderr.preview();
-        let language = if self.kernel == "js" { "JavaScript" } else { "Python" };
+        let language = if self.kernel == "js" {
+            "JavaScript"
+        } else {
+            "Python"
+        };
         Some((
             format!("[Partial {language} output received before failure]\n{out}{err}"),
             self.details(out_omitted, err_omitted, true),
@@ -242,17 +312,31 @@ impl Capture {
     /// bounded tail received before timeout, cancellation, crash or bad frames.
     pub(super) fn with_error(&self, error: Error) -> Error {
         let error = if self.archive.is_some() {
-            Error::tool("eval", format!("{error}; EVAL_ARTIFACT_NOT_PUBLISHED: requested console archive is incomplete"))
-        } else { error };
+            Error::tool(
+                "eval",
+                format!(
+                    "{error}; EVAL_ARTIFACT_NOT_PUBLISHED: requested console archive is incomplete"
+                ),
+            )
+        } else {
+            error
+        };
         // Python retains its Error contract; rich blocks already delivered in
         // running updates cannot be attached to that text-only error value.
-        let error = if self.displays.is_empty() { error } else {
-            Error::tool("eval", format!(
-                "{error}; EVAL_DISPLAY_INCOMPLETE: {} provisional rich displays were received; cell did not complete",
-                self.displays.len()
-            ))
+        let error = if self.displays.is_empty() {
+            error
+        } else {
+            Error::tool(
+                "eval",
+                format!(
+                    "{error}; EVAL_DISPLAY_INCOMPLETE: {} provisional rich displays were received; cell did not complete",
+                    self.displays.len()
+                ),
+            )
         };
-        let Some((partial, _)) = self.partial_output() else { return error; };
+        let Some((partial, _)) = self.partial_output() else {
+            return error;
+        };
         Error::tool("eval", format!("{error}\n{partial}"))
     }
 
@@ -270,7 +354,9 @@ impl Capture {
                     text.text.push('\n');
                     text.text.push_str(&partial);
                 }
-                _ => output.content.push(ContentBlock::Text(TextContent::new(partial))),
+                _ => output
+                    .content
+                    .push(ContentBlock::Text(TextContent::new(partial))),
             }
             if let Some(Value::Object(details)) = output.details.as_mut() {
                 details.insert("output".into(), metadata);
@@ -291,10 +377,15 @@ mod tests {
     #[test]
     fn fragmented_output_retains_exact_prefix_tail_and_omitted_count() {
         let mut capture = BoundedText::new(16);
-        for ch in "abcdefghijklmnopqrstuvwxyz".chars() { capture.push(&ch.to_string()); }
+        for ch in "abcdefghijklmnopqrstuvwxyz".chars() {
+            capture.push(&ch.to_string());
+        }
         assert_eq!(capture.retained(), 16);
         assert_eq!(capture.omitted(), 10);
-        assert_eq!(capture.render(), "abcdefgh\n[EVAL_OUTPUT_TRUNCATED: 10 UTF-8 bytes omitted]\nstuvwxyz");
+        assert_eq!(
+            capture.render(),
+            "abcdefgh\n[EVAL_OUTPUT_TRUNCATED: 10 UTF-8 bytes omitted]\nstuvwxyz"
+        );
     }
 
     #[test]
@@ -318,7 +409,9 @@ mod tests {
         assert_eq!(capture.total, 30000);
         assert_eq!(capture.omitted() + capture.retained() as u64, capture.total);
         let mut plain = BoundedText::new(64);
-        for text in ["hello", "\r", "\n", "😀", "\0"] { plain.push(text); }
+        for text in ["hello", "\r", "\n", "😀", "\0"] {
+            plain.push(text);
+        }
         assert_eq!(plain.render(), "hello\r\n😀\0");
         assert_eq!(plain.omitted(), 0);
     }
@@ -327,8 +420,10 @@ mod tests {
     fn invalid_stream_frames_do_not_mutate_the_capture() {
         let mut capture = Capture::new("python", None);
         for bad in [
-            frame(9, 1, "stdout", "bad"), frame(7, 2, "stdout", "bad"),
-            frame(7, 1, "unknown", "bad"), frame(7, 1, "stdout", &"x".repeat(CHUNK_BYTES + 1)),
+            frame(9, 1, "stdout", "bad"),
+            frame(7, 2, "stdout", "bad"),
+            frame(7, 1, "unknown", "bad"),
+            frame(7, 1, "stdout", &"x".repeat(CHUNK_BYTES + 1)),
             json!({"id":7,"stream":{"sequence":1,"name":"stdout","text":"bad"},"ok":true}),
         ] {
             assert!(capture.accept(&bad, 7).is_err());
@@ -336,7 +431,11 @@ mod tests {
             assert_eq!(capture.stdout.total, 0);
         }
         capture.accept(&frame(7, 1, "stdout", "good"), 7).unwrap();
-        assert!(capture.accept(&frame(7, 1, "stdout", "duplicate"), 7).is_err());
+        assert!(
+            capture
+                .accept(&frame(7, 1, "stdout", "duplicate"), 7)
+                .is_err()
+        );
         assert_eq!(capture.stdout.render(), "good");
     }
 
@@ -344,19 +443,29 @@ mod tests {
     fn updates_are_coalesced_replacement_snapshots_not_repeated_deltas() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
-        let mut capture = Capture::new("python", Some(Box::new(move |event| sink.lock().unwrap().push(event))));
+        let mut capture = Capture::new(
+            "python",
+            Some(Box::new(move |event| sink.lock().unwrap().push(event))),
+        );
         let now = Instant::now();
         capture.accept(&frame(1, 1, "stdout", "first"), 1).unwrap();
         capture.publish_at(now, false);
-        capture.accept(&frame(1, 2, "stdout", " second"), 1).unwrap();
+        capture
+            .accept(&frame(1, 2, "stdout", " second"), 1)
+            .unwrap();
         capture.publish_at(now, false);
         assert_eq!(events.lock().unwrap().len(), 1);
         capture.publish_at(now + UPDATE_INTERVAL, false);
         capture.publish_at(now + UPDATE_INTERVAL, true);
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[1].content[0], ContentBlock::Text(text) if text.text == "first second"));
-        assert_eq!(events[1].details.as_ref().unwrap()["output"]["stdoutBytes"], 12);
+        assert!(
+            matches!(&events[1].content[0], ContentBlock::Text(text) if text.text == "first second")
+        );
+        assert_eq!(
+            events[1].details.as_ref().unwrap()["output"]["stdoutBytes"],
+            12
+        );
     }
 
     #[test]
@@ -377,7 +486,9 @@ mod tests {
     fn previews_and_partial_errors_have_independent_small_bounds() {
         let mut capture = Capture::new("python", None);
         for sequence in 1..=30 {
-            capture.accept(&frame(3, sequence, "stdout", &"界".repeat(10000)), 3).unwrap();
+            capture
+                .accept(&frame(3, sequence, "stdout", &"界".repeat(10000)), 3)
+                .unwrap();
         }
         let (preview, omitted) = capture.stdout.preview();
         assert!(preview.len() < PREVIEW_BYTES + 128);
@@ -390,9 +501,12 @@ mod tests {
     }
 
     fn python() -> Option<(tempfile::TempDir, crate::eval::EvalTool)> {
-        if !std::process::Command::new("python3").arg("--version")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .status().is_ok_and(|status| status.success())
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
         {
             eprintln!("Skipping: python3 not available");
             return None;
@@ -403,20 +517,28 @@ mod tests {
     }
 
     fn run<F: std::future::Future>(future: F) -> F::Output {
-        asupersync::runtime::RuntimeBuilder::new().build().unwrap().block_on(future)
+        asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn text(content: &[ContentBlock]) -> String {
-        content.iter().filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        }).collect()
+        content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
     fn actual_eval_update_unblocks_the_cell_before_it_can_finish() {
         use crate::tools::Tool;
-        let Some((dir, tool)) = python() else { return; };
+        let Some((dir, tool)) = python() else {
+            return;
+        };
         let gate = dir.path().join("progress-gate");
         let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_seen = Arc::clone(&seen);
@@ -445,10 +567,17 @@ mod tests {
     #[test]
     fn actual_eval_large_console_output_has_head_tail_and_honest_metadata() {
         use crate::tools::Tool;
-        let Some((_dir, tool)) = python() else { return; };
-        let output = run(tool.execute("large", json!({
-            "code":"print('BEGIN-' + '界' * 500000 + '-END', end='')"
-        }), None)).unwrap();
+        let Some((_dir, tool)) = python() else {
+            return;
+        };
+        let output = run(tool.execute(
+            "large",
+            json!({
+                "code":"print('BEGIN-' + '界' * 500000 + '-END', end='')"
+            }),
+            None,
+        ))
+        .unwrap();
         assert!(!output.is_error, "{}", text(&output.content));
         let rendered = text(&output.content);
         assert!(rendered.contains("BEGIN-"));
@@ -466,11 +595,18 @@ mod tests {
     #[test]
     fn actual_eval_keeps_console_and_rich_display_before_an_exception() {
         use crate::tools::Tool;
-        let Some((_dir, tool)) = python() else { return; };
-        let output = run(tool.execute("mixed", json!({"code":concat!(
-            "import sys\nprint('kept-once')\nprint('warning-once', file=sys.stderr)\n",
-            "display({'answer':42})\nraise ValueError('expected-failure')"
-        )}), None)).unwrap();
+        let Some((_dir, tool)) = python() else {
+            return;
+        };
+        let output = run(tool.execute(
+            "mixed",
+            json!({"code":concat!(
+                "import sys\nprint('kept-once')\nprint('warning-once', file=sys.stderr)\n",
+                "display({'answer':42})\nraise ValueError('expected-failure')"
+            )}),
+            None,
+        ))
+        .unwrap();
         assert!(output.is_error);
         let rendered = text(&output.content);
         assert_eq!(rendered.matches("kept-once").count(), 1);
@@ -485,12 +621,19 @@ mod tests {
     #[test]
     fn actual_eval_timeout_retains_received_tail_without_becoming_success() {
         use crate::tools::Tool;
-        let Some((_dir, tool)) = python() else { return; };
+        let Some((_dir, tool)) = python() else {
+            return;
+        };
         run(tool.execute("seed", json!({"code":"keep = 7"}), None)).unwrap();
-        let error = run(tool.execute("timeout", json!({
-            "code":"print('timeout-progress', flush=True)\nimport time\ntime.sleep(60)",
-            "timeout_secs":2
-        }), None)).unwrap_err();
+        let error = run(tool.execute(
+            "timeout",
+            json!({
+                "code":"print('timeout-progress', flush=True)\nimport time\ntime.sleep(60)",
+                "timeout_secs":2
+            }),
+            None,
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("EVAL_TIMEOUT"));
         assert!(error.to_string().contains("Partial Python output"));
         assert!(error.to_string().contains("timeout-progress"));
@@ -502,14 +645,23 @@ mod tests {
     #[test]
     fn actual_eval_callback_cancellation_stops_continuous_output_and_preserves_tail() {
         use crate::tools::Tool;
-        let Some((_dir, tool)) = python() else { return; };
+        let Some((_dir, tool)) = python() else {
+            return;
+        };
         let owner = crate::agent_cx::AgentCx::for_testing();
         let stop = owner.clone();
-        let callback = Box::new(move |_: ToolUpdate| { stop.set_cancel_requested(true); });
+        let callback = Box::new(move |_: ToolUpdate| {
+            stop.set_cancel_requested(true);
+        });
         let started = Instant::now();
-        let error = run(owner.with_current(tool.execute("cancel", json!({
-            "code":"while True: print('cancel-progress', flush=True)", "timeout_secs":60
-        }), Some(callback)))).unwrap_err();
+        let error = run(owner.with_current(tool.execute(
+            "cancel",
+            json!({
+                "code":"while True: print('cancel-progress', flush=True)", "timeout_secs":60
+            }),
+            Some(callback),
+        )))
+        .unwrap_err();
         assert!(error.to_string().contains("EVAL_CANCELLED"), "{error}");
         assert!(error.to_string().contains("cancel-progress"));
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -521,12 +673,19 @@ mod tests {
     #[test]
     fn actual_eval_retained_tasks_cannot_print_into_another_cells_result() {
         use crate::tools::Tool;
-        let Some((_dir, tool)) = python() else { return; };
-        let seeded = run(tool.execute("task", json!({"code":concat!(
-            "import asyncio\n",
-            "async def late():\n    await asyncio.sleep(0.05)\n    print('foreign-output')\n",
-            "pending = asyncio.create_task(late())"
-        )}), None)).unwrap();
+        let Some((_dir, tool)) = python() else {
+            return;
+        };
+        let seeded = run(tool.execute(
+            "task",
+            json!({"code":concat!(
+                "import asyncio\n",
+                "async def late():\n    await asyncio.sleep(0.05)\n    print('foreign-output')\n",
+                "pending = asyncio.create_task(late())"
+            )}),
+            None,
+        ))
+        .unwrap();
         assert!(!seeded.is_error);
         let output = run(tool.execute("later", json!({"code":concat!(
             "await asyncio.sleep(0.1)\n",
@@ -540,9 +699,13 @@ mod tests {
     #[test]
     fn javascript_partial_metadata_describes_the_rendered_preview_not_the_larger_capture() {
         let mut capture = Capture::new("js", None);
-        capture.accept(&frame(1, 1, "stdout", &"x".repeat(40_000)), 1).unwrap();
+        capture
+            .accept(&frame(1, 1, "stdout", &"x".repeat(40_000)), 1)
+            .unwrap();
         let mut output = ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new("EVAL_TIMEOUT: stopped"))],
+            content: vec![ContentBlock::Text(TextContent::new(
+                "EVAL_TIMEOUT: stopped",
+            ))],
             details: Some(json!({"kernel":"js", "stateReset":true})),
             is_error: true,
         };
@@ -556,7 +719,10 @@ mod tests {
         assert_eq!(details["stateReset"], true);
         assert_eq!(details["output"]["preview"], true);
         assert_eq!(details["output"]["stdoutBytes"], 40_000);
-        assert_eq!(details["output"]["stdoutOmittedBytes"], 40_000 - PREVIEW_BYTES);
+        assert_eq!(
+            details["output"]["stdoutOmittedBytes"],
+            40_000 - PREVIEW_BYTES
+        );
     }
 
     #[test]
@@ -586,7 +752,10 @@ mod tests {
         assert_eq!(rendered.matches("js-progress-marker").count(), 1);
         assert_eq!(rendered.matches("js-warning").count(), 1);
         assert!(rendered.trim().ends_with("42"));
-        assert_eq!(output.details.as_ref().unwrap()["output"]["stderrBytes"], 11);
+        assert_eq!(
+            output.details.as_ref().unwrap()["output"]["stderrBytes"],
+            11
+        );
     }
 
     #[test]
@@ -594,9 +763,14 @@ mod tests {
         use crate::tools::Tool;
         let dir = tempfile::tempdir().unwrap();
         let tool = crate::eval::EvalTool::new(dir.path());
-        let output = run(tool.execute("large-js", json!({
-            "kernel":"js", "code":"console.log('BEGIN-' + '界'.repeat(500000) + '-END');"
-        }), None)).unwrap();
+        let output = run(tool.execute(
+            "large-js",
+            json!({
+                "kernel":"js", "code":"console.log('BEGIN-' + '界'.repeat(500000) + '-END');"
+            }),
+            None,
+        ))
+        .unwrap();
         assert!(!output.is_error, "{}", text(&output.content));
         let rendered = text(&output.content);
         assert!(rendered.starts_with("BEGIN-"));
@@ -616,10 +790,15 @@ mod tests {
         use crate::tools::Tool;
         let dir = tempfile::tempdir().unwrap();
         let tool = crate::eval::EvalTool::new(dir.path());
-        let output = run(tool.execute("mixed-js", json!({"kernel":"js", "code":concat!(
-            "globalThis.keep = 42; console.log('kept-once'); console.error('warning-once'); ",
-            "display({answer:42}); throw new Error('expected-failure');"
-        )}), None)).unwrap();
+        let output = run(tool.execute(
+            "mixed-js",
+            json!({"kernel":"js", "code":concat!(
+                "globalThis.keep = 42; console.log('kept-once'); console.error('warning-once'); ",
+                "display({answer:42}); throw new Error('expected-failure');"
+            )}),
+            None,
+        ))
+        .unwrap();
         assert!(output.is_error);
         let rendered = text(&output.content);
         assert_eq!(rendered.matches("kept-once").count(), 1);
@@ -629,7 +808,8 @@ mod tests {
         assert_eq!(details["jsonOutputs"], json!([{"answer":42}]));
         assert_eq!(details["output"]["stdoutBytes"], 10);
         assert_eq!(details["output"]["stderrBytes"], 13);
-        let next = run(tool.execute("kept-js", json!({"kernel":"js", "code":"keep"}), None)).unwrap();
+        let next =
+            run(tool.execute("kept-js", json!({"kernel":"js", "code":"keep"}), None)).unwrap();
         assert!(!next.is_error);
         assert_eq!(text(&next.content).trim(), "42");
     }
@@ -639,18 +819,33 @@ mod tests {
         use crate::tools::Tool;
         let dir = tempfile::tempdir().unwrap();
         let tool = crate::eval::EvalTool::new(dir.path());
-        let output = run(tool.execute("timeout-js", json!({
-            "kernel":"js", "timeout_secs":1,
-            "code":"globalThis.keep = 7; console.log('js-timeout-progress'); while (true) {}"
-        }), None)).unwrap();
+        let output = run(tool.execute(
+            "timeout-js",
+            json!({
+                "kernel":"js", "timeout_secs":1,
+                "code":"globalThis.keep = 7; console.log('js-timeout-progress'); while (true) {}"
+            }),
+            None,
+        ))
+        .unwrap();
         assert!(output.is_error);
         let rendered = text(&output.content);
         assert!(rendered.contains("EVAL_TIMEOUT"), "{rendered}");
         assert!(rendered.contains("js-timeout-progress"));
         assert!(rendered.contains("EVAL_STATE_RESET"));
         assert!(!rendered.contains("Partial Python"));
-        assert!(output.details.as_ref().unwrap()["output"]["stdoutBytes"].as_u64().unwrap() > 0);
-        let next = run(tool.execute("fresh-js", json!({"kernel":"js", "code":"typeof keep"}), None)).unwrap();
+        assert!(
+            output.details.as_ref().unwrap()["output"]["stdoutBytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let next = run(tool.execute(
+            "fresh-js",
+            json!({"kernel":"js", "code":"typeof keep"}),
+            None,
+        ))
+        .unwrap();
         assert!(!next.is_error);
         assert!(text(&next.content).contains("undefined"));
     }
@@ -662,12 +857,19 @@ mod tests {
         let tool = crate::eval::EvalTool::new(dir.path());
         let owner = crate::agent_cx::AgentCx::for_testing();
         let stop = owner.clone();
-        let callback = Box::new(move |_: ToolUpdate| { stop.set_cancel_requested(true); });
+        let callback = Box::new(move |_: ToolUpdate| {
+            stop.set_cancel_requested(true);
+        });
         let started = Instant::now();
-        let output = run(owner.with_current(tool.execute("cancel-js", json!({
-            "kernel":"js", "timeout_secs":60,
-            "code":"globalThis.keep = 7; while (true) console.log('js-cancel-progress');"
-        }), Some(callback)))).unwrap();
+        let output = run(owner.with_current(tool.execute(
+            "cancel-js",
+            json!({
+                "kernel":"js", "timeout_secs":60,
+                "code":"globalThis.keep = 7; while (true) console.log('js-cancel-progress');"
+            }),
+            Some(callback),
+        )))
+        .unwrap();
         assert!(output.is_error);
         let rendered = text(&output.content);
         assert!(rendered.contains("EVAL_CANCELLED"), "{rendered}");
@@ -675,7 +877,12 @@ mod tests {
         assert!(rendered.contains("Partial JavaScript"));
         assert_eq!(output.details.as_ref().unwrap()["stateReset"], true);
         assert!(started.elapsed() < Duration::from_secs(10));
-        let next = run(tool.execute("fresh-js", json!({"kernel":"js", "code":"typeof keep"}), None)).unwrap();
+        let next = run(tool.execute(
+            "fresh-js",
+            json!({"kernel":"js", "code":"typeof keep"}),
+            None,
+        ))
+        .unwrap();
         assert!(!next.is_error);
         assert!(text(&next.content).contains("undefined"));
         assert_eq!(next.details.as_ref().unwrap()["cell"], 1);
@@ -686,13 +893,23 @@ mod tests {
         use crate::tools::Tool;
         let dir = tempfile::tempdir().unwrap();
         let tool = crate::eval::EvalTool::new(dir.path());
-        let first = run(tool.execute("first-js", json!({"kernel":"js", "code":
-            "setTimeout(() => console.log('foreign-output'), 50); console.log('first-only');"
-        }), None)).unwrap();
+        let first = run(tool.execute(
+            "first-js",
+            json!({"kernel":"js", "code":
+                "setTimeout(() => console.log('foreign-output'), 50); console.log('first-only');"
+            }),
+            None,
+        ))
+        .unwrap();
         assert!(!first.is_error, "{}", text(&first.content));
-        let next = run(tool.execute("second-js", json!({"kernel":"js", "code":
-            "await sleep(100); console.log('second-only');"
-        }), None)).unwrap();
+        let next = run(tool.execute(
+            "second-js",
+            json!({"kernel":"js", "code":
+                "await sleep(100); console.log('second-only');"
+            }),
+            None,
+        ))
+        .unwrap();
         assert!(!next.is_error, "{}", text(&next.content));
         assert!(text(&next.content).contains("second-only"));
         assert!(!text(&next.content).contains("first-only"));

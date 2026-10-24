@@ -89,8 +89,7 @@ mod enabled {
                 4 => "finished",
                 _ => "outside-model",
             };
-            let callback_age_ms =
-                elapsed.saturating_sub(self.completed_ms.load(Ordering::Relaxed));
+            let callback_age_ms = elapsed.saturating_sub(self.completed_ms.load(Ordering::Relaxed));
             let cooked_input = mode.is_some_and(|mode| mode & 0x0007 != 0);
             let active = !matches!(phase, "starting" | "finished");
             let diagnosis = if active && cooked_input {

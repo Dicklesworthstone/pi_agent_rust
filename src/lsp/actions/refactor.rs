@@ -13,8 +13,8 @@ use crate::lsp::client::{DocumentSnapshot, try_path_to_uri, uri_to_path};
 use crate::lsp::edits::{FileEvidence, PreparedEdit, WorkspaceEditPlan};
 use std::sync::Arc;
 
-mod formatting;
 mod directory;
+mod formatting;
 mod prepare;
 mod versions;
 
@@ -195,7 +195,8 @@ fn append_move(raw: Value, old_uri: &str, new_uri: &str) -> Result<Value> {
 /// Static registrations apply to the original file being renamed. Globs use
 /// native paths, not percent-encoded URI text. No filesystem traversal occurs.
 fn registered_for_file(capabilities: &Value, operation: &str, path: &Path) -> Result<bool> {
-    Ok(file_operation_filters(capabilities, operation)?.iter()
+    Ok(file_operation_filters(capabilities, operation)?
+        .iter()
         .any(|filter| filter.matches(path, false)))
 }
 
@@ -272,7 +273,11 @@ fn file_operation_filters(
             .build()
             .map_err(|_| invalid())?
             .compile_matcher();
-        compiled.push(FileOperationFilter { scheme_matches, directory, matcher });
+        compiled.push(FileOperationFilter {
+            scheme_matches,
+            directory,
+            matcher,
+        });
     }
     Ok(compiled)
 }
@@ -419,7 +424,9 @@ impl LspTool {
         let requested = resolve_tool_path(file, &self.cwd);
         let metadata = std::fs::symlink_metadata(&requested)?;
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            return self.run_rename_group(input, &requested, new_file, true).await;
+            return self
+                .run_rename_group(input, &requested, new_file, true)
+                .await;
         }
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(tool_err(
@@ -429,7 +436,9 @@ impl LspTool {
         }
         let old_path = requested.canonicalize()?;
         if self.registry.specs_for_file(&old_path).len() > 1 {
-            return self.run_rename_group(input, &requested, new_file, false).await;
+            return self
+                .run_rename_group(input, &requested, new_file, false)
+                .await;
         }
         let budget = prepare::Budget::new(self.request_timeout(input));
         budget.remaining()?;

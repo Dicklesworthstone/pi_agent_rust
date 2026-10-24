@@ -26,7 +26,10 @@ impl ModuleDef for DataModule {
         // Neither JSON nor a text string is undefined; initialization must fail,
         // not publish a default value from a partially declared module.
         if value.is_undefined() {
-            return Err(Exception::throw_message(ctx, "EVAL_MODULE_DATA: module data unavailable"));
+            return Err(Exception::throw_message(
+                ctx,
+                "EVAL_MODULE_DATA: module data unavailable",
+            ));
         }
         exports.export("default", value)?;
         metadata.set(DATA_SLOT, Undefined)?;
@@ -112,7 +115,11 @@ mod tests {
 
     #[test]
     fn nesting_is_bounded_without_counting_string_contents() {
-        let accepted = format!("{}0{}", "[".repeat(MAX_JSON_DEPTH), "]".repeat(MAX_JSON_DEPTH));
+        let accepted = format!(
+            "{}0{}",
+            "[".repeat(MAX_JSON_DEPTH),
+            "]".repeat(MAX_JSON_DEPTH)
+        );
         assert!(check_json_depth(&accepted).is_ok());
         assert!(check_json_depth(&format!("[{accepted}]")).is_err());
         let strings = serde_json::to_string(&vec!["[{}]".repeat(1000), "\\\"[".into()]).unwrap();

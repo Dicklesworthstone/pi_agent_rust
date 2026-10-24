@@ -1351,7 +1351,8 @@ mod session_bundle {
                     count += read as u64;
                     hasher.update(&buffer[..read]);
                 }
-                if count != length || crate::package_manager::hex_encode(&hasher.finalize()) != name {
+                if count != length || crate::package_manager::hex_encode(&hasher.finalize()) != name
+                {
                     return Err(io::Error::other("existing migrated attachment is corrupt"));
                 }
                 check_identity(&destination, &existing, &existing_identity)?;
@@ -1449,7 +1450,9 @@ mod session_bundle {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             {
-                return Err(io::Error::other("invalid session attachment digest filename"));
+                return Err(io::Error::other(
+                    "invalid session attachment digest filename",
+                ));
             }
             source_blobs.validate()?;
             copy_verified_blob(&entry.path(), name, &target_blobs)?;

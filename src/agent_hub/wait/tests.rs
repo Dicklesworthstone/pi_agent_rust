@@ -38,7 +38,6 @@ fn replies_are_filtered_by_peer_and_exclusive_cursor_without_consumption() {
     );
 }
 
-
 #[test]
 fn dependency_wait_releases_on_owner_drop_without_cancelling_the_peer() {
     let (_dir, mut hub, first, second) = fixture();
@@ -63,30 +62,47 @@ fn transitive_wait_requires_every_live_alternative_to_depend_on_the_caller() {
     let third = hub.register("third", "third task").unwrap();
     hub.mark_running(&third.id, 13);
     hub.bus_send(&second, &first, "one question").unwrap();
-    let cursor = hub.bus_send(&third.id, &first, "another question").unwrap().seq;
+    let cursor = hub
+        .bus_send(&third.id, &first, "another question")
+        .unwrap()
+        .seq;
     let _first_wait = hub
         .begin_reply_wait(&first, None, cursor, Duration::from_secs(60), None)
         .unwrap();
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), cursor).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), cursor)
+            .unwrap()
+            .status,
         InboxWaitStatus::Pending
     );
     let third_wait = hub
-        .begin_reply_wait(&third.id, Some(&second), cursor, Duration::from_secs(60), None)
+        .begin_reply_wait(
+            &third.id,
+            Some(&second),
+            cursor,
+            Duration::from_secs(60),
+            None,
+        )
         .unwrap();
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), cursor).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), cursor)
+            .unwrap()
+            .status,
         InboxWaitStatus::PeerBlocked
     );
     drop(third_wait);
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), cursor).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), cursor)
+            .unwrap()
+            .status,
         InboxWaitStatus::Pending
     );
     // A stopped alternative cannot keep a dependency cycle looking answerable.
     hub.settle(&third.id, ChildStatus::Done);
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), cursor).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), cursor)
+            .unwrap()
+            .status,
         InboxWaitStatus::PeerBlocked
     );
 }
@@ -99,28 +115,45 @@ fn automatic_wait_includes_independent_peers_added_after_it_opens() {
         .begin_reply_wait(&first, None, cursor, Duration::from_secs(60), None)
         .unwrap();
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), cursor).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), cursor)
+            .unwrap()
+            .status,
         InboxWaitStatus::PeerBlocked
     );
 
     let third = hub.register("third", "independent answer").unwrap();
     hub.mark_running(&third.id, 13);
-    let next = hub.bus_send(&third.id, &first, "another question").unwrap().seq;
+    let next = hub
+        .bus_send(&third.id, &first, "another question")
+        .unwrap()
+        .seq;
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), next).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), next)
+            .unwrap()
+            .status,
         InboxWaitStatus::Pending
     );
 
     let third_wait = hub
-        .begin_reply_wait(&third.id, Some(&second), next, Duration::from_secs(60), None)
+        .begin_reply_wait(
+            &third.id,
+            Some(&second),
+            next,
+            Duration::from_secs(60),
+            None,
+        )
         .unwrap();
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), next).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), next)
+            .unwrap()
+            .status,
         InboxWaitStatus::PeerBlocked
     );
     drop(third_wait);
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), next).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), next)
+            .unwrap()
+            .status,
         InboxWaitStatus::Pending
     );
 }
@@ -133,7 +166,9 @@ fn terminal_wait_snapshot_stays_inert_after_a_later_send() {
         .unwrap();
     let cursor = hub.bus_send(&second, &first, "later question").unwrap().seq;
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), cursor).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), cursor)
+            .unwrap()
+            .status,
         InboxWaitStatus::Pending
     );
 }
@@ -141,13 +176,23 @@ fn terminal_wait_snapshot_stays_inert_after_a_later_send() {
 #[test]
 fn foreground_parent_wait_is_blocked_but_an_answerable_sibling_keeps_waiting() {
     let (_dir, mut hub, first, second) = fixture();
-    let first_hold = hub.hold_child_result(&first, Duration::from_secs(60)).unwrap();
-    hub.bus_send("parent", &first, "parent, can you answer?").unwrap();
-    let cursor = hub.bus_send(&second, &first, "peer, can you answer?").unwrap().seq;
+    let first_hold = hub
+        .hold_child_result(&first, Duration::from_secs(60))
+        .unwrap();
+    hub.bus_send("parent", &first, "parent, can you answer?")
+        .unwrap();
+    let cursor = hub
+        .bus_send(&second, &first, "peer, can you answer?")
+        .unwrap()
+        .seq;
     let pending = hub.wait_snapshot(&first, None, cursor).unwrap();
     assert_eq!(pending.status, InboxWaitStatus::Pending);
     assert_eq!(pending.blocked_peers, vec!["parent"]);
-    let parent = pending.pending_replies.iter().find(|reply| reply.peer == "parent").unwrap();
+    let parent = pending
+        .pending_replies
+        .iter()
+        .find(|reply| reply.peer == "parent")
+        .unwrap();
     assert!(parent.blocked_on_caller);
     assert!(!parent.can_reply);
     hub.settle(&second, ChildStatus::Done);
@@ -172,7 +217,9 @@ fn delivered_reply_releases_dependency_before_the_waiter_polls_again() {
     );
     let reply = hub.bus_send(&first, &second, "the awaited answer").unwrap();
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), reply.seq).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), reply.seq)
+            .unwrap()
+            .status,
         InboxWaitStatus::Pending
     );
     assert_eq!(hub.inbox(&first)[0].seq, reply.seq);
@@ -197,7 +244,9 @@ fn retained_replies_and_history_loss_take_precedence_over_blocked_peers() {
         InboxWaitStatus::HistoryLost
     );
     assert_eq!(
-        hub.wait_snapshot(&second, Some(&first), hub.bus_seq).unwrap().status,
+        hub.wait_snapshot(&second, Some(&first), hub.bus_seq)
+            .unwrap()
+            .status,
         InboxWaitStatus::PeerBlocked
     );
 }
@@ -225,9 +274,10 @@ fn active_dependency_leases_are_bounded_and_released_capacity_is_reusable() {
     let (_dir, mut hub, first, second) = fixture();
     let mut holds = Vec::new();
     for _ in 0..MAX_WAIT_HOLDS {
-        holds.push(hub
-            .begin_reply_wait(&first, Some(&second), 0, Duration::from_secs(60), None)
-            .unwrap());
+        holds.push(
+            hub.begin_reply_wait(&first, Some(&second), 0, Duration::from_secs(60), None)
+                .unwrap(),
+        );
     }
     let error = hub
         .begin_reply_wait(&first, Some(&second), 0, Duration::from_secs(60), None)
@@ -235,9 +285,10 @@ fn active_dependency_leases_are_bounded_and_released_capacity_is_reusable() {
         .expect("active lease bound");
     assert!(error.to_string().contains("PI_HUB_WAIT_LIMIT"));
     drop(holds.pop());
-    assert!(hub
-        .begin_reply_wait(&first, Some(&second), 0, Duration::from_secs(60), None)
-        .is_ok());
+    assert!(
+        hub.begin_reply_wait(&first, Some(&second), 0, Duration::from_secs(60), None)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -248,7 +299,13 @@ fn disconnected_socket_retires_an_edge_before_the_server_polls_again() {
     let (server, _) = listener.accept().unwrap();
     server.set_nonblocking(true).unwrap();
     let _hold = hub
-        .begin_reply_wait(&first, Some(&second), 0, Duration::from_secs(60), Some(server))
+        .begin_reply_wait(
+            &first,
+            Some(&second),
+            0,
+            Duration::from_secs(60),
+            Some(server),
+        )
         .unwrap();
     assert_eq!(
         hub.wait_snapshot(&second, Some(&first), 0).unwrap().status,
@@ -261,7 +318,10 @@ fn disconnected_socket_retires_an_edge_before_the_server_polls_again() {
         if result.status == InboxWaitStatus::Pending {
             break;
         }
-        assert!(Instant::now() < deadline, "disconnected lease remained active");
+        assert!(
+            Instant::now() < deadline,
+            "disconnected lease remained active"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -503,7 +563,10 @@ fn failed_delivery_neither_creates_nor_answers_a_pending_send() {
     let pending = hub.wait_snapshot(&first, None, question.seq).unwrap();
     assert_eq!(pending.status, InboxWaitStatus::Pending);
     assert_eq!(pending.pending_replies[0].peer, second);
-    assert!(hub.pending_reply_snapshot(&second, &hub.blocked_on(&second)).is_empty());
+    assert!(
+        hub.pending_reply_snapshot(&second, &hub.blocked_on(&second))
+            .is_empty()
+    );
     assert!(
         hub.bus_send(&first, "parent", "undeliverable question")
             .is_err()

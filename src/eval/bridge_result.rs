@@ -25,16 +25,25 @@ pub(super) struct Request {
 impl Request {
     pub(super) fn parse(name: &str, input: Value) -> Result<Self, String> {
         if name != "__pi_tool_result" {
-            return Ok(Self { name: name.to_owned(), args: input, structured: false });
+            return Ok(Self {
+                name: name.to_owned(),
+                args: input,
+                structured: false,
+            });
         }
         let Value::Object(mut fields) = input else {
             return Err("EVAL_BRIDGE_INPUT: structured request requires name and args".into());
         };
         let name = match fields.remove("name") {
             Some(Value::String(name)) if !name.is_empty() && name.len() <= 128 => name,
-            _ => return Err("EVAL_BRIDGE_INPUT: expected a nonempty tool name of at most 128 bytes".into()),
+            _ => {
+                return Err(
+                    "EVAL_BRIDGE_INPUT: expected a nonempty tool name of at most 128 bytes".into(),
+                );
+            }
         };
-        let args = fields.remove("args")
+        let args = fields
+            .remove("args")
             .filter(Value::is_object)
             .ok_or("EVAL_BRIDGE_INPUT: structured args must be an object")?;
         if !fields.is_empty() {
@@ -42,7 +51,11 @@ impl Request {
         }
         // No recursive unwrapping. Even a deliberately nested operation must
         // be denied by the same concrete tool-name policy in the caller.
-        Ok(Self { name, args, structured: true })
+        Ok(Self {
+            name,
+            args,
+            structured: true,
+        })
     }
 }
 
@@ -69,7 +82,9 @@ impl Write for BoundedWriter {
         Ok(bytes.len())
     }
 
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn check_json(value: &Value, depth: usize, remaining: &mut usize) -> Result<(), String> {
@@ -79,10 +94,14 @@ fn check_json(value: &Value, depth: usize, remaining: &mut usize) -> Result<(), 
     *remaining -= 1;
     match value {
         Value::Array(values) => {
-            for value in values { check_json(value, depth + 1, remaining)?; }
+            for value in values {
+                check_json(value, depth + 1, remaining)?;
+            }
         }
         Value::Object(values) => {
-            for value in values.values() { check_json(value, depth + 1, remaining)?; }
+            for value in values.values() {
+                check_json(value, depth + 1, remaining)?;
+            }
         }
         _ => {}
     }
@@ -100,7 +119,10 @@ pub(super) fn structured(output: &ToolOutput) -> Result<String, String> {
         details: &output.details,
         is_error: output.is_error,
     };
-    let mut writer = BoundedWriter { bytes: Vec::new(), limit: STRUCTURED_LIMIT };
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        limit: STRUCTURED_LIMIT,
+    };
     serde_json::to_writer(&mut writer, &envelope).map_err(|_| {
         "EVAL_BRIDGE_LIMIT: structured result exceeds 4 MiB or cannot be encoded".to_string()
     })?;
@@ -138,7 +160,12 @@ mod tests {
 
     #[test]
     fn native_details_and_error_are_preserved() {
-        for details in [None, Some(Value::Null), Some(json!([1, "x"])), Some(json!(42))] {
+        for details in [
+            None,
+            Some(Value::Null),
+            Some(json!([1, "x"])),
+            Some(json!(42)),
+        ] {
             let mut output = output(details.clone());
             output.is_error = true;
             let value: Value = serde_json::from_str(&structured(&output).unwrap()).unwrap();
@@ -153,7 +180,8 @@ mod tests {
     fn image_data_is_not_flattened_or_automatically_displayed() {
         let mut output = output(None);
         output.content.push(ContentBlock::Image(ImageContent {
-            data: "aW1hZ2U=".into(), mime_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+            mime_type: "image/png".into(),
         }));
         let value: Value = serde_json::from_str(&structured(&output).unwrap()).unwrap();
         assert_eq!(value["content"][1]["data"], "aW1hZ2U=");
@@ -164,19 +192,37 @@ mod tests {
     #[test]
     fn encoded_bytes_depth_and_node_limits_fail_explicitly() {
         let escaped = output(Some(json!("\u{0}".repeat(STRUCTURED_LIMIT / 6 + 1))));
-        assert!(structured(&escaped).unwrap_err().contains("EVAL_BRIDGE_LIMIT"));
+        assert!(
+            structured(&escaped)
+                .unwrap_err()
+                .contains("EVAL_BRIDGE_LIMIT")
+        );
         let mut nested = Value::Null;
-        for _ in 0..=MAX_DEPTH { nested = json!([nested]); }
-        assert!(structured(&output(Some(nested))).unwrap_err().contains("depth/node"));
+        for _ in 0..=MAX_DEPTH {
+            nested = json!([nested]);
+        }
+        assert!(
+            structured(&output(Some(nested)))
+                .unwrap_err()
+                .contains("depth/node")
+        );
         let wide = Value::Array(vec![Value::Null; MAX_NODES]);
-        assert!(structured(&output(Some(wide))).unwrap_err().contains("depth/node"));
+        assert!(
+            structured(&output(Some(wide)))
+                .unwrap_err()
+                .contains("depth/node")
+        );
     }
 
     #[test]
     fn malformed_operations_are_rejected_before_dispatch() {
-        for input in [Value::Null, json!({}), json!({"name":"read","args":[]}),
+        for input in [
+            Value::Null,
+            json!({}),
+            json!({"name":"read","args":[]}),
             json!({"name":"read","args":{},"extra":true}),
-            json!({"name":"","args":{}})] {
+            json!({"name":"","args":{}}),
+        ] {
             assert!(Request::parse("__pi_tool_result", input).is_err());
         }
         let plain = Request::parse("read", json!({"path":"x"})).unwrap();
@@ -193,14 +239,20 @@ mod tests {
         runtime.block_on(async {
             let args = json!({"path":"data.txt"});
             let direct = crate::tools::ReadTool::new(dir.path())
-                .execute("eval-bridge", args.clone(), None).await.unwrap();
-            let reply = tool.run_bridge_call_parts("__pi_tool_result",
-                json!({"name":"read","args":args})).await.unwrap();
+                .execute("eval-bridge", args.clone(), None)
+                .await
+                .unwrap();
+            let reply = tool
+                .run_bridge_call_parts("__pi_tool_result", json!({"name":"read","args":args}))
+                .await
+                .unwrap();
             let expected = structured(&direct).unwrap();
             assert_eq!(reply, expected);
             for name in ["bash", "eval", "__pi_tool_result"] {
-                let error = tool.run_bridge_call_parts("__pi_tool_result",
-                    json!({"name":name,"args":{}})).await.unwrap_err();
+                let error = tool
+                    .run_bridge_call_parts("__pi_tool_result", json!({"name":name,"args":{}}))
+                    .await
+                    .unwrap_err();
                 assert!(error.contains("EVAL_BRIDGE_DENIED"));
             }
         });
@@ -254,9 +306,15 @@ mod tests {
         assert!(!private.is_error, "{private:?}");
         assert!(text(&private).unwrap().contains("(False, False)"));
 
-        let retained = runtime.block_on(tool.execute("retained-python", json!({
-            "kernel":"python", "code":"saved['schema']"
-        }), None)).unwrap();
+        let retained = runtime
+            .block_on(tool.execute(
+                "retained-python",
+                json!({
+                    "kernel":"python", "code":"saved['schema']"
+                }),
+                None,
+            ))
+            .unwrap();
         assert!(!retained.is_error, "{retained:?}");
         assert!(text(&retained).unwrap().contains("pi.eval.tool_result.v1"));
     }
@@ -294,10 +352,13 @@ mod tests {
 
         let _guard = crate::jobs::process_test_guard();
         for kernel in ["js", "python"] {
-            if kernel == "python" && !std::process::Command::new("python3")
-                .arg("--version").stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()).status()
-                .is_ok_and(|status| status.success())
+            if kernel == "python"
+                && !std::process::Command::new("python3")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
             {
                 eprintln!("Skipping Python agent job fixture: python3 unavailable");
                 continue;
@@ -311,28 +372,43 @@ mod tests {
             let event = json!({"type":"agent_end","messages":[{
                 "role":"assistant","stopReason":"stop",
                 "content":[{"type":"text","text":"{\"count\":7}"}]
-            }]}).to_string();
+            }]})
+            .to_string();
             let binary = root.path().join("child.sh");
-            std::fs::write(&binary, format!( // ubs:ignore[rust.ownership.unwrap-expect] -- The real child waits for explicit release and emits typed output.
-                "#!/bin/sh\nwhile [ ! -f release ]; do sleep 0.02; done\nprintf '%s\\n' '{}'\n",
-                event.replace('\'', "'\"'\"'"),
-            )).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure to create the gated child invalidates native execution coverage.
+            std::fs::write(
+                &binary,
+                format!(
+                    // ubs:ignore[rust.ownership.unwrap-expect] -- The real child waits for explicit release and emits typed output.
+                    "#!/bin/sh\nwhile [ ! -f release ]; do sleep 0.02; done\nprintf '%s\\n' '{}'\n",
+                    event.replace('\'', "'\"'\"'"),
+                ),
+            )
+            .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Failure to create the gated child invalidates native execution coverage.
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Native dispatch requires an executable fixture.
             let owner = format!("eval-agent-job-{}", uuid::Uuid::new_v4());
             let scope = crate::jobs::JobSessionScope::fixed(&owner);
             let mut subagent = crate::subagents::SubagentTool::with_paths(
-                root.path().to_path_buf(), global, binary,
-            ).with_timeout(std::time::Duration::from_secs(20));
+                root.path().to_path_buf(),
+                global,
+                binary,
+            )
+            .with_timeout(std::time::Duration::from_secs(20));
             subagent.bind_job_session_scope(scope.clone()); // ubs:ignore each kernel fixture shares this owner with the native subagent and evaluator
             let mut jobs = JobsTool::new();
             jobs.bind_job_session_scope(scope.clone()); // ubs:ignore the jobs fixture must share the same owner as that kernel's subagent and evaluator
-            let host = NativeHost { owner: owner.clone(), subagent, jobs }; // ubs:ignore the fixture host owns its session ID while assertions retain the original to inspect owner-scoped jobs
+            let host = NativeHost {
+                owner: owner.clone(),
+                subagent,
+                jobs,
+            }; // ubs:ignore the fixture host owns its session ID while assertions retain the original to inspect owner-scoped jobs
             let mut evaluator = super::super::EvalTool::new(root.path());
             evaluator.bind_job_session_scope(scope);
             let protect = |parts: &[&str]| -> Result<Vec<String>> {
                 Ok(parts.iter().map(|part| (*part).to_string()).collect())
             };
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Both kernels must execute through the real eval runtime.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Both kernels must execute through the real eval runtime.
             runtime.block_on(async {
                 let launch = if kernel == "js" {
                     r#"globalThis.saved = await agent('finish', {agent:'worker',outputSchema:{type:'object',required:['count'],properties:{count:{type:'integer'}}},schemaMode:'strict'}); saved.id"#

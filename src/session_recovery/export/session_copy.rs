@@ -10,8 +10,8 @@ use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::{
-    AgentCx, CheckedWriter, MAX_EXPORT_BYTES, RecoveryReport, Result, RetainedBudget,
-    check_owner, graph, invalid, publish_new_file,
+    AgentCx, CheckedWriter, MAX_EXPORT_BYTES, RecoveryReport, Result, RetainedBudget, check_owner,
+    graph, invalid, publish_new_file,
 };
 use crate::session::{Session, SessionEntry, SessionHeader};
 
@@ -61,10 +61,14 @@ impl Session {
 }
 
 fn require_jsonl(path: &Path) -> Result<()> {
-    if !path.extension().and_then(|extension| extension.to_str())
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
     {
-        return Err(invalid("a recovered session destination must end in .jsonl"));
+        return Err(invalid(
+            "a recovered session destination must end in .jsonl",
+        ));
     }
     Ok(())
 }
@@ -82,7 +86,11 @@ fn require_unused_sidecars(path: &Path) -> Result<()> {
     }
     for sidecar in sidecars {
         match std::fs::symlink_metadata(sidecar) {
-            Ok(_) => return Err(invalid("recovered session destination already has a sidecar; choose a new filename")),
+            Ok(_) => {
+                return Err(invalid(
+                    "recovered session destination already has a sidecar; choose a new filename",
+                ));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -94,14 +102,20 @@ fn require_unused_sidecars(path: &Path) -> Result<()> {
 /// children so native readers need not infer a new natural leaf from file order.
 /// Original row position breaks ties; an explicit header selection is mandatory.
 fn ordered_indices(report: &RecoveryReport, owner: &AgentCx) -> Result<Vec<usize>> {
-    let positions: HashMap<_, _> = report.entries.iter().enumerate()
-        .map(|(index, entry)| (entry.id.as_str(), index)).collect();
+    let positions: HashMap<_, _> = report
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.id.as_str(), index))
+        .collect();
     let mut children = vec![Vec::new(); report.entries.len()];
     let mut ready = BinaryHeap::new();
     for (index, entry) in report.entries.iter().enumerate() {
         check_owner(owner)?;
         if let Some(parent) = entry.parent_id.as_deref() {
-            let parent = positions.get(parent).ok_or_else(|| invalid("missing copy parent"))?;
+            let parent = positions
+                .get(parent)
+                .ok_or_else(|| invalid("missing copy parent"))?;
             children[*parent].push(index);
         } else {
             ready.push(Reverse(index));
@@ -128,20 +142,28 @@ fn require_completed_tools(report: &RecoveryReport, path: &[usize], owner: &Agen
         let record = &report.entries[*index].record;
         let Some(message) = record.get("message") else {
             if record["type"] == "compaction" && !pending.is_empty() {
-                return Err(invalid("selected recovery path compacts an unfinished tool batch"));
+                return Err(invalid(
+                    "selected recovery path compacts an unfinished tool batch",
+                ));
             }
             continue;
         };
         if message["role"] == "toolResult" {
-            let id = message.get("toolCallId").and_then(Value::as_str)
+            let id = message
+                .get("toolCallId")
+                .and_then(Value::as_str)
                 .ok_or_else(|| invalid("selected recovery path has an invalid tool result"))?;
             if !pending.remove(id) {
-                return Err(invalid("selected recovery path has an unmatched tool result"));
+                return Err(invalid(
+                    "selected recovery path has an unmatched tool result",
+                ));
             }
             continue;
         }
         if matches!(message["role"].as_str(), Some("user" | "assistant")) && !pending.is_empty() {
-            return Err(invalid("selected recovery path contains an unfinished tool batch; select an earlier entry"));
+            return Err(invalid(
+                "selected recovery path contains an unfinished tool batch; select an earlier entry",
+            ));
         }
         if message["role"] == "assistant"
             && let Some(blocks) = message.get("content").and_then(Value::as_array)
@@ -149,18 +171,26 @@ fn require_completed_tools(report: &RecoveryReport, path: &[usize], owner: &Agen
             for block in blocks {
                 check_owner(owner)?;
                 if block["type"] == "toolCall" {
-                    let id = block.get("id").and_then(Value::as_str)
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
                         .filter(|id| !id.is_empty())
-                        .ok_or_else(|| invalid("selected recovery path has an invalid tool call"))?;
+                        .ok_or_else(|| {
+                            invalid("selected recovery path has an invalid tool call")
+                        })?;
                     if !pending.insert(id) {
-                        return Err(invalid("selected recovery path has duplicate tool-call IDs"));
+                        return Err(invalid(
+                            "selected recovery path has duplicate tool-call IDs",
+                        ));
                     }
                 }
             }
         }
     }
     if !pending.is_empty() {
-        return Err(invalid("selected recovery leaf has unfinished tool calls; select an earlier entry"));
+        return Err(invalid(
+            "selected recovery leaf has unfinished tool calls; select an earlier entry",
+        ));
     }
     Ok(())
 }
@@ -175,7 +205,9 @@ struct PreparedCopy {
 impl PreparedCopy {
     fn new(report: &RecoveryReport, selected: Option<&str>, owner: &AgentCx) -> Result<Self> {
         check_owner(owner)?;
-        let leaf = selected.or(report.selected_leaf.as_deref()).filter(|id| !id.is_empty());
+        let leaf = selected
+            .or(report.selected_leaf.as_deref())
+            .filter(|id| !id.is_empty());
         let path = graph(&report.entries, leaf, owner)?;
         require_completed_tools(report, &path, owner)?;
         let order = ordered_indices(report, owner)?;
@@ -192,7 +224,9 @@ impl PreparedCopy {
         header["currentLeaf"] = json!(notice_id);
         // A copied grandparent path would misidentify this fork's origin.
         // Use immutable source identity/digest provenance, not a borrowed path.
-        header.as_object_mut().ok_or_else(|| invalid("invalid copy header"))?
+        header
+            .as_object_mut()
+            .ok_or_else(|| invalid("invalid copy header"))?
             .remove("parentSession");
         let notice = json!({
             "type":"message", "id":notice_id, "parentId":leaf, "timestamp":timestamp,
@@ -211,13 +245,27 @@ impl PreparedCopy {
         // inspection envelope itself is never written as a session transcript.
         let _ = SessionHeader::deserialize(&header)?;
         let _ = SessionEntry::deserialize(&notice)?;
-        let prepared = Self { session_id, header, notice, order };
+        let prepared = Self {
+            session_id,
+            header,
+            notice,
+            order,
+        };
         prepared.write(report, &mut RetainedBudget(MAX_EXPORT_BYTES), owner)?;
         Ok(prepared)
     }
 
-    fn write(&self, report: &RecoveryReport, writer: &mut impl Write, owner: &AgentCx) -> Result<()> {
-        let mut writer = CheckedWriter { inner: writer, owner, remaining: MAX_EXPORT_BYTES };
+    fn write(
+        &self,
+        report: &RecoveryReport,
+        writer: &mut impl Write,
+        owner: &AgentCx,
+    ) -> Result<()> {
+        let mut writer = CheckedWriter {
+            inner: writer,
+            owner,
+            remaining: MAX_EXPORT_BYTES,
+        };
         serde_json::to_writer(&mut writer, &self.header)?;
         writer.write_all(b"\n")?;
         for index in &self.order {

@@ -2073,10 +2073,7 @@ pub enum PiMsg {
         message: String,
     },
     /// Only the matching operator request can end an MCP authentication wait.
-    McpAuthFinished {
-        request_id: String,
-        message: String,
-    },
+    McpAuthFinished { request_id: String, message: String },
     /// A terminal handoff reply can settle only the request that admitted it.
     HandoffFinished {
         request_id: String,

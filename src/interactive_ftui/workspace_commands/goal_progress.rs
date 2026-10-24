@@ -31,7 +31,10 @@ struct Display {
 impl Display {
     fn bind_control(&self, control: GoalControl) {
         let refuse = {
-            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.closed || state.control.is_some() {
                 Some(control)
             } else {
@@ -52,7 +55,10 @@ impl Display {
 
     fn messages(&self, messages: Vec<PiMsg>) {
         let pause = {
-            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.closed {
                 return;
             }
@@ -72,7 +78,11 @@ impl Display {
         }
     }
 
-    fn forward(&self, state: &mut DisplayState, messages: Vec<PiMsg>) -> Result<(), SendError<PiMsg>> {
+    fn forward(
+        &self,
+        state: &mut DisplayState,
+        messages: Vec<PiMsg>,
+    ) -> Result<(), SendError<PiMsg>> {
         for message in messages {
             let outgoing = match message {
                 PiMsg::AgentStart => {
@@ -132,7 +142,10 @@ impl Display {
 
     fn close(&self, completed: bool) {
         let pause = {
-            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.closed {
                 return;
             }
@@ -218,7 +231,11 @@ mod tests {
     fn done(error: Option<&str>) -> PiMsg {
         PiMsg::AgentDone {
             usage: Some(Usage::default()),
-            stop_reason: if error.is_some() { StopReason::Error } else { StopReason::Stop },
+            stop_reason: if error.is_some() {
+                StopReason::Error
+            } else {
+                StopReason::Stop
+            },
             error_message: error.map(str::to_owned),
         }
     }
@@ -268,10 +285,17 @@ mod tests {
         let subscription = observation.subscription.unwrap();
         let late = Arc::clone(&observation.display);
         observation.finish();
-        late.messages(vec![PiMsg::AgentStart, PiMsg::TextDelta("late".into()), done(None)]);
+        late.messages(vec![
+            PiMsg::AgentStart,
+            PiMsg::TextDelta("late".into()),
+            done(None),
+        ]);
         assert!(receiver.try_recv().is_err());
         assert!(!listeners.unsubscribe(subscription));
-        assert!(listeners.unsubscribe(unrelated), "other subscriptions survive");
+        assert!(
+            listeners.unsubscribe(unrelated),
+            "other subscriptions survive"
+        );
     }
 
     #[test]
@@ -280,10 +304,14 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let observation = Observation::attach(&listeners, &sender);
         let subscription = observation.subscription.unwrap();
-        observation.display.messages(vec![PiMsg::AgentStart, done(None)]);
+        observation
+            .display
+            .messages(vec![PiMsg::AgentStart, done(None)]);
         assert!(matches!(receiver.try_recv().unwrap(), PiMsg::AgentStart));
         drop(observation);
-        assert!(matches!(receiver.try_recv().unwrap(), PiMsg::AgentError(text) if text.contains("interrupted")));
+        assert!(
+            matches!(receiver.try_recv().unwrap(), PiMsg::AgentError(text) if text.contains("interrupted"))
+        );
         assert!(!listeners.unsubscribe(subscription));
         assert!(receiver.try_recv().is_err());
     }
@@ -295,10 +323,15 @@ mod tests {
         let observation = Observation::attach(&listeners, &sender);
         observation.display.messages(vec![
             PiMsg::AgentStart,
-            PiMsg::ToolStart { name: "read".into(), tool_id: "tool-1".into() },
+            PiMsg::ToolStart {
+                name: "read".into(),
+                tool_id: "tool-1".into(),
+            },
             PiMsg::ToolEnd {
-                name: "read".into(), tool_id: "tool-1".into(),
-                is_error: false, output: Some("file contents".into()),
+                name: "read".into(),
+                tool_id: "tool-1".into(),
+                is_error: false,
+                output: Some("file contents".into()),
             },
             done(Some("provider rejected the request")),
         ]);
@@ -317,10 +350,14 @@ mod tests {
         let listeners = EventListeners::default();
         let (sender, receiver) = mpsc::channel();
         let observation = Observation::attach(&listeners, &sender);
-        observation.display.messages(vec![PiMsg::AgentStart, done(None), PiMsg::AgentStart]);
+        observation
+            .display
+            .messages(vec![PiMsg::AgentStart, done(None), PiMsg::AgentStart]);
         assert!(matches!(receiver.try_recv().unwrap(), PiMsg::AgentStart));
         observation.finish();
-        assert!(matches!(receiver.try_recv().unwrap(), PiMsg::AgentError(text) if text.contains("without a native turn-end")));
+        assert!(
+            matches!(receiver.try_recv().unwrap(), PiMsg::AgentError(text) if text.contains("without a native turn-end"))
+        );
     }
 
     fn with_unpolled_control(check: impl FnOnce(GoalControl)) {
@@ -335,19 +372,41 @@ mod tests {
         use std::path::Path;
         use std::time::Duration;
 
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let agent = Agent::new(
-            Arc::new(OpenAIProvider::new("unpolled-goal-control").with_base_url("http://127.0.0.1:1/v1")),
-            ToolRegistry::new(&[], Path::new("."), None), AgentConfig::default(),
+            Arc::new(
+                OpenAIProvider::new("unpolled-goal-control").with_base_url("http://127.0.0.1:1/v1"),
+            ),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
         );
-        let session = AgentSession::new(agent, Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
-            false, ResolvedCompactionSettings::default());
-        let mut handle = AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        let session = AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+            false,
+            ResolvedCompactionSettings::default(),
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
-            let created = handle.create_goal(&owner, "never dispatch this fixture", GoalBudget::default()).await.unwrap();
-            let run = handle.run_goal(&owner, &created.goal, Duration::from_secs(30), |_, _| {},
-                |_, _| GoalDecision::Pause { reason: "test".into() }).unwrap();
+            let created = handle
+                .create_goal(&owner, "never dispatch this fixture", GoalBudget::default())
+                .await
+                .unwrap();
+            let run = handle
+                .run_goal(
+                    &owner,
+                    &created.goal,
+                    Duration::from_secs(30),
+                    |_, _| {},
+                    |_, _| GoalDecision::Pause {
+                        reason: "test".into(),
+                    },
+                )
+                .unwrap();
             check(run.control());
             drop(run);
             assert_eq!(handle.current_goal().unwrap().unwrap().prompts_started(), 0);
@@ -363,8 +422,14 @@ mod tests {
             observation.control_publisher()(control.clone());
             drop(receiver);
             observation.display.messages(vec![PiMsg::AgentStart]);
-            assert!(!control.pause(), "output loss must already have latched pause");
-            assert!(!control.is_finished(), "pause is not proof of completed cleanup");
+            assert!(
+                !control.pause(),
+                "output loss must already have latched pause"
+            );
+            assert!(
+                !control.is_finished(),
+                "pause is not proof of completed cleanup"
+            );
             assert!(observation.display.state.lock().unwrap().control.is_none());
         });
     }
@@ -390,7 +455,11 @@ mod tests {
                 let (sender, _receiver) = mpsc::channel();
                 let observation = Observation::attach(&listeners, &sender);
                 observation.control_publisher()(control.clone());
-                if finish { observation.finish(); } else { drop(observation); }
+                if finish {
+                    observation.finish();
+                } else {
+                    drop(observation);
+                }
                 assert_eq!(control.pause(), finish);
             });
         }

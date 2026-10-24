@@ -8,8 +8,8 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 

@@ -8,8 +8,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    AgentCx, BUFFER_BYTES, FileIdentity, RecoveredEntry, RecoveryReport, Result,
-    RetainedBudget, check_owner, graph, invalid, regular,
+    AgentCx, BUFFER_BYTES, FileIdentity, RecoveredEntry, RecoveryReport, Result, RetainedBudget,
+    check_owner, graph, invalid, regular,
 };
 
 const MAX_EXPORT_BYTES: usize = 256 * 1024 * 1024;
@@ -43,21 +43,27 @@ struct CheckedWriter<'a, W> {
 impl<W: Write> Write for CheckedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         // Interrupted would make write_all retry forever after cancellation.
-        check_owner(self.owner).map_err(|_| io::Error::other("session recovery export cancelled or denied"))?;
+        check_owner(self.owner)
+            .map_err(|_| io::Error::other("session recovery export cancelled or denied"))?;
         if bytes.len() > self.remaining {
-            return Err(io::Error::other("session recovery export byte limit exceeded"));
+            return Err(io::Error::other(
+                "session recovery export byte limit exceeded",
+            ));
         }
         let count = bytes.len().min(BUFFER_BYTES);
         let written = self.inner.write(&bytes[..count])?;
         if written > count {
-            return Err(io::Error::other("export writer returned an invalid byte count"));
+            return Err(io::Error::other(
+                "export writer returned an invalid byte count",
+            ));
         }
         self.remaining -= written;
         Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        check_owner(self.owner).map_err(|_| io::Error::other("session recovery export cancelled or denied"))?;
+        check_owner(self.owner)
+            .map_err(|_| io::Error::other("session recovery export cancelled or denied"))?;
         self.inner.flush()
     }
 }
@@ -98,7 +104,10 @@ fn json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
 }
 
 fn metadata_without<'a>(value: &'a Value, excluded: &str) -> BTreeMap<&'a str, &'a Value> {
-    value.as_object().into_iter().flat_map(|object| object.iter())
+    value
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
         .filter(|(key, _)| key.as_str() != excluded)
         .map(|(key, value)| (key.as_str(), value))
         .collect()
@@ -108,7 +117,11 @@ fn render_entry(writer: &mut impl Write, entry: &RecoveredEntry) -> Result<()> {
     write!(writer, "\n--- line {} | id ", entry.line)?;
     safe_text(writer, &entry.id, false)?;
     writer.write_all(b" | parent ")?;
-    safe_text(writer, entry.parent_id.as_deref().unwrap_or("<root>"), false)?;
+    safe_text(
+        writer,
+        entry.parent_id.as_deref().unwrap_or("<root>"),
+        false,
+    )?;
     writer.write_all(b" ---\n")?;
     let Some(message) = entry.record.get("message") else {
         return json_line(writer, &entry.record);
@@ -161,23 +174,39 @@ impl RecoveryReport {
         writer: &mut impl Write,
     ) -> Result<()> {
         writer.write_all(b"Pi session text recovery (read-only inspection)\n")?;
-        writer.write_all(b"Media omitted without inspection. This is NOT a resumable session or a repair.\n")?;
+        writer.write_all(
+            b"Media omitted without inspection. This is NOT a resumable session or a repair.\n",
+        )?;
         writer.write_all(b"Private history: text and metadata are not secret-redacted.\n")?;
         writeln!(writer, "Source SHA-256: {}", self.source_sha256)?;
         writeln!(writer, "Source bytes: {}", self.source_bytes)?;
         match selection {
-            RecoverySelection::All => writer.write_all(b"Selection: all records in saved order\n")?,
-            RecoverySelection::Active => writer.write_all(b"Selection: saved active path, root first\n")?,
+            RecoverySelection::All => {
+                writer.write_all(b"Selection: all records in saved order\n")?
+            }
+            RecoverySelection::Active => {
+                writer.write_all(b"Selection: saved active path, root first\n")?
+            }
             RecoverySelection::Branch(id) => {
                 writer.write_all(b"Selection: root-to-entry path ending at ")?;
                 safe_text(writer, id, false)?;
                 writeln!(writer)?;
             }
         }
-        writeln!(writer, "Records displayed: {} of {}", indices.len(), self.entries.len())?;
-        writeln!(writer, "Media omissions in whole source: {}", self.omissions.len())?;
+        writeln!(
+            writer,
+            "Records displayed: {} of {}",
+            indices.len(),
+            self.entries.len()
+        )?;
+        writeln!(
+            writer,
+            "Media omissions in whole source: {}",
+            self.omissions.len()
+        )?;
         if self.unterminated_final_row {
-            writer.write_all(b"Source ended without a newline; no source repair was performed.\n")?;
+            writer
+                .write_all(b"Source ended without a newline; no source repair was performed.\n")?;
         }
         writer.write_all(b"Header: ")?;
         json_line(writer, &self.header)?;
@@ -198,7 +227,11 @@ impl RecoveryReport {
 
     /// Export one explicit history selection. Unknown IDs and size-limit
     /// failures are rejected before the first byte reaches the caller's writer.
-    pub fn write_selected_text(&self, selection: RecoverySelection<'_>, writer: &mut impl Write) -> Result<()> {
+    pub fn write_selected_text(
+        &self,
+        selection: RecoverySelection<'_>,
+        writer: &mut impl Write,
+    ) -> Result<()> {
         let owner = AgentCx::for_current_or_request();
         self.write_text_with_limit(selection, writer, MAX_EXPORT_BYTES, &owner)
     }
@@ -213,8 +246,24 @@ impl RecoveryReport {
         check_owner(owner)?;
         let indices = self.indices(selection, owner)?;
         let mut count = RetainedBudget(limit);
-        self.render_text(&indices, selection, &mut CheckedWriter { inner: &mut count, owner, remaining: limit })?;
-        self.render_text(&indices, selection, &mut CheckedWriter { inner: writer, owner, remaining: limit })
+        self.render_text(
+            &indices,
+            selection,
+            &mut CheckedWriter {
+                inner: &mut count,
+                owner,
+                remaining: limit,
+            },
+        )?;
+        self.render_text(
+            &indices,
+            selection,
+            &mut CheckedWriter {
+                inner: writer,
+                owner,
+                remaining: limit,
+            },
+        )
     }
 
     /// Stream the complete JSON report, preserving Unicode and original text
@@ -226,7 +275,11 @@ impl RecoveryReport {
         let mut count = RetainedBudget(MAX_EXPORT_BYTES);
         serde_json::to_writer(&mut count, self)?;
         count.write_all(b"\n")?;
-        let mut checked = CheckedWriter { inner: writer, owner: &owner, remaining: MAX_EXPORT_BYTES };
+        let mut checked = CheckedWriter {
+            inner: writer,
+            owner: &owner,
+            remaining: MAX_EXPORT_BYTES,
+        };
         serde_json::to_writer(&mut checked, self)?;
         checked.write_all(b"\n")?;
         Ok(())
@@ -237,12 +290,21 @@ impl RecoveryReport {
     /// A private staging file is fully written and synced before no-clobber
     /// publication. This syncs file content, not the parent directory; it is
     /// not a crash-durable directory or hostile-directory confinement claim.
-    pub fn export_file(&self, destination: impl AsRef<Path>, format: RecoveryExport<'_>) -> Result<()> {
+    pub fn export_file(
+        &self,
+        destination: impl AsRef<Path>,
+        format: RecoveryExport<'_>,
+    ) -> Result<()> {
         let owner = AgentCx::for_current_or_request();
-        publish_new_file(destination.as_ref(), &owner, |_| Ok(()), |file| match format {
-            RecoveryExport::Json => self.write_json(file),
-            RecoveryExport::Text(selection) => self.write_selected_text(selection, file),
-        })
+        publish_new_file(
+            destination.as_ref(),
+            &owner,
+            |_| Ok(()),
+            |file| match format {
+                RecoveryExport::Json => self.write_json(file),
+                RecoveryExport::Text(selection) => self.write_selected_text(selection, file),
+            },
+        )
     }
 }
 
@@ -256,36 +318,56 @@ fn publish_new_file(
     write: impl FnOnce(&mut std::fs::File) -> Result<()>,
 ) -> Result<()> {
     check_owner(owner)?;
-    let name = destination.file_name().ok_or_else(|| invalid("export requires a filename"))?;
-    let parent = destination.parent().filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new(".")).canonicalize()?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| invalid("export requires a filename"))?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
     let destination = parent.join(name);
     match std::fs::symlink_metadata(&destination) {
-        Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "recovery export never replaces an existing destination").into()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "recovery export never replaces an existing destination",
+            )
+            .into());
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     validate(&destination)?;
     let parent_identity = FileIdentity::of_path_nofollow(&parent)?;
     check_owner(owner)?;
-    let mut staged = tempfile::Builder::new().prefix(".pi-text-recovery-").tempfile_in(&parent)?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".pi-text-recovery-")
+        .tempfile_in(&parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     write(staged.as_file_mut())?;
     check_owner(owner)?;
     staged.as_file().sync_all()?;
     if FileIdentity::of_path_nofollow(&parent)? != parent_identity
         || !regular(&std::fs::symlink_metadata(staged.path())?)
-        || FileIdentity::of_path_nofollow(staged.path())? != FileIdentity::of_open_file(staged.as_file())?
+        || FileIdentity::of_path_nofollow(staged.path())?
+            != FileIdentity::of_open_file(staged.as_file())?
     {
         return Err(invalid("export staging path changed before publication"));
     }
     validate(&destination)?;
     check_owner(owner)?;
-    drop(staged.persist_noclobber(destination).map_err(|error| error.error)?);
+    drop(
+        staged
+            .persist_noclobber(destination)
+            .map_err(|error| error.error)?,
+    );
     // Once admitted, a complete file may exist despite later cancellation.
     // This syncs the file, not its directory, as documented by export_file.
     Ok(())
@@ -293,18 +375,22 @@ fn publish_new_file(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::{header, transcript, user};
+    use super::*;
     use serde_json::json;
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf, RecoveryReport) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("saved.jsonl");
-        transcript(&path, &header(Some("chosen")), &[
-            user("root", None, json!("root text")),
-            user("chosen", Some("root"), json!("chosen text")),
-            user("other", Some("root"), json!("other branch")),
-        ]);
+        transcript(
+            &path,
+            &header(Some("chosen")),
+            &[
+                user("root", None, json!("root text")),
+                user("chosen", Some("root"), json!("chosen text")),
+                user("other", Some("root"), json!("other branch")),
+            ],
+        );
         let report = super::super::recover_session_text(&path).unwrap();
         (dir, path, report)
     }
@@ -318,7 +404,11 @@ mod tests {
         assert!(String::from_utf8(all).unwrap().contains("other branch"));
         for (selection, present, absent) in [
             (RecoverySelection::Active, "chosen text", "other branch"),
-            (RecoverySelection::Branch("other"), "other branch", "chosen text"),
+            (
+                RecoverySelection::Branch("other"),
+                "other branch",
+                "chosen text",
+            ),
         ] {
             let mut bytes = Vec::new();
             report.write_selected_text(selection, &mut bytes).unwrap();
@@ -336,9 +426,22 @@ mod tests {
     fn unknown_selection_and_export_size_refusal_write_nothing() {
         let (_dir, _path, report) = fixture();
         let mut bytes = Vec::new();
-        assert!(report.write_selected_text(RecoverySelection::Branch("missing"), &mut bytes).is_err());
+        assert!(
+            report
+                .write_selected_text(RecoverySelection::Branch("missing"), &mut bytes)
+                .is_err()
+        );
         assert!(bytes.is_empty());
-        assert!(report.write_text_with_limit(RecoverySelection::All, &mut bytes, 16, &AgentCx::for_request()).is_err());
+        assert!(
+            report
+                .write_text_with_limit(
+                    RecoverySelection::All,
+                    &mut bytes,
+                    16,
+                    &AgentCx::for_request()
+                )
+                .is_err()
+        );
         assert!(bytes.is_empty());
     }
 
@@ -346,8 +449,13 @@ mod tests {
     fn terminal_controls_are_escaped_but_json_keeps_original_text() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("controls.jsonl");
-        let original = "line one\n界\tvalue\r\u{1b}]52;c;payload\u{7}\u{9b}2J\u{202e}spoof\\literal";
-        transcript(&path, &header(None), &[user("id\u{1b}", None, json!(original))]);
+        let original =
+            "line one\n界\tvalue\r\u{1b}]52;c;payload\u{7}\u{9b}2J\u{202e}spoof\\literal";
+        transcript(
+            &path,
+            &header(None),
+            &[user("id\u{1b}", None, json!(original))],
+        );
         let report = super::super::recover_session_text(&path).unwrap();
         let mut text = Vec::new();
         report.write_text(&mut text).unwrap();
@@ -362,7 +470,10 @@ mod tests {
         let mut json_bytes = Vec::new();
         report.write_json(&mut json_bytes).unwrap();
         let decoded: Value = serde_json::from_slice(&json_bytes).unwrap();
-        assert_eq!(decoded["entries"][0]["record"]["message"]["content"], original);
+        assert_eq!(
+            decoded["entries"][0]["record"]["message"]["content"],
+            original
+        );
     }
 
     #[test]
@@ -389,7 +500,14 @@ mod tests {
     fn failed_export_leaves_no_destination_or_staging_debris() {
         let (dir, source, report) = fixture();
         let output = dir.path().join("invalid.txt");
-        assert!(report.export_file(&output, RecoveryExport::Text(RecoverySelection::Branch("missing"))).is_err());
+        assert!(
+            report
+                .export_file(
+                    &output,
+                    RecoveryExport::Text(RecoverySelection::Branch("missing"))
+                )
+                .is_err()
+        );
         assert!(!output.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let output = dir.path().join("valid.json");
@@ -406,7 +524,9 @@ mod tests {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "consumer closed"))
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         let (_dir, _source, report) = fixture();
         assert!(report.write_text(&mut Fails).is_err());
@@ -419,20 +539,38 @@ mod tests {
 
     #[test]
     fn cancellation_during_write_stops_instead_of_retrying_interrupted_forever() {
-        struct CancelAfterWrite<'a> { owner: &'a AgentCx, writes: usize }
+        struct CancelAfterWrite<'a> {
+            owner: &'a AgentCx,
+            writes: usize,
+        }
         impl Write for CancelAfterWrite<'_> {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 self.writes += 1;
                 assert_eq!(self.writes, 1, "no second write after cancellation");
-                self.owner.cancel_with(asupersync::types::CancelKind::User, Some("stop export"));
+                self.owner
+                    .cancel_with(asupersync::types::CancelKind::User, Some("stop export"));
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         let (_dir, _source, report) = fixture();
         let owner = AgentCx::for_request();
-        let mut writer = CancelAfterWrite { owner: &owner, writes: 0 };
-        assert!(report.write_text_with_limit(RecoverySelection::All, &mut writer, MAX_EXPORT_BYTES, &owner).is_err());
+        let mut writer = CancelAfterWrite {
+            owner: &owner,
+            writes: 0,
+        };
+        assert!(
+            report
+                .write_text_with_limit(
+                    RecoverySelection::All,
+                    &mut writer,
+                    MAX_EXPORT_BYTES,
+                    &owner
+                )
+                .is_err()
+        );
         assert_eq!(writer.writes, 1);
     }
 
@@ -443,12 +581,20 @@ mod tests {
         let (dir, _source, report) = fixture();
         let output = dir.path().join("report.json");
         report.export_file(&output, RecoveryExport::Json).unwrap();
-        assert_eq!(std::fs::metadata(output).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let absent = dir.path().join("absent.txt");
         let linked = dir.path().join("linked.txt");
         symlink(&absent, &linked).unwrap();
         assert!(report.export_file(&linked, RecoveryExport::Json).is_err());
         assert!(!absent.exists());
-        assert!(std::fs::symlink_metadata(linked).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

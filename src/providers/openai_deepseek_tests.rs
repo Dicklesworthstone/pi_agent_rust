@@ -1,8 +1,6 @@
 //! Terminal and fragmented-stream regressions for DeepSeek text tool recovery.
 
-use super::{
-    AssistantMessage, ContentBlock, SseStream, StopReason, StreamEvent, StreamState,
-};
+use super::{AssistantMessage, ContentBlock, SseStream, StopReason, StreamEvent, StreamState};
 use serde_json::{Value, json};
 
 type TestState = StreamState<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>;
@@ -22,9 +20,7 @@ fn deepseek_state() -> TestState {
 
 fn feed(state: &mut TestState, delta: &Value, finish: Option<&str>) {
     state
-        .process_event(
-            &json!({"choices": [{"delta": delta, "finish_reason": finish}]}).to_string(),
-        )
+        .process_event(&json!({"choices": [{"delta": delta, "finish_reason": finish}]}).to_string())
         .expect("valid stream frame");
 }
 
@@ -48,24 +44,35 @@ fn finish(mut state: TestState) -> (Vec<StreamEvent>, AssistantMessage) {
         })
         .expect("one terminal message");
     assert_eq!(
-        events.iter().filter(|event| matches!(event, StreamEvent::Done { .. })).count(),
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Done { .. }))
+            .count(),
         1
     );
     (events, message)
 }
 
 fn visible(message: &AssistantMessage) -> String {
-    message.content.iter().filter_map(|block| match block {
-        ContentBlock::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    }).collect()
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn calls(message: &AssistantMessage) -> Vec<&crate::model::ToolCall> {
-    message.content.iter().filter_map(|block| match block {
-        ContentBlock::ToolCall(call) => Some(call),
-        _ => None,
-    }).collect()
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .collect()
 }
 
 fn template_call(name: &str, arguments: &Value) -> String {
@@ -93,7 +100,8 @@ fn recovers_both_dsml_spellings_with_typed_parameters_and_ordered_events() {
         feed_characters(&mut state, &input);
         // Neither raw markup nor speculative calls reach any partial snapshot.
         assert!(!state.pending_events.iter().any(|event| matches!(
-            event, StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. }
+            event,
+            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. }
         )));
         assert!(state.pending_events.iter().all(|event| match event {
             StreamEvent::TextDelta { delta, .. } => !delta.contains("DSML"),
@@ -103,23 +111,46 @@ fn recovers_both_dsml_spellings_with_typed_parameters_and_ordered_events() {
         let (events, message) = finish(state);
         assert_eq!(message.stop_reason, StopReason::ToolUse);
         assert_eq!(visible(&message), "Before\n\nAfter");
-        assert!(matches!(message.content.as_slice(), [
-            ContentBlock::Text(_), ContentBlock::ToolCall(_), ContentBlock::Text(_)
-        ]));
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                ContentBlock::Text(_),
+                ContentBlock::ToolCall(_),
+                ContentBlock::Text(_)
+            ]
+        ));
         let calls = calls(&message);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "bash");
         assert!(calls[0].id.starts_with("call_"));
-        assert_eq!(calls[0].arguments, json!({
-            "command": "  echo &lt;ok&gt;\n",
-            "timeout": 15,
-            "options": {"enabled": true, "items": [1, null]}
-        }));
-        let start = events.iter().position(|event| matches!(event, StreamEvent::ToolCallStart { .. })).unwrap();
-        let delta = events.iter().position(|event| matches!(event, StreamEvent::ToolCallDelta { .. })).unwrap();
-        let end = events.iter().position(|event| matches!(event, StreamEvent::ToolCallEnd { .. })).unwrap();
+        assert_eq!(
+            calls[0].arguments,
+            json!({
+                "command": "  echo &lt;ok&gt;\n",
+                "timeout": 15,
+                "options": {"enabled": true, "items": [1, null]}
+            })
+        );
+        let start = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+            .unwrap();
+        let delta = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallDelta { .. }))
+            .unwrap();
+        let end = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            .unwrap();
         assert!(start < delta && delta < end && end < events.len() - 1);
-        assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. })).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            1
+        );
     }
 }
 
@@ -127,16 +158,32 @@ fn recovers_both_dsml_spellings_with_typed_parameters_and_ordered_events() {
 fn recovers_canonical_respelled_and_legacy_templates_at_every_split() {
     let arguments = json!({"path": "src/lib.rs"});
     let inputs = [
-        format!("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>read<｜tool▁sep｜>{arguments}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
-        format!("<｜tool_calls_begin｜><tool_call_begin｜>read<｜tool_sep｜>{arguments}<｜tool_calls_end｜><｜tool_calls_end｜>"),
-        format!("<｜tool▁calls_begin｜><｜tool_call_begin>read<tool_sep｜>{arguments}<tool_calls_end｜>"),
-        format!("<｜tool▁call▁begin｜>function<｜tool▁sep｜>read\n```json\n{arguments}\n```<｜tool▁call▁end｜>"),
+        format!(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>read<｜tool▁sep｜>{arguments}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        ),
+        format!(
+            "<｜tool_calls_begin｜><tool_call_begin｜>read<｜tool_sep｜>{arguments}<｜tool_calls_end｜><｜tool_calls_end｜>"
+        ),
+        format!(
+            "<｜tool▁calls_begin｜><｜tool_call_begin>read<tool_sep｜>{arguments}<tool_calls_end｜>"
+        ),
+        format!(
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>read\n```json\n{arguments}\n```<｜tool▁call▁end｜>"
+        ),
     ];
     for input in inputs {
-        for split in input.char_indices().map(|(index, _)| index).chain([input.len()]) {
+        for split in input
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([input.len()])
+        {
             let mut state = deepseek_state();
             feed(&mut state, &json!({"content": &input[..split]}), None);
-            feed(&mut state, &json!({"content": &input[split..]}), Some("stop"));
+            feed(
+                &mut state,
+                &json!({"content": &input[split..]}),
+                Some("stop"),
+            );
             let (_, message) = finish(state);
             assert_eq!(message.stop_reason, StopReason::ToolUse, "split {split}");
             assert_eq!(visible(&message), "");
@@ -150,7 +197,8 @@ fn recovers_canonical_respelled_and_legacy_templates_at_every_split() {
 
 #[test]
 fn consecutive_calls_have_unique_ids_and_ignore_markers_inside_json_strings() {
-    let arguments = json!({"content": "x <｜tool▁calls▁end｜> <｜tool_call_begin｜> <tool_call_end｜> y"});
+    let arguments =
+        json!({"content": "x <｜tool▁calls▁end｜> <｜tool_call_begin｜> <tool_call_end｜> y"});
     let input = format!(
         "<｜tool_calls_begin｜><｜tool_call_begin｜>write<｜tool_sep｜>{arguments}\
          <｜tool_call_begin｜>read<｜tool_sep｜>{{\"path\":\"a\"}}<｜tool_calls_end｜>Done."
@@ -177,7 +225,10 @@ fn quoted_examples_and_other_model_templates_remain_ordinary_prose() {
         "A <tool_call_begin> element and if a < b.\n",
     );
     let mut state = deepseek_state();
-    feed_characters(&mut state, &format!("{prose}{}", template_call("read", &json!({"path":"a"}))));
+    feed_characters(
+        &mut state,
+        &format!("{prose}{}", template_call("read", &json!({"path":"a"}))),
+    );
     feed(&mut state, &json!({}), Some("stop"));
     let (_, message) = finish(state);
     assert_eq!(visible(&message), prose);
@@ -206,7 +257,11 @@ fn recovery_is_enabled_only_for_deepseek_provider_or_model_components() {
     for (provider, model, expected) in [
         ("deepseek", "chat", true),
         ("openrouter", "deepseek/deepseek-v4-pro", true),
-        ("fireworks", "accounts/fireworks/models/deepseek-v4.1-flash", true),
+        (
+            "fireworks",
+            "accounts/fireworks/models/deepseek-v4.1-flash",
+            true,
+        ),
         ("ollama", "deepseek-r1:latest", true),
         ("openai", "gpt-4o", false),
         ("openai", "my-deepseek-helper", false),
@@ -258,8 +313,20 @@ fn native_calls_remain_authoritative_before_after_or_alongside_text_calls() {
         assert_eq!(calls[0].id, "native-call");
         assert_eq!(calls[0].arguments, json!({"path":"same"}));
         assert_eq!(visible(&message), "");
-        assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ToolCallStart { .. })).count(), 1);
-        assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. })).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            1
+        );
     }
 }
 
@@ -279,9 +346,17 @@ fn malformed_envelopes_fail_the_whole_batch_without_leaking_payloads() {
     ];
     for malformed in malformed {
         let mut state = deepseek_state();
-        feed(&mut state, &json!({"content": "Ordinary introduction. "}), None);
+        feed(
+            &mut state,
+            &json!({"content": "Ordinary introduction. "}),
+            None,
+        );
         // A valid peer must not escape before a malformed later call is checked.
-        feed(&mut state, &json!({"content": template_call("read", &json!({"path":"ok"}))}), None);
+        feed(
+            &mut state,
+            &json!({"content": template_call("read", &json!({"path":"ok"}))}),
+            None,
+        );
         feed_characters(&mut state, malformed);
         feed(&mut state, &json!({}), Some("stop"));
         let (events, message) = finish(state);
@@ -289,7 +364,8 @@ fn malformed_envelopes_fail_the_whole_batch_without_leaking_payloads() {
         assert!(calls(&message).is_empty());
         assert_eq!(visible(&message), "Ordinary introduction. ");
         assert!(!events.iter().any(|event| matches!(
-            event, StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. }
+            event,
+            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. }
         )));
         let error = message.error_message.expect("controlled diagnostic");
         assert!(error.len() < 256);
@@ -308,9 +384,13 @@ fn native_calls_remain_authoritative_when_leaked_text_is_malformed_or_oversized(
         let mut state = deepseek_state();
         // The text error can arrive before the authoritative native lane.
         feed(&mut state, &json!({"content": text}), None);
-        feed(&mut state, &json!({"tool_calls": [{
-            "index": 0, "id": "native", "function": {"name":"read", "arguments":"{}"}
-        }]}), Some("stop"));
+        feed(
+            &mut state,
+            &json!({"tool_calls": [{
+                "index": 0, "id": "native", "function": {"name":"read", "arguments":"{}"}
+            }]}),
+            Some("stop"),
+        );
         let (events, message) = finish(state);
         assert_eq!(message.stop_reason, StopReason::ToolUse);
         assert!(message.error_message.is_none());
@@ -318,7 +398,13 @@ fn native_calls_remain_authoritative_when_leaked_text_is_malformed_or_oversized(
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "native");
         assert_eq!(calls[0].arguments, json!({}));
-        assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. })).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            1
+        );
         assert_eq!(visible(&message), "");
     }
 }
@@ -331,17 +417,26 @@ fn failure_and_length_reasons_never_gain_recovered_calls() {
         ("error", StopReason::Error),
     ] {
         let mut state = deepseek_state();
-        feed(&mut state, &json!({"content": template_call("read", &json!({"path":"a"}))}), Some(wire_reason));
+        feed(
+            &mut state,
+            &json!({"content": template_call("read", &json!({"path":"a"}))}),
+            Some(wire_reason),
+        );
         let (events, message) = finish(state);
         assert_eq!(message.stop_reason, expected);
         assert!(calls(&message).is_empty());
         assert!(!events.iter().any(|event| matches!(
-            event, StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. }
+            event,
+            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. }
         )));
     }
 
     let mut state = deepseek_state();
-    feed(&mut state, &json!({"content": template_call("read", &json!({"path":"a"}))}), None);
+    feed(
+        &mut state,
+        &json!({"content": template_call("read", &json!({"path":"a"}))}),
+        None,
+    );
     state.partial.stop_reason = StopReason::Aborted;
     let (_, message) = finish(state);
     assert_eq!(message.stop_reason, StopReason::Aborted);
@@ -351,7 +446,11 @@ fn failure_and_length_reasons_never_gain_recovered_calls() {
 #[test]
 fn truncated_call_at_length_is_an_explicit_error() {
     let mut state = deepseek_state();
-    feed(&mut state, &json!({"content":"<｜tool_calls_begin｜><｜tool_call_begin｜>read<｜tool_sep｜>{\"path\":\"unfinished"}), Some("length"));
+    feed(
+        &mut state,
+        &json!({"content":"<｜tool_calls_begin｜><｜tool_call_begin｜>read<｜tool_sep｜>{\"path\":\"unfinished"}),
+        Some("length"),
+    );
     let (_, message) = finish(state);
     assert_eq!(message.stop_reason, StopReason::Error);
     assert!(calls(&message).is_empty());
@@ -361,21 +460,42 @@ fn truncated_call_at_length_is_an_explicit_error() {
 #[test]
 fn recovery_preserves_reasoning_and_trailing_usage_and_finalizes_once() {
     let mut state = deepseek_state();
-    feed(&mut state, &json!({"reasoning_content":"Inspect the source first."}), None);
-    feed(&mut state, &json!({"content": template_call("read", &json!({"path":"a"}))}), Some("stop"));
+    feed(
+        &mut state,
+        &json!({"reasoning_content":"Inspect the source first."}),
+        None,
+    );
+    feed(
+        &mut state,
+        &json!({"content": template_call("read", &json!({"path":"a"}))}),
+        Some("stop"),
+    );
     feed(&mut state, &json!({}), Some("stop"));
-    state.process_event(&json!({
-        "choices": [],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
-    }).to_string()).unwrap();
+    state
+        .process_event(
+            &json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
+            })
+            .to_string(),
+        )
+        .unwrap();
     let (events, message) = finish(state);
     assert_eq!(message.stop_reason, StopReason::ToolUse);
     assert_eq!(message.usage.input, 10);
     assert_eq!(message.usage.output, 3);
-    assert!(matches!(&message.content[0], ContentBlock::Thinking(thinking)
-        if thinking.thinking == "Inspect the source first."));
+    assert!(
+        matches!(&message.content[0], ContentBlock::Thinking(thinking)
+        if thinking.thinking == "Inspect the source first.")
+    );
     assert_eq!(calls(&message).len(), 1);
-    assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. })).count(), 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -392,8 +512,17 @@ fn recovery_limits_reject_the_whole_response_without_payload_echo() {
         assert_eq!(message.stop_reason, StopReason::Error);
         assert!(calls(&message).is_empty());
         assert_eq!(visible(&message), "");
-        assert!(message.error_message.as_deref().is_some_and(|error| error.len() < 256));
-        assert!(!events.iter().any(|event| matches!(event, StreamEvent::ToolCallEnd { .. })));
+        assert!(
+            message
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.len() < 256)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+        );
     }
 }
 
@@ -401,10 +530,7 @@ fn recovery_limits_reject_the_whole_response_without_payload_echo() {
 fn quoted_marker_with_long_fragmented_body_remains_text() {
     // Exercise incremental quote lookahead without repeatedly rescanning the
     // already received prefix; no tool is authorized by a quoted example.
-    let input = format!(
-        "`<｜tool_calls_begin｜>{}` Done.",
-        "x".repeat(16 * 1024)
-    );
+    let input = format!("`<｜tool_calls_begin｜>{}` Done.", "x".repeat(16 * 1024));
     let mut state = deepseek_state();
     feed_characters(&mut state, &input);
     feed(&mut state, &json!({}), Some("stop"));
@@ -416,7 +542,10 @@ fn quoted_marker_with_long_fragmented_body_remains_text() {
 
 #[test]
 fn reasoning_envelopes_never_authorize_embedded_tool_calls() {
-    for example in [dsml_call("｜"), template_call("write", &json!({"path":"thought"}))] {
+    for example in [
+        dsml_call("｜"),
+        template_call("write", &json!({"path":"thought"})),
+    ] {
         for closed in [true, false] {
             for fragmented in [true, false] {
                 let reasoning = format!("<think>Consider this example: {example}");
@@ -451,8 +580,10 @@ fn reasoning_envelopes_never_authorize_embedded_tool_calls() {
 fn captured_tail_respects_thinking_and_quoted_think_tags() {
     let quoted = "The `<think>` tag introduces reasoning. ";
     let actual = template_call("read", &json!({"path":"actual"}));
-    let reasoning = format!("<think>Do not execute {}",
-        template_call("write", &json!({"path":"thought"})));
+    let reasoning = format!(
+        "<think>Do not execute {}",
+        template_call("write", &json!({"path":"thought"}))
+    );
     let input = format!("{quoted}{actual}{reasoning}");
     let mut state = deepseek_state();
     feed_characters(&mut state, &input);

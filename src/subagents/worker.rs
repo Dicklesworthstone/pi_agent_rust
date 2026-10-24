@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-mod pool;
 pub(super) mod output_contract;
+mod pool;
 
 const SCHEMA: &str = "pi.subagent.worker.v1";
 const MAX_WORKERS: usize = 32;
@@ -94,9 +94,19 @@ pub(super) fn requested(input: &Value) -> Result<bool> {
         Some(Value::String(operation))
             if matches!(
                 operation.as_str(),
-                "worker_start" | "worker_send" | "worker_status" | "worker_wait" | "worker_close"
-                    | "pool_start" | "pool_push" | "pool_finish" | "pool_status"
-                    | "pool_result" | "pool_wait" | "pool_drain" | "pool_close"
+                "worker_start"
+                    | "worker_send"
+                    | "worker_status"
+                    | "worker_wait"
+                    | "worker_close"
+                    | "pool_start"
+                    | "pool_push"
+                    | "pool_finish"
+                    | "pool_status"
+                    | "pool_result"
+                    | "pool_wait"
+                    | "pool_drain"
+                    | "pool_close"
             ) =>
         {
             Ok(true)
@@ -270,10 +280,14 @@ async fn start(
         .remove(&name)
         .ok_or_else(|| invalid("unknown agent definition"))?;
     let schema = input.get("outputSchema").or(agent.output_schema.as_ref());
-    if input.get("schemaMode").is_some_and(|mode| mode.as_str() != Some("strict"))
+    if input
+        .get("schemaMode")
+        .is_some_and(|mode| mode.as_str() != Some("strict"))
         || (input.get("schemaMode").is_some() && schema.is_none())
     {
-        return Err(invalid("retained output contracts require a schema and strict mode; no corrective retries"));
+        return Err(invalid(
+            "retained output contracts require a schema and strict mode; no corrective retries",
+        ));
     }
     output_contract::OutputContract::preflight(schema, &privacy)?;
     if let Some(schema) = input.get("outputSchema") {
@@ -610,10 +624,14 @@ fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Resul
     let details = privacy.project_json(&value)?;
     if let Some(result) = value.pointer("/turn/result")
         && !output_contract::preserves_typed_result(
-            result, details.pointer("/turn/result").unwrap_or(&Value::Null),
+            result,
+            details.pointer("/turn/result").unwrap_or(&Value::Null),
         )
     {
-        return Err(Error::tool("subagent", "PI_SUBAGENT_WORKER_PRIVACY: privacy policy withheld a schema-validated result"));
+        return Err(Error::tool(
+            "subagent",
+            "PI_SUBAGENT_WORKER_PRIVACY: privacy policy withheld a schema-validated result",
+        ));
     }
     for path in [
         "/schema",
@@ -690,11 +708,7 @@ pub(super) fn should_close(shared: &Shared) -> bool {
     })
 }
 
-pub(super) fn observe_idle_context(
-    shared: &Shared,
-    tokens: Option<u64>,
-    window: Option<u64>,
-) {
+pub(super) fn observe_idle_context(shared: &Shared, tokens: Option<u64>, window: Option<u64>) {
     if let Ok(mut state) = shared.lock() {
         if !state.closed && !state.closing && state.deadline.check().is_ok() {
             state.context_tokens = tokens;
@@ -713,7 +727,8 @@ fn protected_result(result: Result<ToolOutput>, privacy: &AuxiliaryPrivacySnapsh
         let value = serde_json::from_slice::<Value>(&bytes).ok()?;
         let projected = privacy.project_json(&value).ok()?;
         if !output_contract::preserves_typed_result(&value, &projected)
-            || serde_json::to_vec(&projected).ok()?.len() > MAX_TURN_RESULT_BYTES {
+            || serde_json::to_vec(&projected).ok()?.len() > MAX_TURN_RESULT_BYTES
+        {
             return None;
         }
         serde_json::from_value(projected).ok()
@@ -777,11 +792,13 @@ pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>
         turn.status = status;
         turn.result = Some(output);
         state.result_bytes = state.result_bytes.saturating_add(bytes);
-        let notice = state.emit_notices.then(|| format!(
-            "[reusable worker {} turn {id} {status}]\n{}",
-            state.id,
-            if over_budget { WITHHELD } else { &summary }
-        ));
+        let notice = state.emit_notices.then(|| {
+            format!(
+                "[reusable worker {} turn {id} {status}]\n{}",
+                state.id,
+                if over_budget { WITHHELD } else { &summary }
+            )
+        });
         Ok(((), notice))
     });
     if accepted.is_err() {

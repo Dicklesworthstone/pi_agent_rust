@@ -57,7 +57,8 @@ impl Evaluator {
         // Lower only before the first evaluation. A runtime SyntaxError must
         // never cause a second execution of a cell or its dependencies.
         let prepared = if needs_async {
-            imports::prepare(code).map_err(|error| rquickjs::Exception::throw_message(ctx, error))?
+            imports::prepare(code)
+                .map_err(|error| rquickjs::Exception::throw_message(ctx, error))?
         } else {
             None
         };

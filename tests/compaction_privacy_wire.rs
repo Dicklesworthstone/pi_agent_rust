@@ -6,8 +6,8 @@
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 use pi::compaction::{
-    CompactionPreparation, CompactionPrivacy, FileOperations, ResolvedCompactionSettings,
-    compact, compaction_preparation_to_value,
+    CompactionPreparation, CompactionPrivacy, FileOperations, ResolvedCompactionSettings, compact,
+    compaction_preparation_to_value,
 };
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ToolCall, UserContent};
 use pi::provider::{Provider, StreamOptions};
@@ -139,9 +139,7 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> CapturedRequest {
         let body_end = end + 4 + length;
         if bytes.len() >= body_end {
             return CapturedRequest {
-                authorization: header("authorization")
-                    .expect("authorization")
-                    .to_string(),
+                authorization: header("authorization").expect("authorization").to_string(),
                 body: serde_json::from_slice(&bytes[end + 4..body_end]).expect("request JSON"),
             };
         }
@@ -157,7 +155,9 @@ struct WireFixture {
 impl WireFixture {
     fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let url = format!("http://{}/v1", listener.local_addr().expect("address"));
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);

@@ -171,10 +171,18 @@ fn explicit_cwd_controls_target_breakpoints_adapter_process_and_launch_wire() {
     )
     .unwrap();
     let wire = capture(&tool, &runtime);
-    let launch = wire.iter().find(|entry| entry["command"] == "launch").unwrap();
+    let launch = wire
+        .iter()
+        .find(|entry| entry["command"] == "launch")
+        .unwrap();
     assert_eq!(
         launch["arguments"]["program"],
-        nested.join("program.py").canonicalize().unwrap().display().to_string()
+        nested
+            .join("program.py")
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
     );
     assert_eq!(
         launch["arguments"]["cwd"],
@@ -186,7 +194,12 @@ fn explicit_cwd_controls_target_breakpoints_adapter_process_and_launch_wire() {
         .unwrap();
     assert_eq!(
         set["arguments"]["source"]["path"],
-        nested.join("program.py").canonicalize().unwrap().display().to_string()
+        nested
+            .join("program.py")
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
     );
     run(&tool, &runtime, json!({"action":"disconnect"})).unwrap();
     assert!(

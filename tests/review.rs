@@ -11,15 +11,26 @@ use pi::review::{
 };
 
 fn git(repo: &std::path::Path, args: &[&str]) {
-    let output = Command::new("git").args(args).current_dir(repo).output().expect("git command"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Native Git fixture setup must execute successfully.
-    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr)); // ubs:ignore[rust.panic.assert-macros] -- A failed fixture command invalidates every target assertion.
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git command"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Native Git fixture setup must execute successfully.
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    ); // ubs:ignore[rust.panic.assert-macros] -- A failed fixture command invalidates every target assertion.
 }
 
 fn review_repository() -> tempfile::TempDir {
     let temp = tempdir().expect("review repository"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Each integration test requires an isolated repository.
     git(temp.path(), &["init"]);
     git(temp.path(), &["config", "user.name", "Review Test"]);
-    git(temp.path(), &["config", "user.email", "review@example.invalid"]);
+    git(
+        temp.path(),
+        &["config", "user.email", "review@example.invalid"],
+    );
     git(temp.path(), &["config", "commit.gpgsign", "false"]);
     temp
 }
@@ -49,19 +60,33 @@ fn review_git_targets_distinguish_index_commit_branch_and_untracked_changes() {
     fs::create_dir(repo.path().join("nested")).expect("subdirectory"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Root resolution must be exercised from an actual subdirectory.
     fs::write(repo.path().join("nested/space name.rs"), "untracked text\n").expect("new file"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- A real spaced untracked path exercises Git's header delimiter.
 
-    let (_, all) = CodeReviewer::acquire_diff(&repo.path().join("nested"), None).expect("whole repository from subdirectory"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Valid uncommitted target acquisition must succeed from the nested directory.
-    assert_eq!(files_in(&all), ["first.rs", "nested/space name.rs", "second.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Uncommitted review must include index, working-tree, and untracked files.
+    let (_, all) = CodeReviewer::acquire_diff(&repo.path().join("nested"), None)
+        .expect("whole repository from subdirectory"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Valid uncommitted target acquisition must succeed from the nested directory.
+    assert_eq!(
+        files_in(&all),
+        ["first.rs", "nested/space name.rs", "second.rs"]
+            .into_iter()
+            .collect()
+    ); // ubs:ignore[rust.panic.assert-macros] -- Uncommitted review must include index, working-tree, and untracked files.
     let (_, staged) = CodeReviewer::acquire_diff(repo.path(), Some("staged")).expect("staged"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The real index snapshot is the staged-target oracle.
     assert_eq!(files_in(&staged), ["first.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Staged review must exclude working-tree-only and untracked changes.
     for target in ["commit:HEAD", "HEAD~1..HEAD"] {
-        let (_, hunks) = CodeReviewer::acquire_diff(repo.path(), Some(target)).expect("commit selection"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Both explicit commit forms must resolve the valid fixture history.
+        let (_, hunks) =
+            CodeReviewer::acquire_diff(repo.path(), Some(target)).expect("commit selection"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Both explicit commit forms must resolve the valid fixture history.
         assert_eq!(files_in(&hunks), ["second.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Commit selection must retain only the last commit's changed file.
         assert!(hunks.iter().all(|hunk| !hunk.content.contains("unstaged"))); // ubs:ignore[rust.panic.assert-macros] -- Commit snapshots must not incorporate later working-tree bytes.
     }
-    let (_, branch) = CodeReviewer::acquire_diff(repo.path(), Some("branch:baseline")).expect("merge base selection"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The baseline fixture branch must have a resolvable merge base.
-    assert_eq!(files_in(&branch), ["first.rs", "second.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Branch review covers both commits since the merge base.
+    let (_, branch) = CodeReviewer::acquire_diff(repo.path(), Some("branch:baseline"))
+        .expect("merge base selection"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The baseline fixture branch must have a resolvable merge base.
+    assert_eq!(
+        files_in(&branch),
+        ["first.rs", "second.rs"].into_iter().collect()
+    ); // ubs:ignore[rust.panic.assert-macros] -- Branch review covers both commits since the merge base.
     assert!(branch.iter().all(|hunk| !hunk.content.contains("staged"))); // ubs:ignore[rust.panic.assert-macros] -- Branch review must use committed bytes only.
-    eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"git_targets","outcome":"index, commit, merge base, subdirectory and spaced untracked path verified"}));
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"pi.review.test.v1","case":"git_targets","outcome":"index, commit, merge base, subdirectory and spaced untracked path verified"})
+    );
 }
 
 #[test]
@@ -72,17 +97,22 @@ fn review_reports_partial_coverage_and_refuses_binary_only_ship() {
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "base"]);
     fs::write(repo.path().join("blob.bin"), b"\0new binary\n").expect("binary change"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- This snapshot must contain only an actual binary change.
-    let error = CodeReviewer::review(repo.path(), &ReviewOptions::default()).expect_err("binary changes are not a completed text review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Binary-only refusal is the required regression outcome.
+    let error = CodeReviewer::review(repo.path(), &ReviewOptions::default())
+        .expect_err("binary changes are not a completed text review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Binary-only refusal is the required regression outcome.
     assert!(error.to_string().contains("PI_REVIEW_NO_TEXT")); // ubs:ignore[rust.panic.assert-macros] -- An uncovered change must not silently become a clean verdict.
 
     fs::write(repo.path().join("source.rs"), "changed text\n").expect("text change"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Add one reviewable file to the existing binary fixture.
-    let report = CodeReviewer::review(repo.path(), &ReviewOptions::default()).expect("mixed review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Mixed text and binary changes must produce an explicitly scoped report.
+    let report =
+        CodeReviewer::review(repo.path(), &ReviewOptions::default()).expect("mixed review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Mixed text and binary changes must produce an explicitly scoped report.
     assert_eq!(report.stats.files_analyzed, 1); // ubs:ignore[rust.panic.assert-macros] -- Only the text file is included in analyzed coverage.
     assert_eq!(report.skipped_changes.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- The binary change must appear exactly once outside coverage.
     assert!(report.skipped_changes[0].contains("blob.bin")); // ubs:ignore[rust.panic.assert-macros,rust.panic.direct-indexing] -- The preceding length assertion guarantees the one skipped binary entry.
     assert!(report.summary.contains("outside review coverage")); // ubs:ignore[rust.panic.assert-macros] -- A partial review must explicitly qualify its verdict.
     assert!(report.format_markdown().contains("blob.bin")); // ubs:ignore[rust.panic.assert-macros] -- The rendered report must identify the skipped file.
-    eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"review_coverage","outcome":"binary-only refused; mixed review labels skipped file"}));
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"pi.review.test.v1","case":"review_coverage","outcome":"binary-only refused; mixed review labels skipped file"})
+    );
 }
 
 #[test]
@@ -92,21 +122,47 @@ fn review_submodule_pointer_changes_are_explicitly_outside_coverage() {
     git(repo.path(), &["add", "source.rs"]);
     git(repo.path(), &["commit", "-m", "base"]);
     let revision = |name: &str| {
-        let output = Command::new("git").args(["rev-parse", name]).current_dir(repo.path()).output().expect("revision"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Resolve only fixture revisions created by the test.
+        let output = Command::new("git")
+            .args(["rev-parse", name])
+            .current_dir(repo.path())
+            .output()
+            .expect("revision"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Resolve only fixture revisions created by the test.
         assert!(output.status.success()); // ubs:ignore[rust.panic.assert-macros] -- A missing fixture commit invalidates the gitlink regression.
-        String::from_utf8(output.stdout).expect("revision text").trim().to_string() // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.parsing.strict-utf8] -- Git object IDs are required ASCII fixture data.
+        String::from_utf8(output.stdout)
+            .expect("revision text")
+            .trim()
+            .to_string() // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect,rust.parsing.strict-utf8] -- Git object IDs are required ASCII fixture data.
     };
     // A real gitlink index entry requires a commit ID but no checked-out
     // submodule or network access. Reuse local commits for this fixture.
     let base = revision("HEAD");
-    git(repo.path(), &["update-index", "--add", "--cacheinfo", &format!("160000,{base},deps/library")]);
+    git(
+        repo.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{base},deps/library"),
+        ],
+    );
     git(repo.path(), &["commit", "-m", "add gitlink"]);
     let next = revision("HEAD");
-    git(repo.path(), &["update-index", "--cacheinfo", &format!("160000,{next},deps/library")]);
+    git(
+        repo.path(),
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{next},deps/library"),
+        ],
+    );
     git(repo.path(), &["config", "diff.submodule", "log"]);
 
-    let options = ReviewOptions { target: Some("staged".to_string()), ..Default::default() };
-    let error = CodeReviewer::review(repo.path(), &options).expect_err("a SHA-only change is not a completed code review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Gitlink-only refusal is the required coverage outcome.
+    let options = ReviewOptions {
+        target: Some("staged".to_string()),
+        ..Default::default()
+    };
+    let error = CodeReviewer::review(repo.path(), &options)
+        .expect_err("a SHA-only change is not a completed code review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Gitlink-only refusal is the required coverage outcome.
     assert!(error.to_string().contains("PI_REVIEW_NO_TEXT")); // ubs:ignore[rust.panic.assert-macros] -- Opaque commit IDs cannot produce a completed text verdict.
 
     fs::write(repo.path().join("source.rs"), "changed text\n").expect("text change"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Add reviewable text alongside the staged gitlink change.
@@ -116,7 +172,10 @@ fn review_submodule_pointer_changes_are_explicitly_outside_coverage() {
     assert_eq!(report.skipped_changes, vec!["deps/library"]); // ubs:ignore[rust.panic.assert-macros] -- The exact nested repository path must remain visible outside coverage.
     assert!(report.summary.contains("outside review coverage")); // ubs:ignore[rust.panic.assert-macros] -- The mixed verdict must declare its limited coverage.
     assert!(report.format_markdown().contains("deps/library")); // ubs:ignore[rust.panic.assert-macros] -- The displayed report must identify the skipped gitlink.
-    eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"submodule_coverage","outcome":"gitlink-only refused; mixed review explicitly excludes gitlink"}));
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"pi.review.test.v1","case":"submodule_coverage","outcome":"gitlink-only refused; mixed review explicitly excludes gitlink"})
+    );
 }
 
 #[test]
@@ -134,12 +193,23 @@ fn review_commit_target_includes_nonconflicting_merge_changes() {
     fs::write(repo.path().join("mainline.rs"), "already in first parent\n").expect("mainline file"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Divergence forces a nonconflicting merge commit.
     git(repo.path(), &["add", "mainline.rs"]);
     git(repo.path(), &["commit", "-m", "mainline"]);
-    git(repo.path(), &["merge", "--no-ff", "review-feature", "-m", "merge feature"]);
+    git(
+        repo.path(),
+        &["merge", "--no-ff", "review-feature", "-m", "merge feature"],
+    );
 
-    let (_, hunks) = CodeReviewer::acquire_diff(repo.path(), Some("commit:HEAD")).expect("merge commit review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- A valid merge commit must expose its first-parent diff.
+    let (_, hunks) =
+        CodeReviewer::acquire_diff(repo.path(), Some("commit:HEAD")).expect("merge commit review"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- A valid merge commit must expose its first-parent diff.
     assert_eq!(files_in(&hunks), ["feature.rs"].into_iter().collect()); // ubs:ignore[rust.panic.assert-macros] -- Merge review must retain the feature change without repeating first-parent changes.
-    assert!(hunks.iter().any(|hunk| hunk.content.contains("introduced by feature"))); // ubs:ignore[rust.panic.assert-macros] -- The reviewed source bytes must include the introduced feature.
-    eprintln!("{}", serde_json::json!({"schema":"pi.review.test.v1","case":"merge_commit_coverage","outcome":"nonconflicting merge changes retained relative to first parent"}));
+    assert!(
+        hunks
+            .iter()
+            .any(|hunk| hunk.content.contains("introduced by feature"))
+    ); // ubs:ignore[rust.panic.assert-macros] -- The reviewed source bytes must include the introduced feature.
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"pi.review.test.v1","case":"merge_commit_coverage","outcome":"nonconflicting merge changes retained relative to first parent"})
+    );
 }
 
 #[test]
@@ -324,7 +394,6 @@ fn query_user(id: &str) {
     assert_eq!(report_bad.findings[0].severity, ReviewSeverity::P0);
 }
 
-
 /// Real CLI and forge processes exercise the shared acquisition path without
 /// mutating this test process's environment or using network credentials.
 #[cfg(unix)]
@@ -383,7 +452,8 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
                     .chain(std::env::split_paths(&inherited_path)),
             )?;
             let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-            command.current_dir(self.root.path())
+            command
+                .current_dir(self.root.path())
                 .env_clear()
                 .env("PATH", path)
                 .env("PI_CODING_AGENT_DIR", self.root.path().join("agent"))
@@ -394,19 +464,26 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
         }
 
         fn capture(&self) -> TestResult<Value> {
-            Ok(serde_json::from_slice(&fs::read(self.root.path().join("capture.json"))?)?)
+            Ok(serde_json::from_slice(&fs::read(
+                self.root.path().join("capture.json"),
+            )?)?)
         }
     }
 
     fn report(output: &Output) -> TestResult<Value> {
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     #[test]
     fn github_review_fetches_an_explicit_pr_without_a_local_checkout() -> TestResult {
         let fixture = Fixture::new(DIFF.as_bytes())?;
-        let output = fixture.command("https://github.com/team/repo/pull/42/files#diff-123")?
+        let output = fixture
+            .command("https://github.com/team/repo/pull/42/files#diff-123")?
             .env("GH_TOKEN", "fixture-public-token")
             .env("GH_ENTERPRISE_TOKEN", "fixture-enterprise-token")
             .env("GH_REPO", "wrong/repository")
@@ -419,7 +496,17 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
         assert_eq!(report["findings"][0]["lineStart"], 1);
         let capture = fixture.capture()?;
         assert_eq!(capture["program"], "gh");
-        assert_eq!(capture["args"], json!(["pr", "diff", "42", "--color=never", "--repo", "github.com/team/repo"]));
+        assert_eq!(
+            capture["args"],
+            json!([
+                "pr",
+                "diff",
+                "42",
+                "--color=never",
+                "--repo",
+                "github.com/team/repo"
+            ])
+        );
         assert_eq!(capture["env"]["GH_HOST"], "github.com");
         assert_eq!(capture["env"]["GH_TOKEN"], "fixture-public-token");
         assert!(capture["env"]["GH_ENTERPRISE_TOKEN"].is_null());
@@ -430,7 +517,8 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
     #[test]
     fn gitlab_review_preserves_nested_projects_and_binds_api_and_credentials() -> TestResult {
         let fixture = Fixture::new(DIFF.as_bytes())?;
-        let output = fixture.command("https://code.example:8443/team/sub/repo/-/merge_requests/7/diffs")?
+        let output = fixture
+            .command("https://code.example:8443/team/sub/repo/-/merge_requests/7/diffs")?
             .env("GITLAB_URI", "https://code.example:8443")
             .env("GITLAB_TOKEN", "fixture-matching-token")
             .env("GITLAB_API_HOST", "other.example")
@@ -444,11 +532,25 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
             .env("CI_JOB_TOKEN", "fixture-other-ci-token")
             .output()?;
         let report = report(&output)?;
-        assert_eq!(report["target"], "https://code.example:8443/team/sub/repo/-/merge_requests/7");
+        assert_eq!(
+            report["target"],
+            "https://code.example:8443/team/sub/repo/-/merge_requests/7"
+        );
         assert_eq!(report["stats"]["filesAnalyzed"], 1);
         let capture = fixture.capture()?;
         assert_eq!(capture["program"], "glab");
-        assert_eq!(capture["args"], json!(["mr", "diff", "7", "--raw", "--color=never", "--repo", "https://code.example:8443/team/sub/repo"]));
+        assert_eq!(
+            capture["args"],
+            json!([
+                "mr",
+                "diff",
+                "7",
+                "--raw",
+                "--color=never",
+                "--repo",
+                "https://code.example:8443/team/sub/repo"
+            ])
+        );
         assert_eq!(capture["env"]["GITLAB_HOST"], "code.example:8443");
         assert_eq!(capture["env"]["GITLAB_API_HOST"], "code.example:8443");
         assert_eq!(capture["env"]["GLAB_API_PROTOCOL"], "https");
@@ -466,18 +568,32 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
     #[test]
     fn public_forge_reviews_never_forward_tokens_bound_to_another_host() -> TestResult {
         for (target, host_key, host, token_key) in [
-            ("https://github.com/team/repo/pull/1", "GH_HOST", "tenant.ghe.com", "GH_TOKEN"),
-            ("https://gitlab.com/team/repo/-/merge_requests/1", "GITLAB_HOST", "code.example", "GITLAB_TOKEN"),
+            (
+                "https://github.com/team/repo/pull/1",
+                "GH_HOST",
+                "tenant.ghe.com",
+                "GH_TOKEN",
+            ),
+            (
+                "https://gitlab.com/team/repo/-/merge_requests/1",
+                "GITLAB_HOST",
+                "code.example",
+                "GITLAB_TOKEN",
+            ),
         ] {
             let fixture = Fixture::new(DIFF.as_bytes())?;
-            let output = fixture.command(target)?
+            let output = fixture
+                .command(target)?
                 .env(host_key, host)
                 .env(token_key, "fixture-other-host-token")
                 .env("GLAB_CLIENT_CERT", "/fixture/other-host-cert")
                 .output()?;
             report(&output)?;
             let capture = fixture.capture()?;
-            assert!(capture["env"][token_key].is_null(), "{token_key} must not cross hosts");
+            assert!(
+                capture["env"][token_key].is_null(),
+                "{token_key} must not cross hosts"
+            );
             if token_key == "GITLAB_TOKEN" {
                 assert!(capture["env"]["GLAB_CLIENT_CERT"].is_null());
             }
@@ -489,29 +605,55 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
     fn hosted_review_reports_partial_coverage_but_rejects_unreviewable_snapshots() -> TestResult {
         let binary = "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nBinary files a/blob.bin and b/blob.bin differ\n";
         let mixed = Fixture::new(format!("{DIFF}{binary}").as_bytes())?;
-        let output = mixed.command("https://gitlab.com/team/repo/-/merge_requests/1")?.output()?;
+        let output = mixed
+            .command("https://gitlab.com/team/repo/-/merge_requests/1")?
+            .output()?;
         let report = report(&output)?;
         assert_eq!(report["stats"]["filesAnalyzed"], 1);
-        assert!(report["skippedChanges"][0].as_str().unwrap_or_default().contains("blob.bin"));
-        assert!(report["summary"].as_str().unwrap_or_default().contains("outside review coverage"));
+        assert!(
+            report["skippedChanges"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("blob.bin")
+        );
+        assert!(
+            report["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("outside review coverage")
+        );
 
-        let malformed = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n-old\n+new\n";
+        let malformed =
+            "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n-old\n+new\n";
         for (bytes, code) in [
             (Vec::new(), "PI_REVIEW_DIFF"),
             (b"<html>login required</html>\n".to_vec(), "PI_REVIEW_DIFF"),
             (malformed.as_bytes().to_vec(), "PI_REVIEW_DIFF"),
-            (format!("{DIFF}diff --git a/file b/file\nold mode 100644\n").into_bytes(), "PI_REVIEW_DIFF"),
+            (
+                format!("{DIFF}diff --git a/file b/file\nold mode 100644\n").into_bytes(),
+                "PI_REVIEW_DIFF",
+            ),
             (binary.as_bytes().to_vec(), "PI_REVIEW_NO_TEXT"),
             (vec![b'x'; 192 * 1024 + 1], "PI_REVIEW_BUDGET"),
             (vec![0xff, b'\n'], "PI_REVIEW_DIFF"),
         ] {
             let fixture = Fixture::new(&bytes)?;
             let report_path = fixture.root.path().join("report.json");
-            let output = fixture.command("https://github.com/team/repo/pull/1")?
-                .arg("--out").arg(&report_path).output()?;
+            let output = fixture
+                .command("https://github.com/team/repo/pull/1")?
+                .arg("--out")
+                .arg(&report_path)
+                .output()?;
             assert!(!output.status.success(), "{code}");
-            assert!(String::from_utf8_lossy(&output.stderr).contains(code), "{}", String::from_utf8_lossy(&output.stderr));
-            assert!(!report_path.exists(), "failed acquisition cannot publish a report");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(code),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !report_path.exists(),
+                "failed acquisition cannot publish a report"
+            );
         }
         Ok(())
     }
@@ -520,10 +662,13 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
     fn failed_forge_commands_do_not_publish_a_verdict_or_echo_sensitive_stderr() -> TestResult {
         let fixture = Fixture::new(DIFF.as_bytes())?;
         let report_path = fixture.root.path().join("report.json");
-        let output = fixture.command("https://github.com/team/repo/pull/1")?
+        let output = fixture
+            .command("https://github.com/team/repo/pull/1")?
             .env("PI_REVIEW_FIXTURE_EXIT", "7")
             .env("PI_REVIEW_FIXTURE_STDERR", "fixture-secret-never-echo")
-            .arg("--out").arg(&report_path).output()?;
+            .arg("--out")
+            .arg(&report_path)
+            .output()?;
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("PI_REVIEW_FORGE"));
@@ -536,10 +681,16 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
     fn invalid_or_unbound_urls_are_rejected_before_invoking_a_forge() -> TestResult {
         for (target, code) in [
             ("http://github.com/team/repo/pull/1", "PI_REVIEW_TARGET"),
-            ("https://token@github.com/team/repo/pull/1", "PI_REVIEW_TARGET"),
+            (
+                "https://token@github.com/team/repo/pull/1",
+                "PI_REVIEW_TARGET",
+            ),
             ("https://github.com/team%2Frepo/pull/1", "PI_REVIEW_TARGET"),
             ("https://code.example/team/repo/pull/1", "PI_REVIEW_HOST"),
-            ("https://code.example/team/repo/-/merge_requests/1", "PI_REVIEW_HOST"),
+            (
+                "https://code.example/team/repo/-/merge_requests/1",
+                "PI_REVIEW_HOST",
+            ),
         ] {
             let fixture = Fixture::new(DIFF.as_bytes())?;
             let output = fixture.command(target)?.output()?;

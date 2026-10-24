@@ -173,8 +173,8 @@ impl ArchiveBuilder {
 /// vision minimum, keep the original rasterization and role colors unchanged.
 #[allow(clippy::cast_possible_truncation)]
 fn render_group(group: &[(String, Rgb)]) -> SnapFrame {
-    let height = (PAD * 2 + u32::try_from(group.len()).unwrap_or(0) * LINE_HEIGHT)
-        .max(MIN_FRAME_HEIGHT);
+    let height =
+        (PAD * 2 + u32::try_from(group.len()).unwrap_or(0) * LINE_HEIGHT).max(MIN_FRAME_HEIGHT);
     let mut buf = vec![0u8; (FRAME_WIDTH * height * 3) as usize];
     for px in buf.as_chunks_mut::<3>().0 {
         *px = BACKGROUND;
@@ -194,7 +194,11 @@ fn render_group(group: &[(String, Rgb)]) -> SnapFrame {
         }
     }
     SnapFrame {
-        png: base64::engine::general_purpose::STANDARD.encode(png_encode(FRAME_WIDTH, height, &buf)),
+        png: base64::engine::general_purpose::STANDARD.encode(png_encode(
+            FRAME_WIDTH,
+            height,
+            &buf,
+        )),
         width: FRAME_WIDTH,
         height,
     }

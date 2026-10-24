@@ -68,10 +68,14 @@ fn result_value(record: Option<&Record>) -> Value {
 // same receipt after reopening; SDK incarnation checks are intentionally
 // stronger. Live tool authority and execution deadlines are not changed here.
 fn revision(session: &Session, current: &Option<(String, Record)>) -> Result<String> {
-    if session.header.id.is_empty() || session.header.id.len() > 1024
+    if session.header.id.is_empty()
+        || session.header.id.len() > 1024
         || session.leaf_id().is_some_and(|id| id.len() > 1024)
     {
-        return Err(failure("GOAL_REVIEW", "session identity is missing or oversized"));
+        return Err(failure(
+            "GOAL_REVIEW",
+            "session identity is missing or oversized",
+        ));
     }
     let bytes = serde_json::to_vec(&(
         "pi.goal.rpc-review.v1",
@@ -111,7 +115,10 @@ fn requested_budget(request: &Value) -> Result<GoalBudget> {
             .filter(|value| (1..=1024).contains(value))
             .ok_or_else(|| failure("GOAL_RPC", "max_prompts must be an integer from 1 to 1024"))?,
     };
-    Ok(GoalBudget { max_prompts, token_budget })
+    Ok(GoalBudget {
+        max_prompts,
+        token_budget,
+    })
 }
 
 fn revised_budget(session: &Session, request: &Value) -> Result<Record> {
@@ -120,20 +127,34 @@ fn revised_budget(session: &Session, request: &Value) -> Result<Record> {
         || budget.get("token_budget").is_none_or(Value::is_null)
         || budget.get("max_prompts").is_none_or(Value::is_null)
     {
-        return Err(failure("GOAL_RPC", "budget must contain exactly the new token_budget and max_prompts totals"));
+        return Err(failure(
+            "GOAL_RPC",
+            "budget must contain exactly the new token_budget and max_prompts totals",
+        ));
     }
     let budget = requested_budget(budget)?;
-    let reason = request.get("reason").and_then(Value::as_str)
+    let reason = request
+        .get("reason")
+        .and_then(Value::as_str)
         .ok_or_else(|| failure("GOAL_RPC", "budget revision requires an explicit reason"))?;
-    let reviewed = request.get("revision").and_then(Value::as_str)
+    let reviewed = request
+        .get("revision")
+        .and_then(Value::as_str)
         .filter(|value| value.len() == 68 && value.starts_with("gr1-"))
-        .ok_or_else(|| failure("GOAL_RPC", "budget revision requires the receipt from goal get"))?;
+        .ok_or_else(|| {
+            failure(
+                "GOAL_RPC",
+                "budget revision requires the receipt from goal get",
+            )
+        })?;
     let current = latest(session)?;
     if reviewed != revision(session, &current)? {
-        return Err(failure("GOAL_STALE", "session, branch or goal changed; get and review it again. Nothing was changed."));
+        return Err(failure(
+            "GOAL_STALE",
+            "session, branch or goal changed; get and review it again. Nothing was changed.",
+        ));
     }
-    let (_, record) = current
-        .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+    let (_, record) = current.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
     transition(record, Transition::Budget { budget, reason })
 }
 
@@ -257,7 +278,10 @@ mod tests {
     fn result_uses_omp_status_spelling_and_additive_native_fields() {
         let mut record = Record::new(
             "Ship the feature",
-            GoalBudget { max_prompts: 3, token_budget: 90 },
+            GoalBudget {
+                max_prompts: 3,
+                token_budget: 90,
+            },
         )
         .unwrap();
         record.prompts_started = 3;
@@ -280,7 +304,10 @@ mod tests {
         assert!(requested_budget(&json!({"max_prompts":1025})).is_err());
         assert_eq!(
             requested_budget(&json!({"token_budget":17,"max_prompts":2})).unwrap(),
-            GoalBudget { max_prompts: 2, token_budget: 17 }
+            GoalBudget {
+                max_prompts: 2,
+                token_budget: 17
+            }
         );
     }
 

@@ -300,21 +300,26 @@ impl BrowserTool {
         let configured_pointer = interaction::pointer::validate_input(args)?;
         let configured_wait = interaction::wait::validate_input(args)?;
         if self.is_mock() {
-            if storage::is_action(action) || semantic_selector || configured_pointer || configured_wait || matches!(
-                action,
-                "start"
-                    | "status"
-                    | "stop"
-                    | "list_frames"
-                    | "back"
-                    | "forward"
-                    | "reload"
-                    | "upload"
-                    | "download"
-                    | "print_pdf"
-                    | "handle_dialog"
-                    | "diagnostics"
-            ) || interaction::forms::is_action(action)
+            if storage::is_action(action)
+                || semantic_selector
+                || configured_pointer
+                || configured_wait
+                || matches!(
+                    action,
+                    "start"
+                        | "status"
+                        | "stop"
+                        | "list_frames"
+                        | "back"
+                        | "forward"
+                        | "reload"
+                        | "upload"
+                        | "download"
+                        | "print_pdf"
+                        | "handle_dialog"
+                        | "diagnostics"
+                )
+                || interaction::forms::is_action(action)
                 || args.get("frame").is_some()
                 || args.get("full_page").is_some()
                 || args.get("dialog_response").is_some()

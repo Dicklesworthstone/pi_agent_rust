@@ -37,11 +37,15 @@ fn end_position(mut position: Position, text: &str, budget: &Budget) -> Result<P
             if ch == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
                 chars.next();
             }
-            position.line = position.line.checked_add(1)
+            position.line = position
+                .line
+                .checked_add(1)
                 .ok_or_else(|| malformed("source excerpt line overflow"))?;
             position.character = 0;
         } else {
-            position.character = position.character.checked_add(u32::try_from(ch.len_utf16()).unwrap_or(2))
+            position.character = position
+                .character
+                .checked_add(u32::try_from(ch.len_utf16()).unwrap_or(2))
                 .ok_or_else(|| malformed("source excerpt column overflow"))?;
         }
     }
@@ -63,7 +67,10 @@ pub(super) struct SourceText<'a> {
 impl<'a> SourceText<'a> {
     pub(super) fn new(text: &'a str, focus_line: Option<u32>, budget: &Budget) -> Result<Self> {
         budget.remaining()?;
-        let mut current = Position { line: 0, character: 0 };
+        let mut current = Position {
+            line: 0,
+            character: 0,
+        };
         let mut checkpoints = BTreeMap::from([(0, current)]);
         let mut chars = text.char_indices().peekable();
         let mut offset = 0;
@@ -85,11 +92,15 @@ impl<'a> SourceText<'a> {
                     chars.next();
                     offset += 1;
                 }
-                current.line = current.line.checked_add(1)
+                current.line = current
+                    .line
+                    .checked_add(1)
                     .ok_or_else(|| malformed("source excerpt line overflow"))?;
                 current.character = 0;
             } else {
-                current.character = current.character.checked_add(u32::try_from(ch.len_utf16()).unwrap_or(2))
+                current.character = current
+                    .character
+                    .checked_add(u32::try_from(ch.len_utf16()).unwrap_or(2))
                     .ok_or_else(|| malformed("source excerpt column overflow"))?;
             }
         }
@@ -97,15 +108,26 @@ impl<'a> SourceText<'a> {
         if focus_line.is_some() && focus.is_none() {
             return Err(malformed("source excerpt focus line is outside the source"));
         }
-        Ok(Self { text, checkpoints, focus, focus_line })
+        Ok(Self {
+            text,
+            checkpoints,
+            focus,
+            focus_line,
+        })
     }
 
     fn position(&self, offset: usize, budget: &Budget) -> Result<Position> {
-        let (start, position) = self.checkpoints.range(..=offset).next_back()
+        let (start, position) = self
+            .checkpoints
+            .range(..=offset)
+            .next_back()
             .ok_or_else(|| malformed("source excerpt lacks a position checkpoint"))?;
-        let text = self.text.get(*start..offset)
+        let text = self
+            .text
+            .get(*start..offset)
             .ok_or_else(|| malformed("source excerpt offset is not a UTF-8 boundary"))?;
-        if offset > 0 && self.text.as_bytes().get(offset - 1) == Some(&b'\r')
+        if offset > 0
+            && self.text.as_bytes().get(offset - 1) == Some(&b'\r')
             && self.text.as_bytes().get(offset) == Some(&b'\n')
         {
             return Err(malformed("source excerpt offset splits CRLF"));
@@ -113,38 +135,73 @@ impl<'a> SourceText<'a> {
         end_position(*position, text, budget)
     }
 
-    pub(super) fn excerpt(&self, outline: &Outline<'_>, symbol: &Symbol<'_>, budget: &Budget) -> Result<Value> {
+    pub(super) fn excerpt(
+        &self,
+        outline: &Outline<'_>,
+        symbol: &Symbol<'_>,
+        budget: &Budget,
+    ) -> Result<Value> {
         self.with_limit(outline, symbol, MAX_EXCERPT_BYTES, budget)
     }
 
-    fn with_limit(&self, outline: &Outline<'_>, symbol: &Symbol<'_>, limit: usize, budget: &Budget) -> Result<Value> {
+    fn with_limit(
+        &self,
+        outline: &Outline<'_>,
+        symbol: &Symbol<'_>,
+        limit: usize,
+        budget: &Budget,
+    ) -> Result<Value> {
         budget.remaining()?;
         let offset = |position: Position| {
-            outline.offsets.get(&position).copied()
+            outline
+                .offsets
+                .get(&position)
+                .copied()
                 .ok_or_else(|| malformed("source excerpt lacks a validated endpoint"))
         };
         let start = offset(symbol.range.start)?;
         let end = offset(symbol.range.end)?;
-        let full = self.text.get(start..end)
+        let full = self
+            .text
+            .get(start..end)
             .ok_or_else(|| malformed("source excerpt is outside the checked source"))?;
         // Keep short definitions whole. For long ones, reserve a quarter of
         // the window for preceding context. Do not shift a near-EOF window
         // backwards merely to fill its quota: rounding that start could push
         // the requested final line out of the clipped end.
         let wanted_start = if full.len() > limit {
-            self.focus.map_or(start, |focus| focus.clamp(start, end)
-                .saturating_sub(limit / 4).max(start))
-        } else { start };
+            self.focus.map_or(start, |focus| {
+                focus.clamp(start, end).saturating_sub(limit / 4).max(start)
+            })
+        } else {
+            start
+        };
         let first = floor_boundary(self.text, wanted_start);
         let last = floor_boundary(self.text, first.saturating_add(limit).min(end));
-        let snippet = self.text.get(first..last)
+        let snippet = self
+            .text
+            .get(first..last)
             .ok_or_else(|| malformed("source excerpt has an invalid window"))?;
         let omitted_before = first - start;
         let omitted_after = end - last;
         let truncated = omitted_before != 0 || omitted_after != 0;
-        let mode = if !truncated { "full" } else if self.focus.is_some() { "line_context" } else { "prefix" };
-        let range_start = if first == start { symbol.range.start } else { self.position(first, budget)? };
-        let range_end = if last == end { symbol.range.end } else { self.position(last, budget)? };
+        let mode = if !truncated {
+            "full"
+        } else if self.focus.is_some() {
+            "line_context"
+        } else {
+            "prefix"
+        };
+        let range_start = if first == start {
+            symbol.range.start
+        } else {
+            self.position(first, budget)?
+        };
+        let range_end = if last == end {
+            symbol.range.end
+        } else {
+            self.position(last, budget)?
+        };
         budget.remaining()?;
         Ok(json!({
             "text":snippet,"mode":mode,"focusLine":self.focus_line.map(|line| u64::from(line) + 1),
@@ -160,8 +217,11 @@ impl<'a> SourceText<'a> {
 
 fn floor_boundary(text: &str, mut offset: usize) -> usize {
     offset = offset.min(text.len());
-    while !text.is_char_boundary(offset) { offset -= 1; }
-    if offset > 0 && text.as_bytes().get(offset - 1) == Some(&b'\r')
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    if offset > 0
+        && text.as_bytes().get(offset - 1) == Some(&b'\r')
         && text.as_bytes().get(offset) == Some(&b'\n')
     {
         offset -= 1;
@@ -171,25 +231,40 @@ fn floor_boundary(text: &str, mut offset: usize) -> usize {
 
 // Preserve the original prefix checks as the no-focus case of the same reader.
 #[cfg(test)]
-fn excerpt(text: &str, outline: &Outline<'_>, symbol: &Symbol<'_>, budget: &Budget) -> Result<Value> {
+fn excerpt(
+    text: &str,
+    outline: &Outline<'_>,
+    symbol: &Symbol<'_>,
+    budget: &Budget,
+) -> Result<Value> {
     SourceText::new(text, None, budget)?.excerpt(outline, symbol, budget)
 }
 
 #[cfg(test)]
-fn excerpt_with_limit(text: &str, outline: &Outline<'_>, symbol: &Symbol<'_>, limit: usize, budget: &Budget) -> Result<Value> {
+fn excerpt_with_limit(
+    text: &str,
+    outline: &Outline<'_>,
+    symbol: &Symbol<'_>,
+    limit: usize,
+    budget: &Budget,
+) -> Result<Value> {
     SourceText::new(text, None, budget)?.with_limit(outline, symbol, limit, budget)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        MAX_DISPLAY, MAX_PAYLOAD_BYTES, displayed_with_source, parse, validate_boundaries,
+    };
     use super::*;
-    use super::super::{MAX_DISPLAY, MAX_PAYLOAD_BYTES, displayed_with_source, parse, validate_boundaries};
     use crate::lsp::text::{offset_to_position, position_to_offset_exact};
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::time::Duration;
 
-    fn budget() -> Budget { Budget::new(Duration::from_secs(5)) }
+    fn budget() -> Budget {
+        Budget::new(Duration::from_secs(5))
+    }
 
     fn raw(text: &str, start: usize, end: usize) -> Value {
         let start = offset_to_position(text, start).unwrap();
@@ -223,7 +298,8 @@ mod tests {
         let budget = budget();
         let outline = parse(&raw, Path::new("unused"), text, &budget).unwrap();
         for limit in 0..=text.len() {
-            let source = excerpt_with_limit(text, &outline, &outline.symbols[0], limit, &budget).unwrap();
+            let source =
+                excerpt_with_limit(text, &outline, &outline.symbols[0], limit, &budget).unwrap();
             let snippet = source["text"].as_str().unwrap();
             let start: Position = serde_json::from_value(source["range"]["start"].clone()).unwrap();
             let end: Position = serde_json::from_value(source["range"]["end"].clone()).unwrap();
@@ -231,7 +307,10 @@ mod tests {
             let last = position_to_offset_exact(text, end).unwrap();
             assert_eq!(&text[first..last], snippet);
             assert!(snippet.len() <= limit);
-            assert_eq!(usize::try_from(source["omittedBytes"].as_u64().unwrap()).unwrap() + snippet.len(), text.len() - 6);
+            assert_eq!(
+                usize::try_from(source["omittedBytes"].as_u64().unwrap()).unwrap() + snippet.len(),
+                text.len() - 6
+            );
             assert_eq!(source["truncated"], last < text.len());
         }
     }
@@ -240,10 +319,14 @@ mod tests {
     fn mapped_offsets_equal_the_independent_shared_mapper() {
         for text in ["", "😀", "\r\n", "a\rb\n界\r\n😀z\n"] {
             let wanted: BTreeSet<_> = (0..=text.len())
-                .filter_map(|offset| offset_to_position(text, offset)).collect();
+                .filter_map(|offset| offset_to_position(text, offset))
+                .collect();
             let mapped = validate_boundaries(text, &wanted, &budget()).unwrap();
             for position in wanted {
-                assert_eq!(mapped.get(&position).copied(), position_to_offset_exact(text, position));
+                assert_eq!(
+                    mapped.get(&position).copied(),
+                    position_to_offset_exact(text, position)
+                );
             }
         }
     }
@@ -254,11 +337,16 @@ mod tests {
         let raw = json!(vec![raw(&text, 0, text.len())[0].clone(); 64]);
         let budget = budget();
         let outline = parse(&raw, Path::new("unused"), &text, &budget).unwrap();
-        let rows = displayed_with_source(&outline, 0..64, MAX_DISPLAY, Some((&text, None)), &budget).unwrap();
+        let rows =
+            displayed_with_source(&outline, 0..64, MAX_DISPLAY, Some((&text, None)), &budget)
+                .unwrap();
         assert!(!rows.is_empty() && rows.len() < 64);
         assert!(serde_json::to_vec(&rows).unwrap().len() <= MAX_PAYLOAD_BYTES - 8192);
         assert!(rows.iter().all(|row| row["source"]["truncated"] == true));
-        assert_eq!(rows[0]["source"]["text"].as_str().unwrap().len(), MAX_EXCERPT_BYTES);
+        assert_eq!(
+            rows[0]["source"]["text"].as_str().unwrap().len(),
+            MAX_EXCERPT_BYTES
+        );
         let plain = displayed_with_source(&outline, 0..64, 1, None, &budget).unwrap();
         assert!(plain[0].get("source").is_none());
     }
@@ -269,10 +357,14 @@ mod tests {
         let raw = raw(text, 0, text.len());
         let budget = budget();
         let outline = parse(&raw, Path::new("unused"), text, &budget).unwrap();
-        let expected = crate::package_manager::hex_encode(&<Sha256 as sha2::Digest>::digest(text.as_bytes()));
+        let expected =
+            crate::package_manager::hex_encode(&<Sha256 as sha2::Digest>::digest(text.as_bytes()));
         assert_eq!(fingerprint(text, &budget).unwrap(), expected);
         assert_ne!(fingerprint(text.trim_end(), &budget).unwrap(), expected);
-        budget.owner.cancel_with(asupersync::types::CancelKind::User, Some("stop source extraction"));
+        budget.owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("stop source extraction"),
+        );
         assert!(fingerprint(text, &budget).is_err());
         assert!(excerpt(text, &outline, &outline.symbols[0], &budget).is_err());
     }
@@ -280,7 +372,11 @@ mod tests {
     #[test]
     fn flat_locations_are_not_presented_as_inferred_function_bodies() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().canonicalize().unwrap().join("not-opened.rs");
+        let path = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("not-opened.rs");
         let uri = crate::lsp::client::try_path_to_uri(&path).unwrap();
         let text = "fn target() { body(); }";
         let raw = json!([{"name":"target","kind":12,"location":{"uri":uri,"range":{
@@ -296,7 +392,10 @@ mod tests {
 
     #[test]
     fn line_context_includes_late_code_instead_of_repeating_a_large_prefix() {
-        let text = format!("unrelated\nfn target() {{\n{}    target_line();\n}}\n", "    padding();\r\n".repeat(3000));
+        let text = format!(
+            "unrelated\nfn target() {{\n{}    target_line();\n}}\n",
+            "    padding();\r\n".repeat(3000)
+        );
         let focus = text.find("    target_line").unwrap();
         let focus_line = offset_to_position(&text, focus).unwrap().line;
         let start = text.find("fn target").unwrap();
@@ -304,7 +403,9 @@ mod tests {
         let budget = budget();
         let outline = parse(&raw, Path::new("unused"), &text, &budget).unwrap();
         let reader = SourceText::new(&text, Some(focus_line), &budget).unwrap();
-        let source = reader.excerpt(&outline, &outline.symbols[0], &budget).unwrap();
+        let source = reader
+            .excerpt(&outline, &outline.symbols[0], &budget)
+            .unwrap();
         let snippet = source["text"].as_str().unwrap();
         assert!(snippet.contains("target_line();"));
         assert!(!snippet.contains("unrelated"));
@@ -316,18 +417,42 @@ mod tests {
         assert_eq!(source["omittedBytes"], source["omittedBeforeBytes"]);
         let a: Position = serde_json::from_value(source["range"]["start"].clone()).unwrap();
         let b: Position = serde_json::from_value(source["range"]["end"].clone()).unwrap();
-        assert_eq!(&text[position_to_offset_exact(&text, a).unwrap()..position_to_offset_exact(&text, b).unwrap()], snippet);
+        assert_eq!(
+            &text[position_to_offset_exact(&text, a).unwrap()
+                ..position_to_offset_exact(&text, b).unwrap()],
+            snippet
+        );
     }
 
     #[test]
     fn sparse_position_index_matches_exact_mapping_without_allocating_per_line() {
-        let text = format!("{}😀x\r\n{}界e\u{301}\r", "\n".repeat(9000), "x".repeat(9000));
+        let text = format!(
+            "{}😀x\r\n{}界e\u{301}\r",
+            "\n".repeat(9000),
+            "x".repeat(9000)
+        );
         let budget = budget();
         let reader = SourceText::new(&text, None, &budget).unwrap();
         assert!(reader.checkpoints.len() < 10, "not a 9000-entry line index");
-        for offset in [0, 4095, 4096, 4097, 8192, 9000, 9001, 9004, 9006, text.len() - 1, text.len()] {
+        for offset in [
+            0,
+            4095,
+            4096,
+            4097,
+            8192,
+            9000,
+            9001,
+            9004,
+            9006,
+            text.len() - 1,
+            text.len(),
+        ] {
             let expected = offset_to_position(&text, offset);
-            assert_eq!(reader.position(offset, &budget).ok(), expected, "byte {offset}");
+            assert_eq!(
+                reader.position(offset, &budget).ok(),
+                expected,
+                "byte {offset}"
+            );
         }
     }
 
@@ -340,7 +465,9 @@ mod tests {
         for line in 1..=4 {
             let reader = SourceText::new(text, Some(line), &budget).unwrap();
             for limit in 0..=text.len() {
-                let source = reader.with_limit(&outline, &outline.symbols[0], limit, &budget).unwrap();
+                let source = reader
+                    .with_limit(&outline, &outline.symbols[0], limit, &budget)
+                    .unwrap();
                 let a: Position = serde_json::from_value(source["range"]["start"].clone()).unwrap();
                 let b: Position = serde_json::from_value(source["range"]["end"].clone()).unwrap();
                 let first = position_to_offset_exact(text, a).unwrap();
@@ -348,8 +475,16 @@ mod tests {
                 let snippet = source["text"].as_str().unwrap();
                 assert_eq!(&text[first..last], snippet);
                 assert!(first >= 9 && snippet.len() <= limit);
-                assert_eq!(source["omittedBeforeBytes"].as_u64().unwrap() + source["omittedAfterBytes"].as_u64().unwrap(), source["omittedBytes"].as_u64().unwrap());
-                assert_eq!(u64::try_from(snippet.len()).unwrap() + source["omittedBytes"].as_u64().unwrap(), source["totalBytes"].as_u64().unwrap());
+                assert_eq!(
+                    source["omittedBeforeBytes"].as_u64().unwrap()
+                        + source["omittedAfterBytes"].as_u64().unwrap(),
+                    source["omittedBytes"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    u64::try_from(snippet.len()).unwrap()
+                        + source["omittedBytes"].as_u64().unwrap(),
+                    source["totalBytes"].as_u64().unwrap()
+                );
             }
         }
     }
@@ -361,15 +496,22 @@ mod tests {
         let budget = budget();
         let outline = parse(&raw, Path::new("unused"), text, &budget).unwrap();
         let reader = SourceText::new(text, Some(0), &budget).unwrap();
-        let source = reader.excerpt(&outline, &outline.symbols[0], &budget).unwrap();
+        let source = reader
+            .excerpt(&outline, &outline.symbols[0], &budget)
+            .unwrap();
         assert_eq!(source["text"], "target()");
         assert_eq!(source["mode"], "full");
         assert_eq!(source["omittedBytes"], 0);
         assert!(SourceText::new(text, Some(2), &budget).is_err());
         let empty_raw = json!([{"name":"point","kind":12,"range":raw[0]["selectionRange"],"selectionRange":raw[0]["selectionRange"]}]);
         let empty = parse(&empty_raw, Path::new("unused"), text, &budget).unwrap();
-        assert_eq!(reader.excerpt(&empty, &empty.symbols[0], &budget).unwrap()["text"], "");
-        budget.owner.cancel_with(asupersync::types::CancelKind::User, Some("stop indexing"));
+        assert_eq!(
+            reader.excerpt(&empty, &empty.symbols[0], &budget).unwrap()["text"],
+            ""
+        );
+        budget
+            .owner
+            .cancel_with(asupersync::types::CancelKind::User, Some("stop indexing"));
         assert!(SourceText::new(text, Some(0), &budget).is_err());
     }
 }

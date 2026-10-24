@@ -106,18 +106,29 @@ fn is_usage_limit(error_text: &str) -> bool {
     if !matches!(status, Some(402 | 429)) {
         return false;
     }
-    let headline = lower.strip_prefix("provider error: ").map_or(
-        lower.as_str(),
-        |rest| rest.split_once(": ").map_or(rest, |(_, message)| message),
-    );
+    let headline = lower
+        .strip_prefix("provider error: ")
+        .map_or(lower.as_str(), |rest| {
+            rest.split_once(": ").map_or(rest, |(_, message)| message)
+        });
     headline
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
         .filter(|token| !token.is_empty())
         .all(|token| {
             matches!(
                 token,
-                "api" | "http" | "https" | "status" | "error" | "code" | "response"
-                    | "message" | "no" | "body" | "402" | "429"
+                "api"
+                    | "http"
+                    | "https"
+                    | "status"
+                    | "error"
+                    | "code"
+                    | "response"
+                    | "message"
+                    | "no"
+                    | "body"
+                    | "402"
+                    | "429"
             )
         })
 }
@@ -331,9 +342,8 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     // Broad usage-limit labels can describe invalid request fields. Only
     // concrete exhaustion evidence may override a permanent client response.
     let status = recovery_http_status(&text);
-    let usage_label_is_eligible = status.is_none_or(|status| {
-        !(400..=499).contains(&status) || matches!(status, 402 | 408 | 429)
-    });
+    let usage_label_is_eligible = status
+        .is_none_or(|status| !(400..=499).contains(&status) || matches!(status, 402 | 408 | 429));
     if is_quota_exhaustion(&text) || (usage_label_is_eligible && is_usage_limit(&text)) {
         return Some(FailoverClass::Quota);
     }
@@ -1227,9 +1237,7 @@ pub(crate) fn needs_context_compaction(
                 Some(message.usage.input),
             )
         }
-        TurnOutcome::Failed(error) if is_provider_call_error(error) => {
-            (error.to_string(), None)
-        }
+        TurnOutcome::Failed(error) if is_provider_call_error(error) => (error.to_string(), None),
         _ => return false,
     };
     let lower = error_text.to_ascii_lowercase();
@@ -3046,7 +3054,10 @@ mod tests {
         use crate::error::Error;
 
         let overflow = Error::api("context_length_exceeded: prompt is too long");
-        assert!(needs_context_compaction(TurnOutcome::Failed(&overflow), None));
+        assert!(needs_context_compaction(
+            TurnOutcome::Failed(&overflow),
+            None
+        ));
         for error in [
             Error::session("context_length_exceeded"),
             Error::Auth("context_length_exceeded".to_string()),
@@ -3064,7 +3075,10 @@ mod tests {
             TurnOutcome::Completed(&silent),
             Some(8_192),
         ));
-        assert!(!needs_context_compaction(TurnOutcome::Completed(&silent), None));
+        assert!(!needs_context_compaction(
+            TurnOutcome::Completed(&silent),
+            None
+        ));
         let payload = errored_message(Some("HTTP 413: payload rejected"), 8_193);
         assert!(needs_context_compaction(
             TurnOutcome::Completed(&payload),

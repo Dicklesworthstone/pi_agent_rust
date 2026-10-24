@@ -26,14 +26,22 @@ fn source(root: &Path, records: &[Value], leaf: &str) -> PathBuf {
 }
 
 fn rows(path: &Path) -> Vec<Value> {
-    std::fs::read_to_string(path).unwrap().lines()
-        .map(|line| serde_json::from_str(line).unwrap()).collect()
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 fn assistant(id: &str, parent: &str, calls: &[&str]) -> Value {
-    let content: Vec<_> = calls.iter().map(|call| json!({
-        "type":"toolCall", "id":call, "name":"read", "arguments":{"path":"photo.png"}
-    })).collect();
+    let content: Vec<_> = calls
+        .iter()
+        .map(|call| {
+            json!({
+                "type":"toolCall", "id":call, "name":"read", "arguments":{"path":"photo.png"}
+            })
+        })
+        .collect();
     json!({
         "type":"message", "id":id, "parentId":parent,
         "timestamp":"2026-10-13T00:00:00Z",
@@ -67,10 +75,14 @@ fn fork_preserves_all_branches_global_metadata_and_forward_parents_with_new_iden
     let records = [
         record("chosen", Some("root"), json!("chosen 日本語")),
         record("other", Some("root"), json!("other branch")),
-        record("root", None, json!([
-            {"type":"text", "text":"original text"},
-            {"type":"media", "mimeType":"audio/wav", "data":{"missing":true}}
-        ])),
+        record(
+            "root",
+            None,
+            json!([
+                {"type":"text", "text":"original text"},
+                {"type":"media", "mimeType":"audio/wav", "data":{"missing":true}}
+            ]),
+        ),
         global.clone(),
     ];
     let source = source(directory.path(), &records, "chosen");
@@ -93,11 +105,25 @@ fn fork_preserves_all_branches_global_metadata_and_forward_parents_with_new_iden
     assert_eq!(copied[0]["currentLeaf"], notice["id"]);
     assert_eq!(notice["parentId"], "chosen");
     assert_eq!(notice["message"]["customType"], PROVENANCE);
-    assert_eq!(notice["message"]["details"]["sourceSha256"], report.source_sha256());
-    assert_eq!(notice["message"]["details"]["sourceSessionId"], "original-session");
+    assert_eq!(
+        notice["message"]["details"]["sourceSha256"],
+        report.source_sha256()
+    );
+    assert_eq!(
+        notice["message"]["details"]["sourceSessionId"],
+        "original-session"
+    );
     assert_eq!(notice["message"]["details"]["omittedAttachments"], 1);
-    assert!(notice["message"]["content"].as_str().unwrap().contains("not newly verified"));
-    let native: Vec<_> = copied[1..].iter().map(|row| SessionEntry::deserialize(row).unwrap()).collect();
+    assert!(
+        notice["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("not newly verified")
+    );
+    let native: Vec<_> = copied[1..]
+        .iter()
+        .map(|row| SessionEntry::deserialize(row).unwrap())
+        .collect();
     crate::session::validate_session_entry_graph(&native).unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), original);
     assert!(!crate::session::attachments::sidecar_path(&source).exists());
@@ -108,10 +134,14 @@ fn fork_preserves_all_branches_global_metadata_and_forward_parents_with_new_iden
 #[test]
 fn explicit_branch_and_root_select_without_discarding_any_history() {
     let directory = tempfile::tempdir().unwrap();
-    let source = source(directory.path(), &[
-        record("one", None, json!("one")),
-        record("two", Some("one"), json!("two")),
-    ], "two");
+    let source = source(
+        directory.path(),
+        &[
+            record("one", None, json!("one")),
+            record("two", Some("one"), json!("two")),
+        ],
+        "two",
+    );
     for (name, selection, expected) in [
         ("saved.jsonl", None, json!("two")),
         ("earlier.jsonl", Some("one"), json!("one")),
@@ -140,12 +170,20 @@ fn complete_parallel_tools_keep_ids_arguments_results_and_visible_media_omission
     let output = directory.path().join("copy.jsonl");
     Session::fork_recovered_text(&source, &output, None).unwrap();
     let copied = rows(&output);
-    assert_eq!(copied[2], records[1], "historical tool call is not rewritten or re-executed");
+    assert_eq!(
+        copied[2], records[1],
+        "historical tool call is not rewritten or re-executed"
+    );
     assert_eq!(copied[3]["message"]["toolCallId"], "call-b");
     assert_eq!(copied[4]["message"]["toolCallId"], "call-a");
     for result in &copied[3..5] {
         assert_eq!(result["message"]["content"][0]["type"], "text");
-        assert!(result["message"]["content"][0]["text"].as_str().unwrap().contains("not inspected"));
+        assert!(
+            result["message"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not inspected")
+        );
     }
 }
 
@@ -154,9 +192,15 @@ fn unfinished_duplicate_and_unmatched_tool_batches_refuse_without_fabrication() 
     let cases = [
         vec![assistant("calls", "start", &["a"])],
         vec![assistant("calls", "start", &["a", "a"])],
-        vec![assistant("calls", "start", &["a"]), tool_result("wrong", "calls", "b")],
+        vec![
+            assistant("calls", "start", &["a"]),
+            tool_result("wrong", "calls", "b"),
+        ],
         vec![tool_result("orphan", "start", "a")],
-        vec![assistant("calls", "start", &["a"]), record("later", Some("calls"), json!("next"))],
+        vec![
+            assistant("calls", "start", &["a"]),
+            record("later", Some("calls"), json!("next")),
+        ],
     ];
     for tail in cases {
         let directory = tempfile::tempdir().unwrap();
@@ -254,7 +298,10 @@ fn cancellation_after_preparation_does_not_publish_the_copy() {
     let report = Session::recover_text(source).unwrap();
     let owner = AgentCx::for_request();
     let prepared = PreparedCopy::new(&report, None, &owner).unwrap();
-    owner.cancel_with(asupersync::types::CancelKind::User, Some("abandon recovery fork"));
+    owner.cancel_with(
+        asupersync::types::CancelKind::User,
+        Some("abandon recovery fork"),
+    );
     let output = directory.path().join("copy.jsonl");
     assert!(prepared.publish(&report, &output, &owner).is_err());
     assert!(!output.exists());
@@ -269,7 +316,10 @@ fn copy_is_private_and_dangling_destination_or_blob_links_are_preserved() {
     let source = source(directory.path(), &[record("id", None, json!("keep"))], "id");
     let output = directory.path().join("copy.jsonl");
     Session::fork_recovered_text(&source, &output, None).unwrap();
-    assert_eq!(std::fs::metadata(&output).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let absent = directory.path().join("absent");
     let link = directory.path().join("linked.jsonl");
     symlink(&absent, &link).unwrap();
@@ -280,6 +330,16 @@ fn copy_is_private_and_dangling_destination_or_blob_links_are_preserved() {
     assert!(Session::fork_recovered_text(&source, &output, None).is_err());
     assert!(!output.exists());
     assert!(!absent.exists());
-    assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
-    assert!(std::fs::symlink_metadata(sidecar).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(sidecar)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }

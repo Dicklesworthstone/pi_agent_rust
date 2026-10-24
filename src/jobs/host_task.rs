@@ -8,7 +8,8 @@ use super::{
     MAX_TOTAL_ARTIFACT_BYTES, MIN_RETAINED_ARTIFACT_FILES, OUTPUT_TAIL_BYTES, TailBuffer,
     acquire_artifact_budget_lock, capture_session_spawn_generation, create_job_artifact,
     enforce_artifact_retention, ensure_session_spawn_generation, lifecycle_lock, now_ms, registry,
-    reserve_job_slot, session_closing_error, settle_job_and_enqueue_notice, settle_job_without_notice,
+    reserve_job_slot, session_closing_error, settle_job_and_enqueue_notice,
+    settle_job_without_notice,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -46,7 +47,10 @@ impl TaskAdmission {
 
 pub(crate) fn admit_owned_task(owner_session_id: &str) -> Result<TaskAdmission> {
     if owner_session_id.trim().is_empty() {
-        return Err(Error::tool("jobs", "PI_JOBS_SESSION_UNAVAILABLE: missing task owner"));
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: missing task owner",
+        ));
     }
     let admission = TaskAdmission(capture_session_spawn_generation(owner_session_id)?, None);
     #[cfg(test)]
@@ -70,10 +74,12 @@ pub(crate) fn with_owned_task_progress<T>(
     id: &str,
     commit: impl FnOnce() -> Result<(T, Option<String>)>,
 ) -> Result<T> {
-    let stopped = || Error::tool(
-        "jobs",
-        "PI_JOBS_TASK_STOPPED: native task is not accepting progress",
-    );
+    let stopped = || {
+        Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_STOPPED: native task is not accepting progress",
+        )
+    };
     let mut reg = registry().lock().map_err(|_| stopped())?;
     let live = reg.jobs.get(id).is_some_and(|job| {
         job.owner_session_id == owner_session_id
@@ -106,22 +112,29 @@ pub(crate) fn publish_owned_task_progress(
 ) -> Result<()> {
     let prepared = (|| -> Result<(ToolOutput, usize)> {
         if partial_result.is_error {
-            return Err(Error::tool("jobs", "PI_JOBS_TASK_PROGRESS: progress cannot be a terminal error"));
+            return Err(Error::tool(
+                "jobs",
+                "PI_JOBS_TASK_PROGRESS: progress cannot be a terminal error",
+            ));
         }
         // Bound before converting a caller's structured result to a JSON value.
         let mut partial = BoundedJson(Vec::new());
-        serde_json::to_writer(&mut partial, &partial_result)
-            .map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: progress exceeds 1 MiB"))?;
+        serde_json::to_writer(&mut partial, &partial_result).map_err(|_| {
+            Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: progress exceeds 1 MiB")
+        })?;
         let partial: serde_json::Value = serde_json::from_slice(&partial.0)?;
         let output = ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new("Background task progress; work is still running."))],
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Background task progress; work is still running.",
+            ))],
             details: Some(serde_json::json!({"schema": PROGRESS_SCHEMA, "partialResult": partial})),
             is_error: false,
         };
         let output = protect_exact_result(&output, privacy)?;
         let mut encoded = BoundedJson(Vec::new());
-        serde_json::to_writer(&mut encoded, &output)
-            .map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: progress exceeds 1 MiB"))?;
+        serde_json::to_writer(&mut encoded, &output).map_err(|_| {
+            Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: progress exceeds 1 MiB")
+        })?;
         Ok((output, encoded.0.len()))
     })();
     let (output, result_bytes) = match prepared {
@@ -134,13 +147,27 @@ pub(crate) fn publish_owned_task_progress(
             return Err(error);
         }
     };
-    let stopped = || Error::tool("jobs", "PI_JOBS_TASK_STOPPED: native task is not accepting progress");
+    let stopped = || {
+        Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_STOPPED: native task is not accepting progress",
+        )
+    };
     let mut reg = registry().lock().map_err(|_| stopped())?;
-    if reg.closing_owners.contains_key(owner_session_id) { return Err(stopped()); }
-    let job = reg.jobs.get_mut(id).filter(|job| {
-        job.owner_session_id == owner_session_id && job.schema == TASK_SCHEMA
-            && matches!(job.status, JobStatus::Running) && job.process_live && !job.cancel_requested
-    }).ok_or_else(stopped)?;
+    if reg.closing_owners.contains_key(owner_session_id) {
+        return Err(stopped());
+    }
+    let job = reg
+        .jobs
+        .get_mut(id)
+        .filter(|job| {
+            job.owner_session_id == owner_session_id
+                && job.schema == TASK_SCHEMA
+                && matches!(job.status, JobStatus::Running)
+                && job.process_live
+                && !job.cancel_requested
+        })
+        .ok_or_else(stopped)?;
     job.result = Some(output);
     job.result_bytes = result_bytes;
     super::prune_settled_jobs(&mut reg);
@@ -151,14 +178,30 @@ pub(crate) fn publish_owned_task_progress(
 /// task's privacy contract. Removal is permitted after cancellation or owner
 /// shutdown starts, but never after the worker has fenced terminal publication.
 pub(crate) fn clear_owned_task_progress(owner_session_id: &str, id: &str) -> Result<()> {
-    let stopped = || Error::tool("jobs", "PI_JOBS_TASK_STOPPED: native task cannot withdraw progress");
+    let stopped = || {
+        Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_STOPPED: native task cannot withdraw progress",
+        )
+    };
     let mut reg = registry().lock().map_err(|_| stopped())?;
-    let job = reg.jobs.get_mut(id).filter(|job| {
-        job.owner_session_id == owner_session_id && job.schema == TASK_SCHEMA
-            && matches!(job.status, JobStatus::Running) && job.process_live
-    }).ok_or_else(stopped)?;
-    if job.result.as_ref().and_then(|result| result.details.as_ref())
-        .is_some_and(|details| details.get("schema").and_then(serde_json::Value::as_str) == Some(PROGRESS_SCHEMA))
+    let job = reg
+        .jobs
+        .get_mut(id)
+        .filter(|job| {
+            job.owner_session_id == owner_session_id
+                && job.schema == TASK_SCHEMA
+                && matches!(job.status, JobStatus::Running)
+                && job.process_live
+        })
+        .ok_or_else(stopped)?;
+    if job
+        .result
+        .as_ref()
+        .and_then(|result| result.details.as_ref())
+        .is_some_and(|details| {
+            details.get("schema").and_then(serde_json::Value::as_str) == Some(PROGRESS_SCHEMA)
+        })
     {
         job.result = None;
         job.result_bytes = 0;
@@ -171,7 +214,11 @@ pub(crate) fn clear_owned_task_progress(owner_session_id: &str, id: &str) -> Res
 /// before calling. The future must own its inputs and clean up on drop.
 /// Session shutdown, capacity, retention and notifications are shared with
 /// shell jobs. A timeout or cancellation never publishes a success result.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::significant_drop_tightening)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening
+)]
 pub(crate) fn spawn_owned_task<F>(
     admission: TaskAdmission,
     label: &str,
@@ -185,27 +232,44 @@ where
     F: Future<Output = Result<ToolOutput>> + Send + 'static,
 {
     // Even rejected, never-polled work is retired under its original owner.
-    let work = OwnedWork { owner, future: Some(future) };
+    let work = OwnedWork {
+        owner,
+        future: Some(future),
+    };
     check_owner(&work.owner)?;
     let owner_session_id = admission.0.owner_session_id.as_str();
     if timeout.is_zero() || timeout > Duration::from_hours(24) {
-        return Err(Error::tool("jobs", "PI_JOBS_TASK_TIMEOUT: task budget must be positive and at most 24 hours"));
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_TIMEOUT: task budget must be positive and at most 24 hours",
+        ));
     }
-    if label.is_empty() || label.len() > MAX_TASK_LABEL_BYTES || label.chars().any(char::is_control) {
-        return Err(Error::tool("jobs", "PI_JOBS_TASK_LABEL: use a non-empty label of at most 256 bytes without control characters"));
+    if label.is_empty() || label.len() > MAX_TASK_LABEL_BYTES || label.chars().any(char::is_control)
+    {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_LABEL: use a non-empty label of at most 256 bytes without control characters",
+        ));
     }
     let protected_label = privacy.project_json(&serde_json::Value::String(label.to_string()))?;
     let Some(label) = protected_label.as_str() else {
-        return Err(Error::tool("jobs", "PI_JOBS_PRIVACY: task label projection changed shape"));
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_PRIVACY: task label projection changed shape",
+        ));
     };
     let started = Instant::now();
     let timeout = admission.1.map_or(timeout, |deadline| {
         timeout.min(deadline.saturating_duration_since(started))
     });
     if timeout.is_zero() {
-        return Err(Error::tool("jobs", "PI_JOBS_TASK_TIMEOUT: original task deadline expired before launch"));
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_TIMEOUT: original task deadline expired before launch",
+        ));
     }
-    let _lifecycle = lifecycle_lock().lock()
+    let _lifecycle = lifecycle_lock()
+        .lock()
         .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned"))?;
     ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
     let (id, sequence, slot) = reserve_job_slot()?;
@@ -217,10 +281,14 @@ where
     // lane. Recheck both generation and cancellation before publication.
     ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
     let source = {
-        let mut reg = registry().lock()
+        let mut reg = registry()
+            .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
-        let generation = reg.owner_shutdown_generations.get(owner_session_id)
-            .copied().unwrap_or_default();
+        let generation = reg
+            .owner_shutdown_generations
+            .get(owner_session_id)
+            .copied()
+            .unwrap_or_default();
         if reg.closing_owners.contains_key(owner_session_id)
             || generation != admission.0.generation()
         {
@@ -259,7 +327,11 @@ where
     };
     // The caller retains cleanup ownership if the OS refuses a thread.
     let resources = Arc::new(Mutex::new(Some(TaskResources {
-        id: id.clone(), artifact, tail, started: false, settled: false,
+        id: id.clone(),
+        artifact,
+        tail,
+        started: false,
+        settled: false,
     })));
     let worker_resources = Arc::clone(&resources);
     let worker = std::thread::Builder::new().name(format!("pi-task-{id}"))
@@ -291,36 +363,53 @@ where
             resources.finish(status, result, &privacy);
         });
     if let Err(error) = worker {
-        let cleanup = resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let cleanup = resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         drop(cleanup);
-        registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner).jobs.remove(&id);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
         return Err(Error::tool("jobs", format!("PI_JOBS_TASK_SPAWN: {error}")));
     }
     Ok(JobSnapshot::from_source_best_effort(&source))
 }
 
 fn check_owner(owner: &AgentCx) -> Result<()> {
-    owner.checkpoint().map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_CANCELLED: task owner cancelled"))?;
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_CANCELLED: task owner cancelled"))?;
     let capabilities = owner.capabilities();
     if !capabilities.spawn || !capabilities.io || !capabilities.time {
-        return Err(Error::tool("jobs", "PI_JOBS_TASK_CAPABILITY: background tasks require the owner's spawn, I/O and timer capabilities"));
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_CAPABILITY: background tasks require the owner's spawn, I/O and timer capabilities",
+        ));
     }
     Ok(())
 }
 
 fn task_artifact(
-    root: Option<&Path>, id: &str,
+    root: Option<&Path>,
+    id: &str,
 ) -> Result<(std::path::PathBuf, std::fs::File, ArtifactCleanupOutcome)> {
     let root = root.map_or_else(
-        || crate::config::Config::global_dir().join("tool-output-artifacts"), Path::to_path_buf,
+        || crate::config::Config::global_dir().join("tool-output-artifacts"),
+        Path::to_path_buf,
     );
     let directory = root.join("jobs");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Error::tool("jobs", format!("PI_JOBS_TASK_ARTIFACT: {error}")))?;
     let _budget = acquire_artifact_budget_lock(&directory)?;
     let cleanup = enforce_artifact_retention(
-        &directory, ArtifactRetentionPolicy::from_environment()?, MAX_TOTAL_ARTIFACT_BYTES,
-        MAX_ARTIFACT_FILES, MIN_RETAINED_ARTIFACT_FILES,
+        &directory,
+        ArtifactRetentionPolicy::from_environment()?,
+        MAX_TOTAL_ARTIFACT_BYTES,
+        MAX_ARTIFACT_FILES,
+        MIN_RETAINED_ARTIFACT_FILES,
     )?;
     let (path, file) = create_job_artifact(&directory, id)
         .map_err(|error| Error::tool("jobs", format!("PI_JOBS_TASK_ARTIFACT: {error}")))?;
@@ -348,7 +437,10 @@ enum TaskOutcome {
 impl<F: Future<Output = Result<ToolOutput>>> OwnedWork<F> {
     async fn run(mut self, id: &str, started: Instant, timeout: Duration) -> TaskOutcome {
         let Some(future) = self.future.take() else {
-            return TaskOutcome::Completed(Err(Error::tool("jobs", "PI_JOBS_TASK_STATE: missing task future")));
+            return TaskOutcome::Completed(Err(Error::tool(
+                "jobs",
+                "PI_JOBS_TASK_STATE: missing task future",
+            )));
         };
         let mut future = Box::pin(self.owner.with_current(future));
         loop {
@@ -362,7 +454,8 @@ impl<F: Future<Output = Result<ToolOutput>>> OwnedWork<F> {
             // task future is polled under the captured caller's context, so
             // a cancelled caller cannot park its own cleanup monitor.
             let sleep = Box::pin(asupersync::time::sleep(
-                asupersync::time::wall_now(), TASK_POLL_INTERVAL,
+                asupersync::time::wall_now(),
+                TASK_POLL_INTERVAL,
             ));
             match futures::future::select(future, sleep).await {
                 futures::future::Either::Left((result, _)) => {
@@ -382,8 +475,12 @@ impl<F: Future<Output = Result<ToolOutput>>> OwnedWork<F> {
 }
 
 fn task_cancelled(id: &str) -> bool {
-    registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-        .jobs.get(id).is_none_or(|job| job.cancel_requested)
+    registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .jobs
+        .get(id)
+        .is_none_or(|job| job.cancel_requested)
 }
 
 struct TaskResources {
@@ -395,16 +492,27 @@ struct TaskResources {
 }
 
 impl TaskResources {
-    fn finish(&mut self, mut status: JobStatus, mut result: ToolOutput, privacy: &AuxiliaryPrivacySnapshot) {
+    fn finish(
+        &mut self,
+        mut status: JobStatus,
+        mut result: ToolOutput,
+        privacy: &AuxiliaryPrivacySnapshot,
+    ) {
         {
-            let mut reg = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(job) = reg.jobs.get_mut(&self.id) {
                 // Completion/cancellation linearizes before any result is
                 // projected or persisted. No late cancellation can change a
                 // completed task's artifact, notice or structured result.
-                if job.cancel_requested && !matches!(status, JobStatus::Killed | JobStatus::TimedOut) {
+                if job.cancel_requested
+                    && !matches!(status, JobStatus::Killed | JobStatus::TimedOut)
+                {
                     status = JobStatus::Killed;
-                    result = error_output("PI_JOBS_TASK_CANCELLED: task cancelled during result publication; prior side effects may remain");
+                    result = error_output(
+                        "PI_JOBS_TASK_CANCELLED: task cancelled during result publication; prior side effects may remain",
+                    );
                 }
                 job.process_live = false;
                 // Keep only an explicitly published, already-screened partial
@@ -412,8 +520,12 @@ impl TaskResources {
                 // and panic) discard it. Capture under the same fence that
                 // prevents late progress from changing the terminal result.
                 if matches!(status, JobStatus::Killed | JobStatus::TimedOut)
-                    && let Some(details) = job.result.as_ref().and_then(|output| output.details.as_ref())
-                    && details.get("schema").and_then(serde_json::Value::as_str) == Some(PROGRESS_SCHEMA)
+                    && let Some(details) = job
+                        .result
+                        .as_ref()
+                        .and_then(|output| output.details.as_ref())
+                    && details.get("schema").and_then(serde_json::Value::as_str)
+                        == Some(PROGRESS_SCHEMA)
                     && let Some(partial) = details.get("partialResult")
                 {
                     result.details = Some(serde_json::json!({
@@ -425,8 +537,9 @@ impl TaskResources {
                 }
             }
         }
-        let interrupted = result.details.as_ref()
-            .is_some_and(|details| details.get("schema").and_then(serde_json::Value::as_str) == Some(INTERRUPTED_SCHEMA));
+        let interrupted = result.details.as_ref().is_some_and(|details| {
+            details.get("schema").and_then(serde_json::Value::as_str) == Some(INTERRUPTED_SCHEMA)
+        });
         let protected = if interrupted {
             protect_exact_result(&result, privacy)
         } else {
@@ -435,18 +548,28 @@ impl TaskResources {
         let result = match protected {
             Ok(result) => result,
             Err(_) => {
-                if matches!(status, JobStatus::Exited | JobStatus::Failed) { status = JobStatus::Failed; }
-                error_output("PI_JOBS_TASK_RESULT_WITHHELD: result exceeded the 1 MiB budget or failed privacy projection; no raw output was retained")
+                if matches!(status, JobStatus::Exited | JobStatus::Failed) {
+                    status = JobStatus::Failed;
+                }
+                error_output(
+                    "PI_JOBS_TASK_RESULT_WITHHELD: result exceeded the 1 MiB budget or failed privacy projection; no raw output was retained",
+                )
             }
         };
         let encoded = serde_json::to_vec(&result).unwrap_or_default();
         {
-            let mut artifact = self.artifact.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut artifact = self
+                .artifact
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             artifact.write(&encoded);
             artifact.seal();
         }
         {
-            let mut tail = self.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut tail = self
+                .tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for block in &result.content {
                 if let ContentBlock::Text(text) = block {
                     tail.push(text.text.as_bytes());
@@ -456,7 +579,9 @@ impl TaskResources {
             tail.seal();
         }
         {
-            let mut reg = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(job) = reg.jobs.get_mut(&self.id) {
                 job.result = Some(result);
                 job.result_bytes = encoded.len();
@@ -469,17 +594,31 @@ impl TaskResources {
 
 impl Drop for TaskResources {
     fn drop(&mut self) {
-        self.artifact.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seal();
-        self.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seal();
+        self.artifact
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seal();
+        self.tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seal();
         if !self.settled {
             {
-                let mut reg = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(job) = reg.jobs.get_mut(&self.id).filter(|job| !job.status.settled()) {
+                let mut reg = registry()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(job) = reg
+                    .jobs
+                    .get_mut(&self.id)
+                    .filter(|job| !job.status.settled())
+                {
                     // finish itself can unwind after the work future has been
                     // caught. Never freeze a running progress wrapper as a
                     // failed terminal result in that emergency path.
                     job.process_live = false;
-                    let result = error_output("PI_JOBS_TASK_PUBLICATION: task ended without complete result publication");
+                    let result = error_output(
+                        "PI_JOBS_TASK_PUBLICATION: task ended without complete result publication",
+                    );
                     job.result_bytes = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
                     job.result = Some(result);
                 }
@@ -514,7 +653,9 @@ impl Write for BoundedJson {
         Ok(bytes.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn protect_result(result: &ToolOutput, privacy: &AuxiliaryPrivacySnapshot) -> Result<ToolOutput> {
@@ -524,16 +665,31 @@ fn protect_result(result: &ToolOutput, privacy: &AuxiliaryPrivacySnapshot) -> Re
     let value = serde_json::from_slice(&encoded.0)?;
     let projected = privacy.project_json(&value)?;
     encoded.0.clear();
-    serde_json::to_writer(&mut encoded, &projected)
-        .map_err(|_| Error::tool("jobs", "PI_JOBS_TASK_RESULT_LIMIT: projected result exceeds 1 MiB"))?;
-    serde_json::from_value(projected).map_err(|error| Error::tool("jobs", format!("PI_JOBS_PRIVACY: invalid result projection: {error}")))
+    serde_json::to_writer(&mut encoded, &projected).map_err(|_| {
+        Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_RESULT_LIMIT: projected result exceeds 1 MiB",
+        )
+    })?;
+    serde_json::from_value(projected).map_err(|error| {
+        Error::tool(
+            "jobs",
+            format!("PI_JOBS_PRIVACY: invalid result projection: {error}"),
+        )
+    })
 }
 
-fn protect_exact_result(result: &ToolOutput, privacy: &AuxiliaryPrivacySnapshot) -> Result<ToolOutput> {
+fn protect_exact_result(
+    result: &ToolOutput,
+    privacy: &AuxiliaryPrivacySnapshot,
+) -> Result<ToolOutput> {
     let protected = protect_result(result, privacy)?;
     // protect_result bounds both serializations before these value copies.
     if serde_json::to_value(result)? != serde_json::to_value(&protected)? {
-        return Err(Error::tool("jobs", "PI_JOBS_TASK_PROGRESS_PRIVACY: projection changed typed progress; result withheld"));
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_TASK_PROGRESS_PRIVACY: projection changed typed progress; result withheld",
+        ));
     }
     Ok(protected)
 }
@@ -560,8 +716,18 @@ mod tests {
         privacy: AuxiliaryPrivacySnapshot,
         future: F,
     ) -> Result<JobSnapshot>
-    where F: Future<Output = Result<ToolOutput>> + Send + 'static {
-        super::spawn_owned_task(admit_owned_task(owner_session_id)?, label, owner, timeout, artifact_root, privacy, future)
+    where
+        F: Future<Output = Result<ToolOutput>> + Send + 'static,
+    {
+        super::spawn_owned_task(
+            admit_owned_task(owner_session_id)?,
+            label,
+            owner,
+            timeout,
+            artifact_root,
+            privacy,
+            future,
+        )
     }
 
     fn privacy() -> AuxiliaryPrivacySnapshot {
@@ -576,7 +742,9 @@ mod tests {
         }
     }
 
-    fn owner_id() -> String { format!("task-test-{}", uuid::Uuid::new_v4().simple()) }
+    fn owner_id() -> String {
+        format!("task-test-{}", uuid::Uuid::new_v4().simple())
+    }
 
     fn settle(owner: &str, id: &str) -> JobSnapshot {
         let snapshot = super::super::wait(owner, id, Duration::from_secs(10)).expect("job settles"); // ubs:ignore test helper requires bounded native settlement
@@ -591,13 +759,18 @@ mod tests {
 
     impl Future for PendingDrop {
         type Output = Result<ToolOutput>;
-        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
     }
 
     impl Drop for PendingDrop {
         fn drop(&mut self) {
             if let Some(observed) = &self.restricted_drop {
-                observed.store(asupersync::Cx::current().is_some_and(|cx| !cx.capabilities().io), Ordering::Release);
+                observed.store(
+                    asupersync::Cx::current().is_some_and(|cx| !cx.capabilities().io),
+                    Ordering::Release,
+                );
             }
             self.dropped.store(true, Ordering::Release);
         }
@@ -609,23 +782,41 @@ mod tests {
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore isolated artifact directory is required fixture setup
         let owner = owner_id();
         let (release, ready) = futures::channel::oneshot::channel::<()>();
-        let started = spawn_owned_task(&owner, "test task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), privacy(), async move { // ubs:ignore fixture launch must succeed before testing retained results
-            ready.await.map_err(|_| Error::tool("test", "gate disconnected"))?;
-            Ok(output("native result"))
-        }).expect("start task"); // ubs:ignore fixture launch failure invalidates this result-retention regression
+        let started = spawn_owned_task(
+            &owner,
+            "test task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            async move {
+                // ubs:ignore fixture launch must succeed before testing retained results
+                ready
+                    .await
+                    .map_err(|_| Error::tool("test", "gate disconnected"))?;
+                Ok(output("native result"))
+            },
+        )
+        .expect("start task"); // ubs:ignore fixture launch failure invalidates this result-retention regression
         assert_eq!(started.status, "running"); // ubs:ignore assert immediate admission before the gated future completes
         assert_eq!(started.schema, TASK_SCHEMA); // ubs:ignore assert native task schema rather than shell-job schema
         assert!(started.pid.is_none()); // ubs:ignore native futures must not claim a process ID
         assert!(super::super::wait("foreign-owner", &started.id, Duration::ZERO).is_err()); // ubs:ignore assert cross-session wait is denied
         assert!(super::super::cancel("foreign-owner", &started.id).is_err()); // ubs:ignore assert cross-session cancellation is denied
-        assert!(super::super::list("foreign-owner").expect("foreign list").is_empty()); // ubs:ignore foreign-owner listing must succeed without exposing the task
+        assert!(
+            super::super::list("foreign-owner")
+                .expect("foreign list")
+                .is_empty()
+        ); // ubs:ignore foreign-owner listing must succeed without exposing the task
         release.send(()).expect("release task"); // ubs:ignore a live fixture receiver is required to release the gated task
         let settled = settle(&owner, &started.id);
         assert_eq!(settled.status, "exited"); // ubs:ignore assert successful terminal publication
         let result = settled.result.as_ref().expect("native result retained"); // ubs:ignore retained native result is the behavior under test
         assert!(!result.is_error); // ubs:ignore assert the successful future stays successful
         assert_eq!(result.details, Some(json!({"answer":42,"items":[1,2,3]}))); // ubs:ignore assert structured details survive background execution
-        let artifact: ToolOutput = serde_json::from_slice(&std::fs::read(&settled.artifact_path).expect("artifact")).expect("complete native JSON"); // ubs:ignore fixture artifact must contain complete native JSON
+        let artifact: ToolOutput =
+            serde_json::from_slice(&std::fs::read(&settled.artifact_path).expect("artifact"))
+                .expect("complete native JSON"); // ubs:ignore fixture artifact must contain complete native JSON
         assert_eq!(artifact.details, result.details); // ubs:ignore assert artifact and retained-result consistency
         assert_eq!(super::super::take_completion_notices(&owner).len(), 1); // ubs:ignore assert exactly one owner notice
         assert!(super::super::take_completion_notices("foreign-owner").is_empty()); // ubs:ignore assert completion does not leak to another session
@@ -637,12 +828,35 @@ mod tests {
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore cancellation fixture requires isolated artifacts
         let owner = owner_id();
         let dropped = Arc::new(AtomicBool::new(false));
-        let started = spawn_owned_task(&owner, "quiet task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), privacy(), PendingDrop { dropped: Arc::clone(&dropped), restricted_drop: None }).expect("start task"); // ubs:ignore pending-future fixture must launch before cancellation
+        let started = spawn_owned_task(
+            &owner,
+            "quiet task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            PendingDrop {
+                dropped: Arc::clone(&dropped),
+                restricted_drop: None,
+            },
+        )
+        .expect("start task"); // ubs:ignore pending-future fixture must launch before cancellation
         let settled = super::super::cancel(&owner, &started.id).expect("cancel task"); // ubs:ignore native cancellation must complete in this regression
         assert_eq!(settled.status, "killed"); // ubs:ignore assert cancellation terminal state
-        assert!(dropped.load(Ordering::Acquire), "future cleanup precedes completed cancellation"); // ubs:ignore assert cleanup happens before cancellation is observable
-        assert!(settled.result.as_ref().expect("cancellation result").is_error); // ubs:ignore assert cancellation retains an error result
-        let artifact: ToolOutput = serde_json::from_slice(&std::fs::read(&settled.artifact_path).expect("artifact")).expect("cancelled JSON"); // ubs:ignore cancellation artifact must remain valid complete JSON
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "future cleanup precedes completed cancellation"
+        ); // ubs:ignore assert cleanup happens before cancellation is observable
+        assert!(
+            settled
+                .result
+                .as_ref()
+                .expect("cancellation result")
+                .is_error
+        ); // ubs:ignore assert cancellation retains an error result
+        let artifact: ToolOutput =
+            serde_json::from_slice(&std::fs::read(&settled.artifact_path).expect("artifact"))
+                .expect("cancelled JSON"); // ubs:ignore cancellation artifact must remain valid complete JSON
         assert!(artifact.is_error); // ubs:ignore assert cancellation artifact agrees with terminal state
         assert!(settled.output_tail.contains("CANCELLED")); // ubs:ignore assert tail reports cancellation
     }
@@ -660,38 +874,54 @@ mod tests {
             Some(root.path()),
             privacy(),
             futures::future::pending(),
-        ).expect("start task"); // ubs:ignore a live owned task is required to exercise the progress boundary
+        )
+        .expect("start task"); // ubs:ignore a live owned task is required to exercise the progress boundary
         let value = with_owned_task_progress(&owner, &started.id, || {
             Ok((42, Some("screened turn progress".to_string())))
-        }).expect("live progress"); // ubs:ignore the live matching owner must be admitted
+        })
+        .expect("live progress"); // ubs:ignore the live matching owner must be admitted
         assert_eq!(value, 42); // ubs:ignore assert the commit value is returned to the caller
         let notices = super::super::take_completion_notices(&owner);
         assert_eq!(notices.len(), 1); // ubs:ignore successful progress must enqueue exactly one notice
-        assert!(serde_json::to_string(&notices).expect("notices").contains("screened turn progress")); // ubs:ignore verify the screened notice reaches its owner
+        assert!(
+            serde_json::to_string(&notices)
+                .expect("notices")
+                .contains("screened turn progress")
+        ); // ubs:ignore verify the screened notice reaches its owner
 
-        for (scope, id) in [("foreign-owner", started.id.as_str()), (owner.as_str(), "missing-task")] {
+        for (scope, id) in [
+            ("foreign-owner", started.id.as_str()),
+            (owner.as_str(), "missing-task"),
+        ] {
             let mut called = false;
             let error = with_owned_task_progress(scope, id, || {
                 called = true;
                 Ok(((), Some("forbidden progress marker".to_string())))
-            }).expect_err("foreign or missing task"); // ubs:ignore unknown and foreign tasks must reject the callback
+            })
+            .expect_err("foreign or missing task"); // ubs:ignore unknown and foreign tasks must reject the callback
             assert!(!called); // ubs:ignore rejected ownership must never mutate private task state
             let message = error.to_string();
             assert!(message.contains("PI_JOBS_TASK_STOPPED")); // ubs:ignore all unavailable tasks use the same non-disclosing error
             assert!(!message.contains(&started.id) && !message.contains(&owner)); // ubs:ignore ownership errors must not expose another task's metadata
         }
 
-        let _cancelling = super::super::request_cancel(&owner, &started.id).expect("request cancellation"); // ubs:ignore install the real cancellation fence before checking further progress
+        let _cancelling =
+            super::super::request_cancel(&owner, &started.id).expect("request cancellation"); // ubs:ignore install the real cancellation fence before checking further progress
         let mut called = false;
         let error = with_owned_task_progress(&owner, &started.id, || {
             called = true;
             Ok(((), Some("forbidden progress marker".to_string())))
-        }).expect_err("cancelled task"); // ubs:ignore cancellation must win whether or not the monitor has already settled
+        })
+        .expect_err("cancelled task"); // ubs:ignore cancellation must win whether or not the monitor has already settled
         assert!(!called); // ubs:ignore cancelled work cannot enqueue another turn or publish a result
         assert!(error.to_string().contains("PI_JOBS_TASK_STOPPED")); // ubs:ignore verify the named stopped-task error
         assert_eq!(settle(&owner, &started.id).status, "killed"); // ubs:ignore the fixture's pending task must retire after cancellation
         let notices = super::super::take_completion_notices(&owner);
-        assert!(!serde_json::to_string(&notices).expect("notices").contains("forbidden progress marker")); // ubs:ignore rejected callbacks must not deliver their notices
+        assert!(
+            !serde_json::to_string(&notices)
+                .expect("notices")
+                .contains("forbidden progress marker")
+        ); // ubs:ignore rejected callbacks must not deliver their notices
     }
 
     #[test]
@@ -707,13 +937,15 @@ mod tests {
             Some(root.path()),
             privacy(),
             futures::future::pending(),
-        ).expect("start task"); // ubs:ignore a live task is required before installing the owner shutdown fence
+        )
+        .expect("start task"); // ubs:ignore a live task is required before installing the owner shutdown fence
         let shutdown = super::super::SessionShutdownAttempt::begin(&owner).expect("shutdown fence"); // ubs:ignore reproduce the closing fence that precedes lifecycle-lock acquisition
         let mut called = false;
         let error = with_owned_task_progress(&owner, &started.id, || {
             called = true;
             Ok(((), Some("late shutdown progress".to_string())))
-        }).expect_err("closing owner"); // ubs:ignore closing alone must refuse progress even before cancellation reaches each task
+        })
+        .expect_err("closing owner"); // ubs:ignore closing alone must refuse progress even before cancellation reaches each task
         assert!(!called); // ubs:ignore shutdown must prevent the private-state commit
         assert!(error.to_string().contains("PI_JOBS_TASK_STOPPED")); // ubs:ignore shutdown uses the same stopped-task error
         assert!(super::super::take_completion_notices(&owner).is_empty()); // ubs:ignore rejected progress must not publish a late notice
@@ -726,10 +958,20 @@ mod tests {
         let _guard = super::super::process_test_guard();
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore timeout fixture requires isolated artifacts
         let owner = owner_id();
-        let started = spawn_owned_task(&owner, "late task", AgentCx::for_request(), Duration::from_millis(50), Some(root.path()), privacy(), async { // ubs:ignore fixture must launch before exercising a late-ready outcome
-            std::thread::sleep(Duration::from_millis(100));
-            Ok(output("late success must be discarded"))
-        }).expect("start task"); // ubs:ignore late-ready fixture launch is required setup
+        let started = spawn_owned_task(
+            &owner,
+            "late task",
+            AgentCx::for_request(),
+            Duration::from_millis(50),
+            Some(root.path()),
+            privacy(),
+            async {
+                // ubs:ignore fixture must launch before exercising a late-ready outcome
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(output("late success must be discarded"))
+            },
+        )
+        .expect("start task"); // ubs:ignore late-ready fixture launch is required setup
         let settled = settle(&owner, &started.id);
         assert_eq!(settled.status, "timedOut"); // ubs:ignore assert the deadline wins over late readiness
         assert!(settled.result.as_ref().expect("timeout result").is_error); // ubs:ignore timeout must publish an error result
@@ -744,12 +986,39 @@ mod tests {
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore shutdown fixture requires isolated artifacts
         let first_owner = owner_id();
         let second_owner = owner_id();
-        let first = spawn_owned_task(&first_owner, "first task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), privacy(), futures::future::pending()).expect("first task"); // ubs:ignore first owner must have a live fixture task
-        let second = spawn_owned_task(&second_owner, "second task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), privacy(), futures::future::pending()).expect("second task"); // ubs:ignore second owner must have a live isolation-control task
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime"); // ubs:ignore native shutdown fixture requires its runtime
-        runtime.block_on(super::super::kill_session(&first_owner)).expect("owner shutdown"); // ubs:ignore owner shutdown must complete for the isolation assertion
+        let first = spawn_owned_task(
+            &first_owner,
+            "first task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            futures::future::pending(),
+        )
+        .expect("first task"); // ubs:ignore first owner must have a live fixture task
+        let second = spawn_owned_task(
+            &second_owner,
+            "second task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            futures::future::pending(),
+        )
+        .expect("second task"); // ubs:ignore second owner must have a live isolation-control task
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime"); // ubs:ignore native shutdown fixture requires its runtime
+        runtime
+            .block_on(super::super::kill_session(&first_owner))
+            .expect("owner shutdown"); // ubs:ignore owner shutdown must complete for the isolation assertion
         assert_eq!(settle(&first_owner, &first.id).status, "killed"); // ubs:ignore assert shutdown retires its own task
-        assert_eq!(super::super::wait(&second_owner, &second.id, Duration::ZERO).expect("other owner").status, "running"); // ubs:ignore assert shutdown preserves the other owner's task
+        assert_eq!(
+            super::super::wait(&second_owner, &second.id, Duration::ZERO)
+                .expect("other owner")
+                .status,
+            "running"
+        ); // ubs:ignore assert shutdown preserves the other owner's task
         super::super::cancel(&second_owner, &second.id).expect("second cleanup"); // ubs:ignore cleanup must retire the control task
     }
 
@@ -759,7 +1028,16 @@ mod tests {
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore owner-cancellation fixture requires isolated artifacts
         let owner = owner_id();
         let context = AgentCx::for_request();
-        let started = spawn_owned_task(&owner, "owner-cancel task", context.clone(), Duration::from_secs(30), Some(root.path()), privacy(), futures::future::pending()).expect("start task"); // ubs:ignore original-context cancellation requires a live fixture task
+        let started = spawn_owned_task(
+            &owner,
+            "owner-cancel task",
+            context.clone(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            futures::future::pending(),
+        )
+        .expect("start task"); // ubs:ignore original-context cancellation requires a live fixture task
         context.set_cancel_requested(true);
         assert_eq!(settle(&owner, &started.id).status, "killed"); // ubs:ignore assert the monitor observes original-owner cancellation
     }
@@ -770,8 +1048,10 @@ mod tests {
         struct RestoreHooks;
         impl Drop for RestoreHooks {
             fn drop(&mut self) {
-                *crate::jobs::spawn_background_test_hooks().lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = crate::jobs::SpawnBackgroundTestHooks::default();
+                *crate::jobs::spawn_background_test_hooks()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    crate::jobs::SpawnBackgroundTestHooks::default();
             }
         }
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore admission-race fixture requires isolated artifacts
@@ -779,11 +1059,18 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release = Arc::new(Mutex::new(release_rx));
-        *crate::jobs::spawn_background_test_hooks().lock().expect("hooks") = crate::jobs::SpawnBackgroundTestHooks { // ubs:ignore serialized test hook installation must succeed
+        *crate::jobs::spawn_background_test_hooks()
+            .lock()
+            .expect("hooks") = crate::jobs::SpawnBackgroundTestHooks {
+            // ubs:ignore serialized test hook installation must succeed
             owner_session_id: Some(owner.clone()),
             after_initial_owner_check: Some(Arc::new(move || {
                 entered_tx.send(()).expect("admission reached"); // ubs:ignore test must observe the paused admission seam
-                release.lock().expect("release gate").recv_timeout(Duration::from_secs(10)).expect("release old admission"); // ubs:ignore bounded test gate must release the paused launch
+                release
+                    .lock()
+                    .expect("release gate")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release old admission"); // ubs:ignore bounded test gate must release the paused launch
             })),
             ..crate::jobs::SpawnBackgroundTestHooks::default()
         };
@@ -793,21 +1080,47 @@ mod tests {
         let task_owner = owner.clone();
         let artifact_root = root.path().to_path_buf();
         let starter = std::thread::spawn(move || {
-            spawn_owned_task(&task_owner, "queued task", AgentCx::for_request(), Duration::from_secs(30), Some(&artifact_root), privacy(), async move {
-                observed.store(true, Ordering::Release);
-                Ok(output("stale task must not run"))
-            })
+            spawn_owned_task(
+                &task_owner,
+                "queued task",
+                AgentCx::for_request(),
+                Duration::from_secs(30),
+                Some(&artifact_root),
+                privacy(),
+                async move {
+                    observed.store(true, Ordering::Release);
+                    Ok(output("stale task must not run"))
+                },
+            )
         });
-        entered_rx.recv_timeout(Duration::from_secs(10)).expect("old admission paused"); // ubs:ignore test requires a proven paused admission before shutdown
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime"); // ubs:ignore generation-race fixture requires its shutdown runtime
-        runtime.block_on(super::super::kill_session(&owner)).expect("shutdown before publication"); // ubs:ignore fixture must complete shutdown while admission is paused
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("old admission paused"); // ubs:ignore test requires a proven paused admission before shutdown
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime"); // ubs:ignore generation-race fixture requires its shutdown runtime
+        runtime
+            .block_on(super::super::kill_session(&owner))
+            .expect("shutdown before publication"); // ubs:ignore fixture must complete shutdown while admission is paused
         release_tx.send(()).expect("resume old admission"); // ubs:ignore release the old admission so its rejection can be observed
-        let error = starter.join().expect("starter joined").expect_err("stale generation refused"); // ubs:ignore joined fixture launch must reject its stale generation
+        let error = starter
+            .join()
+            .expect("starter joined")
+            .expect_err("stale generation refused"); // ubs:ignore joined fixture launch must reject its stale generation
         assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING")); // ubs:ignore assert the named shutdown-generation error
         assert!(!polled.load(Ordering::Acquire)); // ubs:ignore assert stale work was never polled
         assert!(super::super::list(&owner).expect("owner list").is_empty()); // ubs:ignore assert refused admission leaves no registry entry
         drop(restore);
-        let replacement = spawn_owned_task(&owner, "fresh task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), privacy(), async { Ok(output("fresh work")) }).expect("fresh admission after quiescence"); // ubs:ignore fixture verifies a new generation can be admitted after shutdown
+        let replacement = spawn_owned_task(
+            &owner,
+            "fresh task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            async { Ok(output("fresh work")) },
+        )
+        .expect("fresh admission after quiescence"); // ubs:ignore fixture verifies a new generation can be admitted after shutdown
         assert_eq!(settle(&owner, &replacement.id).status, "exited"); // ubs:ignore assert fresh work completes after the stale generation is refused
     }
 
@@ -822,8 +1135,24 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let restricted_drop = Arc::new(AtomicBool::new(false));
         let owner = owner_id();
-        let result = spawn_owned_task(&owner, "restricted task", context, Duration::from_secs(30), None, privacy(), PendingDrop { dropped: Arc::clone(&dropped), restricted_drop: Some(Arc::clone(&restricted_drop)) });
-        assert!(result.expect_err("capability denied").to_string().contains("PI_JOBS_TASK_CAPABILITY")); // ubs:ignore assert admission refuses the restricted owner
+        let result = spawn_owned_task(
+            &owner,
+            "restricted task",
+            context,
+            Duration::from_secs(30),
+            None,
+            privacy(),
+            PendingDrop {
+                dropped: Arc::clone(&dropped),
+                restricted_drop: Some(Arc::clone(&restricted_drop)),
+            },
+        );
+        assert!(
+            result
+                .expect_err("capability denied")
+                .to_string()
+                .contains("PI_JOBS_TASK_CAPABILITY")
+        ); // ubs:ignore assert admission refuses the restricted owner
         assert!(dropped.load(Ordering::Acquire)); // ubs:ignore assert rejected never-polled work is retired
         assert!(restricted_drop.load(Ordering::Acquire)); // ubs:ignore assert retirement uses the original restricted capabilities
         assert!(super::super::list(&owner).expect("owner list").is_empty()); // ubs:ignore assert rejected work never enters the registry
@@ -834,13 +1163,27 @@ mod tests {
         let _guard = super::super::process_test_guard();
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore panic fixture requires isolated artifacts
         let owner = owner_id();
-        let started = spawn_owned_task(&owner, "panic task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), privacy(), async { // ubs:ignore fixture must launch before triggering the deliberate panic
-            panic!("private panic payload"); // ubs:ignore intentional panic fixture verifies panic retirement and result privacy
-        }).expect("start task"); // ubs:ignore panic fixture launch is required setup
+        let started = spawn_owned_task(
+            &owner,
+            "panic task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            async {
+                // ubs:ignore fixture must launch before triggering the deliberate panic
+                panic!("private panic payload"); // ubs:ignore intentional panic fixture verifies panic retirement and result privacy
+            },
+        )
+        .expect("start task"); // ubs:ignore panic fixture launch is required setup
         let settled = settle(&owner, &started.id);
         assert_eq!(settled.status, "failed"); // ubs:ignore assert panic settles as failure
         assert!(settled.output_tail.contains("PI_JOBS_TASK_PANIC")); // ubs:ignore assert a public named panic error is retained
-        assert!(!serde_json::to_string(&settled).expect("snapshot").contains("private panic payload")); // ubs:ignore serialized fixture snapshot must exclude the private panic payload
+        assert!(
+            !serde_json::to_string(&settled)
+                .expect("snapshot")
+                .contains("private panic payload")
+        ); // ubs:ignore serialized fixture snapshot must exclude the private panic payload
     }
 
     #[test]
@@ -850,21 +1193,51 @@ mod tests {
         let owner = owner_id();
         let secret = "opaque-private-value-from-earlier-turn";
         let mut vault = crate::secrets::SecretVault::default();
-        crate::secrets::obfuscate(secret, &mut vault, &[regex::Regex::new(secret).expect("pattern")]); // ubs:ignore fixed test pattern must seed the remembered-secret fixture
+        crate::secrets::obfuscate(
+            secret,
+            &mut vault,
+            &[regex::Regex::new(secret).expect("pattern")],
+        ); // ubs:ignore fixed test pattern must seed the remembered-secret fixture
         let reversible = vault.mask(secret);
-        let projection = AuxiliaryPrivacySnapshot::with_vault(AuxiliaryPrivacy::from_settings(None), &vault);
-        let started = spawn_owned_task(&owner, "private task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), projection, async move { // ubs:ignore privacy fixture must launch with its known-secret snapshot
-            Ok(ToolOutput { content: vec![ContentBlock::Text(TextContent::new(secret))], details: Some(json!({"echo":secret})), is_error:false })
-        }).expect("start task"); // ubs:ignore privacy fixture launch is required setup
+        let projection =
+            AuxiliaryPrivacySnapshot::with_vault(AuxiliaryPrivacy::from_settings(None), &vault);
+        let started = spawn_owned_task(
+            &owner,
+            "private task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            projection,
+            async move {
+                // ubs:ignore privacy fixture must launch with its known-secret snapshot
+                Ok(ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(secret))],
+                    details: Some(json!({"echo":secret})),
+                    is_error: false,
+                })
+            },
+        )
+        .expect("start task"); // ubs:ignore privacy fixture launch is required setup
         let settled = settle(&owner, &started.id);
         assert_eq!(settled.status, "exited"); // ubs:ignore assert redaction preserves a valid successful result
-        for text in [serde_json::to_string(&settled).expect("snapshot"), std::fs::read_to_string(&settled.artifact_path).expect("artifact")] { // ubs:ignore inspect both complete fixture publication surfaces
+        for text in [
+            serde_json::to_string(&settled).expect("snapshot"),
+            std::fs::read_to_string(&settled.artifact_path).expect("artifact"),
+        ] {
+            // ubs:ignore inspect both complete fixture publication surfaces
             assert!(!text.contains(secret)); // ubs:ignore assert remembered secret is absent from durable and structured output
-            assert!(!text.contains(&reversible), "restorable vault identifiers cannot escape"); // ubs:ignore assert reversible vault tokens cannot escape
+            assert!(
+                !text.contains(&reversible),
+                "restorable vault identifiers cannot escape"
+            ); // ubs:ignore assert reversible vault tokens cannot escape
             assert!(text.contains("<pi-secret:redacted>")); // ubs:ignore assert non-restorable redaction is present
         }
         for notice in super::super::take_completion_notices(&owner) {
-            assert!(!serde_json::to_string(&notice).expect("notice").contains(secret)); // ubs:ignore assert serialized completion notices also protect the secret
+            assert!(
+                !serde_json::to_string(&notice)
+                    .expect("notice")
+                    .contains(secret)
+            ); // ubs:ignore assert serialized completion notices also protect the secret
         }
     }
 
@@ -873,13 +1246,29 @@ mod tests {
         let _guard = super::super::process_test_guard();
         let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore size-limit fixture requires isolated artifacts
         let owner = owner_id();
-        let started = spawn_owned_task(&owner, "large task", AgentCx::for_request(), Duration::from_secs(30), Some(root.path()), privacy(), async { // ubs:ignore oversize-result fixture must reach the carrier
-            Ok(output(&"raw-payload-marker".repeat(MAX_TASK_RESULT_BYTES / 8)))
-        }).expect("start task"); // ubs:ignore oversize fixture launch is required setup
+        let started = spawn_owned_task(
+            &owner,
+            "large task",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(root.path()),
+            privacy(),
+            async {
+                // ubs:ignore oversize-result fixture must reach the carrier
+                Ok(output(
+                    &"raw-payload-marker".repeat(MAX_TASK_RESULT_BYTES / 8),
+                ))
+            },
+        )
+        .expect("start task"); // ubs:ignore oversize fixture launch is required setup
         let settled = settle(&owner, &started.id);
         assert_eq!(settled.status, "failed"); // ubs:ignore assert an oversized result cannot be published as success
         assert!(settled.output_tail.contains("PI_JOBS_TASK_RESULT_WITHHELD")); // ubs:ignore assert the named size refusal reaches the tail
-        assert!(!std::fs::read_to_string(&settled.artifact_path).expect("artifact").contains("raw-payload-marker")); // ubs:ignore assert no raw prefix is persisted when the result exceeds its bound
+        assert!(
+            !std::fs::read_to_string(&settled.artifact_path)
+                .expect("artifact")
+                .contains("raw-payload-marker")
+        ); // ubs:ignore assert no raw prefix is persisted when the result exceeds its bound
         assert!(settled.result.expect("withheld result").is_error); // ubs:ignore assert a withheld result remains an explicit native error
     }
 }

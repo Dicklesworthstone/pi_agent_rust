@@ -8,15 +8,22 @@ use pi::tools::Tool;
 use serde_json::{Value, json};
 
 fn event(case: &str, phase: &str) {
-    eprintln!("{}", json!({"suite":"browser_pointer","case":case,"phase":phase}));
+    eprintln!(
+        "{}",
+        json!({"suite":"browser_pointer","case":case,"phase":phase})
+    );
 }
 
 #[test]
 fn invalid_pointer_options_fail_before_launch_or_network_access() {
     event("public-preflight", "start");
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("invalid-endpoint");
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint("invalid-endpoint");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         for args in [
             json!({"action":"click","selector":"#x","button":"PRIVATE-CANARY"}),
@@ -27,7 +34,11 @@ fn invalid_pointer_options_fail_before_launch_or_network_access() {
             json!({"action":"press","key":"Enter","button":"left"}),
             json!({"action":"evaluate","script":"true","click_count":1}),
         ] {
-            let error = tool.execute("pointer-preflight", args, None).await.unwrap_err().to_string();
+            let error = tool
+                .execute("pointer-preflight", args, None)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("BROWSER_POINTER_USAGE"), "{error}");
             assert!(!error.contains("PRIVATE-CANARY"));
             assert!(!error.contains("CDP endpoint"));
@@ -42,12 +53,21 @@ fn explicit_pointer_sequences_are_described_and_never_simulated() {
     let dir = tempfile::tempdir().unwrap();
     let tool = BrowserTool::new(dir.path()).with_mock(true);
     let schema = tool.parameters();
-    assert_eq!(schema["properties"]["button"]["enum"], json!(["left","middle","right"]));
-    assert_eq!(schema["properties"]["click_count"]["enum"], json!([1,2]));
+    assert_eq!(
+        schema["properties"]["button"]["enum"],
+        json!(["left", "middle", "right"])
+    );
+    assert_eq!(schema["properties"]["click_count"]["enum"], json!([1, 2]));
     assert_eq!(schema["properties"]["modifiers"]["uniqueItems"], true);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
-        for options in [json!({"button":"right"}),json!({"click_count":2}),json!({"modifiers":[]})] {
+        for options in [
+            json!({"button":"right"}),
+            json!({"click_count":2}),
+            json!({"modifiers":[]}),
+        ] {
             let mut args = options;
             args["action"] = json!("click");
             args["selector"] = json!("#x");
@@ -61,8 +81,12 @@ fn explicit_pointer_sequences_are_described_and_never_simulated() {
 fn gestures_require_explicit_scopes_and_reject_invalid_options_before_connection() {
     event("gesture-public-preflight", "start");
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("invalid-endpoint");
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint("invalid-endpoint");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         for args in [
             json!({"action":"hover","selector":"#x"}),
@@ -100,17 +124,26 @@ fn native_gestures_are_in_the_public_and_batch_schemas_but_never_the_mock_backen
     let tool = BrowserTool::new(dir.path()).with_mock(true);
     let schema = tool.parameters();
     for action in ["hover", "drag"] {
-        assert!(schema["properties"]["action"]["enum"].as_array().unwrap().contains(&json!(action)));
+        assert!(
+            schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(action))
+        );
         assert!(schema["properties"]["steps"]["items"]["properties"]["call"]["properties"]["action"]["enum"]
             .as_array().unwrap().contains(&json!(action)));
     }
     assert_eq!(schema["properties"]["drag_steps"]["maximum"], 64);
     assert_eq!(schema["properties"]["duration_ms"]["maximum"], 5000);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         for action in ["hover", "drag"] {
             let mut args = json!({"action":action,"tab":"page","selector":"#x"});
-            if action == "drag" { args["target_selector"] = json!("#y"); }
+            if action == "drag" {
+                args["target_selector"] = json!("#y");
+            }
             assert!(tool.execute("gesture-mock", args, None).await.is_err());
         }
     });
@@ -121,13 +154,22 @@ fn native_gestures_are_in_the_public_and_batch_schemas_but_never_the_mock_backen
 fn hover_schema_mock_refusal_and_preflight_are_connected_to_the_public_tool() {
     event("hover-public", "start");
     let dir = tempfile::tempdir().unwrap();
-    let native = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("invalid-endpoint");
+    let native = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint("invalid-endpoint");
     let mock = BrowserTool::new(dir.path()).with_mock(true);
     let schema = native.parameters();
-    assert!(schema["properties"]["action"]["enum"].as_array().unwrap().contains(&json!("hover")));
+    assert!(
+        schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("hover"))
+    );
     assert!(schema["properties"]["steps"]["items"]["properties"]["call"]["properties"]["action"]["enum"]
         .as_array().unwrap().contains(&json!("hover")));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         for args in [json!({"action":"hover","selector":"#menu"}),
             json!({"action":"hover","tab":"app","selector":"#menu","button":"left"}),
@@ -149,7 +191,9 @@ fn live_hover_reveals_css_menu_with_trusted_events_without_clicking() {
     event("hover-live", "start");
     let dir = tempfile::tempdir().unwrap();
     let tool = live_tool(dir.path());
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool, json!({"action":"open","tab":"hover","url":"about:blank"})).await;
         call(&tool, json!({"action":"evaluate","tab":"hover","script":r#"
@@ -177,15 +221,21 @@ fn live_hover_reveals_css_menu_with_trusted_events_without_clicking() {
 }
 
 fn live_tool(cwd: &std::path::Path) -> BrowserTool {
-    BrowserTool::new(cwd).with_mock(false).with_launch_options(BrowserLaunchOptions {
-        executable_path: std::env::var_os("PI_BROWSER_EXECUTABLE").map(Into::into),
-        ..Default::default()
-    }).with_domain_allowlist(Some(Vec::new()))
+    BrowserTool::new(cwd)
+        .with_mock(false)
+        .with_launch_options(BrowserLaunchOptions {
+            executable_path: std::env::var_os("PI_BROWSER_EXECUTABLE").map(Into::into),
+            ..Default::default()
+        })
+        .with_domain_allowlist(Some(Vec::new()))
 }
 
 async fn call(tool: &BrowserTool, args: Value) -> Value {
-    eprintln!("{}", json!({"suite":"browser_pointer","phase":"dispatch",
-        "action":args["action"],"frameScoped":args.get("frame").is_some()}));
+    eprintln!(
+        "{}",
+        json!({"suite":"browser_pointer","phase":"dispatch",
+        "action":args["action"],"frameScoped":args.get("frame").is_some()})
+    );
     let result = tool.execute("pointer-live", args, None).await.unwrap();
     assert!(!result.is_error);
     result.details.unwrap()
@@ -197,7 +247,9 @@ fn live_double_context_middle_and_modified_clicks_use_native_events() {
     event("native-buttons", "start");
     let dir = tempfile::tempdir().unwrap();
     let tool = live_tool(dir.path());
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool, json!({"action":"open","tab":"pointer","url":"about:blank"})).await;
         call(&tool, json!({"action":"evaluate","tab":"pointer","script":r#"
@@ -243,7 +295,9 @@ fn live_sequences_stop_on_replacement_and_respect_composed_tree_and_frame_scope(
     event("identity-and-scope", "start");
     let dir = tempfile::tempdir().unwrap();
     let tool = live_tool(dir.path());
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool, json!({"action":"open","tab":"pointer","url":"about:blank"})).await;
         call(&tool, json!({"action":"evaluate","tab":"pointer","script":r#"
@@ -290,7 +344,9 @@ fn live_hover_and_html_drag_use_native_events_then_verify_the_application_result
     event("native-gestures", "start");
     let dir = tempfile::tempdir().unwrap();
     let tool = live_tool(dir.path());
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool, json!({"action":"open","tab":"board","url":"about:blank"})).await;
         call(&tool, json!({"action":"evaluate","tab":"board","script":r#"
@@ -335,7 +391,9 @@ fn live_replaced_drag_source_cancels_without_dropping_or_rebinding() {
     event("native-drag-replacement", "start");
     let dir = tempfile::tempdir().unwrap();
     let tool = live_tool(dir.path());
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool,json!({"action":"open","tab":"board","url":"about:blank"})).await;
         call(&tool,json!({"action":"evaluate","tab":"board","script":r#"

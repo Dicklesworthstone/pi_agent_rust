@@ -1343,7 +1343,13 @@ mod tests {
         assert!(branch.is_none() && !root);
 
         let cli = Cli::parse_from([
-            "pi", "recover", "saved.jsonl", "--session-output", "copy.jsonl", "--branch", "answer",
+            "pi",
+            "recover",
+            "saved.jsonl",
+            "--session-output",
+            "copy.jsonl",
+            "--branch",
+            "answer",
         ]);
         let Some(Commands::Recover {
             session_output,
@@ -1365,8 +1371,25 @@ mod tests {
             vec!["pi", "recover", "saved.jsonl", "--branch", ""],
             vec!["pi", "recover", "saved.jsonl", "--active", "--branch", "id"],
             vec!["pi", "recover", "saved.jsonl", "--json", "--branch", "id"],
-            vec!["pi", "recover", "saved.jsonl", "--session-output", "copy.jsonl", "--output", "report.txt"],
-            vec!["pi", "recover", "saved.jsonl", "--session-output", "copy.jsonl", "--root", "--branch", "id"],
+            vec![
+                "pi",
+                "recover",
+                "saved.jsonl",
+                "--session-output",
+                "copy.jsonl",
+                "--output",
+                "report.txt",
+            ],
+            vec![
+                "pi",
+                "recover",
+                "saved.jsonl",
+                "--session-output",
+                "copy.jsonl",
+                "--root",
+                "--branch",
+                "id",
+            ],
         ] {
             assert!(Cli::try_parse_from(argv).is_err());
         }

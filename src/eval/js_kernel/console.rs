@@ -26,7 +26,9 @@ pub(super) fn deliver(
 ) -> Result<(), String> {
     loop {
         if deadline.expired(origin) {
-            return Err(format!("EVAL_TIMEOUT: {kind} delivery exceeded the cell budget"));
+            return Err(format!(
+                "EVAL_TIMEOUT: {kind} delivery exceeded the cell budget"
+            ));
         }
         match output.try_send(frame) {
             Ok(()) => return Ok(()),
@@ -50,7 +52,12 @@ pub(super) struct ConsoleCapture {
 
 impl ConsoleCapture {
     pub(super) fn new() -> Self {
-        Self { capture: None, output: None, sequence: 0, active: false }
+        Self {
+            capture: None,
+            output: None,
+            sequence: 0,
+            active: false,
+        }
     }
 
     pub(super) fn begin(&mut self, output: Option<SyncSender<Value>>) {
@@ -78,7 +85,9 @@ impl ConsoleCapture {
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
-            let sequence = self.sequence.checked_add(1)
+            let sequence = self
+                .sequence
+                .checked_add(1)
                 .ok_or_else(|| "EVAL_OUTPUT_LIMIT: console sequence exhausted".to_string())?;
             // The channel belongs to exactly one invocation. This internal
             // id is not a session identity or a guest-supplied identifier.
@@ -89,7 +98,9 @@ impl ConsoleCapture {
             if let Some(output) = &self.output {
                 deliver(output, frame, deadline, origin, "console")?;
             } else if let Some(capture) = &mut self.capture {
-                capture.accept(&frame, 1).map_err(|error| error.to_string())?;
+                capture
+                    .accept(&frame, 1)
+                    .map_err(|error| error.to_string())?;
             } else {
                 return Err("EVAL_OUTPUT_CLOSED: no console owner".into());
             }
@@ -110,7 +121,9 @@ impl ConsoleCapture {
         while !text.is_empty() {
             let available = CHUNK_BYTES - pending.len();
             let mut end = text.len().min(available);
-            while !text.is_char_boundary(end) { end -= 1; }
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
             pending.push_str(&text[..end]);
             text = &text[end..];
             if !text.is_empty() || pending.len() == CHUNK_BYTES {
@@ -146,11 +159,15 @@ impl ConsoleCapture {
         // Closing precedes the final reply. Once the host receives that reply,
         // draining this channel must observe every successfully sent frame.
         self.output.take();
-        let Some(capture) = self.capture.take() else { return Ok(String::new()); };
+        let Some(capture) = self.capture.take() else {
+            return Ok(String::new());
+        };
         let mut response = json!({
             "stdout": "", "stderr": "", "outputSequence": self.sequence,
         });
-        capture.finish_response(&mut response).map_err(|error| error.to_string())?;
+        capture
+            .finish_response(&mut response)
+            .map_err(|error| error.to_string())?;
         let mut text = response["stdout"].as_str().unwrap_or_default().to_string();
         text.push_str(response["stderr"].as_str().unwrap_or_default());
         Ok(text)
@@ -167,19 +184,27 @@ pub(super) fn install(
 
     let console = rquickjs::Object::new(ctx.clone())?;
     for (method, stream) in [
-        ("log", "stdout"), ("info", "stdout"), ("debug", "stdout"),
-        ("error", "stderr"), ("warn", "stderr"),
+        ("log", "stdout"),
+        ("info", "stdout"),
+        ("debug", "stdout"),
+        ("error", "stderr"),
+        ("warn", "stderr"),
     ] {
         let sink = Rc::clone(capture);
         let deadline = deadline.clone();
-        console.set(method, Func::from(
-            move |ctx: rquickjs::Ctx<'_>, arguments: Rest<rquickjs::Coerced<String>>| {
-                // Rest coercion may call guest code. It has already completed
-                // when this borrow starts, so reentrant toString is safe.
-                let result = sink.borrow_mut().write_arguments(stream, arguments.0, &deadline, origin);
-                result.map_err(|error| rquickjs::Exception::throw_message(&ctx, &error))
-            },
-        ))?;
+        console.set(
+            method,
+            Func::from(
+                move |ctx: rquickjs::Ctx<'_>, arguments: Rest<rquickjs::Coerced<String>>| {
+                    // Rest coercion may call guest code. It has already completed
+                    // when this borrow starts, so reentrant toString is safe.
+                    let result =
+                        sink.borrow_mut()
+                            .write_arguments(stream, arguments.0, &deadline, origin);
+                    result.map_err(|error| rquickjs::Exception::throw_message(&ctx, &error))
+                },
+            ),
+        )?;
     }
     ctx.globals().set("console", console)
 }
@@ -192,15 +217,20 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn cell(kernel: &JsKernel, code: &str) -> JsCellResponse {
-        kernel.submit(code.to_string(), Instant::now() + Duration::from_secs(10))
-            .unwrap().recv_timeout(Duration::from_secs(15)).unwrap()
+        kernel
+            .submit(code.to_string(), Instant::now() + Duration::from_secs(10))
+            .unwrap()
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap()
     }
 
     #[test]
     fn native_console_methods_keep_arguments_and_separate_streams() {
         let kernel = JsKernel::spawn().unwrap();
-        let output = cell(&kernel,
-            "console.log('a', 2); console.error('err'); console.info('b'); console.warn('warn'); console.debug('c');");
+        let output = cell(
+            &kernel,
+            "console.log('a', 2); console.error('err'); console.info('b'); console.warn('warn'); console.debug('c');",
+        );
         assert!(output.ok, "{:?}", output.error);
         assert_eq!(output.console, "a 2\nb\nc\nerr\nwarn\n");
         assert!(output.result.is_none());
@@ -209,8 +239,10 @@ mod tests {
     #[test]
     fn large_unicode_console_keeps_bounded_head_tail_without_changing_cell_result() {
         let kernel = JsKernel::spawn().unwrap();
-        let output = cell(&kernel,
-            "console.log('HEAD'); console.log('界'.repeat(400000)); console.log('TAIL'); 42");
+        let output = cell(
+            &kernel,
+            "console.log('HEAD'); console.log('界'.repeat(400000)); console.log('TAIL'); 42",
+        );
         assert!(output.ok, "{:?}", output.error);
         assert_eq!(output.result.as_deref(), Some("42"));
         assert!(output.console.starts_with("HEAD\n"));
@@ -225,8 +257,10 @@ mod tests {
     #[test]
     fn console_before_exception_survives_and_coercion_can_log_reentrantly() {
         let kernel = JsKernel::spawn().unwrap();
-        let output = cell(&kernel,
-            "globalThis.kept = 42; console.log({toString() { console.log('inner'); return 'outer'; }}); throw new Error('expected');");
+        let output = cell(
+            &kernel,
+            "globalThis.kept = 42; console.log({toString() { console.log('inner'); return 'outer'; }}); throw new Error('expected');",
+        );
         assert!(!output.ok);
         assert!(output.error.as_deref().unwrap().contains("expected"));
         assert_eq!(output.console, "inner\nouter\n");
@@ -238,16 +272,30 @@ mod tests {
         let origin = Instant::now();
         let deadline = DeadlineCell::new(Arc::new(AtomicBool::new(false)));
         let mut capture = ConsoleCapture::new();
-        assert!(capture.write("stdout", "bad", &deadline, origin).unwrap_err()
-            .contains("EVAL_OUTPUT_CLOSED"));
+        assert!(
+            capture
+                .write("stdout", "bad", &deadline, origin)
+                .unwrap_err()
+                .contains("EVAL_OUTPUT_CLOSED")
+        );
         capture.begin(None);
-        capture.write("stdout", "retained", &deadline, origin).unwrap();
+        capture
+            .write("stdout", "retained", &deadline, origin)
+            .unwrap();
         deadline.set(origin, origin);
-        assert!(capture.write("stdout", "late", &deadline, origin).unwrap_err()
-            .contains("EVAL_TIMEOUT"));
+        assert!(
+            capture
+                .write("stdout", "late", &deadline, origin)
+                .unwrap_err()
+                .contains("EVAL_TIMEOUT")
+        );
         assert_eq!(capture.finish().unwrap(), "retained");
-        assert!(capture.write("stderr", "bad", &deadline, origin).unwrap_err()
-            .contains("EVAL_OUTPUT_CLOSED"));
+        assert!(
+            capture
+                .write("stderr", "bad", &deadline, origin)
+                .unwrap_err()
+                .contains("EVAL_OUTPUT_CLOSED")
+        );
     }
 
     #[test]
@@ -258,27 +306,39 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let mut capture = ConsoleCapture::new();
         capture.begin(Some(sender));
-        capture.write("stdout", "accepted", &deadline, origin).unwrap();
-        let error = capture.write("stdout", "blocked", &deadline, origin).unwrap_err();
+        capture
+            .write("stdout", "accepted", &deadline, origin)
+            .unwrap();
+        let error = capture
+            .write("stdout", "blocked", &deadline, origin)
+            .unwrap_err();
         assert!(error.contains("EVAL_TIMEOUT"));
         assert!(origin.elapsed() < Duration::from_secs(5));
         assert_eq!(receiver.try_recv().unwrap()["stream"]["text"], "accepted");
         assert_eq!(capture.sequence, 1);
         assert!(capture.finish().unwrap().is_empty());
-        assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
     fn dropping_a_kernel_revokes_a_worker_blocked_on_console_backpressure() {
         let kernel = JsKernel::spawn().unwrap();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let reply = kernel.submit_with_output(
-            "while (true) console.log('busy');".into(),
-            Instant::now() + Duration::from_secs(60), Some(sender),
-        ).unwrap();
+        let reply = kernel
+            .submit_with_output(
+                "while (true) console.log('busy');".into(),
+                Instant::now() + Duration::from_secs(60),
+                Some(sender),
+            )
+            .unwrap();
         receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(kernel);
-        assert!(matches!(reply.recv_timeout(Duration::from_secs(5)),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

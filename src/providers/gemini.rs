@@ -2108,19 +2108,43 @@ mod tests {
             assert!(
                 matches!(
                     keyword.as_str(),
-                    "type" | "format" | "title" | "description" | "nullable" | "enum"
-                        | "maxItems" | "minItems" | "properties" | "required"
-                        | "minProperties" | "maxProperties" | "minLength" | "maxLength"
-                        | "pattern" | "example" | "anyOf" | "propertyOrdering" | "default"
-                        | "items" | "minimum" | "maximum"
+                    "type"
+                        | "format"
+                        | "title"
+                        | "description"
+                        | "nullable"
+                        | "enum"
+                        | "maxItems"
+                        | "minItems"
+                        | "properties"
+                        | "required"
+                        | "minProperties"
+                        | "maxProperties"
+                        | "minLength"
+                        | "maxLength"
+                        | "pattern"
+                        | "example"
+                        | "anyOf"
+                        | "propertyOrdering"
+                        | "default"
+                        | "items"
+                        | "minimum"
+                        | "maximum"
                 ),
                 "unsupported Gemini Schema field {keyword}: {schema}"
             );
         }
         assert!(
-            schema.get("type").and_then(Value::as_str).is_some_and(|kind| {
-                matches!(kind, "object" | "array" | "string" | "integer" | "number" | "boolean")
-            }) || object.contains_key("anyOf"),
+            schema
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "object" | "array" | "string" | "integer" | "number" | "boolean"
+                    )
+                })
+                || object.contains_key("anyOf"),
             "schema needs a type or typed alternatives: {schema}"
         );
         if let Some(properties) = object.get("properties") {
@@ -2139,10 +2163,15 @@ mod tests {
             }
         }
         if let Some(required) = object.get("required") {
-            let properties = schema["properties"].as_object().expect("required properties");
+            let properties = schema["properties"]
+                .as_object()
+                .expect("required properties");
             for name in required.as_array().expect("required array") {
                 let name = name.as_str().expect("required property name");
-                assert!(properties.contains_key(name), "undefined required property {name}: {schema}");
+                assert!(
+                    properties.contains_key(name),
+                    "undefined required property {name}: {schema}"
+                );
             }
         }
     }
@@ -2165,11 +2194,12 @@ mod tests {
                 parameters: write.parameters(),
             }],
         );
-        let request = serde_json::to_value(
-            provider.build_request(&context, &StreamOptions::default()),
-        ).expect("serialize real write tool request");
+        let request =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize real write tool request");
         let declarations = request["tools"][0]["functionDeclarations"]
-            .as_array().expect("function declarations");
+            .as_array()
+            .expect("function declarations");
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0]["name"], "write");
         let parameters = &declarations[0]["parameters"];
@@ -2189,7 +2219,10 @@ mod tests {
             resolution[1]["properties"]["kind"]["enum"],
             serde_json::json!(["text"])
         );
-        assert_eq!(resolution[1]["required"], serde_json::json!(["kind", "value"]));
+        assert_eq!(
+            resolution[1]["required"],
+            serde_json::json!(["kind", "value"])
+        );
         assert_eq!(
             parameters["anyOf"][0]["properties"]["content"],
             parameters["properties"]["content"]

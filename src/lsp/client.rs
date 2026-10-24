@@ -16,9 +16,9 @@ mod document_sync;
 mod file_uri;
 mod pull_diagnostics;
 mod request;
-pub(in crate::lsp) mod workspace;
 #[cfg(test)]
 mod test_server;
+pub(in crate::lsp) mod workspace;
 pub use file_uri::{path_to_uri, try_path_to_uri, uri_to_path};
 
 const WAIT_TICK: Duration = Duration::from_millis(10);
@@ -177,10 +177,8 @@ impl LspClient {
         // relative native path as the server's document root.
         let root = root.canonicalize()?;
         let root_uri = try_path_to_uri(&root)?;
-        let workspace = std::sync::Arc::new(workspace::Workspace::new(
-            &root_uri,
-            settings.as_ref(),
-        )?);
+        let workspace =
+            std::sync::Arc::new(workspace::Workspace::new(&root_uri, settings.as_ref())?);
         let rpc = JsonRpcClient::spawn(command, args, env, &root)?;
         let client = Self {
             rpc,
@@ -480,9 +478,12 @@ impl LspClient {
         // Reserved workspace services survive installation/replacement of an
         // application's applyEdit handler and cannot be overridden by it.
         let workspace = std::sync::Arc::clone(&self.workspace);
-        self.rpc.set_server_request_responder(std::sync::Arc::new(move |method, params| {
-            workspace.respond(method, params).or_else(|| handler(method, params).map(Ok))
-        }));
+        self.rpc
+            .set_server_request_responder(std::sync::Arc::new(move |method, params| {
+                workspace
+                    .respond(method, params)
+                    .or_else(|| handler(method, params).map(Ok))
+            }));
     }
 
     pub fn call_no_wait_notify(

@@ -88,7 +88,10 @@ impl SessionControlHandle {
     /// atomic, not execution. A caller can clone a PendingInput itself, so this
     /// is not durable exactly-once deduplication or proof of non-delivery. Never
     /// rebuild this batch from already-delivered transcript messages.
-    pub fn restore_pending(&self, pending: &mut Vec<PendingInput>) -> Result<Vec<TransferredInput>> {
+    pub fn restore_pending(
+        &self,
+        pending: &mut Vec<PendingInput>,
+    ) -> Result<Vec<TransferredInput>> {
         if pending.len() > MAX_PENDING_INPUTS {
             return Err(control_error(
                 "SESSION_CONTROL_INPUT",
@@ -98,7 +101,10 @@ impl SessionControlHandle {
         if pending.is_empty() {
             let target = lock(&self.run.data);
             if !target.accepting_input || target.finished {
-                return Err(control_error("SESSION_CONTROL_CLOSED", "this turn no longer accepts input"));
+                return Err(control_error(
+                    "SESSION_CONTROL_CLOSED",
+                    "this turn no longer accepts input",
+                ));
             }
             return Ok(Vec::new());
         }
@@ -107,10 +113,16 @@ impl SessionControlHandle {
         // between publishing the batch and relinquishing its detached source.
         let mut receipts: Vec<TransferredInput> = Vec::new();
         receipts.try_reserve_exact(pending.len()).map_err(|_| {
-            control_error("SESSION_CONTROL_CAPACITY", "cannot allocate recovery receipts")
+            control_error(
+                "SESSION_CONTROL_CAPACITY",
+                "cannot allocate recovery receipts",
+            )
         })?;
         for input in pending.iter() {
-            if receipts.iter().any(|receipt| receipt.previous_id == input.id) {
+            if receipts
+                .iter()
+                .any(|receipt| receipt.previous_id == input.id)
+            {
                 return Err(control_error(
                     "SESSION_CONTROL_DUPLICATE_INPUT",
                     "recovery contains repeated input identities; no input was accepted",
@@ -147,7 +159,10 @@ impl<'a> DetachedBatch<'a> {
     fn stage(source: &'a mut Vec<PendingInput>) -> Result<Self> {
         let mut inputs = Vec::new();
         inputs.try_reserve_exact(source.len()).map_err(|_| {
-            control_error("SESSION_CONTROL_CAPACITY", "cannot allocate recovery staging")
+            control_error(
+                "SESSION_CONTROL_CAPACITY",
+                "cannot allocate recovery staging",
+            )
         })?;
         for input in source.iter_mut() {
             inputs.push((
@@ -418,21 +433,43 @@ mod tests {
     fn detached() -> Vec<PendingInput> {
         let (source, guard, _) = live();
         source.follow_up("first").unwrap();
-        source.steer_with_content(&UserContent::Blocks(vec![
-            ContentBlock::Text(TextContent::new("expanded attachment")),
-            ContentBlock::Image(ImageContent { data: "aGVsbG8=".into(), mime_type: "image/png".into() }),
-        ]), "  original source  ").unwrap();
+        source
+            .steer_with_content(
+                &UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("expanded attachment")),
+                    ContentBlock::Image(ImageContent {
+                        data: "aGVsbG8=".into(),
+                        mime_type: "image/png".into(),
+                    }),
+                ]),
+                "  original source  ",
+            )
+            .unwrap();
         drop(guard);
         source.take_pending()
     }
 
-    fn fingerprint(inputs: &[PendingInput]) -> Vec<(InputId, InputKind, String, serde_json::Value)> {
-        inputs.iter().map(|input| (input.id, input.kind, input.text.clone(),
-            serde_json::to_value(&input.content).unwrap())).collect()
+    fn fingerprint(
+        inputs: &[PendingInput],
+    ) -> Vec<(InputId, InputKind, String, serde_json::Value)> {
+        inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.id,
+                    input.kind,
+                    input.text.clone(),
+                    serde_json::to_value(&input.content).unwrap(),
+                )
+            })
+            .collect()
     }
 
     fn event(case: &str) {
-        eprintln!("{}", serde_json::json!({"schema":"pi.session.detached_recovery.test.v1","case":case}));
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.session.detached_recovery.test.v1","case":case})
+        );
     }
 
     #[test]
@@ -470,15 +507,26 @@ mod tests {
         let original = fingerprint(&pending);
         let (target, _guard, _) = live();
         let freeable = target.steer("first occupied slot").unwrap();
-        for _ in 1..MAX_PENDING_INPUTS - 1 { target.steer("occupied").unwrap(); }
+        for _ in 1..MAX_PENDING_INPUTS - 1 {
+            target.steer("occupied").unwrap();
+        }
         let before = target.snapshot();
-        assert!(target.restore_pending(&mut pending).unwrap_err().to_string().contains("SESSION_CONTROL_FULL"));
+        assert!(
+            target
+                .restore_pending(&mut pending)
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_FULL")
+        );
         assert_eq!(target.snapshot(), before);
         assert_eq!(fingerprint(&pending), original);
         target.retract(freeable).unwrap();
         assert_eq!(target.restore_pending(&mut pending).unwrap().len(), 2);
         assert!(pending.is_empty());
-        assert_eq!(target.snapshot().pending_steering + target.snapshot().pending_follow_up, MAX_PENDING_INPUTS);
+        assert_eq!(
+            target.snapshot().pending_steering + target.snapshot().pending_follow_up,
+            MAX_PENDING_INPUTS
+        );
     }
 
     #[test]
@@ -491,7 +539,11 @@ mod tests {
         let before = target.snapshot();
         assert!(target.restore_pending(&mut pending).is_err());
         assert_eq!(target.snapshot(), before);
-        assert_eq!(fingerprint(&pending), invalid, "even invalid host edits must be returned unchanged");
+        assert_eq!(
+            fingerprint(&pending),
+            invalid,
+            "even invalid host edits must be returned unchanged"
+        );
         pending[1].content = UserContent::Text("\u{0001}".repeat(MAX_INPUT_BYTES * 3));
         let too_large = fingerprint(&pending);
         assert!(target.restore_pending(&mut pending).is_err());
@@ -499,13 +551,17 @@ mod tests {
         assert_eq!(fingerprint(&pending), too_large);
         pending[1].content = UserContent::Text("a valid changed payload".into());
         pending[1].text = "new authored source".into();
-        let expected_bytes: usize = pending.iter().map(|input| {
-            serde_json::to_vec(&input.content).unwrap().len() + input.text.len()
-        }).sum();
+        let expected_bytes: usize = pending
+            .iter()
+            .map(|input| serde_json::to_vec(&input.content).unwrap().len() + input.text.len())
+            .sum();
         let receipts = target.restore_pending(&mut pending).unwrap();
         assert_eq!(target.snapshot().pending_bytes, expected_bytes);
         let claimed = target.run.fetch(InputKind::Steering);
-        assert_eq!(claimed[0].keyword_scan_source(), Some("new authored source"));
+        assert_eq!(
+            claimed[0].keyword_scan_source(),
+            Some("new authored source")
+        );
         assert!(target.retract(receipts[1].new_id).is_none());
     }
 
@@ -517,7 +573,13 @@ mod tests {
         let original = fingerprint(&pending);
         let (target, _guard, _) = live();
         let before = target.snapshot();
-        assert!(target.restore_pending(&mut pending).unwrap_err().to_string().contains("SESSION_CONTROL_DUPLICATE_INPUT"));
+        assert!(
+            target
+                .restore_pending(&mut pending)
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_DUPLICATE_INPUT")
+        );
         assert_eq!(target.snapshot(), before);
         assert_eq!(fingerprint(&pending), original);
     }

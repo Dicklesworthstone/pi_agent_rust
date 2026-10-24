@@ -8,24 +8,42 @@ use pi::tools::Tool;
 use serde_json::{Value, json};
 
 fn event(case: &str, phase: &str) {
-    eprintln!("{}", json!({"suite":"browser_semantic_selectors","case":case,"phase":phase}));
+    eprintln!(
+        "{}",
+        json!({"suite":"browser_semantic_selectors","case":case,"phase":phase})
+    );
 }
 
 #[test]
 fn invalid_semantic_selectors_fail_before_connecting_or_launching() {
     event("public-preflight", "start");
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("invalid-endpoint");
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint("invalid-endpoint");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         for (action, selector) in [
-            ("click", "role/button[name=unquoted]"), ("fill", "label/"),
-            ("wait_for", "text/ \n "), ("evaluate", "text/ignored"),
-            ("scroll", "role/button"), ("screenshot", "testid/ignored"),
+            ("click", "role/button[name=unquoted]"),
+            ("fill", "label/"),
+            ("wait_for", "text/ \n "),
+            ("evaluate", "text/ignored"),
+            ("scroll", "role/button"),
+            ("screenshot", "testid/ignored"),
         ] {
-            let error = tool.execute("semantic-preflight", json!({
-                "action":action,"selector":selector,"text":"PRIVATE-CANARY",
-            }), None).await.unwrap_err().to_string();
+            let error = tool
+                .execute(
+                    "semantic-preflight",
+                    json!({
+                        "action":action,"selector":selector,"text":"PRIVATE-CANARY",
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("BROWSER_SELECTOR_USAGE"), "{error}");
             assert!(!error.contains("PRIVATE-CANARY"));
             assert!(!error.contains("CDP endpoint"));
@@ -39,12 +57,22 @@ fn mock_browser_cannot_claim_a_semantic_match() {
     event("mock-refusal", "start");
     let dir = tempfile::tempdir().unwrap();
     let tool = BrowserTool::new(dir.path()).with_mock(true);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         for selector in ["text/Save", "label/Email", "testid/save", "role/button"] {
-            assert!(tool.execute("semantic-mock", json!({
-                "action":"click","selector":selector,
-            }), None).await.is_err());
+            assert!(
+                tool.execute(
+                    "semantic-mock",
+                    json!({
+                        "action":"click","selector":selector,
+                    }),
+                    None
+                )
+                .await
+                .is_err()
+            );
         }
     });
     event("mock-refusal", "pass");
@@ -52,8 +80,11 @@ fn mock_browser_cannot_claim_a_semantic_match() {
 
 async fn call(tool: &BrowserTool, case: &str, args: Value) -> Value {
     // Log routing metadata, never form values or uploaded file contents.
-    eprintln!("{}", json!({"suite":"browser_semantic_selectors","case":case,
-        "phase":"dispatch","action":args["action"],"frameScoped":args.get("frame").is_some()}));
+    eprintln!(
+        "{}",
+        json!({"suite":"browser_semantic_selectors","case":case,
+        "phase":"dispatch","action":args["action"],"frameScoped":args.get("frame").is_some()})
+    );
     let result = tool.execute(case, args, None).await.unwrap();
     assert!(!result.is_error);
     result.details.unwrap()
@@ -65,12 +96,16 @@ fn live_semantic_locators_drive_native_input_forms_uploads_and_frame_scopes() {
     event("live-public-workflow", "start");
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("upload.txt"), "fixture contents").unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false)
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
         .with_launch_options(BrowserLaunchOptions {
             executable_path: std::env::var_os("PI_BROWSER_EXECUTABLE").map(Into::into),
             ..Default::default()
-        }).with_domain_allowlist(Some(Vec::new()));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        })
+        .with_domain_allowlist(Some(Vec::new()));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool, "open", json!({"action":"open","tab":"semantic","url":"about:blank"})).await;
         call(&tool, "setup", json!({"action":"evaluate","tab":"semantic","script":r#"

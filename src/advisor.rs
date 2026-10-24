@@ -659,28 +659,28 @@ impl AdvisorRuntime {
         };
         let call = self.call_advisor(&digest);
         let timeout = remaining_time.map_or(self.timeout, |time| time.min(self.timeout));
-        let reply =
-            match crate::text_completion::with_timeout_and_abort(timeout, abort, call).await {
-                Ok(Ok(reply)) => reply,
-                Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
-                Err(RequestStop::TimedOut)
-                    if remaining_time.is_some_and(|time| time < self.timeout) =>
-                {
-                    // The owning turn used its budget; this is not evidence
-                    // of a failed advisor and must not trip its watchdog.
-                    return AdvisorOutcome::Quiet;
+        let reply = match crate::text_completion::with_timeout_and_abort(timeout, abort, call).await
+        {
+            Ok(Ok(reply)) => reply,
+            Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
+            Err(RequestStop::TimedOut)
+                if remaining_time.is_some_and(|time| time < self.timeout) =>
+            {
+                // The owning turn used its budget; this is not evidence
+                // of a failed advisor and must not trip its watchdog.
+                return AdvisorOutcome::Quiet;
+            }
+            Ok(Err(_)) | Err(RequestStop::TimedOut | RequestStop::TimeUnavailable) => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    self.disabled_notice = Some(format!(
+                        "advisor ({}) disabled after {} consecutive failures",
+                        self.label, self.consecutive_failures
+                    ));
                 }
-                Ok(Err(_)) | Err(RequestStop::TimedOut | RequestStop::TimeUnavailable) => {
-                    self.consecutive_failures += 1;
-                    if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        self.disabled_notice = Some(format!(
-                            "advisor ({}) disabled after {} consecutive failures",
-                            self.label, self.consecutive_failures
-                        ));
-                    }
-                    return AdvisorOutcome::Failed;
-                }
-            };
+                return AdvisorOutcome::Failed;
+            }
+        };
         self.consecutive_failures = 0;
         let verdict = parse_verdict(&reply);
         if verdict.level == VerdictLevel::Note && verdict.rationale.len() < 12 {

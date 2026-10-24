@@ -166,9 +166,8 @@ pub type ServerRequestHandler = std::sync::Arc<dyn Fn(&str, &Value) -> Option<Va
 /// Native request services can reject invalid parameters without turning an
 /// error object into a successful `result`. The public result-only callback
 /// remains useful for application-specific requests such as applyEdit.
-pub(super) type ServerRequestResponder = Arc<
-    dyn Fn(&str, &Value) -> Option<std::result::Result<Value, RpcErrorObject>> + Send + Sync,
->;
+pub(super) type ServerRequestResponder =
+    Arc<dyn Fn(&str, &Value) -> Option<std::result::Result<Value, RpcErrorObject>> + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -1312,7 +1311,9 @@ mod tests {
             )
             .expect("error reply admitted");
             let bytes = writer.into_inner().unwrap();
-            let reply = read_frame(&mut BufReader::new(bytes.as_slice())).unwrap().unwrap();
+            let reply = read_frame(&mut BufReader::new(bytes.as_slice()))
+                .unwrap()
+                .unwrap();
             assert_eq!(reply["id"], id);
             assert_eq!(reply["error"]["code"], -32602);
             assert!(reply.get("result").is_none());

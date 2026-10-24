@@ -19,12 +19,22 @@ struct Step {
 }
 
 fn step(method: &'static str, params: Value, result: Value) -> Step {
-    Step { method, params, reply: Some(json!({"result":result})), hook: None, after_reply: None }
+    Step {
+        method,
+        params,
+        reply: Some(json!({"result":result})),
+        hook: None,
+        after_reply: None,
+    }
 }
 
 fn headers(stream: &mut TcpStream) -> String {
-    stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(8))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         assert!(bytes.len() < 16 * 1024, "bounded HTTP header");
@@ -53,7 +63,14 @@ fn request(stream: &mut TcpStream) -> Option<Value> {
     let mut first = [0];
     match stream.read(&mut first) {
         Ok(0) => return None,
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => return None,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            return None;
+        }
         Ok(_) => {}
         Err(error) => panic!("fixture frame read: {error}"),
     }
@@ -80,8 +97,12 @@ fn request(stream: &mut TcpStream) -> Option<Value> {
     stream.read_exact(&mut mask).unwrap();
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes).unwrap();
-    for (index, byte) in bytes.iter_mut().enumerate() { *byte ^= mask[index % 4]; }
-    if closing { return None; }
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    if closing {
+        return None;
+    }
     Some(serde_json::from_slice(&bytes).unwrap())
 }
 
@@ -89,10 +110,14 @@ fn reply(stream: &mut TcpStream, frame: &Value) {
     let bytes = serde_json::to_vec(frame).unwrap();
     stream.write_all(&[0x81]).unwrap();
     if bytes.len() < 126 {
-        stream.write_all(&[u8::try_from(bytes.len()).unwrap()]).unwrap();
+        stream
+            .write_all(&[u8::try_from(bytes.len()).unwrap()])
+            .unwrap();
     } else {
         stream.write_all(&[126]).unwrap();
-        stream.write_all(&u16::try_from(bytes.len()).unwrap().to_be_bytes()).unwrap();
+        stream
+            .write_all(&u16::try_from(bytes.len()).unwrap().to_be_bytes())
+            .unwrap();
     }
     stream.write_all(&bytes).unwrap();
 }
@@ -111,10 +136,14 @@ fn peer(scripts: Vec<Vec<Step>>) -> (String, thread::JoinHandle<()>) {
             let mut socket = accept(&listener);
             let upgrade = headers(&mut socket);
             assert!(upgrade.starts_with("GET /devtools/browser/ownership "));
-            let key = upgrade.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
-            }).unwrap();
+            let key = upgrade
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| value.trim())
+                })
+                .unwrap();
             let accept_key = asupersync::net::websocket::compute_accept_key(key);
             write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n").unwrap();
             let mut closed = false;
@@ -122,11 +151,20 @@ fn peer(scripts: Vec<Vec<Step>>) -> (String, thread::JoinHandle<()>) {
                 let message = request(&mut socket).expect("missing expected native command");
                 assert_eq!(message["method"], expected.method);
                 for (name, value) in expected.params.as_object().unwrap() {
-                    assert_eq!(&message["params"][name], value, "{} parameter {name}", expected.method);
+                    assert_eq!(
+                        &message["params"][name], value,
+                        "{} parameter {name}",
+                        expected.method
+                    );
                 }
-                if let Some(hook) = expected.hook.take() { hook(); }
+                if let Some(hook) = expected.hook.take() {
+                    hook();
+                }
                 let Some(mut response) = expected.reply else {
-                    assert!(request(&mut socket).is_none(), "interrupted command was replayed or followed by more work");
+                    assert!(
+                        request(&mut socket).is_none(),
+                        "interrupted command was replayed or followed by more work"
+                    );
                     closed = true;
                     break;
                 };
@@ -135,10 +173,15 @@ fn peer(scripts: Vec<Vec<Step>>) -> (String, thread::JoinHandle<()>) {
                     response["sessionId"] = session.clone();
                 }
                 reply(&mut socket, &response);
-                if let Some(hook) = expected.after_reply.take() { hook(); }
+                if let Some(hook) = expected.after_reply.take() {
+                    hook();
+                }
             }
             if !closed {
-                assert!(request(&mut socket).is_none(), "unexpected extra command on a completed connection");
+                assert!(
+                    request(&mut socket).is_none(),
+                    "unexpected extra command on a completed connection"
+                );
             }
         }
     });
@@ -148,43 +191,90 @@ fn peer(scripts: Vec<Vec<Step>>) -> (String, thread::JoinHandle<()>) {
 fn connection(first: bool, targets: &[&str]) -> Vec<Step> {
     let mut script = Vec::new();
     if first {
-        script.push(step("Browser.setDownloadBehavior", json!({"behavior":"deny","eventsEnabled":true}), json!({})));
+        script.push(step(
+            "Browser.setDownloadBehavior",
+            json!({"behavior":"deny","eventsEnabled":true}),
+            json!({}),
+        ));
     }
-    let pages: Vec<_> = targets.iter().map(|target| json!({
-        "targetId":target, "type":"page", "url":"about:blank", "title":target,
-    })).collect();
-    script.push(step("Target.getTargets", json!({}), json!({"targetInfos":pages})));
+    let pages: Vec<_> = targets
+        .iter()
+        .map(|target| {
+            json!({
+                "targetId":target, "type":"page", "url":"about:blank", "title":target,
+            })
+        })
+        .collect();
+    script.push(step(
+        "Target.getTargets",
+        json!({}),
+        json!({"targetInfos":pages}),
+    ));
     script
 }
 
 fn attach(target: &str) -> Step {
-    step("Target.attachToTarget", json!({"targetId":target,"flatten":true}), json!({"sessionId":format!("session-{target}")}))
+    step(
+        "Target.attachToTarget",
+        json!({"targetId":target,"flatten":true}),
+        json!({"sessionId":format!("session-{target}")}),
+    )
 }
 
 fn open(first: bool, targets: &[&str], target: &str) -> Vec<Step> {
     let mut script = connection(first, targets);
-    script.push(step("Target.createTarget", json!({"url":"about:blank"}), json!({"targetId":target})));
+    script.push(step(
+        "Target.createTarget",
+        json!({"url":"about:blank"}),
+        json!({"targetId":target}),
+    ));
     script.push(attach(target));
     script.push(step("Page.enable", json!({}), json!({})));
-    script.push(step("Page.setLifecycleEventsEnabled", json!({"enabled":true}), json!({})));
-    script.push(step("Page.navigate", json!({"url":"about:blank"}), json!({})));
-    script.push(step("Runtime.evaluate", json!({"expression":"({url: location.href, title: document.title})"}), json!({
-        "result":{"type":"object","value":{"url":"about:blank","title":target}},
-    })));
+    script.push(step(
+        "Page.setLifecycleEventsEnabled",
+        json!({"enabled":true}),
+        json!({}),
+    ));
+    script.push(step(
+        "Page.navigate",
+        json!({"url":"about:blank"}),
+        json!({}),
+    ));
+    script.push(step(
+        "Runtime.evaluate",
+        json!({"expression":"({url: location.href, title: document.title})"}),
+        json!({
+            "result":{"type":"object","value":{"url":"about:blank","title":target}},
+        }),
+    ));
     script
 }
 
-fn evaluate(first: bool, targets: &[&str], target: &str, expression: &str, value: Value) -> Vec<Step> {
+fn evaluate(
+    first: bool,
+    targets: &[&str],
+    target: &str,
+    expression: &str,
+    value: Value,
+) -> Vec<Step> {
     let mut script = connection(first, targets);
     script.push(attach(target));
-    script.push(step("Runtime.evaluate", json!({"expression":expression}), json!({
-        "result":{"type":"object","value":value},
-    })));
+    script.push(step(
+        "Runtime.evaluate",
+        json!({"expression":expression}),
+        json!({
+            "result":{"type":"object","value":value},
+        }),
+    ));
     script
 }
 
 fn registry(path: &std::path::Path, endpoint: &str) -> ToolRegistry {
-    ToolRegistry::from_tools(vec![Box::new(BrowserTool::new(path).with_mock(false).with_cdp_endpoint(endpoint))])
+    ToolRegistry::from_tools(vec![Box::new(
+        BrowserTool::new(path)
+            .with_mock(false)
+            .with_cdp_endpoint(endpoint),
+    )])
 }
 
 #[test]
@@ -204,21 +294,58 @@ fn native_aliases_restore_across_sessions_and_release_does_not_close_external_pa
     let tool = registry.get("browser").unwrap();
     run(async {
         select(&scope, "owner-a");
-        call(tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
+        call(
+            tool,
+            json!({"action":"open","tab":"work","url":"about:blank"}),
+        )
+        .await;
         select(&scope, "owner-b");
-        let error = tool.execute("no-active-b", json!({"action":"evaluate","script":"41 + 1"}), None).await.unwrap_err();
+        let error = tool
+            .execute(
+                "no-active-b",
+                json!({"action":"evaluate","script":"41 + 1"}),
+                None,
+            )
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("nonexistent tab"));
-        call(tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
+        call(
+            tool,
+            json!({"action":"open","tab":"work","url":"about:blank"}),
+        )
+        .await;
         select(&scope, "owner-a");
         let restored = call(tool, json!({"action":"evaluate","script":"41 + 1"})).await;
         assert_eq!(restored.details.as_ref().unwrap()["result"], 42);
         assert_eq!(restored.details.unwrap()["browserSession"]["reused"], true);
         select(&scope, "owner-b");
-        assert_eq!(call(tool, json!({"action":"release"})).await.details.unwrap()["released"], true);
+        assert_eq!(
+            call(tool, json!({"action":"release"}))
+                .await
+                .details
+                .unwrap()["released"],
+            true
+        );
         select(&scope, "owner-a");
-        assert_eq!(call(tool, json!({"action":"evaluate","script":"41 + 1"})).await.details.unwrap()["result"], 42);
+        assert_eq!(
+            call(tool, json!({"action":"evaluate","script":"41 + 1"}))
+                .await
+                .details
+                .unwrap()["result"],
+            42
+        );
         select(&scope, "owner-b");
-        assert!(tool.execute("released-b", json!({"action":"evaluate","script":"41 + 1"}), None).await.unwrap_err().to_string().contains("nonexistent tab"));
+        assert!(
+            tool.execute(
+                "released-b",
+                json!({"action":"evaluate","script":"41 + 1"}),
+                None
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("nonexistent tab")
+        );
     });
     worker.join().unwrap();
 }
@@ -228,7 +355,13 @@ fn quiet_native_operation_is_interrupted_on_switch_and_original_namespace_is_reu
     for unavailable in [false, true] {
         let scope = JobSessionScope::fixed("owner-a");
         let changed = scope.clone();
-        let mut stalled = evaluate(false, &["page-a"], "page-a", "new Promise(() => {})", Value::Null);
+        let mut stalled = evaluate(
+            false,
+            &["page-a"],
+            "page-a",
+            "new Promise(() => {})",
+            Value::Null,
+        );
         let last = stalled.last_mut().unwrap();
         last.reply = None;
         last.hook = Some(Box::new(move || {
@@ -239,20 +372,44 @@ fn quiet_native_operation_is_interrupted_on_switch_and_original_namespace_is_reu
             }
         }));
         let (endpoint, worker) = peer(vec![
-            open(true, &[], "page-a"), stalled,
+            open(true, &[], "page-a"),
+            stalled,
             evaluate(false, &["page-a"], "page-a", "6 * 7", json!(42)),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        let mut tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+        let mut tool = BrowserTool::new(dir.path())
+            .with_mock(false)
+            .with_cdp_endpoint(endpoint);
         tool.bind_job_session_scope(scope.clone());
         run(async {
-            call(&tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
-            let error = tool.execute("stalled", json!({"action":"evaluate","script":"new Promise(() => {})","timeout_ms":3000}), None).await.unwrap_err();
-            assert!(error.to_string().contains(if unavailable { "BROWSER_SESSION_UNAVAILABLE" } else { "BROWSER_SESSION_CHANGED" }));
+            call(
+                &tool,
+                json!({"action":"open","tab":"work","url":"about:blank"}),
+            )
+            .await;
+            let error = tool
+                .execute(
+                    "stalled",
+                    json!({"action":"evaluate","script":"new Promise(() => {})","timeout_ms":3000}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(if unavailable {
+                "BROWSER_SESSION_UNAVAILABLE"
+            } else {
+                "BROWSER_SESSION_CHANGED"
+            }));
             assert!(tool.sessions.execution.try_lock().is_some());
             assert_eq!(tool.sessions.namespaces.lock().unwrap().len(), 1);
             select(&scope, "owner-a");
-            assert_eq!(call(&tool, json!({"action":"evaluate","script":"6 * 7"})).await.details.unwrap()["result"], 42);
+            assert_eq!(
+                call(&tool, json!({"action":"evaluate","script":"6 * 7"}))
+                    .await
+                    .details
+                    .unwrap()["result"],
+                42
+            );
         });
         worker.join().unwrap();
     }
@@ -264,7 +421,13 @@ fn result_time_switch_never_publishes_the_previous_conversations_payload() {
     let changed = scope.clone();
     let (sent, received) = futures::channel::oneshot::channel::<String>();
     let new_identity = received.map(|result| result.ok()).shared();
-    let mut completed = evaluate(false, &["page-a"], "page-a", "privateData", json!("PRIVATE-CANARY"));
+    let mut completed = evaluate(
+        false,
+        &["page-a"],
+        "page-a",
+        "privateData",
+        json!("PRIVATE-CANARY"),
+    );
     // Block any ownership lookup racing this reply until the whole frame was
     // written. Then expose B before publication. This avoids racing intentional
     // connection retirement against the fixture's own response write.
@@ -276,16 +439,42 @@ fn result_time_switch_never_publishes_the_previous_conversations_payload() {
     }));
     let (endpoint, worker) = peer(vec![open(true, &[], "page-a"), completed]);
     let dir = tempfile::tempdir().unwrap();
-    let mut tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+    let mut tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
     tool.bind_job_session_scope(scope.clone());
     run(async {
-        call(&tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
-        let error = tool.execute("changed-result", json!({"action":"evaluate","script":"privateData"}), None).await.unwrap_err().to_string();
+        call(
+            &tool,
+            json!({"action":"open","tab":"work","url":"about:blank"}),
+        )
+        .await;
+        let error = tool
+            .execute(
+                "changed-result",
+                json!({"action":"evaluate","script":"privateData"}),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("BROWSER_SESSION_CHANGED"));
         assert!(!error.contains("PRIVATE-CANARY"));
-        assert_eq!(call(&tool, json!({"action":"release"})).await.details.unwrap()["released"], false);
+        assert_eq!(
+            call(&tool, json!({"action":"release"}))
+                .await
+                .details
+                .unwrap()["released"],
+            false
+        );
         select(&scope, "owner-a");
-        assert_eq!(call(&tool, json!({"action":"release"})).await.details.unwrap()["released"], true);
+        assert_eq!(
+            call(&tool, json!({"action":"release"}))
+                .await
+                .details
+                .unwrap()["released"],
+            true
+        );
     });
     worker.join().unwrap();
 }
@@ -299,18 +488,39 @@ fn cancelling_native_work_retires_its_connection_without_poisoning_the_owner_que
     stalled.last_mut().unwrap().reply = None;
     stalled.last_mut().unwrap().hook = Some(Box::new(move || cancel.set_cancel_requested(true)));
     let (endpoint, worker) = peer(vec![
-        open(true, &[], "page-a"), stalled,
+        open(true, &[], "page-a"),
+        stalled,
         evaluate(false, &["page-a"], "page-a", "recovered", json!(true)),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let mut tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+    let mut tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
     tool.bind_job_session_scope(scope);
     run(async {
-        call(&tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
-        let error = owner.with_current(tool.execute("cancel", json!({"action":"evaluate","script":"pending"}), None)).await.unwrap_err();
+        call(
+            &tool,
+            json!({"action":"open","tab":"work","url":"about:blank"}),
+        )
+        .await;
+        let error = owner
+            .with_current(tool.execute(
+                "cancel",
+                json!({"action":"evaluate","script":"pending"}),
+                None,
+            ))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
         let fresh = AgentCx::for_request();
-        let recovered = fresh.with_current(tool.execute("recover", json!({"action":"evaluate","script":"recovered"}), None)).await.unwrap();
+        let recovered = fresh
+            .with_current(tool.execute(
+                "recover",
+                json!({"action":"evaluate","script":"recovered"}),
+                None,
+            ))
+            .await
+            .unwrap();
         assert_eq!(recovered.details.unwrap()["result"], true);
     });
     worker.join().unwrap();
@@ -321,22 +531,41 @@ fn dropping_native_future_releases_both_leases_and_preserves_its_original_mappin
     let (entered, arrived) = futures::channel::oneshot::channel::<()>();
     let mut stalled = evaluate(false, &["page-a"], "page-a", "pending", Value::Null);
     stalled.last_mut().unwrap().reply = None;
-    stalled.last_mut().unwrap().hook = Some(Box::new(move || { entered.send(()).unwrap(); }));
+    stalled.last_mut().unwrap().hook = Some(Box::new(move || {
+        entered.send(()).unwrap();
+    }));
     let (endpoint, worker) = peer(vec![
-        open(true, &[], "page-a"), stalled,
+        open(true, &[], "page-a"),
+        stalled,
         evaluate(false, &["page-a"], "page-a", "afterDrop", json!(84)),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
     run(async {
-        call(&tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
-        let pending = tool.execute("drop", json!({"action":"evaluate","script":"pending"}), None);
+        call(
+            &tool,
+            json!({"action":"open","tab":"work","url":"about:blank"}),
+        )
+        .await;
+        let pending = tool.execute(
+            "drop",
+            json!({"action":"evaluate","script":"pending"}),
+            None,
+        );
         match futures::future::select(pending, arrived).await {
             futures::future::Either::Right((Ok(()), pending)) => drop(pending),
             _ => panic!("native request must be awaiting its withheld reply"),
         }
         assert!(tool.sessions.execution.try_lock().is_some());
-        assert_eq!(call(&tool, json!({"action":"evaluate","script":"afterDrop"})).await.details.unwrap()["result"], 84);
+        assert_eq!(
+            call(&tool, json!({"action":"evaluate","script":"afterDrop"}))
+                .await
+                .details
+                .unwrap()["result"],
+            84
+        );
     });
     worker.join().unwrap();
 }
@@ -346,28 +575,76 @@ fn dropping_native_future_releases_both_leases_and_preserves_its_original_mappin
 fn live_managed_browsers_keep_two_profiles_and_stopping_one_preserves_the_other() {
     let dir = tempfile::tempdir().unwrap();
     let scope = JobSessionScope::fixed("owner-a");
-    let mut tool = BrowserTool::new(dir.path()).with_mock(false)
+    let mut tool = BrowserTool::new(dir.path())
+        .with_mock(false)
         .with_launch_options(crate::browser::BrowserLaunchOptions::default());
     tool.bind_job_session_scope(scope.clone());
     run(async {
-        call(&tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
-        call(&tool, json!({"action":"evaluate","script":"globalThis.ownerMarker = 41"})).await;
-        let a = call(&tool, json!({"action":"status"})).await.details.unwrap()["process_id"].as_u64().unwrap();
+        call(
+            &tool,
+            json!({"action":"open","tab":"work","url":"about:blank"}),
+        )
+        .await;
+        call(
+            &tool,
+            json!({"action":"evaluate","script":"globalThis.ownerMarker = 41"}),
+        )
+        .await;
+        let a = call(&tool, json!({"action":"status"}))
+            .await
+            .details
+            .unwrap()["process_id"]
+            .as_u64()
+            .unwrap();
         select(&scope, "owner-b");
-        call(&tool, json!({"action":"open","tab":"work","url":"about:blank"})).await;
-        call(&tool, json!({"action":"evaluate","script":"globalThis.ownerMarker = 99"})).await;
-        let b = call(&tool, json!({"action":"status"})).await.details.unwrap()["process_id"].as_u64().unwrap();
+        call(
+            &tool,
+            json!({"action":"open","tab":"work","url":"about:blank"}),
+        )
+        .await;
+        call(
+            &tool,
+            json!({"action":"evaluate","script":"globalThis.ownerMarker = 99"}),
+        )
+        .await;
+        let b = call(&tool, json!({"action":"status"}))
+            .await
+            .details
+            .unwrap()["process_id"]
+            .as_u64()
+            .unwrap();
         assert_ne!(a, b);
         select(&scope, "owner-a");
-        assert_eq!(call(&tool, json!({"action":"evaluate","script":"ownerMarker"})).await.details.unwrap()["result"], 41);
+        assert_eq!(
+            call(&tool, json!({"action":"evaluate","script":"ownerMarker"}))
+                .await
+                .details
+                .unwrap()["result"],
+            41
+        );
         select(&scope, "owner-b");
-        assert_eq!(call(&tool, json!({"action":"evaluate","script":"ownerMarker"})).await.details.unwrap()["result"], 99);
-        assert_eq!(call(&tool, json!({"action":"stop"})).await.details.unwrap()["running"], false);
+        assert_eq!(
+            call(&tool, json!({"action":"evaluate","script":"ownerMarker"}))
+                .await
+                .details
+                .unwrap()["result"],
+            99
+        );
+        assert_eq!(
+            call(&tool, json!({"action":"stop"})).await.details.unwrap()["running"],
+            false
+        );
         select(&scope, "owner-a");
         let status = call(&tool, json!({"action":"status"})).await;
         assert_eq!(status.details.as_ref().unwrap()["running"], true);
         assert_eq!(status.details.unwrap()["process_id"], a);
-        assert_eq!(call(&tool, json!({"action":"evaluate","script":"ownerMarker"})).await.details.unwrap()["result"], 41);
+        assert_eq!(
+            call(&tool, json!({"action":"evaluate","script":"ownerMarker"}))
+                .await
+                .details
+                .unwrap()["result"],
+            41
+        );
         call(&tool, json!({"action":"release"})).await;
     });
 }

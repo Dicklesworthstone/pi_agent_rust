@@ -107,8 +107,8 @@ fn single_header<'a>(headers: &'a [(String, String)], name: &str) -> Result<Opti
 /// Success omits `error` entirely. In particular, `error: null` is invalid,
 /// not a successful RPC. Unknown top-level fields remain forward-compatible.
 pub(super) fn terminal_error(payload: &[u8]) -> Result<Option<String>> {
-    let value: Value = serde_json::from_slice(payload)
-        .map_err(|_| protocol("malformed Connect terminal JSON"))?;
+    let value: Value =
+        serde_json::from_slice(payload).map_err(|_| protocol("malformed Connect terminal JSON"))?;
     let object = value
         .as_object()
         .ok_or_else(|| protocol("Connect terminal must be a JSON object"))?;
@@ -177,10 +177,7 @@ mod tests {
         drain_with_encoding(chunks, Encoding::Identity)
     }
 
-    fn drain_with_encoding(
-        chunks: Vec<Vec<u8>>,
-        encoding: Encoding,
-    ) -> Vec<Result<StreamEvent>> {
+    fn drain_with_encoding(chunks: Vec<Vec<u8>>, encoding: Encoding) -> Vec<Result<StreamEvent>> {
         let source: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> =
             Box::pin(stream::iter(chunks.into_iter().map(Ok)));
         let mut state = StreamState::new(source, AssistantMessage::default());
@@ -480,7 +477,10 @@ mod tests {
     fn gzip_round_trips_empty_and_binary_payloads() {
         for payload in [b"".as_slice(), b"\0\xff\x01protobuf\0".as_slice()] {
             assert_eq!(
-                Encoding::Gzip.decode(&gzip(payload), true).unwrap().as_ref(),
+                Encoding::Gzip
+                    .decode(&gzip(payload), true)
+                    .unwrap()
+                    .as_ref(),
                 payload
             );
         }
@@ -568,7 +568,10 @@ mod tests {
         let events = drain_with_encoding(
             vec![
                 text_frame("partial"),
-                encode_frame(CONNECT_END_STREAM_FLAG | CONNECT_COMPRESSED_FLAG, &compressed),
+                encode_frame(
+                    CONNECT_END_STREAM_FLAG | CONNECT_COMPRESSED_FLAG,
+                    &compressed,
+                ),
             ],
             Encoding::Gzip,
         );
@@ -595,7 +598,10 @@ mod tests {
         );
         assert!(matches!(
             events.last(),
-            Some(Ok(StreamEvent::Error { reason: StopReason::Error, .. }))
+            Some(Ok(StreamEvent::Error {
+                reason: StopReason::Error,
+                ..
+            }))
         ));
     }
 
@@ -767,10 +773,7 @@ mod tests {
 
         for wire in [
             encode_frame(CONNECT_END_STREAM_FLAG, b"not valid JSON: quota exceeded"),
-            encode_frame(
-                CONNECT_END_STREAM_FLAG,
-                br#"{"error":{"code":"INVALID"}}"#,
-            ),
+            encode_frame(CONNECT_END_STREAM_FLAG, br#"{"error":{"code":"INVALID"}}"#),
             encode_frame(0, &[0]),
             encode_frame(4, b"{}"),
         ] {

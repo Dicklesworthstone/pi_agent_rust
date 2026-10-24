@@ -12,8 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn headers(socket: &mut TcpStream) -> String {
-    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         assert!(bytes.len() < 16 * 1024);
@@ -61,14 +65,18 @@ fn read_frame(socket: &mut TcpStream) -> Value {
     socket.read_exact(&mut mask).unwrap();
     let mut bytes = vec![0; size];
     socket.read_exact(&mut bytes).unwrap();
-    for (i, byte) in bytes.iter_mut().enumerate() { *byte ^= mask[i % 4]; }
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte ^= mask[i % 4];
+    }
     serde_json::from_slice(&bytes).unwrap()
 }
 
 fn write_frame(socket: &mut TcpStream, value: &Value) {
     let bytes = serde_json::to_vec(value).unwrap();
     if bytes.len() < 126 {
-        socket.write_all(&[0x81, u8::try_from(bytes.len()).unwrap()]).unwrap();
+        socket
+            .write_all(&[0x81, u8::try_from(bytes.len()).unwrap()])
+            .unwrap();
     } else {
         let length = u16::try_from(bytes.len()).unwrap();
         socket.write_all(&[0x81, 126]).unwrap();
@@ -80,29 +88,48 @@ fn write_frame(socket: &mut TcpStream, value: &Value) {
 fn reply(socket: &mut TcpStream, method: &str, result: Value) -> Value {
     let request = read_frame(socket);
     assert_eq!(request["method"], method);
-    if method.starts_with("Page.") || method.starts_with("Runtime.")
-        || method.starts_with("Network.") || method.starts_with("DOM.")
+    if method.starts_with("Page.")
+        || method.starts_with("Runtime.")
+        || method.starts_with("Network.")
+        || method.starts_with("DOM.")
     {
         assert_eq!(request["sessionId"], "session");
     }
-    write_frame(socket, &json!({"id":request["id"],"sessionId":request["sessionId"],"result":result}));
+    write_frame(
+        socket,
+        &json!({"id":request["id"],"sessionId":request["sessionId"],"result":result}),
+    );
     request
 }
 
 fn event(socket: &mut TcpStream, method: &str, params: Value) {
-    write_frame(socket, &json!({"sessionId":"session","method":method,"params":params}));
+    write_frame(
+        socket,
+        &json!({"sessionId":"session","method":method,"params":params}),
+    );
 }
 
 #[derive(Clone, Copy)]
 enum Scenario {
-    Success, ActionError, Passive, NetworkRefused, ScopeLost, ConsoleOnly, Settled,
-    Checked, Select,
+    Success,
+    ActionError,
+    Passive,
+    NetworkRefused,
+    ScopeLost,
+    ConsoleOnly,
+    Settled,
+    Checked,
+    Select,
 }
 
 fn form_document(socket: &mut TcpStream) {
-    reply(socket, "Page.getFrameTree", json!({"frameTree":{"frame":{
-        "id":"main","loaderId":"loader","url":"https://example.com/app"
-    }}}));
+    reply(
+        socket,
+        "Page.getFrameTree",
+        json!({"frameTree":{"frame":{
+            "id":"main","loaderId":"loader","url":"https://example.com/app"
+        }}}),
+    );
 }
 
 fn form_action(socket: &mut TcpStream, scenario: Scenario) {
@@ -112,29 +139,57 @@ fn form_action(socket: &mut TcpStream, scenario: Scenario) {
     reply(socket, "DOM.getDocument", json!({"root":{"nodeId":1}}));
     let query = reply(socket, "DOM.querySelector", json!({"nodeId":7}));
     assert_eq!(query["params"]["selector"], "#control");
-    reply(socket, "DOM.describeNode", json!({"node":{"backendNodeId":77}}));
+    reply(
+        socket,
+        "DOM.describeNode",
+        json!({"node":{"backendNodeId":77}}),
+    );
     let calls = if matches!(scenario, Scenario::Checked) {
-        vec![("form_checked", Value::Null, json!({
-            "kind":"checkbox","checked":true,"indeterminate":false
-        }))]
+        vec![(
+            "form_checked",
+            Value::Null,
+            json!({
+                "kind":"checkbox","checked":true,"indeterminate":false
+            }),
+        )]
     } else {
         let selected = json!([{"index":0,"value":"literal 雪","label":"Choice"}]);
         vec![
-            ("form_select", json!([{"value":"literal 雪"}]), json!({
-                "multiple":false,"selected":selected.clone(),"changed":true
-            })),
-            ("form_selection", Value::Null, json!({"multiple":false,"selected":selected})),
+            (
+                "form_select",
+                json!([{"value":"literal 雪"}]),
+                json!({
+                    "multiple":false,"selected":selected.clone(),"changed":true
+                }),
+            ),
+            (
+                "form_selection",
+                Value::Null,
+                json!({"multiple":false,"selected":selected}),
+            ),
         ]
     };
     for (action, arguments, value) in calls {
         form_document(socket);
-        let world = reply(socket, "Page.createIsolatedWorld", json!({"executionContextId":3}));
+        let world = reply(
+            socket,
+            "Page.createIsolatedWorld",
+            json!({"executionContextId":3}),
+        );
         assert_eq!(world["params"]["frameId"], "main");
-        event(socket, "Runtime.executionContextCreated", json!({"context":{
-            "id":3,"origin":"https://example.com","auxData":{"frameId":"main","isDefault":false}
-        }}));
+        event(
+            socket,
+            "Runtime.executionContextCreated",
+            json!({"context":{
+                "id":3,"origin":"https://example.com","auxData":{"frameId":"main","isDefault":false}
+            }}),
+        );
         form_document(socket);
-        let resolved = reply(socket, "DOM.resolveNode", json!({"object":{"objectId":"control-object"}}));
+        let resolved = reply(
+            socket,
+            "DOM.resolveNode",
+            json!({"object":{"objectId":"control-object"}}),
+        );
         assert_eq!(resolved["params"]["backendNodeId"], 77);
         assert_eq!(resolved["params"]["executionContextId"], 3);
         form_document(socket);
@@ -142,20 +197,34 @@ fn form_action(socket: &mut TcpStream, scenario: Scenario) {
         assert_eq!(call["method"], "Runtime.callFunctionOn");
         assert_eq!(call["sessionId"], "session");
         assert_eq!(call["params"]["objectId"], "control-object");
-        assert_eq!(call["params"]["arguments"], json!([{"value":action},{"value":arguments}]));
+        assert_eq!(
+            call["params"]["arguments"],
+            json!([{"value":action},{"value":arguments}])
+        );
         assert_eq!(call["params"]["userGesture"], false);
         for (context, message) in [(1, action), (3, "PRIVATE-ISOLATED")] {
-            event(socket, "Runtime.consoleAPICalled", json!({
-                "executionContextId":context,"type":"log","args":[{"type":"string","value":message}]
-            }));
+            event(
+                socket,
+                "Runtime.consoleAPICalled",
+                json!({
+                    "executionContextId":context,"type":"log","args":[{"type":"string","value":message}]
+                }),
+            );
         }
         if action == "form_select" {
-            event(socket, "Network.requestWillBeSent", json!({
-                "requestId":"form-request","frameId":"main","documentURL":"https://example.com/app",
-                "timestamp":1,"type":"Fetch","request":{"url":"https://example.com/selection?PRIVATE","method":"POST","postData":"PRIVATE"}
-            }));
+            event(
+                socket,
+                "Network.requestWillBeSent",
+                json!({
+                    "requestId":"form-request","frameId":"main","documentURL":"https://example.com/app",
+                    "timestamp":1,"type":"Fetch","request":{"url":"https://example.com/selection?PRIVATE","method":"POST","postData":"PRIVATE"}
+                }),
+            );
         }
-        write_frame(socket, &json!({"id":call["id"],"sessionId":"session","result":{"result":{"type":"object","value":value}}}));
+        write_frame(
+            socket,
+            &json!({"id":call["id"],"sessionId":"session","result":{"result":{"type":"object","value":value}}}),
+        );
         form_document(socket);
         let released = reply(socket, "Runtime.releaseObject", json!({}));
         assert_eq!(released["params"]["objectId"], "control-object");
@@ -169,97 +238,186 @@ fn peer(scenario: Scenario) -> (String, thread::JoinHandle<()>) {
     let handle = thread::spawn(move || {
         let mut discovery = accept(&listener);
         assert!(headers(&mut discovery).starts_with("GET /json/version "));
-        let body = json!({"webSocketDebuggerUrl":format!("ws://{addr}/devtools/browser/fixture")}).to_string();
-        write!(discovery, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let body = json!({"webSocketDebuggerUrl":format!("ws://{addr}/devtools/browser/fixture")})
+            .to_string();
+        write!(
+            discovery,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
         drop(discovery);
         let mut socket = accept(&listener);
         let handshake = headers(&mut socket);
-        let key = handshake.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
-        }).unwrap();
+        let key = handshake
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .unwrap();
         let accept = asupersync::net::websocket::compute_accept_key(key);
         write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
         reply(&mut socket, "Browser.setDownloadBehavior", json!({}));
-        reply(&mut socket, "Target.getTargets", json!({"targetInfos":[{
-            "targetId":"page","type":"page","url":"https://example.com/app","title":"fixture"
-        }]}));
-        reply(&mut socket, "Target.attachToTarget", json!({"sessionId":"session"}));
-        reply(&mut socket, "Page.getFrameTree", json!({"frameTree":{"frame":{
-            "id":"main","loaderId":"loader","url":"https://example.com/app"
-        }}}));
+        reply(
+            &mut socket,
+            "Target.getTargets",
+            json!({"targetInfos":[{
+                "targetId":"page","type":"page","url":"https://example.com/app","title":"fixture"
+            }]}),
+        );
+        reply(
+            &mut socket,
+            "Target.attachToTarget",
+            json!({"sessionId":"session"}),
+        );
+        reply(
+            &mut socket,
+            "Page.getFrameTree",
+            json!({"frameTree":{"frame":{
+                "id":"main","loaderId":"loader","url":"https://example.com/app"
+            }}}),
+        );
         reply(&mut socket, "Page.enable", json!({}));
         let runtime = read_frame(&mut socket);
         assert_eq!(runtime["method"], "Runtime.enable");
         assert_eq!(runtime["sessionId"], "session");
         for (id, frame) in [(1, "main"), (2, "child")] {
-            event(&mut socket, "Runtime.executionContextCreated", json!({"context":{
-                "id":id,"origin":"https://example.com","auxData":{"frameId":frame,"isDefault":true}
-            }}));
+            event(
+                &mut socket,
+                "Runtime.executionContextCreated",
+                json!({"context":{
+                    "id":id,"origin":"https://example.com","auxData":{"frameId":frame,"isDefault":true}
+                }}),
+            );
         }
-        event(&mut socket, "Runtime.consoleAPICalled", json!({
-            "type":"log","executionContextId":1,"args":[{"type":"string","value":"buffered setup"}]
-        }));
-        write_frame(&mut socket, &json!({"id":runtime["id"],"sessionId":"session","result":{}}));
+        event(
+            &mut socket,
+            "Runtime.consoleAPICalled",
+            json!({
+                "type":"log","executionContextId":1,"args":[{"type":"string","value":"buffered setup"}]
+            }),
+        );
+        write_frame(
+            &mut socket,
+            &json!({"id":runtime["id"],"sessionId":"session","result":{}}),
+        );
         if !matches!(scenario, Scenario::ConsoleOnly) {
-        let network = read_frame(&mut socket);
-        assert_eq!(network["method"], "Network.enable");
-        assert_eq!(network["sessionId"], "session");
-        assert_eq!(network["params"]["maxPostDataSize"], 0);
-        if matches!(scenario, Scenario::NetworkRefused) {
-            write_frame(&mut socket, &json!({"id":network["id"],"sessionId":"session","error":{"code":-32601,"message":"unsupported"}}));
-        } else {
-            if matches!(scenario, Scenario::ScopeLost) {
-                event(&mut socket, "Page.frameNavigated", json!({"frame":{"id":"main","url":"https://forbidden.test/"}}));
+            let network = read_frame(&mut socket);
+            assert_eq!(network["method"], "Network.enable");
+            assert_eq!(network["sessionId"], "session");
+            assert_eq!(network["params"]["maxPostDataSize"], 0);
+            if matches!(scenario, Scenario::NetworkRefused) {
+                write_frame(
+                    &mut socket,
+                    &json!({"id":network["id"],"sessionId":"session","error":{"code":-32601,"message":"unsupported"}}),
+                );
+            } else {
+                if matches!(scenario, Scenario::ScopeLost) {
+                    event(
+                        &mut socket,
+                        "Page.frameNavigated",
+                        json!({"frame":{"id":"main","url":"https://forbidden.test/"}}),
+                    );
+                }
+                write_frame(
+                    &mut socket,
+                    &json!({"id":network["id"],"sessionId":"session","result":{}}),
+                );
             }
-            write_frame(&mut socket, &json!({"id":network["id"],"sessionId":"session","result":{}}));
-        }
         }
         if matches!(scenario, Scenario::Checked | Scenario::Select) {
             form_action(&mut socket, scenario);
-        } else if !matches!(scenario, Scenario::Passive | Scenario::NetworkRefused | Scenario::ScopeLost) {
+        } else if !matches!(
+            scenario,
+            Scenario::Passive | Scenario::NetworkRefused | Scenario::ScopeLost
+        ) {
             let request = read_frame(&mut socket);
             assert_eq!(request["method"], "Runtime.evaluate");
             assert_eq!(request["params"]["expression"], "triggerOnce()");
-            for (session, context, text) in [("session",1,"during action"),("session",2,"PRIVATE-CHILD"),("other",1,"PRIVATE-SESSION")] {
-                write_frame(&mut socket, &json!({"sessionId":session,"method":"Runtime.consoleAPICalled","params":{
-                    "type":"error","executionContextId":context,"args":[{"type":"string","value":text}]
-                }}));
+            for (session, context, text) in [
+                ("session", 1, "during action"),
+                ("session", 2, "PRIVATE-CHILD"),
+                ("other", 1, "PRIVATE-SESSION"),
+            ] {
+                write_frame(
+                    &mut socket,
+                    &json!({"sessionId":session,"method":"Runtime.consoleAPICalled","params":{
+                        "type":"error","executionContextId":context,"args":[{"type":"string","value":text}]
+                    }}),
+                );
             }
-            event(&mut socket, "Network.requestWillBeSent", json!({
-                "requestId":"r1","frameId":"main","documentURL":"https://example.com/app",
-                "timestamp":1,"type":"Fetch","request":{"url":"https://example.com/api?PRIVATE#PRIVATE","method":"GET","headers":{"Cookie":"PRIVATE"}}
-            }));
-            event(&mut socket, "Network.responseReceived", json!({
-                "requestId":"r1","frameId":"main","timestamp":1.25,
-                "response":{"url":"https://example.com/api?PRIVATE","status":503,"headers":{"Set-Cookie":"PRIVATE"}}
-            }));
-            event(&mut socket, "Network.loadingFinished", json!({"requestId":"r1","timestamp":1.5,"encodedDataLength":99}));
-            event(&mut socket, "Network.requestWillBeSent", json!({
-                "requestId":"r2","frameId":"main","documentURL":"https://example.com/app",
-                "timestamp":2,"type":"Fetch","request":{"url":"https://example.com/offline","method":"GET"}
-            }));
-            event(&mut socket, "Network.loadingFailed", json!({"requestId":"r2","timestamp":2.5,"errorText":"net::ERR_CONNECTION_REFUSED"}));
+            event(
+                &mut socket,
+                "Network.requestWillBeSent",
+                json!({
+                    "requestId":"r1","frameId":"main","documentURL":"https://example.com/app",
+                    "timestamp":1,"type":"Fetch","request":{"url":"https://example.com/api?PRIVATE#PRIVATE","method":"GET","headers":{"Cookie":"PRIVATE"}}
+                }),
+            );
+            event(
+                &mut socket,
+                "Network.responseReceived",
+                json!({
+                    "requestId":"r1","frameId":"main","timestamp":1.25,
+                    "response":{"url":"https://example.com/api?PRIVATE","status":503,"headers":{"Set-Cookie":"PRIVATE"}}
+                }),
+            );
+            event(
+                &mut socket,
+                "Network.loadingFinished",
+                json!({"requestId":"r1","timestamp":1.5,"encodedDataLength":99}),
+            );
+            event(
+                &mut socket,
+                "Network.requestWillBeSent",
+                json!({
+                    "requestId":"r2","frameId":"main","documentURL":"https://example.com/app",
+                    "timestamp":2,"type":"Fetch","request":{"url":"https://example.com/offline","method":"GET"}
+                }),
+            );
+            event(
+                &mut socket,
+                "Network.loadingFailed",
+                json!({"requestId":"r2","timestamp":2.5,"errorText":"net::ERR_CONNECTION_REFUSED"}),
+            );
             if matches!(scenario, Scenario::ActionError) {
-                write_frame(&mut socket, &json!({"id":request["id"],"sessionId":"session","result":{
-                    "exceptionDetails":{"text":"Uncaught","exception":{"description":"trigger failed"}}
-                }}));
+                write_frame(
+                    &mut socket,
+                    &json!({"id":request["id"],"sessionId":"session","result":{
+                        "exceptionDetails":{"text":"Uncaught","exception":{"description":"trigger failed"}}
+                    }}),
+                );
             } else {
-                write_frame(&mut socket, &json!({"id":request["id"],"sessionId":"session","result":{"result":{"type":"boolean","value":true}}}));
+                write_frame(
+                    &mut socket,
+                    &json!({"id":request["id"],"sessionId":"session","result":{"result":{"type":"boolean","value":true}}}),
+                );
             }
             if matches!(scenario, Scenario::Settled) {
-                event(&mut socket, "Runtime.consoleAPICalled", json!({
-                    "type":"warn","executionContextId":1,"args":[{"type":"string","value":"after action"}]
-                }));
+                event(
+                    &mut socket,
+                    "Runtime.consoleAPICalled",
+                    json!({
+                        "type":"warn","executionContextId":1,"args":[{"type":"string","value":"after action"}]
+                    }),
+                );
             }
         }
         // A successful return or setup refusal must never replay a command,
         // issue a body fetch, or leave a background socket reader alive.
         let mut end = [0];
         match socket.read(&mut end) {
-            Ok(0) => {},
+            Ok(0) => {}
             Ok(_) => assert_eq!(end[0] & 0x0f, 8, "unexpected extra browser command"),
-            Err(error) => assert!(matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted), "socket remained live: {error}"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                "socket remained live: {error}"
+            ),
         }
     });
     (format!("http://{addr}"), handle)
@@ -268,9 +426,13 @@ fn peer(scenario: Scenario) -> (String, thread::JoinHandle<()>) {
 fn run(scenario: Scenario) -> pi::tools::ToolOutput {
     let (endpoint, handle) = peer(scenario);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint)
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint)
         .with_domain_allowlist(Some(vec!["example.com".into()]));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let mut args = json!({"action":"evaluate","tab":"page","script":"triggerOnce()",
         "diagnostics":{"network":true,"settle_ms":0},"timeout_ms":5000});
     if matches!(scenario, Scenario::Passive) {
@@ -292,10 +454,15 @@ fn run(scenario: Scenario) -> pi::tools::ToolOutput {
             args["options"] = json!([{"value":"literal 雪"}]);
         }
     }
-    let result = runtime.block_on(tool.execute("browser-diagnostics", args, None)).unwrap();
+    let result = runtime
+        .block_on(tool.execute("browser-diagnostics", args, None))
+        .unwrap();
     handle.join().unwrap();
-    eprintln!("{}", json!({"schema":"pi.test.browser-diagnostics.v1","is_error":result.is_error,
-        "completion":result.details.as_ref().unwrap()["diagnostics"]["completion"]}));
+    eprintln!(
+        "{}",
+        json!({"schema":"pi.test.browser-diagnostics.v1","is_error":result.is_error,
+        "completion":result.details.as_ref().unwrap()["diagnostics"]["completion"]})
+    );
     result
 }
 
@@ -309,8 +476,14 @@ fn capture_precedes_action_and_correlates_http_and_transport_failures_without_re
     assert_eq!(report["console"].as_array().unwrap().len(), 2);
     assert_eq!(report["console"][0]["phase"], "setup");
     assert_eq!(report["console"][1]["phase"], "action");
-    assert_eq!(report["network"]["requests"][0]["response"]["status"].as_f64(), Some(503.0));
-    assert_eq!(report["network"]["requests"][1]["error_code"], "net::ERR_CONNECTION_REFUSED");
+    assert_eq!(
+        report["network"]["requests"][0]["response"]["status"].as_f64(),
+        Some(503.0)
+    );
+    assert_eq!(
+        report["network"]["requests"][1]["error_code"],
+        "net::ERR_CONNECTION_REFUSED"
+    );
     assert!(!report.to_string().contains("PRIVATE"));
 }
 
@@ -329,22 +502,34 @@ fn original_action_failure_keeps_diagnostics_without_becoming_success() {
 fn passive_capture_never_executes_a_page_script() {
     let result = run(Scenario::Passive);
     assert!(!result.is_error);
-    assert_eq!(result.details.as_ref().unwrap()["diagnostics"]["network"]["requests"], json!([]));
+    assert_eq!(
+        result.details.as_ref().unwrap()["diagnostics"]["network"]["requests"],
+        json!([])
+    );
 }
 
 #[test]
 fn domain_setup_failure_prevents_original_action_and_is_not_a_fake_empty_capture() {
     let result = run(Scenario::NetworkRefused);
     assert!(result.is_error);
-    assert_eq!(result.details.as_ref().unwrap()["diagnostics"]["action_started"], false);
+    assert_eq!(
+        result.details.as_ref().unwrap()["diagnostics"]["action_started"],
+        false
+    );
 }
 
 #[test]
 fn forbidden_navigation_during_setup_prevents_action_start() {
     let result = run(Scenario::ScopeLost);
     assert!(result.is_error);
-    assert_eq!(result.details.as_ref().unwrap()["diagnostics"]["completion"], "scope_lost");
-    assert_eq!(result.details.as_ref().unwrap()["diagnostics"]["action_started"], false);
+    assert_eq!(
+        result.details.as_ref().unwrap()["diagnostics"]["completion"],
+        "scope_lost"
+    );
+    assert_eq!(
+        result.details.as_ref().unwrap()["diagnostics"]["action_started"],
+        false
+    );
 }
 
 #[test]
@@ -374,7 +559,10 @@ fn checkbox_diagnostics_pass_both_validators_without_toggling_an_already_checked
     assert_eq!(details["checked"], true);
     assert_eq!(details["changed"], false);
     assert_eq!(details["diagnostics"]["action_succeeded"], true);
-    assert_eq!(details["diagnostics"]["console"][1]["arguments"][0]["value"], "form_checked");
+    assert_eq!(
+        details["diagnostics"]["console"][1]["arguments"][0]["value"],
+        "form_checked"
+    );
     assert!(!details.to_string().contains("PRIVATE"));
 }
 
@@ -388,8 +576,14 @@ fn selection_diagnostics_preserve_literal_options_and_independent_postcondition_
     let report = &details["diagnostics"];
     assert_eq!(report["console"].as_array().unwrap().len(), 3);
     assert_eq!(report["console"][1]["arguments"][0]["value"], "form_select");
-    assert_eq!(report["console"][2]["arguments"][0]["value"], "form_selection");
-    assert_eq!(report["network"]["requests"][0]["url"], "https://example.com/selection");
+    assert_eq!(
+        report["console"][2]["arguments"][0]["value"],
+        "form_selection"
+    );
+    assert_eq!(
+        report["network"]["requests"][0]["url"],
+        "https://example.com/selection"
+    );
     assert_eq!(report["network"]["pending_at_end"], 1);
     assert!(!report.to_string().contains("PRIVATE"));
 }
@@ -399,23 +593,56 @@ fn malformed_capture_and_foreign_form_options_fail_before_connecting() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false)
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
         .with_cdp_endpoint(format!("http://{}", listener.local_addr().unwrap()));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     for (case, extra, expected_error) in [
-        ("bad-capture", json!({"diagnostics":{"network":"true"}}), "diagnostics.network must be a boolean"),
-        ("foreign-form-field", json!({"diagnostics":{},"script":"PRIVATE"}), "BROWSER_FORM_INVALID"),
-        ("implicit-dialog-consent", json!({"diagnostics":{},"accept":true}), "BROWSER_DIALOG_INVALID"),
-        ("scoped-capture", json!({"diagnostics":{},"frame":"child"}), "diagnostics require a main-document"),
-        ("missing-explicit-tab", json!({"diagnostics":{},"tab":null}), "diagnostics require an explicit valid tab"),
+        (
+            "bad-capture",
+            json!({"diagnostics":{"network":"true"}}),
+            "diagnostics.network must be a boolean",
+        ),
+        (
+            "foreign-form-field",
+            json!({"diagnostics":{},"script":"PRIVATE"}),
+            "BROWSER_FORM_INVALID",
+        ),
+        (
+            "implicit-dialog-consent",
+            json!({"diagnostics":{},"accept":true}),
+            "BROWSER_DIALOG_INVALID",
+        ),
+        (
+            "scoped-capture",
+            json!({"diagnostics":{},"frame":"child"}),
+            "diagnostics require a main-document",
+        ),
+        (
+            "missing-explicit-tab",
+            json!({"diagnostics":{},"tab":null}),
+            "diagnostics require an explicit valid tab",
+        ),
     ] {
         let mut args = json!({"action":"set_checked","tab":"page","selector":"#control",
             "checked":true,"timeout_ms":100});
-        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-        let error = runtime.block_on(tool.execute(case, args, None)).unwrap_err().to_string();
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = runtime
+            .block_on(tool.execute(case, args, None))
+            .unwrap_err()
+            .to_string();
         assert!(!error.contains("PRIVATE"));
         assert!(error.contains(expected_error), "{error}");
-        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
-        eprintln!("{}", json!({"schema":"pi.test.browser-diagnostics.v1","case":case,"connected":false}));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        eprintln!(
+            "{}",
+            json!({"schema":"pi.test.browser-diagnostics.v1","case":case,"connected":false})
+        );
     }
 }

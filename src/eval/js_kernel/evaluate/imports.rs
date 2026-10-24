@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use swc_common::{FileName, SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    Expr, ImportDecl, ImportPhase, ImportSpecifier, Lit, MetaPropExpr, MetaPropKind,
-    ModuleDecl, ModuleExportName, ModuleItem, Prop, PropName, PropOrSpread, Stmt,
+    Expr, ImportDecl, ImportPhase, ImportSpecifier, Lit, MetaPropExpr, MetaPropKind, ModuleDecl,
+    ModuleExportName, ModuleItem, Prop, PropName, PropOrSpread, Stmt,
 };
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -20,14 +20,19 @@ const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMPORTS: usize = 128;
 const MAX_BINDINGS: usize = 512;
-const LIMIT: &str = "EVAL_IMPORT_LIMIT: static-import preparation exceeded its source, binding or output budget";
+const LIMIT: &str =
+    "EVAL_IMPORT_LIMIT: static-import preparation exceeded its source, binding or output budget";
 const INVALID: &str = "EVAL_IMPORT_SYNTAX: use ordinary static imports in a retained script; exports, import.meta and source/defer imports require a module file";
 
 type Result<T> = std::result::Result<T, &'static str>;
 
 fn quoted(value: &str) -> Result<String> {
     serde_json::to_string(value)
-        .map(|value| value.replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029"))
+        .map(|value| {
+            value
+                .replace('\u{2028}', "\\u2028")
+                .replace('\u{2029}', "\\u2029")
+        })
         .map_err(|_| INVALID)
 }
 
@@ -55,24 +60,34 @@ fn append(output: &mut String, text: &str) -> Result<()> {
 }
 
 fn attributes(declaration: &ImportDecl) -> Result<String> {
-    let Some(attributes) = &declaration.with else { return Ok(String::new()); };
+    let Some(attributes) = &declaration.with else {
+        return Ok(String::new());
+    };
     if attributes.props.is_empty() {
         return Ok(String::new());
     }
     if attributes.props.len() != 1 {
         return Err("EVAL_IMPORT_ATTRIBUTES: only one literal type attribute is supported");
     }
-    let PropOrSpread::Prop(property) = &attributes.props[0] else { return Err(INVALID); };
-    let Prop::KeyValue(property) = property.as_ref() else { return Err(INVALID); };
+    let PropOrSpread::Prop(property) = &attributes.props[0] else {
+        return Err(INVALID);
+    };
+    let Prop::KeyValue(property) = property.as_ref() else {
+        return Err(INVALID);
+    };
     let key = match &property.key {
         PropName::Ident(key) => quoted(key.sym.as_ref())?,
         PropName::Str(key) => string_literal(key)?,
         _ => return Err(INVALID),
     };
-    let Expr::Lit(Lit::Str(value)) = property.value.as_ref() else { return Err(INVALID); };
+    let Expr::Lit(Lit::Str(value)) = property.value.as_ref() else {
+        return Err(INVALID);
+    };
     let value = string_literal(value)?;
     if key != "\"type\"" || !matches!(value.as_str(), "\"json\"" | "\"text\"") {
-        return Err("EVAL_IMPORT_ATTRIBUTES: type must be json or text; executable modules take no attributes");
+        return Err(
+            "EVAL_IMPORT_ATTRIBUTES: type must be json or text; executable modules take no attributes",
+        );
     }
     Ok(format!(",{{with:{{type:{value}}}}}"))
 }
@@ -92,7 +107,10 @@ impl Plan {
         }
         let source = string_literal(&declaration.src)?;
         let attributes = attributes(declaration)?;
-        append(&mut self.calls, &format!("const m{index}=await import({source}{attributes});"))?;
+        append(
+            &mut self.calls,
+            &format!("const m{index}=await import({source}{attributes});"),
+        )?;
         for specifier in &declaration.specifiers {
             if specifier.is_type_only() || self.names.len() >= MAX_BINDINGS {
                 return Err(LIMIT);
@@ -111,11 +129,16 @@ impl Plan {
                 }),
             };
             let value = if let Some(export) = export {
-                append(&mut self.calls, &format!(
-                    "if(!({export} in m{index}))throw 'EVAL_IMPORT_EXPORT: requested export is unavailable';"
-                ))?;
+                append(
+                    &mut self.calls,
+                    &format!(
+                        "if(!({export} in m{index}))throw 'EVAL_IMPORT_EXPORT: requested export is unavailable';"
+                    ),
+                )?;
                 format!("m{index}[{export}]")
-            } else { format!("m{index}") };
+            } else {
+                format!("m{index}")
+            };
             let key = quoted(&local)?;
             // Computed keys retain an ordinary __proto__ binding. Object
             // destructuring avoids consulting the guest's Array iterator.
@@ -139,7 +162,10 @@ impl Plan {
             // An imported local named `then` must not turn this internal
             // transfer into a thenable. Null prototypes also prevent a guest
             // Object.prototype.then from intercepting promise fulfillment.
-            append(&mut prefix, "return {__proto__:null,bindings:{__proto__:null,")?;
+            append(
+                &mut prefix,
+                "return {__proto__:null,bindings:{__proto__:null,",
+            )?;
             append(&mut prefix, &self.values)?;
             append(&mut prefix, "}};")?;
         }
@@ -160,34 +186,66 @@ impl Visit for ImportMeta {
 /// None preserves the original QuickJS grammar/error behavior for ordinary
 /// scripts, dynamic imports and unparseable input. No source is evaluated here.
 pub(super) fn prepare(code: &str) -> Result<Option<String>> {
-    if code.len() > MAX_SOURCE_BYTES { return Err(LIMIT); }
+    if code.len() > MAX_SOURCE_BYTES {
+        return Err(LIMIT);
+    }
     let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
-    let file = cm.new_source_file(FileName::Custom("eval imports".into()).into(), code.to_owned());
+    let file = cm.new_source_file(
+        FileName::Custom("eval imports".into()).into(),
+        code.to_owned(),
+    );
     let lexer = Lexer::new(
-        Syntax::Es(EsSyntax { import_attributes: true, ..Default::default() }),
-        Default::default(), StringInput::from(&*file), None,
+        Syntax::Es(EsSyntax {
+            import_attributes: true,
+            ..Default::default()
+        }),
+        Default::default(),
+        StringInput::from(&*file),
+        None,
     );
     let mut parser = Parser::new_from(lexer);
-    let Ok(module) = parser.parse_module() else { return Ok(None); };
-    if !parser.take_errors().is_empty() { return Ok(None); }
-    let imports = module.body.iter().filter_map(|item| match item {
-        ModuleItem::ModuleDecl(ModuleDecl::Import(declaration)) => Some(declaration),
-        _ => None,
-    }).collect::<Vec<_>>();
-    if imports.is_empty() { return Ok(None); }
-    if imports.len() > MAX_IMPORTS { return Err(LIMIT); }
+    let Ok(module) = parser.parse_module() else {
+        return Ok(None);
+    };
+    if !parser.take_errors().is_empty() {
+        return Ok(None);
+    }
+    let imports = module
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(declaration)) => Some(declaration),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if imports.is_empty() {
+        return Ok(None);
+    }
+    if imports.len() > MAX_IMPORTS {
+        return Err(LIMIT);
+    }
     let mut import_meta = ImportMeta::default();
     module.visit_with(&mut import_meta);
     if import_meta.0 || module.body.iter().any(|item| {
         matches!(item, ModuleItem::ModuleDecl(declaration) if !matches!(declaration, ModuleDecl::Import(_)))
     }) { return Err(INVALID); }
 
-    let mut insertion = if code.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
+    let mut insertion = if code.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
     if code[insertion..].starts_with("#!") {
-        insertion = code.find(['\r', '\n', '\u{2028}', '\u{2029}']).map_or(code.len(), |index| {
-            index + if code[index..].starts_with("\r\n") { 2 }
-                else { code[index..].chars().next().map_or(0, char::len_utf8) }
-        });
+        insertion = code
+            .find(['\r', '\n', '\u{2028}', '\u{2029}'])
+            .map_or(code.len(), |index| {
+                index
+                    + if code[index..].starts_with("\r\n") {
+                        2
+                    } else {
+                        code[index..].chars().next().map_or(0, char::len_utf8)
+                    }
+            });
     }
     // Keep the user's original directive prologue effective. All imported
     // modules finish before any non-directive body statement is evaluated.
@@ -196,7 +254,9 @@ pub(super) fn prepare(code: &str) -> Result<Option<String>> {
             && matches!(statement.expr.as_ref(), Expr::Lit(Lit::Str(_)))
         {
             insertion = range(statement.span(), file.start_pos.0, code)?.end;
-        } else { break; }
+        } else {
+            break;
+        }
     }
     let mut plan = Plan::default();
     let mut removed = Vec::with_capacity(imports.len());
@@ -205,7 +265,9 @@ pub(super) fn prepare(code: &str) -> Result<Option<String>> {
         removed.push(range(declaration.span, file.start_pos.0, code)?);
     }
     let prefix = plan.prefix()?;
-    if prefix.len() > MAX_OUTPUT_BYTES.saturating_sub(code.len()) { return Err(LIMIT); }
+    if prefix.len() > MAX_OUTPUT_BYTES.saturating_sub(code.len()) {
+        return Err(LIMIT);
+    }
     // Preserve statement bytes and original newline locations; only import
     // declarations are blanked. Generated code has no physical newlines.
     let mut body = code.as_bytes().to_vec();

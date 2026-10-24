@@ -48,7 +48,10 @@ fn property(name: &str) -> Option<(&'static str, Kind)> {
         "invalid" => ("invalid", Token(&["false", "true", "grammar", "spelling"])),
         "live" => ("live", Token(&["off", "polite", "assertive"])),
         "autocomplete" => ("autocomplete", Token(&["none", "inline", "list", "both"])),
-        "hasPopup" => ("hasPopup", Token(&["false", "true", "menu", "listbox", "tree", "grid", "dialog"])),
+        "hasPopup" => (
+            "hasPopup",
+            Token(&["false", "true", "menu", "listbox", "tree", "grid", "dialog"]),
+        ),
         "orientation" => ("orientation", Token(&["horizontal", "vertical"])),
         "level" => ("level", Level),
         _ => return None,
@@ -87,12 +90,19 @@ fn primitive(name: &str, kind: Kind, wire: &Value) -> Result<Option<Value>, ()> 
         },
         Kind::Token(allowed) if ty == "token" => {
             let token = value.as_str().ok_or(())?;
-            let token = allowed.iter().copied().find(|allowed| *allowed == token).ok_or(())?;
+            let token = allowed
+                .iter()
+                .copied()
+                .find(|allowed| *allowed == token)
+                .ok_or(())?;
             // Serialize the allowlisted constant, never an arbitrary source token.
             json!(token)
         }
         Kind::Level if ty == "integer" => {
-            let level = value.as_u64().filter(|level| (1..=1_000_000).contains(level)).ok_or(())?;
+            let level = value
+                .as_u64()
+                .filter(|level| (1..=1_000_000).contains(level))
+                .ok_or(())?;
             json!(level)
         }
         _ => return Err(()),
@@ -105,7 +115,10 @@ pub(super) fn project(node: &Value) -> Observation {
     let Some(properties) = node.get("properties") else {
         return observation;
     };
-    let Some(properties) = properties.as_array().filter(|properties| properties.len() <= MAX_PROPERTIES) else {
+    let Some(properties) = properties
+        .as_array()
+        .filter(|properties| properties.len() <= MAX_PROPERTIES)
+    else {
         observation.incomplete = true;
         return observation;
     };
@@ -126,7 +139,9 @@ pub(super) fn project(node: &Value) -> Observation {
             continue;
         }
         match primitive(name, kind, &entry["value"]) {
-            Ok(Some(value)) => { observation.states.insert(name, value); }
+            Ok(Some(value)) => {
+                observation.states.insert(name, value);
+            }
             Ok(None) => {}
             Err(()) => observation.incomplete = true,
         }
@@ -136,9 +151,11 @@ pub(super) fn project(node: &Value) -> Observation {
 
 impl Observation {
     pub(super) fn suffix(&self) -> String {
-        let mut fields: Vec<String> = self.states.iter().map(|(name, value)| {
-            format!("{name}={value}")
-        }).collect();
+        let mut fields: Vec<String> = self
+            .states
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
         if self.incomplete {
             fields.push("state-projection-incomplete".to_string());
         }
@@ -198,18 +215,26 @@ impl SnapshotMemory {
         let mut metadata = Sha256::new();
         hash_field(&mut metadata, url.as_bytes());
         hash_field(&mut metadata, title.as_bytes());
-        Self { rows, order, metadata: metadata.finalize().into(), coverage_limited }
+        Self {
+            rows,
+            order,
+            metadata: metadata.finalize().into(),
+            coverage_limited,
+        }
     }
 
     pub(super) fn compare(&self, previous: Option<&Self>) -> Changes {
         let mut changes = Changes {
             schema: "pi.browser.snapshot-changes.v1",
             compared: previous.is_some(),
-            newly_observed: Vec::new(), changed: Vec::new(), no_longer_observed: Vec::new(),
+            newly_observed: Vec::new(),
+            changed: Vec::new(),
+            no_longer_observed: Vec::new(),
             unchanged_count: 0,
             order_changed: previous.map(|old| old.order != self.order),
             metadata_changed: previous.map(|old| old.metadata != self.metadata),
-            coverage_limited: self.coverage_limited || previous.is_some_and(|old| old.coverage_limited),
+            coverage_limited: self.coverage_limited
+                || previous.is_some_and(|old| old.coverage_limited),
         };
         for reference in &self.order {
             match previous.and_then(|old| old.rows.get(reference)) {
@@ -249,11 +274,25 @@ impl Changes {
         }
         format!(
             "Snapshot changes: new [{}]; changed [{}]; no longer observed [{}]; {} unchanged.{}{}{}\n",
-            self.newly_observed.join(", "), self.changed.join(", "),
-            self.no_longer_observed.join(", "), self.unchanged_count,
-            if self.order_changed == Some(true) { " Observation order changed." } else { "" },
-            if self.metadata_changed == Some(true) { " Page URL/title changed." } else { "" },
-            if self.coverage_limited { " Comparison coverage is limited." } else { "" },
+            self.newly_observed.join(", "),
+            self.changed.join(", "),
+            self.no_longer_observed.join(", "),
+            self.unchanged_count,
+            if self.order_changed == Some(true) {
+                " Observation order changed."
+            } else {
+                ""
+            },
+            if self.metadata_changed == Some(true) {
+                " Page URL/title changed."
+            } else {
+                ""
+            },
+            if self.coverage_limited {
+                " Comparison coverage is limited."
+            } else {
+                ""
+            },
         )
     }
 }
@@ -276,10 +315,13 @@ mod tests {
             entry("hasPopup", "token", json!("menu")),
             entry("level", "integer", json!(3)),
         ]}));
-        assert_eq!(serde_json::to_value(&state).unwrap(), json!({"states":{
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            json!({"states":{
             "checked":"mixed", "expanded":false, "disabled":true,
             "selected":false, "hasPopup":"menu", "level":3,
-        }, "incomplete":false}));
+        }, "incomplete":false})
+        );
     }
 
     #[test]
@@ -289,8 +331,12 @@ mod tests {
             assert_eq!(state.states["busy"], expected);
             assert!(!state.incomplete);
         }
-        for (name, wire) in [("busy", json!(2)), ("busy", json!("1")),
-            ("busy", json!(1.0)), ("disabled", json!(1))] {
+        for (name, wire) in [
+            ("busy", json!(2)),
+            ("busy", json!("1")),
+            ("busy", json!(1.0)),
+            ("disabled", json!(1)),
+        ] {
             let state = project(&json!({"properties":[entry(name, "boolean", wire)]}));
             assert!(state.incomplete);
             assert!(state.states.is_empty());
@@ -305,7 +351,8 @@ mod tests {
             {"name":"checked","value":{"type":"valueUndefined"}},
         ]}));
         assert_eq!(undefined, Observation::default());
-        let null = project(&json!({"properties":[entry("expanded", "booleanOrUndefined", Value::Null)]}));
+        let null =
+            project(&json!({"properties":[entry("expanded", "booleanOrUndefined", Value::Null)]}));
         assert!(null.incomplete);
         assert!(null.states.is_empty());
     }
@@ -336,7 +383,11 @@ mod tests {
         assert_eq!(state.states.len(), 1);
         assert_eq!(state.states["disabled"], true);
         assert!(state.incomplete);
-        assert!(!serde_json::to_string(&state).unwrap().contains("PRIVATE-CANARY"));
+        assert!(
+            !serde_json::to_string(&state)
+                .unwrap()
+                .contains("PRIVATE-CANARY")
+        );
         assert!(!state.suffix().contains("PRIVATE-CANARY"));
     }
 
@@ -353,10 +404,14 @@ mod tests {
 
     #[test]
     fn wire_types_are_checked_before_extracting_primitives() {
-        for entry in [entry("selected", "string", json!(true)),
-            entry("checked", "boolean", json!(true)), entry("level", "integer", json!(-1)),
-            entry("level", "integer", json!(1_000_001)), entry("level", "integer", json!(2.5)),
-            entry("orientation", "token", json!("diagonal"))] {
+        for entry in [
+            entry("selected", "string", json!(true)),
+            entry("checked", "boolean", json!(true)),
+            entry("level", "integer", json!(-1)),
+            entry("level", "integer", json!(1_000_001)),
+            entry("level", "integer", json!(2.5)),
+            entry("orientation", "token", json!("diagonal")),
+        ] {
             let state = project(&json!({"properties":[entry]}));
             assert!(state.incomplete);
             assert!(state.states.is_empty());
@@ -375,20 +430,38 @@ mod tests {
     }
 
     fn memory(rows: &[(&str, &str, bool)], truncated: bool) -> SnapshotMemory {
-        let elements: Vec<_> = rows.iter().map(|(reference, text, _)| super::super::BrowserElementRef {
-            ref_id: (*reference).to_string(), tag: "input".into(), role: "checkbox".into(),
-            text: (*text).to_string(), selector: (*reference).to_string(),
-        }).collect();
+        let elements: Vec<_> = rows
+            .iter()
+            .map(|(reference, text, _)| super::super::BrowserElementRef {
+                ref_id: (*reference).to_string(),
+                tag: "input".into(),
+                role: "checkbox".into(),
+                text: (*text).to_string(),
+                selector: (*reference).to_string(),
+            })
+            .collect();
         let states = rows.iter().map(|(reference, _, checked)| ((*reference).to_string(),
             project(&json!({"properties":[entry("checked", "tristate", json!(if *checked { "true" } else { "false" }))]}))
         )).collect();
-        SnapshotMemory::capture(&elements, &states, "https://example.test", "Test", truncated)
+        SnapshotMemory::capture(
+            &elements,
+            &states,
+            "https://example.test",
+            "Test",
+            truncated,
+        )
     }
 
     #[test]
     fn comparisons_report_state_and_label_changes_without_replaying_old_content() {
-        let old = memory(&[("@e1", "PRIVATE-OLD-NAME", false), ("@e2", "B", false)], false);
-        let current = memory(&[("@e1", "A", false), ("@e2", "B", true), ("@e3", "C", false)], false);
+        let old = memory(
+            &[("@e1", "PRIVATE-OLD-NAME", false), ("@e2", "B", false)],
+            false,
+        );
+        let current = memory(
+            &[("@e1", "A", false), ("@e2", "B", true), ("@e3", "C", false)],
+            false,
+        );
         let delta = current.compare(Some(&old));
         assert_eq!(delta.changed, vec!["@e1", "@e2"]);
         assert_eq!(delta.newly_observed, vec!["@e3"]);
@@ -429,10 +502,16 @@ mod tests {
 
     #[test]
     fn snapshot_memory_caps_rows_and_marks_missing_state_projection() {
-        let elements = vec![super::super::BrowserElementRef {
-            ref_id: "@e1".into(), tag: "input".into(), role: "textbox".into(),
-            text: "Bounded".into(), selector: "@e1".into(),
-        }; super::super::MAX_ELEMENTS + 1];
+        let elements = vec![
+            super::super::BrowserElementRef {
+                ref_id: "@e1".into(),
+                tag: "input".into(),
+                role: "textbox".into(),
+                text: "Bounded".into(),
+                selector: "@e1".into(),
+            };
+            super::super::MAX_ELEMENTS + 1
+        ];
         let observed = SnapshotMemory::capture(&elements, &BTreeMap::new(), "", "", false);
         assert!(observed.coverage_limited);
         assert!(observed.order.len() <= super::super::MAX_ELEMENTS);

@@ -28,12 +28,17 @@ pub(super) fn validate_request(input: &Value) -> Result<()> {
 }
 
 fn invalid(message: &str) -> Error {
-    Error::tool("subagent", format!("PI_SUBAGENT_INVALID_WORKSPACE: {message}"))
+    Error::tool(
+        "subagent",
+        format!("PI_SUBAGENT_INVALID_WORKSPACE: {message}"),
+    )
 }
 
 fn validate_fields(input: &Value) -> Result<()> {
     if let Some(value) = input.get("cwd") {
-        let path = value.as_str().ok_or_else(|| invalid("cwd must be a non-empty string"))?;
+        let path = value
+            .as_str()
+            .ok_or_else(|| invalid("cwd must be a non-empty string"))?;
         if path.is_empty() || path.contains('\0') {
             return Err(invalid("cwd must be a non-empty path without NUL bytes"));
         }
@@ -41,7 +46,11 @@ fn validate_fields(input: &Value) -> Result<()> {
     if let Some(value) = input.get("isolation") {
         match value.as_str() {
             Some("none" | "worktree") => {}
-            _ => return Err(invalid("isolation must be none or worktree; omit it for the default")),
+            _ => {
+                return Err(invalid(
+                    "isolation must be none or worktree; omit it for the default",
+                ));
+            }
         }
     }
     if let Some(value) = input.get("isoApply") {
@@ -74,7 +83,9 @@ mod tests {
         let value = single();
         validate_request(&value).expect("valid");
         let request: SubagentRequest = serde_json::from_value(value).expect("request");
-        let RequestMode::Single(task) = request.mode().expect("single") else { panic!("single"); };
+        let RequestMode::Single(task) = request.mode().expect("single") else {
+            panic!("single");
+        };
         assert!(task.cwd.is_none());
         assert!(task.isolation.is_none());
         assert!(task.iso_apply.is_none());
@@ -86,7 +97,9 @@ mod tests {
             let value = json!({"agent":"task","task":"implement","cwd":"packages/core","isolation":"worktree","isoApply":disposition});
             validate_request(&value).expect("valid workspace");
             let request: SubagentRequest = serde_json::from_value(value).expect("request");
-            let RequestMode::Single(task) = request.mode().expect("single") else { panic!("single"); };
+            let RequestMode::Single(task) = request.mode().expect("single") else {
+                panic!("single");
+            };
             assert_eq!(task.cwd, Some(PathBuf::from("packages/core")));
             assert_eq!(task.isolation.as_deref(), Some("worktree"));
             assert_eq!(task.iso_apply.as_deref(), Some(disposition));
@@ -96,15 +109,49 @@ mod tests {
     #[test]
     fn explicit_invalid_fields_are_not_downgraded_in_any_workflow() {
         for (field, values) in [
-            ("cwd", vec![Value::Null, json!(false), json!(42), json!([]), json!(""), json!("a\0b")]),
-            ("isolation", vec![Value::Null, json!(false), json!(42), json!({}), json!(""), json!("worktrees")]),
-            ("isoApply", vec![Value::Null, json!(false), json!(42), json!([]), json!(""), json!("force")]),
+            (
+                "cwd",
+                vec![
+                    Value::Null,
+                    json!(false),
+                    json!(42),
+                    json!([]),
+                    json!(""),
+                    json!("a\0b"),
+                ],
+            ),
+            (
+                "isolation",
+                vec![
+                    Value::Null,
+                    json!(false),
+                    json!(42),
+                    json!({}),
+                    json!(""),
+                    json!("worktrees"),
+                ],
+            ),
+            (
+                "isoApply",
+                vec![
+                    Value::Null,
+                    json!(false),
+                    json!(42),
+                    json!([]),
+                    json!(""),
+                    json!("force"),
+                ],
+            ),
         ] {
             for value in values {
                 let mut entry = single();
                 entry["isolation"] = json!("worktree");
                 entry[field] = value;
-                for request in [entry.clone(), json!({"tasks":[entry.clone()]}), json!({"chain":[entry.clone()]})] {
+                for request in [
+                    entry.clone(),
+                    json!({"tasks":[entry.clone()]}),
+                    json!({"chain":[entry.clone()]}),
+                ] {
                     let error = validate_request(&request).expect_err("must fail closed");
                     assert!(error.to_string().contains("PI_SUBAGENT_INVALID_WORKSPACE"));
                 }
@@ -124,7 +171,8 @@ mod tests {
                 }
             }
         }
-        let typed: SubagentRequest = serde_json::from_value(json!({"tasks":[single()],"cwd":"nested"})).expect("typed");
+        let typed: SubagentRequest =
+            serde_json::from_value(json!({"tasks":[single()],"cwd":"nested"})).expect("typed");
         assert!(typed.mode().is_err());
     }
 
@@ -134,7 +182,9 @@ mod tests {
             for disposition in ["keep", "apply", "drop"] {
                 let mut request = single();
                 request["isoApply"] = json!(disposition);
-                if let Some(isolation) = isolation { request["isolation"] = json!(isolation); }
+                if let Some(isolation) = isolation {
+                    request["isolation"] = json!(isolation);
+                }
                 assert!(validate_request(&request).is_err());
             }
         }
@@ -165,7 +215,11 @@ mod tests {
         let schema = SubagentTool::new(Path::new(".")).parameters();
         for field in FIELDS {
             assert!(schema["properties"].get(field).is_some());
-            assert!(schema["definitions"]["task"]["properties"].get(field).is_some());
+            assert!(
+                schema["definitions"]["task"]["properties"]
+                    .get(field)
+                    .is_some()
+            );
         }
     }
 
@@ -175,11 +229,25 @@ mod tests {
         let global = temp.path().join("global");
         std::fs::create_dir_all(global.join("agents")).expect("agents");
         std::fs::write(global.join("agents/broken.md"), "invalid definition").expect("definition");
-        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global, PathBuf::from("nonexistent-child"));
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
-        let error = runtime.block_on(tool.execute("invalid-workspace", json!({"agent":"task","task":"x","isolation":null}), None))
+        let tool = SubagentTool::with_paths(
+            temp.path().to_path_buf(),
+            global,
+            PathBuf::from("nonexistent-child"),
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(tool.execute(
+                "invalid-workspace",
+                json!({"agent":"task","task":"x","isolation":null}),
+                None,
+            ))
             .expect_err("validation precedes discovery");
-        assert!(error.to_string().contains("PI_SUBAGENT_INVALID_WORKSPACE"), "{error}");
+        assert!(
+            error.to_string().contains("PI_SUBAGENT_INVALID_WORKSPACE"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -190,7 +258,8 @@ mod tests {
 printf '%s\n' 'delegated change' > delegated.txt
 printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"done"}]}]}'
 "#).expect("child");
-        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).expect("executable");
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700))
+            .expect("executable");
         child
     }
 
@@ -200,9 +269,21 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("workspace");
         std::fs::create_dir_all(root.join("nested")).expect("workspace");
-        let tool = SubagentTool::with_paths(root.clone(), temp.path().join("global"), child_fixture(temp.path()));
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
-        let output = runtime.block_on(tool.execute("single-cwd", json!({"agent":"task","task":"write marker","cwd":"nested"}), None)).expect("execute");
+        let tool = SubagentTool::with_paths(
+            root.clone(),
+            temp.path().join("global"),
+            child_fixture(temp.path()),
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let output = runtime
+            .block_on(tool.execute(
+                "single-cwd",
+                json!({"agent":"task","task":"write marker","cwd":"nested"}),
+                None,
+            ))
+            .expect("execute");
         assert!(!output.is_error, "{output:?}");
         assert!(root.join("nested/delegated.txt").exists());
         assert!(!root.join("delegated.txt").exists());
@@ -212,12 +293,23 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
     #[test]
     fn single_isolation_refuses_non_git_without_launching_child() {
         let temp = TempDir::new().expect("tempdir");
-        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), temp.path().join("global"), child_fixture(temp.path()));
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
+        let tool = SubagentTool::with_paths(
+            temp.path().to_path_buf(),
+            temp.path().join("global"),
+            child_fixture(temp.path()),
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
         let output = runtime.block_on(tool.execute("single-non-git", json!({"agent":"task","task":"write marker","isolation":"worktree","isoApply":"keep"}), None)).expect("tool result");
         assert!(output.is_error, "{output:?}");
         assert!(!temp.path().join("delegated.txt").exists());
-        assert!(output.details.expect("details")["results"][0]["error"].as_str().expect("error").contains("PI_ISO_NOT_GIT"));
+        assert!(
+            output.details.expect("details")["results"][0]["error"]
+                .as_str()
+                .expect("error")
+                .contains("PI_ISO_NOT_GIT")
+        );
     }
 
     #[cfg(unix)]
@@ -225,10 +317,24 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
     fn single_worktree_dispositions_use_existing_writeback_gates() {
         fn git(root: &Path, args: &[&str]) -> String {
             let output = std::process::Command::new("git")
-                .arg("-C").arg(root)
-                .args(["-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false"])
-                .args(args).output().expect("git");
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.test",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             String::from_utf8(output.stdout).expect("UTF-8 git result")
         }
         for disposition in ["keep", "apply", "drop"] {
@@ -246,24 +352,53 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":
             std::fs::write(root.join("nested/base.txt"), "unstaged parent\n").expect("dirty edit");
             let head = git(&root, &["rev-parse", "HEAD"]);
             let index = git(&root, &["diff", "--cached"]);
-            let tool = SubagentTool::with_paths(root.clone(), temp.path().join("global"), child_fixture(temp.path()));
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
+            let tool = SubagentTool::with_paths(
+                root.clone(),
+                temp.path().join("global"),
+                child_fixture(temp.path()),
+            );
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
             let output = runtime.block_on(tool.execute("single-isolated", json!({"agent":"task","task":"write marker","cwd":"nested","isolation":"worktree","isoApply":disposition}), None)).expect("execute");
             assert!(!output.is_error, "{disposition}: {output:?}");
             let details = output.details.expect("details");
             let iso = &details["results"][0]["iso"];
             assert_eq!(iso["applyMode"], disposition);
             assert_eq!(iso["applied"], disposition == "apply");
-            assert!(iso["patch"].as_str().expect("patch").contains("delegated.txt"));
-            assert_eq!(root.join("nested/delegated.txt").exists(), disposition == "apply");
-            assert_eq!(std::fs::read_to_string(root.join("nested/base.txt")).expect("parent"), "unstaged parent\n");
+            assert!(
+                iso["patch"]
+                    .as_str()
+                    .expect("patch")
+                    .contains("delegated.txt")
+            );
+            assert_eq!(
+                root.join("nested/delegated.txt").exists(),
+                disposition == "apply"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("nested/base.txt")).expect("parent"),
+                "unstaged parent\n"
+            );
             assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
             assert_eq!(git(&root, &["diff", "--cached"]), index);
             let worktree = Path::new(iso["worktreePath"].as_str().expect("worktree"));
             if disposition == "keep" {
                 assert!(worktree.join("nested/delegated.txt").exists());
-                assert_eq!(std::fs::read_to_string(worktree.join("nested/base.txt")).expect("captured dirty file"), "unstaged parent\n");
-                git(&root, &["worktree", "remove", "--force", worktree.to_str().expect("path")]);
+                assert_eq!(
+                    std::fs::read_to_string(worktree.join("nested/base.txt"))
+                        .expect("captured dirty file"),
+                    "unstaged parent\n"
+                );
+                git(
+                    &root,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        worktree.to_str().expect("path"),
+                    ],
+                );
             } else {
                 assert!(!worktree.exists());
             }

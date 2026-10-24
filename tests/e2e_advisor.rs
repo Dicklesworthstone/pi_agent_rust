@@ -190,7 +190,10 @@ fn e2e_advisor_concern_automatically_continues_completed_turn() {
         .into_iter()
         .filter(|request| request.path == "/doer/v1/chat/completions")
         .count();
-    assert_eq!(doer_hits, 3, "read, initial completion, and one continuation");
+    assert_eq!(
+        doer_hits, 3,
+        "read, initial completion, and one continuation"
+    );
 
     // The advisor was consulted…
     let advisor_hits = server
@@ -198,7 +201,10 @@ fn e2e_advisor_concern_automatically_continues_completed_turn() {
         .into_iter()
         .filter(|r| r.path == "/advisor/v1/chat/completions")
         .count();
-    assert_eq!(advisor_hits, 1, "the short corrected reply needs no second review");
+    assert_eq!(
+        advisor_hits, 1,
+        "the short corrected reply needs no second review"
+    );
 
     // …and the CONCERN injection reached the doer's next-turn context
     // (visible in the final request body).

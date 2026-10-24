@@ -514,7 +514,12 @@ impl CommitExecutor {
 
         let mut add_cmd = Command::new("git");
         // Stage deletions as well as modifications, and separate options from paths.
-        add_cmd.arg("add").arg("-A").arg("--").args(&unit.files).current_dir(cwd);
+        add_cmd
+            .arg("add")
+            .arg("-A")
+            .arg("--")
+            .args(&unit.files)
+            .current_dir(cwd);
 
         let add_res = add_cmd.status();
         let add_ok = add_res.is_ok_and(|s| s.success());
@@ -641,8 +646,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = dir.path();
         let git = |args: &[&str]| {
-            let output = Command::new("git").args(args).current_dir(cwd).output().expect("git available");
-            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
             output.stdout
         };
         git(&["init", "-q"]);
@@ -669,11 +683,19 @@ mod tests {
         };
         let result = CommitExecutor::execute_single_unit(cwd, &unit, None);
         assert!(result.success, "{result:?}");
-        let committed = String::from_utf8(git(&["show", "--format=", "--name-only", "HEAD"])).unwrap();
-        assert_eq!(committed.trim(), "selected.txt", "unrelated staged file entered this commit");
+        let committed =
+            String::from_utf8(git(&["show", "--format=", "--name-only", "HEAD"])).unwrap();
+        assert_eq!(
+            committed.trim(),
+            "selected.txt",
+            "unrelated staged file entered this commit"
+        );
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"])).unwrap();
         assert_eq!(staged.trim(), "other.txt", "unrelated staged edit was lost");
-        assert_eq!(std::fs::read_to_string(cwd.join("other.txt")).unwrap(), "other staged update\n");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("other.txt")).unwrap(),
+            "other staged update\n"
+        );
     }
 
     #[test]

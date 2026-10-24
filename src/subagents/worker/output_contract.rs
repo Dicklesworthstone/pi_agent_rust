@@ -33,7 +33,9 @@ impl Write for SchemaBytes {
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(in crate::subagents) struct OutputContract {
@@ -43,7 +45,9 @@ pub(in crate::subagents) struct OutputContract {
 
 impl OutputContract {
     pub(in crate::subagents) fn prepare(schema: Option<&Value>) -> Result<Option<Self>> {
-        let Some(schema) = schema else { return Ok(None); };
+        let Some(schema) = schema else {
+            return Ok(None);
+        };
         if !schema.is_object() && !schema.is_boolean() {
             return Err(Error::tool("subagent", INPUT));
         }
@@ -79,8 +83,12 @@ impl OutputContract {
         let options = jsonschema::options().with_retriever(NoExternalResources);
         let options = if schema.get("$schema").is_none() {
             options.with_draft(jsonschema::Draft::Draft202012)
-        } else { options };
-        let validator = options.build(schema).map_err(|_| Error::tool("subagent", INPUT))?;
+        } else {
+            options
+        };
+        let validator = options
+            .build(schema)
+            .map_err(|_| Error::tool("subagent", INPUT))?;
         Ok(Some(Self { encoded, validator }))
     }
 
@@ -137,8 +145,14 @@ impl OutputContract {
 /// its original validation claim. Preserve the complete typed ToolOutput or
 /// withhold it. Plain text turns keep their existing redaction behavior.
 pub(super) fn preserves_typed_result(original: &Value, projected: &Value) -> bool {
-    let typed = original.pointer("/details/results").and_then(Value::as_array)
-        .is_some_and(|results| results.iter().any(|result| result.get("schemaValid") == Some(&Value::Bool(true))));
+    let typed = original
+        .pointer("/details/results")
+        .and_then(Value::as_array)
+        .is_some_and(|results| {
+            results
+                .iter()
+                .any(|result| result.get("schemaValid") == Some(&Value::Bool(true)))
+        });
     !typed || original == projected
 }
 
@@ -153,12 +167,24 @@ mod tests {
 
     #[test]
     fn typed_values_are_validated_without_coercion_or_extraction() {
-        let schema = contract(json!({"type":"object", "required":["files"], "additionalProperties":false,
-            "properties":{"files":{"type":"array","items":{"type":"string"}}}}));
-        assert_eq!(schema.answer(r#"{"files":["雪.rs"]}"#).unwrap(), json!({"files":["雪.rs"]}));
-        for bad in ["{}", r#"{"files":"x"}"#, r#"{"files":[3]}"#, r#"{"files":[],"extra":1}"#,
-            "```json\n{\"files\":[]}\n```", "text {\"files\":[]}", "{\"files\":[]} null",
-            r#"{"files":[],"\u0066iles":["x"]}"#] {
+        let schema = contract(
+            json!({"type":"object", "required":["files"], "additionalProperties":false,
+            "properties":{"files":{"type":"array","items":{"type":"string"}}}}),
+        );
+        assert_eq!(
+            schema.answer(r#"{"files":["雪.rs"]}"#).unwrap(),
+            json!({"files":["雪.rs"]})
+        );
+        for bad in [
+            "{}",
+            r#"{"files":"x"}"#,
+            r#"{"files":[3]}"#,
+            r#"{"files":[],"extra":1}"#,
+            "```json\n{\"files\":[]}\n```",
+            "text {\"files\":[]}",
+            "{\"files\":[]} null",
+            r#"{"files":[],"\u0066iles":["x"]}"#,
+        ] {
             assert!(schema.answer(bad).is_err(), "{bad}");
         }
     }
@@ -166,42 +192,66 @@ mod tests {
     #[test]
     fn null_false_and_local_references_remain_typed() {
         let any = contract(json!(true));
-        for (text, expected) in [("null", Value::Null), ("false", json!(false)), ("7", json!(7))] {
+        for (text, expected) in [
+            ("null", Value::Null),
+            ("false", json!(false)),
+            ("7", json!(7)),
+        ] {
             assert_eq!(any.answer(text).unwrap(), expected);
         }
         assert!(contract(json!(false)).answer("null").is_err());
         let schema = contract(json!({"$defs":{"positive":{"type":"integer","minimum":1}},
             "type":"array", "items":{"$ref":"#/$defs/positive"}}));
-        assert_eq!(schema.answer("[1,2]").unwrap(), json!([1,2]));
+        assert_eq!(schema.answer("[1,2]").unwrap(), json!([1, 2]));
         assert!(schema.answer("[0]").is_err());
     }
 
     #[test]
     fn schema_and_answer_bounds_and_unavailable_resources_are_explicit() {
-        for value in [Value::Null, json!([]), json!({"type":"CANARY"}),
-            json!({"$ref":"https://invalid.example/CANARY"}), json!({"$ref":"file:///CANARY"}),
-            json!({"description":"x".repeat(MAX_SCHEMA_BYTES)})] {
-            let error = OutputContract::prepare(Some(&value)).err().unwrap().to_string();
+        for value in [
+            Value::Null,
+            json!([]),
+            json!({"type":"CANARY"}),
+            json!({"$ref":"https://invalid.example/CANARY"}),
+            json!({"$ref":"file:///CANARY"}),
+            json!({"description":"x".repeat(MAX_SCHEMA_BYTES)}),
+        ] {
+            let error = OutputContract::prepare(Some(&value))
+                .err()
+                .unwrap()
+                .to_string();
             assert!(error.contains("PI_SUBAGENT_WORKER_SCHEMA"));
             assert!(!error.contains("CANARY"));
         }
         let any = contract(json!(true));
-        assert!(any.answer(&format!("\"{}\"", "x".repeat(MAX_ANSWER_BYTES))).is_err());
-        assert!(any.answer(&format!("{}0{}", "[".repeat(34), "]".repeat(34))).is_err());
+        assert!(
+            any.answer(&format!("\"{}\"", "x".repeat(MAX_ANSWER_BYTES)))
+                .is_err()
+        );
+        assert!(
+            any.answer(&format!("{}0{}", "[".repeat(34), "]".repeat(34)))
+                .is_err()
+        );
         let mut deep = json!(true);
-        for _ in 0..40 { deep = json!({"items":deep}); }
+        for _ in 0..40 {
+            deep = json!({"items":deep});
+        }
         assert!(OutputContract::prepare(Some(&deep)).is_err());
     }
 
     #[test]
     fn only_schema_valid_results_require_exact_projection() {
-        let original = json!({"content":[], "details":{"results":[{"schemaValid":true,"data":{"n":3}}]}});
+        let original =
+            json!({"content":[], "details":{"results":[{"schemaValid":true,"data":{"n":3}}]}});
         assert!(preserves_typed_result(&original, &original));
         let mut changed = original.clone();
         changed["details"]["results"][0]["data"]["n"] = json!("redacted");
         assert!(!preserves_typed_result(&original, &changed));
         let plain = json!({"content":[{"type":"text","text":"secret"}], "details":null});
-        assert!(preserves_typed_result(&plain, &json!({"content":[],"details":null})));
+        assert!(preserves_typed_result(
+            &plain,
+            &json!({"content":[],"details":null})
+        ));
     }
 
     #[test]
@@ -210,10 +260,13 @@ mod tests {
         let mut vault = crate::secrets::SecretVault::default();
         crate::secrets::obfuscate(secret, &mut vault, &[regex::Regex::new(secret).unwrap()]);
         let privacy = AuxiliaryPrivacySnapshot::with_vault(
-            crate::text_completion::AuxiliaryPrivacy::from_settings(None), &vault,
+            crate::text_completion::AuxiliaryPrivacy::from_settings(None),
+            &vault,
         );
         let schema = json!({"type":"string", "const":secret});
-        let error = OutputContract::preflight(Some(&schema), &privacy).unwrap_err().to_string();
+        let error = OutputContract::preflight(Some(&schema), &privacy)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("PI_SUBAGENT_WORKER_SCHEMA_PRIVACY"));
         assert!(!error.contains(secret));
     }

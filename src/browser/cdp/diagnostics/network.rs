@@ -34,8 +34,11 @@ pub(super) struct Trace {
 
 fn token(value: &Value, maximum: usize) -> Option<&str> {
     value.as_str().filter(|text| {
-        !text.is_empty() && text.len() <= maximum
-            && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-.:/".contains(&byte))
+        !text.is_empty()
+            && text.len() <= maximum
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:/".contains(&byte))
     })
 }
 
@@ -55,8 +58,12 @@ fn response_fields(response: &Value, allowlist: Option<&[String]>) -> Option<Val
 }
 
 fn url_shortened(value: &Value) -> bool {
-    let Some(raw) = value.as_str().filter(|raw| raw.len() <= 64 * 1024) else { return false };
-    let Ok(mut url) = url::Url::parse(raw) else { return false };
+    let Some(raw) = value.as_str().filter(|raw| raw.len() <= 64 * 1024) else {
+        return false;
+    };
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return false;
+    };
     url.set_query(None);
     url.set_fragment(None);
     url.as_str().len() > super::MAX_FIELD_BYTES
@@ -65,8 +72,13 @@ fn url_shortened(value: &Value) -> bool {
 impl Trace {
     pub(super) fn new(max_events: usize) -> Self {
         Self {
-            hops: VecDeque::new(), seen: BTreeSet::new(), max_events,
-            sequence: 0, dropped: 0, filtered: 0, invalid: 0,
+            hops: VecDeque::new(),
+            seen: BTreeSet::new(),
+            max_events,
+            sequence: 0,
+            dropped: 0,
+            filtered: 0,
+            invalid: 0,
             fields_truncated: false,
             admission_stopped: false,
         }
@@ -77,9 +89,15 @@ impl Trace {
     }
 
     fn bound(&mut self) {
-        let mut bytes: usize = self.hops.iter().map(|hop| hop.fields.to_string().len()).sum();
+        let mut bytes: usize = self
+            .hops
+            .iter()
+            .map(|hop| hop.fields.to_string().len())
+            .sum();
         while self.hops.len() > self.max_events || bytes > MAX_BYTES {
-            let Some(hop) = self.hops.pop_front() else { break };
+            let Some(hop) = self.hops.pop_front() else {
+                break;
+            };
             bytes -= hop.fields.to_string().len();
             self.dropped = self.dropped.saturating_add(1);
         }
@@ -145,14 +163,18 @@ impl Trace {
         // to a forbidden URL. Its old hop can finish, but the new one is omitted.
         let request = &params["request"];
         let admitted = params["frameId"].as_str() == Some(main_frame)
-            && params["documentURL"].as_str().is_some_and(|url| admitted_url(url, allowlist));
-        let fields = admitted.then(|| {
-            Some((
-                display_url(request["url"].as_str()?, allowlist)?,
-                token(&request["method"], 32)?.to_string(),
-                finite_number(&params["timestamp"])?,
-            ))
-        }).flatten();
+            && params["documentURL"]
+                .as_str()
+                .is_some_and(|url| admitted_url(url, allowlist));
+        let fields = admitted
+            .then(|| {
+                Some((
+                    display_url(request["url"].as_str()?, allowlist)?,
+                    token(&request["method"], 32)?.to_string(),
+                    finite_number(&params["timestamp"])?,
+                ))
+            })
+            .flatten();
         // Remember rejected identities too so later unscoped events cannot
         // resurrect them. This set is independent of the latest-result tail.
         if !self.seen.contains(id) {
@@ -184,7 +206,12 @@ impl Trace {
             "redirect_start_missing": redirect_from.is_none() && params.get("redirectResponse").is_some(),
         });
         self.hops.push_back(Hop {
-            id: id.to_string(), sequence, start, last: start, active: true, fields,
+            id: id.to_string(),
+            sequence,
+            start,
+            last: start,
+            active: true,
+            fields,
         });
     }
 
@@ -196,9 +223,12 @@ impl Trace {
         phase: &str,
     ) {
         let method = event["method"].as_str().unwrap_or_default();
-        if !matches!(method,
-            "Network.requestWillBeSent" | "Network.responseReceived"
-                | "Network.loadingFinished" | "Network.loadingFailed"
+        if !matches!(
+            method,
+            "Network.requestWillBeSent"
+                | "Network.responseReceived"
+                | "Network.loadingFinished"
+                | "Network.loadingFailed"
                 | "Network.requestServedFromCache"
         ) {
             return;
@@ -225,8 +255,7 @@ impl Trace {
                     self.invalid = self.invalid.saturating_add(1);
                     return;
                 }
-                if params.get("frameId").is_some()
-                    && params["frameId"].as_str() != Some(main_frame)
+                if params.get("frameId").is_some() && params["frameId"].as_str() != Some(main_frame)
                 {
                     self.invalid = self.invalid.saturating_add(1);
                     return;
@@ -241,7 +270,9 @@ impl Trace {
                 }
                 self.fields_truncated |= url_shortened(&params["response"]["url"]);
                 Some(response)
-            } else { None };
+            } else {
+                None
+            };
             if self.timestamp(index, &params["timestamp"]).is_none() {
                 self.invalid = self.invalid.saturating_add(1);
                 return;
@@ -254,19 +285,26 @@ impl Trace {
                 hop.active = false;
                 if method == "Network.loadingFinished" {
                     hop.fields["state"] = json!("completed");
-                    hop.fields["encoded_bytes"] = json!(finite_number(&params["encodedDataLength"]));
+                    hop.fields["encoded_bytes"] =
+                        json!(finite_number(&params["encodedDataLength"]));
                 } else {
                     hop.fields["state"] = json!("failed");
                     // Chromium normally supplies net::ERR_* here. Do not copy
                     // arbitrary diagnostics that might contain a URL or cookie.
-                    hop.fields["error_code"] = json!(token(&params["errorText"], 128)
-                        .filter(|text| text.strip_prefix("net::ERR_").is_some_and(|code| {
-                            !code.is_empty() && code.bytes().all(|byte| {
-                                byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    hop.fields["error_code"] =
+                        json!(token(&params["errorText"], 128).filter(|text| {
+                            text.strip_prefix("net::ERR_").is_some_and(|code| {
+                                !code.is_empty()
+                                    && code.bytes().all(|byte| {
+                                        byte.is_ascii_uppercase()
+                                            || byte.is_ascii_digit()
+                                            || byte == b'_'
+                                    })
                             })
-                        })));
+                        }));
                     hop.fields["blocked_reason"] = json!(token(&params["blockedReason"], 64));
-                    hop.fields["cors_error"] = json!(token(&params["corsErrorStatus"]["corsError"], 128));
+                    hop.fields["cors_error"] =
+                        json!(token(&params["corsErrorStatus"]["corsError"], 128));
                     hop.fields["canceled"] = json!(params["canceled"].as_bool());
                 }
             }
@@ -318,21 +356,36 @@ mod tests {
     #[test]
     fn real_request_lifecycle_keeps_http_failure_separate_from_transport_failure() {
         let mut trace = Trace::new(100);
-        observe(&mut trace, &start("1", "https://example.com/api?PRIVATE#PRIVATE", 10.0));
+        observe(
+            &mut trace,
+            &start("1", "https://example.com/api?PRIVATE#PRIVATE", 10.0),
+        );
         observe(&mut trace, &response("1", 503, 10.25));
-        observe(&mut trace, &json!({"method":"Network.loadingFinished","params":{
-            "requestId":"1","timestamp":10.5,"encodedDataLength":80
-        }}));
+        observe(
+            &mut trace,
+            &json!({"method":"Network.loadingFinished","params":{
+                "requestId":"1","timestamp":10.5,"encodedDataLength":80
+            }}),
+        );
         observe(&mut trace, &start("2", "https://example.com/offline", 11.0));
-        observe(&mut trace, &json!({"method":"Network.loadingFailed","params":{
-            "requestId":"2","timestamp":11.125,"errorText":"net::ERR_CONNECTION_REFUSED","canceled":false
-        }}));
+        observe(
+            &mut trace,
+            &json!({"method":"Network.loadingFailed","params":{
+                "requestId":"2","timestamp":11.125,"errorText":"net::ERR_CONNECTION_REFUSED","canceled":false
+            }}),
+        );
         let report = trace.report();
         assert_eq!(report["requests"][0]["state"], "completed");
-        assert_eq!(report["requests"][0]["response"]["status"].as_f64(), Some(503.0));
+        assert_eq!(
+            report["requests"][0]["response"]["status"].as_f64(),
+            Some(503.0)
+        );
         assert_eq!(report["requests"][0]["elapsed_ms"].as_f64(), Some(500.0));
         assert_eq!(report["requests"][1]["state"], "failed");
-        assert_eq!(report["requests"][1]["error_code"], "net::ERR_CONNECTION_REFUSED");
+        assert_eq!(
+            report["requests"][1]["error_code"],
+            "net::ERR_CONNECTION_REFUSED"
+        );
         assert!(!report.to_string().contains("PRIVATE"));
         assert_eq!(report["pending_at_end"], 0);
     }
@@ -342,10 +395,12 @@ mod tests {
         let mut trace = Trace::new(100);
         observe(&mut trace, &start("1", "https://example.com/first", 1.0));
         let mut redirected = start("1", "https://example.com/second", 2.0);
-        redirected["params"]["redirectResponse"] = json!({"url":"https://example.com/first","status":302});
+        redirected["params"]["redirectResponse"] =
+            json!({"url":"https://example.com/first","status":302});
         observe(&mut trace, &redirected);
         let mut forbidden = start("1", "https://forbidden.test/PRIVATE", 3.0);
-        forbidden["params"]["redirectResponse"] = json!({"url":"https://example.com/second","status":307});
+        forbidden["params"]["redirectResponse"] =
+            json!({"url":"https://example.com/second","status":307});
         observe(&mut trace, &forbidden);
         observe(&mut trace, &response("1", 200, 4.0));
         let report = trace.report();
@@ -367,7 +422,10 @@ mod tests {
         observe(&mut trace, &start("1", "https://example.com/old", 2.0));
         observe(&mut trace, &start("2", "https://example.com/new", 3.0));
         observe(&mut trace, &response("1", 500, 4.0));
-        observe(&mut trace, &start("1", "https://example.com/PRIVATE-reused", 4.0));
+        observe(
+            &mut trace,
+            &start("1", "https://example.com/PRIVATE-reused", 4.0),
+        );
         let report = trace.report();
         assert_eq!(report["requests"].as_array().unwrap().len(), 1);
         assert_eq!(report["requests"][0]["url"], "https://example.com/new");
@@ -408,10 +466,13 @@ mod tests {
     fn arbitrary_failure_payloads_and_response_headers_are_not_report_fields() {
         let mut trace = Trace::new(100);
         observe(&mut trace, &start("1", "https://example.com/api", 1.0));
-        observe(&mut trace, &json!({"method":"Network.loadingFailed","params":{
-            "requestId":"1","timestamp":2.0,"errorText":"failed https://example.com?PRIVATE",
-            "corsErrorStatus":{"corsError":"InvalidResponse","failedParameter":"PRIVATE"}
-        }}));
+        observe(
+            &mut trace,
+            &json!({"method":"Network.loadingFailed","params":{
+                "requestId":"1","timestamp":2.0,"errorText":"failed https://example.com?PRIVATE",
+                "corsErrorStatus":{"corsError":"InvalidResponse","failedParameter":"PRIVATE"}
+            }}),
+        );
         let report = trace.report();
         assert_eq!(report["requests"][0]["error_code"], Value::Null);
         assert_eq!(report["requests"][0]["cors_error"], "InvalidResponse");

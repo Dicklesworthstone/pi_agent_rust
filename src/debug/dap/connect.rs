@@ -23,7 +23,12 @@ impl ConnectPermit {
                 (count < MAX_CONNECT_WORKERS).then_some(count + 1)
             })
             .map(|_| Self)
-            .map_err(|_| tool_err("DAP_CONNECT_CAPACITY", "eight debugger connections are already pending"))
+            .map_err(|_| {
+                tool_err(
+                    "DAP_CONNECT_CAPACITY",
+                    "eight debugger connections are already pending",
+                )
+            })
     }
 }
 
@@ -45,15 +50,23 @@ fn validate(endpoint: SocketAddr, timeout: Duration) -> Result<()> {
         ));
     }
     if timeout.is_zero() || timeout > MAX_CONNECT_WAIT {
-        return Err(tool_err("DAP_USAGE", "debugger connection timeout must be positive and at most 30 seconds"));
+        return Err(tool_err(
+            "DAP_USAGE",
+            "debugger connection timeout must be positive and at most 30 seconds",
+        ));
     }
     Ok(())
 }
 
 fn checkpoint(owner: &AgentCx, started: Instant, timeout: Duration) -> Result<()> {
-    owner.checkpoint().map_err(|_| tool_err("DAP_CANCELLED", "debugger connection cancelled"))?;
+    owner
+        .checkpoint()
+        .map_err(|_| tool_err("DAP_CANCELLED", "debugger connection cancelled"))?;
     if started.elapsed() >= timeout {
-        return Err(tool_err("DAP_CONNECT_TIMEOUT", "debugger connection exceeded its deadline"));
+        return Err(tool_err(
+            "DAP_CONNECT_TIMEOUT",
+            "debugger connection exceeded its deadline",
+        ));
     }
     Ok(())
 }
@@ -74,7 +87,10 @@ impl DapTransport {
         let started = Instant::now();
         checkpoint(&owner, started, timeout)?;
         if !owner.capabilities().io || !owner.capabilities().time {
-            return Err(tool_err("DAP_PERMISSION", "debugger connection requires I/O and timer capabilities"));
+            return Err(tool_err(
+                "DAP_PERMISSION",
+                "debugger connection requires I/O and timer capabilities",
+            ));
         }
         let permit = ConnectPermit::acquire()?;
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -87,21 +103,37 @@ impl DapTransport {
                 let result = TcpStream::connect_timeout(&endpoint, timeout);
                 let _ = sender.send(result);
             })
-            .map_err(|error| tool_err("DAP_CONNECT", format!("cannot start connection worker: {error}")))?;
-        let connected = owner.with_current(await_completion(receiver, timeout, || {})).await;
+            .map_err(|error| {
+                tool_err(
+                    "DAP_CONNECT",
+                    format!("cannot start connection worker: {error}"),
+                )
+            })?;
+        let connected = owner
+            .with_current(await_completion(receiver, timeout, || {}))
+            .await;
         checkpoint(&owner, started, timeout)?;
-        let socket = connected.map_err(|error| match error {
-            CompletionWaitError::Cancelled => tool_err("DAP_CANCELLED", "debugger connection cancelled"),
-            CompletionWaitError::Timeout => tool_err("DAP_CONNECT_TIMEOUT", "debugger connection exceeded its deadline"),
-            CompletionWaitError::Closed => tool_err("DAP_CONNECT", "debugger connection worker closed"),
-        })?.map_err(|error| {
-            let code = if error.kind() == std::io::ErrorKind::TimedOut {
-                "DAP_CONNECT_TIMEOUT"
-            } else {
-                "DAP_CONNECT"
-            };
-            tool_err(code, format!("cannot connect to {endpoint}: {error}"))
-        })?;
+        let socket = connected
+            .map_err(|error| match error {
+                CompletionWaitError::Cancelled => {
+                    tool_err("DAP_CANCELLED", "debugger connection cancelled")
+                }
+                CompletionWaitError::Timeout => tool_err(
+                    "DAP_CONNECT_TIMEOUT",
+                    "debugger connection exceeded its deadline",
+                ),
+                CompletionWaitError::Closed => {
+                    tool_err("DAP_CONNECT", "debugger connection worker closed")
+                }
+            })?
+            .map_err(|error| {
+                let code = if error.kind() == std::io::ErrorKind::TimedOut {
+                    "DAP_CONNECT_TIMEOUT"
+                } else {
+                    "DAP_CONNECT"
+                };
+                tool_err(code, format!("cannot connect to {endpoint}: {error}"))
+            })?;
         socket.set_nodelay(true)?;
         let input = socket.try_clone()?;
         let output = socket.try_clone()?;
@@ -127,7 +159,10 @@ mod tests {
     use std::net::TcpListener;
 
     fn run<F: std::future::Future>(future: F) -> F::Output {
-        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(future)
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn accept(listener: &TcpListener) -> TcpStream {
@@ -136,12 +171,19 @@ mod tests {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
                     return stream;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(started.elapsed() < Duration::from_secs(3), "client never connected");
+                    assert!(
+                        started.elapsed() < Duration::from_secs(3),
+                        "client never connected"
+                    );
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(error) => panic!("accept: {error}"),
@@ -150,12 +192,20 @@ mod tests {
     }
 
     fn request(reader: &mut BufReader<TcpStream>) -> Value {
-        read_frame_with_scratch(reader, &mut Vec::new()).unwrap().unwrap()
+        read_frame_with_scratch(reader, &mut Vec::new())
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
     fn non_loopback_zero_port_and_invalid_budgets_are_rejected() {
-        for endpoint in ["0.0.0.0:1", "192.0.2.1:1", "127.0.0.1:0", "[::]:1", "[::ffff:127.0.0.1]:1"] {
+        for endpoint in [
+            "0.0.0.0:1",
+            "192.0.2.1:1",
+            "127.0.0.1:0",
+            "[::]:1",
+            "[::ffff:127.0.0.1]:1",
+        ] {
             assert!(validate(endpoint.parse().unwrap(), Duration::from_secs(1)).is_err());
         }
         for endpoint in ["127.0.0.1:1", "[::1]:1"] {
@@ -172,11 +222,15 @@ mod tests {
         let owner = AgentCx::for_request();
         owner.set_cancel_requested(true);
         let result = run(owner.with_current(DapTransport::connect_loopback(
-            listener.local_addr().unwrap(), Duration::from_secs(1),
+            listener.local_addr().unwrap(),
+            Duration::from_secs(1),
         )));
         assert!(result.err().unwrap().to_string().contains("DAP_CANCELLED"));
         listener.set_nonblocking(true).unwrap();
-        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
@@ -190,21 +244,32 @@ mod tests {
             assert_eq!(input["command"], "threads");
             stream.write_all(&encode_frame(&json!({"seq":1,"type":"event","event":"output","body":{"output":"external-marker"}}))).unwrap();
             stream.write_all(&encode_frame(&json!({"seq":2,"type":"response","request_seq":input["seq"],"command":"threads","success":true,"body":{"threads":[{"id":7,"name":"external"}]}}))).unwrap();
-            assert_eq!(reader.read(&mut [0_u8; 1]).unwrap(), 0, "drop must close the socket, not send a terminate command");
+            assert_eq!(
+                reader.read(&mut [0_u8; 1]).unwrap(),
+                0,
+                "drop must close the socket, not send a terminate command"
+            );
             // The external service is still accepting clients after retirement.
             let mut second = accept(&listener);
             second.write_all(b"alive").unwrap();
         });
         run(async {
-            let transport = DapTransport::connect_loopback(endpoint, Duration::from_secs(1)).await.unwrap();
+            let transport = DapTransport::connect_loopback(endpoint, Duration::from_secs(1))
+                .await
+                .unwrap();
             assert!(lock(&transport.life.child).is_none());
-            let reply = transport.request("threads", json!({}), Duration::from_secs(1)).await.unwrap();
+            let reply = transport
+                .request("threads", json!({}), Duration::from_secs(1))
+                .await
+                .unwrap();
             assert_eq!(reply["threads"][0]["name"], "external");
             assert!(transport.stderr_tail().contains("external-marker"));
             drop(transport);
         });
         let mut second = TcpStream::connect_timeout(&endpoint, Duration::from_secs(1)).unwrap();
-        second.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let mut alive = [0; 5];
         second.read_exact(&mut alive).unwrap();
         assert_eq!(&alive, b"alive");
@@ -221,8 +286,12 @@ mod tests {
             // Close without a reply: this is a transport failure, not success.
         });
         run(async {
-            let transport = DapTransport::connect_loopback(endpoint, Duration::from_secs(1)).await.unwrap();
-            let result = transport.request("threads", json!({}), Duration::from_secs(1)).await;
+            let transport = DapTransport::connect_loopback(endpoint, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let result = transport
+                .request("threads", json!({}), Duration::from_secs(1))
+                .await;
             assert!(matches!(result, Err(DapError::Transport(_))), "{result:?}");
             assert!(!transport.is_alive());
             assert!(lock(&transport.pending).is_empty());
@@ -243,10 +312,15 @@ mod tests {
         });
         let owner = AgentCx::for_request();
         run(owner.with_current(async {
-            let transport = DapTransport::connect_loopback(endpoint, Duration::from_secs(1)).await.unwrap();
-            let mut pending = Box::pin(transport.request("stall", json!({}), Duration::from_secs(2)));
+            let transport = DapTransport::connect_loopback(endpoint, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let mut pending =
+                Box::pin(transport.request("stall", json!({}), Duration::from_secs(2)));
             assert!(futures::poll!(pending.as_mut()).is_pending());
-            await_completion(received, Duration::from_secs(1), || {}).await.unwrap();
+            await_completion(received, Duration::from_secs(1), || {})
+                .await
+                .unwrap();
             owner.set_cancel_requested(true);
             assert!(matches!(pending.await, Err(DapError::Cancelled)));
             assert!(lock(&transport.pending).is_empty());

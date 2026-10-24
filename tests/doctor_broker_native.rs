@@ -29,7 +29,10 @@ fn run_native_doctor(
     fs::write(agent.join("settings.json"), "{}")?;
     if corrupt_ledger {
         fs::create_dir_all(cwd.join(".beads"))?;
-        fs::write(cwd.join(".beads/issues.jsonl"), "{ broken coordination state\n")?;
+        fs::write(
+            cwd.join(".beads/issues.jsonl"),
+            "{ broken coordination state\n",
+        )?;
     }
     // Only real ordinary shell executables are discoverable, never br/am/rch.
     for name in ["sh", "bash"] {
@@ -72,14 +75,27 @@ fn run_native_doctor(
 fn real_consumer_report_is_healthy_but_not_swarm_admission_evidence() -> TestResult {
     for selection in [None, Some("config")] {
         let (report, exit, provenance) = run_native_doctor(selection, false)?;
-        assert_eq!(exit, 0, "consumer installation must remain healthy: {report}");
+        assert_eq!(
+            exit, 0,
+            "consumer installation must remain healthy: {report}"
+        );
         assert_eq!(report["summary"]["fail"], 0);
         let findings = report["findings"].as_array().ok_or("findings array")?;
         assert!(!findings.is_empty());
-        assert!(findings.iter().all(|finding| finding["category"] != "swarm"));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding["category"] != "swarm")
+        );
         let input = normalize_doctor_json(provenance, &report)?;
-        assert!(input.health.is_degraded(), "consumer health is not admission evidence");
-        assert!(!input.has_failures, "the broker must not invent consumer failures");
+        assert!(
+            input.health.is_degraded(),
+            "consumer health is not admission evidence"
+        );
+        assert!(
+            !input.has_failures,
+            "the broker must not invent consumer failures"
+        );
         assert_eq!(input.checks.len(), findings.len());
     }
     Ok(())
@@ -89,7 +105,10 @@ fn real_consumer_report_is_healthy_but_not_swarm_admission_evidence() -> TestRes
 fn real_swarm_report_retains_storage_and_coordination_failures() -> TestResult {
     for selection in ["swarm", "config,swarm"] {
         let (report, exit, provenance) = run_native_doctor(Some(selection), true)?;
-        assert_eq!(exit, 1, "explicit swarm failures must affect exit: {report}");
+        assert_eq!(
+            exit, 1,
+            "explicit swarm failures must affect exit: {report}"
+        );
         let findings = report["findings"].as_array().ok_or("findings array")?;
         assert!(findings.iter().any(|finding| {
             finding["category"] == "swarm"
@@ -98,16 +117,16 @@ fn real_swarm_report_retains_storage_and_coordination_failures() -> TestResult {
         }));
         let resource = findings
             .iter()
-            .find(|finding| {
-                finding["data"]["schema"] == "pi.doctor.swarm_resource_preflight.v1"
-            })
+            .find(|finding| finding["data"]["schema"] == "pi.doctor.swarm_resource_preflight.v1")
             .ok_or("native resource preflight")?;
         assert_eq!(resource["severity"], "fail");
         let paths = resource["data"]["tmpfs_headroom"]["paths"]
             .as_array()
             .ok_or("native storage evidence")?;
         for name in ["CARGO_TARGET_DIR", "TMPDIR"] {
-            let path = paths.iter().find(|path| path["env_name"] == name)
+            let path = paths
+                .iter()
+                .find(|path| path["env_name"] == name)
                 .ok_or("required native scratch row")?;
             assert_eq!(path["ready"], false);
         }

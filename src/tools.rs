@@ -6610,12 +6610,9 @@ impl ReadTool {
             } else {
                 crate::url_read::SsrfPolicy::BlockPrivateTargets
             };
-            let outcome = crate::url_read::fetch(
-                &source,
-                policy,
-                crate::url_read::UrlReadMode::SourceUtf8,
-            )
-            .await?;
+            let outcome =
+                crate::url_read::fetch(&source, policy, crate::url_read::UrlReadMode::SourceUtf8)
+                    .await?;
             if outcome.download_truncated {
                 return Err(Error::tool(
                     "read",
@@ -6629,9 +6626,9 @@ impl ReadTool {
                 .into_bytes()
         } else {
             let archive = crate::archive_read::parse_path(&source)?;
-            let source_path = archive.as_ref().map_or(source.as_str(), |archive| {
-                archive.archive_path.as_str()
-            });
+            let source_path = archive
+                .as_ref()
+                .map_or(source.as_str(), |archive| archive.archive_path.as_str());
             let path = resolve_read_path(source_path, &self.cwd);
             let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
             let mut roots = self.workspace.snapshot_or(&self.cwd).all();
@@ -7002,7 +6999,11 @@ impl Tool for ReadTool {
             crate::media_tools::video::parse_target(&input.path, literal_exists)?
         };
         let source_path = archive_path.as_ref().map_or_else(
-            || video_target.as_ref().map_or(file_path, |video| video.path.as_str()),
+            || {
+                video_target
+                    .as_ref()
+                    .map_or(file_path, |video| video.path.as_str())
+            },
             |archive| archive.archive_path.as_str(),
         );
         let path = resolve_read_path(source_path, &self.cwd);
@@ -7030,11 +7031,8 @@ impl Tool for ReadTool {
                 let mut prefix = [0_u8; 16];
                 let mut prefix_len = 0;
                 while prefix_len < prefix.len() {
-                    let read = positioned_file_read(
-                        &file,
-                        &mut prefix[prefix_len..],
-                        prefix_len as u64,
-                    )?;
+                    let read =
+                        positioned_file_read(&file, &mut prefix[prefix_len..], prefix_len as u64)?;
                     if read == 0 {
                         break;
                     }
@@ -9039,19 +9037,30 @@ impl Tool for BashTool {
             && (timeout_secs == 0 || timeout_secs.saturating_mul(1000) > threshold_ms);
         let persistent = cfg!(unix)
             && input.background != Some(true)
-            && self.mediation.as_ref().and_then(|settings| settings.persistent).unwrap_or(true);
-        let background_session_id = if input.background == Some(true) || auto_background || persistent {
-            Some(self.job_session_scope.session_id().await?)
-        } else {
-            None
-        };
+            && self
+                .mediation
+                .as_ref()
+                .and_then(|settings| settings.persistent)
+                .unwrap_or(true);
+        let background_session_id =
+            if input.background == Some(true) || auto_background || persistent {
+                Some(self.job_session_scope.session_id().await?)
+            } else {
+                None
+            };
         let mut shell_state = None;
         let mut shell_notice = None;
         if persistent {
-            let shell = self.shell_path.clone().map_or_else(default_bash_shell, Ok)?;
+            let shell = self
+                .shell_path
+                .clone()
+                .map_or_else(default_bash_shell, Ok)?;
             // Shell snapshots use native Bash declarations. An explicitly
             // selected non-Bash shell continues using its existing runner.
-            if Path::new(&shell).file_name().is_some_and(|name| name == "bash") {
+            if Path::new(&shell)
+                .file_name()
+                .is_some_and(|name| name == "bash")
+            {
                 match bash_session::acquire(
                     background_session_id.as_deref().ok_or_else(|| {
                         Error::tool("bash", "session shell scope was not resolved")
@@ -9061,12 +9070,16 @@ impl Tool for BashTool {
                     self.command_prefix.as_deref(),
                     &input.command,
                 )? {
-                    bash_session::Acquisition::Persistent(transaction) => shell_state = Some(transaction),
+                    bash_session::Acquisition::Persistent(transaction) => {
+                        shell_state = Some(transaction)
+                    }
                     bash_session::Acquisition::Temporary(notice) => shell_notice = Some(notice),
                 }
             }
         }
-        let execution_cwd = shell_state.as_ref().map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd);
+        let execution_cwd = shell_state
+            .as_ref()
+            .map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd);
         let mut mediation_warning = None;
 
         // Mediation gate (bd-cv653.1.7): classify before spawn against
@@ -9090,8 +9103,12 @@ impl Tool for BashTool {
                     let verdict = crate::bash_mediation::MediationVerdict::Allow { hits: vec![] };
                     let _ = verdict;
                 } else {
-                    let verdict =
-                        crate::bash_mediation::assess(&input.command, mediation, mode, execution_cwd);
+                    let verdict = crate::bash_mediation::assess(
+                        &input.command,
+                        mediation,
+                        mode,
+                        execution_cwd,
+                    );
                     match verdict {
                         crate::bash_mediation::MediationVerdict::Allow { hits } => {
                             if !hits.is_empty() {
@@ -9202,7 +9219,10 @@ impl Tool for BashTool {
                 )
                 .await?
         {
-            return Err(Error::tool("bash", "Command cancelled before the session shell could start"));
+            return Err(Error::tool(
+                "bash",
+                "Command cancelled before the session shell could start",
+            ));
         }
 
         if auto_background
@@ -9228,8 +9248,15 @@ impl Tool for BashTool {
         let result = execute_bash_spawn(
             execution_cwd,
             self.shell_path.as_deref(),
-            if shell_state.is_some() { None } else { self.command_prefix.as_deref() },
-            shell_state.as_ref().map_or(input.command.as_str(), bash_session::ShellTransaction::command),
+            if shell_state.is_some() {
+                None
+            } else {
+                self.command_prefix.as_deref()
+            },
+            shell_state.as_ref().map_or(
+                input.command.as_str(),
+                bash_session::ShellTransaction::command,
+            ),
             input.timeout,
             on_update.as_deref(),
             use_pty,
@@ -9248,11 +9275,12 @@ impl Tool for BashTool {
             shell_state.finish(!result.cancelled && result.exit_code >= 0 && owns_session);
         }
 
-        self.bash_result_output(tool_call_id, result)
-            .map(|output| Self::annotate_bash_mediation(
+        self.bash_result_output(tool_call_id, result).map(|output| {
+            Self::annotate_bash_mediation(
                 Self::annotate_shell_state(output, shell_notice),
                 &mediation_warning,
-            ))
+            )
+        })
     }
 }
 
@@ -9404,8 +9432,15 @@ impl Tool for JobsTool {
                                         "{}: {}{} (pid {}, exit {}, artifact {})",
                                         job["id"].as_str().unwrap_or("?"),
                                         job["status"].as_str().unwrap_or("?"),
-                                        if job.get("schema").and_then(serde_json::Value::as_str) == Some("pi.host_job.v1") {
-                                            format!(" [{}]", job.get("command").and_then(serde_json::Value::as_str).unwrap_or("native task"))
+                                        if job.get("schema").and_then(serde_json::Value::as_str)
+                                            == Some("pi.host_job.v1")
+                                        {
+                                            format!(
+                                                " [{}]",
+                                                job.get("command")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or("native task")
+                                            )
                                         } else {
                                             String::new()
                                         },
@@ -12526,10 +12561,11 @@ impl GrepTool {
             ));
         }
         if path.starts_with("http://") || path.starts_with("https://") {
-            let (url, mode) = path.strip_suffix(":raw").map_or(
-                (path, crate::url_read::UrlReadMode::Reader),
-                |url| (url, crate::url_read::UrlReadMode::Raw),
-            );
+            let (url, mode) = path
+                .strip_suffix(":raw")
+                .map_or((path, crate::url_read::UrlReadMode::Reader), |url| {
+                    (url, crate::url_read::UrlReadMode::Raw)
+                });
             let policy = if self.allow_private_urls {
                 crate::url_read::SsrfPolicy::AllowPrivateTargets
             } else {
@@ -12604,7 +12640,9 @@ impl GrepTool {
         if effective_limit > MAX_GREP_RESOURCE_MATCHES {
             return Err(Error::tool(
                 "grep",
-                format!("[GREP_RESOURCE_MATCH_LIMIT] Resource searches support at most {MAX_GREP_RESOURCE_MATCHES} matches; narrow the pattern or resource list"),
+                format!(
+                    "[GREP_RESOURCE_MATCH_LIMIT] Resource searches support at most {MAX_GREP_RESOURCE_MATCHES} matches; narrow the pattern or resource list"
+                ),
             ));
         }
         let pattern = if input.literal.unwrap_or(false) {
@@ -12640,7 +12678,9 @@ impl GrepTool {
                 ));
             }
             source_truncated |= resource.source_truncated;
-            let scan_limit = effective_limit.saturating_sub(match_count).saturating_add(1);
+            let scan_limit = effective_limit
+                .saturating_sub(match_count)
+                .saturating_add(1);
             let scan_matcher = Arc::clone(&matcher);
             let scan_owner = owner.clone();
             let (content, mut match_lines) = asupersync::runtime::spawn_blocking(move || {
@@ -13391,20 +13431,22 @@ impl Tool for GrepTool {
             }
             Err(_) => return self.effects(),
         };
-        paths.into_iter().fold(ToolEffects::read(), |effects, path| {
-            let scheme = path.split_once("://").map_or("", |(scheme, _)| scheme);
-            let resource_effects = match scheme {
-                "http" | "https" => ToolEffects::network(),
-                "pr" | "issue" | "ssh" => ToolEffects::process().union(ToolEffects::network()),
-                "conflict" => ToolEffects::process(),
-                "agent" if crate::agent_hub::ipc::inherited_channel_present() => {
-                    ToolEffects::network()
-                }
-                "agent" | "skill" | "prompt" | "local" => ToolEffects::read(),
-                _ => self.effects(),
-            };
-            effects.union(resource_effects)
-        })
+        paths
+            .into_iter()
+            .fold(ToolEffects::read(), |effects, path| {
+                let scheme = path.split_once("://").map_or("", |(scheme, _)| scheme);
+                let resource_effects = match scheme {
+                    "http" | "https" => ToolEffects::network(),
+                    "pr" | "issue" | "ssh" => ToolEffects::process().union(ToolEffects::network()),
+                    "conflict" => ToolEffects::process(),
+                    "agent" if crate::agent_hub::ipc::inherited_channel_present() => {
+                        ToolEffects::network()
+                    }
+                    "agent" | "skill" | "prompt" | "local" => ToolEffects::read(),
+                    _ => self.effects(),
+                };
+                effects.union(resource_effects)
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -13425,7 +13467,9 @@ impl Tool for GrepTool {
         }
 
         if let Some(paths) = grep_resource_paths(input.path.as_deref())? {
-            return self.execute_resource_grep(tool_call_id, &input, &paths).await;
+            return self
+                .execute_resource_grep(tool_call_id, &input, &paths)
+                .await;
         }
 
         if self.backend == SearchBackend::External && !rg_available() {
@@ -15921,7 +15965,10 @@ impl PtyProcessGuard {
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-        let status = self.child.as_mut().map_or(Ok(None), |child| child.try_wait())?;
+        let status = self
+            .child
+            .as_mut()
+            .map_or(Ok(None), |child| child.try_wait())?;
         if status.is_some() {
             self.retire_reaped_group();
             drop(self.shell_process.take());
@@ -20519,7 +20566,9 @@ mod tests {
                     .await
                     .expect_err("blocked images must not invoke a decoder");
                 assert!(
-                    error.to_string().contains("Images are blocked by configuration"),
+                    error
+                        .to_string()
+                        .contains("Images are blocked by configuration"),
                     "{error}"
                 );
             }
@@ -20564,7 +20613,12 @@ mod tests {
             let text = get_text(&output.content);
             assert!(text.contains("literal source"), "{text}");
             assert!(text.starts_with("1#"), "{text}");
-            assert!(output.content.iter().all(|part| matches!(part, ContentBlock::Text(_))));
+            assert!(
+                output
+                    .content
+                    .iter()
+                    .all(|part| matches!(part, ContentBlock::Text(_)))
+            );
         });
     }
 
@@ -22308,9 +22362,15 @@ mod tests {
             let prefix = format!("grep-agent-{}", uuid::Uuid::new_v4());
             let (accepted, pending, rejected) = {
                 let mut hub = crate::agent_hub::registry().lock().unwrap();
-                let accepted = hub.register(&format!("{prefix}-accepted"), "accepted fixture").unwrap();
-                let pending = hub.register(&format!("{prefix}-pending"), "pending fixture").unwrap();
-                let rejected = hub.register(&format!("{prefix}-rejected"), "cancelled fixture").unwrap();
+                let accepted = hub
+                    .register(&format!("{prefix}-accepted"), "accepted fixture")
+                    .unwrap();
+                let pending = hub
+                    .register(&format!("{prefix}-pending"), "pending fixture")
+                    .unwrap();
+                let rejected = hub
+                    .register(&format!("{prefix}-rejected"), "cancelled fixture")
+                    .unwrap();
                 hub.settle(&accepted.id, ChildStatus::Done);
                 hub.settle(&rejected.id, ChildStatus::Cancelled);
                 (
@@ -22335,10 +22395,20 @@ mod tests {
             );
             let tool = GrepTool::new(temp.path());
             let path = format!("agent://{}/findings/0/path", accepted.id);
-            let output = tool.execute("accepted-result", serde_json::json!({
-                "pattern":"src/needle.rs", "literal":true, "path":path,
-            }), None).await.unwrap();
-            assert_eq!(get_text(&output.content), format!("{path}:1: src/needle.rs"));
+            let output = tool
+                .execute(
+                    "accepted-result",
+                    serde_json::json!({
+                        "pattern":"src/needle.rs", "literal":true, "path":path,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                get_text(&output.content),
+                format!("{path}:1: src/needle.rs")
+            );
             for (entry, code) in [
                 (pending, "PI_URL_AGENT_OUTPUT_PENDING"),
                 (rejected, "PI_URL_AGENT_OUTPUT_REJECTED"),
@@ -22357,12 +22427,20 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let name = format!("grep-external-{}", uuid::Uuid::new_v4());
             crate::url_router::write_local(&name, "prefix\0is still text\nneedle\n").unwrap();
-            let output = GrepTool::with_backend(temp.path(), SearchBackend::External).execute(
-                "virtual-native", serde_json::json!({
-                    "pattern":"needle", "path":format!("local://{name}"),
-                }), None,
-            ).await.unwrap();
-            assert_eq!(get_text(&output.content), format!("local://{name}:2: needle"));
+            let output = GrepTool::with_backend(temp.path(), SearchBackend::External)
+                .execute(
+                    "virtual-native",
+                    serde_json::json!({
+                        "pattern":"needle", "path":format!("local://{name}"),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                get_text(&output.content),
+                format!("local://{name}:2: needle")
+            );
         });
     }
 
@@ -22373,11 +22451,16 @@ mod tests {
             let owner = AgentCx::for_request();
             owner.cx().set_cancel_requested(true);
             let tool = GrepTool::new(temp.path());
-            let error = owner.with_current(tool.execute(
-                "cancelled-resource", serde_json::json!({
-                    "pattern":"needle", "path":"local://must-not-resolve-after-cancel",
-                }), None,
-            )).await.unwrap_err();
+            let error = owner
+                .with_current(tool.execute(
+                    "cancelled-resource",
+                    serde_json::json!({
+                        "pattern":"needle", "path":"local://must-not-resolve-after-cancel",
+                    }),
+                    None,
+                ))
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("cancelled"), "{error}");
             assert!(!error.to_string().contains("PI_URL_UNRESOLVABLE"));
         });
@@ -22396,11 +22479,24 @@ mod tests {
             };
             assert!(owner.capabilities().io);
             assert!(!owner.capabilities().spawn);
-            for path in ["pr://1/diff", "issue://owner/repo/1", "ssh://must-not-connect/tmp/file", "conflict://*"] {
-                let error = owner.with_current(tool.execute(
-                    "spawn-denied", serde_json::json!({"pattern":"needle","path":path}), None,
-                )).await.unwrap_err();
-                assert!(error.to_string().contains("GREP_RESOURCE_PERMISSION"), "{path}: {error}");
+            for path in [
+                "pr://1/diff",
+                "issue://owner/repo/1",
+                "ssh://must-not-connect/tmp/file",
+                "conflict://*",
+            ] {
+                let error = owner
+                    .with_current(tool.execute(
+                        "spawn-denied",
+                        serde_json::json!({"pattern":"needle","path":path}),
+                        None,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("GREP_RESOURCE_PERMISSION"),
+                    "{path}: {error}"
+                );
             }
         });
     }
@@ -25100,26 +25196,25 @@ mod tests {
 
     #[test]
     fn hub_wait_dependency_result_explains_the_cycle_and_preserves_details() {
-        let result: crate::agent_hub::InboxWaitResult = serde_json::from_value(
-            serde_json::json!({
-                "id": "worker-1",
-                "status": "peerBlocked",
-                "messages": [],
-                "nextCursor": 17,
-                "hasMore": false,
-                "oldestCursor": 0,
-                "droppedThroughCursor": 0,
+        let result: crate::agent_hub::InboxWaitResult = serde_json::from_value(serde_json::json!({
+            "id": "worker-1",
+            "status": "peerBlocked",
+            "messages": [],
+            "nextCursor": 17,
+            "hasMore": false,
+            "oldestCursor": 0,
+            "droppedThroughCursor": 0,
+            "peerStatus": null,
+            "pendingReplies": [{
+                "peer": "parent",
+                "sentCursor": 17,
                 "peerStatus": null,
-                "pendingReplies": [{
-                    "peer": "parent",
-                    "sentCursor": 17,
-                    "peerStatus": null,
-                    "canReply": false,
-                    "blockedOnCaller": true
-                }],
-                "blockedPeers": ["parent"]
-            }),
-        ).unwrap();
+                "canReply": false,
+                "blockedOnCaller": true
+            }],
+            "blockedPeers": ["parent"]
+        }))
+        .unwrap();
         let (text, details) = HubTool::format_wait_reply(&result);
         assert!(text.contains("dependency cycle"));
         assert!(text.contains("waiting on your result"));

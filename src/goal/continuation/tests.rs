@@ -45,7 +45,9 @@ fn text_only_success_pauses_instead_of_treating_prose_as_progress() {
     let mut tracker = Tracker::new(4);
     tracker.observe(&AgentEvent::MessageEnd {
         message: Message::assistant(AssistantMessage {
-            content: vec![ContentBlock::Text(TextContent::new("Made progress; goal complete!"))],
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Made progress; goal complete!",
+            ))],
             ..AssistantMessage::default()
         }),
     });
@@ -127,7 +129,10 @@ fn either_error_flag_excludes_an_operation_from_successful_progress() {
         let mut tracker = Tracker::new(3);
         tracker.observe(&start("a", "read", json!({"path":"missing"})));
         let mut event = end("a", "read", "different error each time");
-        if let AgentEvent::ToolExecutionEnd { result, is_error, .. } = &mut event {
+        if let AgentEvent::ToolExecutionEnd {
+            result, is_error, ..
+        } = &mut event
+        {
             *is_error = event_flag;
             result.is_error = !event_flag;
         }
@@ -159,7 +164,8 @@ fn changed_image_bytes_are_new_output_but_stable_bytes_repeat() {
         let mut event = end(id, "read", "");
         if let AgentEvent::ToolExecutionEnd { result, .. } = &mut event {
             result.content = vec![ContentBlock::Image(ImageContent {
-                data: data.into(), mime_type: "image/png".into(),
+                data: data.into(),
+                mime_type: "image/png".into(),
             })];
         }
         tracker.observe(&event);
@@ -177,13 +183,19 @@ fn missing_mismatched_duplicate_or_unfinished_events_fail_closed() {
         vec![end("unknown", "read", "A")],
         vec![start("a", "read", json!({})), end("a", "write", "A")],
         vec![start("a", "read", json!({})), start("a", "read", json!({}))],
-        vec![start("a", "read", json!({})), end("a", "read", "A"), end("a", "read", "A")],
+        vec![
+            start("a", "read", json!({})),
+            end("a", "read", "A"),
+            end("a", "read", "A"),
+        ],
         vec![start("a", "read", json!({}))],
     ];
     for events in cases {
         let mut tracker = Tracker::new(3);
         operation(&mut tracker, "valid", "a", "A");
-        for event in events { tracker.observe(&event); }
+        for event in events {
+            tracker.observe(&event);
+        }
         paused(tracker.decide(), "GOAL_PROGRESS_UNCERTAIN");
     }
 }
@@ -221,7 +233,10 @@ fn byte_and_json_node_admission_boundaries_are_inclusive() {
     part(&mut digest, &mut budget, b"a").unwrap();
     assert_eq!(budget.bytes, 0);
     assert!(part(&mut digest, &mut budget, b"").is_err());
-    let mut budget = Budget { bytes: 100, nodes: 1 };
+    let mut budget = Budget {
+        bytes: 100,
+        nodes: 1,
+    };
     json(&mut digest, &mut budget, &Value::Null, 0).unwrap();
     assert!(json(&mut digest, &mut budget, &Value::Null, 0).is_err());
 }
@@ -229,7 +244,9 @@ fn byte_and_json_node_admission_boundaries_are_inclusive() {
 #[test]
 fn nested_and_wide_arguments_stop_at_fixed_depth_and_node_limits() {
     let mut value = Value::Null;
-    for _ in 0..MAX_DEPTH { value = Value::Array(vec![value]); }
+    for _ in 0..MAX_DEPTH {
+        value = Value::Array(vec![value]);
+    }
     let mut digest = Sha256::new();
     json(&mut digest, &mut Budget::default(), &value, 0).unwrap();
     let too_deep = Value::Array(vec![value]);
@@ -242,7 +259,11 @@ fn nested_and_wide_arguments_stop_at_fixed_depth_and_node_limits() {
 fn a_partial_fingerprint_cannot_authorize_continuation() {
     let mut tracker = Tracker::new(3);
     operation(&mut tracker, "good", "a", "A");
-    tracker.observe(&start("large", "read", json!({"path":"x".repeat(MAX_BYTES)})));
+    tracker.observe(&start(
+        "large",
+        "read",
+        json!({"path":"x".repeat(MAX_BYTES)}),
+    ));
     tracker.observe(&end("large", "read", "later valid-looking output"));
     paused(tracker.decide(), "GOAL_PROGRESS_UNCERTAIN");
 }

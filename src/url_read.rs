@@ -128,7 +128,10 @@ pub fn convert_bytes(
         UrlContentKind::Pdf => (convert_pdf(bytes)?, "pdf"),
         UrlContentKind::Notebook => {
             if download_truncated {
-                return Err(Error::tool("read", "[NOTEBOOK_INCOMPLETE] cannot interpret a truncated notebook"));
+                return Err(Error::tool(
+                    "read",
+                    "[NOTEBOOK_INCOMPLETE] cannot interpret a truncated notebook",
+                ));
             }
             (convert_notebook(bytes)?, "notebook")
         }
@@ -345,7 +348,11 @@ mod tests {
             UrlContentKind::PlainText
         );
         assert_eq!(
-            classify("https://x/REPORT.DOCX?download=1", "application/octet-stream", b"PK"),
+            classify(
+                "https://x/REPORT.DOCX?download=1",
+                "application/octet-stream",
+                b"PK"
+            ),
             UrlContentKind::Docx
         );
         assert_eq!(
@@ -357,7 +364,11 @@ mod tests {
             UrlContentKind::Pptx
         );
         assert_eq!(
-            classify("https://x/BOOK.XLSX?download=1", "application/octet-stream", b"PK"),
+            classify(
+                "https://x/BOOK.XLSX?download=1",
+                "application/octet-stream",
+                b"PK"
+            ),
             UrlContentKind::Xlsx
         );
         assert_eq!(

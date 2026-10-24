@@ -15,7 +15,8 @@ use std::time::Duration;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge_batch_drain";
 const CURSOR_SCHEMA: &str = "pi.eval.batch-cursor.v1";
-const INPUT: &str = "EVAL_BATCH_INPUT: expected jobId, optional cursor and timeoutMs from 0 through 600000";
+const INPUT: &str =
+    "EVAL_BATCH_INPUT: expected jobId, optional cursor and timeoutMs from 0 through 600000";
 const PROTOCOL: &str = "EVAL_BATCH_PROTOCOL: invalid or incompatible native batch observation";
 const CURSOR: &str = "EVAL_BATCH_CURSOR: cursor does not match this batch's retained evidence";
 const HOST: &str = "EVAL_BATCH_HOST: current jobs lookup was refused";
@@ -33,40 +34,72 @@ struct Request {
 impl Request {
     fn parse(input: &Value) -> Result<Self> {
         let fields = input.as_object().ok_or(INPUT)?;
-        if fields.keys().any(|key| !matches!(key.as_str(), "jobId" | "cursor" | "timeoutMs")) {
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "jobId" | "cursor" | "timeoutMs"))
+        {
             return Err(INPUT.into());
         }
-        let id = fields.get("jobId").and_then(Value::as_str).filter(|id| {
-            !id.is_empty() && id.len() <= 128
-                && !id.chars().any(|c| c.is_whitespace() || c.is_control())
-        }).ok_or(INPUT)?;
+        let id = fields
+            .get("jobId")
+            .and_then(Value::as_str)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && !id.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+            .ok_or(INPUT)?;
         let timeout = match fields.get("timeoutMs") {
             None => 30_000,
-            Some(value) => value.as_u64().filter(|value| *value <= 600_000).ok_or(INPUT)?,
+            Some(value) => value
+                .as_u64()
+                .filter(|value| *value <= 600_000)
+                .ok_or(INPUT)?,
         };
         let mut seen = 0_u16;
         let mut manifest = None;
         if let Some(cursor) = fields.get("cursor").filter(|cursor| !cursor.is_null()) {
-            let cursor = cursor.as_object().filter(|cursor| cursor.len() == 4).ok_or(CURSOR)?;
+            let cursor = cursor
+                .as_object()
+                .filter(|cursor| cursor.len() == 4)
+                .ok_or(CURSOR)?;
             if cursor.get("schema").and_then(Value::as_str) != Some(CURSOR_SCHEMA)
                 || cursor.get("jobId").and_then(Value::as_str) != Some(id)
-            { return Err(CURSOR.into()); }
-            let indices = cursor.get("seen").and_then(Value::as_array)
-                .filter(|indices| indices.len() <= 16).ok_or(CURSOR)?;
+            {
+                return Err(CURSOR.into());
+            }
+            let indices = cursor
+                .get("seen")
+                .and_then(Value::as_array)
+                .filter(|indices| indices.len() <= 16)
+                .ok_or(CURSOR)?;
             for index in indices {
                 let index = index.as_u64().filter(|index| *index < 16).ok_or(CURSOR)?;
                 let bit = 1_u16 << index;
-                if seen & bit != 0 { return Err(CURSOR.into()); }
+                if seen & bit != 0 {
+                    return Err(CURSOR.into());
+                }
                 seen |= bit;
             }
             manifest = match cursor.get("manifest") {
                 Some(Value::Null) if seen == 0 => None,
-                Some(Value::String(value)) if value.len() == 64
-                    && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => Some(value.clone()),
+                Some(Value::String(value))
+                    if value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+                {
+                    Some(value.clone())
+                }
                 _ => return Err(CURSOR.into()),
             };
         }
-        Ok(Self { id: id.to_owned(), seen, manifest, timeout: Duration::from_millis(timeout) })
+        Ok(Self {
+            id: id.to_owned(),
+            seen,
+            manifest,
+            timeout: Duration::from_millis(timeout),
+        })
     }
 }
 
@@ -75,8 +108,12 @@ fn record(value: &Value) -> Result<&serde_json::Map<String, Value>> {
 }
 
 fn count(value: &Value, name: &str) -> Result<usize> {
-    value.get(name).and_then(Value::as_u64).filter(|value| *value <= 16)
-        .and_then(|value| usize::try_from(value).ok()).ok_or_else(|| PROTOCOL.into())
+    value
+        .get(name)
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= 16)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| PROTOCOL.into())
 }
 
 fn error_flag(value: &Value) -> Result<bool> {
@@ -137,34 +174,71 @@ struct Reply<'a> {
 
 impl<'a> Observation<'a> {
     fn parse(job: &'a Value, request: &Request) -> Result<Self> {
-        if job["schema"] != "pi.host_job.v1" || job["id"] != request.id
+        if job["schema"] != "pi.host_job.v1"
+            || job["id"] != request.id
             || job["command"] != "eval judgment_batch"
-        { return Err(PROTOCOL.into()); }
-        let status = job.get("status").and_then(Value::as_str).filter(|status| {
-            matches!(*status, "running" | "exited" | "failed" | "killed" | "timedOut")
-        }).ok_or(PROTOCOL)?;
-        let empty = Self { status, items: None, progress: false, mask: 0, manifest: None };
+        {
+            return Err(PROTOCOL.into());
+        }
+        let status = job
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| {
+                matches!(
+                    *status,
+                    "running" | "exited" | "failed" | "killed" | "timedOut"
+                )
+            })
+            .ok_or(PROTOCOL)?;
+        let empty = Self {
+            status,
+            items: None,
+            progress: false,
+            mask: 0,
+            manifest: None,
+        };
         let Some(result) = job.get("result").filter(|result| !result.is_null()) else {
-            return if status == "running" { Ok(empty) } else { Err(PROTOCOL.into()) };
+            return if status == "running" {
+                Ok(empty)
+            } else {
+                Err(PROTOCOL.into())
+            };
         };
         let failed = error_flag(result)?;
-        if (status == "running" || status == "exited") == failed { return Err(PROTOCOL.into()); }
+        if (status == "running" || status == "exited") == failed {
+            return Err(PROTOCOL.into());
+        }
         let details = &result["details"];
         if details.is_null() {
-            return if failed { Ok(empty) } else { Err(PROTOCOL.into()) };
+            return if failed {
+                Ok(empty)
+            } else {
+                Err(PROTOCOL.into())
+            };
         }
-        let schema = details.get("schema").and_then(Value::as_str).ok_or(PROTOCOL)?;
+        let schema = details
+            .get("schema")
+            .and_then(Value::as_str)
+            .ok_or(PROTOCOL)?;
         let (payload, receipts, progress) = match schema {
             "pi.host_job.progress.v1" | "pi.host_job.interrupted.v1" => {
                 if (schema == "pi.host_job.progress.v1" && status != "running")
-                    || (schema == "pi.host_job.interrupted.v1" && !matches!(status, "killed" | "timedOut"))
-                { return Err(PROTOCOL.into()); }
+                    || (schema == "pi.host_job.interrupted.v1"
+                        && !matches!(status, "killed" | "timedOut"))
+                {
+                    return Err(PROTOCOL.into());
+                }
                 let partial = &details["partialResult"];
-                if error_flag(partial)? { return Err(PROTOCOL.into()); }
+                if error_flag(partial)? {
+                    return Err(PROTOCOL.into());
+                }
                 let payload = &partial["details"];
                 if payload["schema"] != "pi.eval.model-job.progress.v1"
-                    || payload["operation"] != "judgment_batch" || payload["complete"] != false
-                { return Err(PROTOCOL.into()); }
+                    || payload["operation"] != "judgment_batch"
+                    || payload["complete"] != false
+                {
+                    return Err(PROTOCOL.into());
+                }
                 (payload, &payload["judgments"], true)
             }
             "pi.eval.model-job.result.v1" if status != "running" => {
@@ -175,16 +249,23 @@ impl<'a> Observation<'a> {
                 if payload.is_null() {
                     return if failed && details["error"].as_str().is_some_and(|s| !s.is_empty()) {
                         Ok(empty)
-                    } else { Err(PROTOCOL.into()) };
+                    } else {
+                        Err(PROTOCOL.into())
+                    };
                 }
-                if payload["schema"] != "pi.eval.judgment-batch.v1" { return Err(PROTOCOL.into()); }
+                if payload["schema"] != "pi.eval.judgment-batch.v1" {
+                    return Err(PROTOCOL.into());
+                }
                 (payload, &details["judgments"], false)
             }
             _ => return Err(PROTOCOL.into()),
         };
         let total = count(payload, "total")?;
-        let items = payload.get("items").and_then(Value::as_array)
-            .filter(|items| total > 0 && items.len() == total).ok_or(PROTOCOL)?;
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .filter(|items| total > 0 && items.len() == total)
+            .ok_or(PROTOCOL)?;
         let (retries, min_ok) = if ["retries", "minOk", "meetsMinimum"]
             .iter()
             .any(|name| payload.get(name).is_some())
@@ -202,55 +283,87 @@ impl<'a> Observation<'a> {
             (0, total)
         };
         if receipts["schema"] != "pi.eval.judgments.v1"
-            || !receipts["attempts"].as_array().is_some_and(|items|
+            || !receipts["attempts"].as_array().is_some_and(|items| {
                 (total..=16.min(total * (retries + 1))).contains(&items.len())
-                    && items.iter().all(Value::is_object))
-        { return Err(PROTOCOL.into()); }
+                    && items.iter().all(Value::is_object)
+            })
+        {
+            return Err(PROTOCOL.into());
+        }
         let mut mask = 0_u16;
         let mut counts = [0_usize; 4]; // queued, running, completed, failed
         let mut keys = Vec::with_capacity(total);
         for (index, item) in items.iter().enumerate() {
             record(item)?;
             let key = item.get("key").ok_or(PROTOCOL)?;
-            if !(key.as_str().is_some_and(|key| !key.is_empty() && key.len() <= 128)
-                || key.as_u64() == u64::try_from(index).ok()) || keys.contains(&key)
-                || keys.first().is_some_and(|first: &&Value| first.is_string() != key.is_string())
-            { return Err(PROTOCOL.into()); }
+            if !(key
+                .as_str()
+                .is_some_and(|key| !key.is_empty() && key.len() <= 128)
+                || key.as_u64() == u64::try_from(index).ok())
+                || keys.contains(&key)
+                || keys
+                    .first()
+                    .is_some_and(|first: &&Value| first.is_string() != key.is_string())
+            {
+                return Err(PROTOCOL.into());
+            }
             keys.push(key);
             let state = if progress {
                 match item["status"].as_str() {
-                    Some("queued") => 0, Some("running") => 1,
-                    Some("completed") => 2, Some("failed") => 3,
+                    Some("queued") => 0,
+                    Some("running") => 1,
+                    Some("completed") => 2,
+                    Some("failed") => 3,
                     _ => return Err(PROTOCOL.into()),
                 }
             } else {
-                match item["ok"].as_bool() { Some(true) => 2, Some(false) => 3, _ => return Err(PROTOCOL.into()) }
+                match item["ok"].as_bool() {
+                    Some(true) => 2,
+                    Some(false) => 3,
+                    _ => return Err(PROTOCOL.into()),
+                }
             };
             counts[state] += 1;
             match state {
                 2 => {
-                    if item.get("error").is_some() || item["verdict"]["schema"] != "pi.judgment.v1"
-                        || !item["verdict"]["answers"].as_object().is_some_and(|answers| !answers.is_empty())
-                    { return Err(PROTOCOL.into()); }
-                }
-                3 => {
-                    if item.get("verdict").is_some() || !item["error"].as_str().is_some_and(|text| !text.is_empty()) {
+                    if item.get("error").is_some()
+                        || item["verdict"]["schema"] != "pi.judgment.v1"
+                        || !item["verdict"]["answers"]
+                            .as_object()
+                            .is_some_and(|answers| !answers.is_empty())
+                    {
                         return Err(PROTOCOL.into());
                     }
                 }
-                _ if item.get("verdict").is_some() || item.get("error").is_some() => return Err(PROTOCOL.into()),
+                3 => {
+                    if item.get("verdict").is_some()
+                        || !item["error"].as_str().is_some_and(|text| !text.is_empty())
+                    {
+                        return Err(PROTOCOL.into());
+                    }
+                }
+                _ if item.get("verdict").is_some() || item.get("error").is_some() => {
+                    return Err(PROTOCOL.into());
+                }
                 _ => {}
             }
-            if state >= 2 { mask |= 1_u16 << index; }
+            if state >= 2 {
+                mask |= 1_u16 << index;
+            }
         }
         if count(payload, "succeeded")? != counts[2] || count(payload, "failed")? != counts[3] {
             return Err(PROTOCOL.into());
         }
         if progress {
-            if count(payload, "queued")? != counts[0] || count(payload, "running")? != counts[1]
+            if count(payload, "queued")? != counts[0]
+                || count(payload, "running")? != counts[1]
                 || count(payload, "completed")? != counts[2] + counts[3]
-            { return Err(PROTOCOL.into()); }
-        } else if payload["allOk"].as_bool() != Some(counts[3] == 0) || failed != (counts[2] < min_ok) {
+            {
+                return Err(PROTOCOL.into());
+            }
+        } else if payload["allOk"].as_bool() != Some(counts[3] == 0)
+            || failed != (counts[2] < min_ok)
+        {
             return Err(PROTOCOL.into());
         }
         // Identical literal keys and order are required across observations,
@@ -258,10 +371,21 @@ impl<'a> Observation<'a> {
         let manifest = crate::package_manager::hex_encode(&Sha256::digest(
             serde_json::to_vec(&keys).map_err(|_| PROTOCOL)?,
         ));
-        if request.seen & !mask != 0 || request.manifest.as_ref().is_some_and(|previous| previous != &manifest) {
+        if request.seen & !mask != 0
+            || request
+                .manifest
+                .as_ref()
+                .is_some_and(|previous| previous != &manifest)
+        {
             return Err(CURSOR.into());
         }
-        Ok(Self { status, items: Some(items), progress, mask, manifest: Some(manifest) })
+        Ok(Self {
+            status,
+            items: Some(items),
+            progress,
+            mask,
+            manifest: Some(manifest),
+        })
     }
 
     fn ready(&self, request: &Request) -> bool {
@@ -273,10 +397,18 @@ impl<'a> Observation<'a> {
         let mut delta = Vec::new();
         for (index, item) in self.items.into_iter().flatten().enumerate() {
             let bit = 1_u16 << index;
-            if self.mask & bit == 0 || request.seen & bit != 0 { continue; }
-            let ok = if self.progress { item["status"] == "completed" } else { item["ok"] == true };
+            if self.mask & bit == 0 || request.seen & bit != 0 {
+                continue;
+            }
+            let ok = if self.progress {
+                item["status"] == "completed"
+            } else {
+                item["ok"] == true
+            };
             delta.push(Item {
-                index, key: &item["key"], ok,
+                index,
+                key: &item["key"],
+                ok,
                 verdict: ok.then_some(&item["verdict"]),
                 error: (!ok).then_some(&item["error"]),
             });
@@ -285,18 +417,28 @@ impl<'a> Observation<'a> {
         // Borrow accepted bodies until the bounded encoder finishes. An
         // oversized custom host result cannot force a second unbounded copy.
         let value = Reply {
-            schema: "pi.eval.batch-drain.v1", job_id: &request.id, job_status: self.status,
-            done: self.status != "running", job_failed: !matches!(self.status, "running" | "exited"),
-            complete: self.items.is_some() && !self.progress, evidence_available: self.items.is_some(),
-            total: self.items.map(|items| items.len()), settled: self.items.map(|_| self.mask.count_ones()),
-            items: delta, cursor: Cursor {
-                schema: CURSOR_SCHEMA, job_id: &request.id,
+            schema: "pi.eval.batch-drain.v1",
+            job_id: &request.id,
+            job_status: self.status,
+            done: self.status != "running",
+            job_failed: !matches!(self.status, "running" | "exited"),
+            complete: self.items.is_some() && !self.progress,
+            evidence_available: self.items.is_some(),
+            total: self.items.map(|items| items.len()),
+            settled: self.items.map(|_| self.mask.count_ones()),
+            items: delta,
+            cursor: Cursor {
+                schema: CURSOR_SCHEMA,
+                job_id: &request.id,
                 manifest: self.manifest.as_deref().or(request.manifest.as_deref()),
-                seen: (0..16).filter(|index| next & (1_u16 << index) != 0).collect(),
+                seen: (0..16)
+                    .filter(|index| next & (1_u16 << index) != 0)
+                    .collect(),
             },
         };
         let mut encoded = Bounded(Vec::new());
-        serde_json::to_writer(&mut encoded, &value).map_err(|_| "EVAL_BATCH_LIMIT: drain exceeds 1 MiB; cursor unchanged")?;
+        serde_json::to_writer(&mut encoded, &value)
+            .map_err(|_| "EVAL_BATCH_LIMIT: drain exceeds 1 MiB; cursor unchanged")?;
         String::from_utf8(encoded.0).map_err(|_| PROTOCOL.into())
     }
 }
@@ -310,19 +452,31 @@ impl Write for Bounded {
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // Unprojected native snapshots are ONLY wake-up hints. Never return their
 // values, identifiers or diagnostics to the guest. A current host lookup is
 // mandatory before constructing a response after waiting.
 fn ready_hint(snapshot: &crate::jobs::JobSnapshot, seen: u16) -> bool {
-    if snapshot.status != "running" { return true; }
-    let items = snapshot.result.as_ref().and_then(|result| result.details.as_ref())
-        .and_then(|details| details.pointer("/partialResult/details/items")).and_then(Value::as_array);
-    items.is_some_and(|items| items.len() > 16 || items.iter().enumerate().any(|(index, item)| {
-        seen & (1_u16 << index) == 0 && matches!(item["status"].as_str(), Some("completed" | "failed"))
-    }))
+    if snapshot.status != "running" {
+        return true;
+    }
+    let items = snapshot
+        .result
+        .as_ref()
+        .and_then(|result| result.details.as_ref())
+        .and_then(|details| details.pointer("/partialResult/details/items"))
+        .and_then(Value::as_array);
+    items.is_some_and(|items| {
+        items.len() > 16
+            || items.iter().enumerate().any(|(index, item)| {
+                seen & (1_u16 << index) == 0
+                    && matches!(item["status"].as_str(), Some("completed" | "failed"))
+            })
+    })
 }
 
 impl Invocation<'_> {
@@ -332,39 +486,79 @@ impl Invocation<'_> {
         let session = self.host_session.clone().ok_or(HOST)?;
         let owner = AgentCx::for_current_or_request();
         owner.checkpoint().map_err(|_| "EVAL_BATCH_CANCELLED")?;
-        if !owner.capabilities().io || !owner.capabilities().time { return Err(HOST.into()); }
+        if !owner.capabilities().io || !owner.capabilities().time {
+            return Err(HOST.into());
+        }
         let timeout = request.timeout;
         if !timeout.is_zero() && self.tool_receipts.len() > super::MAX_TOOL_CALLS - 2 {
-            return Err("EVAL_BRIDGE_LIMIT: a blocking batch drain requires room for two host lookups".into());
+            return Err(
+                "EVAL_BRIDGE_LIMIT: a blocking batch drain requires room for two host lookups"
+                    .into(),
+            );
         }
         let read = async {
-            tool.require_eval_session(&session).await.map_err(|_| HOST)?;
-            let initial = self.call_host_output(host, "jobs".into(), json!({
-                "action":"wait", "jobId":request.id, "timeoutMs":0,
-            })).await.map_err(|_| HOST)?;
-            if initial.is_error { return Err(HOST.into()); }
+            tool.require_eval_session(&session)
+                .await
+                .map_err(|_| HOST)?;
+            let initial = self
+                .call_host_output(
+                    host,
+                    "jobs".into(),
+                    json!({
+                        "action":"wait", "jobId":request.id, "timeoutMs":0,
+                    }),
+                )
+                .await
+                .map_err(|_| HOST)?;
+            if initial.is_error {
+                return Err(HOST.into());
+            }
             owner.checkpoint().map_err(|_| "EVAL_BATCH_CANCELLED")?;
-            tool.require_eval_session(&session).await.map_err(|_| HOST)?;
+            tool.require_eval_session(&session)
+                .await
+                .map_err(|_| HOST)?;
             let job = initial.details.as_ref().ok_or(PROTOCOL)?;
             let observed = Observation::parse(job, &request)?;
-            if timeout.is_zero() || observed.ready(&request) { return observed.reply(&request); }
+            if timeout.is_zero() || observed.ready(&request) {
+                return observed.reply(&request);
+            }
             loop {
                 owner.checkpoint().map_err(|_| "EVAL_BATCH_CANCELLED")?;
-                tool.require_eval_session(&session).await.map_err(|_| HOST)?;
-                let native = crate::jobs::wait_async(&session, &request.id, POLL_INTERVAL).await
+                tool.require_eval_session(&session)
+                    .await
+                    .map_err(|_| HOST)?;
+                let native = crate::jobs::wait_async(&session, &request.id, POLL_INTERVAL)
+                    .await
                     .map_err(|_| "EVAL_BATCH_UNAVAILABLE: native job is no longer available")?;
-                if ready_hint(&native, request.seen) { break; }
+                if ready_hint(&native, request.seen) {
+                    break;
+                }
             }
-            tool.require_eval_session(&session).await.map_err(|_| HOST)?;
-            let current = self.call_host_output(host, "jobs".into(), json!({
-                "action":"wait", "jobId":request.id, "timeoutMs":0,
-            })).await.map_err(|_| HOST)?;
-            if current.is_error { return Err(HOST.into()); }
+            tool.require_eval_session(&session)
+                .await
+                .map_err(|_| HOST)?;
+            let current = self
+                .call_host_output(
+                    host,
+                    "jobs".into(),
+                    json!({
+                        "action":"wait", "jobId":request.id, "timeoutMs":0,
+                    }),
+                )
+                .await
+                .map_err(|_| HOST)?;
+            if current.is_error {
+                return Err(HOST.into());
+            }
             owner.checkpoint().map_err(|_| "EVAL_BATCH_CANCELLED")?;
-            tool.require_eval_session(&session).await.map_err(|_| HOST)?;
+            tool.require_eval_session(&session)
+                .await
+                .map_err(|_| HOST)?;
             Observation::parse(current.details.as_ref().ok_or(PROTOCOL)?, &request)?.reply(&request)
         };
-        if timeout.is_zero() { return owner.with_current(read).await; }
+        if timeout.is_zero() {
+            return owner.with_current(read).await;
+        }
         owner.with_current(crate::text_completion::with_timeout(timeout, read)).await.map_err(|stop| match stop {
             crate::text_completion::RequestStop::TimedOut => "EVAL_BATCH_TIMEOUT: no drain delivered; retain the cursor; the model job is not cancelled".to_owned(),
             crate::text_completion::RequestStop::Cancelled => "EVAL_BATCH_CANCELLED: cursor unchanged".to_owned(),

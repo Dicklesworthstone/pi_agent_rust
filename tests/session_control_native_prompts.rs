@@ -36,8 +36,12 @@ struct Peer {
 }
 
 fn read_request(stream: &TcpStream) -> Value {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut header_bytes = 0;
     let mut length = None;
@@ -238,10 +242,16 @@ fn native_prompt_preserves_order_and_media_in_session_with_normal_wire_degradati
     assert_eq!(requests.len(), 1);
     let content = first_user(&requests[0]).as_array().unwrap();
     assert_eq!(content[0], json!({"type":"text", "text":"  inspect\n"}));
-    assert_eq!(content[1], json!({
-        "type":"image_url", "image_url":{"url":"data:image/png;base64,YQ=="}
-    }));
-    assert_eq!(content[2], json!({"type":"text", "text":"\ntrailing context  "}));
+    assert_eq!(
+        content[1],
+        json!({
+            "type":"image_url", "image_url":{"url":"data:image/png;base64,YQ=="}
+        })
+    );
+    assert_eq!(
+        content[2],
+        json!({"type":"text", "text":"\ntrailing context  "})
+    );
     let wire = requests[0].to_string();
     assert!(wire.contains("clip.wav") && wire.contains("clip.mp4"));
     assert!(!wire.contains("YXVkaW8=") && !wire.contains("dmlkZW8="));
@@ -258,13 +268,16 @@ fn native_callback_steers_and_follows_up_without_replaying_the_tool() {
     let observed = Arc::clone(&tool_calls);
     runtime.block_on(async {
         let turn = session
-            .prompt_with_content_with_control(native_input("read note.txt"), move |control, event| {
-                if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                    assert_eq!(observed.fetch_add(1, Ordering::SeqCst), 0);
-                    control.steer("focus on constraints").unwrap();
-                    control.follow_up("then explain tradeoffs").unwrap();
-                }
-            })
+            .prompt_with_content_with_control(
+                native_input("read note.txt"),
+                move |control, event| {
+                    if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                        assert_eq!(observed.fetch_add(1, Ordering::SeqCst), 0);
+                        control.steer("focus on constraints").unwrap();
+                        control.follow_up("then explain tradeoffs").unwrap();
+                    }
+                },
+            )
             .unwrap();
         let control = turn.control();
         assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
@@ -291,7 +304,9 @@ fn unused_and_precancelled_native_turns_preserve_pending_input_without_dispatch(
     let mut session = peer.handle(temp.path(), true).into_controllable();
     runtime.block_on(async {
         for cancel in [false, true] {
-            let turn = session.prompt_with_content(native_input("never sent"), |_| {}).unwrap();
+            let turn = session
+                .prompt_with_content(native_input("never sent"), |_| {})
+                .unwrap();
             let control = turn.control();
             let id = control.follow_up("recover only this input").unwrap();
             if cancel {
@@ -307,10 +322,18 @@ fn unused_and_precancelled_native_turns_preserve_pending_input_without_dispatch(
             assert!(stored_users(&mut session).await.is_empty());
         }
         assert_eq!(
-            session.prompt("ordinary text".to_string(), |_| {}).unwrap().await.unwrap().stop_reason,
+            session
+                .prompt("ordinary text".to_string(), |_| {})
+                .unwrap()
+                .await
+                .unwrap()
+                .stop_reason,
             StopReason::Stop
         );
-        assert_eq!(stored_users(&mut session).await, vec![json!("ordinary text")]);
+        assert_eq!(
+            stored_users(&mut session).await,
+            vec![json!("ordinary text")]
+        );
     });
     let requests = peer.requests();
     assert_eq!(requests.len(), 1);
@@ -327,10 +350,13 @@ fn invalid_native_prompt_retires_control_and_does_not_poison_the_next_turn() {
     let mut session = peer.handle(temp.path(), true).into_controllable();
     runtime.block_on(async {
         let turn = session
-            .prompt_with_content(vec![ContentBlock::Thinking(ThinkingContent {
-                thinking: "assistant-only input".to_string(),
-                thinking_signature: None,
-            })], |_| {})
+            .prompt_with_content(
+                vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "assistant-only input".to_string(),
+                    thinking_signature: None,
+                })],
+                |_| {},
+            )
             .unwrap();
         let control = turn.control();
         let id = control.follow_up("still recoverable").unwrap();
@@ -339,7 +365,12 @@ fn invalid_native_prompt_retires_control_and_does_not_poison_the_next_turn() {
         assert_eq!(control.take_pending()[0].id, id);
         assert!(stored_users(&mut session).await.is_empty());
         assert_eq!(
-            session.prompt_with_content(native_input("valid"), |_| {}).unwrap().await.unwrap().stop_reason,
+            session
+                .prompt_with_content(native_input("valid"), |_| {})
+                .unwrap()
+                .await
+                .unwrap()
+                .stop_reason,
             StopReason::Stop
         );
     });
@@ -357,11 +388,15 @@ fn native_turn_after_handle_replacement_uses_only_the_new_session_and_control_la
     let second = Peer::new(false);
     let mut session = first.handle(temp.path(), true).into_controllable();
     runtime.block_on(async {
-        let turn = session.prompt_with_content(native_input("old session"), |_| {}).unwrap();
+        let turn = session
+            .prompt_with_content(native_input("old session"), |_| {})
+            .unwrap();
         let old = turn.control();
         assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
         let previous = std::mem::replace(session.session_mut(), second.handle(temp.path(), true));
-        let turn = session.prompt_with_content(native_input("new session"), |_| {}).unwrap();
+        let turn = session
+            .prompt_with_content(native_input("new session"), |_| {})
+            .unwrap();
         let current = turn.control();
         current.follow_up("new follow-up").unwrap();
         assert!(!old.abort());
@@ -371,7 +406,10 @@ fn native_turn_after_handle_replacement_uses_only_the_new_session_and_control_la
         assert!(current.snapshot().finished);
         let users = stored_users(&mut session).await;
         assert_eq!(users.len(), 2);
-        assert_eq!(users[0], serde_json::to_value(native_input("new session")).unwrap());
+        assert_eq!(
+            users[0],
+            serde_json::to_value(native_input("new session")).unwrap()
+        );
         assert_eq!(users[1], json!("new follow-up"));
         drop(previous);
     });

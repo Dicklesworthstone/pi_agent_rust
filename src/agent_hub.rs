@@ -241,10 +241,7 @@ impl AgentHubRegistry {
                 // Do not silently recreate a vanished namespace or adopt a
                 // symlink: older children still reference its original files.
                 let metadata = fs::symlink_metadata(dir).map_err(|error| {
-                    Error::tool(
-                        "hub",
-                        format!("inspect hub dir {}: {error}", dir.display()),
-                    )
+                    Error::tool("hub", format!("inspect hub dir {}: {error}", dir.display()))
                 })?;
                 if !metadata.file_type().is_dir() {
                     return Err(Error::tool(
@@ -1312,7 +1309,8 @@ mod tests {
         let dir = reg.dir_in(temp.path()).unwrap();
         let child = reg.register("worker", "task").unwrap();
         reg.append_transcript(&child.id, "private transcript");
-        reg.steer(&child.id, "parent", "private instruction").unwrap();
+        reg.steer(&child.id, "parent", "private instruction")
+            .unwrap();
         for path in [
             dir,
             child.transcript_path,

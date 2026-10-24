@@ -1682,10 +1682,7 @@ impl PrintMcpCommand {
 
 /// Read original argv before files or prompt resources can supply text. One
 /// quoted argument preserves exact names, including internal whitespace.
-fn print_mcp_command(
-    cli: &cli::Cli,
-    piped_stdin: Option<&str>,
-) -> Result<Option<PrintMcpCommand>> {
+fn print_mcp_command(cli: &cli::Cli, piped_stdin: Option<&str>) -> Result<Option<PrintMcpCommand>> {
     let print_mode = cli
         .mode
         .as_deref()
@@ -1696,8 +1693,7 @@ fn print_mcp_command(
     let messages = cli.message_args();
     let candidate = messages.iter().find_map(|text| {
         let rest = text.trim().strip_prefix("/mcp")?;
-        (rest.is_empty() || rest.starts_with(char::is_whitespace))
-            .then_some((rest.trim(), *text))
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some((rest.trim(), *text))
     });
     let Some((rest, original)) = candidate else {
         return Ok(None);
@@ -1815,12 +1811,8 @@ async fn run_print_mcp_command(
         if cli.no_mcp {
             bail!("MCP is disabled by --no-mcp");
         }
-        let manager = pi::mcp::McpManager::bootstrap(
-            cwd,
-            global_dir,
-            &cli.mcp_config,
-            project_trusted,
-        )?;
+        let manager =
+            pi::mcp::McpManager::bootstrap(cwd, global_dir, &cli.mcp_config, project_trusted)?;
         let output_error = Arc::new(StdMutex::new(None::<io::Error>));
         let owner = pi::agent_cx::AgentCx::for_current_or_request();
         let on_url: Arc<dyn Fn(&str) + Send + Sync> = {
@@ -1858,9 +1850,7 @@ async fn run_print_mcp_command(
         };
         let result = owner
             .with_current(Box::pin(execute_print_mcp_command(
-                &manager,
-                &command,
-                on_url,
+                &manager, &command, on_url,
             )))
             .await;
         // This invocation owns its processes and receive tasks, including
@@ -3763,7 +3753,8 @@ async fn handle_subcommand(
                 offline,
                 project_trusted,
                 cli,
-            ).await?;
+            )
+            .await?;
         }
         cli::Commands::Gc {
             older_than,
@@ -6509,7 +6500,10 @@ async fn review_model_client(
     let global = Config::global_dir();
     let config_path = Config::config_path_override_from_env(cwd);
     let config = Config::load_with_roots_and_project_trust(
-        config_path.as_deref(), &global, cwd, project_trusted,
+        config_path.as_deref(),
+        &global,
+        cwd,
+        project_trusted,
     )?;
     for warning in pi::http::proxy::configure(config.http.as_ref()) {
         tracing::warn!("{warning}");
@@ -6530,24 +6524,51 @@ async fn review_model_client(
     if let Some(error) = registry.error() {
         return Err(anyhow::anyhow!("Cannot load review model catalog: {error}"));
     }
-    let scope = config.model_scope_overrides.as_deref()
+    let scope = config
+        .model_scope_overrides
+        .as_deref()
         .and_then(|overrides| pi::failover::best_scope_override(overrides, cwd));
-    let patterns = cli.models.as_deref().map(pi::app::parse_models_arg)
+    let patterns = cli
+        .models
+        .as_deref()
+        .map(pi::app::parse_models_arg)
         .or_else(|| scope.and_then(|scope| scope.enabled_models.clone()))
         .unwrap_or_else(|| config.enabled_models.clone().unwrap_or_default());
     validate_startup_api_key_scope(cli, &patterns)?;
     let session = Session::in_memory();
     let (selection, key) = resolve_selection_with_auth(
-        cli, &config, &session, cwd, &mut registry, &patterns, &mut auth,
-        &models_path, false, &[], &[],
-    ).await?.ok_or_else(|| anyhow::anyhow!("No review model selected"))?;
-    validate_startup_oauth_refresh(cli, &refresh, &selection.model_entry.model.provider, &[], false)?;
+        cli,
+        &config,
+        &session,
+        cwd,
+        &mut registry,
+        &patterns,
+        &mut auth,
+        &models_path,
+        false,
+        &[],
+        &[],
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("No review model selected"))?;
+    validate_startup_oauth_refresh(
+        cli,
+        &refresh,
+        &selection.model_entry.model.provider,
+        &[],
+        false,
+    )?;
     if let Some(warning) = &selection.fallback_message {
         eprintln!("{warning}");
     }
-    let provider = pi::providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))?;
+    let provider =
+        pi::providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))?;
     let stream_options = pi::app::build_stream_options(&config, key, &selection, &session);
-    Ok(pi::review::ModelReviewer::new(provider, stream_options, config.secrets.as_ref()))
+    Ok(pi::review::ModelReviewer::new(
+        provider,
+        stream_options,
+        config.secrets.as_ref(),
+    ))
 }
 
 /// `pi gc` (bd-cv653.7.11): retention-policy pruning for sessions, artifacts, and caches.
@@ -9716,7 +9737,10 @@ struct PrintRequest {
     command: Option<PrintCommand>,
 }
 
-fn prepare_print_requests(messages: Vec<String>, first_is_piped: bool) -> Result<Vec<PrintRequest>> {
+fn prepare_print_requests(
+    messages: Vec<String>,
+    first_is_piped: bool,
+) -> Result<Vec<PrintRequest>> {
     messages
         .into_iter()
         .enumerate()
@@ -10043,14 +10067,9 @@ async fn run_print_mode(
                 .trim()
                 .split_once(char::is_whitespace)
                 .map_or("", |(_, args)| args.trim());
-            let outcome = execute_print_command(
-                session,
-                command,
-                focus,
-                &abort_signal,
-                make_event_handler(),
-            )
-            .await?;
+            let outcome =
+                execute_print_command(session, command, focus, &abort_signal, make_event_handler())
+                    .await?;
             match outcome {
                 PrintCommandOutcome::Compacted(result) => {
                     sent_prompts = sent_prompts.saturating_add(1);
@@ -11308,7 +11327,10 @@ mod tests {
             Some(PrintMcpCommand::Refresh(Some("docs".into())))
         );
         let cli = cli::Cli::parse_from(["pi", "-p", "/mcp"]);
-        assert_eq!(print_mcp_command(&cli, None).unwrap(), Some(PrintMcpCommand::List));
+        assert_eq!(
+            print_mcp_command(&cli, None).unwrap(),
+            Some(PrintMcpCommand::List)
+        );
     }
 
     #[test]
@@ -13875,7 +13897,11 @@ mod tests {
             parse_print_command("/handoff preserve the migration plan", true).unwrap(),
             Some(PrintCommand::Handoff)
         );
-        for input in ["/retry extra", "/compact unknown", "/handoff invalid\0focus"] {
+        for input in [
+            "/retry extra",
+            "/compact unknown",
+            "/handoff invalid\0focus",
+        ] {
             let error = parse_print_command(input, true).unwrap_err();
             assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
         }
@@ -13999,7 +14025,11 @@ mod tests {
                 .unwrap()
                 .push(serde_json::to_value(&context.messages).unwrap());
             // ToolDef is not Serialize; the names show which tools were offered.
-            let tools: Vec<&str> = context.tools.iter().map(|tool| tool.name.as_str()).collect();
+            let tools: Vec<&str> = context
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
             self.metadata.lock().unwrap().push(json!({
                 "system": context.system_prompt,
                 "tools": tools,
@@ -14049,12 +14079,14 @@ mod tests {
                     message.stop_reason = StopReason::Length;
                 }
                 HeadlessCommandBehavior::ToolCall => {
-                    message.content.push(ContentBlock::ToolCall(pi::model::ToolCall {
-                        id: "unexpected-handoff-tool".into(),
-                        name: "write".into(),
-                        arguments: json!({"path": "should-not-exist.txt", "content": "bad"}),
-                        thought_signature: None,
-                    }));
+                    message
+                        .content
+                        .push(ContentBlock::ToolCall(pi::model::ToolCall {
+                            id: "unexpected-handoff-tool".into(),
+                            name: "write".into(),
+                            arguments: json!({"path": "should-not-exist.txt", "content": "bad"}),
+                            thought_signature: None,
+                        }));
                 }
                 _ => {}
             }
@@ -14161,9 +14193,10 @@ mod tests {
             stored.save().await.unwrap();
             let mut session = headless_command_session(&provider, stored, true, false);
             let (_abort, signal) = AbortHandle::new();
-            let outcome = execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
-                .await
-                .unwrap();
+            let outcome =
+                execute_print_command(&mut session, PrintCommand::Retry, "", &signal, |_| {})
+                    .await
+                    .unwrap();
             let PrintCommandOutcome::Retry(recovered) = outcome else {
                 panic!("native retry input")
             };
@@ -14271,12 +14304,8 @@ mod tests {
         run_cli_workdir_test(async {
             for command in [PrintCommand::Compact, PrintCommand::Shake] {
                 let provider = Arc::new(HeadlessCommandProvider::default());
-                let mut session = headless_command_session(
-                    &provider,
-                    headless_compaction_history(),
-                    false,
-                    true,
-                );
+                let mut session =
+                    headless_command_session(&provider, headless_compaction_history(), false, true);
                 let (_abort, signal) = AbortHandle::new();
                 let outcome = execute_print_command(&mut session, command, "", &signal, |_| {})
                     .await
@@ -14284,11 +14313,17 @@ mod tests {
                 assert!(matches!(outcome, PrintCommandOutcome::Compacted(Some(_))));
                 let cx = pi::agent_cx::AgentCx::for_request();
                 let stored = session.session.lock(cx.cx()).await.unwrap();
-                assert!(stored.entries.iter().any(|entry| {
-                    matches!(entry, pi::session::SessionEntry::Compaction(_))
-                }));
+                assert!(
+                    stored
+                        .entries
+                        .iter()
+                        .any(|entry| { matches!(entry, pi::session::SessionEntry::Compaction(_)) })
+                );
                 let requests = provider.requests.lock().unwrap();
-                assert_eq!(requests.len(), usize::from(command == PrintCommand::Compact));
+                assert_eq!(
+                    requests.len(),
+                    usize::from(command == PrintCommand::Compact)
+                );
                 assert!(
                     requests
                         .iter()
@@ -14359,9 +14394,10 @@ mod tests {
             options.session_id = Some("primary-transport".into());
             options.prompt_cache_key = Some("primary-cache".into());
             options.max_tokens = Some(8192);
-            options.before_provider_request = Some(pi::provider::BeforeProviderRequestHook::new(
-                |_| Box::pin(async { None }),
-            ));
+            options.before_provider_request =
+                Some(pi::provider::BeforeProviderRequestHook::new(|_| {
+                    Box::pin(async { None })
+                }));
             let (_abort, signal) = AbortHandle::new();
             let outcome = execute_print_command(
                 &mut session,
@@ -14379,7 +14415,10 @@ mod tests {
             assert_eq!(result["firstKeptEntryId"], kept_user);
             let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
             assert_eq!(reopened.header.id, original_id);
-            assert_eq!(reopened.header.parent_session.as_deref(), Some("original-parent.jsonl"));
+            assert_eq!(
+                reopened.header.parent_session.as_deref(),
+                Some("original-parent.jsonl")
+            );
             assert_eq!(reopened.path.as_deref(), Some(path.as_path()));
             assert_eq!(reopened.entries.len(), original_count + 1);
             assert_eq!(
@@ -14387,7 +14426,8 @@ mod tests {
                 original_entries,
                 "all original history and branch metadata remain archived",
             );
-            let pi::session::SessionEntry::Compaction(entry) = reopened.entries.last().unwrap() else {
+            let pi::session::SessionEntry::Compaction(entry) = reopened.entries.last().unwrap()
+            else {
                 panic!("durable compaction entry")
             };
             assert_eq!(entry.base.parent_id, original_leaf);
@@ -14406,17 +14446,28 @@ mod tests {
             {
                 let requests = provider.requests.lock().unwrap();
                 assert_eq!(requests.len(), 1);
-                assert!(requests[0].to_string().contains("preserve migration decisions and next steps"));
+                assert!(
+                    requests[0]
+                        .to_string()
+                        .contains("preserve migration decisions and next steps")
+                );
                 assert!(!requests[0].to_string().contains("YXVkaW8="));
                 let metadata = provider.metadata.lock().unwrap();
                 assert_eq!(metadata[0]["tools"], json!([]));
                 assert_ne!(metadata[0]["sessionId"], "primary-transport");
-                assert!(metadata[0]["sessionId"].as_str().is_some_and(|id| !id.is_empty()));
+                assert!(
+                    metadata[0]["sessionId"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty())
+                );
                 assert!(metadata[0]["promptCacheKey"].is_null());
                 assert_eq!(metadata[0]["maxTokens"], 256);
                 assert_eq!(metadata[0]["providerHook"], false);
             }
-            assert_eq!(session.agent.stream_options().session_id.as_deref(), Some("primary-transport"));
+            assert_eq!(
+                session.agent.stream_options().session_id.as_deref(),
+                Some("primary-transport")
+            );
             run_print_recovery_fixture(
                 &mut session,
                 PromptInput::Text {
@@ -14450,7 +14501,10 @@ mod tests {
             ] {
                 let directory = TempDir::new().unwrap();
                 let path = directory.path().join("failed-handoff.jsonl");
-                let provider = Arc::new(HeadlessCommandProvider { behavior, ..Default::default() });
+                let provider = Arc::new(HeadlessCommandProvider {
+                    behavior,
+                    ..Default::default()
+                });
                 let mut stored = headless_compaction_history();
                 stored.path = Some(path.clone());
                 stored.session_dir = Some(directory.path().to_path_buf());
@@ -14464,11 +14518,10 @@ mod tests {
                     session.compaction_settings(),
                 ));
                 let (_abort, signal) = AbortHandle::new();
-                let error = execute_print_command(
-                    &mut session, PrintCommand::Handoff, "", &signal, |_| {},
-                )
-                .await
-                .unwrap_err();
+                let error =
+                    execute_print_command(&mut session, PrintCommand::Handoff, "", &signal, |_| {})
+                        .await
+                        .unwrap_err();
                 assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
                 assert_eq!(provider.requests.lock().unwrap().len(), 1);
                 assert_eq!(fs::read(&path).unwrap(), before);
@@ -14491,16 +14544,16 @@ mod tests {
             let stored = headless_compaction_history();
             let old_entries = serde_json::to_value(&stored.entries).unwrap();
             let mut session = headless_command_session(&provider, stored, false, false);
-            let error = execute_print_command(
-                &mut session, PrintCommand::Handoff, "", &signal, |_| {},
-            )
-            .await
-            .unwrap_err();
+            let error =
+                execute_print_command(&mut session, PrintCommand::Handoff, "", &signal, |_| {})
+                    .await
+                    .unwrap_err();
             assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
             assert_eq!(provider.requests.lock().unwrap().len(), 1);
             let cx = pi::agent_cx::AgentCx::for_request();
             assert_eq!(
-                serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries).unwrap(),
+                serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries)
+                    .unwrap(),
                 old_entries,
             );
 
@@ -14515,23 +14568,33 @@ mod tests {
                 AgentConfig::default(),
             );
             let mut session = AgentSession::new(
-                agent, Arc::clone(&stored), false,
+                agent,
+                Arc::clone(&stored),
+                false,
                 ResolvedCompactionSettings {
-                    enabled: false, keep_recent_tokens: 8, ..Default::default()
+                    enabled: false,
+                    keep_recent_tokens: 8,
+                    ..Default::default()
                 },
             );
             let (_abort, signal) = AbortHandle::new();
-            let error = execute_print_command(
-                &mut session, PrintCommand::Handoff, "", &signal, |_| {},
-            )
-            .await
-            .unwrap_err();
+            let error =
+                execute_print_command(&mut session, PrintCommand::Handoff, "", &signal, |_| {})
+                    .await
+                    .unwrap_err();
             assert!(error.to_string().contains("source changed"));
             let stored = stored.lock(cx.cx()).await.unwrap();
-            assert!(!stored.entries.iter().any(|entry| matches!(entry,
-                pi::session::SessionEntry::Compaction(_)
-            )));
-            assert!(serde_json::to_string(&stored.entries).unwrap().contains("A newer authored turn"));
+            assert!(
+                !stored
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, pi::session::SessionEntry::Compaction(_)))
+            );
+            assert!(
+                serde_json::to_string(&stored.entries)
+                    .unwrap()
+                    .contains("A newer authored turn")
+            );
         });
     }
 
@@ -14549,12 +14612,16 @@ mod tests {
                     "Continue the current task with all of the preserved context",
                 ] {
                     stored.append_message(pi::session::SessionMessage::User {
-                        content: pi::model::UserContent::Text(text.into()), timestamp: Some(0),
+                        content: pi::model::UserContent::Text(text.into()),
+                        timestamp: Some(0),
                     });
                 }
                 let original = serde_json::to_value(&stored.entries).unwrap();
                 let mut session = headless_command_session_with_config(
-                    &provider, stored, false, false,
+                    &provider,
+                    stored,
+                    false,
+                    false,
                     AgentConfig {
                         secrets: Some(pi::secrets::SecretsSettings {
                             mode: Some(mode.into()),
@@ -14565,7 +14632,11 @@ mod tests {
                 );
                 let (_abort, signal) = AbortHandle::new();
                 let result = execute_print_command(
-                    &mut session, PrintCommand::Handoff, "Consider ACME-654321", &signal, |_| {},
+                    &mut session,
+                    PrintCommand::Handoff,
+                    "Consider ACME-654321",
+                    &signal,
+                    |_| {},
                 )
                 .await;
                 let cx = pi::agent_cx::AgentCx::for_request();
@@ -14587,7 +14658,8 @@ mod tests {
                         assert!(!summary.contains(secret));
                     }
                     assert_eq!(
-                        serde_json::to_value(&stored.entries[..2]).unwrap(), original,
+                        serde_json::to_value(&stored.entries[..2]).unwrap(),
+                        original,
                         "privacy projection must not rewrite original evidence",
                     );
                 }
@@ -14606,17 +14678,27 @@ mod tests {
             ] {
                 let directory = TempDir::new().unwrap();
                 let path = directory.path().join("handoff-hook.native.json");
-                fs::write(&path, serde_json::to_vec(&json!({
-                    "id": "handoff-hook", "name": "handoff-hook", "version": "1.0.0",
-                    "apiVersion": pi::extensions::PROTOCOL_VERSION,
-                    "eventHooks": ["session_before_compact"],
-                    "eventResponses": {"session_before_compact": response}
-                })).unwrap()).unwrap();
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&json!({
+                        "id": "handoff-hook", "name": "handoff-hook", "version": "1.0.0",
+                        "apiVersion": pi::extensions::PROTOCOL_VERSION,
+                        "eventHooks": ["session_before_compact"],
+                        "eventResponses": {"session_before_compact": response}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
                 let manager = pi::extensions::ExtensionManager::new();
-                manager.set_native_runtime(NativeRustExtensionRuntimeHandle::start().await.unwrap());
-                manager.load_native_extensions(vec![
-                    pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path).unwrap(),
-                ]).await.unwrap();
+                manager
+                    .set_native_runtime(NativeRustExtensionRuntimeHandle::start().await.unwrap());
+                manager
+                    .load_native_extensions(vec![
+                        pi::extensions::NativeRustExtensionLoadSpec::from_entry_path(&path)
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
                 let provider = Arc::new(HeadlessCommandProvider::default());
                 let stored = headless_compaction_history();
                 let old_entries = serde_json::to_value(&stored.entries).unwrap();
@@ -14624,13 +14706,20 @@ mod tests {
                 session.extensions = Some(pi::extensions::ExtensionRegion::new(manager));
                 let (_abort, signal) = AbortHandle::new();
                 let error = execute_print_command(
-                    &mut session, PrintCommand::Handoff, "Keep decisions", &signal, |_| {},
-                ).await.unwrap_err();
+                    &mut session,
+                    PrintCommand::Handoff,
+                    "Keep decisions",
+                    &signal,
+                    |_| {},
+                )
+                .await
+                .unwrap_err();
                 assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
                 assert!(provider.requests.lock().unwrap().is_empty());
                 let cx = pi::agent_cx::AgentCx::for_request();
                 assert_eq!(
-                    serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries).unwrap(),
+                    serde_json::to_value(&session.session.lock(cx.cx()).await.unwrap().entries)
+                        .unwrap(),
                     old_entries,
                 );
                 session.extensions.as_ref().unwrap().shutdown().await;
@@ -14683,9 +14772,12 @@ mod tests {
             let cx = pi::agent_cx::AgentCx::for_request();
             let stored = session.session.lock(cx.cx()).await.unwrap();
             assert_eq!(stored.leaf_id(), old_leaf.as_deref());
-            assert!(!stored.entries.iter().any(|entry| {
-                matches!(entry, pi::session::SessionEntry::Compaction(_))
-            }));
+            assert!(
+                !stored
+                    .entries
+                    .iter()
+                    .any(|entry| { matches!(entry, pi::session::SessionEntry::Compaction(_)) })
+            );
             drop(stored);
             session.extensions.as_ref().unwrap().shutdown().await;
         });
@@ -14695,9 +14787,14 @@ mod tests {
     fn headless_command_refusals_and_cancellation_do_not_dispatch() {
         run_cli_workdir_test(async {
             let provider = Arc::new(HeadlessCommandProvider::default());
-            let mut session = headless_command_session(&provider, Session::in_memory(), false, false);
+            let mut session =
+                headless_command_session(&provider, Session::in_memory(), false, false);
             let (abort, signal) = AbortHandle::new();
-            for command in [PrintCommand::Compact, PrintCommand::Retry, PrintCommand::Handoff] {
+            for command in [
+                PrintCommand::Compact,
+                PrintCommand::Retry,
+                PrintCommand::Handoff,
+            ] {
                 let error = execute_print_command(&mut session, command, "", &signal, |_| {})
                     .await
                     .unwrap_err();

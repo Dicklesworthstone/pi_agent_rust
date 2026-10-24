@@ -111,7 +111,10 @@ impl DapSession {
         Self::begin_inner(transport, Some(terminal)).await
     }
 
-    async fn begin_inner(transport: DapTransport, terminal: Option<Arc<TerminalHost>>) -> Result<Self> {
+    async fn begin_inner(
+        transport: DapTransport,
+        terminal: Option<Arc<TerminalHost>>,
+    ) -> Result<Self> {
         let capabilities = transport.request("initialize", json!({
             "clientID": "pi_agent_rust", "clientName": "pi_agent_rust", "adapterID": "pi-dap",
             "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path",
@@ -231,9 +234,16 @@ impl DapSession {
     }
 
     pub(super) async fn terminal_input(&self, text: &str, enter: bool) -> Result<Value> {
-        self.terminal.as_ref()
-            .ok_or_else(|| tool_err("DAP_TERMINAL_NOT_STARTED", "this debugger has no host-owned terminal"))?
-            .send(text, enter).await
+        self.terminal
+            .as_ref()
+            .ok_or_else(|| {
+                tool_err(
+                    "DAP_TERMINAL_NOT_STARTED",
+                    "this debugger has no host-owned terminal",
+                )
+            })?
+            .send(text, enter)
+            .await
     }
 
     #[must_use]
@@ -286,7 +296,10 @@ impl DapSession {
             ));
         }
         if self.terminal.is_some() && command != "launch" {
-            return Err(tool_err("DAP_TERMINAL_DENIED", "terminal host is local-launch-only"));
+            return Err(tool_err(
+                "DAP_TERMINAL_DENIED",
+                "terminal host is local-launch-only",
+            ));
         }
         Self::lock(&self.state).origin = Some(origin);
         let configure = async {
@@ -330,14 +343,18 @@ impl DapSession {
         let operation = async {
             let launch = async {
                 let response = if let Some(terminal) = &self.terminal {
-                    self.transport.request_with_reverse(command, arguments, timeout, terminal.handler()).await
+                    self.transport
+                        .request_with_reverse(command, arguments, timeout, terminal.handler())
+                        .await
                 } else {
                     self.transport.request(command, arguments, timeout).await
                 };
                 response.map_err(crate::error::Error::from)
             };
             futures::future::try_join(launch, configure).await?;
-            if let Some(terminal) = &self.terminal { terminal.require_started()?; }
+            if let Some(terminal) = &self.terminal {
+                terminal.require_started()?;
+            }
             self.pump_events();
             Self::lock(&self.state).check()?;
             Ok(())

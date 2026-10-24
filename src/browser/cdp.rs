@@ -2,8 +2,8 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, history, interaction, launch,
-    output, policy, required, storage,
+    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, history, interaction,
+    launch, output, policy, required, storage,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -621,9 +621,11 @@ impl Cdp {
     }
 
     fn current_download_context(&self) -> contexts::Context {
-        self.context_binding.as_ref().map_or(contexts::Context::Default, |binding| {
-            binding.context.clone()
-        })
+        self.context_binding
+            .as_ref()
+            .map_or(contexts::Context::Default, |binding| {
+                binding.context.clone()
+            })
     }
 
     pub(super) fn download_context_metadata(&self) -> Value {
@@ -645,7 +647,9 @@ impl Cdp {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        self.current_download_context().command(owner, self, method, params).await
+        self.current_download_context()
+            .command(owner, self, method, params)
+            .await
     }
 
     pub(super) fn page_session_id(&self) -> Result<&str> {
@@ -1469,7 +1473,8 @@ mod tests {
         let mut downloads = BTreeMap::new();
         let start = download_start("job");
         record_download_event_into(&mut downloads, &start).unwrap();
-        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0)).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0))
+            .unwrap();
         let saved = downloads.clone();
         record_download_event_into(&mut downloads, &start).unwrap();
         assert_eq!(downloads, saved);
@@ -1486,7 +1491,8 @@ mod tests {
     fn invalid_download_progress_cannot_partially_complete_a_record() {
         let mut downloads = BTreeMap::new();
         record_download_event_into(&mut downloads, &download_start("job")).unwrap();
-        record_download_event_into(&mut downloads, &download_progress("inProgress", 4.0, 0.0)).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("inProgress", 4.0, 0.0))
+            .unwrap();
         let saved = downloads.clone();
         for invalid in [
             download_progress("completed", 7.0, f64::NAN),
@@ -1498,8 +1504,10 @@ mod tests {
             assert_eq!(downloads, saved);
         }
         // An unknown total becoming known is ordinary progress, not a reset.
-        record_download_event_into(&mut downloads, &download_progress("inProgress", 5.0, 10.0)).unwrap();
-        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0)).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("inProgress", 5.0, 10.0))
+            .unwrap();
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0))
+            .unwrap();
         assert_eq!(downloads["job"].state, "completed");
     }
 
@@ -1516,7 +1524,15 @@ mod tests {
                 download_progress("inProgress", 7.0, 9.0),
                 download_progress(terminal, 8.0, 9.0),
                 download_progress(terminal, 7.0, 10.0),
-                download_progress(if terminal == "completed" { "canceled" } else { "completed" }, 7.0, 9.0),
+                download_progress(
+                    if terminal == "completed" {
+                        "canceled"
+                    } else {
+                        "completed"
+                    },
+                    7.0,
+                    9.0,
+                ),
             ] {
                 assert!(record_download_event_into(&mut downloads, &invalid).is_err());
                 assert_eq!(downloads, saved);
@@ -1548,12 +1564,14 @@ mod tests {
     fn download_record_budget_allows_duplicates_not_extra_transfer_identities() {
         let mut downloads = BTreeMap::new();
         for i in 0..MAX_DOWNLOAD_RECORDS {
-            record_download_event_into(&mut downloads, &download_start(&format!("job-{i}"))).unwrap();
+            record_download_event_into(&mut downloads, &download_start(&format!("job-{i}")))
+                .unwrap();
         }
         record_download_event_into(&mut downloads, &download_start("job-0")).unwrap();
         assert!(record_download_event_into(&mut downloads, &download_start("overflow")).is_err());
         assert_eq!(downloads.len(), MAX_DOWNLOAD_RECORDS);
-        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0)).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0))
+            .unwrap();
         assert!(!downloads.contains_key("job"));
     }
 }

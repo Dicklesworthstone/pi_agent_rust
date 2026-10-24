@@ -35,10 +35,7 @@ impl super::EvalTool {
     ///
     /// Returns `EVAL_PY_INPUT` for empty/NUL-containing selections, unsupported
     /// drive-relative paths, unavailable home expansion, or discovery limits.
-    pub fn new_with_python(
-        cwd: &Path,
-        interpreter: impl Into<OsString>,
-    ) -> Result<Self> {
+    pub fn new_with_python(cwd: &Path, interpreter: impl Into<OsString>) -> Result<Self> {
         let interpreter = interpreter.into();
         if interpreter.is_empty() {
             return Err(input_error("explicit SDK interpreter cannot be empty"));
@@ -98,7 +95,8 @@ pub(super) struct Resolved {
 impl Resolved {
     pub(super) fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
-        command.env("PATH", &self.path)
+        command
+            .env("PATH", &self.path)
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "utf-8");
         if let Some(root) = &self.root {
@@ -116,10 +114,13 @@ impl Resolved {
 
     pub(super) fn annotate(&self, output: &mut crate::tools::ToolOutput) {
         if let Some(serde_json::Value::Object(details)) = output.details.as_mut() {
-            details.insert("pythonRuntime".into(), serde_json::json!({
-                "executable": self.executable.to_string_lossy(),
-                "source": self.source.label(),
-            }));
+            details.insert(
+                "pythonRuntime".into(),
+                serde_json::json!({
+                    "executable": self.executable.to_string_lossy(),
+                    "source": self.source.label(),
+                }),
+            );
         }
     }
 }
@@ -143,16 +144,24 @@ impl Environment {
         }
         let path = Path::new(path);
         let expanded = if let Ok(suffix) = path.strip_prefix("~") {
-            self.home.as_ref().ok_or_else(|| input_error("cannot expand ~ without a home directory"))?
+            self.home
+                .as_ref()
+                .ok_or_else(|| input_error("cannot expand ~ without a home directory"))?
                 .join(suffix)
         } else {
             path.to_path_buf()
         };
         // Do NOT canonicalize: following bin/python's symlink would lose the
         // venv entry path and make Python initialize its base installation.
-        let absolute = if expanded.is_absolute() { expanded } else { cwd.join(expanded) };
+        let absolute = if expanded.is_absolute() {
+            expanded
+        } else {
+            cwd.join(expanded)
+        };
         if !absolute.is_absolute() {
-            return Err(input_error("drive-relative interpreter paths are not supported"));
+            return Err(input_error(
+                "drive-relative interpreter paths are not supported",
+            ));
         }
         Ok(absolute)
     }
@@ -162,9 +171,15 @@ impl Environment {
             return Err(input_error("interpreter paths cannot contain NUL"));
         }
         if self.empty_override && requested.is_empty() {
-            return Err(input_error("PI_EVAL_PYTHON is empty; unset it to enable discovery"));
+            return Err(input_error(
+                "PI_EVAL_PYTHON is empty; unset it to enable discovery",
+            ));
         }
-        if self.path.as_ref().is_some_and(|p| p.as_encoded_bytes().len() > 64 * 1024) {
+        if self
+            .path
+            .as_ref()
+            .is_some_and(|p| p.as_encoded_bytes().len() > 64 * 1024)
+        {
             return Err(input_error("PATH exceeds the 64 KiB discovery limit"));
         }
         let cwd = std::path::absolute(cwd)
@@ -173,29 +188,51 @@ impl Environment {
         if !requested.is_empty() {
             let path = Path::new(requested);
             let bare = path.components().count() == 1
-                && matches!(path.components().next(), Some(std::path::Component::Normal(_)))
+                && matches!(
+                    path.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
                 && requested != OsStr::new("~");
             if bare {
                 self.add_path_candidates(&mut candidates, &[requested])?;
             } else {
-                self.add(&mut candidates, self.absolute(requested, &cwd)?, Source::Explicit, None)?;
+                self.add(
+                    &mut candidates,
+                    self.absolute(requested, &cwd)?,
+                    Source::Explicit,
+                    None,
+                )?;
             }
-            for candidate in &mut candidates { candidate.source = Source::Explicit; }
+            for candidate in &mut candidates {
+                candidate.source = Source::Explicit;
+            }
             return Ok(candidates);
         }
         if let Some(root) = &self.virtual_env {
-            self.add_environment(&mut candidates, self.absolute(root, &cwd)?, Source::ActiveVenv)?;
+            self.add_environment(
+                &mut candidates,
+                self.absolute(root, &cwd)?,
+                Source::ActiveVenv,
+            )?;
         }
         if let Some(root) = &self.conda_prefix {
             self.add_environment(&mut candidates, self.absolute(root, &cwd)?, Source::Conda)?;
         }
         self.add_environment(&mut candidates, cwd.join(".venv"), Source::DotVenv)?;
         self.add_environment(&mut candidates, cwd.join("venv"), Source::Venv)?;
-        self.add_path_candidates(&mut candidates, &[OsStr::new("python3"), OsStr::new("python")])?;
+        self.add_path_candidates(
+            &mut candidates,
+            &[OsStr::new("python3"), OsStr::new("python")],
+        )?;
         Ok(candidates)
     }
 
-    fn add_environment(&self, output: &mut Vec<Resolved>, root: PathBuf, source: Source) -> Result<()> {
+    fn add_environment(
+        &self,
+        output: &mut Vec<Resolved>,
+        root: PathBuf,
+        source: Source,
+    ) -> Result<()> {
         if cfg!(windows) {
             let executable = if source == Source::Conda {
                 root.join("python.exe")
@@ -205,7 +242,12 @@ impl Environment {
             self.add(output, executable, source, Some(root))
         } else {
             for name in ["python", "python3"] {
-                self.add(output, root.join("bin").join(name), source, Some(root.clone()))?;
+                self.add(
+                    output,
+                    root.join("bin").join(name),
+                    source,
+                    Some(root.clone()),
+                )?;
             }
             Ok(())
         }
@@ -213,10 +255,17 @@ impl Environment {
 
     fn add_path_candidates(&self, output: &mut Vec<Resolved>, names: &[&OsStr]) -> Result<()> {
         for name in names {
-            for directory in self.path.as_deref().into_iter().flat_map(std::env::split_paths) {
+            for directory in self
+                .path
+                .as_deref()
+                .into_iter()
+                .flat_map(std::env::split_paths)
+            {
                 // Like native Windows shell discovery, never implicitly pick
                 // an executable from the working tree via empty/relative PATH.
-                if !directory.is_absolute() { continue; }
+                if !directory.is_absolute() {
+                    continue;
+                }
                 let mut executable = directory.join(name);
                 if cfg!(windows) && executable.extension().is_none() {
                     executable.set_extension("exe");
@@ -227,23 +276,61 @@ impl Environment {
         Ok(())
     }
 
-    fn add(&self, output: &mut Vec<Resolved>, executable: PathBuf, source: Source, root: Option<PathBuf>) -> Result<()> {
-        if output.iter().any(|candidate| candidate.executable == executable) { return Ok(()); }
-        if output.len() >= MAX_CANDIDATES {
-            return Err(input_error("more than 128 interpreter candidates; set PI_EVAL_PYTHON to a path"));
+    fn add(
+        &self,
+        output: &mut Vec<Resolved>,
+        executable: PathBuf,
+        source: Source,
+        root: Option<PathBuf>,
+    ) -> Result<()> {
+        if output
+            .iter()
+            .any(|candidate| candidate.executable == executable)
+        {
+            return Ok(());
         }
-        let mut paths = vec![executable.parent().ok_or_else(|| input_error("interpreter has no parent directory"))?.to_path_buf()];
-        if cfg!(windows) && source == Source::Conda && let Some(root) = &root {
+        if output.len() >= MAX_CANDIDATES {
+            return Err(input_error(
+                "more than 128 interpreter candidates; set PI_EVAL_PYTHON to a path",
+            ));
+        }
+        let mut paths = vec![
+            executable
+                .parent()
+                .ok_or_else(|| input_error("interpreter has no parent directory"))?
+                .to_path_buf(),
+        ];
+        if cfg!(windows)
+            && source == Source::Conda
+            && let Some(root) = &root
+        {
             paths.push(root.join("Library").join("bin"));
             paths.push(root.join("Scripts"));
         }
-        paths.extend(self.path.as_deref().into_iter().flat_map(std::env::split_paths));
-        let path = std::env::join_paths(paths).map_err(|_| input_error("selected interpreter cannot be represented in PATH"))?;
-        output.push(Resolved { executable, source, root, path });
+        paths.extend(
+            self.path
+                .as_deref()
+                .into_iter()
+                .flat_map(std::env::split_paths),
+        );
+        let path = std::env::join_paths(paths)
+            .map_err(|_| input_error("selected interpreter cannot be represented in PATH"))?;
+        output.push(Resolved {
+            executable,
+            source,
+            root,
+            path,
+        });
         Ok(())
     }
 
-    pub(super) async fn resolve(&self, requested: &OsStr, cwd: &Path, hard_deadline: Instant, session: &CellSession) -> Result<Resolved> {
+    pub(super) async fn resolve(
+        &self,
+        requested: &OsStr,
+        cwd: &Path,
+        hard_deadline: Instant,
+        session: &CellSession,
+    ) -> Result<Resolved> {
         let owner = AgentCx::for_current_or_request();
         let deadline = hard_deadline.min(Instant::now() + DISCOVERY_BUDGET);
         let candidates = self.candidates(requested, cwd)?;
@@ -251,11 +338,18 @@ impl Environment {
         for candidate in candidates {
             check(&owner, hard_deadline, session).await?;
             if Instant::now() >= deadline {
-                return Err(Error::tool("eval", "EVAL_PY_DISCOVERY_TIMEOUT: interpreter discovery exceeded 8 seconds; no cell was sent"));
+                return Err(Error::tool(
+                    "eval",
+                    "EVAL_PY_DISCOVERY_TIMEOUT: interpreter discovery exceeded 8 seconds; no cell was sent",
+                ));
             }
             let mut command = candidate.command();
-            command.args(["-c", PROBE]).current_dir(cwd)
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            command
+                .args(["-c", PROBE])
+                .current_dir(cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             crate::tools::isolate_command_process_group(&mut command);
             let process = match crate::tools::spawn_command_with_job_discipline(&mut command) {
                 Ok(process) => process,
@@ -263,36 +357,69 @@ impl Environment {
                 Err(error) => {
                     // Do not search around a process-policy/permission denial
                     // or silently change an explicitly selected executable.
-                    return Err(Error::tool("eval", format!("EVAL_PY_PROBE: {} interpreter could not start: {error}; no cell was sent", candidate.source.label())));
+                    return Err(Error::tool(
+                        "eval",
+                        format!(
+                            "EVAL_PY_PROBE: {} interpreter could not start: {error}; no cell was sent",
+                            candidate.source.label()
+                        ),
+                    ));
                 }
             };
             let mut process = ProcessGuard::new(process, ProcessCleanupMode::ProcessGroupTree);
             let probe_deadline = deadline.min(Instant::now() + PROBE_BUDGET);
             let status = loop {
                 check(&owner, hard_deadline, session).await?;
-                if Instant::now() >= probe_deadline { break None; }
+                if Instant::now() >= probe_deadline {
+                    break None;
+                }
                 match process.try_wait_child() {
                     Ok(Some(status)) => break Some(status),
                     Ok(None) => owner.time().sleep(Duration::from_millis(20)).await,
-                    Err(error) => return Err(Error::tool("eval", format!("EVAL_PY_PROBE: cannot inspect interpreter: {error}"))),
+                    Err(error) => {
+                        return Err(Error::tool(
+                            "eval",
+                            format!("EVAL_PY_PROBE: cannot inspect interpreter: {error}"),
+                        ));
+                    }
                 }
             };
             // Reap the probe's entire owned tree, even after a root exit. No
             // detached discovery workers or pipes survive to execute the cell.
-            process.terminate_and_wait().map_err(|error| Error::tool("eval", format!("EVAL_PY_PROBE: cleanup failed: {error}")))?;
+            process.terminate_and_wait().map_err(|error| {
+                Error::tool("eval", format!("EVAL_PY_PROBE: cleanup failed: {error}"))
+            })?;
             check(&owner, hard_deadline, session).await?;
             if Instant::now() >= deadline {
-                return Err(Error::tool("eval", "EVAL_PY_DISCOVERY_TIMEOUT: interpreter discovery exceeded 8 seconds; no cell was sent"));
+                return Err(Error::tool(
+                    "eval",
+                    "EVAL_PY_DISCOVERY_TIMEOUT: interpreter discovery exceeded 8 seconds; no cell was sent",
+                ));
             }
-            if status.is_some_and(|status| status.success()) { return Ok(candidate); }
-            let reason = if status.is_some() { "failed-version/startup-check" } else { "probe-timeout" };
+            if status.is_some_and(|status| status.success()) {
+                return Ok(candidate);
+            }
+            let reason = if status.is_some() {
+                "failed-version/startup-check"
+            } else {
+                "probe-timeout"
+            };
             failures.push(format!("{}:{reason}", candidate.source.label()));
-            if !requested.is_empty() { break; }
+            if !requested.is_empty() {
+                break;
+            }
         }
-        Err(Error::tool("eval", format!(
-            "EVAL_PY_MISSING: no usable Python 3.10+ interpreter; set PI_EVAL_PYTHON to an executable. No cell was sent. Checks: {}",
-            if failures.is_empty() { "candidates not found".into() } else { failures.join(", ") }
-        )))
+        Err(Error::tool(
+            "eval",
+            format!(
+                "EVAL_PY_MISSING: no usable Python 3.10+ interpreter; set PI_EVAL_PYTHON to an executable. No cell was sent. Checks: {}",
+                if failures.is_empty() {
+                    "candidates not found".into()
+                } else {
+                    failures.join(", ")
+                }
+            ),
+        ))
     }
 }
 
@@ -301,11 +428,24 @@ fn input_error(message: &str) -> Error {
 }
 
 async fn check(owner: &AgentCx, deadline: Instant, session: &CellSession) -> Result<()> {
-    owner.checkpoint().map_err(|_| Error::tool("eval", "EVAL_CANCELLED: interpreter discovery stopped; no cell was sent"))?;
+    owner.checkpoint().map_err(|_| {
+        Error::tool(
+            "eval",
+            "EVAL_CANCELLED: interpreter discovery stopped; no cell was sent",
+        )
+    })?;
     session.check_tool().await?;
-    owner.checkpoint().map_err(|_| Error::tool("eval", "EVAL_CANCELLED: interpreter discovery stopped; no cell was sent"))?;
+    owner.checkpoint().map_err(|_| {
+        Error::tool(
+            "eval",
+            "EVAL_CANCELLED: interpreter discovery stopped; no cell was sent",
+        )
+    })?;
     if Instant::now() >= deadline {
-        return Err(Error::tool("eval", "EVAL_TIMEOUT: interpreter discovery exhausted the cell budget; no cell was sent"));
+        return Err(Error::tool(
+            "eval",
+            "EVAL_TIMEOUT: interpreter discovery exhausted the cell budget; no cell was sent",
+        ));
     }
     Ok(())
 }

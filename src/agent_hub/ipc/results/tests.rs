@@ -2,13 +2,18 @@ use super::*;
 use serde_json::json;
 
 fn event(case: &str) {
-    eprintln!("{}", json!({"suite":"agent_result_channel","case":case,"phase":"start"}));
+    eprintln!(
+        "{}",
+        json!({"suite":"agent_result_channel","case":case,"phase":"start"})
+    );
 }
 
 fn document(reference: &str, content: &str) -> Document {
     Document {
-        reference: reference.to_string(), content: content.to_string(),
-        content_type: "text/plain".to_string(), metadata: json!({"scope":"parentChannel"}),
+        reference: reference.to_string(),
+        content: content.to_string(),
+        content_type: "text/plain".to_string(),
+        metadata: json!({"scope":"parentChannel"}),
     }
 }
 
@@ -17,7 +22,10 @@ fn result_envelopes_cannot_smuggle_messaging_or_sender_fields() {
     event("closed-envelope");
     let valid = json!({"version":1,"token":"a".repeat(64),"result":{"reference":"peer-1/value"}});
     assert!(serde_json::from_value::<super::super::Incoming>(valid.clone()).is_ok());
-    for (field, value) in [("request",json!({"action":"send"})), ("sender",json!("parent"))] {
+    for (field, value) in [
+        ("request", json!({"action":"send"})),
+        ("sender", json!("parent")),
+    ] {
         let mut candidate = valid.clone();
         candidate[field] = value;
         assert!(serde_json::from_value::<super::super::Incoming>(candidate).is_err());
@@ -34,9 +42,15 @@ fn wrong_credentials_fail_before_lookup_without_echoing_the_secret() {
     for (version, supplied) in [(1, "b".repeat(64)), (2, "a".repeat(64))] {
         let expected = "a".repeat(64);
         let request = WireRequest {
-            version, token: supplied.clone(), result: ReadRequest { reference:"does-not-exist".into() },
+            version,
+            token: supplied.clone(),
+            result: ReadRequest {
+                reference: "does-not-exist".into(),
+            },
         };
-        let error = dispatch_authenticated("unregistered", &expected, request, &owner).unwrap_err().to_string();
+        let error = dispatch_authenticated("unregistered", &expected, request, &owner)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("PI_HUB_IPC_AUTH"));
         assert!(!error.contains(&expected) && !error.contains(&supplied));
     }
@@ -85,14 +99,20 @@ pub(super) fn serve(response: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<(
         let mut socket = loop {
             match listener.accept() {
                 Ok((socket, _)) => break socket,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < until =>
+                {
                     std::thread::sleep(IDLE_POLL);
                 }
                 Err(error) => panic!("fixture accept: {error}"),
             }
         };
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut input = Vec::new();
         loop {
             let mut chunk = [0_u8; 4096];
@@ -100,14 +120,18 @@ pub(super) fn serve(response: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<(
             assert!(count != 0);
             input.extend_from_slice(&chunk[..count]);
             assert!(input.len() <= MAX_REQUEST_BYTES);
-            if input.ends_with(b"\n") { break; }
+            if input.ends_with(b"\n") {
+                break;
+            }
         }
         let request: WireRequest = serde_json::from_slice(&input).unwrap();
         assert_eq!(request.result.reference, "peer-1/value");
         // Fragment the real socket response. A closed client on an intentional
         // refusal may stop the fixture writer; it does not require a retry.
         for chunk in response.chunks(47) {
-            if socket.write_all(chunk).is_err() { break; }
+            if socket.write_all(chunk).is_err() {
+                break;
+            }
         }
     });
     (address, handle)
@@ -118,7 +142,13 @@ fn request_response(response: WireResponse) -> Result<ResolvedDoc> {
     response.push(b'\n');
     let (address, handle) = serve(response);
     let owner = AgentCx::for_testing_with_io();
-    let result = resolve_at(&owner, address, "a".repeat(64), "peer-1/value", read_deadline(&owner).unwrap());
+    let result = resolve_at(
+        &owner,
+        address,
+        "a".repeat(64),
+        "peer-1/value",
+        read_deadline(&owner).unwrap(),
+    );
     handle.join().unwrap();
     result
 }
@@ -131,20 +161,38 @@ fn client_reassembles_fragmented_utf8_and_keeps_parent_failure_taxonomy() {
     assert_eq!(resolved.content, value);
     assert_eq!(resolved.scheme, "agent");
     assert_eq!(resolved.metadata["scope"], "parentChannel");
-    let error = request_response(WireResponse::Error("PI_URL_AGENT_OUTPUT_REJECTED: failed child".into())).unwrap_err();
+    let error = request_response(WireResponse::Error(
+        "PI_URL_AGENT_OUTPUT_REJECTED: failed child".into(),
+    ))
+    .unwrap_err();
     assert!(error.to_string().contains("PI_URL_AGENT_OUTPUT_REJECTED"));
 }
 
 #[test]
 fn mismatched_oversized_and_incomplete_responses_are_not_documents() {
     event("bad-result-response");
-    let error = request_response(WireResponse::Ok(document("different-peer/value", "wrong result"))).unwrap_err();
+    let error = request_response(WireResponse::Ok(document(
+        "different-peer/value",
+        "wrong result",
+    )))
+    .unwrap_err();
     assert!(error.to_string().contains("PI_HUB_IPC_PROTOCOL"));
-    let error = request_response(WireResponse::Ok(document("peer-1/value", &"x".repeat(MAX_COMPLETE_BYTES)))).unwrap_err();
+    let error = request_response(WireResponse::Ok(document(
+        "peer-1/value",
+        &"x".repeat(MAX_COMPLETE_BYTES),
+    )))
+    .unwrap_err();
     assert!(error.to_string().contains("PI_HUB_IPC_RESULT_LIMIT"));
     let (address, handle) = serve(b"{\"status\":\"ok\"".to_vec());
     let owner = AgentCx::for_testing_with_io();
-    let error = resolve_at(&owner, address, "a".repeat(64), "peer-1/value", read_deadline(&owner).unwrap()).unwrap_err();
+    let error = resolve_at(
+        &owner,
+        address,
+        "a".repeat(64),
+        "peer-1/value",
+        read_deadline(&owner).unwrap(),
+    )
+    .unwrap_err();
     handle.join().unwrap();
     assert!(error.to_string().contains("PI_HUB_IPC_CLOSED"));
 }
@@ -156,14 +204,35 @@ fn cancelled_expired_and_nonlocal_clients_never_connect() {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
-    let error = resolve_at(&owner, address, "a".repeat(64), "peer-1/value", Instant::now()).unwrap_err();
+    let error = resolve_at(
+        &owner,
+        address,
+        "a".repeat(64),
+        "peer-1/value",
+        Instant::now(),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("PI_HUB_IPC_TIMEOUT"));
     owner.set_cancel_requested(true);
-    let error = resolve_at(&owner, address, "a".repeat(64), "peer-1/value", Instant::now() + Duration::from_secs(1)).unwrap_err();
+    let error = resolve_at(
+        &owner,
+        address,
+        "a".repeat(64),
+        "peer-1/value",
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("PI_HUB_IPC_CANCELLED"));
     assert!(listener.accept().is_err());
     let owner = AgentCx::for_testing_with_io();
-    let error = resolve_at(&owner, "192.0.2.1:80".parse().unwrap(), "a".repeat(64), "peer-1/value", read_deadline(&owner).unwrap()).unwrap_err();
+    let error = resolve_at(
+        &owner,
+        "192.0.2.1:80".parse().unwrap(),
+        "a".repeat(64),
+        "peer-1/value",
+        read_deadline(&owner).unwrap(),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("PI_HUB_IPC_CONFIG"));
 }
 
@@ -175,29 +244,52 @@ fn cancelled_expired_and_nonlocal_clients_never_connect() {
 fn native_reader_process() {
     use crate::model::ContentBlock;
     use crate::tools::{ReadTool, Tool};
-    let Some(root) = std::env::var_os("PI_RESULT_READER_FIXTURE") else { return; };
+    let Some(root) = std::env::var_os("PI_RESULT_READER_FIXTURE") else {
+        return;
+    };
     let seed = std::env::var("PI_RESULT_READER_SEED").unwrap();
     let root = PathBuf::from(root);
     let roster = crate::url_router::resolve("agent://", &root).unwrap();
     assert_eq!(roster.metadata["scope"], "parentChannel");
     let roster: Value = serde_json::from_str(&roster.content).unwrap();
-    let id = roster["agents"].as_array().unwrap().iter()
+    let id = roster["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
         .filter_map(|entry| entry["id"].as_str())
-        .find(|id| id.starts_with(&format!("{seed}-"))).unwrap();
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        .find(|id| id.starts_with(&format!("{seed}-")))
+        .unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let tool = ReadTool::new(&root);
-    let output = runtime.block_on(tool.execute("peer-result", json!({
-        "path":format!("agent://{id}/answer"),"offset":2,"limit":1
-    }), None)).unwrap();
+    let output = runtime
+        .block_on(tool.execute(
+            "peer-result",
+            json!({
+                "path":format!("agent://{id}/answer"),"offset":2,"limit":1
+            }),
+            None,
+        ))
+        .unwrap();
     assert!(!output.is_error);
-    let text = output.content.iter().filter_map(|block| match block {
-        ContentBlock::Text(text) => Some(text.text.as_str()), _ => None,
-    }).collect::<Vec<_>>().join("\n");
+    let text = output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("beta") && !text.contains("alpha") && !text.contains("gamma"));
     let missing = crate::url_router::resolve(&format!("agent://{id}/missing"), &root).unwrap_err();
     assert!(missing.to_string().contains("PI_URL_AGENT_FIELD_NOT_FOUND"));
     let full = crate::url_router::resolve(&format!("agent://{id}/answer"), &root).unwrap();
-    assert_eq!(full.content, std::fs::read_to_string(root.join("expected-answer.txt")).unwrap());
+    assert_eq!(
+        full.content,
+        std::fs::read_to_string(root.join("expected-answer.txt")).unwrap()
+    );
     let event = json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop",
         "content":[{"type":"text","text":"accepted peer result read through native channel"}]}]});
     std::fs::write(root.join("reader-result.jsonl"), format!("{event}\n")).unwrap();
@@ -240,12 +332,14 @@ fn run_native_chain(answer: &str) {
             "---\nname: {name}\ndescription: native result fixture\ntools: read,hub\n---\nReturn fixture output.\n"
         )).unwrap();
     }
-    let quote = |value: &std::path::Path| format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"));
+    let quote =
+        |value: &std::path::Path| format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"));
     let executable = std::env::current_exe().unwrap();
     let child = dir.path().join("child.sh");
     // Harness chatter goes to a fixture file, never native stdout. Only a
     // successful real ReadTool subprocess writes the final agent_end frame.
-    let script = format!(r#"#!/bin/sh
+    let script = format!(
+        r#"#!/bin/sh
 set -eu
 for arg do task="$arg"; done
 case "$task" in
@@ -257,15 +351,35 @@ case "$task" in
     cat reader-result.jsonl
     ;;
 esac
-"#, root=quote(&root), executable=quote(&executable));
+"#,
+        root = quote(&root),
+        executable = quote(&executable)
+    );
     std::fs::write(&child, script).unwrap();
     std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let tool = SubagentTool::with_paths(root.clone(), global, child).with_timeout(Duration::from_secs(15));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let output = runtime.block_on(tool.execute("native-peer-chain", json!({"scope":"user","chain":[
-        {"agent":seed,"task":"SEED","outputSchema":{"type":"object"},"schemaMode":"strict"},
-        {"agent":reader,"task":"READ"}
-    ]}), None)).unwrap();
-    assert!(!output.is_error, "{output:?}; harness: {}", std::fs::read_to_string(root.join("reader-harness.log")).unwrap_or_default());
-    assert!(std::fs::read_to_string(root.join("reader-result.jsonl")).unwrap().contains("accepted peer result read"));
+    let tool =
+        SubagentTool::with_paths(root.clone(), global, child).with_timeout(Duration::from_secs(15));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let output = runtime
+        .block_on(tool.execute(
+            "native-peer-chain",
+            json!({"scope":"user","chain":[
+                {"agent":seed,"task":"SEED","outputSchema":{"type":"object"},"schemaMode":"strict"},
+                {"agent":reader,"task":"READ"}
+            ]}),
+            None,
+        ))
+        .unwrap();
+    assert!(
+        !output.is_error,
+        "{output:?}; harness: {}",
+        std::fs::read_to_string(root.join("reader-harness.log")).unwrap_or_default()
+    );
+    assert!(
+        std::fs::read_to_string(root.join("reader-result.jsonl"))
+            .unwrap()
+            .contains("accepted peer result read")
+    );
 }

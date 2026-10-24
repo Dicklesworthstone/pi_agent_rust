@@ -20,9 +20,8 @@ use serde_json::{Value, json};
 use super::super::{auth, config, manager};
 use super::{
     ClientRoots, DEFAULT_MCP_TIMEOUT, HTTP_CANCEL_TIMEOUT, HttpTransport, MAX_HTTP_BODY,
-    McpTransport, RequestDispatch, is_server_error, redacted_origin,
-    reject_authentication_status, tool_err, validate_initialize_result,
-    validate_jsonrpc_response, validate_outgoing_params,
+    McpTransport, RequestDispatch, is_server_error, redacted_origin, reject_authentication_status,
+    tool_err, validate_initialize_result, validate_jsonrpc_response, validate_outgoing_params,
 };
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{CompletionWaitError, await_completion};
@@ -63,7 +62,9 @@ struct SsePending {
 }
 
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    value.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl SseTransport {
@@ -72,7 +73,9 @@ impl SseTransport {
     /// Rejects malformed URLs, URL credentials, fragments, and unsafe or
     /// protocol-owned custom headers before opening a connection.
     pub fn new(url: &str, headers: Vec<(String, String)>) -> Result<Self> {
-        if url.chars().any(|character| character.is_control() || character.is_whitespace())
+        if url
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
             || has_url_userinfo(url)
         {
             return Err(tool_err(
@@ -137,7 +140,10 @@ impl SseTransport {
             ));
         }
         let state = Arc::get_mut(&mut self.state).ok_or_else(|| {
-            tool_err("MCP_CONFIG_INVALID", "cannot change active SSE authentication")
+            tool_err(
+                "MCP_CONFIG_INVALID",
+                "cannot change active SSE authentication",
+            )
         })?;
         state.authentication = Some(binding);
         Ok(self)
@@ -170,7 +176,9 @@ fn endpoint_url(base: &url::Url, advertised: &str) -> Result<String> {
     if advertised.is_empty()
         || advertised.len() > MAX_ENDPOINT_BYTES
         || advertised.trim() != advertised
-        || advertised.chars().any(|character| character.is_control() || character.is_whitespace())
+        || advertised
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
         || has_url_userinfo(advertised)
         || advertised.contains('\\')
     {
@@ -321,7 +329,10 @@ impl SseState {
         }
         if !self.started.swap(true, Ordering::AcqRel) {
             let runtime = asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
-                tool_err("MCP_RUNTIME_UNAVAILABLE", "legacy SSE requires an active runtime")
+                tool_err(
+                    "MCP_RUNTIME_UNAVAILABLE",
+                    "legacy SSE requires an active runtime",
+                )
             })?;
             let mut request = self
                 .client
@@ -369,7 +380,10 @@ impl SseState {
                     }
                 })
                 .map_err(|_| {
-                    tool_err("MCP_RUNTIME_UNAVAILABLE", "could not start legacy SSE reader")
+                    tool_err(
+                        "MCP_RUNTIME_UNAVAILABLE",
+                        "could not start legacy SSE reader",
+                    )
                 })?;
         }
         self.endpoint_ready
@@ -392,7 +406,10 @@ impl SseState {
         refresh: bool,
     ) -> Result<()> {
         let endpoint = self.endpoint.get().ok_or_else(|| {
-            tool_err("MCP_TRANSPORT_UNAVAILABLE", "legacy SSE endpoint is not established")
+            tool_err(
+                "MCP_TRANSPORT_UNAVAILABLE",
+                "legacy SSE endpoint is not established",
+            )
         })?;
         let mut request = self
             .client
@@ -406,7 +423,10 @@ impl SseState {
             request = request.try_header("Authorization", value)?;
         }
         let request = request.json(frame).map_err(|_| {
-            tool_err("MCP_PROTOCOL", "could not encode legacy SSE JSON-RPC message")
+            tool_err(
+                "MCP_PROTOCOL",
+                "could not encode legacy SSE JSON-RPC message",
+            )
         })?;
         if refresh && !self.is_alive() {
             return Err(self.closed_error());
@@ -416,19 +436,18 @@ impl SseState {
         {
             return Err(tool_err("MCP_CANCELLED", "request revoked before SSE POST"));
         }
-        let response = request.timeout(timeout).send().await.map_err(|_| {
-            tool_err("MCP_TRANSPORT_IO", "legacy SSE POST did not complete")
-        })?;
+        let response = request
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|_| tool_err("MCP_TRANSPORT_IO", "legacy SSE POST did not complete"))?;
         self.check_status(response.status())?;
         // Legacy servers commonly send a textual 202 Accepted body. It has
         // no JSON-RPC meaning: dropping it avoids an unbounded body wait.
         Ok(())
     }
 
-    async fn read_stream(
-        self: &Arc<Self>,
-        response: crate::http::client::Response,
-    ) -> Result<()> {
+    async fn read_stream(self: &Arc<Self>, response: crate::http::client::Response) -> Result<()> {
         let mut budget = EventBudget::default();
         let bytes = response.bytes_stream().map(move |chunk| {
             chunk.and_then(|chunk| {
@@ -437,8 +456,7 @@ impl SseState {
             })
         });
         let mut stream = crate::sse::SseStream::new(bytes);
-        let mut replies: FuturesUnordered<BoxFuture<'static, Result<()>>> =
-            FuturesUnordered::new();
+        let mut replies: FuturesUnordered<BoxFuture<'static, Result<()>>> = FuturesUnordered::new();
         let mut turns = 0_u8;
         loop {
             if turns == 64 {
@@ -461,9 +479,8 @@ impl SseState {
                     futures::future::Either::Right((event, _)) => event,
                 }
             };
-            let event = next.ok_or_else(|| {
-                tool_err("MCP_TRANSPORT_CLOSED", "legacy SSE GET stream ended")
-            })?;
+            let event = next
+                .ok_or_else(|| tool_err("MCP_TRANSPORT_CLOSED", "legacy SSE GET stream ended"))?;
             let event = event.map_err(|error| {
                 let code = if error.kind() == std::io::ErrorKind::InvalidData {
                     "MCP_PROTOCOL"
@@ -489,7 +506,10 @@ impl SseState {
                 }
             } else {
                 self.endpoint.set(endpoint).map_err(|_| {
-                    tool_err("MCP_PROTOCOL", "legacy SSE endpoint was already established")
+                    tool_err(
+                        "MCP_PROTOCOL",
+                        "legacy SSE endpoint was already established",
+                    )
                 })?;
                 self.endpoint_ready.notify_waiters();
             }
@@ -504,9 +524,8 @@ impl SseState {
                 "legacy SSE message arrived before the endpoint",
             ));
         }
-        let value: Value = serde_json::from_str(&event.data).map_err(|_| {
-            tool_err("MCP_PROTOCOL", "legacy SSE message contains invalid JSON")
-        })?;
+        let value: Value = serde_json::from_str(&event.data)
+            .map_err(|_| tool_err("MCP_PROTOCOL", "legacy SSE message contains invalid JSON"))?;
         match value {
             Value::Array(messages) if !messages.is_empty() => {
                 for message in messages {
@@ -524,7 +543,10 @@ impl SseState {
         replies: &mut FuturesUnordered<BoxFuture<'static, Result<()>>>,
     ) -> Result<()> {
         let object = message.as_object().ok_or_else(|| {
-            tool_err("MCP_PROTOCOL", "legacy SSE JSON-RPC message must be an object")
+            tool_err(
+                "MCP_PROTOCOL",
+                "legacy SSE JSON-RPC message must be an object",
+            )
         })?;
         if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             return Err(tool_err("MCP_PROTOCOL", "legacy SSE requires JSON-RPC 2.0"));
@@ -536,9 +558,14 @@ impl SseState {
                 .ok_or_else(|| tool_err("MCP_PROTOCOL", "invalid legacy SSE RPC method"))?;
             if object.contains_key("result")
                 || object.contains_key("error")
-                || object.get("params").is_some_and(|params| !params.is_object())
+                || object
+                    .get("params")
+                    .is_some_and(|params| !params.is_object())
             {
-                return Err(tool_err("MCP_PROTOCOL", "invalid legacy SSE request envelope"));
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "invalid legacy SSE request envelope",
+                ));
             }
             let Some(id) = object.get("id") else {
                 if method == "notifications/progress" {
@@ -549,7 +576,10 @@ impl SseState {
                 return Ok(());
             };
             if !matches!(id, Value::String(_) | Value::Number(_)) {
-                return Err(tool_err("MCP_PROTOCOL", "invalid legacy SSE server request id"));
+                return Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "invalid legacy SSE server request id",
+                ));
             }
             if replies.len() >= MAX_SERVER_REPLIES {
                 return Err(tool_err(
@@ -570,11 +600,14 @@ impl SseState {
             return Ok(());
         }
         let mut pending = lock(&self.pending);
-        let waiting = pending.as_ref().ok_or_else(|| {
-            tool_err("MCP_PROTOCOL", "unsolicited legacy SSE JSON-RPC response")
-        })?;
+        let waiting = pending
+            .as_ref()
+            .ok_or_else(|| tool_err("MCP_PROTOCOL", "unsolicited legacy SSE JSON-RPC response"))?;
         if !waiting.dispatch.is_claimed() {
-            return Err(tool_err("MCP_PROTOCOL", "legacy SSE response preceded dispatch"));
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "legacy SSE response preceded dispatch",
+            ));
         }
         let result = validate_jsonrpc_response(&message, waiting.id);
         if result.as_ref().is_err_and(|error| !is_server_error(error)) {
@@ -600,11 +633,7 @@ struct PendingSseRequest {
 }
 
 impl PendingSseRequest {
-    fn new(
-        state: Arc<SseState>,
-        dispatch: Arc<RequestDispatch>,
-        cancel_allowed: bool,
-    ) -> Self {
+    fn new(state: Arc<SseState>, dispatch: Arc<RequestDispatch>, cancel_allowed: bool) -> Self {
         Self {
             state,
             dispatch,
@@ -618,7 +647,10 @@ impl PendingSseRequest {
     fn disarm(&mut self) {
         self.armed = false;
         let mut pending = lock(&self.state.pending);
-        if pending.as_ref().is_some_and(|pending| Some(pending.id) == self.id) {
+        if pending
+            .as_ref()
+            .is_some_and(|pending| Some(pending.id) == self.id)
+        {
             pending.take();
         }
     }
@@ -631,7 +663,8 @@ impl Drop for PendingSseRequest {
         }
         let dispatched = self.dispatch.cancel();
         self.state.abort();
-        if dispatched && self.cancel_allowed
+        if dispatched
+            && self.cancel_allowed
             && let (Some(runtime), Some(id)) = (self.runtime.take(), self.id)
         {
             let state = Arc::clone(&self.state);
@@ -691,7 +724,10 @@ impl SseState {
         let (sender, receiver) = sync_channel(1);
         let mut pending = lock(&self.pending);
         if pending.is_some() {
-            return Err(tool_err("MCP_PROTOCOL", "legacy SSE request lane is occupied"));
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                "legacy SSE request lane is occupied",
+            ));
         }
         *pending = Some(SsePending {
             id,
@@ -720,7 +756,10 @@ impl SseState {
             "jsonrpc": "2.0", "id": id, "method": method,
             "params": if params.is_null() { json!({}) } else { params },
         });
-        if let Err(error) = self.post(&frame, timeout, Some(&pending.dispatch), true).await {
+        if let Err(error) = self
+            .post(&frame, timeout, Some(&pending.dispatch), true)
+            .await
+        {
             // Only a rejection from this POST establishes non-delivery.
             // Authentication failure in an independent server-reply task
             // cannot prove that this already-accepted request did not run.
@@ -734,9 +773,10 @@ impl SseState {
             Err(CompletionWaitError::Timeout) => {
                 Err(tool_err("MCP_TIMEOUT", "legacy SSE response timed out"))
             }
-            Err(CompletionWaitError::Cancelled) => {
-                Err(tool_err("MCP_CANCELLED", "legacy SSE request was cancelled"))
-            }
+            Err(CompletionWaitError::Cancelled) => Err(tool_err(
+                "MCP_CANCELLED",
+                "legacy SSE request was cancelled",
+            )),
             Err(CompletionWaitError::Closed) => Err(self.closed_error()),
         }
     }
@@ -782,25 +822,32 @@ impl McpTransport for SseTransport {
             .checkpoint()
             .map_err(|_| tool_err("MCP_CANCELLED", "cancelled before legacy SSE dispatch"))?;
         if timeout.is_zero() {
-            return Err(tool_err("MCP_TIMEOUT", "legacy SSE deadline elapsed before dispatch"));
+            return Err(tool_err(
+                "MCP_TIMEOUT",
+                "legacy SSE deadline elapsed before dispatch",
+            ));
         }
         let rejected = AtomicBool::new(false);
         let result = request_deadline(
             async {
-                let _lane = asupersync::sync::OwnedMutexGuard::lock(
-                    Arc::clone(&self.lane),
-                    owner.cx(),
-                )
-                .await
-                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled before legacy SSE admission"))?;
+                let _lane =
+                    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.lane), owner.cx())
+                        .await
+                        .map_err(|_| {
+                            tool_err("MCP_CANCELLED", "cancelled before legacy SSE admission")
+                        })?;
                 let mut pending = PendingSseRequest::new(
                     Arc::clone(&self.state),
                     Arc::clone(&dispatch),
                     method != "initialize",
                 );
-                let result = Box::pin(self.state.run_until_abort(
-                    self.state.exchange(method, params, timeout, &mut pending, &rejected),
-                ))
+                let result = Box::pin(self.state.run_until_abort(self.state.exchange(
+                    method,
+                    params,
+                    timeout,
+                    &mut pending,
+                    &rejected,
+                )))
                 .await;
                 match result {
                     Ok(value) => {
@@ -851,12 +898,12 @@ impl McpTransport for SseTransport {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         request_deadline(
             async {
-                let _lane = asupersync::sync::OwnedMutexGuard::lock(
-                    Arc::clone(&self.lane),
-                    owner.cx(),
-                )
-                .await
-                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled before legacy SSE notification"))?;
+                let _lane =
+                    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.lane), owner.cx())
+                        .await
+                        .map_err(|_| {
+                            tool_err("MCP_CANCELLED", "cancelled before legacy SSE notification")
+                        })?;
                 let mut pending = PendingSseRequest::new(
                     Arc::clone(&self.state),
                     Arc::new(RequestDispatch::new()),
@@ -868,7 +915,9 @@ impl McpTransport for SseTransport {
                         "jsonrpc": "2.0", "method": method,
                         "params": if params.is_null() { json!({}) } else { params },
                     });
-                    self.state.post(&frame, DEFAULT_MCP_TIMEOUT, None, true).await
+                    self.state
+                        .post(&frame, DEFAULT_MCP_TIMEOUT, None, true)
+                        .await
                 }))
                 .await;
                 if let Err(error) = &result {
@@ -900,7 +949,10 @@ impl McpTransport for SseTransport {
     }
 
     fn diagnostics_tail(&self) -> String {
-        let mut result = format!("legacy SSE transport to {}", redacted_origin(self.state.url.as_str()));
+        let mut result = format!(
+            "legacy SSE transport to {}",
+            redacted_origin(self.state.url.as_str())
+        );
         if let Some(detail) = lock(&self.state.failure).as_ref() {
             result.push_str(": ");
             result.push_str(&config::display_safe(detail));
@@ -995,7 +1047,10 @@ mod tests {
     }
 
     fn event(stream: &mut TcpStream, kind: &str, data: &str) {
-        chunk(stream, format!("event: {kind}\ndata: {data}\n\n").as_bytes());
+        chunk(
+            stream,
+            format!("event: {kind}\ndata: {data}\n\n").as_bytes(),
+        );
     }
 
     fn message(stream: &mut TcpStream, value: Value) {
@@ -1110,39 +1165,54 @@ mod tests {
                             initialize_id = frame.get("id").cloned();
                             // Force a client response while initialization is
                             // still waiting on the independent GET channel.
-                            message(events, json!({
-                                "jsonrpc": "2.0", "id": "workspace",
-                                "method": "roots/list", "params": {},
-                            }));
+                            message(
+                                events,
+                                json!({
+                                    "jsonrpc": "2.0", "id": "workspace",
+                                    "method": "roots/list", "params": {},
+                                }),
+                            );
                         }
                         Some("tools/list") => {
-                            message(events, json!({
-                                "jsonrpc": "2.0", "id": frame["id"],
-                                "result": {"tools": [{
-                                    "name": "echo",
-                                    "description": "Echo",
-                                    "inputSchema": {"type": "object"},
-                                }]},
-                            }));
+                            message(
+                                events,
+                                json!({
+                                    "jsonrpc": "2.0", "id": frame["id"],
+                                    "result": {"tools": [{
+                                        "name": "echo",
+                                        "description": "Echo",
+                                        "inputSchema": {"type": "object"},
+                                    }]},
+                                }),
+                            );
                         }
                         Some("tools/call") => {
                             if matches!(mode, Mode::RejectReply) {
-                                message(events, json!({
-                                    "jsonrpc": "2.0", "id": "workspace",
-                                    "method": "roots/list", "params": {},
-                                }));
+                                message(
+                                    events,
+                                    json!({
+                                        "jsonrpc": "2.0", "id": "workspace",
+                                        "method": "roots/list", "params": {},
+                                    }),
+                                );
                                 continue;
                             }
-                            message(events, json!({
-                                "jsonrpc": "2.0",
-                                "method": "notifications/tools/list_changed",
-                                "params": {},
-                            }));
+                            message(
+                                events,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/tools/list_changed",
+                                    "params": {},
+                                }),
+                            );
                             if let Some(token) = frame.pointer("/params/_meta/progressToken") {
-                                message(events, json!({
-                                    "jsonrpc": "2.0", "method": "notifications/progress",
-                                    "params": {"progressToken": token, "progress": 1, "total": 2},
-                                }));
+                                message(
+                                    events,
+                                    json!({
+                                        "jsonrpc": "2.0", "method": "notifications/progress",
+                                        "params": {"progressToken": token, "progress": 1, "total": 2},
+                                    }),
+                                );
                             }
                             let response = json!({
                                 "jsonrpc": "2.0", "id": frame["id"],
@@ -1154,12 +1224,18 @@ mod tests {
                             chunk(events, &wire.as_bytes()[split..]);
                         }
                         None if frame.get("id") == Some(&Value::String("workspace".into())) => {
-                            message(events, initialized(initialize_id.take().expect("initialize id")));
+                            message(
+                                events,
+                                initialized(initialize_id.take().expect("initialize id")),
+                            );
                         }
                         Some(_) if frame.get("id").is_some() => {
-                            message(events, json!({
-                                "jsonrpc": "2.0", "id": frame["id"], "result": {},
-                            }));
+                            message(
+                                events,
+                                json!({
+                                    "jsonrpc": "2.0", "id": frame["id"], "result": {},
+                                }),
+                            );
                         }
                         _ => {}
                     }
@@ -1185,7 +1261,9 @@ mod tests {
         fn tool_posts(&self) -> usize {
             lock(&self.requests)
                 .iter()
-                .filter(|request| request.body.get("method").and_then(Value::as_str) == Some("tools/call"))
+                .filter(|request| {
+                    request.body.get("method").and_then(Value::as_str) == Some("tools/call")
+                })
                 .count()
         }
     }
@@ -1263,17 +1341,38 @@ mod tests {
             std::task::Poll::Ready(Some(update)) => update,
             _ => panic!("expected routed tool progress"),
         };
-        assert_eq!(update.details.expect("progress details")["mcpProgress"]["progress"], 1);
+        assert_eq!(
+            update.details.expect("progress details")["mcpProgress"]["progress"],
+            1
+        );
         let requests = fixture.captured();
         assert!(requests[0].line.starts_with("GET /nested/sse?"));
         let posts: Vec<_> = requests.iter().skip(1).collect();
-        assert_eq!(posts.len(), 4, "initialize, roots response, initialized, tool");
-        assert!(posts.iter().all(|request| request.line.starts_with("POST /nested/messages?session=safe ")));
-        assert!(requests.iter().all(|request| request.headers.iter().any(
-            |(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer fixture-token"
-        )));
-        let roots = posts.iter().find(|request| request.body["id"] == "workspace").expect("roots response");
-        assert!(roots.body["result"]["roots"][0]["uri"].as_str().expect("root URI").starts_with("file://"));
+        assert_eq!(
+            posts.len(),
+            4,
+            "initialize, roots response, initialized, tool"
+        );
+        assert!(posts.iter().all(|request| {
+            request
+                .line
+                .starts_with("POST /nested/messages?session=safe ")
+        }));
+        assert!(requests.iter().all(|request| {
+            request.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization") && value == "Bearer fixture-token"
+            })
+        }));
+        let roots = posts
+            .iter()
+            .find(|request| request.body["id"] == "workspace")
+            .expect("roots response");
+        assert!(
+            roots.body["result"]["roots"][0]["uri"]
+                .as_str()
+                .expect("root URI")
+                .starts_with("file://")
+        );
         assert!(!transport.diagnostics_tail().contains("not-for-diagnostics"));
     }
 
@@ -1301,16 +1400,14 @@ mod tests {
                 .to_string(),
             )
             .expect("write imported OMP configuration");
-            let manager = manager::McpManager::bootstrap(
-                workspace.path(),
-                &global_dir,
-                &[],
-                true,
-            )
-            .expect("discover imported configuration");
+            let manager = manager::McpManager::bootstrap(workspace.path(), &global_dir, &[], true)
+                .expect("discover imported configuration");
             assert!(manager.warnings().is_empty());
             runtime().block_on(async {
-                let tools = manager.trust("legacy").await.expect("initialize and list tools");
+                let tools = manager
+                    .trust("legacy")
+                    .await
+                    .expect("initialize and list tools");
                 assert_eq!(tools.len(), 1);
                 assert_eq!(tools[0].name, "echo");
                 let mounted = manager.mounted_tool_metas();
@@ -1330,17 +1427,15 @@ mod tests {
                 .iter()
                 .find(|request| request.body["method"] == "initialize")
                 .expect("manager initialization request");
-            assert_eq!(
-                initialize.body["params"]["protocolVersion"],
-                "2024-11-05"
-            );
+            assert_eq!(initialize.body["params"]["protocolVersion"], "2024-11-05");
             assert!(requests.iter().skip(1).all(|request| {
-                request.line.starts_with("POST /nested/messages?session=safe ")
+                request
+                    .line
+                    .starts_with("POST /nested/messages?session=safe ")
             }));
             assert!(requests.iter().all(|request| {
                 request.headers.iter().any(|(name, value)| {
-                    name.eq_ignore_ascii_case("authorization")
-                        && value == "Bearer fixture-token"
+                    name.eq_ignore_ascii_case("authorization") && value == "Bearer fixture-token"
                 })
             }));
             assert_eq!(fixture.tool_posts(), 1);
@@ -1428,8 +1523,8 @@ mod tests {
     #[test]
     fn legacy_endpoint_wait_honors_owner_cancellation_before_dispatch() {
         runtime().block_on(async {
-            let transport = SseTransport::new("http://127.0.0.1:1/sse", Vec::new())
-                .expect("transport");
+            let transport =
+                SseTransport::new("http://127.0.0.1:1/sse", Vec::new()).expect("transport");
             // Isolate the state after GET setup but before its endpoint event.
             // This guarantees cancellation exercises the Notify wait itself;
             // the network handshake is covered by the fixture test above.
@@ -1445,7 +1540,10 @@ mod tests {
             ));
             let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
             assert!(request.as_mut().poll(&mut context).is_pending());
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel endpoint wait"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel endpoint wait"),
+            );
             let error = match request.as_mut().poll(&mut context) {
                 std::task::Poll::Ready(Err(error)) => error,
                 _ => panic!("owner cancellation must end an idle endpoint wait immediately"),
@@ -1467,9 +1565,19 @@ mod tests {
                 Duration::from_secs(2),
             ))
             .expect_err("accepted request lost its response stream");
-        assert!(error.to_string().contains("MCP_DELIVERY_INDETERMINATE"), "{error}");
+        assert!(
+            error.to_string().contains("MCP_DELIVERY_INDETERMINATE"),
+            "{error}"
+        );
         assert_eq!(fixture.tool_posts(), 1);
-        assert_eq!(fixture.captured().iter().filter(|request| request.line.starts_with("GET ")).count(), 1);
+        assert_eq!(
+            fixture
+                .captured()
+                .iter()
+                .filter(|request| request.line.starts_with("GET "))
+                .count(),
+            1
+        );
         assert!(!transport.is_alive());
     }
 
@@ -1489,10 +1597,20 @@ mod tests {
                     Duration::from_secs(2),
                 ))
                 .expect_err("POST status cannot prove that a tool did not execute");
-            assert!(error.to_string().contains("MCP_DELIVERY_INDETERMINATE"), "{error}");
+            assert!(
+                error.to_string().contains("MCP_DELIVERY_INDETERMINATE"),
+                "{error}"
+            );
             assert!(error.to_string().contains("MCP_HTTP_STATUS"), "{error}");
             assert_eq!(fixture.tool_posts(), 1);
-            assert_eq!(fixture.captured().iter().filter(|request| request.line.starts_with("GET ")).count(), 1);
+            assert_eq!(
+                fixture
+                    .captured()
+                    .iter()
+                    .filter(|request| request.line.starts_with("GET "))
+                    .count(),
+                1
+            );
             assert!(!transport.is_alive());
         }
     }
@@ -1504,7 +1622,9 @@ mod tests {
         let post_seen = Arc::clone(&fixture.post_seen);
         let aborting = Arc::clone(&transport);
         let aborter = std::thread::spawn(move || {
-            let observed = lock(&post_seen).recv_timeout(Duration::from_secs(2)).is_ok();
+            let observed = lock(&post_seen)
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok();
             aborting.abort();
             observed
         });
@@ -1518,7 +1638,10 @@ mod tests {
             .expect_err("abort must stop the blocked POST");
         assert!(aborter.join().expect("abort thread"));
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(error.to_string().contains("MCP_DELIVERY_INDETERMINATE"), "{error}");
+        assert!(
+            error.to_string().contains("MCP_DELIVERY_INDETERMINATE"),
+            "{error}"
+        );
         assert_eq!(fixture.tool_posts(), 1);
         assert!(!transport.is_alive());
     }
@@ -1552,7 +1675,10 @@ mod tests {
                 Duration::from_secs(2),
             ))
             .expect_err("server reply authentication failure must retire the stream");
-        assert!(error.to_string().contains("MCP_DELIVERY_INDETERMINATE"), "{error}");
+        assert!(
+            error.to_string().contains("MCP_DELIVERY_INDETERMINATE"),
+            "{error}"
+        );
         assert!(transport.authentication_required());
         assert_eq!(fixture.tool_posts(), 1);
         assert!(!transport.is_alive());
@@ -1563,13 +1689,11 @@ mod tests {
         let data = "x".repeat(64 * 1024);
         let wire = format!("data: {data}\r\n\r\n").into_bytes();
         let events = MAX_HTTP_BODY / wire.len() + 2;
-        let chunks = futures::stream::iter(
-            (0..events).flat_map(move |_| {
-                // Split the CRLF delimiter itself across byte-stream chunks.
-                let split = wire.len() - 1;
-                [Ok(wire[..split].to_vec()), Ok(wire[split..].to_vec())]
-            }),
-        );
+        let chunks = futures::stream::iter((0..events).flat_map(move |_| {
+            // Split the CRLF delimiter itself across byte-stream chunks.
+            let split = wire.len() - 1;
+            [Ok(wire[..split].to_vec()), Ok(wire[split..].to_vec())]
+        }));
         let mut budget = EventBudget::default();
         let bytes = chunks.map(move |chunk: std::io::Result<Vec<u8>>| {
             chunk.and_then(|chunk| {
@@ -1586,7 +1710,10 @@ mod tests {
             }
             count
         });
-        assert_eq!(count, events, "a long-lived stream must not have a lifetime byte cap");
+        assert_eq!(
+            count, events,
+            "a long-lived stream must not have a lifetime byte cap"
+        );
         let mut oversized = EventBudget::default();
         assert!(oversized.check(&vec![b'x'; MAX_HTTP_BODY + 1]).is_err());
     }

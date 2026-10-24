@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::config::{ConfiguredServer, McpDiscovery, McpOAuthConfig, Provenance};
-use super::transport::{DEFAULT_MCP_TIMEOUT, McpTransport};
 #[cfg(test)]
 use super::transport::MCP_PROTOCOL_VERSION;
+use super::transport::{DEFAULT_MCP_TIMEOUT, McpTransport};
 use super::trust::{TrustDecision, TrustStore, TrustWriteGuard};
 use crate::error::{Error, Result};
 
@@ -690,7 +690,9 @@ impl McpManager {
             async {
                 // Do not hold the connection lane during browser interaction:
                 // unauth/deny/shutdown must be able to revoke a pending flow.
-                let configuration = self.resolve_authentication_configuration(&entry, client_id).await?;
+                let configuration = self
+                    .resolve_authentication_configuration(&entry, client_id)
+                    .await?;
                 binding.reauthenticate(configuration, on_url, check).await?;
                 let _lane = asupersync::sync::OwnedMutexGuard::lock(
                     Arc::clone(&entry.connect_lane),
@@ -738,7 +740,9 @@ impl McpManager {
         let cwd = entry.effective_cwd(&self.inner.cwd);
         let workspace = self.inner.cwd.clone();
         let trust_path = self.inner.trust_path.clone();
-        let manager = Self { inner: Arc::clone(&self.inner) };
+        let manager = Self {
+            inner: Arc::clone(&self.inner),
+        };
         let entry = Arc::clone(entry);
         let abandoned = Arc::new(AtomicBool::new(false));
         let abandoned_worker = Arc::clone(&abandoned);
@@ -749,7 +753,10 @@ impl McpManager {
                 catalog::check_request_owner(&owner)?;
                 manager.check_running()?;
                 if abandoned_worker.load(Ordering::Acquire) {
-                    return Err(tool_err("MCP_CANCELLED", "MCP credential resolution was cancelled"));
+                    return Err(tool_err(
+                        "MCP_CANCELLED",
+                        "MCP credential resolution was cancelled",
+                    ));
                 }
                 if !Arc::ptr_eq(&manager.entry(&config.name)?, &entry) {
                     return Err(tool_err(
@@ -1986,7 +1993,10 @@ impl McpManager {
                 env: optional_string_map(spec, "env")?,
                 url: optional_string(spec, "url")?,
                 headers: optional_string_map(spec, "headers")?,
-                oauth: spec.get("oauth").map(super::config::parse_oauth_config).transpose()?,
+                oauth: spec
+                    .get("oauth")
+                    .map(super::config::parse_oauth_config)
+                    .transpose()?,
                 transport_hint,
                 enabled: super::config::configured_enabled(spec)?,
                 cwd: None,
@@ -2132,14 +2142,18 @@ fn resolve_oauth_settings(
         oauth.client_id = Some(client_id);
         oauth.client_secret = None;
     }
-    oauth.validate_raw().map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
+    oauth
+        .validate_raw()
+        .map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
     check()?;
     if !public_override {
         for (name, field) in [
             ("clientId", &mut oauth.client_id),
             ("clientSecret", &mut oauth.client_secret),
         ] {
-            let Some(raw) = field.as_ref() else { continue; };
+            let Some(raw) = field.as_ref() else {
+                continue;
+            };
             check()?;
             if config.provenance != Provenance::Acp
                 && raw.trim().starts_with("$CMD:")
@@ -2161,10 +2175,12 @@ fn resolve_oauth_settings(
                 "MCP_SECRET_UNRESOLVED",
                 format!("cannot resolve oauth.{name}; credential values and helper output are redacted"),
             ))?;
-            let (_, value) = resolved.pop().ok_or_else(|| tool_err(
-                "MCP_SECRET_UNRESOLVED",
-                format!("oauth.{name} did not resolve to a value"),
-            ))?;
+            let (_, value) = resolved.pop().ok_or_else(|| {
+                tool_err(
+                    "MCP_SECRET_UNRESOLVED",
+                    format!("oauth.{name} did not resolve to a value"),
+                )
+            })?;
             *field = Some(value);
         }
     }
@@ -2180,12 +2196,16 @@ fn resolve_oauth_settings(
         {
             // Ordinary OAuth options support variable interpolation only.
             // Expanded values never acquire command-execution semantics.
-            *field = Some(super::config::expand_config_value(raw, workspace).map_err(|_| {
-                tool_err("MCP_CONFIG_INVALID", format!("cannot expand oauth.{name}"))
-            })?);
+            *field = Some(
+                super::config::expand_config_value(raw, workspace).map_err(|_| {
+                    tool_err("MCP_CONFIG_INVALID", format!("cannot expand oauth.{name}"))
+                })?,
+            );
         }
     }
-    oauth.validate_resolved().map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
+    oauth
+        .validate_resolved()
+        .map_err(|reason| tool_err("MCP_CONFIG_INVALID", reason))?;
     check()?;
     Ok(oauth)
 }

@@ -7,7 +7,10 @@ fn notebook(cell: Value) -> Vec<u8> {
 
 #[test]
 fn multiline_fields_are_concatenated_without_inventing_separators() {
-    assert_eq!(multiline(&json!(["one", "two\n", "界"])).unwrap(), "onetwo\n界");
+    assert_eq!(
+        multiline(&json!(["one", "two\n", "界"])).unwrap(),
+        "onetwo\n界"
+    );
     for value in [json!(["keep", 3]), json!(null), json!({})] {
         assert!(multiline(&value).is_err());
     }
@@ -15,11 +18,13 @@ fn multiline_fields_are_concatenated_without_inventing_separators() {
 
 #[test]
 fn saved_streams_errors_and_outputs_remain_in_order() {
-    let raw = notebook(json!({"cell_type":"code","source":"work()","execution_count":3,"outputs":[
-        {"output_type":"stream","name":"stderr","text":["first", "\n"]},
-        {"output_type":"error","ename":"ValueError","evalue":"second","traceback":["frame one", "frame two"]},
-        {"output_type":"stream","name":"stdout","text":"third"}
-    ]}));
+    let raw = notebook(
+        json!({"cell_type":"code","source":"work()","execution_count":3,"outputs":[
+            {"output_type":"stream","name":"stderr","text":["first", "\n"]},
+            {"output_type":"error","ename":"ValueError","evalue":"second","traceback":["frame one", "frame two"]},
+            {"output_type":"stream","name":"stdout","text":"third"}
+        ]}),
+    );
     let text = render(&raw).unwrap();
     assert!(text.find("first").unwrap() < text.find("ValueError: second").unwrap());
     assert!(text.find("frame one").unwrap() < text.find("frame two").unwrap());
@@ -56,14 +61,18 @@ fn html_only_outputs_use_static_reader_not_executable_markup() {
 
 #[test]
 fn binary_widget_and_attachment_payloads_are_not_echoed() {
-    let raw = notebook(json!({"cell_type":"markdown","source":"diagram","attachments":{
-        "inline.png":{"image/png":"attachment secret"}},"outputs":[
-        {"output_type":"display_data","data":{"image/png":"binary secret","application/vnd.jupyter.widget-view+json":{"model_id":"widget secret"}}}
-    ]}));
+    let raw = notebook(
+        json!({"cell_type":"markdown","source":"diagram","attachments":{
+            "inline.png":{"image/png":"attachment secret"}},"outputs":[
+            {"output_type":"display_data","data":{"image/png":"binary secret","application/vnd.jupyter.widget-view+json":{"model_id":"widget secret"}}}
+        ]}),
+    );
     let text = render(&raw).unwrap();
     assert!(text.contains("1 saved attachments"));
     assert!(text.contains("binary/widget output was not rendered"));
-    for secret in ["attachment secret", "binary secret", "widget secret"] { assert!(!text.contains(secret)); }
+    for secret in ["attachment secret", "binary secret", "widget secret"] {
+        assert!(!text.contains(secret));
+    }
 }
 
 #[test]
@@ -78,31 +87,58 @@ fn raw_code_fences_and_terminal_controls_are_rendered_as_data() {
 
 #[test]
 fn unknown_types_are_explicit_and_malformed_known_fields_fail() {
-    let raw = notebook(json!({"cell_type":"future_cell","source":"kept source","outputs":[
-        {"output_type":"future_output","payload":"not interpreted"}
-    ]}));
+    let raw = notebook(
+        json!({"cell_type":"future_cell","source":"kept source","outputs":[
+            {"output_type":"future_output","payload":"not interpreted"}
+        ]}),
+    );
     let text = render(&raw).unwrap();
     assert!(text.contains("kept source"));
     assert!(text.contains("Unsupported saved output type"));
     assert!(!text.contains("not interpreted"));
-    for output in [json!({"output_type":"stream","text":7}),
+    for output in [
+        json!({"output_type":"stream","text":7}),
         json!({"output_type":"display_data","data":null}),
-        json!({"output_type":"error","ename":"Bad","evalue":"error","traceback":[3]})] {
-        assert!(render(&notebook(json!({"cell_type":"code","source":"x","outputs":[output]}))).is_err());
+        json!({"output_type":"error","ename":"Bad","evalue":"error","traceback":[3]}),
+    ] {
+        assert!(
+            render(&notebook(
+                json!({"cell_type":"code","source":"x","outputs":[output]})
+            ))
+            .is_err()
+        );
     }
-    assert!(render(&notebook(json!({"cell_type":"code","source":"x","execution_count":true}))).is_err());
+    assert!(
+        render(&notebook(
+            json!({"cell_type":"code","source":"x","execution_count":true})
+        ))
+        .is_err()
+    );
 }
 
 #[test]
 fn cell_output_and_render_limits_refuse_instead_of_truncating() {
-    assert!(render(&serde_json::to_vec(&json!({"nbformat":4,"cells":vec![json!({}); MAX_CELLS+1]})).unwrap()).is_err());
-    let raw = notebook(json!({"cell_type":"code","source":"x","outputs":vec![json!({}); MAX_OUTPUTS+1]}));
+    assert!(
+        render(
+            &serde_json::to_vec(&json!({"nbformat":4,"cells":vec![json!({}); MAX_CELLS+1]}))
+                .unwrap()
+        )
+        .is_err()
+    );
+    let raw =
+        notebook(json!({"cell_type":"code","source":"x","outputs":vec![json!({}); MAX_OUTPUTS+1]}));
     assert!(render(&raw).unwrap_err().to_string().contains("LIMIT"));
-    let mut out = Render { bytes: Vec::new(), limit: 10 };
+    let mut out = Render {
+        bytes: Vec::new(),
+        limit: 10,
+    };
     out.push("1234567890").unwrap();
     assert!(out.push("x").is_err());
     assert_eq!(out.bytes.len(), 10);
-    let mut out = Render { bytes: Vec::new(), limit: 20 };
+    let mut out = Render {
+        bytes: Vec::new(),
+        limit: 20,
+    };
     assert!(out.json(&json!({"large":"x".repeat(50)})).is_err());
     assert!(out.bytes.len() <= 20);
 }

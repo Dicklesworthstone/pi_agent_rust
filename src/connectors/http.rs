@@ -739,12 +739,15 @@ mod deployment_method_tests {
             headers: &[(String, String)],
             body: &[u8],
         ) -> Result<TransportResponse> {
-            self.calls.lock().expect("recording lock").push(RecordedCall {
-                method: method.to_string(),
-                url: url.to_string(),
-                headers: headers.to_vec(),
-                body: body.to_vec(),
-            });
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .push(RecordedCall {
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    headers: headers.to_vec(),
+                    body: body.to_vec(),
+                });
             Ok((
                 201,
                 vec![(
@@ -1051,10 +1054,7 @@ mod timeout_budget_tests {
             json!(false),
         ] {
             let params = json!({"timeout": value, "timeoutMs": value, "timeout_ms": value});
-            assert_eq!(
-                prepared_timeout(params.clone(), Some(75), 30_000),
-                Some(75)
-            );
+            assert_eq!(prepared_timeout(params.clone(), Some(75), 30_000), Some(75));
             assert_eq!(
                 prepared_timeout(params.clone(), Some(0), 30_000),
                 Some(30_000)

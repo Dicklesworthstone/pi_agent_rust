@@ -1557,7 +1557,10 @@ pub enum UiCommand {
     /// replays the rewritten history into the transcript.
     Compact,
     /// Generate and install a continuation brief without changing sessions.
-    Handoff { focus: String, request: HandoffRequest },
+    Handoff {
+        focus: String,
+        request: HandoffRequest,
+    },
     /// OMP `/shake` (also `/compact shake`): compact by dropping bulky tool
     /// output from the older span, with no model summary.
     Shake,
@@ -2924,8 +2927,15 @@ impl PiFtuiModel {
 
     #[allow(clippy::too_many_lines)]
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
-        if let PiMsg::McpAuthFinished { request_id, message } = msg {
-            if self.mcp_auth_request.as_ref().map(|request| request.id.as_str())
+        if let PiMsg::McpAuthFinished {
+            request_id,
+            message,
+        } = msg
+        {
+            if self
+                .mcp_auth_request
+                .as_ref()
+                .map(|request| request.id.as_str())
                 != Some(request_id.as_str())
             {
                 return Cmd::none();
@@ -2942,7 +2952,10 @@ impl PiFtuiModel {
             return self.handle_agent(PiMsg::System(message));
         }
         if let PiMsg::HandoffFinished { request_id, event } = msg {
-            if self.busy.as_ref().and_then(|op| op.handoff.as_ref().map(|request| request.id.as_str()))
+            if self
+                .busy
+                .as_ref()
+                .and_then(|op| op.handoff.as_ref().map(|request| request.id.as_str()))
                 != Some(request_id.as_str())
             {
                 return Cmd::none();
@@ -3469,11 +3482,17 @@ impl PiFtuiModel {
     /// turn is starting or ending) becomes the next prompt instead.
     fn submit_mid_turn(&mut self, follow_up: bool) {
         if self.mcp_auth_request.is_some() {
-            self.push_entry(EntryRole::Error, String::from("MCP authentication is still running; press Escape to cancel it."));
+            self.push_entry(
+                EntryRole::Error,
+                String::from("MCP authentication is still running; press Escape to cancel it."),
+            );
             return;
         }
         if self.handoff_in_progress() {
-            self.push_entry(EntryRole::Error, String::from("Handoff is still running; press Escape to cancel it."));
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Handoff is still running; press Escape to cancel it."),
+            );
             return;
         }
         let text = self.input.text();
@@ -3650,14 +3669,20 @@ impl PiFtuiModel {
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
         if self.mcp_auth_request.is_some() {
-            self.push_entry(EntryRole::Error, String::from("MCP authentication is still running; press Escape to cancel it."));
+            self.push_entry(
+                EntryRole::Error,
+                String::from("MCP authentication is still running; press Escape to cancel it."),
+            );
             return;
         }
         if self.settings_pending {
             return;
         }
         if self.handoff_in_progress() {
-            self.push_entry(EntryRole::Error, String::from("Handoff is still running; press Escape to cancel it."));
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Handoff is still running; press Escape to cancel it."),
+            );
             return;
         }
         let text = self.input.text();
@@ -3917,7 +3942,10 @@ impl PiFtuiModel {
                 match crate::interactive::workspace_reports::handoff_mode(rest) {
                     Ok(crate::interactive::workspace_reports::HandoffMode::InPlace(focus)) => {
                         let Some(owner_session_id) = self.displayed_session_id.clone() else {
-                            self.push_entry(EntryRole::Error, String::from("Handoff unavailable: session is still loading"));
+                            self.push_entry(
+                                EntryRole::Error,
+                                String::from("Handoff unavailable: session is still loading"),
+                            );
                             return true;
                         };
                         let request = HandoffRequest::new(owner_session_id);
@@ -3925,7 +3953,10 @@ impl PiFtuiModel {
                         if let Some(busy) = &mut self.busy {
                             busy.handoff = Some(request.clone());
                         }
-                        self.send_command(UiCommand::Handoff { focus: focus.to_string(), request });
+                        self.send_command(UiCommand::Handoff {
+                            focus: focus.to_string(),
+                            request,
+                        });
                         return true;
                     }
                     Ok(_) => {}
@@ -4100,28 +4131,40 @@ impl PiFtuiModel {
             let subcommand = if verb.is_empty() { "list" } else { verb }.to_ascii_lowercase();
             let authentication = matches!(subcommand.as_str(), "reauth" | "unauth");
             let name = (!remainder.is_empty()).then(|| remainder.to_string());
-            let valid = !rest.contains(['\r', '\n']) && match subcommand.as_str() {
-                "list" => name.is_none(),
-                "trust" | "deny" | "test" =>
-                    name.is_some() && remainder.split_whitespace().count() == 1,
-                "reauth" | "unauth" => name.is_some(),
-                _ => false,
-            };
+            let valid = !rest.contains(['\r', '\n'])
+                && match subcommand.as_str() {
+                    "list" => name.is_none(),
+                    "trust" | "deny" | "test" => {
+                        name.is_some() && remainder.split_whitespace().count() == 1
+                    }
+                    "reauth" | "unauth" => name.is_some(),
+                    _ => false,
+                };
             if valid {
                 if authentication {
                     if self.busy.is_some() || self.state == AgentUiState::Working {
-                        self.push_entry(EntryRole::Error, String::from("MCP authentication needs an idle session"));
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from("MCP authentication needs an idle session"),
+                        );
                         return true;
                     }
                     let Some(owner_session_id) = self.displayed_session_id.clone() else {
-                        self.push_entry(EntryRole::Error, String::from("MCP authentication unavailable: session is still loading"));
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from(
+                                "MCP authentication unavailable: session is still loading",
+                            ),
+                        );
                         return true;
                     };
                     let request = McpAuthRequest::new(owner_session_id);
                     self.mcp_auth_request = Some(request.clone());
                     self.begin_busy("MCP authentication (Escape to cancel) ...");
                     self.send_command(UiCommand::McpAuth {
-                        subcommand, name: remainder.to_string(), request,
+                        subcommand,
+                        name: remainder.to_string(),
+                        request,
                     });
                 } else {
                     self.send_command(UiCommand::Mcp { subcommand, name });
@@ -4809,12 +4852,17 @@ impl PiFtuiModel {
 
     /// Cancel an operator command that uses the driver's shared abort lane.
     fn abort_driver_operation(&mut self) -> bool {
-        let abort = self.mcp_auth_request.as_ref().map(|request| request.abort.clone())
-            .or_else(|| self.turn_abort.as_ref().and_then(|slot| {
-                slot.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            }));
+        let abort = self
+            .mcp_auth_request
+            .as_ref()
+            .map(|request| request.abort.clone())
+            .or_else(|| {
+                self.turn_abort.as_ref().and_then(|slot| {
+                    slot.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+            });
         if let Some(abort) = abort {
             // Later keys can still reach an older turn or the normal exit path.
             if abort.signal().is_aborted() {
@@ -5180,13 +5228,21 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::CursorDown));
                 let page = self.body_height().saturating_sub(1).max(1);
                 if self.handoff_in_progress()
-                    && matches!(action, Some(
-                        AppAction::SelectModel | AppAction::OpenSettings
-                        | AppAction::CycleThinkingLevel | AppAction::CycleModelForward
-                        | AppAction::CycleModelBackward
-                    ))
+                    && matches!(
+                        action,
+                        Some(
+                            AppAction::SelectModel
+                                | AppAction::OpenSettings
+                                | AppAction::CycleThinkingLevel
+                                | AppAction::CycleModelForward
+                                | AppAction::CycleModelBackward
+                        )
+                    )
                 {
-                    self.push_entry(EntryRole::Error, String::from("Handoff is still running; press Escape to cancel it."));
+                    self.push_entry(
+                        EntryRole::Error,
+                        String::from("Handoff is still running; press Escape to cancel it."),
+                    );
                     return Cmd::none();
                 }
                 match action {
@@ -6592,17 +6648,28 @@ async fn run_handoff_command(
     let event = if abort_signal.is_aborted() {
         PiMsg::System("Handoff cancelled".to_string())
     } else {
-        match handle.with_session(|session| session.header.id.clone()).await {
+        match handle
+            .with_session(|session| session.header.id.clone())
+            .await
+        {
             Ok(owner) if owner == request.owner_session_id => {
                 crate::interactive::workspace_reports::run_in_place_handoff(
-                    handle, focus, &abort_signal,
-                ).await
+                    handle,
+                    focus,
+                    &abort_signal,
+                )
+                .await
             }
-            Ok(_) => PiMsg::AgentError("Handoff cancelled: the session changed before it started".to_string()),
+            Ok(_) => PiMsg::AgentError(
+                "Handoff cancelled: the session changed before it started".to_string(),
+            ),
             Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
         }
     };
-    let _ = agent_tx.send(PiMsg::HandoffFinished { request_id: request.id, event: Box::new(event) });
+    let _ = agent_tx.send(PiMsg::HandoffFinished {
+        request_id: request.id,
+        event: Box::new(event),
+    });
 }
 
 const BTW_USAGE: &str = "Usage: /btw <question>";
@@ -7486,13 +7553,18 @@ async fn run_mcp_auth_command(
     agent_tx: &Sender<PiMsg>,
 ) {
     let finish = |message: String| {
-        *turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *turn_abort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let _ = agent_tx.send(PiMsg::McpAuthFinished {
-            request_id: request.id.clone(), message,
+            request_id: request.id.clone(),
+            message,
         });
     };
     let abort_signal = request.abort.signal();
-    *turn_abort.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.abort.clone());
+    *turn_abort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.abort.clone());
     if abort_signal.is_aborted() {
         finish("MCP authentication cancelled".to_string());
         return;
@@ -7506,14 +7578,19 @@ async fn run_mcp_auth_command(
     let callback_failed = Arc::clone(&output_failed);
     let callback_tx = agent_tx.clone();
     let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
-        if callback_tx.send(PiMsg::SystemNote(format!(
-            "Open this URL to sign in to the MCP server:\n{url}\n"
-        ))).is_err() {
+        if callback_tx
+            .send(PiMsg::SystemNote(format!(
+                "Open this URL to sign in to the MCP server:\n{url}\n"
+            )))
+            .is_err()
+        {
             callback_failed.store(true, std::sync::atomic::Ordering::Release);
         }
     });
     let work = owner.with_current(async {
-        let current_session = handle.with_session(|session| session.header.id.clone()).await?;
+        let current_session = handle
+            .with_session(|session| session.header.id.clone())
+            .await?;
         if current_session != request.owner_session_id {
             return Err(crate::error::Error::validation(
                 "MCP authentication cancelled: the session changed before it started",
@@ -7537,15 +7614,17 @@ async fn run_mcp_auth_command(
         futures::future::Either::Left(((), pending)) => {
             drop(pending);
             Err(crate::error::Error::tool(
-                "mcp", "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
+                "mcp",
+                "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
             ))
         }
         futures::future::Either::Right((result, _)) => result,
     };
     crate::mcp::reconcile_tools(&manager, &handle.session().agent.shared_tools());
     let message = match outcome {
-        Ok(()) if subcommand == "unauth" =>
-            format!("Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."),
+        Ok(()) if subcommand == "unauth" => format!(
+            "Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."
+        ),
         Ok(()) => format!("Signed in to MCP server {name:?}; its tool catalog has been refreshed."),
         Err(error) => format!("MCP {name:?}: {error}"),
     };
@@ -13051,7 +13130,9 @@ mod tests {
             .with_submit_channel(submit_tx)
             .with_turn_abort(Arc::clone(&slot));
         model.displayed_session_id = Some("current-session".into());
-        model.input.set_text("/HANDOFF preserve @notes.md and Next Steps");
+        model
+            .input
+            .set_text("/HANDOFF preserve @notes.md and Next Steps");
         model.submit_input();
         let UiCommand::Handoff { focus, request } = submit_rx.try_recv().unwrap() else {
             panic!("native handoff route");
@@ -13064,19 +13145,27 @@ mod tests {
             crate::interactive::FtuiStatusSnapshot::default(),
         ));
         let _ = model.handle_agent(PiMsg::AgentDone {
-            usage: None, stop_reason: StopReason::Stop, error_message: None,
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
         });
         let _ = model.handle_agent(PiMsg::MessagePicker {
-            fork: false, messages: vec![("earlier branch".into(), "old-entry".into())],
+            fork: false,
+            messages: vec![("earlier branch".into(), "old-entry".into())],
         });
-        assert!(model.picker.is_none(), "late pickers cannot replace handoff ownership");
+        assert!(
+            model.picker.is_none(),
+            "late pickers cannot replace handoff ownership"
+        );
         let _ = model.handle_agent(PiMsg::HandoffFinished {
-            request_id: "older-request".into(), event: Box::new(PiMsg::System("stale".into())),
+            request_id: "older-request".into(),
+            event: Box::new(PiMsg::System("stale".into())),
         });
         assert!(model.handoff_in_progress());
         assert!(!model.transcript.iter().any(|entry| entry.text == "stale"));
         let _ = model.handle_agent(PiMsg::LoginPending {
-            provider: Some("late-login".into()), accepts_empty_input: false,
+            provider: Some("late-login".into()),
+            accepts_empty_input: false,
         });
         model.input.set_text("Keep this draft");
         model.submit_input();
@@ -13085,12 +13174,21 @@ mod tests {
         assert!(submit_rx.try_recv().is_err());
         assert!(model.handoff_in_progress());
         let _ = model.handle_agent(PiMsg::HandoffFinished {
-            request_id: request.id, event: Box::new(PiMsg::System("Handoff cancelled".into())),
+            request_id: request.id,
+            event: Box::new(PiMsg::System("Handoff cancelled".into())),
         });
         assert!(!model.handoff_in_progress());
         assert_eq!(model.input.text(), "Keep this draft");
-        assert!(model.transcript.iter().any(|entry| entry.text == "Handoff cancelled"));
-        eprintln!("{}", serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"request_owned_busy"}));
+        assert!(
+            model
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "Handoff cancelled")
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"request_owned_busy"})
+        );
     }
 
     #[test]
@@ -13110,17 +13208,32 @@ mod tests {
         assert!(submit_rx.try_recv().is_err());
         assert_eq!(model.busy_label(), Some("loading session ..."));
         model.busy = None;
-        for args in ["--report", "--report human", "--model -- remaining work", "--import /tmp/brief.json"] {
+        for args in [
+            "--report",
+            "--report human",
+            "--model -- remaining work",
+            "--import /tmp/brief.json",
+        ] {
             assert!(model.route_slash_command(&format!("/handoff {args}")));
-            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Workspace {
-                command: workspace_commands::WorkspaceCommand::Handoff, args: args.into(),
-            });
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::Workspace {
+                    command: workspace_commands::WorkspaceCommand::Handoff,
+                    args: args.into(),
+                }
+            );
             model.busy = None;
         }
         assert!(model.route_slash_command("/handoff --unknown target"));
         assert!(submit_rx.try_recv().is_err());
         assert!(model.busy.is_none());
-        assert!(model.transcript.iter().any(|entry| entry.role == EntryRole::Error && entry.text.contains("Usage: /handoff")));
+        assert!(
+            model
+                .transcript
+                .iter()
+                .any(|entry| entry.role == EntryRole::Error
+                    && entry.text.contains("Usage: /handoff"))
+        );
     }
 
     #[test]
@@ -13137,16 +13250,20 @@ mod tests {
             };
             let _ = model.handle_agent(PiMsg::AgentStart);
             let _ = model.handle_agent(PiMsg::SessionSystemNote {
-                owner_session_id: "current-session".into(), message: "Background answer".into(),
+                owner_session_id: "current-session".into(),
+                message: "Background answer".into(),
             });
             let _ = model.handle_agent(PiMsg::AgentDone {
-                usage: None, stop_reason: StopReason::Stop, error_message: None,
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
             });
             assert_eq!(model.state, AgentUiState::Working);
             assert!(model.handoff_in_progress());
             let event = if success {
                 PiMsg::ConversationReset {
-                    session_id: "current-session".into(), messages: Vec::new(),
+                    session_id: "current-session".into(),
+                    messages: Vec::new(),
                     usage: crate::model::Usage::default(),
                     status: Some("Handoff saved".into()),
                 }
@@ -13154,15 +13271,24 @@ mod tests {
                 PiMsg::System("Handoff cancelled".into())
             };
             let _ = model.handle_agent(PiMsg::HandoffFinished {
-                request_id: request.id, event: Box::new(event),
+                request_id: request.id,
+                event: Box::new(event),
             });
             assert_eq!(model.state, AgentUiState::Ready);
             assert!(!model.handoff_in_progress());
             assert!(model.deferred_notes.is_empty());
-            assert!(model.transcript.iter().any(|entry| entry.text == "Background answer"));
+            assert!(
+                model
+                    .transcript
+                    .iter()
+                    .any(|entry| entry.text == "Background answer")
+            );
             model.input.set_text("Continue the work");
             model.submit_input();
-            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Prompt("Continue the work".into()));
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::Prompt("Continue the work".into())
+            );
         }
     }
 
@@ -13301,12 +13427,18 @@ mod tests {
             sim.init();
             type_str(&mut sim, "earlier prompt");
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Prompt("earlier prompt".into()));
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::Prompt("earlier prompt".into())
+            );
             // The preceding prompt has not yet delivered AgentStart.
             type_str(&mut sim, "/mcp reauth remote  service");
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-            let UiCommand::McpAuth { subcommand, name, request } =
-                submit_rx.try_recv().expect("operator command")
+            let UiCommand::McpAuth {
+                subcommand,
+                name,
+                request,
+            } = submit_rx.try_recv().expect("operator command")
             else {
                 panic!("expected native MCP authentication command");
             };
@@ -13324,13 +13456,24 @@ mod tests {
                 PiMsg::System("An older MCP test completed".into()),
                 PiMsg::AgentError("Unrelated background task failed".into()),
                 PiMsg::AgentDone {
-                    usage: None, stop_reason: crate::model::StopReason::Stop, error_message: None,
+                    usage: None,
+                    stop_reason: crate::model::StopReason::Stop,
+                    error_message: None,
                 },
-                PiMsg::McpAuthFinished { request_id: "older-auth".into(), message: "stale".into() },
+                PiMsg::McpAuthFinished {
+                    request_id: "older-auth".into(),
+                    message: "stale".into(),
+                },
             ] {
                 sim.send(PiFtuiMsg::Agent(notice));
-                assert!(sim.model().busy.is_some(), "only the matching auth completion ends busy");
-                assert_eq!(sim.model().mcp_auth_request.as_ref().unwrap().id, request.id);
+                assert!(
+                    sim.model().busy.is_some(),
+                    "only the matching auth completion ends busy"
+                );
+                assert_eq!(
+                    sim.model().mcp_auth_request.as_ref().unwrap().id,
+                    request.id
+                );
                 assert!(matches!(sim.model().state, AgentUiState::Working));
             }
             for draft in ["keep this draft", "/queue next", "/new"] {
@@ -13338,19 +13481,32 @@ mod tests {
                 sim.model_mut().submit_input();
                 sim.model_mut().submit_mid_turn(true);
                 assert_eq!(sim.model().input.text(), draft);
-                assert!(submit_rx.try_recv().is_err(), "auth must not enqueue foreground work");
+                assert!(
+                    submit_rx.try_recv().is_err(),
+                    "auth must not enqueue foreground work"
+                );
             }
             sim.inject_event(cancel);
             assert!(auth_signal.is_aborted());
-            assert!(!earlier_signal.is_aborted(), "cancel targets the admitted auth request");
-            assert!(!sim.model_mut().abort_driver_operation(), "an aborted auth request must not swallow later cancellation keys");
+            assert!(
+                !earlier_signal.is_aborted(),
+                "cancel targets the admitted auth request"
+            );
+            assert!(
+                !sim.model_mut().abort_driver_operation(),
+                "an aborted auth request must not swallow later cancellation keys"
+            );
             sim.send(PiFtuiMsg::Agent(PiMsg::McpAuthFinished {
-                request_id: request.id, message: "MCP authentication cancelled".into(),
+                request_id: request.id,
+                message: "MCP authentication cancelled".into(),
             }));
             assert!(sim.model().busy.is_none());
             assert!(sim.model().mcp_auth_request.is_none());
             assert!(matches!(sim.model().state, AgentUiState::Ready));
-            assert!(slot.lock().expect("slot").is_some(), "UI cannot erase another driver handle");
+            assert!(
+                slot.lock().expect("slot").is_some(),
+                "UI cannot erase another driver handle"
+            );
         }
     }
 
@@ -17902,24 +18058,44 @@ mod tests {
         assert!(request.abort.signal().is_aborted());
         assert!(sim.model().handoff_in_progress());
         sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));
-        assert!(submit_rx.try_recv().is_err(), "settings cannot replace the handoff owner");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "settings cannot replace the handoff owner"
+        );
         assert!(sim.model().handoff_in_progress());
         let provider = Arc::new(NativePromptProbe::default());
         let mut handle = native_prompt_handle(Arc::clone(&provider));
         let (agent_tx, agent_rx) = mpsc::channel();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         // A different queued workspace command can replace and clear the
         // legacy global slot without touching this request's cancellation.
         *slot.lock().unwrap() = Some(crate::agent::AbortHandle::new().0);
         *slot.lock().unwrap() = None;
         runtime.block_on(run_handoff_command(&mut handle, &focus, request, &agent_tx));
         assert!(provider.calls.lock().unwrap().is_empty());
-        assert!(handle.session_store().try_lock().unwrap().entries.is_empty());
+        assert!(
+            handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         assert!(slot.lock().unwrap().is_none());
         sim.send(PiFtuiMsg::Agent(agent_rx.try_recv().unwrap()));
         assert!(!sim.model().handoff_in_progress());
-        assert!(sim.model().transcript.iter().any(|entry| entry.text == "Handoff cancelled"));
-        eprintln!("{}", serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"pre_dequeue_escape"}));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "Handoff cancelled")
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"pre_dequeue_escape"})
+        );
     }
 
     #[test]
@@ -17928,7 +18104,9 @@ mod tests {
         use crate::session::{Session, SessionEntry, SessionMessage};
         let reactor = asupersync::runtime::reactor::create_reactor().unwrap();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .with_reactor(reactor).build().unwrap();
+            .with_reactor(reactor)
+            .build()
+            .unwrap();
         runtime.block_on(Box::pin(async {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("interactive-handoff.jsonl");
@@ -17999,8 +18177,15 @@ mod tests {
         let request = HandoffRequest::new("replaced-session".into());
         let expected_request_id = request.id.clone();
         let (agent_tx, agent_rx) = mpsc::channel();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(run_handoff_command(&mut handle, "keep the original task", request, &agent_tx));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(run_handoff_command(
+            &mut handle,
+            "keep the original task",
+            request,
+            &agent_tx,
+        ));
         let PiMsg::HandoffFinished { request_id, event } = agent_rx.try_recv().unwrap() else {
             panic!("owned terminal refusal");
         };
@@ -18008,7 +18193,14 @@ mod tests {
         assert!(matches!(event.as_ref(), PiMsg::AgentError(message)
             if message.contains("session changed before it started")));
         assert!(provider.calls.lock().unwrap().is_empty());
-        assert!(handle.session_store().try_lock().unwrap().entries.is_empty());
+        assert!(
+            handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         assert!(handle.session().agent.messages().is_empty());
     }
 

@@ -759,12 +759,7 @@ pub fn persist_provider_model_catalog(
             catalog.provider
         ))
     })?;
-    persist_provider_model_catalog_rows(
-        models_path,
-        catalog,
-        route_fingerprint,
-        fetched_at_unix_ms,
-    )
+    persist_provider_model_catalog_rows(models_path, catalog, route_fingerprint, fetched_at_unix_ms)
 }
 
 fn persist_provider_model_catalog_rows(

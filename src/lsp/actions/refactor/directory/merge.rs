@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use super::{Result, check_response_size, inside_root, parse_workspace_edit, tool_err, try_path_to_uri};
+use super::{
+    Result, check_response_size, inside_root, parse_workspace_edit, tool_err, try_path_to_uri,
+};
 use crate::lsp::client::uri_to_path;
 use crate::lsp::refactor_preview::MAX_REFACTOR_SERVERS;
 use crate::lsp::text::Range;
@@ -47,16 +49,23 @@ fn overlap(a: Range, b: Range) -> bool {
 /// Bound the combined wire payload before cloning any individual edit strings.
 pub(super) fn admit(raws: &[Value]) -> Result<()> {
     if raws.is_empty() || raws.len() > MAX_REFACTOR_SERVERS {
-        return Err(tool_err("LSP_EDIT_LIMIT", "rename requires 1..8 server edit sets"));
+        return Err(tool_err(
+            "LSP_EDIT_LIMIT",
+            "rename requires 1..8 server edit sets",
+        ));
     }
     struct Limit(usize);
     impl std::io::Write for Limit {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_sub(bytes.len())
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
                 .ok_or_else(|| std::io::Error::other("combined import edits exceed 2 MiB"))?;
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     serde_json::to_writer(&mut Limit(crate::lsp::actions::MAX_ACTION_BYTES), raws)
         .map_err(|_| tool_err("LSP_EDIT_LIMIT", "combined import edits exceed 2 MiB"))
@@ -69,13 +78,23 @@ pub(super) fn combine(raws: &[Value], root: &Path) -> Result<Merged> {
     for (source, raw) in raws.iter().enumerate() {
         let plan = parse_workspace_edit(raw)?;
         if !plan.file_ops.is_empty() {
-            return Err(conflict("coordinated import edits cannot contain server resource operations"));
+            return Err(conflict(
+                "coordinated import edits cannot contain server resource operations",
+            ));
         }
-        let annotations: BTreeMap<_, _> = raw.get("changeAnnotations")
-            .and_then(Value::as_object).into_iter().flat_map(|table| table.iter())
-            .enumerate().map(|(index, (id, value))| {
-                (id.as_str(), (format!("s{source}-a{index}"), Arc::new(value.clone())))
-            }).collect();
+        let annotations: BTreeMap<_, _> = raw
+            .get("changeAnnotations")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|table| table.iter())
+            .enumerate()
+            .map(|(index, (id, value))| {
+                (
+                    id.as_str(),
+                    (format!("s{source}-a{index}"), Arc::new(value.clone())),
+                )
+            })
+            .collect();
         let mut seen = BTreeSet::new();
         let mut document = |uri: &str, edits: &Value| -> Result<()> {
             let path = uri_to_path(uri).ok_or_else(|| conflict("unsupported import-edit URI"))?;
@@ -84,13 +103,24 @@ pub(super) fn combine(raws: &[Value], root: &Path) -> Result<Merged> {
             inside_root(&path, root)?;
             let path = path.canonicalize()?;
             if !seen.insert(path.clone()) {
-                return Err(conflict("one server returned sequential or aliased edits for the same file; cannot merge their coordinate spaces"));
+                return Err(conflict(
+                    "one server returned sequential or aliased edits for the same file; cannot merge their coordinate spaces",
+                ));
             }
-            let edits = edits.as_array().ok_or_else(|| conflict("invalid import-edit array"))?;
-            edit_count = edit_count.checked_add(edits.len()).filter(|count| *count <= MAX_EDITS)
-                .ok_or_else(|| tool_err("LSP_EDIT_LIMIT", "combined import edits exceed 32768 edits"))?;
+            let edits = edits
+                .as_array()
+                .ok_or_else(|| conflict("invalid import-edit array"))?;
+            edit_count = edit_count
+                .checked_add(edits.len())
+                .filter(|count| *count <= MAX_EDITS)
+                .ok_or_else(|| {
+                    tool_err("LSP_EDIT_LIMIT", "combined import edits exceed 32768 edits")
+                })?;
             if !documents.contains_key(&path) && documents.len() >= 1024 {
-                return Err(tool_err("LSP_EDIT_LIMIT", "combined import edits exceed 1024 files"));
+                return Err(tool_err(
+                    "LSP_EDIT_LIMIT",
+                    "combined import edits exceed 1024 files",
+                ));
             }
             let target = documents.entry(path).or_default();
             for edit in edits {
@@ -100,26 +130,41 @@ pub(super) fn combine(raws: &[Value], root: &Path) -> Result<Merged> {
                 if range.end < range.start {
                     return Err(conflict("reversed import-edit range"));
                 }
-                let text = inner["newText"].as_str()
-                    .ok_or_else(|| conflict("import edit is missing newText"))?.to_string();
-                let annotation = edit.get("annotationId").or_else(|| inner.get("annotationId"))
-                    .and_then(Value::as_str).map(|id| {
-                        annotations.get(id).cloned()
+                let text = inner["newText"]
+                    .as_str()
+                    .ok_or_else(|| conflict("import edit is missing newText"))?
+                    .to_string();
+                let annotation = edit
+                    .get("annotationId")
+                    .or_else(|| inner.get("annotationId"))
+                    .and_then(Value::as_str)
+                    .map(|id| {
+                        annotations
+                            .get(id)
+                            .cloned()
                             .ok_or_else(|| conflict("missing import-edit annotation"))
-                    }).transpose()?;
-                target.push(Edit { range, text, annotation });
+                    })
+                    .transpose()?;
+                target.push(Edit {
+                    range,
+                    text,
+                    annotation,
+                });
             }
             Ok(())
         };
         // Match WorkspaceEdit's normative documentChanges precedence exactly.
         if let Some(changes) = raw.get("documentChanges").and_then(Value::as_array) {
             for change in changes {
-                let uri = change["textDocument"]["uri"].as_str()
+                let uri = change["textDocument"]["uri"]
+                    .as_str()
                     .ok_or_else(|| conflict("missing import-edit document URI"))?;
                 document(uri, &change["edits"])?;
             }
         } else if let Some(changes) = raw.get("changes").and_then(Value::as_object) {
-            for (uri, edits) in changes { document(uri, edits)?; }
+            for (uri, edits) in changes {
+                document(uri, edits)?;
+            }
         }
     }
     let mut changes = Vec::with_capacity(documents.len());
@@ -137,7 +182,9 @@ pub(super) fn combine(raws: &[Value], root: &Path) -> Result<Merged> {
                     continue;
                 }
                 if overlap(previous.range, edit.range) {
-                    return Err(conflict("language servers returned overlapping or differently annotated import edits; no server was preferred and nothing was applied"));
+                    return Err(conflict(
+                        "language servers returned overlapping or differently annotated import edits; no server was preferred and nothing was applied",
+                    ));
                 }
             }
             kept.push(edit);
@@ -147,11 +194,15 @@ pub(super) fn combine(raws: &[Value], root: &Path) -> Result<Merged> {
             let mut value = json!({"range":edit.range,"newText":edit.text});
             if let Some((id, annotation)) = edit.annotation {
                 value["annotationId"] = json!(id);
-                annotations.entry(id).or_insert_with(|| (*annotation).clone());
+                annotations
+                    .entry(id)
+                    .or_insert_with(|| (*annotation).clone());
             }
             output.push(value);
         }
-        changes.push(json!({"textDocument":{"uri":try_path_to_uri(&path)?,"version":null},"edits":output}));
+        changes.push(
+            json!({"textDocument":{"uri":try_path_to_uri(&path)?,"version":null},"edits":output}),
+        );
     }
     let edit = json!({"documentChanges":changes,"changeAnnotations":annotations});
     check_response_size(&edit)?;
@@ -186,12 +237,26 @@ mod tests {
     #[test]
     fn independent_import_edits_apply_to_original_coordinates() {
         let (_temp, root, uri) = workspace();
-        let merged = combine(&[wire(&uri, vec![edit(0, 1, "long")]), wire(&uri, vec![edit(4, 6, "Z")])], &root).unwrap();
-        let prepared = PreparedEdit::new(&parse_workspace_edit(&merged.edit).unwrap(), &HashMap::new()).unwrap();
+        let merged = combine(
+            &[
+                wire(&uri, vec![edit(0, 1, "long")]),
+                wire(&uri, vec![edit(4, 6, "Z")]),
+            ],
+            &root,
+        )
+        .unwrap();
+        let prepared = PreparedEdit::new(
+            &parse_workspace_edit(&merged.edit).unwrap(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(root.join("source")).unwrap(), b"abcdef\n");
         prepared.commit(|| Ok(())).unwrap();
         assert_eq!(std::fs::read(root.join("source")).unwrap(), b"longbcdZ\n");
-        eprintln!("{}", json!({"case":"merge_original_coordinates","event":"verified","sources":2}));
+        eprintln!(
+            "{}",
+            json!({"case":"merge_original_coordinates","event":"verified","sources":2})
+        );
     }
 
     #[test]
@@ -200,12 +265,32 @@ mod tests {
         let a = wire(&uri, vec![edit(1, 3, "X")]);
         let merged = combine(&[a.clone(), a.clone()], &root).unwrap();
         assert_eq!(merged.duplicates, 1);
-        assert_eq!(merged.edit["documentChanges"][0]["edits"].as_array().unwrap().len(), 1);
-        for b in [edit(1, 3, "Y"), edit(2, 4, "Z"), edit(1, 1, "insert"), edit(3, 3, "insert")] {
-            assert!(combine(&[a.clone(), wire(&uri, vec![b])], &root).err().unwrap().to_string().contains("LSP_RENAME_CONFLICT"));
+        assert_eq!(
+            merged.edit["documentChanges"][0]["edits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        for b in [
+            edit(1, 3, "Y"),
+            edit(2, 4, "Z"),
+            edit(1, 1, "insert"),
+            edit(3, 3, "insert"),
+        ] {
+            assert!(
+                combine(&[a.clone(), wire(&uri, vec![b])], &root)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("LSP_RENAME_CONFLICT")
+            );
         }
         assert_eq!(std::fs::read(root.join("source")).unwrap(), b"abcdef\n");
-        eprintln!("{}", json!({"case":"merge_conflicts","event":"verified","silentPreference":false}));
+        eprintln!(
+            "{}",
+            json!({"case":"merge_conflicts","event":"verified","silentPreference":false})
+        );
     }
 
     #[test]
@@ -220,13 +305,24 @@ mod tests {
             raws.push(raw);
         }
         let merged = combine(&raws, &root).unwrap();
-        let prepared = PreparedEdit::new(&parse_workspace_edit(&merged.edit).unwrap(), &HashMap::new()).unwrap();
+        let prepared = PreparedEdit::new(
+            &parse_workspace_edit(&merged.edit).unwrap(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(prepared.required_annotations().len(), 2);
         assert!(prepared.commit(|| Ok(())).is_err());
-        let prepared = PreparedEdit::new(&parse_workspace_edit(&merged.edit).unwrap(), &HashMap::new()).unwrap();
+        let prepared = PreparedEdit::new(
+            &parse_workspace_edit(&merged.edit).unwrap(),
+            &HashMap::new(),
+        )
+        .unwrap();
         prepared.commit_reviewed(|| Ok(())).unwrap();
         assert_eq!(std::fs::read(root.join("source")).unwrap(), b"XbcdXf\n");
-        eprintln!("{}", json!({"case":"merge_annotations","event":"verified","confirmations":2}));
+        eprintln!(
+            "{}",
+            json!({"case":"merge_annotations","event":"verified","confirmations":2})
+        );
     }
 
     #[test]
@@ -235,9 +331,13 @@ mod tests {
         let plain = wire(&uri, vec![edit(0, 1, "X")]);
         let mut annotated = plain.clone();
         annotated["changes"][&uri][0]["annotationId"] = json!("review");
-        annotated["changeAnnotations"] = json!({"review":{"label":"must review","needsConfirmation":true}});
+        annotated["changeAnnotations"] =
+            json!({"review":{"label":"must review","needsConfirmation":true}});
         assert!(combine(&[plain, annotated], &root).is_err());
-        eprintln!("{}", json!({"case":"merge_annotation_conflict","event":"verified"}));
+        eprintln!(
+            "{}",
+            json!({"case":"merge_annotation_conflict","event":"verified"})
+        );
     }
 
     #[test]
@@ -248,7 +348,10 @@ mod tests {
         let merged = combine(&[raw], &root).unwrap();
         assert!(merged.edit["documentChanges"][0]["textDocument"]["version"].is_null());
         assert_eq!(merged.edit["documentChanges"].as_array().unwrap().len(), 1);
-        eprintln!("{}", json!({"case":"merge_version_scope","event":"verified"}));
+        eprintln!(
+            "{}",
+            json!({"case":"merge_version_scope","event":"verified"})
+        );
     }
 
     #[test]
@@ -256,9 +359,18 @@ mod tests {
         let (_temp, root, uri) = workspace();
         let change = json!({"textDocument":{"uri":uri,"version":null},"edits":[edit(0, 1, "X")]});
         assert!(combine(&[json!({"documentChanges":[change.clone(),change]})], &root).is_err());
-        assert!(combine(&[json!({"documentChanges":[{"kind":"delete","uri":uri}]})], &root).is_err());
+        assert!(
+            combine(
+                &[json!({"documentChanges":[{"kind":"delete","uri":uri}]})],
+                &root
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(root.join("source")).unwrap(), b"abcdef\n");
-        eprintln!("{}", json!({"case":"merge_unsupported_operations","event":"verified"}));
+        eprintln!(
+            "{}",
+            json!({"case":"merge_unsupported_operations","event":"verified"})
+        );
     }
 
     #[test]
@@ -267,7 +379,13 @@ mod tests {
         assert!(combine(&[], &root).is_err());
         assert!(combine(&vec![Value::Null; MAX_REFACTOR_SERVERS + 1], &root).is_err());
         let large = wire(&uri, vec![edit(0, 1, &"x".repeat(1024 * 1024))]);
-        assert!(combine(&[large.clone(), large], &root).err().unwrap().to_string().contains("LSP_EDIT_LIMIT"));
+        assert!(
+            combine(&[large.clone(), large], &root)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("LSP_EDIT_LIMIT")
+        );
         assert_eq!(std::fs::read(root.join("source")).unwrap(), b"abcdef\n");
         eprintln!("{}", json!({"case":"merge_limits","event":"verified"}));
     }

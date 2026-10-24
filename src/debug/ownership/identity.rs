@@ -11,7 +11,8 @@ use crate::error::Result;
 use crate::jobs::JobSessionScope;
 
 fn checkpoint(owner: &AgentCx, deadline: Instant) -> Result<()> {
-    owner.checkpoint()
+    owner
+        .checkpoint()
         .map_err(|_| tool_err("DAP_CANCELLED", "debug owner resolution cancelled"))?;
     if Instant::now() >= deadline {
         return Err(tool_err(
@@ -26,7 +27,11 @@ pub(super) async fn resolve(scope: &JobSessionScope, owner: &AgentCx) -> Result<
     resolve_before(scope, owner, Instant::now() + DEFAULT_DAP_TIMEOUT).await
 }
 
-async fn resolve_before(scope: &JobSessionScope, owner: &AgentCx, deadline: Instant) -> Result<String> {
+async fn resolve_before(
+    scope: &JobSessionScope,
+    owner: &AgentCx,
+    deadline: Instant,
+) -> Result<String> {
     // Retire the resolver under its request's context even when a queued tool
     // is dropped on another worker. Never keep a thread-local guard over await.
     let mut pending = Box::pin(owner.with_current(scope.session_id()));
@@ -42,7 +47,9 @@ async fn resolve_before(scope: &JobSessionScope, owner: &AgentCx, deadline: Inst
                 "waiting for the current agent session requires timer capability",
             ));
         }
-        let wait = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(20));
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(20));
         let time = owner.time();
         let sleeper = Box::pin(time.sleep(wait));
         match futures::future::select(pending, sleeper).await {
@@ -53,10 +60,12 @@ async fn resolve_before(scope: &JobSessionScope, owner: &AgentCx, deadline: Inst
     // Cancellation or a blocking Ready poll that overran its deadline cannot
     // become success just because identity resolution completed in that poll.
     checkpoint(owner, deadline)?;
-    result.map_err(|_| tool_err(
-        "DAP_SESSION_UNAVAILABLE",
-        "current agent session identity is unavailable",
-    ))
+    result.map_err(|_| {
+        tool_err(
+            "DAP_SESSION_UNAVAILABLE",
+            "current agent session identity is unavailable",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -67,7 +76,10 @@ mod tests {
 
     fn run<F: std::future::Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(1, 8).build().unwrap().block_on(future)
+            .blocking_threads(1, 8)
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     #[test]
@@ -81,7 +93,9 @@ mod tests {
         }));
         let owner = AgentCx::for_request();
         run(async {
-            let error = resolve_before(&scope, &owner, Instant::now()).await.unwrap_err();
+            let error = resolve_before(&scope, &owner, Instant::now())
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("DAP_SESSION_TIMEOUT"));
             owner.set_cancel_requested(true);
             let error = resolve(&scope, &owner).await.unwrap_err();
@@ -94,7 +108,9 @@ mod tests {
     fn a_pending_resolver_is_dropped_at_its_deadline() {
         struct OnDrop(Arc<AtomicBool>);
         impl Drop for OnDrop {
-            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
         }
         let dropped = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&dropped);
@@ -109,7 +125,9 @@ mod tests {
         let owner = AgentCx::for_request();
         run(async {
             let start = Instant::now();
-            let error = resolve_before(&scope, &owner, start + Duration::from_millis(30)).await.unwrap_err();
+            let error = resolve_before(&scope, &owner, start + Duration::from_millis(30))
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("DAP_SESSION_TIMEOUT"));
             assert!(start.elapsed() < Duration::from_secs(5));
         });
@@ -138,14 +156,18 @@ mod tests {
     fn a_blocking_ready_resolution_cannot_overrun_the_deadline_as_success() {
         let owner = AgentCx::for_request();
         let scope = JobSessionScope::fixed("unused");
-        scope.bind(Arc::new(|| Box::pin(async {
-            // Deliberately block one poll, not an asynchronous timer: the
-            // result must still fail the post-poll deadline check.
-            std::thread::sleep(Duration::from_millis(20));
-            Some("owner-a".into())
-        })));
+        scope.bind(Arc::new(|| {
+            Box::pin(async {
+                // Deliberately block one poll, not an asynchronous timer: the
+                // result must still fail the post-poll deadline check.
+                std::thread::sleep(Duration::from_millis(20));
+                Some("owner-a".into())
+            })
+        }));
         run(async {
-            let error = resolve_before(&scope, &owner, Instant::now() + Duration::from_millis(5)).await.unwrap_err();
+            let error = resolve_before(&scope, &owner, Instant::now() + Duration::from_millis(5))
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("DAP_SESSION_TIMEOUT"));
         });
     }

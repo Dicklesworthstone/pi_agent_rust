@@ -53,10 +53,13 @@ impl OwnershipStop {
     }
 
     pub(super) fn tool_error(self) -> Error {
-        Error::tool("eval", format!(
-            "{}: active cell no longer has its original session owner; EVAL_STATE_RESET: selected kernel discarded",
-            self.code()
-        ))
+        Error::tool(
+            "eval",
+            format!(
+                "{}: active cell no longer has its original session owner; EVAL_STATE_RESET: selected kernel discarded",
+                self.code()
+            ),
+        )
     }
 }
 
@@ -72,11 +75,18 @@ pub(super) struct CellSession {
 
 impl CellSession {
     pub(super) fn new(scope: JobSessionScope, expected: String) -> Self {
-        Self { expected, scope, stop: Mutex::new(None) }
+        Self {
+            expected,
+            scope,
+            stop: Mutex::new(None),
+        }
     }
 
     fn stopped(&self) -> Option<OwnershipStop> {
-        *self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) async fn check(&self) -> std::result::Result<(), OwnershipStop> {
@@ -89,7 +99,10 @@ impl CellSession {
             Ok(_) => None,
             Err(_) => Some(OwnershipStop::Unavailable),
         };
-        let mut stop = self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stop = self
+            .stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(failure) = failure {
             let _ = stop.get_or_insert(failure);
         }
@@ -114,13 +127,16 @@ impl Activation {
     pub(super) fn annotate(&self, output: &mut ToolOutput) {
         if let Some(Value::Object(details)) = output.details.as_mut() {
             // Do not disclose another session's ID or kernel contents.
-            details.insert("kernelSession".into(), json!({
-                "scope": "session",
-                "changed": self.changed,
-                "namespaceRestored": self.restored,
-                "idleNamespaceEvicted": self.evicted,
-                "capacity": MAX_RETAINED_SESSIONS,
-            }));
+            details.insert(
+                "kernelSession".into(),
+                json!({
+                    "scope": "session",
+                    "changed": self.changed,
+                    "namespaceRestored": self.restored,
+                    "idleNamespaceEvicted": self.evicted,
+                    "capacity": MAX_RETAINED_SESSIONS,
+                }),
+            );
         }
     }
 }
@@ -133,10 +149,20 @@ impl EvalTool {
     pub(super) fn bind_eval_session_scope(&mut self, scope: JobSessionScope) {
         self.session_scope = scope;
         let retired = std::mem::take(
-            self.retained_sessions.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner),
+            self.retained_sessions
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let python = self.kernel.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        let javascript = self.js.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let python = self
+            .kernel
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let javascript = self
+            .js
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         drop(python);
         drop(javascript);
         drop(retired);
@@ -146,10 +172,16 @@ impl EvalTool {
     /// must not fall back to the preceding session or a process-global kernel.
     pub(super) async fn eval_session_id(&self) -> Result<String> {
         let id = self.session_scope.session_id().await.map_err(|_| {
-            Error::tool("eval", "EVAL_SESSION_UNAVAILABLE: current session identity is unavailable")
+            Error::tool(
+                "eval",
+                "EVAL_SESSION_UNAVAILABLE: current session identity is unavailable",
+            )
         })?;
         if id.len() > MAX_SESSION_ID_BYTES {
-            return Err(Error::tool("eval", "EVAL_SESSION_UNAVAILABLE: session identity exceeds 1024 bytes"));
+            return Err(Error::tool(
+                "eval",
+                "EVAL_SESSION_UNAVAILABLE: session identity exceeds 1024 bytes",
+            ));
         }
         Ok(id)
     }
@@ -174,22 +206,39 @@ impl EvalTool {
         owner: &AgentCx,
     ) -> Activation {
         let (activation, evicted) = {
-            let mut retained = self.retained_sessions.lock()
+            let mut retained = self
+                .retained_sessions
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if retained.active.as_deref() == Some(session_id) {
-                return Activation { changed: false, restored: false, evicted: false };
+                return Activation {
+                    changed: false,
+                    restored: false,
+                    evicted: false,
+                };
             }
             let changed = retained.active.is_some();
-            let index = retained.dormant.iter().position(|entry| entry.session_id == session_id);
+            let index = retained
+                .dormant
+                .iter()
+                .position(|entry| entry.session_id == session_id);
             let mut incoming = index.and_then(|index| retained.dormant.remove(index));
             let restored = incoming.is_some();
-            let mut python = self.kernel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut javascript = self.js.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut python = self
+                .kernel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut javascript = self
+                .js
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous_python = std::mem::replace(
-                &mut *python, incoming.as_mut().and_then(|entry| entry.python.take()),
+                &mut *python,
+                incoming.as_mut().and_then(|entry| entry.python.take()),
             );
             let previous_javascript = std::mem::replace(
-                &mut *javascript, incoming.as_mut().and_then(|entry| entry.javascript.take()),
+                &mut *javascript,
+                incoming.as_mut().and_then(|entry| entry.javascript.take()),
             );
             let previous = retained.active.replace(session_id.to_string());
             // All production runners activate before spawning. Keep an orphan
@@ -211,10 +260,17 @@ impl EvalTool {
                     None
                 }
             };
-            let did_evict = evicted.as_ref().is_some_and(|entry| {
-                entry.python.is_some() || entry.javascript.is_some()
-            });
-            (Activation { changed, restored, evicted: did_evict }, evicted)
+            let did_evict = evicted
+                .as_ref()
+                .is_some_and(|entry| entry.python.is_some() || entry.javascript.is_some());
+            (
+                Activation {
+                    changed,
+                    restored,
+                    evicted: did_evict,
+                },
+                evicted,
+            )
         };
         // PyKernel's ProcessGuard reaps its owned process tree. JsKernel Drop
         // revokes its worker. Never run either cleanup under a cache/slot lock.

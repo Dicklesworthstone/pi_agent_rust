@@ -7,8 +7,8 @@
 //! Their host acquires the run control before the first poll, without new rights.
 
 use super::{
-    GoalBudget, GoalControl, GoalPersistence, GoalReconciliation, GoalRunReport, GoalStatus, MAX_TEXT_BYTES,
-    Record, Transition, append, check_owner, failure, latest, persist, snapshot,
+    GoalBudget, GoalControl, GoalPersistence, GoalReconciliation, GoalRunReport, GoalStatus,
+    MAX_TEXT_BYTES, Record, Transition, append, check_owner, failure, latest, persist, snapshot,
     transition, validate_text,
 };
 use crate::agent_cx::AgentCx;
@@ -27,11 +27,22 @@ const MAX_REPORT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 enum Action<'a> {
-    Create { objective: &'a str, budget: GoalBudget },
-    Budget { reason: &'a str, budget: GoalBudget },
-    Reconcile { outcome: GoalReconciliation, evidence: &'a str },
+    Create {
+        objective: &'a str,
+        budget: GoalBudget,
+    },
+    Budget {
+        reason: &'a str,
+        budget: GoalBudget,
+    },
+    Reconcile {
+        outcome: GoalReconciliation,
+        evidence: &'a str,
+    },
     Step,
-    Run { steps: u32 },
+    Run {
+        steps: u32,
+    },
     Pause,
     Resume,
     Drop(&'a str),
@@ -78,12 +89,18 @@ fn parse(args: &str) -> Result<Command<'_>> {
     let mut remaining = args;
     let verb = word(&mut remaining).unwrap_or("status");
     if verb.eq_ignore_ascii_case("status") {
-        return if word(&mut remaining).is_none() { Ok(Command::Status) } else { Err(usage()) };
+        return if word(&mut remaining).is_none() {
+            Ok(Command::Status)
+        } else {
+            Err(usage())
+        };
     }
     let review = word(&mut remaining).ok_or_else(usage)?;
     if review.len() != RECEIPT_PREFIX.len() + 64
         || !review.starts_with(RECEIPT_PREFIX)
-        || !review[RECEIPT_PREFIX.len()..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !review[RECEIPT_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(usage());
     }
@@ -98,12 +115,14 @@ fn parse(args: &str) -> Result<Command<'_>> {
                     Some("--tokens") if !tokens_seen => {
                         tokens_seen = true;
                         budget.token_budget = word(&mut remaining)
-                            .and_then(|value| value.parse().ok()).ok_or_else(usage)?;
+                            .and_then(|value| value.parse().ok())
+                            .ok_or_else(usage)?;
                     }
                     Some("--prompts") if !prompts_seen => {
                         prompts_seen = true;
                         budget.max_prompts = word(&mut remaining)
-                            .and_then(|value| value.parse().ok()).ok_or_else(usage)?;
+                            .and_then(|value| value.parse().ok())
+                            .ok_or_else(usage)?;
                     }
                     Some("--") => {
                         remaining = saved;
@@ -114,13 +133,21 @@ fn parse(args: &str) -> Result<Command<'_>> {
             }
             // Existing creation defaults remain useful, but revising one
             // total must not silently reset the other to a default allowance.
-            if revising && !(tokens_seen && prompts_seen) { return Err(usage()); }
+            if revising && !(tokens_seen && prompts_seen) {
+                return Err(usage());
+            }
             budget.validate()?;
             let text = text_tail(&mut remaining)?;
             if revising {
-                Action::Budget { reason: text, budget }
+                Action::Budget {
+                    reason: text,
+                    budget,
+                }
             } else {
-                Action::Create { objective: text, budget }
+                Action::Create {
+                    objective: text,
+                    budget,
+                }
             }
         }
         "drop" => Action::Drop(text_tail(&mut remaining)?),
@@ -132,7 +159,10 @@ fn parse(args: &str) -> Result<Command<'_>> {
                 Some("--drop") => GoalReconciliation::Drop,
                 _ => return Err(usage()),
             };
-            Action::Reconcile { outcome, evidence: text_tail(&mut remaining)? }
+            Action::Reconcile {
+                outcome,
+                evidence: text_tail(&mut remaining)?,
+            }
         }
         "run" => {
             if word(&mut remaining) != Some("--steps") {
@@ -148,7 +178,9 @@ fn parse(args: &str) -> Result<Command<'_>> {
             Action::Run { steps }
         }
         "step" | "pause" | "resume" | "save" => {
-            if word(&mut remaining).is_some() { return Err(usage()); }
+            if word(&mut remaining).is_some() {
+                return Err(usage());
+            }
             match verb.to_ascii_lowercase().as_str() {
                 "step" => Action::Step,
                 "pause" => Action::Pause,
@@ -171,10 +203,14 @@ fn receipt(
     live_plan: PlanMode,
     persistent: bool,
 ) -> Result<String> {
-    if session.header.id.is_empty() || session.header.id.len() > 1024
+    if session.header.id.is_empty()
+        || session.header.id.len() > 1024
         || session.leaf_id().is_some_and(|id| id.len() > 1024)
     {
-        return Err(failure("GOAL_REVIEW", "session identity is missing or oversized"));
+        return Err(failure(
+            "GOAL_REVIEW",
+            "session identity is missing or oversized",
+        ));
     }
     let state = serde_json::to_vec(&(
         "pi.goal.terminal-review.v1",
@@ -195,7 +231,10 @@ fn receipt(
 
 fn require_no_plan(session: &Session, live: PlanMode) -> Result<()> {
     if live != PlanMode::Off || crate::plan::replayed_plan_mode(session) != PlanMode::Off {
-        return Err(failure("GOAL_PLAN_MODE", "exit plan mode before creating, resuming or running a goal"));
+        return Err(failure(
+            "GOAL_PLAN_MODE",
+            "exit plan mode before creating, resuming or running a goal",
+        ));
     }
     Ok(())
 }
@@ -220,19 +259,27 @@ pub(crate) async fn run_with_control(
     let persistent = handle.session().save_enabled();
     let live_plan = handle.session().agent.plan_state().mode();
     let store = handle.session_store();
-    let mut session = store.try_lock_owned()
+    let mut session = store
+        .try_lock_owned()
         .map_err(|_| failure("GOAL_BUSY", "session is busy; retry /goal status when idle"))?;
     let mut current = latest(&session)?;
     let expected = receipt(&session, &current, live_plan, persistent)?;
     let Command::Change { review, action } = command else {
-        return Ok(render(current.as_ref().map(|(_, record)| record), &expected));
+        return Ok(render(
+            current.as_ref().map(|(_, record)| record),
+            &expected,
+        ));
     };
     if review != expected {
-        return Err(failure("GOAL_STALE", "session, branch or goal changed; run /goal status and review it again. Nothing was changed."));
+        return Err(failure(
+            "GOAL_STALE",
+            "session, branch or goal changed; run /goal status and review it again. Nothing was changed.",
+        ));
     }
     if matches!(action, Action::Step | Action::Run { .. }) {
         require_no_plan(&session, live_plan)?;
-        let (id, record) = current.as_ref()
+        let (id, record) = current
+            .as_ref()
             .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
         let reviewed = snapshot(&store, &session, id.clone(), record.clone());
         let (requested_steps, label) = match action {
@@ -258,43 +305,72 @@ pub(crate) async fn run_with_control(
         let live_plan = handle.session().agent.plan_state().mode();
         let persistent = handle.session().save_enabled();
         let store = handle.session_store();
-        let session = store.try_lock_owned()
+        let session = store
+            .try_lock_owned()
             .map_err(|_| failure("GOAL_BUSY", "session is busy after goal execution"))?;
         let current = latest(&session)?;
         let review = receipt(&session, &current, live_plan, persistent)?;
-        let _ = write!(output, "{}", render(current.as_ref().map(|(_, record)| record), &review));
+        let _ = write!(
+            output,
+            "{}",
+            render(current.as_ref().map(|(_, record)| record), &review)
+        );
         return Ok(output);
     }
     check_owner(&owner, persistent)?;
     let next = match action {
         Action::Create { objective, budget } => {
             require_no_plan(&session, live_plan)?;
-            if current.as_ref().is_some_and(|(_, record)| !record.status.terminal()) {
-                return Err(failure("GOAL_EXISTS", "resume or explicitly drop the existing goal before replacing it"));
+            if current
+                .as_ref()
+                .is_some_and(|(_, record)| !record.status.terminal())
+            {
+                return Err(failure(
+                    "GOAL_EXISTS",
+                    "resume or explicitly drop the existing goal before replacing it",
+                ));
             }
             Some(Record::new(objective, budget)?)
         }
         Action::Budget { budget, reason } => {
-            let (_, record) = current.as_ref()
+            let (_, record) = current
+                .as_ref()
                 .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
-            Some(transition(record.clone(), Transition::Budget { budget, reason })?)
+            Some(transition(
+                record.clone(),
+                Transition::Budget { budget, reason },
+            )?)
         }
         Action::Reconcile { outcome, evidence } => {
-            let (_, record) = current.as_ref()
+            let (_, record) = current
+                .as_ref()
                 .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
-            Some(transition(record.clone(), Transition::Reconcile { outcome, evidence })?)
+            Some(transition(
+                record.clone(),
+                Transition::Reconcile { outcome, evidence },
+            )?)
         }
         Action::Save => {
-            if current.is_none() { return Err(failure("GOAL_MISSING", "this branch has no goal to save")); }
+            if current.is_none() {
+                return Err(failure("GOAL_MISSING", "this branch has no goal to save"));
+            }
             None
         }
-        Action::Step | Action::Run { .. } => unreachable!("execution handled before journal mutation"),
+        Action::Step | Action::Run { .. } => {
+            unreachable!("execution handled before journal mutation")
+        }
         Action::Pause | Action::Resume | Action::Drop(_) | Action::Complete(_) => {
-            if matches!(action, Action::Resume) { require_no_plan(&session, live_plan)?; }
-            let (_, record) = current.as_ref()
+            if matches!(action, Action::Resume) {
+                require_no_plan(&session, live_plan)?;
+            }
+            let (_, record) = current
+                .as_ref()
                 .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
             if matches!(action, Action::Pause) && record.in_flight {
-                return Err(failure("GOAL_INTERRUPTED", "an unfinished attempt is already paused; inspect history and side effects, then use /goal reconcile, resume or drop"));
+                return Err(failure(
+                    "GOAL_INTERRUPTED",
+                    "an unfinished attempt is already paused; inspect history and side effects, then use /goal reconcile, resume or drop",
+                ));
             }
             let change = match action {
                 Action::Pause => Transition::Pause("Paused by terminal user"),
@@ -316,7 +392,11 @@ pub(crate) async fn run_with_control(
     }
     let persistence = persist(&mut session, &owner, persistent).await;
     let review = receipt(&session, &current, live_plan, persistent)?;
-    Ok(format!("{}\n{}", persistence_text(&persistence), render(current.as_ref().map(|(_, record)| record), &review)))
+    Ok(format!(
+        "{}\n{}",
+        persistence_text(&persistence),
+        render(current.as_ref().map(|(_, record)| record), &review)
+    ))
 }
 
 /// Quote a bounded amount of native output; never truncate the final review
@@ -324,11 +404,15 @@ pub(crate) async fn run_with_control(
 /// ASCII bytes plus line prefixes are emitted per source scalar.
 fn report_text(output: &mut String, text: &str) {
     let available = MAX_REPORT_BYTES.saturating_sub(output.len());
-    if available < 128 { return; }
+    if available < 128 {
+        return;
+    }
     let bounded: String = text.chars().take((available - 128) / 16).collect();
     quoted(output, &bounded);
     if bounded.len() < text.len() {
-        output.push_str("[native output truncated; inspect the session history before replaying work]\n");
+        output.push_str(
+            "[native output truncated; inspect the session history before replaying work]\n",
+        );
     }
 }
 
@@ -339,7 +423,9 @@ fn report_message(output: &mut String, message: &AssistantMessage) {
         report_text(output, error);
     }
     for block in &message.content {
-        if output.len() >= MAX_REPORT_BYTES.saturating_sub(128) { break; }
+        if output.len() >= MAX_REPORT_BYTES.saturating_sub(128) {
+            break;
+        }
         if let ContentBlock::Text(text) = block
             && !text.text.trim().is_empty()
         {
@@ -375,9 +461,15 @@ fn execution_report(label: &str, report: &GoalRunReport) -> String {
         report_text(&mut output, &error.to_string());
     }
     if !report.pending.is_empty() {
-        let _ = writeln!(output, "{} unsent input(s) were NOT replayed. Review before resubmitting:", report.pending.len());
+        let _ = writeln!(
+            output,
+            "{} unsent input(s) were NOT replayed. Review before resubmitting:",
+            report.pending.len()
+        );
         for input in &report.pending {
-            if output.len() >= MAX_REPORT_BYTES.saturating_sub(128) { break; }
+            if output.len() >= MAX_REPORT_BYTES.saturating_sub(128) {
+                break;
+            }
             report_text(&mut output, &input.text);
         }
     }
@@ -390,7 +482,10 @@ fn execution_report(label: &str, report: &GoalRunReport) -> String {
 fn escaped(text: &str) -> String {
     let mut output = String::new();
     for character in text.chars() {
-        if character == '\n' || character == ' ' || (character.is_ascii_graphic() && character != '\\') {
+        if character == '\n'
+            || character == ' '
+            || (character.is_ascii_graphic() && character != '\\')
+        {
             output.push(character);
         } else {
             output.extend(character.escape_default());
@@ -400,19 +495,28 @@ fn escaped(text: &str) -> String {
 }
 
 fn quoted(output: &mut String, text: &str) {
-    for line in escaped(text).split('\n') { let _ = writeln!(output, "| {line}"); }
+    for line in escaped(text).split('\n') {
+        let _ = writeln!(output, "| {line}");
+    }
 }
 
 fn persistence_text(persistence: &GoalPersistence) -> String {
     match persistence {
         GoalPersistence::Saved => "Goal journal saved to the session.".into(),
-        GoalPersistence::MemoryOnly => "Memory-only session: goal journal was NOT saved to disk.".into(),
+        GoalPersistence::MemoryOnly => {
+            "Memory-only session: goal journal was NOT saved to disk.".into()
+        }
         GoalPersistence::Unconfirmed { reason } => {
             let bounded: String = reason.chars().take(1024).collect();
-            let mut text = String::from("Saving was NOT confirmed; the live decision was not rolled back.\n");
+            let mut text =
+                String::from("Saving was NOT confirmed; the live decision was not rolled back.\n");
             quoted(&mut text, &bounded);
-            if bounded.len() < reason.len() { text.push_str("[persistence diagnostic truncated]\n"); }
-            text.push_str("Use /goal save with the new review receipt; do not repeat the decision.");
+            if bounded.len() < reason.len() {
+                text.push_str("[persistence diagnostic truncated]\n");
+            }
+            text.push_str(
+                "Use /goal save with the new review receipt; do not repeat the decision.",
+            );
             text
         }
     }
@@ -428,9 +532,16 @@ fn render(record: Option<&Record>, review: &str) -> String {
             GoalStatus::Complete => "complete (user/host attestation)",
             GoalStatus::Dropped => "dropped",
         };
-        let _ = writeln!(text, "Goal {}: {status}\nPrompts: {}/{}; recorded tokens: {}/{}; interrupted: {}",
-            record.id, record.prompts_started, record.max_prompts,
-            record.tokens_spent, record.token_budget, record.in_flight);
+        let _ = writeln!(
+            text,
+            "Goal {}: {status}\nPrompts: {}/{}; recorded tokens: {}/{}; interrupted: {}",
+            record.id,
+            record.prompts_started,
+            record.max_prompts,
+            record.tokens_spent,
+            record.token_budget,
+            record.in_flight
+        );
         text.push_str("Objective (complete; non-ASCII, controls and backslashes escaped):\n");
         quoted(&mut text, &record.objective);
         text.push_str("End of objective.\n");
@@ -447,30 +558,48 @@ fn render(record: Option<&Record>, review: &str) -> String {
     }
     let _ = writeln!(text, "Review: {review}");
     if record.is_none_or(|record| record.status.terminal()) {
-        let _ = writeln!(text, "Create: /goal create {review} --tokens 100000 --prompts 16 -- <objective>");
+        let _ = writeln!(
+            text,
+            "Create: /goal create {review} --tokens 100000 --prompts 16 -- <objective>"
+        );
     } else {
         if record.is_some_and(|record| record.in_flight) {
-            let _ = writeln!(text, "Reconcile and keep paused: /goal reconcile {review} --pause -- <evidence>\nReconcile as complete: /goal reconcile {review} --complete -- <evidence>\nReconcile and abandon: /goal reconcile {review} --drop -- <evidence>\nReconciliation records a host attestation, preserves spent allowances and does not execute work.");
+            let _ = writeln!(
+                text,
+                "Reconcile and keep paused: /goal reconcile {review} --pause -- <evidence>\nReconcile as complete: /goal reconcile {review} --complete -- <evidence>\nReconcile and abandon: /goal reconcile {review} --drop -- <evidence>\nReconciliation records a host attestation, preserves spent allowances and does not execute work."
+            );
         } else {
-            let _ = writeln!(text, "Pause: /goal pause {review}\nAttest completion: /goal complete {review} -- <evidence>");
+            let _ = writeln!(
+                text,
+                "Pause: /goal pause {review}\nAttest completion: /goal complete {review} -- <evidence>"
+            );
         }
-        let _ = writeln!(text, "Resume: /goal resume {review}\nDrop: /goal drop {review} -- <reason>\nRetry saving: /goal save {review}");
-        let _ = writeln!(text, "Revise total budgets: /goal budget {review} --tokens N --prompts N -- <reason>\nBudget revision preserves spent counters and interruption; it does not resume work.");
+        let _ = writeln!(
+            text,
+            "Resume: /goal resume {review}\nDrop: /goal drop {review} -- <reason>\nRetry saving: /goal save {review}"
+        );
+        let _ = writeln!(
+            text,
+            "Revise total budgets: /goal budget {review} --tokens N --prompts N -- <reason>\nBudget revision preserves spent counters and interruption; it does not resume work."
+        );
     }
     if record.is_some_and(|record| record.status.terminal()) {
         let _ = writeln!(text, "Retry saving terminal state: /goal save {review}");
     }
     if record.is_some_and(|record| record.effective_status() == GoalStatus::Active) {
-        let _ = writeln!(text, "Execute one prompt: /goal step {review}\nExecute up to N prompts: /goal run {review} --steps N (1..32)\nRuns pause early on absent or repeated successful tool activity; review the recorded reason before resuming.");
+        let _ = writeln!(
+            text,
+            "Execute one prompt: /goal step {review}\nExecute up to N prompts: /goal run {review} --steps N (1..32)\nRuns pause early on absent or repeated successful tool activity; review the recorded reason before resuming."
+        );
     }
     text.push_str("Lifecycle controls do not start provider work; step and run explicitly execute bounded goal prompts. Activity is not proof of completion.\nToken accounting is reported usage, not a hard billing ceiling. Completion evidence is an attestation, not an independently verified test result.");
     text
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod control_tests;
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod progress_contract_tests {

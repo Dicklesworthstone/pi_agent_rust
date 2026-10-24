@@ -275,7 +275,9 @@ fn read_row(
         if available.is_empty() {
             return Ok(row);
         }
-        let count = available.iter().position(|byte| *byte == b'\n')
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
             .map_or(available.len(), |index| index + 1);
         if count > max.saturating_sub(row.len()) || count as u64 > *remaining {
             return Err(invalid("source or row byte limit exceeded"));
@@ -295,7 +297,9 @@ struct RetainedBudget(usize);
 
 impl Write for RetainedBudget {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.checked_sub(bytes.len())
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
             .ok_or_else(|| io::Error::other("retained text recovery limit exceeded"))?;
         Ok(bytes.len())
     }
@@ -310,7 +314,9 @@ fn charge(budget: &mut RetainedBudget, value: &impl Serialize) -> Result<()> {
 }
 
 fn identifier(value: &Value) -> Result<&str> {
-    value.as_str().filter(|id| !id.trim().is_empty() && id.len() <= 1024)
+    value
+        .as_str()
+        .filter(|id| !id.trim().is_empty() && id.len() <= 1024)
         .ok_or_else(|| invalid("entry IDs must be nonempty strings of at most 1024 bytes"))
 }
 
@@ -323,7 +329,10 @@ fn omit_attachments(
     if record.get("type").and_then(Value::as_str) != Some("message") {
         return Ok(());
     }
-    let Some(blocks) = record.pointer_mut("/message/content").and_then(Value::as_array_mut) else {
+    let Some(blocks) = record
+        .pointer_mut("/message/content")
+        .and_then(Value::as_array_mut)
+    else {
         return Ok(());
     };
     for (block_index, block) in blocks.iter_mut().enumerate() {
@@ -334,8 +343,14 @@ fn omit_attachments(
             entry_id: id.to_string(),
             block_index,
             kind: kind.to_string(),
-            mime_type: block.get("mimeType").and_then(Value::as_str).map(str::to_string),
-            name: block.get("name").and_then(Value::as_str).map(str::to_string),
+            mime_type: block
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            name: block
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             storage: match block.get("data") {
                 Some(Value::String(_)) => "inline",
                 Some(Value::Object(_)) => "reference_not_inspected",
@@ -359,11 +374,21 @@ fn graph(entries: &[RecoveredEntry], leaf: Option<&str>, owner: &AgentCx) -> Res
             return Err(invalid("duplicate entry ID"));
         }
     }
-    let parents = entries.iter().map(|entry| {
-        entry.parent_id.as_deref().map(|parent| {
-            positions.get(parent).copied().ok_or_else(|| invalid("missing parent entry"))
-        }).transpose()
-    }).collect::<Result<Vec<_>>>()?;
+    let parents = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .parent_id
+                .as_deref()
+                .map(|parent| {
+                    positions
+                        .get(parent)
+                        .copied()
+                        .ok_or_else(|| invalid("missing parent entry"))
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
     // Each edge is visited at most twice. Forward references and independent
     // roots are valid; cycles in unselected branches still reject the report.
     let mut colors = vec![0_u8; entries.len()];
@@ -388,9 +413,14 @@ fn graph(entries: &[RecoveredEntry], leaf: Option<&str>, owner: &AgentCx) -> Res
             cursor = parents[index];
         }
     }
-    let mut cursor = leaf.map(|id| {
-        positions.get(id).copied().ok_or_else(|| invalid("selected leaf is missing"))
-    }).transpose()?;
+    let mut cursor = leaf
+        .map(|id| {
+            positions
+                .get(id)
+                .copied()
+                .ok_or_else(|| invalid("selected leaf is missing"))
+        })
+        .transpose()?;
     let mut path = Vec::new();
     while let Some(index) = cursor {
         check_owner(owner)?;
@@ -420,14 +450,16 @@ fn recover(
     let mut retained = RetainedBudget(limits.retained);
     let mut digest = Sha256::new();
     let first = read_row(&mut reader, limits.row, &mut remaining, owner, &mut digest)?;
-    let header = strict_json::parse(&first, &mut nodes).map_err(|_| invalid("invalid JSON header"))?;
+    let header =
+        strict_json::parse(&first, &mut nodes).map_err(|_| invalid("invalid JSON header"))?;
     if header.get("type").and_then(Value::as_str) != Some("session")
         || header.get("version").and_then(Value::as_u64) != Some(3)
     {
         return Err(invalid("text recovery requires a version-3 JSONL session"));
     }
     identifier(&header["id"])?;
-    let native_header = SessionHeader::deserialize(&header).map_err(|_| invalid("invalid native session header"))?;
+    let native_header = SessionHeader::deserialize(&header)
+        .map_err(|_| invalid("invalid native session header"))?;
     charge(&mut retained, &header)?;
     let mut report = RecoveryReport {
         schema: SCHEMA,
@@ -467,7 +499,12 @@ fn recover(
         // decoder, cache, provider or Session constructor is involved.
         let _ = SessionEntry::deserialize(&record)
             .map_err(|_| invalid(format!("invalid native record at line {line}")))?;
-        let entry = RecoveredEntry { line, id, parent_id, record };
+        let entry = RecoveredEntry {
+            line,
+            id,
+            parent_id,
+            record,
+        };
         charge(&mut retained, &entry)?;
         report.entries.push(entry);
     }
@@ -499,9 +536,13 @@ fn recover(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error.into()),
         };
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         count += read as u64;
-        if count > stamp.length { return Err(invalid("source grew during verification")); }
+        if count > stamp.length {
+            return Err(invalid("source grew during verification"));
+        }
         second.update(&buffer[..read]);
     }
     let verified: [u8; 32] = second.finalize().into();

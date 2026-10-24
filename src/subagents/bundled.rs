@@ -17,11 +17,36 @@ const SONIC: &str = "You are a delegated agent for narrowly specified mechanical
 
 pub(super) fn definitions() -> BTreeMap<String, AgentDefinition> {
     [
-        ("task", "General-purpose implementation and multi-step work", TASK_TOOLS, TASK),
-        ("scout", "Read-only exploration and implementation planning", READ_TOOLS, SCOUT),
-        ("reviewer", "Read-only correctness and regression review", READ_TOOLS, REVIEWER),
-        ("security-reviewer", "Read-only defensive security review", READ_TOOLS, SECURITY_REVIEWER),
-        ("sonic", "Narrow mechanical updates and data collection", TASK_TOOLS, SONIC),
+        (
+            "task",
+            "General-purpose implementation and multi-step work",
+            TASK_TOOLS,
+            TASK,
+        ),
+        (
+            "scout",
+            "Read-only exploration and implementation planning",
+            READ_TOOLS,
+            SCOUT,
+        ),
+        (
+            "reviewer",
+            "Read-only correctness and regression review",
+            READ_TOOLS,
+            REVIEWER,
+        ),
+        (
+            "security-reviewer",
+            "Read-only defensive security review",
+            READ_TOOLS,
+            SECURITY_REVIEWER,
+        ),
+        (
+            "sonic",
+            "Narrow mechanical updates and data collection",
+            TASK_TOOLS,
+            SONIC,
+        ),
     ]
     .into_iter()
     .map(|(name, description, tools, prompt)| {
@@ -59,7 +84,9 @@ mod tests {
         std::fs::create_dir_all(dir).expect("create definitions");
         std::fs::write(
             dir.join(format!("{name}.md")),
-            format!("---\nname: {name}\ndescription: {description}\ntools: read\n---\n{description}"),
+            format!(
+                "---\nname: {name}\ndescription: {description}\ntools: read\n---\n{description}"
+            ),
         )
         .expect("write definition");
     }
@@ -68,8 +95,9 @@ mod tests {
     fn empty_installation_discovers_all_five_profiles_in_every_scope() {
         let temp = TempDir::new().expect("tempdir");
         for scope in [AgentScope::Both, AgentScope::User, AgentScope::Project] {
-            let agents = discover_agents_with_roots(temp.path(), &temp.path().join("global"), scope)
-                .expect("discover built-ins");
+            let agents =
+                discover_agents_with_roots(temp.path(), &temp.path().join("global"), scope)
+                    .expect("discover built-ins");
             assert_eq!(agents.len(), 5);
             for name in ["task", "scout", "reviewer", "security-reviewer", "sonic"] {
                 let agent = agents.get(name).expect("built-in exists");
@@ -79,7 +107,10 @@ mod tests {
                 assert!(agent.model.is_none());
             }
         }
-        assert!(!temp.path().join("global").exists(), "discovery must not install files");
+        assert!(
+            !temp.path().join("global").exists(),
+            "discovery must not install files"
+        );
     }
 
     #[test]
@@ -100,7 +131,10 @@ mod tests {
             let agents = discover_agents_with_roots(&cwd, &global, scope).expect("discover");
             assert_eq!(agents["scout"].description, expected);
             assert!(matches!(agents["task"].source, AgentSource::BuiltIn));
-            assert_eq!(agents.contains_key("custom"), !matches!(scope, AgentScope::Project));
+            assert_eq!(
+                agents.contains_key("custom"),
+                !matches!(scope, AgentScope::Project)
+            );
         }
         write_definition(&cwd.join(".pi/agents"), "reviewer", "nearest reviewer");
         let agents = discover_agents_with_roots(&cwd, &global, AgentScope::Both).expect("nearest");
@@ -115,9 +149,27 @@ mod tests {
             let agent = &agents[name];
             assert_eq!(agent.tools.as_ref().expect("tools"), &split_csv(READ_TOOLS));
             let args = child_args(agent, "inspect", None, None, None);
-            assert!(args.windows(2).any(|pair| pair[0] == "--tools" && pair[1] == READ_TOOLS));
-            for forbidden in ["bash", "write", "edit", "hashline_edit", "eval", "hub", "subagent"] {
-                assert!(!agent.tools.as_ref().expect("tools").iter().any(|tool| tool == forbidden));
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--tools" && pair[1] == READ_TOOLS)
+            );
+            for forbidden in [
+                "bash",
+                "write",
+                "edit",
+                "hashline_edit",
+                "eval",
+                "hub",
+                "subagent",
+            ] {
+                assert!(
+                    !agent
+                        .tools
+                        .as_ref()
+                        .expect("tools")
+                        .iter()
+                        .any(|tool| tool == forbidden)
+                );
             }
         }
     }
@@ -142,14 +194,27 @@ mod tests {
         let schema = json!({"type": "object", "required": ["ok"]});
         for agent in definitions().values() {
             let args = child_args(agent, "inspect", None, Some(&parent), Some(&schema));
-            assert!(args.windows(2).any(|pair| pair[0] == "--provider" && pair[1] == "fixture-provider"));
-            assert!(args.windows(2).any(|pair| pair[0] == "--model" && pair[1] == "resolved/model:literal"));
-            let prompt = args.windows(2).find(|pair| pair[0] == "--append-system-prompt")
-                .expect("prompt")[1].to_string_lossy();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--provider" && pair[1] == "fixture-provider")
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--model" && pair[1] == "resolved/model:literal")
+            );
+            let prompt = args
+                .windows(2)
+                .find(|pair| pair[0] == "--append-system-prompt")
+                .expect("prompt")[1]
+                .to_string_lossy();
             assert!(prompt.starts_with(&agent.system_prompt));
             assert!(prompt.contains("JSON Schema"));
             let role_args = child_args(agent, "inspect", Some("role-model"), Some(&parent), None);
-            assert!(role_args.windows(2).any(|pair| pair[0] == "--model" && pair[1] == "role-model"));
+            assert!(
+                role_args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--model" && pair[1] == "role-model")
+            );
             assert!(!role_args.iter().any(|arg| arg == "--provider"));
         }
     }
@@ -160,8 +225,11 @@ mod tests {
         let global = temp.path().join("global");
         let dir = global.join("agents");
         std::fs::create_dir_all(&dir).expect("definitions");
-        std::fs::write(dir.join("scout.md"), "---\nname: scout\n---\nmissing description")
-            .expect("write malformed definition");
+        std::fs::write(
+            dir.join("scout.md"),
+            "---\nname: scout\n---\nmissing description",
+        )
+        .expect("write malformed definition");
         assert!(discover_agents_with_roots(temp.path(), &global, AgentScope::Both).is_err());
     }
 
@@ -189,16 +257,28 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"scout evidence"}]}]}'
 "#).expect("write protocol child");
-        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).expect("executable");
-        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), temp.path().join("global"), child);
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
-        let output = runtime.block_on(tool.execute("bundled-scout", json!({"agent":"scout","task":"inspect"}), None))
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700))
+            .expect("executable");
+        let tool =
+            SubagentTool::with_paths(temp.path().to_path_buf(), temp.path().join("global"), child);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let output = runtime
+            .block_on(tool.execute(
+                "bundled-scout",
+                json!({"agent":"scout","task":"inspect"}),
+                None,
+            ))
             .expect("execute");
         assert!(!output.is_error, "{output:?}");
         let details = output.details.expect("details");
         assert_eq!(details["results"][0]["source"], "built_in");
         assert_eq!(details["results"][0]["status"], "completed");
         assert_eq!(details["results"][0]["output"], "scout evidence");
-        assert_eq!(details["results"][0]["tools"], json!(["read","grep","find","ls"]));
+        assert_eq!(
+            details["results"][0]["tools"],
+            json!(["read", "grep", "find", "ls"])
+        );
     }
 }

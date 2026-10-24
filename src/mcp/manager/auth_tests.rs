@@ -22,7 +22,11 @@ fn read_request(stream: &TcpStream) -> std::io::Result<(String, Value)> {
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let method = line.split_whitespace().next().unwrap_or_default().to_string();
+    let method = line
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
     let mut content_length = 0usize;
     let mut header_bytes = line.len();
     loop {
@@ -371,7 +375,6 @@ fn operator_authentication_requires_trust_and_cannot_replace_static_authorizatio
     }
 }
 
-
 fn configured_oauth_fixture(
     temporary: &tempfile::TempDir,
     spec: &Value,
@@ -382,14 +385,23 @@ fn configured_oauth_fixture(
     let manager = McpManager::new(
         temporary.path(),
         &global,
-        McpDiscovery { servers: Vec::new(), warnings: Vec::new() },
+        McpDiscovery {
+            servers: Vec::new(),
+            warnings: Vec::new(),
+        },
     );
     manager.register_extension_server("configured", spec);
-    let entry = manager.entry("configured").expect("configured extension server");
+    let entry = manager
+        .entry("configured")
+        .expect("configured extension server");
     if trusted {
         TrustStore::load(&manager.inner.trust_path)
             .expect("load trust store")
-            .acknowledge("configured", &manager.trust_fingerprint_for(&entry), "operator")
+            .acknowledge(
+                "configured",
+                &manager.trust_fingerprint_for(&entry),
+                "operator",
+            )
             .expect("acknowledge configured OAuth fixture");
     }
     (manager, entry)
@@ -411,9 +423,11 @@ fn public_client_override_skips_both_configured_helpers_and_preserves_authored_s
         }),
         true,
     );
-    let resolved = runtime().block_on(
-        manager.resolve_authentication_configuration(&entry, Some("public-client".to_string())),
-    ).expect("public override must not run either unused helper");
+    let resolved = runtime()
+        .block_on(
+            manager.resolve_authentication_configuration(&entry, Some("public-client".to_string())),
+        )
+        .expect("public override must not run either unused helper");
     assert_eq!(resolved.client_id.as_deref(), Some("public-client"));
     assert!(resolved.client_secret.is_none());
     assert_eq!(resolved.scope.as_deref(), Some("read offline_access"));
@@ -431,13 +445,26 @@ fn public_client_override_skips_both_configured_helpers_and_preserves_authored_s
         temporary.path(),
         false,
         &|| Ok(()),
-    ).expect("literal public identifier");
-    assert_eq!(literal.client_id.as_deref(), Some("$CMD:literal-client-identifier"));
+    )
+    .expect("literal public identifier");
+    assert_eq!(
+        literal.client_id.as_deref(),
+        Some("$CMD:literal-client-identifier")
+    );
     assert!(literal.client_secret.is_none());
     let error = resolve_oauth_settings(
-        &entry.config, None, temporary.path(), temporary.path(), false, &|| Ok(()),
-    ).expect_err("selected helper requires process capability");
-    assert!(error.to_string().contains("MCP_CAPABILITY_DENIED"), "{error}");
+        &entry.config,
+        None,
+        temporary.path(),
+        temporary.path(),
+        false,
+        &|| Ok(()),
+    )
+    .expect_err("selected helper requires process capability");
+    assert!(
+        error.to_string().contains("MCP_CAPABILITY_DENIED"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]
@@ -464,13 +491,19 @@ fn configured_oauth_helpers_and_network_wait_for_trust_and_enabled_admission() {
         );
         runtime().block_on(async {
             if denied {
-                manager.deny("configured").await.expect("deny configured server");
+                manager
+                    .deny("configured")
+                    .await
+                    .expect("deny configured server");
             }
-            let error = manager.reauthenticate(
-                "configured",
-                None,
-                Arc::new(|_| panic!("rejected admission must not emit a sign-in URL")),
-            ).await.expect_err("OAuth admission must reject this server");
+            let error = manager
+                .reauthenticate(
+                    "configured",
+                    None,
+                    Arc::new(|_| panic!("rejected admission must not emit a sign-in URL")),
+                )
+                .await
+                .expect_err("OAuth admission must reject this server");
             assert!(error.to_string().contains(expected), "{error}");
             assert!(!temporary.path().join("oauth-helper-marker").exists());
             assert_eq!(server.count(), 0, "admission must precede discovery");
@@ -484,8 +517,11 @@ fn configured_oauth_resolution_uses_server_cwd_and_session_workspace_without_per
     let temporary = tempfile::tempdir().expect("temporary directory");
     let helper_directory = temporary.path().join("helper");
     std::fs::create_dir_all(&helper_directory).expect("helper directory");
-    std::fs::write(helper_directory.join("client-secret.txt"), "registered-secret")
-        .expect("helper secret fixture");
+    std::fs::write(
+        helper_directory.join("client-secret.txt"),
+        "registered-secret",
+    )
+    .expect("helper secret fixture");
     let (manager, entry) = configured_oauth_fixture(
         &temporary,
         &json!({
@@ -500,14 +536,23 @@ fn configured_oauth_resolution_uses_server_cwd_and_session_workspace_without_per
         }),
         true,
     );
-    let resolved = runtime().block_on(
-        manager.resolve_authentication_configuration(&entry, None),
-    ).expect("resolve trusted configured OAuth");
-    assert_eq!(resolved.client_id, Some(format!("client-{}", manager.inner.cwd.display())));
+    let resolved = runtime()
+        .block_on(manager.resolve_authentication_configuration(&entry, None))
+        .expect("resolve trusted configured OAuth");
+    assert_eq!(
+        resolved.client_id,
+        Some(format!("client-{}", manager.inner.cwd.display()))
+    );
     assert_eq!(resolved.client_secret.as_deref(), Some("registered-secret"));
     let authored = entry.config.oauth.as_ref().expect("authored configuration");
-    assert_eq!(authored.client_id.as_deref(), Some("client-${workspaceFolder}"));
-    assert_eq!(authored.client_secret.as_deref(), Some("$CMD:cat client-secret.txt"));
+    assert_eq!(
+        authored.client_id.as_deref(),
+        Some("client-${workspaceFolder}")
+    );
+    assert_eq!(
+        authored.client_secret.as_deref(),
+        Some("$CMD:cat client-secret.txt")
+    );
     assert!(!format!("{resolved:?}").contains("registered-secret"));
 }
 
@@ -523,10 +568,13 @@ fn changing_oauth_configuration_requires_a_new_trust_acknowledgment() {
     let mut changed_spec = spec;
     changed_spec["oauth"]["clientId"] = Value::String("replacement".to_string());
     let (changed, changed_entry) = configured_oauth_fixture(&temporary, &changed_spec, false);
-    assert_ne!(original_fingerprint, changed.trust_fingerprint_for(&changed_entry));
-    let error = runtime().block_on(
-        changed.resolve_authentication_configuration(&changed_entry, None),
-    ).expect_err("changed client must not reuse prior trust or run its helper");
+    assert_ne!(
+        original_fingerprint,
+        changed.trust_fingerprint_for(&changed_entry)
+    );
+    let error = runtime()
+        .block_on(changed.resolve_authentication_configuration(&changed_entry, None))
+        .expect_err("changed client must not reuse prior trust or run its helper");
     assert!(error.to_string().contains("MCP_TRUST_PENDING"), "{error}");
 }
 
@@ -545,9 +593,9 @@ fn oauth_helper_diagnostics_never_expose_command_output_or_secret_values() {
         }),
         true,
     );
-    let error = runtime().block_on(
-        manager.resolve_authentication_configuration(&entry, None),
-    ).expect_err("failed credential helper");
+    let error = runtime()
+        .block_on(manager.resolve_authentication_configuration(&entry, None))
+        .expect_err("failed credential helper");
     assert!(error.to_string().contains("oauth.clientSecret"), "{error}");
     assert!(!error.to_string().contains("DO_NOT_ECHO_OAUTH_SECRET"));
     assert!(!error.to_string().contains("exit 23"));

@@ -23,15 +23,21 @@ const IDLE_POLL: Duration = Duration::from_millis(15);
 type Lines = Mutex<mpsc::Receiver<std::result::Result<String, String>>>;
 
 fn stopped(code: &str, message: &str) -> Error {
-    Error::tool("eval", format!(
-        "{code}: {message}; EVAL_STATE_RESET: Python kernel discarded"
-    ))
+    Error::tool(
+        "eval",
+        format!("{code}: {message}; EVAL_STATE_RESET: Python kernel discarded"),
+    )
 }
 
 fn checkpoint(owner: &AgentCx, deadline: Instant) -> Result<()> {
-    owner.checkpoint().map_err(|_| stopped("EVAL_CANCELLED", "Python tool wait cancelled"))?;
+    owner
+        .checkpoint()
+        .map_err(|_| stopped("EVAL_CANCELLED", "Python tool wait cancelled"))?;
     if Instant::now() >= deadline {
-        return Err(stopped("EVAL_TIMEOUT", "Python tool wait exhausted the cell budget"));
+        return Err(stopped(
+            "EVAL_TIMEOUT",
+            "Python tool wait exhausted the cell budget",
+        ));
     }
     Ok(())
 }
@@ -49,13 +55,19 @@ fn drain(
     let mut bytes = 0usize;
     for _ in 0..DRAIN_FRAMES {
         checkpoint(owner, deadline)?;
-        let received = lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_recv();
+        let received = lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv();
         let line = match received {
             Ok(Ok(line)) => line,
             Ok(Err(error)) => return Err(stopped("EVAL_PROTOCOL_READ", &error)),
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(stopped("EVAL_KERNEL_CRASH", "Python exited during a tool exchange"));
+                return Err(stopped(
+                    "EVAL_KERNEL_CRASH",
+                    "Python exited during a tool exchange",
+                ));
             }
         };
         bytes = bytes.saturating_add(line.len());
@@ -63,13 +75,18 @@ fn drain(
             let frame: Value = serde_json::from_str(&line)
                 .map_err(|_| stopped("EVAL_PROTOCOL", "invalid output during Python tool wait"))?;
             if frame.get("stream").is_none() {
-                return Err(stopped("EVAL_PROTOCOL", "expected output, not another request or completion, during Python tool wait"));
+                return Err(stopped(
+                    "EVAL_PROTOCOL",
+                    "expected output, not another request or completion, during Python tool wait",
+                ));
             }
             // The ordinary capture validates exact envelope/cell/sequence,
             // console bounds and MIME frames, and writes archives only once.
             capture.accept(&frame, id)?;
         }
-        if bytes >= DRAIN_TARGET_BYTES { break; }
+        if bytes >= DRAIN_TARGET_BYTES {
+            break;
+        }
     }
     Ok(())
 }
@@ -102,7 +119,8 @@ pub(super) async fn wait_python<F: Future>(
         session.check_tool().await?;
         checkpoint(&owner, deadline)?;
         let sleeper = Box::pin(asupersync::time::sleep(
-            asupersync::time::wall_now(), IDLE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            asupersync::time::wall_now(),
+            IDLE_POLL.min(deadline.saturating_duration_since(Instant::now())),
         ));
         match futures::future::select(pending, sleeper).await {
             futures::future::Either::Left((reply, _)) => {

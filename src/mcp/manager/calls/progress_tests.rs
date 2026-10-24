@@ -4,12 +4,12 @@
 use super::*;
 use crate::mcp::{ConfiguredServer, McpDiscovery, McpTool, McpToolMeta, Provenance, TrustStore};
 use crate::tools::Tool;
+use asupersync::{Budget, Cx};
+use serde_json::json;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use asupersync::{Budget, Cx};
-use serde_json::json;
 
 const PEER: &str = r#"
 import json, pathlib, queue, sys, threading, time
@@ -162,18 +162,29 @@ fn configured(root: &Path, mode: &str) -> (ConfiguredServer, Option<PeerChild>) 
     let script = root.join("progress_peer.py");
     std::fs::write(&script, PEER).unwrap();
     let args = vec![
-        "-u".to_string(), script.display().to_string(),
-        root.display().to_string(), mode.to_string(),
+        "-u".to_string(),
+        script.display().to_string(),
+        root.display().to_string(),
+        mode.to_string(),
     ];
     let mut child = None;
     let is_http = matches!(mode, "http" | "http-get");
     let url = if is_http {
-        child = Some(PeerChild(Command::new("python3").args(&args)
-            .stdin(Stdio::null()).stdout(Stdio::null()).spawn().expect("Python protocol peer")));
+        child = Some(PeerChild(
+            Command::new("python3")
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("Python protocol peer"),
+        ));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !root.join("port").exists() {
             assert!(Instant::now() < deadline, "HTTP peer did not start");
-            assert!(child.as_mut().unwrap().0.try_wait().unwrap().is_none(), "HTTP peer exited");
+            assert!(
+                child.as_mut().unwrap().0.try_wait().unwrap().is_none(),
+                "HTTP peer exited"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let port = std::fs::read_to_string(root.join("port")).unwrap();
@@ -181,43 +192,60 @@ fn configured(root: &Path, mode: &str) -> (ConfiguredServer, Option<PeerChild>) 
     } else {
         None
     };
-    (ConfiguredServer {
-        name: "progress".to_string(),
-        command: (!is_http).then(|| "python3".to_string()),
-        args: if is_http { Vec::new() } else { args },
-        env: Vec::new(), url, headers: Vec::new(),
-        oauth: None,
-        transport_hint: Some(if is_http { "http" } else { "stdio" }.to_string()),
-        enabled: true,
-        cwd: None,
-        timeout_ms: None,
-        provenance: Provenance::ProjectPi,
-        source_file: root.join("mcp.json"),
-    }, child)
+    (
+        ConfiguredServer {
+            name: "progress".to_string(),
+            command: (!is_http).then(|| "python3".to_string()),
+            args: if is_http { Vec::new() } else { args },
+            env: Vec::new(),
+            url,
+            headers: Vec::new(),
+            oauth: None,
+            transport_hint: Some(if is_http { "http" } else { "stdio" }.to_string()),
+            enabled: true,
+            cwd: None,
+            timeout_ms: None,
+            provenance: Provenance::ProjectPi,
+            source_file: root.join("mcp.json"),
+        },
+        child,
+    )
 }
 
 fn manager(root: &Path, config: ConfiguredServer) -> (Arc<McpManager>, Arc<ServerEntry>) {
-    let manager = Arc::new(McpManager::new(root, root, McpDiscovery {
-        servers: vec![config], warnings: Vec::new(),
-    }));
+    let manager = Arc::new(McpManager::new(
+        root,
+        root,
+        McpDiscovery {
+            servers: vec![config],
+            warnings: Vec::new(),
+        },
+    ));
     let entry = manager.entry("progress").unwrap();
     // Mirror the public trust operation instead of bypassing its executable
     // binding. A fingerprint-only approval is not sufficient for stdio.
-    let identity = entry.config
+    let identity = entry
+        .config
         .execution_identity(&entry.effective_cwd(&manager.inner.cwd))
         .expect("resolve the fixture's executable identity");
     let fingerprint = manager.trust_fingerprint_for(&entry);
     let mut store = TrustStore::load(&manager.inner.trust_path).unwrap();
     if let Some(execution) = identity {
-        store.acknowledge_execution("progress", &fingerprint, "operator", execution).unwrap();
+        store
+            .acknowledge_execution("progress", &fingerprint, "operator", execution)
+            .unwrap();
     } else {
-        store.acknowledge("progress", &fingerprint, "operator").unwrap();
+        store
+            .acknowledge("progress", &fingerprint, "operator")
+            .unwrap();
     }
     (manager, entry)
 }
 
 fn runtime() -> asupersync::runtime::Runtime {
-    asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
 }
 
 #[cfg(unix)]
@@ -227,8 +255,12 @@ fn mounted_tools_report_live_progress_over_stdio_and_http_without_changing_resul
         let temp = tempfile::tempdir().unwrap();
         let (config, _peer) = configured(temp.path(), mode);
         let (manager, entry) = manager(temp.path(), config);
-        let meta = McpToolMeta { name: "work".to_string(), description: "Work".to_string(),
-            input_schema: json!({"type":"object"}), output_schema: None };
+        let meta = McpToolMeta {
+            name: "work".to_string(),
+            description: "Work".to_string(),
+            input_schema: json!({"type":"object"}),
+            output_schema: None,
+        };
         let tool = McpTool::new("progress", &meta, Arc::clone(&manager));
         let runtime = runtime();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
@@ -241,18 +273,32 @@ fn mounted_tools_report_live_progress_over_stdio_and_http_without_changing_resul
             let details = update.details.unwrap()["mcpProgress"].clone();
             let count = details["progress"].as_u64().unwrap();
             assert!([1, 2].contains(&count));
-            assert!(!details["message"].as_str().unwrap().chars().any(char::is_control));
+            assert!(
+                !details["message"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .any(char::is_control)
+            );
             updates.lock().unwrap().push(details);
-            let request: Value = serde_json::from_str(
-                &std::fs::read_to_string(root.join("request.json")).unwrap()
-            ).unwrap();
+            let request: Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join("request.json")).unwrap())
+                    .unwrap();
             let id = request["id"].as_u64().unwrap();
             std::fs::write(root.join(format!("ack-{id}-{count}")), "observed").unwrap();
         };
         runtime.block_on(owner.with_current(async {
-            let result = tool.execute("call-1", json!({"_meta":{"progressToken":"model-literal"}}), Some(Box::new(callback))).await;
+            let result = tool
+                .execute(
+                    "call-1",
+                    json!({"_meta":{"progressToken":"model-literal"}}),
+                    Some(Box::new(callback)),
+                )
+                .await;
             let transport = McpManager::lock(&entry.transport).clone();
-            if let Some(transport) = transport { transport.close().await; }
+            if let Some(transport) = transport {
+                transport.close().await;
+            }
             let result = result.expect("native tool completes after progress acknowledgement");
             assert!(!result.is_error);
             assert_eq!(result.content.len(), 1);
@@ -262,12 +308,27 @@ fn mounted_tools_report_live_progress_over_stdio_and_http_without_changing_resul
             assert_eq!(text.text, "done");
         }));
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2, "duplicate/regressing/foreign progress escaped: {mode}");
+        assert_eq!(
+            seen.len(),
+            2,
+            "duplicate/regressing/foreign progress escaped: {mode}"
+        );
         assert_eq!(seen[0]["progress"], 1);
         assert_eq!(seen[1]["progress"], 2);
-        let request: Value = serde_json::from_str(&std::fs::read_to_string(temp.path().join("request.json")).unwrap()).unwrap();
-        assert_eq!(request["params"]["arguments"]["_meta"]["progressToken"], "model-literal");
-        assert!(request["params"]["_meta"]["progressToken"].as_str().unwrap().starts_with("pi-mcp-"));
+        let request: Value = serde_json::from_str(
+            &std::fs::read_to_string(temp.path().join("request.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request["params"]["arguments"]["_meta"]["progressToken"],
+            "model-literal"
+        );
+        assert!(
+            request["params"]["_meta"]["progressToken"]
+                .as_str()
+                .unwrap()
+                .starts_with("pi-mcp-")
+        );
     }
 }
 
@@ -282,10 +343,14 @@ fn calls_without_an_observer_do_not_request_progress() {
     runtime.block_on(owner.with_current(async {
         let result = manager.call_tool("progress", "work", json!({})).await;
         let transport = McpManager::lock(&entry.transport).clone();
-        if let Some(transport) = transport { transport.close().await; }
+        if let Some(transport) = transport {
+            transport.close().await;
+        }
         assert_eq!(result.unwrap()["content"][0]["text"], "done");
     }));
-    let request: Value = serde_json::from_str(&std::fs::read_to_string(temp.path().join("request.json")).unwrap()).unwrap();
+    let request: Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("request.json")).unwrap())
+            .unwrap();
     assert!(request["params"].get("_meta").is_none());
 }
 
@@ -298,19 +363,35 @@ fn continuous_progress_does_not_restart_the_manager_deadline() {
     let runtime = runtime();
     let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
     let observed = AtomicUsize::new(0);
-    let callback = |_update| { observed.fetch_add(1, Ordering::SeqCst); };
+    let callback = |_update| {
+        observed.fetch_add(1, Ordering::SeqCst);
+    };
     runtime.block_on(owner.with_current(async {
-        let (transport, contract) = manager.prepare_tool_call(&owner, &entry, "work", DEFAULT_MCP_TIMEOUT).await.unwrap();
+        let (transport, contract) = manager
+            .prepare_tool_call(&owner, &entry, "work", DEFAULT_MCP_TIMEOUT)
+            .await
+            .unwrap();
         let began = Instant::now();
-        let result = manager.execute_tool_call(&entry, &transport, "work", &json!({}),
-            Duration::from_millis(250), contract.output_schema, Some(&callback)).await;
+        let result = manager
+            .execute_tool_call(
+                &entry,
+                &transport,
+                "work",
+                &json!({}),
+                Duration::from_millis(250),
+                contract.output_schema,
+                Some(&callback),
+            )
+            .await;
         transport.close().await;
         assert!(result.unwrap_err().to_string().contains("MCP_TIMEOUT"));
         assert!(began.elapsed() < Duration::from_secs(5));
-        assert!(observed.load(Ordering::SeqCst) > 0, "peer progress never reached the caller");
+        assert!(
+            observed.load(Ordering::SeqCst) > 0,
+            "peer progress never reached the caller"
+        );
     }));
 }
-
 
 /// The mounted callback can stop its owning native turn. No second callback,
 /// successful result, reconnect or replay may escape the cancelled owner.
@@ -333,28 +414,40 @@ fn a_live_progress_callback_can_cancel_its_native_call_without_replay() {
         );
     };
     let meta = McpToolMeta {
-        name: "work".to_string(), description: "Work".to_string(),
-        input_schema: json!({"type":"object"}), output_schema: None,
+        name: "work".to_string(),
+        description: "Work".to_string(),
+        input_schema: json!({"type":"object"}),
+        output_schema: None,
     };
     let tool = McpTool::new("progress", &meta, Arc::clone(&manager));
     runtime.block_on(owner.with_current(async {
         // Keep a reference to the actual connection so cleanup is observable
         // even after cancellation removes the manager's published generation.
-        let (transport, _) = manager.prepare_tool_call(
-            &owner, &entry, "work", DEFAULT_MCP_TIMEOUT,
-        ).await.unwrap();
-        let result = tool.execute("cancelled-call", json!({}), Some(Box::new(callback))).await;
+        let (transport, _) = manager
+            .prepare_tool_call(&owner, &entry, "work", DEFAULT_MCP_TIMEOUT)
+            .await
+            .unwrap();
+        let result = tool
+            .execute("cancelled-call", json!({}), Some(Box::new(callback)))
+            .await;
         let alive = transport.is_alive();
         transport.abort();
         assert!(result.unwrap_err().to_string().contains("MCP_CANCELLED"));
-        assert!(!alive, "cancellation must retire this dispatched stdio request");
+        assert!(
+            !alive,
+            "cancellation must retire this dispatched stdio request"
+        );
         assert!(McpManager::lock(&entry.transport).is_none());
         assert!(McpManager::lock(&entry.tools_cache).is_none());
         assert_eq!(McpManager::lock(&entry.restarts).count, 1);
     }));
     assert_eq!(observed.load(Ordering::SeqCst), 1);
     let calls = std::fs::read_to_string(temp.path().join("calls.jsonl")).unwrap();
-    assert_eq!(calls.lines().count(), 1, "a cancelled call must not be replayed");
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "a cancelled call must not be replayed"
+    );
 }
 
 #[cfg(unix)]
@@ -362,14 +455,22 @@ fn a_live_progress_callback_can_cancel_its_native_call_without_replay() {
 fn observing_progress_cannot_admit_an_untrusted_stdio_server() {
     let temp = tempfile::tempdir().unwrap();
     let (config, _peer) = configured(temp.path(), "stdio");
-    let manager = Arc::new(McpManager::new(temp.path(), temp.path(), McpDiscovery {
-        servers: vec![config], warnings: Vec::new(),
-    }));
+    let manager = Arc::new(McpManager::new(
+        temp.path(),
+        temp.path(),
+        McpDiscovery {
+            servers: vec![config],
+            warnings: Vec::new(),
+        },
+    ));
     let entry = manager.entry("progress").unwrap();
     let runtime = runtime();
     let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
     let result = runtime.block_on(owner.with_current(manager.call_tool_with_updates(
-        "progress", "work", json!({}), Some(Box::new(|_| panic!("untrusted progress"))),
+        "progress",
+        "work",
+        json!({}),
+        Some(Box::new(|_| panic!("untrusted progress"))),
     )));
     assert!(result.unwrap_err().to_string().contains("MCP_TRUST"));
     assert!(McpManager::lock(&entry.transport).is_none());

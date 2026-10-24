@@ -63,7 +63,9 @@ impl Sessions {
     }
 
     fn select(&self, id: &str, retain: bool) -> Result<(Arc<Namespace>, bool)> {
-        let mut namespaces = self.namespaces.lock()
+        let mut namespaces = self
+            .namespaces
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(namespace) = namespaces.get(id) {
             return Ok((Arc::clone(namespace), true));
@@ -81,7 +83,9 @@ impl Sessions {
     }
 
     fn release(&self, id: &str) -> bool {
-        let retired = self.namespaces.lock()
+        let retired = self
+            .namespaces
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id);
         let released = retired.is_some();
@@ -92,10 +96,13 @@ impl Sessions {
     }
 
     async fn identity(&self, budget: &Budget) -> Result<String> {
-        let id = budget.wait(self.scope.session_id()).await?
-            .map_err(|_| error("BROWSER_SESSION_UNAVAILABLE: current conversation identity is unavailable"))?;
+        let id = budget.wait(self.scope.session_id()).await?.map_err(|_| {
+            error("BROWSER_SESSION_UNAVAILABLE: current conversation identity is unavailable")
+        })?;
         if id.len() > MAX_OWNER_BYTES {
-            return Err(error("BROWSER_SESSION_UNAVAILABLE: conversation identity exceeds 1024 bytes"));
+            return Err(error(
+                "BROWSER_SESSION_UNAVAILABLE: conversation identity exceeds 1024 bytes",
+            ));
         }
         Ok(id)
     }
@@ -128,9 +135,14 @@ impl Sessions {
                 return Ok(result);
             }
             if !budget.owner.capabilities().time {
-                return Err(error("BROWSER_SESSION_PERMISSION: active ownership observation requires timer capability"));
+                return Err(error(
+                    "BROWSER_SESSION_PERMISSION: active ownership observation requires timer capability",
+                ));
             }
-            let wait = budget.deadline.saturating_duration_since(Instant::now()).min(POLL_INTERVAL);
+            let wait = budget
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .min(POLL_INTERVAL);
             let time = budget.owner.time();
             let sleeper = Box::pin(time.sleep(wait));
             match futures::future::select(operation, sleeper).await {
@@ -148,7 +160,9 @@ impl Sessions {
         let budget = Budget::new(args, action)?;
         let batch = batch::Plan::parse(args)?;
         if batch.is_some() && tool.is_mock() {
-            return Err(error("BROWSER_BATCH_NATIVE_REQUIRED: batches require the native browser backend"));
+            return Err(error(
+                "BROWSER_BATCH_NATIVE_REQUIRED: batches require the native browser backend",
+            ));
         }
         if action == "release" {
             validate_release(args)?;
@@ -178,7 +192,8 @@ impl Sessions {
         let result = if let Some(batch) = batch {
             batch.execute(self, &id, &budget, tool, &namespace).await
         } else {
-            self.run_owned(&id, &budget, tool.execute_in_namespace(&namespace, args)).await?
+            self.run_owned(&id, &budget, tool.execute_in_namespace(&namespace, args))
+                .await?
         };
         // Stop belongs to the captured owner even if the frontend switched
         // during its execution. Do not postpone bookkeeping past that check.
@@ -189,10 +204,13 @@ impl Sessions {
         self.require_identity(&id, &budget).await?;
         let mut result = result?;
         if let Some(details) = result.details.as_mut().and_then(Value::as_object_mut) {
-            details.insert("browserSession".into(), json!({
-                "scope":"session", "reused":reused, "retained":!stopped && (retain || reused),
-                "capacity":CAPACITY,
-            }));
+            details.insert(
+                "browserSession".into(),
+                json!({
+                    "scope":"session", "reused":reused, "retained":!stopped && (retain || reused),
+                    "capacity":CAPACITY,
+                }),
+            );
         }
         Ok(result)
     }
@@ -200,7 +218,9 @@ impl Sessions {
 
 fn validate_release(args: &Value) -> Result<()> {
     if args.as_object().is_none_or(|object| {
-        object.keys().any(|key| !matches!(key.as_str(), "action" | "timeout_ms"))
+        object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "action" | "timeout_ms"))
     }) {
         return Err(error(
             "BROWSER_SESSION_INVALID: release accepts only action and timeout_ms; its owner is selected by the host",
@@ -220,8 +240,15 @@ struct Budget {
 impl Budget {
     fn new(args: &Value, action: &str) -> Result<Self> {
         let milliseconds = match args.get("timeout_ms") {
-            None => if action == "wait_for" { 5000 } else { 30_000 },
-            Some(value) => value.as_u64()
+            None => {
+                if action == "wait_for" {
+                    5000
+                } else {
+                    30_000
+                }
+            }
+            Some(value) => value
+                .as_u64()
                 .filter(|value| (1..=120_000).contains(value))
                 .ok_or_else(|| error("timeout_ms must be an integer in 1..=120000"))?,
         };
@@ -235,7 +262,9 @@ impl Budget {
         self.owner.checkpoint()
             .map_err(|_| error("BROWSER_SESSION_CANCELLED: browser operation cancelled; admitted effects are not rolled back"))?;
         if Instant::now() >= self.deadline {
-            return Err(error("BROWSER_SESSION_TIMEOUT: browser operation timed out; admitted effects are not rolled back"));
+            return Err(error(
+                "BROWSER_SESSION_TIMEOUT: browser operation timed out; admitted effects are not rolled back",
+            ));
         }
         Ok(())
     }
@@ -248,9 +277,14 @@ impl Budget {
                 break result;
             }
             if !self.owner.capabilities().time {
-                return Err(error("BROWSER_SESSION_PERMISSION: waiting for browser ownership requires timer capability"));
+                return Err(error(
+                    "BROWSER_SESSION_PERMISSION: waiting for browser ownership requires timer capability",
+                ));
             }
-            let wait = self.deadline.saturating_duration_since(Instant::now()).min(POLL_INTERVAL);
+            let wait = self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .min(POLL_INTERVAL);
             let time = self.owner.time();
             let sleeper = Box::pin(time.sleep(wait));
             match futures::future::select(operation, sleeper).await {

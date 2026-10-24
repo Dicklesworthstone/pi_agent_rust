@@ -63,7 +63,11 @@ pub(super) fn download_url(raw: &str, allowlist: Option<&[String]>) -> Result<Do
     let (kind, display_url) = match parsed.scheme() {
         "http" | "https" => {
             check_navigation(raw, allowlist).map_err(|_| download_url_error())?;
-            let kind = if parsed.scheme() == "https" { "https" } else { "http" };
+            let kind = if parsed.scheme() == "https" {
+                "https"
+            } else {
+                "http"
+            };
             // Signed export links commonly put credentials in these fields.
             // Keep the original URL only in the private immutable tracker.
             parsed.set_query(None);
@@ -81,7 +85,10 @@ pub(super) fn download_url(raw: &str, allowlist: Option<&[String]>) -> Result<Do
                 return Err(download_url_error());
             }
             check_navigation(creator.as_str(), allowlist).map_err(|_| download_url_error())?;
-            ("blob", format!("blob:{}/[redacted]", creator.origin().ascii_serialization()))
+            (
+                "blob",
+                format!("blob:{}/[redacted]", creator.origin().ascii_serialization()),
+            )
         }
         "data" => {
             // The browser has already interpreted this literal resource. Do
@@ -159,7 +166,10 @@ mod tests {
     #[test]
     fn generated_download_admission_does_not_relax_navigation_or_cdp_endpoints() {
         let rules = vec!["example.com".to_string()];
-        for raw in ["data:text/plain,export", "blob:https://example.com/export-id"] {
+        for raw in [
+            "data:text/plain,export",
+            "blob:https://example.com/export-id",
+        ] {
             assert!(download_url(raw, Some(&rules)).is_ok());
             assert!(check_navigation(raw, Some(&rules)).is_err());
             assert!(endpoint(raw, false).is_err());
@@ -194,10 +204,15 @@ mod tests {
     #[test]
     fn blob_downloads_reject_unknown_origins_credentials_and_nested_schemes() {
         for raw in [
-            "blob:null/opaque-id", "blob:file:///private/id", "blob:ftp://example.com/id",
-            "blob:blob:https://example.com/id", "blob:data:text/plain,secret",
-            "blob:javascript:secret", "blob:https://user:secret@example.com/id",
-            "blob:https://example.com/", "blob:https://example.com/id?secret=value",
+            "blob:null/opaque-id",
+            "blob:file:///private/id",
+            "blob:ftp://example.com/id",
+            "blob:blob:https://example.com/id",
+            "blob:data:text/plain,secret",
+            "blob:javascript:secret",
+            "blob:https://user:secret@example.com/id",
+            "blob:https://example.com/",
+            "blob:https://example.com/id?secret=value",
         ] {
             assert!(download_url(raw, None).is_err(), "unexpected admission");
         }
@@ -208,7 +223,8 @@ mod tests {
         for raw in [
             "data:text/plain;PRIVATE-CANARY=value,PRIVATE-CANARY",
             "data:application/octet-stream;base64,UFJJVkFURS1DQU5BUlk=",
-            "data:,", "DATA:text/plain,PRIVATE-CANARY?also=private#fragment",
+            "data:,",
+            "DATA:text/plain,PRIVATE-CANARY?also=private#fragment",
         ] {
             let resource = download_url(raw, Some(&[])).unwrap();
             assert_eq!(resource.display_url, "data:[redacted]");
@@ -219,11 +235,19 @@ mod tests {
         let blob = download_url("blob:https://example.com/PRIVATE-CANARY#secret", None).unwrap();
         assert_eq!(blob.display_url, "blob:https://example.com/[redacted]");
         assert!(blob.redacted);
-        let signed = download_url("https://example.com/export?token=PRIVATE-CANARY#secret", None).unwrap();
+        let signed = download_url(
+            "https://example.com/export?token=PRIVATE-CANARY#secret",
+            None,
+        )
+        .unwrap();
         assert_eq!(signed.display_url, "https://example.com/export");
         assert_eq!(signed.kind, "https");
         assert!(signed.redacted);
-        assert!(!download_url("http://example.com/export", None).unwrap().redacted);
+        assert!(
+            !download_url("http://example.com/export", None)
+                .unwrap()
+                .redacted
+        );
     }
 
     #[test]
@@ -233,9 +257,15 @@ mod tests {
         assert!(download_url(&exact, None).is_ok());
         assert!(download_url(&format!("{exact}x"), None).is_err());
         for raw in [
-            "", "data:text/plain", " data:,PRIVATE-CANARY", "data:,PRIVATE-CANARY\n",
-            "data:,PRIVATE\0CANARY", "file:///PRIVATE-CANARY", "javascript:PRIVATE-CANARY",
-            "https://blocked.test/PRIVATE-CANARY", "blob:https://blocked.test/PRIVATE-CANARY",
+            "",
+            "data:text/plain",
+            " data:,PRIVATE-CANARY",
+            "data:,PRIVATE-CANARY\n",
+            "data:,PRIVATE\0CANARY",
+            "file:///PRIVATE-CANARY",
+            "javascript:PRIVATE-CANARY",
+            "https://blocked.test/PRIVATE-CANARY",
+            "blob:https://blocked.test/PRIVATE-CANARY",
         ] {
             let error = download_url(raw, Some(&[])).unwrap_err().to_string();
             assert!(error.contains("BROWSER_DOWNLOAD_URL"));

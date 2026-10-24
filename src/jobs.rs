@@ -39,8 +39,8 @@ use crate::model::{Message, UserContent, UserMessage};
 
 mod host_task;
 pub(crate) use host_task::{
-    admit_owned_task, clear_owned_task_progress, publish_owned_task_progress,
-    spawn_owned_task, with_owned_task_progress,
+    admit_owned_task, clear_owned_task_progress, publish_owned_task_progress, spawn_owned_task,
+    with_owned_task_progress,
 };
 
 /// Future returned by the live session-identity resolver shared by the jobs
@@ -1600,8 +1600,7 @@ impl ForegroundJob {
             // Await that real terminal result instead of relabelling it as
             // cancellation or returning an unconfirmed cleanup result.
         }
-        let snapshot =
-            wait_for_settlement_wall(&self.handle, Duration::from_secs(10)).await?;
+        let snapshot = wait_for_settlement_wall(&self.handle, Duration::from_secs(10)).await?;
         if snapshot.status == JobStatus::Running.as_str() {
             return Err(Error::tool(
                 "bash",
@@ -1706,7 +1705,10 @@ pub(crate) fn spawn_foreground(
         JobDelivery::Foreground,
         shell_state,
     )?;
-    Ok(ForegroundJob { handle, armed: true })
+    Ok(ForegroundJob {
+        handle,
+        armed: true,
+    })
 }
 
 // Guard scope is deliberate; tightening drops would change lock-hold semantics.
@@ -1764,10 +1766,12 @@ fn spawn_managed(
 
     let retained_command = truncate_utf8_bytes(command, MAX_RETAINED_COMMAND_BYTES);
     let shell_command = shell_state.map_or_else(
-        || command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
-            || command.to_string(),
-            |prefix| format!("{prefix}\n{command}"),
-        ),
+        || {
+            command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+                || command.to_string(),
+                |prefix| format!("{prefix}\n{command}"),
+            )
+        },
         |state| state.command().to_owned(),
     );
     let shell_command = format!("trap 'code=$?; wait; exit $code' EXIT\n{shell_command}");
@@ -2056,7 +2060,10 @@ fn spawn_managed(
     // Ownership has reached the monitor before inspecting I/O-owned state.
     // A pump stalled in filesystem I/O must not strand the child, lifecycle
     // lock, and cancellation path inside this spawn call.
-    Ok((JobSnapshot::from_source_best_effort(&snapshot_source), handle))
+    Ok((
+        JobSnapshot::from_source_best_effort(&snapshot_source),
+        handle,
+    ))
 }
 
 #[cfg(windows)]
@@ -2603,9 +2610,7 @@ fn monitor_job(
         ),
     };
     if let Some(shell_state) = &resources.shell_state {
-        shell_state.finish(
-            termination_status.is_none() && exit_code.is_some_and(|code| code >= 0),
-        );
+        shell_state.finish(termination_status.is_none() && exit_code.is_some_and(|code| code >= 0));
     }
     settle_job_and_enqueue_notice(id, status, code, output_complete);
     resources.settlement_published = true;
@@ -2749,23 +2754,35 @@ fn prune_settled_jobs(reg: &mut JobRegistry) {
     // Native task results can contain structured data beyond the shell tail.
     // Bound their aggregate retention independently from descriptor count.
     const MAX_RETAINED_TASK_RESULT_BYTES: usize = 32 * 1024 * 1024;
-    let mut task_results: Vec<_> = reg.jobs.values()
+    let mut task_results: Vec<_> = reg
+        .jobs
+        .values()
         .filter(|job| job.status.settled() && job.result_bytes > 0)
-        .filter_map(|job| job.settled_sequence.map(|sequence| (sequence, job.id.clone(), job.result_bytes)))
+        .filter_map(|job| {
+            job.settled_sequence
+                .map(|sequence| (sequence, job.id.clone(), job.result_bytes))
+        })
         .collect();
     task_results.sort();
     // Live progress shares this budget. Only older settled entries are evicted;
     // a live task's latest observation must remain available to its owner.
-    let mut retained_bytes = reg.jobs.values().fold(0usize, |total, job| total.saturating_add(job.result_bytes));
+    let mut retained_bytes = reg
+        .jobs
+        .values()
+        .fold(0usize, |total, job| total.saturating_add(job.result_bytes));
     for (_, id, bytes) in task_results {
-        if retained_bytes <= MAX_RETAINED_TASK_RESULT_BYTES { break; }
+        if retained_bytes <= MAX_RETAINED_TASK_RESULT_BYTES {
+            break;
+        }
         reg.jobs.remove(&id);
         retained_bytes = retained_bytes.saturating_sub(bytes);
     }
     let mut settled_by_owner: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-    for job in reg.jobs.values().filter(|job| {
-        job.status.settled() && job.delivery == JobDelivery::Background
-    }) {
+    for job in reg
+        .jobs
+        .values()
+        .filter(|job| job.status.settled() && job.delivery == JobDelivery::Background)
+    {
         if let Some(sequence) = job.settled_sequence {
             settled_by_owner
                 .entry(job.owner_session_id.clone())
@@ -2816,8 +2833,7 @@ pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
         .jobs
         .values()
         .filter(|job| {
-            job.owner_session_id == owner_session_id
-                && job.delivery == JobDelivery::Background
+            job.owner_session_id == owner_session_id && job.delivery == JobDelivery::Background
         })
         .map(|job| {
             let settled = job
@@ -3511,7 +3527,9 @@ pub fn kill_all() {
 #[cfg(test)]
 pub(crate) fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
-    TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -6367,11 +6385,7 @@ mod tests {
             }
         }
         assert!(
-            !registry()
-                .lock()
-                .expect("registry")
-                .jobs
-                .contains_key(&id),
+            !registry().lock().expect("registry").jobs.contains_key(&id),
             "consuming inline completion releases its registry metadata"
         );
         assert!(take_completion_notices(&owner).is_empty());

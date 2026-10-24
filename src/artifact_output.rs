@@ -168,7 +168,9 @@ pub fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result<()> {
 }
 
 fn check_owner(owner: &crate::agent_cx::AgentCx, tool: &str) -> Result<()> {
-    owner.checkpoint().map_err(|_| error(tool, "artifact publication cancelled"))
+    owner
+        .checkpoint()
+        .map_err(|_| error(tool, "artifact publication cancelled"))
 }
 
 /// Copy at most `limit` bytes into private staging. Read one extra byte only
@@ -185,21 +187,31 @@ fn copy_bounded(
     loop {
         check_owner(owner, tool)?;
         let wanted = usize::try_from(limit.saturating_sub(total).saturating_add(1))
-            .unwrap_or(buffer.len()).min(buffer.len());
+            .unwrap_or(buffer.len())
+            .min(buffer.len());
         let read = match source.read(&mut buffer[..wanted]) {
             Ok(read) => read,
             Err(failure) if failure.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(failure) => return Err(error(tool, format!("cannot read artifact source: {failure}"))),
+            Err(failure) => {
+                return Err(error(
+                    tool,
+                    format!("cannot read artifact source: {failure}"),
+                ));
+            }
         };
         check_owner(owner, tool)?;
         if read == 0 {
-            if total == 0 { return Err(error(tool, "refusing to publish an empty artifact")); }
+            if total == 0 {
+                return Err(error(tool, "refusing to publish an empty artifact"));
+            }
             return Ok(total);
         }
-        total = total.checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+        total = total
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
             .filter(|total| *total <= limit)
             .ok_or_else(|| error(tool, format!("artifact source exceeds {limit} bytes")))?;
-        destination.write_all(&buffer[..read])
+        destination
+            .write_all(&buffer[..read])
             .map_err(|failure| error(tool, format!("cannot write artifact: {failure}")))?;
     }
 }
@@ -349,7 +361,9 @@ pub fn publish_from_reader(
     let mut staged = tempfile::NamedTempFile::new_in(&canonical_parent)
         .map_err(|failure| error(tool, format!("cannot stage artifact: {failure}")))?;
     let bytes = copy_bounded(source, &mut staged, max_bytes, &owner, tool)?;
-    staged.as_file().sync_all()
+    staged
+        .as_file()
+        .sync_all()
         .map_err(|failure| error(tool, format!("cannot write artifact: {failure}")))?;
     let canonical_parent_after = std::fs::canonicalize(parent).map_err(|failure| {
         error(
@@ -382,12 +396,20 @@ mod tests {
         let source_path = root.path().join("source.bin");
         let block: Vec<u8> = (0..=255).collect();
         let mut file = std::fs::File::create(&source_path).unwrap();
-        for _ in 0..8192 { file.write_all(&block).unwrap(); }
+        for _ in 0..8192 {
+            file.write_all(&block).unwrap();
+        }
         drop(file);
         let target = resolve_new(root.path(), "nested/copied.bin", "test").unwrap();
         let mut source = std::fs::File::open(&source_path).unwrap();
-        assert_eq!(publish_from_reader(&target, &mut source, 2 * 1024 * 1024, "test").unwrap(), 2 * 1024 * 1024);
-        assert_eq!(std::fs::read(target.path()).unwrap(), std::fs::read(source_path).unwrap());
+        assert_eq!(
+            publish_from_reader(&target, &mut source, 2 * 1024 * 1024, "test").unwrap(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            std::fs::read(target.path()).unwrap(),
+            std::fs::read(source_path).unwrap()
+        );
     }
 
     #[test]
@@ -402,7 +424,10 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         assert!(publish_from_reader(&target, &mut std::io::empty(), 4, "test").is_err());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-        assert_eq!(publish_from_reader(&target, &mut &b"1234"[..], 4, "test").unwrap(), 4);
+        assert_eq!(
+            publish_from_reader(&target, &mut &b"1234"[..], 4, "test").unwrap(),
+            4
+        );
     }
 
     #[test]
@@ -410,7 +435,9 @@ mod tests {
         struct Broken(bool);
         impl Read for Broken {
             fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                if self.0 { return Err(std::io::Error::other("source failed")); }
+                if self.0 {
+                    return Err(std::io::Error::other("source failed"));
+                }
                 self.0 = true;
                 buffer[..3].copy_from_slice(b"abc");
                 Ok(3)
@@ -426,7 +453,10 @@ mod tests {
 
     #[test]
     fn bounded_copy_handles_interrupted_reads_and_never_requests_large_buffers() {
-        struct Fragmented { interrupted: bool, remaining: usize }
+        struct Fragmented {
+            interrupted: bool,
+            remaining: usize,
+        }
         impl Read for Fragmented {
             fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
                 assert!(buffer.len() <= 64 * 1024);
@@ -442,8 +472,14 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let target = resolve_new(root.path(), "result.bin", "test").unwrap();
-        let mut source = Fragmented { interrupted: false, remaining: 100_003 };
-        assert_eq!(publish_from_reader(&target, &mut source, 100_003, "test").unwrap(), 100_003);
+        let mut source = Fragmented {
+            interrupted: false,
+            remaining: 100_003,
+        };
+        assert_eq!(
+            publish_from_reader(&target, &mut source, 100_003, "test").unwrap(),
+            100_003
+        );
         assert_eq!(std::fs::read(target.path()).unwrap(), vec![b'x'; 100_003]);
     }
 
@@ -461,7 +497,8 @@ mod tests {
         let target = resolve_new(root.path(), "result.bin", "test").unwrap();
         let owner = crate::agent_cx::AgentCx::for_testing();
         let _current = owner.cx().clone().set_current_restricted();
-        let failure = publish_from_reader(&target, &mut Cancelling(owner.clone()), 10, "test").unwrap_err();
+        let failure =
+            publish_from_reader(&target, &mut Cancelling(owner.clone()), 10, "test").unwrap_err();
         assert!(failure.to_string().contains("cancelled"));
         assert!(!target.path().exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

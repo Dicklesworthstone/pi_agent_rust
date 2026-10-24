@@ -138,14 +138,12 @@ impl NativeDoctorEvidence {
         match data.get("critical_failures").and_then(Value::as_array) {
             Some(failures) => {
                 self.has_failures |= !failures.is_empty();
-                if failures.iter().any(|failure| {
-                    !failure
-                        .as_str()
-                        .is_some_and(|text| !text.trim().is_empty())
-                }) {
-                    self.degraded_reasons.push(
-                        "doctor_swarm_resource_critical_failures_invalid".to_string(),
-                    );
+                if failures
+                    .iter()
+                    .any(|failure| !failure.as_str().is_some_and(|text| !text.trim().is_empty()))
+                {
+                    self.degraded_reasons
+                        .push("doctor_swarm_resource_critical_failures_invalid".to_string());
                 }
             }
             None => self
@@ -292,7 +290,10 @@ impl NativeDoctorEvidence {
     }
 
     fn validate_summary(&mut self, report: &Value) {
-        for (severity, count) in ["pass", "info", "warn", "fail"].into_iter().zip(self.counts) {
+        for (severity, count) in ["pass", "info", "warn", "fail"]
+            .into_iter()
+            .zip(self.counts)
+        {
             if report
                 .get("summary")
                 .and_then(|summary| summary.get(severity))
@@ -499,12 +500,20 @@ mod tests {
         let input = normalize_doctor_json(provenance(), &report).expect("normalize");
         assert_eq!(input.health.state, ValidationSourceState::Degraded);
         assert!(!input.has_failures, "do not invent consumer failures");
-        assert!(input.health.degraded_reasons.iter().any(|reason| {
-            reason.contains("resource_preflight_expected_once")
-        }));
-        assert!(input.health.degraded_reasons.iter().any(|reason| {
-            reason.contains("admission_expected_once")
-        }));
+        assert!(
+            input
+                .health
+                .degraded_reasons
+                .iter()
+                .any(|reason| { reason.contains("resource_preflight_expected_once") })
+        );
+        assert!(
+            input
+                .health
+                .degraded_reasons
+                .iter()
+                .any(|reason| { reason.contains("admission_expected_once") })
+        );
         assert_eq!(input.checks.len(), 2);
     }
 
@@ -592,7 +601,12 @@ mod tests {
             report["checks"] = json!([{"name": "legacy success", "status": "ok"}]);
             let input = normalize_doctor_json(provenance(), &report).expect("normalize");
             assert!(input.health.is_degraded());
-            assert!(input.checks.iter().all(|check| check.name != "legacy success"));
+            assert!(
+                input
+                    .checks
+                    .iter()
+                    .all(|check| check.name != "legacy success")
+            );
         }
     }
 
@@ -615,14 +629,8 @@ mod tests {
     }
 
     fn source(name: &str) -> ValidationSourceProvenance {
-        ValidationSourceProvenance::new(
-            name,
-            vec![name.to_string()],
-            "/workspace",
-            START,
-            None,
-        )
-        .expect("source provenance")
+        ValidationSourceProvenance::new(name, vec![name.to_string()], "/workspace", START, None)
+            .expect("source provenance")
     }
 
     fn inputs() -> ValidationBrokerInputSnapshot {
@@ -638,8 +646,7 @@ mod tests {
                 .expect("cargo headroom"),
             doctor: normalize_doctor_json(provenance(), &native_report(ready_findings()))
                 .expect("doctor input"),
-            git: normalize_git_status_text(source("git"), "head", "## main\n")
-                .expect("git input"),
+            git: normalize_git_status_text(source("git"), "head", "## main\n").expect("git input"),
             beads: normalize_beads_json(source("beads"), &json!([]), NOW, 3600)
                 .expect("Beads input"),
             scratch_headroom: normalize_headroom_json(source("scratch_headroom"), &headroom)
@@ -714,7 +721,10 @@ mod tests {
     }
 
     fn assert_blocked_without_reuse(decision: &ValidationAdmissionDecisionRecord) {
-        assert_eq!(decision.decision, ValidationAdmissionDecision::DegradedBlock);
+        assert_eq!(
+            decision.decision,
+            ValidationAdmissionDecision::DegradedBlock
+        );
         assert!(decision.reusable_slot.is_none());
         assert!(decision.coalesced_artifacts.is_empty());
     }
@@ -722,11 +732,7 @@ mod tests {
     #[test]
     fn cached_result_cannot_override_consumer_only_or_failed_doctor() {
         let store = reusable_store();
-        let consumer = native_report(vec![finding(
-            CheckCategory::Config,
-            Severity::Pass,
-            None,
-        )]);
+        let consumer = native_report(vec![finding(CheckCategory::Config, Severity::Pass, None)]);
         let failed = json!({"checks": [{"name": "scratch", "status": "fail"}]});
         for report in [consumer, failed] {
             let mut inputs = inputs();
@@ -748,7 +754,12 @@ mod tests {
             let decision = decide(&inputs, &reusable_store());
             assert_blocked_without_reuse(&decision);
             assert!(decision.policy.blocking_source_degraded);
-            assert!(decision.reasons.iter().any(|reason| reason.starts_with("rch:")));
+            assert!(
+                decision
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("rch:"))
+            );
         }
     }
 
@@ -798,9 +809,12 @@ mod tests {
         let decision = decide(&inputs, &reusable_store());
         assert_eq!(decision.decision, ValidationAdmissionDecision::Coalesce);
         assert_eq!(decision.confidence, "medium");
-        assert!(decision.no_claims.iter().any(|claim| {
-            claim == "not_permission_to_skip_required_gates"
-        }));
+        assert!(
+            decision
+                .no_claims
+                .iter()
+                .any(|claim| { claim == "not_permission_to_skip_required_gates" })
+        );
     }
 
     fn normalize_resource(data: Value) -> ValidationDoctorInput {
@@ -899,7 +913,12 @@ mod tests {
     #[test]
     fn storage_evidence_requires_typed_measurements_flags_and_policy() {
         for field in [
-            "available_kb", "exists", "under_expected_root", "ready", "problem", "path",
+            "available_kb",
+            "exists",
+            "under_expected_root",
+            "ready",
+            "problem",
+            "path",
         ] {
             for replacement in [json!([]), json!({}), json!("invalid")] {
                 let mut data = ready_resource();
@@ -913,7 +932,13 @@ mod tests {
                 .remove(field);
             assert_resource_blocks_new_work_and_reuse(data);
         }
-        for replacement in [Value::Null, json!(0), json!(-1), json!("10485760"), json!(1.5)] {
+        for replacement in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!("10485760"),
+            json!(1.5),
+        ] {
             let mut data = ready_resource();
             data["tmpfs_headroom"]["warn_available_kb"] = replacement;
             assert_resource_blocks_new_work_and_reuse(data);

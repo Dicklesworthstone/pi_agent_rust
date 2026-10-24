@@ -40,14 +40,21 @@ impl Context {
     }
 
     fn parameters(&self, method: &str, params: Value) -> Result<Value> {
-        if !matches!(method, "Browser.setDownloadBehavior" | "Browser.cancelDownload") {
-            return Err(error("BROWSER_CONTEXT_COMMAND: unsupported context operation"));
+        if !matches!(
+            method,
+            "Browser.setDownloadBehavior" | "Browser.cancelDownload"
+        ) {
+            return Err(error(
+                "BROWSER_CONTEXT_COMMAND: unsupported context operation",
+            ));
         }
         let mut params = params.as_object().cloned().ok_or_else(|| {
             error("BROWSER_CONTEXT_COMMAND: context command parameters must be an object")
         })?;
         if params.contains_key("browserContextId") {
-            return Err(error("BROWSER_CONTEXT_COMMAND: context overrides are not permitted"));
+            return Err(error(
+                "BROWSER_CONTEXT_COMMAND: context overrides are not permitted",
+            ));
         }
         if let Self::Named(id) = self {
             params.insert("browserContextId".to_owned(), json!(id));
@@ -62,7 +69,9 @@ impl Context {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        owner.checkpoint().map_err(|_| error("BROWSER_CONTEXT_CANCELLED"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| error("BROWSER_CONTEXT_CANCELLED"))?;
         cdp.browser_command(owner, method, self.parameters(method, params)?)
             .await
             .map_err(|_| error("BROWSER_CONTEXT_COMMAND: browser context operation failed"))
@@ -104,19 +113,29 @@ impl Catalog {
         let mut named = BTreeSet::new();
         for value in ids {
             if !named.insert(identifier(value)?) {
-                return Err(error("BROWSER_CONTEXT_METADATA: duplicate context identity"));
+                return Err(error(
+                    "BROWSER_CONTEXT_METADATA: duplicate context identity",
+                ));
             }
         }
-        let default = value.get("defaultBrowserContextId").map(identifier).transpose()?;
+        let default = value
+            .get("defaultBrowserContextId")
+            .map(identifier)
+            .transpose()?;
         if default.as_ref().is_some_and(|id| named.contains(id)) {
-            return Err(error("BROWSER_CONTEXT_METADATA: conflicting default context identity"));
+            return Err(error(
+                "BROWSER_CONTEXT_METADATA: conflicting default context identity",
+            ));
         }
         Ok(Self { named, default })
     }
 
     async fn read(owner: &AgentCx, cdp: &mut Cdp) -> Result<Self> {
-        owner.checkpoint().map_err(|_| error("BROWSER_CONTEXT_CANCELLED"))?;
-        let response = cdp.browser_command(owner, "Target.getBrowserContexts", json!({}))
+        owner
+            .checkpoint()
+            .map_err(|_| error("BROWSER_CONTEXT_CANCELLED"))?;
+        let response = cdp
+            .browser_command(owner, "Target.getBrowserContexts", json!({}))
             .await
             .map_err(|_| error("BROWSER_CONTEXT_METADATA: cannot enumerate browser contexts"))?;
         Self::parse(&response)
@@ -146,16 +165,25 @@ impl Binding {
             || identifier(&info["targetId"])? != self.target
             || identifier(&info["browserContextId"])? != self.raw_context
         {
-            return Err(error("BROWSER_CONTEXT_CHANGED: selected target changed context identity"));
+            return Err(error(
+                "BROWSER_CONTEXT_CHANGED: selected target changed context identity",
+            ));
         }
         Ok(())
     }
 
     pub(super) async fn check(&self, owner: &AgentCx, cdp: &mut Cdp) -> Result<()> {
-        owner.checkpoint().map_err(|_| error("BROWSER_CONTEXT_CANCELLED"))?;
-        let response = cdp.browser_command(
-            owner, "Target.getTargetInfo", json!({"targetId":self.target}),
-        ).await.map_err(|_| error("BROWSER_CONTEXT_CHANGED: selected target is unavailable"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| error("BROWSER_CONTEXT_CANCELLED"))?;
+        let response = cdp
+            .browser_command(
+                owner,
+                "Target.getTargetInfo",
+                json!({"targetId":self.target}),
+            )
+            .await
+            .map_err(|_| error("BROWSER_CONTEXT_CHANGED: selected target is unavailable"))?;
         self.verify(&response["targetInfo"])
     }
 }
@@ -166,32 +194,44 @@ impl Binding {
 /// Hidden targets belong to this connection and disappear on disconnect even
 /// if cancellation prevents the explicit close. No user target is navigated.
 async fn default_identity(owner: &AgentCx, cdp: &mut Cdp, selected: &str) -> Result<String> {
-    let created = cdp.browser_command(owner, "Target.createTarget", json!({
-        "url":"about:blank", "hidden":true, "background":true,
-    })).await.map_err(|_| error("BROWSER_CONTEXT_UNKNOWN: default context identity is unavailable"))?;
+    let created = cdp
+        .browser_command(
+            owner,
+            "Target.createTarget",
+            json!({
+                "url":"about:blank", "hidden":true, "background":true,
+            }),
+        )
+        .await
+        .map_err(|_| error("BROWSER_CONTEXT_UNKNOWN: default context identity is unavailable"))?;
     let target = identifier(&created["targetId"])?;
     if target == selected {
-        return Err(error("BROWSER_CONTEXT_METADATA: identity probe reused the selected target"));
+        return Err(error(
+            "BROWSER_CONTEXT_METADATA: identity probe reused the selected target",
+        ));
     }
-    let inspected = cdp.browser_command(
-        owner, "Target.getTargetInfo", json!({"targetId":target}),
-    ).await;
+    let inspected = cdp
+        .browser_command(owner, "Target.getTargetInfo", json!({"targetId":target}))
+        .await;
     // Close only the hidden target we just created; never dispose a context.
-    let closed = cdp.browser_command(
-        owner, "Target.closeTarget", json!({"targetId":target}),
-    ).await;
-    let inspected = inspected.map_err(|_| {
-        error("BROWSER_CONTEXT_UNKNOWN: cannot inspect default context identity")
-    })?;
+    let closed = cdp
+        .browser_command(owner, "Target.closeTarget", json!({"targetId":target}))
+        .await;
+    let inspected = inspected
+        .map_err(|_| error("BROWSER_CONTEXT_UNKNOWN: cannot inspect default context identity"))?;
     if closed.ok().is_none_or(|value| value["success"] != true) {
-        return Err(error("BROWSER_CONTEXT_UNKNOWN: hidden identity target did not close"));
+        return Err(error(
+            "BROWSER_CONTEXT_UNKNOWN: hidden identity target did not close",
+        ));
     }
     let info = &inspected["targetInfo"];
     if identifier(&info["targetId"])? != target
         || !matches!(info["type"].as_str(), Some("page" | "other"))
         || info["url"] != "about:blank"
     {
-        return Err(error("BROWSER_CONTEXT_METADATA: invalid default identity target"));
+        return Err(error(
+            "BROWSER_CONTEXT_METADATA: invalid default identity target",
+        ));
     }
     identifier(&info["browserContextId"])
 }
@@ -210,25 +250,41 @@ pub(super) async fn select(
     let raw_context = identifier(raw)?;
     let target = identifier(&info["targetId"])?;
     if info["type"] != "page" {
-        return Err(error("BROWSER_CONTEXT_METADATA: selected target is not a page"));
+        return Err(error(
+            "BROWSER_CONTEXT_METADATA: selected target is not a page",
+        ));
     }
     let mut catalog = Catalog::read(owner, cdp).await?;
     if catalog.classify(&raw_context).is_none() && catalog.default.is_none() {
         let default = default_identity(owner, cdp, &target).await?;
         if catalog.named.contains(&default) {
-            return Err(error("BROWSER_CONTEXT_METADATA: default identity overlaps a named context"));
+            return Err(error(
+                "BROWSER_CONTEXT_METADATA: default identity overlaps a named context",
+            ));
         }
         catalog.default = Some(default);
     }
     let context = catalog.classify(&raw_context).ok_or_else(|| {
         error("BROWSER_CONTEXT_UNKNOWN: target is outside the default or CDP-created contexts")
     })?;
-    let binding = Binding { target, raw_context, context };
+    let binding = Binding {
+        target,
+        raw_context,
+        context,
+    };
     binding.check(owner, cdp).await?;
     if matches!(binding.context, Context::Named(_)) {
-        binding.context.command(owner, cdp, "Browser.setDownloadBehavior", json!({
-            "behavior":"deny", "eventsEnabled":true,
-        })).await?;
+        binding
+            .context
+            .command(
+                owner,
+                cdp,
+                "Browser.setDownloadBehavior",
+                json!({
+                    "behavior":"deny", "eventsEnabled":true,
+                }),
+            )
+            .await?;
         binding.check(owner, cdp).await?;
     }
     Ok(Some(binding))
@@ -242,16 +298,23 @@ mod tests {
     fn context_inventory_is_closed_bounded_and_unambiguous() {
         let catalog = Catalog::parse(&json!({
             "browserContextIds":["incognito"], "defaultBrowserContextId":"ordinary",
-        })).unwrap();
-        assert_eq!(catalog.classify("incognito"), Some(Context::Named("incognito".into())));
+        }))
+        .unwrap();
+        assert_eq!(
+            catalog.classify("incognito"),
+            Some(Context::Named("incognito".into()))
+        );
         assert_eq!(catalog.classify("ordinary"), Some(Context::Default));
         assert_eq!(catalog.classify("unlisted"), None);
-        for value in [json!({}), json!({"browserContextIds":null}),
+        for value in [
+            json!({}),
+            json!({"browserContextIds":null}),
             json!({"browserContextIds":["same","same"]}),
             json!({"browserContextIds":["same"],"defaultBrowserContextId":"same"}),
             json!({"browserContextIds":[],"defaultBrowserContextId":null}),
             json!({"browserContextIds":["PRIVATE-CANARY\n"]}),
-            json!({"browserContextIds":["x".repeat(257)]})] {
+            json!({"browserContextIds":["x".repeat(257)]}),
+        ] {
             let failure = Catalog::parse(&value).unwrap_err().to_string();
             assert!(!failure.contains("PRIVATE-CANARY"));
         }
@@ -272,13 +335,22 @@ mod tests {
     fn policy_and_cancellation_keep_the_same_explicit_context() {
         let context = Context::Named("private".into());
         for (method, params) in [
-            ("Browser.setDownloadBehavior", json!({"behavior":"allowAndName","downloadPath":"/private/staging","eventsEnabled":true})),
-            ("Browser.setDownloadBehavior", json!({"behavior":"deny","eventsEnabled":true})),
+            (
+                "Browser.setDownloadBehavior",
+                json!({"behavior":"allowAndName","downloadPath":"/private/staging","eventsEnabled":true}),
+            ),
+            (
+                "Browser.setDownloadBehavior",
+                json!({"behavior":"deny","eventsEnabled":true}),
+            ),
             ("Browser.cancelDownload", json!({"guid":"transfer"})),
         ] {
             let scoped = context.parameters(method, params.clone()).unwrap();
             assert_eq!(scoped["browserContextId"], "private");
-            assert_eq!(Context::Default.parameters(method, params.clone()).unwrap(), params);
+            assert_eq!(
+                Context::Default.parameters(method, params.clone()).unwrap(),
+                params
+            );
             for (key, value) in params.as_object().unwrap() {
                 assert_eq!(scoped[key], *value);
             }
@@ -289,19 +361,33 @@ mod tests {
     fn context_parameters_do_not_accept_overrides_or_arbitrary_commands() {
         for context in [Context::Default, Context::Named("owned".into())] {
             assert!(context.parameters("Browser.close", json!({})).is_err());
-            assert!(context.parameters("Browser.cancelDownload", Value::Null).is_err());
+            assert!(
+                context
+                    .parameters("Browser.cancelDownload", Value::Null)
+                    .is_err()
+            );
             for value in [Value::Null, json!("owned"), json!("other")] {
-                assert!(context.parameters("Browser.cancelDownload", json!({
-                    "guid":"job", "browserContextId":value,
-                })).is_err());
+                assert!(
+                    context
+                        .parameters(
+                            "Browser.cancelDownload",
+                            json!({
+                                "guid":"job", "browserContextId":value,
+                            })
+                        )
+                        .is_err()
+                );
             }
         }
     }
 
     #[test]
     fn context_binding_rejects_replacement_targets_and_missing_identity() {
-        let binding = Binding { target:"page".into(), raw_context:"private".into(),
-            context:Context::Named("private".into()) };
+        let binding = Binding {
+            target: "page".into(),
+            raw_context: "private".into(),
+            context: Context::Named("private".into()),
+        };
         let good = json!({"targetId":"page","type":"page","browserContextId":"private"});
         binding.verify(&good).unwrap();
         for field in ["targetId", "type", "browserContextId"] {

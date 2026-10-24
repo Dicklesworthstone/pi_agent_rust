@@ -15,15 +15,27 @@ fn sdk_recovers_and_exports_a_selected_branch_without_media_or_session_mutation(
     header.current_leaf = Some("answer".to_string());
     let mut rows = vec![serde_json::to_value(header).unwrap()];
     for (id, parent, content) in [
-        ("root", None, json!([
-            {"type":"text", "text":"Keep this reasoning even without the image."},
-            {"type":"image", "mimeType":"image/png", "data":{
-                "$piBlob":format!("sha256:{}", "a".repeat(64)),
-                "sizeBytes":100_000, "encoding":"base64"
-            }}
-        ])),
-        ("answer", Some("root"), json!("Selected path with Unicode: 日本語")),
-        ("alternate", Some("root"), json!("Independent alternate branch")),
+        (
+            "root",
+            None,
+            json!([
+                {"type":"text", "text":"Keep this reasoning even without the image."},
+                {"type":"image", "mimeType":"image/png", "data":{
+                    "$piBlob":format!("sha256:{}", "a".repeat(64)),
+                    "sizeBytes":100_000, "encoding":"base64"
+                }}
+            ]),
+        ),
+        (
+            "answer",
+            Some("root"),
+            json!("Selected path with Unicode: 日本語"),
+        ),
+        (
+            "alternate",
+            Some("root"),
+            json!("Independent alternate branch"),
+        ),
     ] {
         rows.push(json!({
             "type":"message", "id":id, "parentId":parent,
@@ -42,11 +54,19 @@ fn sdk_recovers_and_exports_a_selected_branch_without_media_or_session_mutation(
     assert_eq!(report.entries().len(), 3);
     assert_eq!(report.omissions().len(), 1);
     assert_eq!(report.selected_leaf(), Some("answer"));
-    assert_eq!(report.active_path().map(|entry| entry.id()).collect::<Vec<_>>(), ["root", "answer"]);
+    assert_eq!(
+        report
+            .active_path()
+            .map(|entry| entry.id())
+            .collect::<Vec<_>>(),
+        ["root", "answer"]
+    );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 
     let mut selected = Vec::new();
-    report.write_selected_text(RecoverySelection::Active, &mut selected).unwrap();
+    report
+        .write_selected_text(RecoverySelection::Active, &mut selected)
+        .unwrap();
     let selected = String::from_utf8(selected).unwrap();
     assert!(selected.contains("Keep this reasoning"));
     assert!(selected.contains("日本語"));
@@ -54,12 +74,21 @@ fn sdk_recovers_and_exports_a_selected_branch_without_media_or_session_mutation(
     assert!(selected.contains("attachment not inspected"));
 
     let json_path = directory.path().join("recovered.json");
-    report.export_file(&json_path, RecoveryExport::Json).unwrap();
+    report
+        .export_file(&json_path, RecoveryExport::Json)
+        .unwrap();
     let decoded: Value = serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
     assert_eq!(decoded["schema"], "pi.session_text_recovery.v1");
-    assert_eq!(decoded["entries"][2]["record"]["message"]["content"], "Independent alternate branch");
+    assert_eq!(
+        decoded["entries"][2]["record"]["message"]["content"],
+        "Independent alternate branch"
+    );
     assert!(report.export_file(&source, RecoveryExport::Json).is_err());
-    assert!(report.export_file(&json_path, RecoveryExport::Json).is_err());
+    assert!(
+        report
+            .export_file(&json_path, RecoveryExport::Json)
+            .is_err()
+    );
     assert_eq!(std::fs::read(&source).unwrap(), original);
     assert!(!source.with_extension("jsonl.blobs").exists());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
@@ -110,31 +139,59 @@ fn persisted_source(root: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
 }
 
 fn path_ids(session: &Session) -> Vec<String> {
-    session.entries_for_current_path().iter().map(|entry| {
-        serde_json::to_value(entry).unwrap()["id"].as_str().unwrap().to_string()
-    }).collect()
+    session
+        .entries_for_current_path()
+        .iter()
+        .map(|entry| {
+            serde_json::to_value(entry).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
 }
 
 #[test]
 fn recovered_copy_opens_appends_saves_and_reopens_through_the_native_session_api() {
     let directory = tempfile::tempdir().unwrap();
     let (source, original) = persisted_source(directory.path());
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
-        assert!(Session::open(source.to_str().unwrap()).await.is_err(),
-            "normal loading must still refuse absent media");
+        assert!(
+            Session::open(source.to_str().unwrap()).await.is_err(),
+            "normal loading must still refuse absent media"
+        );
         let output = directory.path().join("copy.jsonl");
         let id = Session::fork_recovered_text(&source, &output, None).unwrap();
-        let (mut session, diagnostics) = Session::open_with_diagnostics(output.to_str().unwrap()).await.unwrap();
+        let (mut session, diagnostics) = Session::open_with_diagnostics(output.to_str().unwrap())
+            .await
+            .unwrap();
         assert!(diagnostics.skipped_entries.is_empty());
         assert!(diagnostics.orphaned_parent_links.is_empty());
         assert_eq!(session.header.id, id);
         assert_ne!(id, "original-session");
         let notice = session.leaf_id().unwrap().to_string();
-        assert_eq!(path_ids(&session), ["request", "calls", "result", "answered", &notice]);
-        assert_eq!(session.entries.len(), 6, "all five source records plus provenance");
-        assert!(serde_json::to_string(&session.entries).unwrap().contains("Other branch preserved"));
-        assert!(!serde_json::to_string(&session.entries).unwrap().contains("$piBlob"));
+        assert_eq!(
+            path_ids(&session),
+            ["request", "calls", "result", "answered", &notice]
+        );
+        assert_eq!(
+            session.entries.len(),
+            6,
+            "all five source records plus provenance"
+        );
+        assert!(
+            serde_json::to_string(&session.entries)
+                .unwrap()
+                .contains("Other branch preserved")
+        );
+        assert!(
+            !serde_json::to_string(&session.entries)
+                .unwrap()
+                .contains("$piBlob")
+        );
         let last = serde_json::to_value(session.entries.last().unwrap()).unwrap();
         assert_eq!(last["message"]["details"]["omittedAttachments"], 2);
 
@@ -146,17 +203,30 @@ fn recovered_copy_opens_appends_saves_and_reopens_through_the_native_session_api
         });
         let continued = session.leaf_id().unwrap().to_string();
         session.save().await.unwrap();
-        assert_eq!(session.path.as_ref().unwrap().canonicalize().unwrap(), output.canonicalize().unwrap());
-        let (reopened, diagnostics) = Session::open_with_diagnostics(output.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            session.path.as_ref().unwrap().canonicalize().unwrap(),
+            output.canonicalize().unwrap()
+        );
+        let (reopened, diagnostics) = Session::open_with_diagnostics(output.to_str().unwrap())
+            .await
+            .unwrap();
         assert!(diagnostics.skipped_entries.is_empty());
         assert!(diagnostics.orphaned_parent_links.is_empty());
         assert_eq!(reopened.header.id, id);
         assert_eq!(reopened.leaf_id(), Some(continued.as_str()));
-        assert_eq!(path_ids(&reopened), ["request", "calls", "result", "answered", &notice, &continued]);
+        assert_eq!(
+            path_ids(&reopened),
+            [
+                "request", "calls", "result", "answered", &notice, &continued
+            ]
+        );
         assert_eq!(reopened.entries.len(), 7);
         let appended = serde_json::to_value(reopened.entries.last().unwrap()).unwrap();
         assert_eq!(appended["parentId"], notice);
-        assert_eq!(appended["message"]["content"], "Continue using the preserved text");
+        assert_eq!(
+            appended["message"]["content"],
+            "Continue using the preserved text"
+        );
         assert_eq!(std::fs::read(&source).unwrap(), original);
         assert!(!source.with_extension("jsonl.blobs").exists());
         assert!(!output.with_extension("jsonl.blobs").exists());
@@ -168,17 +238,27 @@ fn recovered_copy_opens_appends_saves_and_reopens_through_the_native_session_api
 fn explicit_root_and_alternate_branch_resume_with_their_own_selected_paths() {
     let directory = tempfile::tempdir().unwrap();
     let (source, original) = persisted_source(directory.path());
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     for (name, selection, expected) in [
         ("root.jsonl", "", Vec::<String>::new()),
-        ("alternate.jsonl", "alternate", vec!["request".to_string(), "alternate".to_string()]),
+        (
+            "alternate.jsonl",
+            "alternate",
+            vec!["request".to_string(), "alternate".to_string()],
+        ),
     ] {
         let output = directory.path().join(name);
         let id = Session::fork_recovered_text(&source, &output, Some(selection)).unwrap();
         runtime.block_on(async {
             let mut session = Session::open(output.to_str().unwrap()).await.unwrap();
             assert_eq!(session.header.id, id);
-            assert_eq!(session.entries.len(), 6, "selection does not discard other branches");
+            assert_eq!(
+                session.entries.len(),
+                6,
+                "selection does not discard other branches"
+            );
             let mut expected_path = expected;
             let notice = session.leaf_id().unwrap().to_string();
             expected_path.push(notice.clone());
@@ -215,7 +295,9 @@ fn recovered_copy_never_repairs_or_reuses_corrupt_original_attachments() {
         std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     let output = directory.path().join("copy.jsonl");
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         assert!(Session::open(source.to_str().unwrap()).await.is_err());
         let id = Session::fork_recovered_text(&source, &output, None).unwrap();

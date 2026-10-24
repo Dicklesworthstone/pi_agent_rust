@@ -51,7 +51,10 @@ pub struct AuxiliaryPrivacySnapshot {
 impl AuxiliaryPrivacySnapshot {
     #[must_use]
     pub fn from_privacy(privacy: AuxiliaryPrivacy) -> Self {
-        Self { privacy, known_secrets: crate::secrets::SecretVault::default() }
+        Self {
+            privacy,
+            known_secrets: crate::secrets::SecretVault::default(),
+        }
     }
 
     #[must_use]
@@ -59,7 +62,10 @@ impl AuxiliaryPrivacySnapshot {
         privacy: AuxiliaryPrivacy,
         known_secrets: &crate::secrets::SecretVault,
     ) -> Self {
-        Self { privacy, known_secrets: known_secrets.clone() }
+        Self {
+            privacy,
+            known_secrets: known_secrets.clone(),
+        }
     }
 
     /// Remember discoveries across the complete, bounded task input before
@@ -395,12 +401,18 @@ mod tests {
         admitted.capture_json(&serde_json::json!({"api_key":secret}))?;
         assert_eq!(source.mask(secret), secret); // ubs:ignore -- Task discoveries must never mutate the live Agent vault.
         assert_eq!(original.project_inputs(&[secret])?, vec![secret]); // ubs:ignore -- Separately captured task snapshots must not share mutable discoveries.
-        assert_eq!(admitted.project_inputs(&[secret])?, vec!["<pi-secret:redacted>"]); // ubs:ignore -- The admitted task must retain its own discoveries.
+        assert_eq!(
+            admitted.project_inputs(&[secret])?,
+            vec!["<pi-secret:redacted>"]
+        ); // ubs:ignore -- The admitted task must retain its own discoveries.
         let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
-            mode: Some("block".to_string()), ..Default::default()
+            mode: Some("block".to_string()),
+            ..Default::default()
         }));
         let mut blocked = AuxiliaryPrivacySnapshot::from_privacy(privacy);
-        let error = blocked.capture_json(&serde_json::json!({"api_key":secret})).expect_err("blocked input"); // ubs:ignore -- Blocking policy must refuse complete input before any background request can be admitted.
+        let error = blocked
+            .capture_json(&serde_json::json!({"api_key":secret}))
+            .expect_err("blocked input"); // ubs:ignore -- Blocking policy must refuse complete input before any background request can be admitted.
         assert!(error.to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore -- Preserve the named block error without echoing the source.
         assert!(!error.to_string().contains(secret)); // ubs:ignore -- Error paths cannot disclose the blocked value.
         Ok(())
@@ -520,9 +532,8 @@ mod tests {
         ]);
         let original = source.clone();
         let mut vault = crate::secrets::SecretVault::default();
-        let protected =
-            redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault)
-                .expect("descriptive context can redact a numeric credential");
+        let protected = redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault)
+            .expect("descriptive context can redact a numeric credential");
         assert_eq!(
             protected,
             serde_json::json!([
@@ -649,11 +660,8 @@ mod tests {
         let source = serde_json::json!({"ACME-1111": 1, "ACME-2222": 2});
         let original = source.clone();
         let mut vault = crate::secrets::SecretVault::default();
-        let _ = crate::secrets::obfuscate(
-            "API_KEY=rememberedCredentialValue123456",
-            &mut vault,
-            &[],
-        );
+        let _ =
+            crate::secrets::obfuscate("API_KEY=rememberedCredentialValue123456", &mut vault, &[]);
         let before = vault.mask("rememberedCredentialValue123456");
         let error = redact_json_with_vault(&source, &privacy, &mut vault)
             .expect_err("non-restorable key markers must not discard an object member");

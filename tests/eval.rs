@@ -225,9 +225,17 @@ fn python_async_state_loop_context_and_tasks_survive_cells() {
         return;
     }
     let tool = pi::eval::EvalTool::new(&harness.temp_path("."));
-    let out = python_cell(&harness, &tool, "import asyncio, contextvars\nloop = asyncio.get_running_loop()\nkey = contextvars.ContextVar('key')\nkey.set(40)\nevent = asyncio.Event()\nasync def later():\n    await event.wait()\n    return 2\ntask = asyncio.create_task(later())\nNone");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "import asyncio, contextvars\nloop = asyncio.get_running_loop()\nkey = contextvars.ContextVar('key')\nkey.set(40)\nevent = asyncio.Event()\nasync def later():\n    await event.wait()\n    return 2\ntask = asyncio.create_task(later())\nNone",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
-    let out = python_cell(&harness, &tool, "event.set()\nvalue = key.get() + await task\n(value, asyncio.get_running_loop() is loop)");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "event.set()\nvalue = key.get() + await task\n(value, asyncio.get_running_loop() is loop)",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
     assert_eq!(first_text(&out).trim(), "(42, True)");
     let out = python_cell(&harness, &tool, "await asyncio.sleep(0, result=value)");
@@ -269,14 +277,26 @@ fn python_async_bridge_preserves_host_whitelist() {
     let root = harness.temp_path(".");
     std::fs::write(root.join("data.txt"), "async-bridge-verified\n").expect("fixture");
     let tool = pi::eval::EvalTool::new(&root);
-    let out = python_cell(&harness, &tool, "import asyncio\nresults = await asyncio.gather(tool.call('read', {'path': 'data.txt'}), tool.call('read', {'path': 'data.txt'}))\nlen(results) == 2 and all('async-bridge-verified' in text for text in results)");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "import asyncio\nresults = await asyncio.gather(tool.call('read', {'path': 'data.txt'}), tool.call('read', {'path': 'data.txt'}))\nlen(results) == 2 and all('async-bridge-verified' in text for text in results)",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
     assert!(first_text(&out).trim().ends_with("True"));
-    let out = python_cell(&harness, &tool, "await tool.call('write', {'path': 'must-not-exist', 'content': 'forbidden'})");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "await tool.call('write', {'path': 'must-not-exist', 'content': 'forbidden'})",
+    );
     assert!(out.is_error);
     assert!(first_text(&out).contains("EVAL_BRIDGE_DENIED"));
     assert!(!root.join("must-not-exist").exists());
-    let out = python_cell(&harness, &tool, "'async-bridge-verified' in tool.read('data.txt')");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "'async-bridge-verified' in tool.read('data.txt')",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
     assert_eq!(first_text(&out).trim(), "True");
     finish_case(&harness, case);
@@ -298,7 +318,11 @@ fn python_async_timeout_discards_state_and_restarts() {
     .expect_err("host must terminate the async cell");
     harness.log().info("timeout", error.to_string());
     assert!(error.to_string().contains("EVAL_TIMEOUT"));
-    let out = python_cell(&harness, &tool, "import asyncio\n(await asyncio.sleep(0, result=42), 'marker' in globals())");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "import asyncio\n(await asyncio.sleep(0, result=42), 'marker' in globals())",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
     assert!(first_text(&out).contains("(42, False)"));
     finish_case(&harness, case);
@@ -312,7 +336,11 @@ fn python_async_statements_capture_stdout_and_stderr() {
         return;
     }
     let tool = pi::eval::EvalTool::new(&harness.temp_path("."));
-    let out = python_cell(&harness, &tool, "import sys\nfrom contextlib import asynccontextmanager\n@asynccontextmanager\nasync def scope():\n    yield 40\nasync def values():\n    for x in range(2):\n        yield x\nasync with scope() as total:\n    print('async-stdout')\nasync for x in values():\n    total += x\nprint('async-stderr', file=sys.stderr)\ntotal");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "import sys\nfrom contextlib import asynccontextmanager\n@asynccontextmanager\nasync def scope():\n    yield 40\nasync def values():\n    for x in range(2):\n        yield x\nasync with scope() as total:\n    print('async-stdout')\nasync for x in values():\n    total += x\nprint('async-stderr', file=sys.stderr)\ntotal",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
     assert!(first_text(&out).contains("async-stdout\nasync-stderr\n41"));
     finish_case(&harness, case);
@@ -326,7 +354,11 @@ fn python_coroutine_value_is_not_implicitly_awaited() {
         return;
     }
     let tool = pi::eval::EvalTool::new(&harness.temp_path("."));
-    let out = python_cell(&harness, &tool, "async def later():\n    raise ValueError('must not run')\ncoro = later()\ncoro");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "async def later():\n    raise ValueError('must not run')\ncoro = later()\ncoro",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
     assert!(first_text(&out).contains("coroutine object"));
     let out = python_cell(&harness, &tool, "coro.close()");
@@ -372,15 +404,27 @@ fn python_load_compile_failure_retains_state_and_runtime_errors_name_script() {
     }
     let root = harness.temp_path(".");
     std::fs::write(root.join("bad.py"), "sentinel = 9\nyield 1\n").expect("bad script");
-    std::fs::write(root.join("failed.py"), "sentinel = 8\nraise ValueError('loaded-failure')\n").expect("failing script");
+    std::fs::write(
+        root.join("failed.py"),
+        "sentinel = 8\nraise ValueError('loaded-failure')\n",
+    )
+    .expect("failing script");
     let tool = pi::eval::EvalTool::new(&root);
-    let out = python_cell(&harness, &tool, "import sys\nsentinel = 7\n__file__ = 'previous.py'\nold_path = list(sys.path)");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "import sys\nsentinel = 7\n__file__ = 'previous.py'\nold_path = list(sys.path)",
+    );
     assert!(!out.is_error, "{}", first_text(&out));
     let out = python_cell(&harness, &tool, "%load bad.py");
     assert!(out.is_error);
     assert!(first_text(&out).contains("bad.py"));
     assert!(first_text(&out).contains("SyntaxError"));
-    let out = python_cell(&harness, &tool, "(sentinel, __file__, old_path == sys.path)");
+    let out = python_cell(
+        &harness,
+        &tool,
+        "(sentinel, __file__, old_path == sys.path)",
+    );
     assert_eq!(first_text(&out).trim(), "(7, 'previous.py', True)");
     let out = python_cell(&harness, &tool, "%load failed.py");
     assert!(out.is_error);
@@ -442,7 +486,11 @@ fn python_load_limits_and_source_encodings() {
     let out = python_cell(&harness, &tool, "%load large.py");
     assert!(out.is_error);
     assert!(first_text(&out).contains("EVAL_LOAD_LIMIT"));
-    std::fs::write(root.join("latin.py"), b"# coding: latin-1\nanswer = 'caf\xe9'\nanswer\n").expect("encoded script");
+    std::fs::write(
+        root.join("latin.py"),
+        b"# coding: latin-1\nanswer = 'caf\xe9'\nanswer\n",
+    )
+    .expect("encoded script");
     let out = python_cell(&harness, &tool, "%load latin.py");
     assert!(!out.is_error, "{}", first_text(&out));
     assert_eq!(first_text(&out).trim(), "'café'");

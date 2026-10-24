@@ -97,7 +97,8 @@ impl Recovery {
                 }
                 continue;
             }
-            self.code.settle_before(rest.chars().next().unwrap_or_default());
+            self.code
+                .settle_before(rest.chars().next().unwrap_or_default());
             let marker = marker_at(rest);
             let opens_thinking = rest.starts_with("<think>");
             if self.code.fence < 3 && (marker.is_some() || opens_thinking) {
@@ -295,7 +296,9 @@ fn marker_at(text: &str) -> Option<(Marker, usize)> {
         return None;
     }
     for (name, marker) in DSML_NAMES {
-        let (closing, name) = name.strip_prefix('/').map_or(("", *name), |name| ("/", name));
+        let (closing, name) = name
+            .strip_prefix('/')
+            .map_or(("", *name), |name| ("/", name));
         for bar in ["｜", "|"] {
             let prefix = format!("<{closing}{bar}DSML{bar}{name}");
             if let Some(tail) = text.strip_prefix(&prefix) {
@@ -336,7 +339,9 @@ fn could_be_marker(text: &str) -> bool {
         return false;
     }
     for (name, _) in DSML_NAMES {
-        let (closing, name) = name.strip_prefix('/').map_or(("", *name), |name| ("/", name));
+        let (closing, name) = name
+            .strip_prefix('/')
+            .map_or(("", *name), |name| ("/", name));
         for bar in ["｜", "|"] {
             if format!("<{closing}{bar}DSML{bar}{name}>").starts_with(text) {
                 return true;
@@ -377,7 +382,8 @@ fn parse_tail(text: &str) -> RecoveryResult<Vec<Part>> {
         if code.fence == 0 {
             if opens_thinking {
                 // Preserve an unclosed reasoning envelope through the end.
-                cursor += rest.find("</think>")
+                cursor += rest
+                    .find("</think>")
                     .map_or(rest.len(), |end| end + "</think>".len());
                 code = CodeState::default();
                 continue;
@@ -398,8 +404,10 @@ fn parse_tail(text: &str) -> RecoveryResult<Vec<Part>> {
                     }
                     // Hosts sometimes duplicate a section close. Orphan DSML
                     // closers are likewise template noise, never replay text.
-                    Marker::SectionClose | Marker::CallClose
-                    | Marker::DsmlSectionClose | Marker::DsmlInvokeClose
+                    Marker::SectionClose
+                    | Marker::CallClose
+                    | Marker::DsmlSectionClose
+                    | Marker::DsmlInvokeClose
                     | Marker::DsmlParameterClose => length,
                     Marker::Separator | Marker::DsmlInvokeOpen | Marker::DsmlParameterOpen => {
                         return Err("DeepSeek text tool markup is missing its enclosing call");
@@ -513,7 +521,13 @@ fn parse_template_call(text: &str) -> RecoveryResult<(Part, usize)> {
         Marker::SectionClose | Marker::CallOpen => {}
         _ => return Err("DeepSeek text tool call has an invalid closing marker"),
     }
-    Ok((Part::Call { name: name.to_string(), arguments }, cursor))
+    Ok((
+        Part::Call {
+            name: name.to_string(),
+            arguments,
+        },
+        cursor,
+    ))
 }
 
 fn parse_object_prefix(text: &str) -> RecoveryResult<(Value, usize)> {
@@ -533,7 +547,9 @@ fn parse_object_prefix(text: &str) -> RecoveryResult<(Value, usize)> {
 fn validate_name(name: &str) -> RecoveryResult<()> {
     let mut characters = name.chars();
     if name.len() > 128
-        || !characters.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !characters
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         || !characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
         return Err("DeepSeek text tool function name is invalid");
@@ -570,10 +586,13 @@ struct Attributes {
 }
 
 fn parse_dsml_open(text: &str, kind: &str) -> RecoveryResult<(Attributes, usize)> {
-    let mut cursor = ["｜", "|"].into_iter().find_map(|bar| {
-        let prefix = format!("<{bar}DSML{bar}{kind}");
-        text.strip_prefix(&prefix).map(|_| prefix.len())
-    }).ok_or("DeepSeek DSML tag is invalid")?;
+    let mut cursor = ["｜", "|"]
+        .into_iter()
+        .find_map(|bar| {
+            let prefix = format!("<{bar}DSML{bar}{kind}");
+            text.strip_prefix(&prefix).map(|_| prefix.len())
+        })
+        .ok_or("DeepSeek DSML tag is invalid")?;
     let mut name = None;
     let mut string_value = None;
     loop {
@@ -581,16 +600,23 @@ fn parse_dsml_open(text: &str, kind: &str) -> RecoveryResult<(Attributes, usize)
         cursor += whitespace;
         if text[cursor..].starts_with('>') {
             let name = name.ok_or("DeepSeek DSML tag has no name")?;
-            return Ok((Attributes {
-                name,
-                string_value: string_value.unwrap_or(true),
-            }, cursor + 1));
+            return Ok((
+                Attributes {
+                    name,
+                    string_value: string_value.unwrap_or(true),
+                },
+                cursor + 1,
+            ));
         }
         if whitespace == 0 {
             return Err("DeepSeek DSML attributes must be separated by whitespace");
         }
         let start = cursor;
-        while text.as_bytes().get(cursor).is_some_and(u8::is_ascii_alphabetic) {
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_alphabetic)
+        {
             cursor += 1;
         }
         let key = &text[start..cursor];
@@ -638,10 +664,13 @@ fn parse_dsml_invoke(text: &str) -> RecoveryResult<(Part, usize)> {
         cursor += skip_space(&text[cursor..]);
         match marker_at(&text[cursor..]) {
             Some((Marker::DsmlInvokeClose, length)) => {
-                return Ok((Part::Call {
-                    name: invoke.name,
-                    arguments: Value::Object(arguments),
-                }, cursor + length));
+                return Ok((
+                    Part::Call {
+                        name: invoke.name,
+                        arguments: Value::Object(arguments),
+                    },
+                    cursor + length,
+                ));
             }
             Some((Marker::DsmlParameterOpen, _)) => {
                 let (parameter, opened) = parse_dsml_open(&text[cursor..], "parameter")?;
@@ -661,8 +690,9 @@ fn parse_dsml_invoke(text: &str) -> RecoveryResult<(Part, usize)> {
                 } else {
                     let value = serde_json::from_str::<Value>(raw)
                         .map_err(|_| "DeepSeek DSML typed parameter is not complete JSON")?;
-                    serde_json::from_str::<super::UniqueToolArgumentKeys>(raw)
-                        .map_err(|_| "DeepSeek DSML typed parameter contains duplicate JSON keys")?;
+                    serde_json::from_str::<super::UniqueToolArgumentKeys>(raw).map_err(
+                        |_| "DeepSeek DSML typed parameter contains duplicate JSON keys",
+                    )?;
                     value
                 };
                 if arguments.insert(parameter.name, value).is_some() {

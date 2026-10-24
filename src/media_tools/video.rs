@@ -107,7 +107,9 @@ pub(crate) fn parse_target(path: &str, literal_exists: bool) -> Result<Option<Vi
 
 fn decimal(value: &str) -> Option<f64> {
     if value.is_empty()
-        || !value.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
         || value.bytes().filter(|&byte| byte == b'.').count() > 1
         || !value.bytes().any(|byte| byte.is_ascii_digit())
     {
@@ -197,7 +199,12 @@ impl Permit {
                 (active < MAX_ACTIVE_READS).then_some(active + 1)
             })
             .map(|_| Self)
-            .map_err(|_| failure("VIDEO_BUSY", "Two video reads are active; retry when one completes."))
+            .map_err(|_| {
+                failure(
+                    "VIDEO_BUSY",
+                    "Two video reads are active; retry when one completes.",
+                )
+            })
     }
 }
 
@@ -241,7 +248,10 @@ struct SourceStamp {
 impl SourceStamp {
     fn new(metadata: &Metadata) -> Result<Self> {
         if !metadata.is_file() {
-            return Err(failure("VIDEO_SOURCE", "Video input must be a regular file."));
+            return Err(failure(
+                "VIDEO_SOURCE",
+                "Video input must be a regular file.",
+            ));
         }
         if metadata.len() == 0 || metadata.len() > MAX_SOURCE_BYTES {
             return Err(failure(
@@ -270,7 +280,10 @@ impl SourceStamp {
 fn process_error(error: io::Error) -> Error {
     match error.kind() {
         io::ErrorKind::Interrupted => Error::Aborted,
-        io::ErrorKind::TimedOut => failure("VIDEO_TIMEOUT", "Video helper exceeded the operation budget."),
+        io::ErrorKind::TimedOut => failure(
+            "VIDEO_TIMEOUT",
+            "Video helper exceeded the operation budget.",
+        ),
         _ => failure("VIDEO_PROCESS", error),
     }
 }
@@ -311,7 +324,9 @@ fn find_binary(name: &str, owner: &AgentCx, deadline: &Deadline) -> Result<PathB
     }
     Err(failure(
         "VIDEO_HELPER_MISSING",
-        format!("Install FFmpeg with ffmpeg and ffprobe on an absolute PATH entry; {name} was not found."),
+        format!(
+            "Install FFmpeg with ffmpeg and ffprobe on an absolute PATH entry; {name} was not found."
+        ),
     ))
 }
 
@@ -332,16 +347,13 @@ async fn run_helper(
     stdout_limit: usize,
 ) -> Result<Output> {
     deadline.check(owner)?;
-    let output = capture(
-        command,
-        owner,
-        deadline,
-        stdout_limit + MAX_STDERR_BYTES,
-    )
-    .await?;
+    let output = capture(command, owner, deadline, stdout_limit + MAX_STDERR_BYTES).await?;
     deadline.check(owner)?;
     if output.stdout.len() > stdout_limit || output.stderr.len() > MAX_STDERR_BYTES {
-        return Err(failure("VIDEO_OUTPUT_LIMIT", "Video helper output exceeded its byte limit."));
+        return Err(failure(
+            "VIDEO_OUTPUT_LIMIT",
+            "Video helper output exceeded its byte limit.",
+        ));
     }
     if !output.status.success() {
         let diagnostic = sanitize_media_name(&String::from_utf8_lossy(&output.stderr))
@@ -397,7 +409,11 @@ async fn capture(
                 && stdout_pipe.is_none()
                 && stderr_pipe.is_none()
             {
-                return Ok(Output { status, stdout, stderr });
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             owner
                 .time()
@@ -408,7 +424,10 @@ async fn capture(
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (command, byte_limit);
-        Err(failure("VIDEO_PLATFORM", "Video previews require Unix or Windows."))
+        Err(failure(
+            "VIDEO_PLATFORM",
+            "Video previews require Unix or Windows.",
+        ))
     }
 }
 
@@ -461,11 +480,7 @@ fn has_fd_input_protocol(output: &[u8]) -> bool {
     false
 }
 
-async fn check_helper(
-    executable: &Path,
-    owner: &AgentCx,
-    deadline: &Deadline,
-) -> Result<()> {
+async fn check_helper(executable: &Path, owner: &AgentCx, deadline: &Deadline) -> Result<()> {
     let mut command = helper_command(owner, executable);
     command.args(["-hide_banner", "-protocols"]);
     let output = run_helper(command, owner, deadline, MAX_METADATA_BYTES).await?;
@@ -564,7 +579,10 @@ fn probe_duration(value: Option<&str>) -> Result<Option<f64>> {
                 .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                 .ok_or_else(|| failure("VIDEO_METADATA", "Invalid video duration."))?;
             if seconds > MAX_DURATION_SECONDS {
-                return Err(failure("VIDEO_DURATION", "Video duration exceeds the 24-hour limit."));
+                return Err(failure(
+                    "VIDEO_DURATION",
+                    "Video duration exceeds the 24-hour limit.",
+                ));
             }
             Ok((seconds > 0.0).then_some(seconds))
         }
@@ -587,7 +605,10 @@ fn parse_probe(bytes: &[u8]) -> Result<VideoInfo> {
     let probe: Probe = serde_json::from_slice(bytes)
         .map_err(|_| failure("VIDEO_METADATA", "ffprobe returned invalid video metadata."))?;
     if probe.streams.len() > 64 {
-        return Err(failure("VIDEO_STREAMS", "Video contains more than 64 streams."));
+        return Err(failure(
+            "VIDEO_STREAMS",
+            "Video contains more than 64 streams.",
+        ));
     }
     let video = probe
         .streams
@@ -595,7 +616,12 @@ fn parse_probe(bytes: &[u8]) -> Result<VideoInfo> {
         .find(|stream| {
             stream.codec_type.as_deref() == Some("video") && stream.disposition.attached_pic == 0
         })
-        .ok_or_else(|| failure("VIDEO_STREAM", "The file contains no non-attached video stream."))?;
+        .ok_or_else(|| {
+            failure(
+                "VIDEO_STREAM",
+                "The file contains no non-attached video stream.",
+            )
+        })?;
     let width = video.width.unwrap_or(0);
     let height = video.height.unwrap_or(0);
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS {
@@ -604,8 +630,12 @@ fn parse_probe(bytes: &[u8]) -> Result<VideoInfo> {
             "Video dimensions are missing or exceed the 16-megapixel decoded-frame limit.",
         ));
     }
-    let duration = probe_duration(video.duration.as_deref())?
-        .or(probe_duration(probe.format.as_ref().and_then(|format| format.duration.as_deref()))?);
+    let duration = probe_duration(video.duration.as_deref())?.or(probe_duration(
+        probe
+            .format
+            .as_ref()
+            .and_then(|format| format.duration.as_deref()),
+    )?);
     let codec = video
         .codec_name
         .as_deref()
@@ -660,7 +690,10 @@ fn validate_selection(selector: &VideoSelector, info: &VideoInfo) -> Result<()> 
     match selector {
         VideoSelector::Frame(index) => {
             if *index > MAX_FRAME_INDEX || info.frame_count.is_some_and(|frames| *index >= frames) {
-                return Err(failure("VIDEO_FRAME_RANGE", "Requested frame is outside the video or frame limit."));
+                return Err(failure(
+                    "VIDEO_FRAME_RANGE",
+                    "Requested frame is outside the video or frame limit.",
+                ));
             }
         }
         VideoSelector::Time(seconds) => {
@@ -668,7 +701,10 @@ fn validate_selection(selector: &VideoSelector, info: &VideoInfo) -> Result<()> 
                 || !(0.0..=MAX_DURATION_SECONDS).contains(seconds)
                 || info.duration.is_some_and(|duration| *seconds >= duration)
             {
-                return Err(failure("VIDEO_TIME_RANGE", "Requested timestamp is outside the video or time limit."));
+                return Err(failure(
+                    "VIDEO_TIME_RANGE",
+                    "Requested timestamp is outside the video or time limit.",
+                ));
             }
         }
     }
@@ -686,7 +722,10 @@ fn sample_times(info: &VideoInfo) -> Vec<f64> {
     let mut times = Vec::with_capacity(CONTACT_FRAMES);
     for index in 0..CONTACT_FRAMES {
         let time = horizon * index as f64 / (CONTACT_FRAMES - 1) as f64;
-        if times.last().is_none_or(|previous: &f64| (time - previous).abs() >= 0.001) {
+        if times
+            .last()
+            .is_none_or(|previous: &f64| (time - previous).abs() >= 0.001)
+        {
             times.push(time);
         }
     }
@@ -696,9 +735,13 @@ fn sample_times(info: &VideoInfo) -> Vec<f64> {
 fn raw_size(width: u32, height: u32) -> Result<usize> {
     let bytes = u64::from(width) * u64::from(height) * 3;
     if width == 0 || height == 0 || bytes > u64::from(FRAME_EDGE) * u64::from(FRAME_EDGE) * 3 {
-        return Err(failure("VIDEO_OUTPUT_LIMIT", "Requested preview dimensions exceed the image limit."));
+        return Err(failure(
+            "VIDEO_OUTPUT_LIMIT",
+            "Requested preview dimensions exceed the image limit.",
+        ));
     }
-    usize::try_from(bytes).map_err(|_| failure("VIDEO_OUTPUT_LIMIT", "Preview size does not fit memory."))
+    usize::try_from(bytes)
+        .map_err(|_| failure("VIDEO_OUTPUT_LIMIT", "Preview size does not fit memory."))
 }
 
 // Explicit inputs keep the admitted file and operation owner visible at every decode.
@@ -717,7 +760,14 @@ async fn extract_frame(
     let (width, height) = dimensions;
     let expected = raw_size(width, height)?;
     let mut command = helper_command(owner, executable);
-    command.args(["-hide_banner", "-v", "error", "-nostdin", "-filter_threads", "1"]);
+    command.args([
+        "-hide_banner",
+        "-v",
+        "error",
+        "-nostdin",
+        "-filter_threads",
+        "1",
+    ]);
     input_options(&mut command, demuxer);
     if let VideoSelector::Time(seconds) = selector {
         command.args(["-ss", &format!("{seconds:.6}")]);
@@ -768,7 +818,10 @@ async fn extract_frame(
 
 fn compose_sheet(frames: &[Vec<u8>]) -> Result<(u32, u32, Vec<u8>)> {
     if frames.is_empty() || frames.len() > CONTACT_FRAMES {
-        return Err(failure("VIDEO_FRAME", "No usable video frames were decoded."));
+        return Err(failure(
+            "VIDEO_FRAME",
+            "No usable video frames were decoded.",
+        ));
     }
     let columns = u32::try_from(frames.len().min(3)).unwrap_or(3);
     let rows = u32::try_from(frames.len().div_ceil(3)).unwrap_or(2);
@@ -780,7 +833,10 @@ fn compose_sheet(frames: &[Vec<u8>]) -> Result<(u32, u32, Vec<u8>)> {
     let sheet_row_bytes = usize::try_from(width * 3).unwrap_or(2880);
     for (index, frame) in frames.iter().enumerate() {
         if frame.len() != thumb_size {
-            return Err(failure("VIDEO_FRAME", "Contact-sheet frame has an invalid size."));
+            return Err(failure(
+                "VIDEO_FRAME",
+                "Contact-sheet frame has an invalid size.",
+            ));
         }
         let column = index % columns as usize;
         let row = index / columns as usize;
@@ -810,7 +866,10 @@ fn png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) -> Result<()> {
 /// PNG uses zlib (including Adler-32) inside IDAT and CRC-32 for every chunk.
 fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>> {
     if rgb.len() != raw_size(width, height)? {
-        return Err(failure("VIDEO_FRAME", "RGB preview length does not match its dimensions."));
+        return Err(failure(
+            "VIDEO_FRAME",
+            "RGB preview length does not match its dimensions.",
+        ));
     }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     let row_bytes = usize::try_from(width * 3)
@@ -831,7 +890,10 @@ fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>> {
     png_chunk(&mut png, b"IDAT", &compressed)?;
     png_chunk(&mut png, b"IEND", &[])?;
     if png.len() > MAX_PNG_BYTES {
-        return Err(failure("VIDEO_OUTPUT_LIMIT", "Encoded preview exceeds the image byte limit."));
+        return Err(failure(
+            "VIDEO_OUTPUT_LIMIT",
+            "Encoded preview exceeds the image byte limit.",
+        ));
     }
     Ok(png)
 }
@@ -888,8 +950,12 @@ pub(crate) async fn render_open_file(
         .and_then(|name| name.to_str())
         .and_then(sanitize_media_name)
         .unwrap_or_else(|| "video".to_owned());
-    let duration = info.duration.map_or_else(|| "unknown".to_owned(), display_time);
-    let fps = info.fps.map_or_else(|| "unknown".to_owned(), |fps| format!("{fps:.3}"));
+    let duration = info
+        .duration
+        .map_or_else(|| "unknown".to_owned(), display_time);
+    let fps = info
+        .fps
+        .map_or_else(|| "unknown".to_owned(), |fps| format!("{fps:.3}"));
     let audio = info.audio_codec.as_deref().unwrap_or("none");
     let mut description = format!(
         "Video: {name}\nVideo stream: {}, {}x{}; {fps} fps\n\
@@ -909,10 +975,17 @@ pub(crate) async fn render_open_file(
             &deadline,
         )
         .await?
-        .ok_or_else(|| failure("VIDEO_EMPTY_FRAME", "No frame exists at the requested position."))?;
+        .ok_or_else(|| {
+            failure(
+                "VIDEO_EMPTY_FRAME",
+                "No frame exists at the requested position.",
+            )
+        })?;
         match selection {
             VideoSelector::Frame(index) => {
-                description.push_str(&format!("Selected frame: {index} (zero-based decoded frame index).\n"));
+                description.push_str(&format!(
+                    "Selected frame: {index} (zero-based decoded frame index).\n"
+                ));
             }
             VideoSelector::Time(seconds) => {
                 timestamps.push(*seconds);
@@ -954,10 +1027,12 @@ pub(crate) async fn render_open_file(
             timestamps.iter().copied().map(display_time).collect::<Vec<_>>().join(", ")
         ));
         if info.duration.is_none() {
-            description.push_str("Duration is unknown; the preview contains the first available frame.\n");
+            description
+                .push_str("Duration is unknown; the preview contains the first available frame.\n");
         }
         if frames.len() < requested_count {
-            description.push_str("Some requested positions had no decodable frame and were omitted.\n");
+            description
+                .push_str("Some requested positions had no decodable frame and were omitted.\n");
         }
         description.push_str(
             "Timestamp previews use the first available frame at or after each requested position. \
@@ -1017,7 +1092,10 @@ mod tests {
             let path = format!("clip.{extension}");
             assert_eq!(
                 parse_target(&path, false).unwrap(),
-                Some(VideoReadTarget { path, selector: None })
+                Some(VideoReadTarget {
+                    path,
+                    selector: None
+                })
             );
         }
         assert_eq!(parse_target("literal.mp4:12", true).unwrap(), None);
@@ -1038,7 +1116,10 @@ mod tests {
             ("0.0", 0.0),
         ] {
             assert_eq!(
-                parse_target(&format!("clip.mp4:{suffix}"), false).unwrap().unwrap().selector,
+                parse_target(&format!("clip.mp4:{suffix}"), false)
+                    .unwrap()
+                    .unwrap()
+                    .selector,
                 Some(VideoSelector::Time(seconds))
             );
         }
@@ -1047,12 +1128,30 @@ mod tests {
     #[test]
     fn rejects_ambiguous_or_unbounded_selector_expressions() {
         for suffix in [
-            "", "-1", "+1", "NaN", "inf", "1e4", "1 s", "1s1m", "1h2h",
-            "1.2.3", "1:60", "60:01", "25h", "f1.5", "10000001",
-            "184467440737095516160", "frame1s", "1:2:3:4",
+            "",
+            "-1",
+            "+1",
+            "NaN",
+            "inf",
+            "1e4",
+            "1 s",
+            "1s1m",
+            "1h2h",
+            "1.2.3",
+            "1:60",
+            "60:01",
+            "25h",
+            "f1.5",
+            "10000001",
+            "184467440737095516160",
+            "frame1s",
+            "1:2:3:4",
         ] {
             let error = parse_target(&format!("clip.mp4:{suffix}"), false).unwrap_err();
-            assert!(error.to_string().contains("VIDEO_SELECTOR"), "{suffix}: {error}");
+            assert!(
+                error.to_string().contains("VIDEO_SELECTOR"),
+                "{suffix}: {error}"
+            );
         }
     }
 
@@ -1084,7 +1183,9 @@ mod tests {
             assert!(parse_probe(metadata).is_err());
         }
         assert!(!has_fd_input_protocol(b"Input:\nfile\nOutput:\nfd\n"));
-        assert!(has_fd_input_protocol(b"Supported file protocols:\nInput:\n  fd\nOutput:\npipe\n"));
+        assert!(has_fd_input_protocol(
+            b"Supported file protocols:\nInput:\n  fd\nOutput:\npipe\n"
+        ));
     }
 
     #[test]
@@ -1134,7 +1235,9 @@ mod tests {
             let kind = &png[offset + 4..offset + 8];
             let data = &png[offset + 8..offset + 8 + length];
             let stored_crc = u32::from_be_bytes(
-                png[offset + 8 + length..offset + 12 + length].try_into().unwrap(),
+                png[offset + 8 + length..offset + 12 + length]
+                    .try_into()
+                    .unwrap(),
             );
             let mut crc = Crc::new();
             crc.update(kind);
@@ -1156,7 +1259,9 @@ mod tests {
         }
         assert!(saw_end);
         let mut filtered = Vec::new();
-        ZlibDecoder::new(compressed.as_slice()).read_to_end(&mut filtered).unwrap();
+        ZlibDecoder::new(compressed.as_slice())
+            .read_to_end(&mut filtered)
+            .unwrap();
         let stride = dimensions.0 as usize * 3 + 1;
         assert_eq!(filtered.len(), stride * dimensions.1 as usize);
         let mut rgb = Vec::new();
@@ -1179,7 +1284,8 @@ mod tests {
         assert_eq!((width, height), (960, 480));
         for (index, expected) in (1..=6).enumerate() {
             let offset = ((index / 3 * THUMB_HEIGHT as usize) * width as usize
-                + index % 3 * THUMB_WIDTH as usize) * 3;
+                + index % 3 * THUMB_WIDTH as usize)
+                * 3;
             assert_eq!(rgb[offset], expected);
         }
         let png = encode_png(width, height, &rgb).unwrap();
@@ -1196,14 +1302,27 @@ mod tests {
         file.write_all(b"video").unwrap();
         let stamp = SourceStamp::new(&file.metadata().unwrap()).unwrap();
         file.set_len(10).unwrap();
-        assert!(stamp.check(&file).unwrap_err().to_string().contains("VIDEO_CHANGED"));
+        assert!(
+            stamp
+                .check(&file)
+                .unwrap_err()
+                .to_string()
+                .contains("VIDEO_CHANGED")
+        );
         file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
-        assert!(SourceStamp::new(&file.metadata().unwrap()).unwrap_err().to_string().contains("VIDEO_SIZE"));
+        assert!(
+            SourceStamp::new(&file.metadata().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("VIDEO_SIZE")
+        );
     }
 
     #[test]
     fn cancelled_owner_is_checked_before_helpers_or_source_metadata() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::for_request();
         owner.cancel_with(asupersync::types::CancelKind::User, Some("video cancelled"));
         let result = runtime.block_on(render_open_file(
@@ -1226,13 +1345,18 @@ mod tests {
         let mut source = File::open(&path).unwrap();
         let stamp = SourceStamp::new(&source.metadata().unwrap()).unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
             let deadline = Deadline::new();
             for _ in 0..2 {
                 let mut command = helper_command(&owner, Path::new("/bin/sh"));
-                command.args(["-c", "while IFS= read -r line; do printf '%s\\n' \"$line\"; done"]);
+                command.args([
+                    "-c",
+                    "while IFS= read -r line; do printf '%s\\n' \"$line\"; done",
+                ]);
                 attach_source(&mut command, &mut source, &stamp).unwrap();
                 let output = run_helper(command, &owner, &deadline, 64).await.unwrap();
                 assert_eq!(output.stdout, b"original admitted bytes\n");
@@ -1244,12 +1368,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn subprocess_capture_enforces_combined_output_and_operation_deadline() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
             let mut command = helper_command(&owner, Path::new("/bin/sh"));
             command.args(["-c", "printf abc; printf def >&2"]);
-            let error = capture(command, &owner, &Deadline::new(), 5).await.unwrap_err();
+            let error = capture(command, &owner, &Deadline::new(), 5)
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("byte limit"));
             let mut command = helper_command(&owner, Path::new("/bin/sh"));
             command.args(["-c", "while :; do :; done"]);
@@ -1264,7 +1392,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn running_capture_observes_owner_cancellation() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
             let mut command = helper_command(&owner, Path::new("/bin/sh"));
@@ -1273,7 +1403,10 @@ mod tests {
             let operation = capture(command, &owner, &deadline, 0);
             let cancel = async {
                 owner.time().sleep(Duration::from_millis(20)).await;
-                owner.cancel_with(asupersync::types::CancelKind::User, Some("video test cancellation"));
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("video test cancellation"),
+                );
             };
             let (result, ()) = futures::join!(operation, cancel);
             assert!(matches!(result, Err(Error::Aborted)));
@@ -1342,23 +1475,39 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("two-frames.avi");
         std::fs::write(&path, avi_fixture()).unwrap();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let owner = AgentCx::for_current_or_request();
-            for selector in [Some(VideoSelector::Frame(1)), Some(VideoSelector::Time(1.0)), None] {
+            for selector in [
+                Some(VideoSelector::Frame(1)),
+                Some(VideoSelector::Time(1.0)),
+                None,
+            ] {
                 let output = render_open_file(
-                    File::open(&path).unwrap(), path.clone(), selector.clone(), owner.clone(),
-                ).await.unwrap();
+                    File::open(&path).unwrap(),
+                    path.clone(),
+                    selector.clone(),
+                    owner.clone(),
+                )
+                .await
+                .unwrap();
                 let ContentBlock::Image(image) = &output.content[1] else {
                     panic!("expected a normal provider-compatible image block");
                 };
-                let png = base64::engine::general_purpose::STANDARD.decode(&image.data).unwrap();
+                let png = base64::engine::general_purpose::STANDARD
+                    .decode(&image.data)
+                    .unwrap();
                 let (width, height, rgb) = decode_our_png(&png);
                 if selector.is_some() {
                     let middle = (height as usize / 2 * width as usize + width as usize / 2) * 3;
                     assert_eq!(&rgb[middle..middle + 3], &[0, 255, 0]);
                 } else {
-                    assert_eq!(output.details.as_ref().unwrap()["video"]["renderedFrames"], 6);
+                    assert_eq!(
+                        output.details.as_ref().unwrap()["video"]["renderedFrames"],
+                        6
+                    );
                 }
             }
         });

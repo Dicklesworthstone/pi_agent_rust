@@ -6,16 +6,26 @@ fn message(id: &str, parent: Option<&str>, role: &str, text: &str) -> Value {
 }
 
 fn encode(entries: &[Value]) -> String {
-    entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")
+    entries
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn active_ids(history: &History<'_>) -> Vec<String> {
-    history.order.iter().filter_map(|&index| {
-        if history.excluded(index) { return None; }
-        let value: Value = serde_json::from_slice(history.lines[index].bytes).ok()?;
-        matches!(value["type"].as_str(), Some("user" | "assistant"))
-            .then(|| value["uuid"].as_str().unwrap().to_string())
-    }).collect()
+    history
+        .order
+        .iter()
+        .filter_map(|&index| {
+            if history.excluded(index) {
+                return None;
+            }
+            let value: Value = serde_json::from_slice(history.lines[index].bytes).ok()?;
+            matches!(value["type"].as_str(), Some("user" | "assistant"))
+                .then(|| value["uuid"].as_str().unwrap().to_string())
+        })
+        .collect()
 }
 
 fn branched() -> Vec<Value> {
@@ -43,7 +53,10 @@ fn latest_main_leaf_ignores_progress_sidechain_and_team_tails() {
     assert_eq!(active_ids(&history), ["root", "new"]);
     assert_eq!(history.excluded.len(), 3);
     assert_eq!(history.order.len(), history.lines.len());
-    assert_eq!(history.order.iter().copied().collect::<HashSet<_>>().len(), history.lines.len());
+    assert_eq!(
+        history.order.iter().copied().collect::<HashSet<_>>().len(),
+        history.lines.len()
+    );
 }
 
 #[test]
@@ -66,7 +79,8 @@ fn hidden_messages_bridge_ancestry_but_never_become_provider_context() {
     let mut hidden = message("hidden", Some("root"), "user", "internal metadata");
     hidden["isMeta"] = json!(true);
     let raw = encode(&[
-        message("root", None, "user", "question"), hidden,
+        message("root", None, "user", "question"),
+        hidden,
         json!({"type":"attachment","uuid":"bridge","parentUuid":"hidden"}),
         message("answer", Some("bridge"), "assistant", "answer"),
     ]);
@@ -112,14 +126,20 @@ fn sidechain_only_logs_require_deliberate_selection() {
     side["isSidechain"] = json!(true);
     let raw = encode(&[side]);
     assert!(History::prepare(ImportSource::Claude, raw.as_bytes(), None).is_err());
-    assert_eq!(active_ids(&History::prepare(ImportSource::Claude, raw.as_bytes(), Some("side")).unwrap()), ["side"]);
+    assert_eq!(
+        active_ids(&History::prepare(ImportSource::Claude, raw.as_bytes(), Some("side")).unwrap()),
+        ["side"]
+    );
 }
 
 #[test]
 fn default_main_selection_refuses_to_cross_into_sidechain_ancestry() {
     let mut side = message("side", None, "assistant", "isolated agent");
     side["isSidechain"] = json!(true);
-    let raw = encode(&[side, message("main", Some("side"), "user", "ambiguous join")]);
+    let raw = encode(&[
+        side,
+        message("main", Some("side"), "user", "ambiguous join"),
+    ]);
     assert!(History::prepare(ImportSource::Claude, raw.as_bytes(), None).is_err());
     assert!(History::prepare(ImportSource::Claude, raw.as_bytes(), Some("main")).is_ok());
 }
@@ -128,21 +148,40 @@ fn default_main_selection_refuses_to_cross_into_sidechain_ancestry() {
 fn incomplete_ambiguous_and_cyclic_graphs_never_become_shorter_successes() {
     for entries in [
         vec![message("leaf", Some("missing"), "user", "question")],
-        vec![message("x", Some("y"), "user", "x"), message("y", Some("x"), "assistant", "y")],
+        vec![
+            message("x", Some("y"), "user", "x"),
+            message("y", Some("x"), "assistant", "y"),
+        ],
         vec![message("self", Some("self"), "assistant", "cycle")],
-        vec![message("dup", None, "user", "first"), message("dup", None, "user", "different")],
-        vec![message("root", None, "user", "first"), json!({"type":"assistant","message":{"content":"unlinked"}})],
-        vec![message("root", None, "user", "first"), json!({"type":"assistant","uuid":"missing-parent","message":{"content":"partial"}})],
+        vec![
+            message("dup", None, "user", "first"),
+            message("dup", None, "user", "different"),
+        ],
+        vec![
+            message("root", None, "user", "first"),
+            json!({"type":"assistant","message":{"content":"unlinked"}}),
+        ],
+        vec![
+            message("root", None, "user", "first"),
+            json!({"type":"assistant","uuid":"missing-parent","message":{"content":"partial"}}),
+        ],
     ] {
         let raw = encode(&entries);
-        assert!(History::prepare(ImportSource::Claude, raw.as_bytes(), None).is_err(), "{raw}");
+        assert!(
+            History::prepare(ImportSource::Claude, raw.as_bytes(), None).is_err(),
+            "{raw}"
+        );
     }
 }
 
 #[test]
 fn identical_duplicate_envelopes_are_archived_and_do_not_repeat_messages() {
     let root = message("root", None, "user", "once");
-    let raw = encode(&[root.clone(), message("answer", Some("root"), "assistant", "answer"), root]);
+    let raw = encode(&[
+        root.clone(),
+        message("answer", Some("root"), "assistant", "answer"),
+        root,
+    ]);
     let history = History::prepare(ImportSource::Claude, raw.as_bytes(), None).unwrap();
     assert_eq!(active_ids(&history), ["root", "answer"]);
     assert!(history.excluded(2));
@@ -165,7 +204,14 @@ fn line_numbers_keep_blank_lines_and_corruption_as_audit_input() {
     let last = message("last", Some("first"), "assistant", "answer");
     let raw = format!("\n{first}\n\nnot-json\n\n{last}\n");
     let history = History::prepare(ImportSource::Claude, raw.as_bytes(), None).unwrap();
-    assert_eq!(history.lines.iter().map(|line| line.number).collect::<Vec<_>>(), [2, 4, 6]);
+    assert_eq!(
+        history
+            .lines
+            .iter()
+            .map(|line| line.number)
+            .collect::<Vec<_>>(),
+        [2, 4, 6]
+    );
     assert_eq!(active_ids(&history), ["first", "last"]);
     assert_eq!(history.lines[history.order[0]].bytes, b"not-json");
 }
@@ -210,7 +256,9 @@ fn large_duplicate_runs_are_coalesced_without_quadratic_ancestry_scans() {
 #[test]
 fn nonblank_record_limit_prevents_unbounded_graph_working_sets() {
     let raw = "{}\n".repeat(MAX_RECORDS + 1);
-    let error = History::prepare(ImportSource::Claude, raw.as_bytes(), None).err().expect("bounded source");
+    let error = History::prepare(ImportSource::Claude, raw.as_bytes(), None)
+        .err()
+        .expect("bounded source");
     assert!(error.to_string().contains("record limit"));
 }
 
@@ -234,14 +282,29 @@ fn public_import_reopens_one_branch_and_preserves_excluded_source_bytes() {
     let active = serde_json::to_string(&messages).unwrap();
     assert!(active.contains("chosen answer"));
     for excluded in ["abandoned answer", "subagent output", "teammate output"] {
-        assert!(!active.contains(excluded), "{excluded} leaked into native context");
+        assert!(
+            !active.contains(excluded),
+            "{excluded} leaked into native context"
+        );
     }
-    let saved: Vec<Value> = std::fs::read_to_string(&outcome.session_path).unwrap().lines()
-        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let saved: Vec<Value> = std::fs::read_to_string(&outcome.session_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     for entry in &entries[1..2] {
-        assert!(saved.iter().any(|value| value.pointer("/data/raw").and_then(Value::as_str) == Some(entry.to_string().as_str())));
+        assert!(
+            saved
+                .iter()
+                .any(|value| value.pointer("/data/raw").and_then(Value::as_str)
+                    == Some(entry.to_string().as_str()))
+        );
     }
-    assert!(saved.iter().any(|value| value.pointer("/data/selectedLeafId") == Some(&json!("new"))));
+    assert!(
+        saved
+            .iter()
+            .any(|value| value.pointer("/data/selectedLeafId") == Some(&json!("new")))
+    );
     assert_eq!(std::fs::read_to_string(&source).unwrap(), raw);
     let again = super::super::import_claude_branch(&source, "new", Some(&target)).unwrap();
     assert!(again.already_imported);
@@ -252,7 +315,11 @@ fn public_import_reopens_one_branch_and_preserves_excluded_source_bytes() {
     let active = serde_json::to_string(&read_messages(&alternate.session_path)).unwrap();
     assert!(active.contains("abandoned answer"));
     assert!(!active.contains("chosen answer"));
-    assert!(super::super::import_claude_branch(&source, "old", Some(&target)).unwrap().already_imported);
+    assert!(
+        super::super::import_claude_branch(&source, "old", Some(&target))
+            .unwrap()
+            .already_imported
+    );
 }
 
 #[test]
@@ -263,20 +330,38 @@ fn excluded_tool_results_cannot_complete_a_call_in_the_selected_branch() {
     let mut call = message("call", Some("root"), "assistant", "");
     call["message"]["content"] = json!([{"type":"tool_use","id":"tool-a","name":"bash","input":{"command":"not executed by import"}}]);
     let mut old_output = message("old-output", Some("call"), "user", "");
-    old_output["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"tool-a","content":"abandoned result"}]);
+    old_output["message"]["content"] =
+        json!([{"type":"tool_result","tool_use_id":"tool-a","content":"abandoned result"}]);
     let raw = encode(&[
-        message("root", None, "user", "question"), call, old_output,
+        message("root", None, "user", "question"),
+        call,
+        old_output,
         message("new-branch", Some("call"), "user", "take another approach"),
     ]);
     std::fs::write(&source, raw).unwrap();
     let outcome = super::super::import_claude(&source, Some(&root.path().join("native"))).unwrap();
     let messages = read_messages(&outcome.session_path);
     assert_eq!(messages.len(), 3);
-    assert!(!messages.iter().any(|message| matches!(message, Message::ToolResult(_))));
-    let Message::Assistant(assistant) = &messages[1] else { panic!("historical assistant") };
+    assert!(
+        !messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_)))
+    );
+    let Message::Assistant(assistant) = &messages[1] else {
+        panic!("historical assistant")
+    };
     assert_eq!(assistant.stop_reason, StopReason::Stop);
-    assert!(!assistant.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(_))));
-    assert!(!serde_json::to_string(&messages).unwrap().contains("abandoned result"));
+    assert!(
+        !assistant
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+    );
+    assert!(
+        !serde_json::to_string(&messages)
+            .unwrap()
+            .contains("abandoned result")
+    );
 }
 
 #[test]
@@ -287,13 +372,20 @@ fn forward_parent_tool_exchange_stays_complete_after_native_reopen() {
     let mut call = message("call", Some("root"), "assistant", "");
     call["message"]["content"] = json!([{"type":"tool_use","id":"tc","name":"read","input":{}}]);
     let mut output = message("output", Some("call"), "user", "");
-    output["message"]["content"] = json!([{"type":"tool_result","tool_use_id":"tc","content":"source text"}]);
-    std::fs::write(&source, encode(&[output, call, message("root", None, "user", "read source")])).unwrap();
+    output["message"]["content"] =
+        json!([{"type":"tool_result","tool_use_id":"tc","content":"source text"}]);
+    std::fs::write(
+        &source,
+        encode(&[output, call, message("root", None, "user", "read source")]),
+    )
+    .unwrap();
     let outcome = super::super::import_claude(&source, Some(&root.path().join("native"))).unwrap();
     let messages = read_messages(&outcome.session_path);
     assert_eq!(messages.len(), 3);
     assert_eq!(outcome.skipped, 0);
-    assert!(matches!(&messages[2], Message::ToolResult(result) if result.tool_name == "read" && result.tool_call_id == "tc"));
+    assert!(
+        matches!(&messages[2], Message::ToolResult(result) if result.tool_name == "read" && result.tool_call_id == "tc")
+    );
 }
 
 #[test]

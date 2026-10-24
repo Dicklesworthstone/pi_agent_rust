@@ -21,8 +21,8 @@ const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSACTION_FILES: usize = 1024;
 
-pub(super) mod evidence;
 mod directory;
+pub(super) mod evidence;
 
 #[derive(Clone, PartialEq, Eq)]
 struct Image {
@@ -231,7 +231,11 @@ impl Transaction {
         ignore_missing: bool,
     ) -> Result<()> {
         self.require_before_directory_move()?;
-        if let FileOp::Rename { old_path, new_path, overwrite } = operation
+        if let FileOp::Rename {
+            old_path,
+            new_path,
+            overwrite,
+        } = operation
             && std::fs::symlink_metadata(old_path).is_ok_and(|metadata| metadata.is_dir())
         {
             if *overwrite || ignore_exists || !self.operations.is_empty() {
@@ -246,10 +250,14 @@ impl Transaction {
             for path in moving.files() {
                 self.load(path)?;
             }
-            if self.files.keys().any(|path| {
-                path.starts_with(&moving.new) || moving.new.starts_with(path)
-            }) {
-                return Err(conflict("directory destination overlaps another edit target"));
+            if self
+                .files
+                .keys()
+                .any(|path| path.starts_with(&moving.new) || moving.new.starts_with(path))
+            {
+                return Err(conflict(
+                    "directory destination overlaps another edit target",
+                ));
             }
             self.directory = Some(moving);
             self.operations.push(describe_file_op(operation));
@@ -319,14 +327,18 @@ impl Transaction {
 
     fn require_before_directory_move(&self) -> Result<()> {
         if self.directory.is_some() {
-            return Err(conflict("directory rename must be the final workspace edit operation"));
+            return Err(conflict(
+                "directory rename must be the final workspace edit operation",
+            ));
         }
         Ok(())
     }
 
     fn verify_directory(&self) -> Result<()> {
         if let Some(moving) = &self.directory {
-            moving.verify().map_err(|error| io_context(&moving.old, &error))?;
+            moving
+                .verify()
+                .map_err(|error| io_context(&moving.old, &error))?;
         }
         Ok(())
     }
@@ -371,10 +383,16 @@ impl Transaction {
         }
         // Retain the expected final images of every moved file, including
         // unedited binary data, for the boundary immediately before the move.
-        let moved_images: Vec<_> = self.files.iter().filter_map(|(path, staged)| {
-            self.directory.as_ref().filter(|moving| path.starts_with(&moving.old))
-                .map(|_| (path.clone(), staged.after.clone()))
-        }).collect();
+        let moved_images: Vec<_> = self
+            .files
+            .iter()
+            .filter_map(|(path, staged)| {
+                self.directory
+                    .as_ref()
+                    .filter(|moving| path.starts_with(&moving.old))
+                    .map(|_| (path.clone(), staged.after.clone()))
+            })
+            .collect();
         self.files.retain(|_, staged| staged.before != staged.after);
         let mut changes: Vec<_> = self
             .files
@@ -450,9 +468,15 @@ impl Transaction {
             });
         }
         Ok(ApplyOutcome {
-            files_changed: self.text_paths.into_iter().map(|path| {
-                self.directory.as_ref().map_or_else(|| path.clone(), |moving| moving.moved_path(&path))
-            }).collect(),
+            files_changed: self
+                .text_paths
+                .into_iter()
+                .map(|path| {
+                    self.directory
+                        .as_ref()
+                        .map_or_else(|| path.clone(), |moving| moving.moved_path(&path))
+                })
+                .collect(),
             file_ops_applied: self.operations,
         })
     }

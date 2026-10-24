@@ -36,11 +36,12 @@ fn json_output(output: &ToolOutput) -> &Value {
 }
 
 fn finish(harness: &TestHarness) {
-    harness.log().info("verify", "TypeScript eval assertions passed");
+    harness
+        .log()
+        .info("verify", "TypeScript eval assertions passed");
     let path = harness.temp_path("typescript-events.jsonl");
     harness.write_jsonl_logs(&path).unwrap();
-    let errors =
-        common::logging::validate_jsonl_v2_only(&std::fs::read_to_string(path).unwrap());
+    let errors = common::logging::validate_jsonl_v2_only(&std::fs::read_to_string(path).unwrap());
     assert!(errors.is_empty(), "{errors:?}");
 }
 

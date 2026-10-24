@@ -60,7 +60,10 @@ impl Drop for ReaderStop {
         // Never put a blocking thread join on async kernel teardown. On Unix
         // the reader observes stop between bounded nonblocking retries. A
         // completed worker may be joined without waiting for its peer's EOF.
-        if self.worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished)
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
             && let Some(worker) = self.worker.take()
         {
             let _ = worker.join();
@@ -100,7 +103,13 @@ fn spawn_prepared_reader<R: Read + Send + 'static>(
             // completion receipt is published, including on unwind.
             run_reader(reader, &sender, &worker_state);
         })?;
-    Ok((receiver, ReaderStop { state, worker: Some(worker) }))
+    Ok((
+        receiver,
+        ReaderStop {
+            state,
+            worker: Some(worker),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -200,7 +209,10 @@ fn read_frame_with_limit(reader: &mut impl BufRead, limit: usize) -> io::Result<
             return if bytes.is_empty() {
                 Ok(None)
             } else {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EVAL_PROTOCOL: incomplete frame"))
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EVAL_PROTOCOL: incomplete frame",
+                ))
             };
         }
         let end = available.iter().position(|byte| *byte == b'\n');
@@ -208,20 +220,29 @@ fn read_frame_with_limit(reader: &mut impl BufRead, limit: usize) -> io::Result<
         // Check before extending; even a newline-free writer cannot make this
         // reader allocate proportionally to the child process's output.
         if payload > limit.saturating_sub(bytes.len()) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "EVAL_PROTOCOL_LIMIT: frame exceeds 16 MiB"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "EVAL_PROTOCOL_LIMIT: frame exceeds 16 MiB",
+            ));
         }
         bytes.extend_from_slice(&available[..payload]);
         reader.consume(payload + usize::from(end.is_some()));
         if end.is_some() {
             return String::from_utf8(bytes).map(Some).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "EVAL_PROTOCOL: frame is not UTF-8")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EVAL_PROTOCOL: frame is not UTF-8",
+                )
             });
         }
     }
 }
 
 fn invalid(message: &str) -> Error {
-    Error::tool("eval", format!("EVAL_PROTOCOL: {message}; EVAL_STATE_RESET: Python kernel discarded"))
+    Error::tool(
+        "eval",
+        format!("EVAL_PROTOCOL: {message}; EVAL_STATE_RESET: Python kernel discarded"),
+    )
 }
 
 pub(super) fn validate_bridge(frame: &Value) -> Result<()> {
@@ -230,8 +251,14 @@ pub(super) fn validate_bridge(frame: &Value) -> Result<()> {
         return Err(invalid("ambiguous bridge response"));
     }
     let bridge = &frame["bridge"];
-    if !bridge.get("call").and_then(Value::as_u64).is_some_and(|id| id > 0)
-        || !bridge.get("tool").and_then(Value::as_str).is_some_and(|name| !name.is_empty())
+    if !bridge
+        .get("call")
+        .and_then(Value::as_u64)
+        .is_some_and(|id| id > 0)
+        || !bridge
+            .get("tool")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty())
         || !bridge.get("input").is_some_and(Value::is_object)
     {
         return Err(invalid("malformed bridge request"));
@@ -255,13 +282,20 @@ pub(super) fn validate_bridge_owner(
         return Err(invalid("bridge belongs to a different cell"));
     }
     if frame.as_object().is_none_or(|object| object.len() != 2)
-        || frame["bridge"].as_object().is_none_or(|object| object.len() != 3)
+        || frame["bridge"]
+            .as_object()
+            .is_none_or(|object| object.len() != 3)
     {
         return Err(invalid("ambiguous bridge envelope"));
     }
     let bridge = &frame["bridge"];
-    if bridge["tool"].as_str().is_none_or(|name| name.chars().count() > 128) {
-        return Err(invalid("EVAL_BRIDGE_LIMIT: tool name exceeds 128 characters"));
+    if bridge["tool"]
+        .as_str()
+        .is_none_or(|name| name.chars().count() > 128)
+    {
+        return Err(invalid(
+            "EVAL_BRIDGE_LIMIT: tool name exceeds 128 characters",
+        ));
     }
     Ok(())
 }
@@ -277,12 +311,18 @@ pub(super) fn validate_response(frame: &Value, expected_id: u64) -> Result<()> {
         return Err(invalid("EVAL_BRIDGE_PROTOCOL: incomplete tool exchange"));
     }
     if frame.get("kernelError").is_some() {
-        return Err(invalid("EVAL_KERNEL_INCOMPLETE: cell did not settle safely"));
+        return Err(invalid(
+            "EVAL_KERNEL_INCOMPLETE: cell did not settle safely",
+        ));
     }
-    let ok = frame.get("ok").and_then(Value::as_bool)
+    let ok = frame
+        .get("ok")
+        .and_then(Value::as_bool)
         .ok_or_else(|| invalid("response status must be boolean"))?;
     if let Some(value) = frame.get("softTimeout") {
-        let expired = value.as_bool().ok_or_else(|| invalid("soft timeout status must be boolean"))?;
+        let expired = value
+            .as_bool()
+            .ok_or_else(|| invalid("soft timeout status must be boolean"))?;
         if expired && ok {
             return Err(invalid("soft timeout cannot report success"));
         }
@@ -294,7 +334,10 @@ pub(super) fn validate_response(frame: &Value, expected_id: u64) -> Result<()> {
         return Err(invalid("malformed final response"));
     }
     if ok {
-        if !frame.get("result").is_some_and(|value| value.is_null() || value.is_string()) {
+        if !frame
+            .get("result")
+            .is_some_and(|value| value.is_null() || value.is_string())
+        {
             return Err(invalid("result must be text or null"));
         }
     } else if !frame.get("error").is_some_and(Value::is_string) {
@@ -313,8 +356,14 @@ mod tests {
     fn exact_limit_newline_and_following_frame_are_preserved() {
         for capacity in [1, 2, 7, 128] {
             let mut input = BufReader::with_capacity(capacity, Cursor::new(b"1234567\nnext\n"));
-            assert_eq!(read_frame_with_limit(&mut input, 7).unwrap(), Some("1234567".into()));
-            assert_eq!(read_frame_with_limit(&mut input, 7).unwrap(), Some("next".into()));
+            assert_eq!(
+                read_frame_with_limit(&mut input, 7).unwrap(),
+                Some("1234567".into())
+            );
+            assert_eq!(
+                read_frame_with_limit(&mut input, 7).unwrap(),
+                Some("next".into())
+            );
             assert_eq!(read_frame_with_limit(&mut input, 7).unwrap(), None);
         }
     }
@@ -326,20 +375,41 @@ mod tests {
         assert!(error.to_string().contains("EVAL_PROTOCOL_LIMIT"));
         assert_eq!(input.position(), 0);
         let mut input = BufReader::with_capacity(8, Cursor::new(b"12345678901234567\n"));
-        assert!(read_frame_with_limit(&mut input, 16).unwrap_err().to_string().contains("EVAL_PROTOCOL_LIMIT"));
+        assert!(
+            read_frame_with_limit(&mut input, 16)
+                .unwrap_err()
+                .to_string()
+                .contains("EVAL_PROTOCOL_LIMIT")
+        );
     }
 
     #[test]
     fn split_unicode_and_crlf_decode_without_losing_bytes() {
         let mut input = BufReader::with_capacity(1, Cursor::new("界😀\r\n".as_bytes()));
-        assert_eq!(read_frame_with_limit(&mut input, 8).unwrap(), Some("界😀\r".into()));
+        assert_eq!(
+            read_frame_with_limit(&mut input, 8).unwrap(),
+            Some("界😀\r".into())
+        );
     }
 
     #[test]
     fn truncated_or_invalid_utf8_frames_are_not_valid_eof() {
-        assert_eq!(read_frame_with_limit(&mut Cursor::new(b"unterminated"), 64).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(read_frame_with_limit(&mut Cursor::new(b"\xff\n"), 64).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        assert_eq!(read_frame_with_limit(&mut Cursor::new(b"\n"), 64).unwrap(), Some(String::new()));
+        assert_eq!(
+            read_frame_with_limit(&mut Cursor::new(b"unterminated"), 64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_frame_with_limit(&mut Cursor::new(b"\xff\n"), 64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_frame_with_limit(&mut Cursor::new(b"\n"), 64).unwrap(),
+            Some(String::new())
+        );
     }
 
     #[test]
@@ -347,12 +417,23 @@ mod tests {
         let valid = json!({"id":7,"ok":true,"stdout":"","stderr":"","result":null});
         assert!(validate_response(&valid, 7).is_ok());
         assert!(validate_response(&valid, 8).is_err());
-        for (key, value) in [("id", json!("7")), ("ok", json!("true")), ("stdout", Value::Null), ("result", json!(42))] {
+        for (key, value) in [
+            ("id", json!("7")),
+            ("ok", json!("true")),
+            ("stdout", Value::Null),
+            ("result", json!(42)),
+        ] {
             let mut bad = valid.clone();
             bad[key] = value;
             assert!(validate_response(&bad, 7).is_err());
         }
-        assert!(validate_response(&json!({"id":7,"ok":false,"stdout":"","stderr":"","error":"failure"}), 7).is_ok());
+        assert!(
+            validate_response(
+                &json!({"id":7,"ok":false,"stdout":"","stderr":"","error":"failure"}),
+                7
+            )
+            .is_ok()
+        );
         assert!(validate_response(&json!({"id":7,"ok":false,"stdout":"","stderr":""}), 7).is_err());
     }
 
@@ -389,10 +470,14 @@ mod tests {
     fn bridge_effect_admission_requires_current_cell_and_exact_envelope() {
         let frame = json!({"id":7,"bridge":{"call":9,"tool":"read","input":{"path":"x"}}});
         assert!(validate_bridge_owner(&frame, 7, 90).is_ok());
-        for (id, size) in [(8,90), (7,1024*1024)] {
+        for (id, size) in [(8, 90), (7, 1024 * 1024)] {
             assert!(validate_bridge_owner(&frame, id, size).is_err());
         }
-        for (key, value) in [("id", json!(true)), ("stream", json!({})), ("softTimeout", json!(true))] {
+        for (key, value) in [
+            ("id", json!(true)),
+            ("stream", json!({})),
+            ("softTimeout", json!(true)),
+        ] {
             let mut bad = frame.clone();
             bad[key] = value;
             assert!(validate_bridge_owner(&bad, 7, 90).is_err());
@@ -409,7 +494,12 @@ mod tests {
         for marker in [Value::Null, json!(false), json!("pending root")] {
             let mut bad = response.clone();
             bad["kernelError"] = marker;
-            assert!(validate_response(&bad, 1).unwrap_err().to_string().contains("EVAL_KERNEL_INCOMPLETE"));
+            assert!(
+                validate_response(&bad, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("EVAL_KERNEL_INCOMPLETE")
+            );
         }
         let mut success = response.clone();
         success["ok"] = json!(true);
@@ -425,8 +515,11 @@ mod tests {
     #[test]
     fn actual_kernel_wrong_cell_reply_is_rejected_and_state_is_retired() {
         use crate::tools::Tool;
-        if !std::process::Command::new("python3").arg("--version")
-            .stdout(std::process::Stdio::null()).status().is_ok_and(|status| status.success())
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
         {
             eprintln!("Skipping: python3 not available");
             return;
@@ -454,8 +547,11 @@ mod tests {
     #[test]
     fn actual_kernel_newline_free_oversize_reply_is_not_misreported_as_timeout() {
         use crate::tools::Tool;
-        if !std::process::Command::new("python3").arg("--version")
-            .stdout(std::process::Stdio::null()).status().is_ok_and(|status| status.success())
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
         {
             eprintln!("Skipping: python3 not available");
             return;
@@ -467,10 +563,14 @@ mod tests {
             "wire = tool.read.__globals__['_REAL_STDOUT']\nwire.write('x' * {})\nwire.flush()",
             MAX_FRAME_BYTES + 1
         );
-        let error = runtime.block_on(tool.execute("oversize", json!({"code":code}), None)).unwrap_err();
+        let error = runtime
+            .block_on(tool.execute("oversize", json!({"code":code}), None))
+            .unwrap_err();
         assert!(error.to_string().contains("EVAL_PROTOCOL_LIMIT"), "{error}");
         assert!(!error.to_string().contains("EVAL_TIMEOUT"), "{error}");
-        let next = runtime.block_on(tool.execute("next", json!({"code":"42"}), None)).unwrap();
+        let next = runtime
+            .block_on(tool.execute("next", json!({"code":"42"}), None))
+            .unwrap();
         assert!(!next.is_error);
         assert_eq!(next.details.as_ref().unwrap()["cell"], 1);
     }
@@ -499,17 +599,27 @@ mod tests {
             let retired = wait_until(|| stop.worker.as_ref().unwrap().is_finished());
             if !retired {
                 drop(writer);
-                assert!(wait_until(|| stop.worker.as_ref().unwrap().is_finished()),
-                    "reader failed to retire even after releasing its peer");
+                assert!(
+                    wait_until(|| stop.worker.as_ref().unwrap().is_finished()),
+                    "reader failed to retire even after releasing its peer"
+                );
                 stop.worker.take().unwrap().join().expect("reader worker");
                 panic!("reader required peer EOF instead of observing cancellation");
             }
             stop.worker.take().unwrap().join().expect("reader worker");
-            assert!(blocked, "the kernel must report an idle read before cancellation");
+            assert!(
+                blocked,
+                "the kernel must report an idle read before cancellation"
+            );
             assert!(stop.state.finished.load(Ordering::Acquire));
-            assert!(matches!(frames.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
-            assert_eq!(writer.write(b"x").expect_err("closed reader fd").kind(),
-                io::ErrorKind::BrokenPipe);
+            assert!(matches!(
+                frames.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            assert_eq!(
+                writer.write(b"x").expect_err("closed reader fd").kind(),
+                io::ErrorKind::BrokenPipe
+            );
         }
     }
 
@@ -527,16 +637,26 @@ mod tests {
         if !retired {
             drop(frames);
             drop(writer);
-            assert!(wait_until(|| stop.worker.as_ref().unwrap().is_finished()),
-                "reader did not retire after releasing its queue and pipe");
+            assert!(
+                wait_until(|| stop.worker.as_ref().unwrap().is_finished()),
+                "reader did not retire after releasing its queue and pipe"
+            );
             stop.worker.take().unwrap().join().expect("reader worker");
             panic!("full queue ignored kernel receiver retirement");
         }
         stop.worker.take().unwrap().join().expect("reader worker");
-        assert!(blocked, "establish actual channel backpressure before cancellation");
-        assert!(matches!(frames.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
-        assert_eq!(writer.write(b"x").expect_err("closed reader fd").kind(),
-            io::ErrorKind::BrokenPipe);
+        assert!(
+            blocked,
+            "establish actual channel backpressure before cancellation"
+        );
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(
+            writer.write(b"x").expect_err("closed reader fd").kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     struct GappedReader {
@@ -569,9 +689,18 @@ mod tests {
     #[test]
     fn nonblocking_gaps_preserve_utf8_and_following_frames() {
         let state = ReaderState::default();
-        let mut reader = BufReader::new(CancellableReader { reader: gapped_reader(), state: &state });
-        assert_eq!(read_frame(&mut reader).expect("split scalar"), Some("界".into()));
-        assert_eq!(read_frame(&mut reader).expect("following frame"), Some("42".into()));
+        let mut reader = BufReader::new(CancellableReader {
+            reader: gapped_reader(),
+            state: &state,
+        });
+        assert_eq!(
+            read_frame(&mut reader).expect("split scalar"),
+            Some("界".into())
+        );
+        assert_eq!(
+            read_frame(&mut reader).expect("following frame"),
+            Some("42".into())
+        );
         assert_eq!(read_frame(&mut reader).expect("EOF"), None);
         assert_eq!(state.read_waits.load(Ordering::Acquire), 1);
     }
@@ -579,8 +708,12 @@ mod tests {
     #[test]
     fn nonblocking_gaps_do_not_reset_the_frame_byte_limit() {
         let state = ReaderState::default();
-        let mut reader = BufReader::new(CancellableReader { reader: gapped_reader(), state: &state });
-        let error = read_frame_with_limit(&mut reader, 2).expect_err("three-byte scalar exceeds limit");
+        let mut reader = BufReader::new(CancellableReader {
+            reader: gapped_reader(),
+            state: &state,
+        });
+        let error =
+            read_frame_with_limit(&mut reader, 2).expect_err("three-byte scalar exceeds limit");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(state.read_waits.load(Ordering::Acquire), 1);
     }
@@ -588,15 +721,20 @@ mod tests {
     #[test]
     fn reader_worker_distinguishes_real_eof_from_partial_frame_failure() {
         for (input, failed) in [(b"".as_slice(), false), (b"partial".as_slice(), true)] {
-            let (frames, mut stop) = spawn_prepared_reader(Cursor::new(input)).expect("reader worker");
+            let (frames, mut stop) =
+                spawn_prepared_reader(Cursor::new(input)).expect("reader worker");
             if failed {
-                let error = frames.recv_timeout(Duration::from_secs(2))
-                    .expect("error frame").expect_err("partial frame failure");
+                let error = frames
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("error frame")
+                    .expect_err("partial frame failure");
                 assert!(error.contains("EVAL_PROTOCOL_READ"));
                 assert!(error.contains("incomplete frame"));
             }
-            assert!(matches!(frames.recv_timeout(Duration::from_secs(2)),
-                Err(mpsc::RecvTimeoutError::Disconnected)));
+            assert!(matches!(
+                frames.recv_timeout(Duration::from_secs(2)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
             stop.worker.take().unwrap().join().expect("reader worker");
             assert!(stop.state.finished.load(Ordering::Acquire));
         }
@@ -606,31 +744,68 @@ mod tests {
     #[test]
     fn public_eval_reset_and_drop_stop_the_owned_protocol_readers() {
         use crate::tools::Tool;
-        if !std::process::Command::new("python3").arg("--version")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .status().is_ok_and(|status| status.success())
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
         {
             eprintln!("Skipping: python3 not available");
             return;
         }
         let dir = tempfile::tempdir().expect("workspace");
         let tool = crate::eval::EvalTool::new(dir.path());
-        let runtime = asupersync::runtime::RuntimeBuilder::new().build().expect("runtime");
-        let first = runtime.block_on(tool.execute("seed", json!({"code":"retained = 41"}), None))
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime");
+        let first = runtime
+            .block_on(tool.execute("seed", json!({"code":"retained = 41"}), None))
             .expect("seed cell");
         assert!(!first.is_error);
-        let old = Arc::clone(&tool.kernel.lock().unwrap().as_ref().unwrap().reader_stop.state);
+        let old = Arc::clone(
+            &tool
+                .kernel
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .reader_stop
+                .state,
+        );
         assert!(!old.stopped.load(Ordering::SeqCst));
-        let reset = runtime.block_on(tool.execute("reset", json!({"code":"42", "reset":true}), None))
+        let reset = runtime
+            .block_on(tool.execute("reset", json!({"code":"42", "reset":true}), None))
             .expect("reset cell");
         assert!(!reset.is_error);
-        assert!(old.stopped.load(Ordering::SeqCst), "reset must revoke the old reader");
-        assert!(wait_until(|| old.finished.load(Ordering::Acquire)), "old reader did not retire");
-        let new = Arc::clone(&tool.kernel.lock().unwrap().as_ref().unwrap().reader_stop.state);
+        assert!(
+            old.stopped.load(Ordering::SeqCst),
+            "reset must revoke the old reader"
+        );
+        assert!(
+            wait_until(|| old.finished.load(Ordering::Acquire)),
+            "old reader did not retire"
+        );
+        let new = Arc::clone(
+            &tool
+                .kernel
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .reader_stop
+                .state,
+        );
         assert!(!Arc::ptr_eq(&old, &new));
         assert!(!new.stopped.load(Ordering::SeqCst));
         drop(tool);
-        assert!(new.stopped.load(Ordering::SeqCst), "session drop must revoke its reader");
-        assert!(wait_until(|| new.finished.load(Ordering::Acquire)), "session reader did not retire");
+        assert!(
+            new.stopped.load(Ordering::SeqCst),
+            "session drop must revoke its reader"
+        );
+        assert!(
+            wait_until(|| new.finished.load(Ordering::Acquire)),
+            "session reader did not retire"
+        );
     }
 }

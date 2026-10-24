@@ -162,7 +162,10 @@ mod tests {
             rustix::fs::fcntl_getfl(&reader.inner).expect("prepared reader flags"),
             reader_flags | rustix::fs::OFlags::NONBLOCK
         );
-        assert_eq!(rustix::fs::fcntl_getfl(&writer).expect("writer flags"), writer_flags);
+        assert_eq!(
+            rustix::fs::fcntl_getfl(&writer).expect("writer flags"),
+            writer_flags
+        );
     }
 
     #[test]
@@ -176,7 +179,9 @@ mod tests {
         let mut final_chunk = encoded.as_bytes()[split..].to_vec();
         final_chunk.extend_from_slice(b"\r\n");
         final_chunk.extend_from_slice(
-            serde_json::to_string(&second).expect("second frame").as_bytes(),
+            serde_json::to_string(&second)
+                .expect("second frame")
+                .as_bytes(),
         );
         final_chunk.push(b'\n');
         let source = ScriptedReader(VecDeque::from([
@@ -243,9 +248,12 @@ mod tests {
             bytes(b"{\"jsonrpc\":\"2.0\""),
             ReadStep::Stop(Arc::clone(&alive)),
         ]));
-        let mut reader = BufReader::new(CancellablePipe { inner: source, alive });
-        let error = super::super::read_stdio_message(&mut reader)
-            .expect_err("cancelled partial frame");
+        let mut reader = BufReader::new(CancellablePipe {
+            inner: source,
+            alive,
+        });
+        let error =
+            super::super::read_stdio_message(&mut reader).expect_err("cancelled partial frame");
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     }
 
@@ -337,23 +345,33 @@ mod tests {
     fn cancellation_is_rechecked_after_interrupted_io() {
         let alive = live();
         let stop = Arc::clone(&alive);
-        let mut pipe = CancellablePipe { inner: 0usize, alive };
-        let error = pipe.retry(|attempts| -> io::Result<()> {
-            *attempts += 1;
-            stop.store(false, Ordering::SeqCst);
-            Err(io::ErrorKind::Interrupted.into())
-        }).expect_err("interruption must not swallow cancellation");
+        let mut pipe = CancellablePipe {
+            inner: 0usize,
+            alive,
+        };
+        let error = pipe
+            .retry(|attempts| -> io::Result<()> {
+                *attempts += 1;
+                stop.store(false, Ordering::SeqCst);
+                Err(io::ErrorKind::Interrupted.into())
+            })
+            .expect_err("interruption must not swallow cancellation");
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(pipe.inner, 1);
     }
 
     #[test]
     fn fatal_io_errors_are_not_retried_or_disguised_as_eof() {
-        let mut pipe = CancellablePipe { inner: 0usize, alive: live() };
-        let error = pipe.retry(|attempts| -> io::Result<()> {
-            *attempts += 1;
-            Err(io::ErrorKind::PermissionDenied.into())
-        }).expect_err("fatal I/O error");
+        let mut pipe = CancellablePipe {
+            inner: 0usize,
+            alive: live(),
+        };
+        let error = pipe
+            .retry(|attempts| -> io::Result<()> {
+                *attempts += 1;
+                Err(io::ErrorKind::PermissionDenied.into())
+            })
+            .expect_err("fatal I/O error");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(pipe.inner, 1);
     }
@@ -367,7 +385,9 @@ mod tests {
 
     impl<T> ObserveBlocked<T> {
         fn observe<R>(&mut self, result: io::Result<R>) -> io::Result<R> {
-            if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
                 && let Some(sender) = self.blocked.take()
             {
                 let _ = sender.try_send(());
@@ -472,7 +492,8 @@ mod tests {
         let stopped_with_reader_held = done_rx.recv_timeout(Duration::from_secs(2));
         drop(reader);
         if stopped_with_reader_held.is_err() {
-            done_rx.recv_timeout(Duration::from_secs(2))
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
                 .expect("writer retires after releasing its peer");
         }
         worker.join().expect("writer worker");

@@ -516,7 +516,10 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
         Ok(content) => {
             // Startup treats an empty settings file as the default configuration.
             if content.trim().is_empty() {
-                findings.push(Finding::pass(cat, format!("{label}: empty (using defaults)")));
+                findings.push(Finding::pass(
+                    cat,
+                    format!("{label}: empty (using defaults)"),
+                ));
                 return;
             }
             let value: serde_json::Value = match serde_json::from_str(&content) {
@@ -551,7 +554,8 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                     Finding::fail(cat, format!("{label}: invalid settings values"))
                         .with_detail(format!(
                             "Settings cannot be loaded at line {}, column {} (values omitted)",
-                            err.line(), err.column(),
+                            err.line(),
+                            err.column(),
                         ))
                         .with_remediation("Correct invalid setting types or duplicate fields"),
                 );
@@ -586,7 +590,7 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
 
 #[cfg(test)]
 mod doctor_typed_settings_regressions {
-    use super::{check_settings_file, CheckCategory, DoctorReport, Severity};
+    use super::{CheckCategory, DoctorReport, Severity, check_settings_file};
 
     #[test]
     fn invalid_typed_settings_fail_without_leaking_values() {
@@ -603,7 +607,11 @@ mod doctor_typed_settings_regressions {
             let report = DoctorReport::from_findings(findings);
             assert_eq!(report.overall, Severity::Fail);
             assert_eq!(report.summary.fail, 1);
-            for rendered in [report.render_text(), report.render_markdown(), report.to_json().unwrap()] {
+            for rendered in [
+                report.render_text(),
+                report.render_markdown(),
+                report.to_json().unwrap(),
+            ] {
                 assert!(!rendered.contains("private-invalid-value"));
                 assert!(!rendered.contains("not-an-integer"));
             }
@@ -614,8 +622,11 @@ mod doctor_typed_settings_regressions {
     fn empty_settings_and_unknown_keys_remain_nonfatal() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("settings.json");
-        for (content, expected) in [("", Severity::Pass), ("  \n", Severity::Pass),
-            (r#"{"hideThinkngBlock":true}"#, Severity::Warn)] {
+        for (content, expected) in [
+            ("", Severity::Pass),
+            ("  \n", Severity::Pass),
+            (r#"{"hideThinkngBlock":true}"#, Severity::Warn),
+        ] {
             std::fs::write(&path, content).unwrap();
             let mut findings = Vec::new();
             check_settings_file(CheckCategory::Config, &path, "Settings", &mut findings);

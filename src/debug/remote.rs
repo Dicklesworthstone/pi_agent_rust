@@ -36,31 +36,56 @@ struct PathMapping {
 
 impl AttachOptions {
     pub(super) fn validate(&self, input: &DebugInput) -> Result<()> {
-        let requested = self.port.is_some() || self.host.is_some()
-            || self.connect_timeout_ms.is_some() || self.path_mappings.is_some()
+        let requested = self.port.is_some()
+            || self.host.is_some()
+            || self.connect_timeout_ms.is_some()
+            || self.path_mappings.is_some()
             || self.just_my_code.is_some();
         if !requested {
             return Ok(());
         }
-        if input.action != "attach" || self.port.is_none()
-            || input.pid.is_some() || input.program.is_some() || input.args.is_some()
-            || input.go_mode.is_some() || input.stop_on_entry.is_some()
-            || input.adapter.as_deref().is_some_and(|adapter| adapter != "debugpy")
+        if input.action != "attach"
+            || self.port.is_none()
+            || input.pid.is_some()
+            || input.program.is_some()
+            || input.args.is_some()
+            || input.go_mode.is_some()
+            || input.stop_on_entry.is_some()
+            || input
+                .adapter
+                .as_deref()
+                .is_some_and(|adapter| adapter != "debugpy")
         {
-            return Err(tool_err("DAP_USAGE", "port attachment requires action=attach and an existing debugpy endpoint; do not combine it with pid, program, args, goMode, stopOnEntry or another adapter"));
+            return Err(tool_err(
+                "DAP_USAGE",
+                "port attachment requires action=attach and an existing debugpy endpoint; do not combine it with pid, program, args, goMode, stopOnEntry or another adapter",
+            ));
         }
         self.endpoint()?;
-        if self.connect_timeout_ms.is_some_and(|wait| !(1..=30_000).contains(&wait)) {
-            return Err(tool_err("DAP_USAGE", "connectTimeoutMs must be in 1..=30000"));
+        if self
+            .connect_timeout_ms
+            .is_some_and(|wait| !(1..=30_000).contains(&wait))
+        {
+            return Err(tool_err(
+                "DAP_USAGE",
+                "connectTimeoutMs must be in 1..=30000",
+            ));
         }
         if let Some(mappings) = &self.path_mappings {
             if mappings.len() > MAX_MAPPINGS {
-                return Err(tool_err("DAP_USAGE", "pathMappings supports at most 16 entries"));
+                return Err(tool_err(
+                    "DAP_USAGE",
+                    "pathMappings supports at most 16 entries",
+                ));
             }
             for mapping in mappings {
                 for path in [&mapping.local_root, &mapping.remote_root] {
-                    if path.trim().is_empty() || path.len() > MAX_PATH_BYTES || path.contains('\0') {
-                        return Err(tool_err("DAP_USAGE", "pathMappings roots must be nonempty, NUL-free and at most 4096 bytes"));
+                    if path.trim().is_empty() || path.len() > MAX_PATH_BYTES || path.contains('\0')
+                    {
+                        return Err(tool_err(
+                            "DAP_USAGE",
+                            "pathMappings roots must be nonempty, NUL-free and at most 4096 bytes",
+                        ));
                     }
                 }
             }
@@ -74,39 +99,71 @@ impl AttachOptions {
             // Deliberate literal mapping; do not consult DNS or search domains.
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         } else {
-            host.parse::<IpAddr>().map_err(|_| tool_err(
-                "DAP_USAGE", "host must be a loopback IP literal or localhost (IPv4)",
-            ))?
+            host.parse::<IpAddr>().map_err(|_| {
+                tool_err(
+                    "DAP_USAGE",
+                    "host must be a loopback IP literal or localhost (IPv4)",
+                )
+            })?
         };
-        let port = self.port.filter(|port| *port != 0)
+        let port = self
+            .port
+            .filter(|port| *port != 0)
             .ok_or_else(|| tool_err("DAP_USAGE", "port must be in 1..=65535"))?;
         if !address.is_loopback() {
-            return Err(tool_err("DAP_USAGE", "only loopback debugger endpoints are supported; use a trusted local tunnel for remote services"));
+            return Err(tool_err(
+                "DAP_USAGE",
+                "only loopback debugger endpoints are supported; use a trusted local tunnel for remote services",
+            ));
         }
         Ok(SocketAddr::new(address, port))
     }
 
     fn mappings(&self, cwd: &Path) -> Result<Vec<Value>> {
-        let Some(mappings) = self.path_mappings.as_ref().filter(|mappings| !mappings.is_empty()) else {
+        let Some(mappings) = self
+            .path_mappings
+            .as_ref()
+            .filter(|mappings| !mappings.is_empty())
+        else {
             return Ok(Vec::new());
         };
         let workspace = std::fs::canonicalize(cwd).map_err(|error| {
-            tool_err("DAP_PATH_MAPPING", format!("cannot resolve the local workspace: {error}"))
+            tool_err(
+                "DAP_PATH_MAPPING",
+                format!("cannot resolve the local workspace: {error}"),
+            )
         })?;
         let mut seen = BTreeSet::new();
         let mut resolved = Vec::with_capacity(mappings.len());
         for mapping in mappings {
-            let local = std::fs::canonicalize(workspace.join(&mapping.local_root)).map_err(|error| {
-                tool_err("DAP_PATH_MAPPING", format!("cannot resolve localRoot: {error}"))
-            })?;
+            let local =
+                std::fs::canonicalize(workspace.join(&mapping.local_root)).map_err(|error| {
+                    tool_err(
+                        "DAP_PATH_MAPPING",
+                        format!("cannot resolve localRoot: {error}"),
+                    )
+                })?;
             if !local.is_dir() || !local.starts_with(&workspace) {
-                return Err(tool_err("DAP_PATH_MAPPING", "localRoot must resolve to a directory inside this tool's workspace"));
+                return Err(tool_err(
+                    "DAP_PATH_MAPPING",
+                    "localRoot must resolve to a directory inside this tool's workspace",
+                ));
             }
             if !seen.insert(local.clone()) {
-                return Err(tool_err("DAP_PATH_MAPPING", "duplicate canonical localRoot; use one remote mapping for each local root"));
+                return Err(tool_err(
+                    "DAP_PATH_MAPPING",
+                    "duplicate canonical localRoot; use one remote mapping for each local root",
+                ));
             }
-            let local = local.to_str().filter(|path| path.len() <= MAX_PATH_BYTES)
-                .ok_or_else(|| tool_err("DAP_PATH_MAPPING", "resolved localRoot must be UTF-8 and at most 4096 bytes"))?;
+            let local = local
+                .to_str()
+                .filter(|path| path.len() <= MAX_PATH_BYTES)
+                .ok_or_else(|| {
+                    tool_err(
+                        "DAP_PATH_MAPPING",
+                        "resolved localRoot must be UTF-8 and at most 4096 bytes",
+                    )
+                })?;
             // remoteRoot belongs to the server's OS. Never canonicalize it on
             // this host, fetch remote files, or assume it uses our separators.
             resolved.push(json!({"localRoot":local,"remoteRoot":mapping.remote_root}));
@@ -129,9 +186,14 @@ impl DebugTool {
     pub(super) async fn run_remote_start(&self, input: &DebugInput) -> Result<ToolOutput> {
         input.remote.validate(input)?;
         let owner = AgentCx::for_current_or_request();
-        owner.checkpoint().map_err(|_| tool_err("DAP_CANCELLED", "debugger attachment cancelled"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| tool_err("DAP_CANCELLED", "debugger attachment cancelled"))?;
         if !owner.capabilities().io || !owner.capabilities().time {
-            return Err(tool_err("DAP_PERMISSION", "debugger attachment requires I/O and timer capabilities"));
+            return Err(tool_err(
+                "DAP_PERMISSION",
+                "debugger attachment requires I/O and timer capabilities",
+            ));
         }
         // Complete local preflight before opening the user's selected endpoint.
         // cwd selects local source identity, not the remote process directory.
@@ -139,16 +201,29 @@ impl DebugTool {
         let source_root = self.resolve_working_directory(input.cwd.as_deref())?;
         let endpoint = input.remote.endpoint()?;
         let mappings = input.remote.mappings(&self.cwd)?;
-        let initial = breakpoints::initial(&source_root, input.initial_breakpoints.as_deref().unwrap_or(&[]))?;
+        let initial = breakpoints::initial(
+            &source_root,
+            input.initial_breakpoints.as_deref().unwrap_or(&[]),
+        )?;
         let connect_ms = input.remote.connect_timeout_ms.unwrap_or(5_000);
         let startup_ms = input.startup_timeout_ms.unwrap_or(120_000);
-        let transport = DapTransport::connect_loopback(endpoint, Duration::from_millis(connect_ms)).await?;
-        let session = DapSession::begin(transport).await?.with_source_root(source_root);
-        session.start(
-            "attach", input.remote.arguments(endpoint, &mappings), &initial,
-            input.exception_filters.as_deref(), Duration::from_millis(startup_ms),
-        ).await?;
-        owner.checkpoint().map_err(|_| tool_err("DAP_CANCELLED", "debugger attachment cancelled"))?;
+        let transport =
+            DapTransport::connect_loopback(endpoint, Duration::from_millis(connect_ms)).await?;
+        let session = DapSession::begin(transport)
+            .await?
+            .with_source_root(source_root);
+        session
+            .start(
+                "attach",
+                input.remote.arguments(endpoint, &mappings),
+                &initial,
+                input.exception_filters.as_deref(),
+                Duration::from_millis(startup_ms),
+            )
+            .await?;
+        owner
+            .checkpoint()
+            .map_err(|_| tool_err("DAP_CANCELLED", "debugger attachment cancelled"))?;
         let state = session.state();
         let payload = json!({
             "action":"attach", "adapter":"debugpy", "transport":"tcp",
@@ -218,9 +293,13 @@ mod tests {
             request.validate().unwrap();
             assert!(request.remote.endpoint().unwrap().ip().is_loopback());
         }
-        input(json!({"action":"attach","pid":1})).validate().unwrap();
+        input(json!({"action":"attach","pid":1}))
+            .validate()
+            .unwrap();
         input(json!({"action":"sessions"})).validate().unwrap();
-        assert!(serde_json::from_value::<DebugInput>(json!({"action":"attach","port":65536})).is_err());
+        assert!(
+            serde_json::from_value::<DebugInput>(json!({"action":"attach","port":65536})).is_err()
+        );
     }
 
     #[test]
@@ -233,8 +312,19 @@ mod tests {
         request.validate().unwrap();
         let mappings = request.remote.mappings(workspace.path()).unwrap();
         assert_eq!(mappings[0]["remoteRoot"], "C:\\service\\source");
-        assert_eq!(mappings[0]["localRoot"], workspace.path().join("source").canonicalize().unwrap().to_str().unwrap());
-        let args = request.remote.arguments(request.remote.endpoint().unwrap(), &mappings);
+        assert_eq!(
+            mappings[0]["localRoot"],
+            workspace
+                .path()
+                .join("source")
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let args = request
+            .remote
+            .arguments(request.remote.endpoint().unwrap(), &mappings);
         assert_eq!(args["subProcess"], false);
         assert_eq!(args["justMyCode"], true);
         assert!(args.get("processId").is_none());
@@ -251,16 +341,33 @@ mod tests {
 
     #[test]
     fn malformed_or_oversized_mapping_is_not_silently_ignored() {
-        assert!(serde_json::from_value::<DebugInput>(json!({"action":"attach","port":1,"pathMappings":[
-            {"localRoot":".","remoteRoot":".","typo":true}
-        ]})).is_err());
-        for root in ["".to_string(), "x\0y".to_string(), "x".repeat(MAX_PATH_BYTES + 1)] {
-            assert!(input(json!({"action":"attach","port":1,"pathMappings":[
-                {"localRoot":".","remoteRoot":root}
-            ]})).validate().is_err());
+        assert!(
+            serde_json::from_value::<DebugInput>(
+                json!({"action":"attach","port":1,"pathMappings":[
+                    {"localRoot":".","remoteRoot":".","typo":true}
+                ]})
+            )
+            .is_err()
+        );
+        for root in [
+            "".to_string(),
+            "x\0y".to_string(),
+            "x".repeat(MAX_PATH_BYTES + 1),
+        ] {
+            assert!(
+                input(json!({"action":"attach","port":1,"pathMappings":[
+                    {"localRoot":".","remoteRoot":root}
+                ]}))
+                .validate()
+                .is_err()
+            );
         }
         let mappings = vec![json!({"localRoot":".","remoteRoot":"."}); MAX_MAPPINGS + 1];
-        assert!(input(json!({"action":"attach","port":1,"pathMappings":mappings})).validate().is_err());
+        assert!(
+            input(json!({"action":"attach","port":1,"pathMappings":mappings}))
+                .validate()
+                .is_err()
+        );
     }
 
     /// Opt-in native acceptance: this talks through the actual Rust tool to a
@@ -295,8 +402,12 @@ mod tests {
         let python = std::env::var_os("PI_DEBUG_TEST_PYTHON").unwrap_or_else(|| "python3".into());
         let log = std::fs::File::create(root.join("debugpy.log")).unwrap();
         let mut command = Command::new(python);
-        command.args(["-I", "-u"]).arg(remote.join("program.py")).arg(&root)
-            .stdin(Stdio::null()).stdout(Stdio::from(log.try_clone().unwrap()))
+        command
+            .args(["-I", "-u"])
+            .arg(remote.join("program.py"))
+            .arg(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
         #[cfg(unix)]
         {
@@ -315,9 +426,15 @@ mod tests {
             {
                 break value;
             }
-            assert!(process.try_wait_child().unwrap().is_none(), "debugpy startup failed: {}",
-                std::fs::read_to_string(root.join("debugpy.log")).unwrap_or_default());
-            assert!(started.elapsed() < Duration::from_secs(15), "debugpy startup timed out");
+            assert!(
+                process.try_wait_child().unwrap().is_none(),
+                "debugpy startup failed: {}",
+                std::fs::read_to_string(root.join("debugpy.log")).unwrap_or_default()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "debugpy startup timed out"
+            );
             std::thread::sleep(Duration::from_millis(10));
         };
         let registry = ToolRegistry::from_tools(vec![Box::new(
@@ -330,47 +447,99 @@ mod tests {
             output.details.unwrap()
         }
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(1, 8).build().unwrap();
+            .blocking_threads(1, 8)
+            .build()
+            .unwrap();
         runtime.block_on(owner.with_current(async {
-            let attached = call(tool, json!({"action":"attach","port":endpoint[1],
+            let attached = call(
+                tool,
+                json!({"action":"attach","port":endpoint[1],
                 "connectTimeoutMs":3000,"startupTimeoutMs":10000,
                 "pathMappings":[{"localRoot":".","remoteRoot":remote}],
-                "initialBreakpoints":[{"file":"program.py","line":12}]})).await;
+                "initialBreakpoints":[{"file":"program.py","line":12}]}),
+            )
+            .await;
             assert_eq!(attached["adapterProcessOwned"], false);
             let wait = Instant::now();
             loop {
                 let sessions = call(tool, json!({"action":"sessions"})).await;
-                if sessions["sessions"][0]["state"]["state"] == "stopped" { break; }
-                assert!(wait.elapsed() < Duration::from_secs(5), "did not hit mapped breakpoint");
+                if sessions["sessions"][0]["state"]["state"] == "stopped" {
+                    break;
+                }
+                assert!(
+                    wait.elapsed() < Duration::from_secs(5),
+                    "did not hit mapped breakpoint"
+                );
                 owner.time().sleep(Duration::from_millis(10)).await;
             }
-            assert!(!root.join("ran.json").exists(), "debuggee was not actually suspended");
+            assert!(
+                !root.join("ran.json").exists(),
+                "debuggee was not actually suspended"
+            );
             let stack = call(tool, json!({"action":"stack_trace"})).await;
             let frame = &stack["frames"][0];
             assert_eq!(frame["line"], 12);
-            assert_eq!(Path::new(frame["source"]["path"].as_str().unwrap()).canonicalize().unwrap(),
-                local.join("program.py"));
-            let value = call(tool, json!({"action":"evaluate","frameId":frame["id"],"expression":"answer"})).await;
+            assert_eq!(
+                Path::new(frame["source"]["path"].as_str().unwrap())
+                    .canonicalize()
+                    .unwrap(),
+                local.join("program.py")
+            );
+            let value = call(
+                tool,
+                json!({"action":"evaluate","frameId":frame["id"],"expression":"answer"}),
+            )
+            .await;
             assert_eq!(value["result"], "41");
             let scopes = call(tool, json!({"action":"scopes","frameId":frame["id"]})).await;
-            let reference = &scopes["scopes"].as_array().unwrap().iter()
-                .find(|scope| scope["name"] == "Locals").unwrap()["variablesReference"];
-            let values = call(tool, json!({"action":"variables","variablesReference":reference})).await;
-            assert!(values["variables"].as_array().unwrap().iter()
-                .any(|value| value["name"] == "answer" && value["value"] == "41"));
-            let changed = call(tool, json!({"action":"set_expression","frameId":frame["id"],
-                "expression":"answer","value":"99"})).await;
+            let reference = &scopes["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|scope| scope["name"] == "Locals")
+                .unwrap()["variablesReference"];
+            let values = call(
+                tool,
+                json!({"action":"variables","variablesReference":reference}),
+            )
+            .await;
+            assert!(
+                values["variables"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value["name"] == "answer" && value["value"] == "41")
+            );
+            let changed = call(
+                tool,
+                json!({"action":"set_expression","frameId":frame["id"],
+                "expression":"answer","value":"99"}),
+            )
+            .await;
             assert_eq!(changed["value"], "99");
             call(tool, json!({"action":"disconnect"})).await;
-            assert_eq!(call(tool, json!({"action":"sessions"})).await["sessions"], json!([]));
+            assert_eq!(
+                call(tool, json!({"action":"sessions"})).await["sessions"],
+                json!([])
+            );
         }));
         let wait = Instant::now();
-        while std::fs::read_to_string(root.join("ran.json")).ok().as_deref() != Some("100") {
+        while std::fs::read_to_string(root.join("ran.json"))
+            .ok()
+            .as_deref()
+            != Some("100")
+        {
             assert!(process.try_wait_child().unwrap().is_none());
-            assert!(wait.elapsed() < Duration::from_secs(5), "detached target did not resume");
+            assert!(
+                wait.elapsed() < Duration::from_secs(5),
+                "detached target did not resume"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(process.try_wait_child().unwrap().is_none(), "disconnect killed the external target");
+        assert!(
+            process.try_wait_child().unwrap().is_none(),
+            "disconnect killed the external target"
+        );
         std::fs::write(root.join("finish"), "done").unwrap();
         let wait = Instant::now();
         loop {
@@ -378,7 +547,10 @@ mod tests {
                 assert!(status.success());
                 break;
             }
-            assert!(wait.elapsed() < Duration::from_secs(10), "target did not exit under its own control");
+            assert!(
+                wait.elapsed() < Duration::from_secs(10),
+                "target did not exit under its own control"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }

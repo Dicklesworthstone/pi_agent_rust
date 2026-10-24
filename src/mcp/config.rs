@@ -211,7 +211,12 @@ impl McpOAuthConfig {
     fn validate_fields(&self) -> Result<(), String> {
         for (name, value, limit, allow_empty) in [
             ("clientId", self.client_id.as_deref(), 4096, false),
-            ("clientSecret", self.client_secret.as_deref(), 16 * 1024, false),
+            (
+                "clientSecret",
+                self.client_secret.as_deref(),
+                16 * 1024,
+                false,
+            ),
             ("scope", self.scope.as_deref(), 4096, true),
             ("redirectUri", self.redirect_uri.as_deref(), 4096, false),
             ("callbackPath", self.callback_path.as_deref(), 4096, false),
@@ -311,14 +316,10 @@ fn validate_oauth_callback_path(path: &str) -> Result<(), String> {
         "oauth.callbackPath must be an absolute URL path without query, fragment, or normalization"
             .to_string()
     };
-    if !path.starts_with('/')
-        || path.starts_with("//")
-        || path.contains(['?', '#', '\\'])
-    {
+    if !path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#', '\\']) {
         return Err(invalid());
     }
-    let url = url::Url::parse(&format!("http://127.0.0.1{path}"))
-        .map_err(|_| invalid())?;
+    let url = url::Url::parse(&format!("http://127.0.0.1{path}")).map_err(|_| invalid())?;
     if url.path() != path {
         return Err(invalid());
     }
@@ -948,9 +949,7 @@ fn validate_oauth_shape(value: &Value) -> Result<(), String> {
                     .as_u64()
                     .is_some_and(|port| (1..=65535).contains(&port))
                 {
-                    return Err(
-                        "oauth.callbackPort must be an integer from 1 to 65535".to_string(),
-                    );
+                    return Err("oauth.callbackPort must be an integer from 1 to 65535".to_string());
                 }
             }
             _ => return Err("oauth contains an unknown field".to_string()),
@@ -2843,12 +2842,21 @@ mod tests {
             .expect("protected server");
         let oauth = server.oauth.as_ref().expect("OAuth settings");
         assert_eq!(server.provenance, Provenance::Foreign);
-        assert_eq!(oauth.client_id.as_deref(), Some("${PI_MCP_CONFIGURED_CLIENT}"));
+        assert_eq!(
+            oauth.client_id.as_deref(),
+            Some("${PI_MCP_CONFIGURED_CLIENT}")
+        );
         assert_eq!(oauth.client_secret.as_deref(), Some("$CMD:exit 97"));
         assert_eq!(oauth.scope.as_deref(), Some("${PI_MCP_CONFIGURED_SCOPE}"));
-        assert_eq!(oauth.redirect_uri.as_deref(), Some("${PI_MCP_CONFIGURED_REDIRECT}"));
+        assert_eq!(
+            oauth.redirect_uri.as_deref(),
+            Some("${PI_MCP_CONFIGURED_REDIRECT}")
+        );
         assert_eq!(oauth.callback_port, Some(43121));
-        assert_eq!(oauth.callback_path.as_deref(), Some("${PI_MCP_CONFIGURED_CALLBACK}"));
+        assert_eq!(
+            oauth.callback_path.as_deref(),
+            Some("${PI_MCP_CONFIGURED_CALLBACK}")
+        );
         assert_eq!(oauth.prompt.as_deref(), Some(""));
         let disabled = discovery
             .servers
@@ -2931,7 +2939,9 @@ mod tests {
                 ..McpOAuthConfig::default()
             };
             options.validate_raw().expect("raw loopback callback");
-            options.validate_resolved().expect("resolved loopback callback");
+            options
+                .validate_resolved()
+                .expect("resolved loopback callback");
             assert_eq!(options.redirect_uri.as_deref(), Some(redirect));
         }
         let options = McpOAuthConfig {
@@ -2940,7 +2950,9 @@ mod tests {
             callback_path: Some("/callback".to_string()),
             ..McpOAuthConfig::default()
         };
-        options.validate_resolved().expect("matching default HTTP port");
+        options
+            .validate_resolved()
+            .expect("matching default HTTP port");
         for redirect in [
             "http://0.0.0.0:43121/callback",
             "http://[::]:43121/callback",
@@ -2963,7 +2975,15 @@ mod tests {
             };
             assert!(options.validate_resolved().is_err(), "{redirect}");
         }
-        for path in ["", "callback", "//other/callback", "/a/../callback", "/a b", "/cb?x", "/cb#x"] {
+        for path in [
+            "",
+            "callback",
+            "//other/callback",
+            "/a/../callback",
+            "/a b",
+            "/cb?x",
+            "/cb#x",
+        ] {
             let options = McpOAuthConfig {
                 callback_path: Some(path.to_string()),
                 ..McpOAuthConfig::default()
@@ -2998,7 +3018,9 @@ mod tests {
             )
             .expect("expand path"),
         );
-        options.validate_resolved().expect("resolved matching callback");
+        options
+            .validate_resolved()
+            .expect("resolved matching callback");
         options.callback_path = Some("/different".to_string());
         assert!(options.validate_resolved().is_err());
     }

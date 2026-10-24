@@ -410,20 +410,32 @@ fn lsp_invalid_configured_settings_are_rejected_before_server_startup() {
     ] {
         let config = Config {
             lsp: Some(LspSettings {
-                servers: Some(HashMap::from([("rust-analyzer".to_string(), LspServerSettings {
-                    command: Some("/nonexistent/must-not-start-language-server".to_string()),
-                    settings: Some(settings),
-                    ..Default::default()
-                })])),
+                servers: Some(HashMap::from([(
+                    "rust-analyzer".to_string(),
+                    LspServerSettings {
+                        command: Some("/nonexistent/must-not-start-language-server".to_string()),
+                        settings: Some(settings),
+                        ..Default::default()
+                    },
+                )])),
                 ..Default::default()
             }),
             ..Config::default()
         };
         let registry = lsp_tool(&harness.temp_path("."), Some(&config));
-        let err = execute_lsp(&registry, json!({"action":"capabilities","file":"source.rs"}))
-            .expect_err("malformed configured settings must reject the connection");
-        assert!(err.to_string().contains("[LSP_CONFIGURATION_INVALID]"), "{err}");
-        assert!(!err.to_string().contains("[LSP_SERVER_MISSING]"), "validation must precede spawning");
+        let err = execute_lsp(
+            &registry,
+            json!({"action":"capabilities","file":"source.rs"}),
+        )
+        .expect_err("malformed configured settings must reject the connection");
+        assert!(
+            err.to_string().contains("[LSP_CONFIGURATION_INVALID]"),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("[LSP_SERVER_MISSING]"),
+            "validation must precede spawning"
+        );
         assert!(!err.to_string().contains("PRIVATE_CONFIGURATION_MARKER"));
         let status = output_json(&execute_lsp(&registry, json!({"action":"status"})).unwrap());
         assert!(status["live"].as_array().unwrap().is_empty());

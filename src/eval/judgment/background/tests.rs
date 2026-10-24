@@ -1067,10 +1067,20 @@ fn retained_jobs_capture_each_selected_role_before_the_invocation_disappears() -
     let _serial = crate::jobs::process_test_guard();
     let mut fast = Harness::new(&[r#"{"source":"fast"}"#], false)?;
     let slow = Harness::new(&[r#"{"q":0.2}"#, r#"{"q":0.3}"#], true)?;
-    let fast_judge = fast.tool.judge.take().ok_or_else(|| Error::tool("fixture", "missing fast binding"))?;
-    let slow_judge = slow.tool.judge.clone().ok_or_else(|| Error::tool("fixture", "missing slow binding"))?;
-    let smol = super::super::Selection::role(&json!("smol")).ok_or_else(|| Error::tool("fixture", "missing smol role"))?;
-    let deep = super::super::Selection::role(&json!("slow")).ok_or_else(|| Error::tool("fixture", "missing slow role"))?;
+    let fast_judge = fast
+        .tool
+        .judge
+        .take()
+        .ok_or_else(|| Error::tool("fixture", "missing fast binding"))?;
+    let slow_judge = slow
+        .tool
+        .judge
+        .clone()
+        .ok_or_else(|| Error::tool("fixture", "missing slow binding"))?;
+    let smol = super::super::Selection::role(&json!("smol"))
+        .ok_or_else(|| Error::tool("fixture", "missing smol role"))?;
+    let deep = super::super::Selection::role(&json!("slow"))
+        .ok_or_else(|| Error::tool("fixture", "missing slow role"))?;
     runtime().block_on(async {
         let factory = privacy;
         let mut invocation = Invocation::new(None, &json!({"judge_model":{"role":"smol"}}), None)?
@@ -1118,9 +1128,14 @@ fn helper_role_cannot_replace_a_host_binding_or_read_images_before_rejection() -
     runtime().block_on(async {
         let factory = privacy;
         let mut invocation = harness.invocation(&factory)?;
-        let error = invocation.start_background(&harness.tool, Operation::Completion,
-            json!({"prompt":"work","model":"smol","images":["image.png"]}))
-            .await.expect_err("host-bound Judge cannot be overridden"); // ubs:ignore -- Guest role selection cannot replace native host authority.
+        let error = invocation
+            .start_background(
+                &harness.tool,
+                Operation::Completion,
+                json!({"prompt":"work","model":"smol","images":["image.png"]}),
+            )
+            .await
+            .expect_err("host-bound Judge cannot be overridden"); // ubs:ignore -- Guest role selection cannot replace native host authority.
         assert!(error.contains("PI_COMPLETION_BINDING")); // ubs:ignore -- The explicit host binding must reject role replacement before admission.
         assert!(invocation.receipts.is_empty()); // ubs:ignore -- A rejected override must not reserve a provider attempt.
         assert!(invocation.tool_receipts.is_empty()); // ubs:ignore -- No jobs policy or read call is necessary for a rejected override.

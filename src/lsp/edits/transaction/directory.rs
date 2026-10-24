@@ -78,7 +78,9 @@ fn require_absent(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
-        Ok(_) => Err(io::Error::other("directory rename destination already exists")),
+        Ok(_) => Err(io::Error::other(
+            "directory rename destination already exists",
+        )),
     }
 }
 
@@ -98,13 +100,17 @@ impl DirectoryMove {
         require_absent(&new)?;
         let nodes = inventory(&old)?;
         if !nodes.get(&old).is_some_and(|node| node.directory) {
-            return Err(io::Error::other("directory rename source is not a directory"));
+            return Err(io::Error::other(
+                "directory rename source is not a directory",
+            ));
         }
         Ok(Self { old, new, nodes })
     }
 
     pub(super) fn files(&self) -> impl Iterator<Item = &PathBuf> {
-        self.nodes.iter().filter_map(|(path, node)| (!node.directory).then_some(path))
+        self.nodes
+            .iter()
+            .filter_map(|(path, node)| (!node.directory).then_some(path))
     }
 
     pub(super) fn verify(&self) -> io::Result<()> {
@@ -113,7 +119,9 @@ impl DirectoryMove {
         }
         require_absent(&self.new)?;
         if inventory(&self.old)? != self.nodes {
-            return Err(io::Error::other("directory rename tree changed; request a new plan"));
+            return Err(io::Error::other(
+                "directory rename tree changed; request a new plan",
+            ));
         }
         Ok(())
     }

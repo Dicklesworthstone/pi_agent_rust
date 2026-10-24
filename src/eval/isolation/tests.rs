@@ -4,20 +4,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 fn run<F: std::future::Future>(future: F) -> F::Output {
-    asupersync::runtime::RuntimeBuilder::current_thread().blocking_threads(1, 8)
-        .build().unwrap().block_on(future)
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 8)
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 async fn js(tool: &EvalTool, code: &str, mode: &str) -> ToolOutput {
-    tool.execute("test", json!({"kernel":"js", "kernel_mode":mode, "code":code}), None)
-        .await.unwrap()
+    tool.execute(
+        "test",
+        json!({"kernel":"js", "kernel_mode":mode, "code":code}),
+        None,
+    )
+    .await
+    .unwrap()
 }
 
 fn text(output: &ToolOutput) -> String {
-    output.content.iter().filter_map(|block| match block {
-        ContentBlock::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    }).collect::<Vec<_>>().join("\n")
+    output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -46,17 +59,31 @@ fn invalid_mode_fails_before_admission_or_reset() {
     run(async {
         js(&tool, "globalThis.keep = 42", "session").await;
         let lease = tool.execution.lock().await;
-        for mode in [Value::Null, json!(false), json!(3), json!("per-call"), json!("SESSION")] {
-            let mut pending = tool.execute("bad", json!({
-                "kernel":"js", "kernel_mode":mode, "code":"", "reset":true
-            }), None);
+        for mode in [
+            Value::Null,
+            json!(false),
+            json!(3),
+            json!("per-call"),
+            json!("SESSION"),
+        ] {
+            let mut pending = tool.execute(
+                "bad",
+                json!({
+                    "kernel":"js", "kernel_mode":mode, "code":"", "reset":true
+                }),
+                None,
+            );
             let std::task::Poll::Ready(Err(error)) = futures::poll!(pending.as_mut()) else {
                 panic!("invalid mode waited or ran");
             };
             assert!(error.to_string().contains("EVAL_INPUT"));
         }
         drop(lease);
-        assert!(text(&js(&tool, "keep", "session").await).trim().ends_with("42"));
+        assert!(
+            text(&js(&tool, "keep", "session").await)
+                .trim()
+                .ends_with("42")
+        );
     });
 }
 
@@ -68,14 +95,28 @@ fn isolated_calls_share_admission_and_cannot_escape_waiting_cancellation() {
     run(async {
         js(&tool, "globalThis.keep = 42", "session").await;
         let lease = tool.execution.lock().await;
-        let mut pending = Box::pin(owner.with_current(tool.execute("queued", json!({
-            "kernel":"js", "kernel_mode":"per_call", "code":"globalThis.keep = 99", "reset":true
-        }), None)));
+        let mut pending = Box::pin(owner.with_current(tool.execute(
+            "queued",
+            json!({
+                "kernel":"js", "kernel_mode":"per_call", "code":"globalThis.keep = 99", "reset":true
+            }),
+            None,
+        )));
         assert!(futures::poll!(pending.as_mut()).is_pending());
         owner.set_cancel_requested(true);
-        assert!(pending.await.unwrap_err().to_string().contains("EVAL_CANCELLED"));
+        assert!(
+            pending
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("EVAL_CANCELLED")
+        );
         drop(lease);
-        assert!(text(&js(&tool, "keep", "session").await).trim().ends_with("42"));
+        assert!(
+            text(&js(&tool, "keep", "session").await)
+                .trim()
+                .ends_with("42")
+        );
     });
 }
 
@@ -89,16 +130,25 @@ fn active_private_cancellation_and_abandonment_preserve_the_session() {
             let owner = AgentCx::for_testing();
             let started = Arc::new(AtomicBool::new(false));
             let observed = Arc::clone(&started);
-            let mut active = Box::pin(owner.with_current(tool.execute("private", json!({
-                "kernel":"js", "kernel_mode":"per_call", "timeout_secs":10,
-                "code":"console.log('started'); await sleep(60000)"
-            }), Some(Box::new(move |_| { observed.store(true, Ordering::SeqCst); })))));
+            let mut active = Box::pin(owner.with_current(tool.execute(
+                "private",
+                json!({
+                    "kernel":"js", "kernel_mode":"per_call", "timeout_secs":10,
+                    "code":"console.log('started'); await sleep(60000)"
+                }),
+                Some(Box::new(move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                })),
+            )));
             // Poll to an actual producer update, not just source preparation.
             let end = Instant::now() + Duration::from_secs(5);
             while !started.load(Ordering::SeqCst) {
                 assert!(futures::poll!(active.as_mut()).is_pending());
                 assert!(Instant::now() < end);
-                AgentCx::for_current_or_request().time().sleep(Duration::from_millis(10)).await;
+                AgentCx::for_current_or_request()
+                    .time()
+                    .sleep(Duration::from_millis(10))
+                    .await;
             }
             if cancel {
                 owner.set_cancel_requested(true);
@@ -109,7 +159,11 @@ fn active_private_cancellation_and_abandonment_preserve_the_session() {
                 drop(active);
             }
             assert!(tool.execution.try_lock().is_some());
-            assert!(text(&js(&tool, "keep", "session").await).trim().ends_with("42"));
+            assert!(
+                text(&js(&tool, "keep", "session").await)
+                    .trim()
+                    .ends_with("42")
+            );
         }
     });
 }
@@ -118,16 +172,42 @@ fn active_private_cancellation_and_abandonment_preserve_the_session() {
 fn per_call_reloads_modules_without_invalidating_the_retained_cache() {
     let dir = tempfile::tempdir().unwrap();
     let module = dir.path().join("counter.js");
-    std::fs::write(&module, "export let value = 1; export function bump() { value += 1; }").unwrap();
+    std::fs::write(
+        &module,
+        "export let value = 1; export function bump() { value += 1; }",
+    )
+    .unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        assert!(!js(&tool, "const m = await import('./counter.js'); m.bump(); m.value", "session").await.is_error);
-        let fresh = js(&tool, "const m = await import('./counter.js'); m.value", "per_call").await;
+        assert!(
+            !js(
+                &tool,
+                "const m = await import('./counter.js'); m.bump(); m.value",
+                "session"
+            )
+            .await
+            .is_error
+        );
+        let fresh = js(
+            &tool,
+            "const m = await import('./counter.js'); m.value",
+            "per_call",
+        )
+        .await;
         assert!(text(&fresh).trim().ends_with('1'));
-        let failed = js(&tool, "globalThis.keep = 99; throw new Error('private failure')", "per_call").await;
+        let failed = js(
+            &tool,
+            "globalThis.keep = 99; throw new Error('private failure')",
+            "per_call",
+        )
+        .await;
         assert!(failed.is_error);
         assert!(text(&failed).contains("private failure"));
-        assert!(text(&js(&tool, "m.value", "session").await).trim().ends_with('2'));
+        assert!(
+            text(&js(&tool, "m.value", "session").await)
+                .trim()
+                .ends_with('2')
+        );
         assert!(text(&js(&tool, "typeof keep", "session").await).contains("undefined"));
     });
 }
@@ -160,5 +240,8 @@ fn explicit_python_configuration_and_fresh_storage_are_copied_without_recapture(
     assert!(private.kernel.lock().unwrap().is_none());
     assert!(private.js.lock().unwrap().is_none());
     let schema = tool.parameters();
-    assert_eq!(schema["properties"]["kernel_mode"]["enum"], json!(["session", "per_call"]));
+    assert_eq!(
+        schema["properties"]["kernel_mode"]["enum"],
+        json!(["session", "per_call"])
+    );
 }

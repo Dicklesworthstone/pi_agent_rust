@@ -111,9 +111,7 @@ pub(super) fn acquire(
         if !sessions.contains_key(&key) && sessions.len() >= MAX_RETAINED_SESSIONS {
             let oldest_idle = sessions
                 .iter()
-                .filter(|(_, entry)| {
-                    entry.state.try_lock().is_ok_and(|state| !state.busy)
-                })
+                .filter(|(_, entry)| entry.state.try_lock().is_ok_and(|state| !state.busy))
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| key.clone());
             if let Some(oldest_idle) = oldest_idle {
@@ -143,8 +141,13 @@ pub(super) fn acquire(
     };
     // Fallible file setup must release the lease too. No process can have
     // executed at this point, so the old snapshot remains authoritative.
-    match prepare_transaction(Arc::clone(&state), snapshot.as_deref(), prefix, command, initial_cwd)
-    {
+    match prepare_transaction(
+        Arc::clone(&state),
+        snapshot.as_deref(),
+        prefix,
+        command,
+        initial_cwd,
+    ) {
         Ok(transaction) => Ok(Acquisition::Persistent(transaction)),
         Err(error) => {
             state
@@ -168,28 +171,45 @@ fn prepare_transaction(
     let mut restore = tempfile::Builder::new()
         .prefix("pi-shell-restore-")
         .tempfile()
-        .map_err(|error| Error::tool("bash", format!("Cannot prepare private shell state: {error}")))?;
+        .map_err(|error| {
+            Error::tool(
+                "bash",
+                format!("Cannot prepare private shell state: {error}"),
+            )
+        })?;
     let capture = tempfile::Builder::new()
         .prefix("pi-shell-capture-")
         .tempfile()
-        .map_err(|error| Error::tool("bash", format!("Cannot prepare private shell state: {error}")))?;
+        .map_err(|error| {
+            Error::tool(
+                "bash",
+                format!("Cannot prepare private shell state: {error}"),
+            )
+        })?;
     let proxy_env = crate::http::proxy::child_process_env();
     let proxy_variables: Vec<String> = proxy_env.iter().map(|(key, _)| key.clone()).collect();
     // A removed working directory must not make every future `cd` fail before
     // the command can run. Keep variables and fall back to the tool's root.
     let cwd = snapshot
         .filter(|snapshot| snapshot.cwd.is_dir())
-        .map_or_else(|| initial_cwd.to_path_buf(), |snapshot| snapshot.cwd.clone());
+        .map_or_else(
+            || initial_cwd.to_path_buf(),
+            |snapshot| snapshot.cwd.clone(),
+        );
     let restore_source = snapshot.map_or_else(String::new, |snapshot| {
         snapshot.restore_source(&proxy_variables, &cwd)
     });
-    restore.write_all(restore_source.as_bytes()).map_err(|error| {
-        Error::tool("bash", format!("Cannot write private shell state: {error}"))
-    })?;
-    let user_command = prefix.filter(|prefix| !prefix.trim().is_empty()).map_or_else(
-        || command.to_owned(),
-        |prefix| format!("{prefix}\n{command}"),
-    );
+    restore
+        .write_all(restore_source.as_bytes())
+        .map_err(|error| {
+            Error::tool("bash", format!("Cannot write private shell state: {error}"))
+        })?;
+    let user_command = prefix
+        .filter(|prefix| !prefix.trim().is_empty())
+        .map_or_else(
+            || command.to_owned(),
+            |prefix| format!("{prefix}\n{command}"),
+        );
     let command = wrapper(
         &restore.path().to_string_lossy(),
         &capture.path().to_string_lossy(),
@@ -295,7 +315,10 @@ impl TransactionInner {
             .read_to_end(&mut bytes)
             .ok()?;
         if bytes.len() > MAX_SNAPSHOT_BYTES {
-            tracing::warn!(event = "pi.bash.state", "shell state exceeded its 1 MiB bound; previous state retained");
+            tracing::warn!(
+                event = "pi.bash.state",
+                "shell state exceeded its 1 MiB bound; previous state retained"
+            );
             return None;
         }
         let text = String::from_utf8(bytes).ok()?;
@@ -390,10 +413,25 @@ fn ordinary_variable(name: &str) -> bool {
         && !name.starts_with("BASH")
         && !matches!(
             name,
-            "SHELLOPTS" | "EUID" | "UID" | "PPID" | "PWD" | "OLDPWD" | "SHLVL"
-                | "_" | "RANDOM" | "SRANDOM" | "SECONDS" | "EPOCHREALTIME"
-                | "EPOCHSECONDS" | "LINENO" | "FUNCNAME" | "GROUPS" | "DIRSTACK"
-                | "PIPESTATUS" | "HISTCMD"
+            "SHELLOPTS"
+                | "EUID"
+                | "UID"
+                | "PPID"
+                | "PWD"
+                | "OLDPWD"
+                | "SHLVL"
+                | "_"
+                | "RANDOM"
+                | "SRANDOM"
+                | "SECONDS"
+                | "EPOCHREALTIME"
+                | "EPOCHSECONDS"
+                | "LINENO"
+                | "FUNCNAME"
+                | "GROUPS"
+                | "DIRSTACK"
+                | "PIPESTATUS"
+                | "HISTCMD"
         )
 }
 
@@ -443,7 +481,9 @@ impl Snapshot {
                 return None;
             }
             if !proxy_variables.iter().any(|key| key == name)
-                && variables.insert(name.to_owned(), declaration.to_owned()).is_some()
+                && variables
+                    .insert(name.to_owned(), declaration.to_owned())
+                    .is_some()
             {
                 return None;
             }
@@ -477,7 +517,8 @@ impl Snapshot {
             let Some(name) = name.to_str().filter(|name| ordinary_variable(name)) else {
                 continue;
             };
-            if !self.variables.contains_key(name) && !proxy_variables.iter().any(|key| key == name) {
+            if !self.variables.contains_key(name) && !proxy_variables.iter().any(|key| key == name)
+            {
                 let _ = writeln!(source, "\\builtin unset -v -- {}", quote(name));
             }
         }
@@ -500,10 +541,18 @@ impl Snapshot {
             source.push_str("}\n");
         }
         source.push_str(&self.functions);
-        let _ = writeln!(source, "\\builtin cd -- {} || \\builtin exit 125", quote(&cwd.to_string_lossy()));
+        let _ = writeln!(
+            source,
+            "\\builtin cd -- {} || \\builtin exit 125",
+            quote(&cwd.to_string_lossy())
+        );
         let _ = writeln!(source, "\\builtin umask {}", self.umask);
         source.push_str("while IFS= \\builtin read -r __PI_SHELL_OPTION; do \\builtin set +o \"$__PI_SHELL_OPTION\"; done < <(\\builtin compgen -A setopt)\n");
-        if self.bash_options.iter().any(|option| option == "expand_aliases") {
+        if self
+            .bash_options
+            .iter()
+            .any(|option| option == "expand_aliases")
+        {
             source.push_str("\\builtin shopt -s expand_aliases\n");
         }
         // xtrace/verbose are restored only after private declarations were
@@ -530,7 +579,12 @@ mod tests {
         assert_eq!(snapshot.cwd, Path::new("/tmp/line\nend"));
         assert_eq!(snapshot.umask, "0077");
         assert_eq!(snapshot.variables["PI_VALUE"], declaration);
-        assert!(snapshot.shell_options.iter().any(|option| option == "interactive-comments"));
+        assert!(
+            snapshot
+                .shell_options
+                .iter()
+                .any(|option| option == "interactive-comments")
+        );
         for end in [0, complete.len() / 2, complete.len() - 1] {
             assert!(Snapshot::parse(&complete[..end], &[]).is_none());
         }
@@ -562,21 +616,43 @@ mod tests {
         )
         .expect("prepare private state");
         assert_eq!(
-            transaction.0._restore.as_file().metadata().expect("restore metadata").permissions().mode() & 0o777,
+            transaction
+                .0
+                ._restore
+                .as_file()
+                .metadata()
+                .expect("restore metadata")
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         {
             let mut capture = transaction.0.capture.lock().expect("capture");
             assert_eq!(
-                capture.as_file().metadata().expect("capture metadata").permissions().mode() & 0o777,
+                capture
+                    .as_file()
+                    .metadata()
+                    .expect("capture metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o600
             );
-            capture.write_all(&vec![b'x'; MAX_SNAPSHOT_BYTES + 1]).expect("oversized producer");
+            capture
+                .write_all(&vec![b'x'; MAX_SNAPSHOT_BYTES + 1])
+                .expect("oversized producer");
         }
         transaction.finish(true);
         let retained = state.lock().expect("state");
         assert!(!retained.busy);
-        assert!(Arc::ptr_eq(retained.snapshot.as_ref().expect("prior snapshot"), &original));
-        assert!(!transaction.command().contains("private-value"), "state values must not enter process arguments");
+        assert!(Arc::ptr_eq(
+            retained.snapshot.as_ref().expect("prior snapshot"),
+            &original
+        ));
+        assert!(
+            !transaction.command().contains("private-value"),
+            "state values must not enter process arguments"
+        );
     }
 }

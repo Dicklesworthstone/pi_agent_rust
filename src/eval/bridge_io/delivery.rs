@@ -8,13 +8,17 @@
 
 use std::future::Future;
 use std::io::{self, Write};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Instant;
 
 use serde_json::Value;
 
-use super::{DRAIN_FRAMES, DRAIN_TARGET_BYTES, IDLE_POLL, checkpoint, stopped};
 use super::super::{PyKernel, output::Capture, session::CellSession, transport::MAX_FRAME_BYTES};
+use super::{DRAIN_FRAMES, DRAIN_TARGET_BYTES, IDLE_POLL, checkpoint, stopped};
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
 
@@ -29,13 +33,19 @@ impl Write for Frame {
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn encode(value: &Value) -> Result<Vec<u8>> {
     let mut frame = Frame(Vec::new());
-    serde_json::to_writer(&mut frame, value)
-        .map_err(|_| stopped("EVAL_PROTOCOL_LIMIT", "Python input exceeds the 16 MiB encoded frame budget"))?;
+    serde_json::to_writer(&mut frame, value).map_err(|_| {
+        stopped(
+            "EVAL_PROTOCOL_LIMIT",
+            "Python input exceeds the 16 MiB encoded frame budget",
+        )
+    })?;
     frame.0.push(b'\n');
     Ok(frame.0)
 }
@@ -43,7 +53,9 @@ fn encode(value: &Value) -> Result<Vec<u8>> {
 struct WriteLease(Arc<AtomicBool>);
 
 impl Drop for WriteLease {
-    fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn write_once<W: Write>(
@@ -55,7 +67,10 @@ fn write_once<W: Write>(
 ) -> Result<W> {
     let check = || {
         if revoked.load(Ordering::SeqCst) {
-            return Err(stopped("EVAL_CANCELLED", "Python input delivery was abandoned; no replay"));
+            return Err(stopped(
+                "EVAL_CANCELLED",
+                "Python input delivery was abandoned; no replay",
+            ));
         }
         checkpoint(owner, deadline)
     };
@@ -64,7 +79,12 @@ fn write_once<W: Write>(
         check()?;
         let end = written.saturating_add(64 * 1024).min(frame.len());
         match pipe.write(&frame[written..end]) {
-            Ok(0) => return Err(stopped("EVAL_IO", "Python input write stopped; delivery uncertain, no replay")),
+            Ok(0) => {
+                return Err(stopped(
+                    "EVAL_IO",
+                    "Python input write stopped; delivery uncertain, no replay",
+                ));
+            }
             Ok(count) => written += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -76,11 +96,21 @@ fn write_once<W: Write>(
                     IDLE_POLL.min(deadline.saturating_duration_since(Instant::now())),
                 );
             }
-            Err(_) => return Err(stopped("EVAL_IO", "Python input write failed; delivery uncertain, no replay")),
+            Err(_) => {
+                return Err(stopped(
+                    "EVAL_IO",
+                    "Python input write failed; delivery uncertain, no replay",
+                ));
+            }
         }
     }
     check()?;
-    pipe.flush().map_err(|_| stopped("EVAL_IO", "Python input flush failed; delivery uncertain, no replay"))?;
+    pipe.flush().map_err(|_| {
+        stopped(
+            "EVAL_IO",
+            "Python input flush failed; delivery uncertain, no replay",
+        )
+    })?;
     check()?;
     Ok(pipe)
 }
@@ -94,22 +124,34 @@ fn drain_during_delivery(
     id: u64,
     capture: &mut Capture,
 ) -> Result<()> {
-    if pending_line.is_some() { return Ok(()); }
+    if pending_line.is_some() {
+        return Ok(());
+    }
     let mut bytes = 0usize;
     for _ in 0..DRAIN_FRAMES {
-        let received = lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_recv();
+        let received = lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv();
         let line = match received {
             Ok(Ok(line)) => line,
             Ok(Err(error)) => return Err(stopped("EVAL_PROTOCOL_READ", &error)),
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(stopped("EVAL_KERNEL_CRASH", "Python exited during input delivery"));
+                return Err(stopped(
+                    "EVAL_KERNEL_CRASH",
+                    "Python exited during input delivery",
+                ));
             }
         };
         bytes = bytes.saturating_add(line.len());
         if !line.trim().is_empty() {
-            let frame: Value = serde_json::from_str(&line)
-                .map_err(|_| stopped("EVAL_PROTOCOL", "invalid output during Python input delivery"))?;
+            let frame: Value = serde_json::from_str(&line).map_err(|_| {
+                stopped(
+                    "EVAL_PROTOCOL",
+                    "invalid output during Python input delivery",
+                )
+            })?;
             if frame.get("stream").is_some() {
                 capture.accept(&frame, id)?;
             } else {
@@ -117,7 +159,9 @@ fn drain_during_delivery(
                 break;
             }
         }
-        if bytes >= DRAIN_TARGET_BYTES { break; }
+        if bytes >= DRAIN_TARGET_BYTES {
+            break;
+        }
     }
     Ok(())
 }
@@ -144,7 +188,8 @@ async fn wait_receipt<F: Future<Output = Result<std::process::ChildStdin>>>(
         session.check_tool().await?;
         checkpoint(&owner, deadline)?;
         let sleeper = Box::pin(asupersync::time::sleep(
-            asupersync::time::wall_now(), IDLE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            asupersync::time::wall_now(),
+            IDLE_POLL.min(deadline.saturating_duration_since(Instant::now())),
         ));
         match futures::future::select(pending, sleeper).await {
             futures::future::Either::Left((pipe, _)) => {
@@ -174,7 +219,9 @@ pub(in crate::eval) async fn send_python(
     checkpoint(&owner, deadline)?;
     let frame = encode(frame)?;
     checkpoint(&owner, deadline)?;
-    let pipe = kernel.stdin.take()
+    let pipe = kernel
+        .stdin
+        .take()
         .ok_or_else(|| stopped("EVAL_IO", "Python input has no completed write receipt"))?;
     let lease = WriteLease(Arc::new(AtomicBool::new(false)));
     let revoked = Arc::clone(&lease.0);

@@ -7,9 +7,18 @@ use serde_json::Value;
 
 #[derive(Clone, Copy)]
 pub(super) enum Resolution<'a> {
-    Complete { evidence: &'a str, reviewed: &'a str },
-    Save { reviewed: &'a str },
-    Reconcile { outcome: GoalReconciliation, evidence: &'a str, reviewed: &'a str },
+    Complete {
+        evidence: &'a str,
+        reviewed: &'a str,
+    },
+    Save {
+        reviewed: &'a str,
+    },
+    Reconcile {
+        outcome: GoalReconciliation,
+        evidence: &'a str,
+        reviewed: &'a str,
+    },
 }
 
 impl Resolution<'_> {
@@ -25,8 +34,9 @@ impl Resolution<'_> {
     /// Saving retains even terminal/interrupted state without acknowledging it.
     pub(super) fn apply(self, session: &Session) -> Result<Option<Record>> {
         let reviewed = match self {
-            Self::Complete { reviewed, .. } | Self::Save { reviewed }
-                | Self::Reconcile { reviewed, .. } => reviewed,
+            Self::Complete { reviewed, .. }
+            | Self::Save { reviewed }
+            | Self::Reconcile { reviewed, .. } => reviewed,
         };
         let current = latest(session)?;
         if reviewed != revision(session, &current)? {
@@ -35,16 +45,16 @@ impl Resolution<'_> {
                 "session, branch or goal changed; get and review it again. Nothing was changed.",
             ));
         }
-        let (_, record) = current
-            .ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+        let (_, record) =
+            current.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
         match self {
             Self::Complete { evidence, .. } => {
                 transition(record, Transition::Complete(evidence)).map(Some)
             }
             Self::Save { .. } => Ok(None),
-            Self::Reconcile { outcome, evidence, .. } => {
-                transition(record, Transition::Reconcile { outcome, evidence }).map(Some)
-            }
+            Self::Reconcile {
+                outcome, evidence, ..
+            } => transition(record, Transition::Reconcile { outcome, evidence }).map(Some),
         }
     }
 }
@@ -59,17 +69,31 @@ pub(super) fn parse<'a>(request: &'a Value, op: &str) -> Result<Option<Resolutio
     if op != "pause" {
         return Err(failure("GOAL_RPC", "resolution requires op=pause"));
     }
-    if ["budget", "objective", "token_budget", "max_prompts", "reason"]
-        .iter().any(|field| request.get(*field).is_some())
+    if [
+        "budget",
+        "objective",
+        "token_budget",
+        "max_prompts",
+        "reason",
+    ]
+    .iter()
+    .any(|field| request.get(*field).is_some())
     {
         return Err(failure(
             "GOAL_RPC",
             "resolution cannot be combined with goal creation or budget fields",
         ));
     }
-    let reviewed = request.get("revision").and_then(Value::as_str)
-        .filter(|value| value.len() == 68 && value.starts_with("gr1-")
-            && value[4..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    let reviewed = request
+        .get("revision")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 68
+                && value.starts_with("gr1-")
+                && value[4..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
         .ok_or_else(|| failure("GOAL_RPC", "resolution requires the revision from goal get"))?;
     let fields = raw.as_object().ok_or_else(invalid)?;
     let resolution = match fields.get("kind").and_then(Value::as_str) {
@@ -79,8 +103,10 @@ pub(super) fn parse<'a>(request: &'a Value, op: &str) -> Result<Option<Resolutio
             Resolution::Complete { evidence, reviewed }
         }
         Some("save") if fields.len() == 1 => Resolution::Save { reviewed },
-        Some("reconcile") if fields.len() == 3
-            && fields.contains_key("outcome") && fields.contains_key("evidence") =>
+        Some("reconcile")
+            if fields.len() == 3
+                && fields.contains_key("outcome")
+                && fields.contains_key("evidence") =>
         {
             let outcome = match fields["outcome"].as_str() {
                 Some("pause") => GoalReconciliation::Pause,
@@ -90,7 +116,11 @@ pub(super) fn parse<'a>(request: &'a Value, op: &str) -> Result<Option<Resolutio
             };
             let evidence = fields["evidence"].as_str().ok_or_else(invalid)?;
             super::super::validate_text(evidence, "interruption reconciliation evidence")?;
-            Resolution::Reconcile { outcome, evidence, reviewed }
+            Resolution::Reconcile {
+                outcome,
+                evidence,
+                reviewed,
+            }
         }
         _ => return Err(invalid()),
     };

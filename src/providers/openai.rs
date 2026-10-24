@@ -331,8 +331,7 @@ impl OpenAIProvider {
         // override: disabling thinking now must not erase reasoning from history.
         let replay_reasoning =
             tools.is_some() && self.reasoning_style() == Some(ReasoningStyle::DeepSeek);
-        let messages =
-            self.build_messages_with_role(context, system_role, replay_reasoning);
+        let messages = self.build_messages_with_role(context, system_role, replay_reasoning);
 
         // Determine which max-tokens field to populate based on compat config.
         let use_alt_field = self
@@ -1232,9 +1231,12 @@ where
             self.partial.content.len() - 1
         } else {
             let index = self.partial.content.len();
-            self.partial.content.push(ContentBlock::Text(TextContent::new("")));
-            self.pending_events
-                .push_back(StreamEvent::TextStart { content_index: index });
+            self.partial
+                .content
+                .push(ContentBlock::Text(TextContent::new("")));
+            self.pending_events.push_back(StreamEvent::TextStart {
+                content_index: index,
+            });
             index
         };
         if let Some(ContentBlock::Text(text)) = self.partial.content.get_mut(content_index) {
@@ -1283,7 +1285,10 @@ where
         // Native deltas are authoritative, even if they arrived after the text.
         // Interrupted/refused/failed responses never gain executable calls.
         let recover_calls = !native_calls
-            && matches!(self.partial.stop_reason, StopReason::Stop | StopReason::ToolUse);
+            && matches!(
+                self.partial.stop_reason,
+                StopReason::Stop | StopReason::ToolUse
+            );
         for part in parts {
             match part {
                 deepseek::Part::Text(text) => self.append_text(text),
@@ -1685,13 +1690,27 @@ impl<'de> serde::de::Visitor<'de> for UniqueToolArgumentKeys {
         Ok(self)
     }
 
-    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self, E> { Ok(self) }
-    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self, E> { Ok(self) }
-    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self, E> { Ok(self) }
-    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self, E> { Ok(self) }
-    fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self, E> { Ok(self) }
-    fn visit_string<E: serde::de::Error>(self, _: String) -> std::result::Result<Self, E> { Ok(self) }
-    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self, E> { Ok(self) }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_string<E: serde::de::Error>(self, _: String) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
 }
 
 #[cfg(test)]
@@ -2768,7 +2787,10 @@ mod tests {
             },
         ))
         .unwrap();
-        assert_eq!(body["messages"][0]["reasoning_content"], " first\n日本語🙂 last ");
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            " first\n日本語🙂 last "
+        );
         assert_eq!(body["messages"][0]["content"], "visible");
     }
 
@@ -2819,10 +2841,8 @@ mod tests {
         let provider = OpenAIProvider::new("deepseek-reasoner")
             .with_provider_name("deepseek")
             .with_reasoning(true);
-        for (source_provider, signature) in [
-            ("other-provider", None),
-            ("deepseek", Some("opaque")),
-        ] {
+        for (source_provider, signature) in [("other-provider", None), ("deepseek", Some("opaque"))]
+        {
             let context = Context {
                 system_prompt: None,
                 messages: vec![Message::assistant(AssistantMessage {
@@ -2843,10 +2863,9 @@ mod tests {
                 }]
                 .into(),
             };
-            let body = serde_json::to_value(
-                provider.build_request(&context, &StreamOptions::default()),
-            )
-            .unwrap();
+            let body =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .unwrap();
             assert_eq!(body["messages"][0]["reasoning_content"], "");
             assert!(!body.to_string().contains("private-reasoning"));
             assert!(!body.to_string().contains("opaque"));

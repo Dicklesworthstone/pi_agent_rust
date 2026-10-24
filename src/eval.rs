@@ -156,7 +156,9 @@ impl PyKernel {
         loop {
             session_guard.check_tool().await?;
             capture.publish(false);
-            if let Some(line) = self.pending_line.take() { return Ok(Some(line)); }
+            if let Some(line) = self.pending_line.take() {
+                return Ok(Some(line));
+            }
             let received = self
                 .lines
                 .lock()
@@ -186,7 +188,9 @@ impl PyKernel {
         // before waiting for any process. Exclusive kernel ownership makes
         // get_mut nonblocking; no live-cell receiver lock is needed here.
         self.reader_stop.stop_receiving(
-            self.lines.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner),
+            self.lines
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         // The guard releases its child after reaping, so repeated cleanup
         // cannot signal a recycled PID or replace the kernel's Windows Job.
@@ -277,30 +281,44 @@ impl EvalTool {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         let (output_tx, output_rx) = std::sync::mpsc::sync_channel(JS_OUTPUT_QUEUE);
         let reply_rx = kernel
-            .submit_source_with_output(code.to_string(), filename.map(str::to_owned), deadline, Some(output_tx))
+            .submit_source_with_output(
+                code.to_string(),
+                filename.map(str::to_owned),
+                deadline,
+                Some(output_tx),
+            )
             .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
 
         let mut response = loop {
-            owner.checkpoint().map_err(|_| Error::tool(
-                "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
-            ))?;
+            owner.checkpoint().map_err(|_| {
+                Error::tool(
+                    "eval",
+                    "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+                )
+            })?;
             session_guard.check_tool().await?;
             let received = drain_js_console(&output_rx, capture)?;
             capture.publish(false);
             // Callbacks may cancel or switch sessions. Observe both before
             // admitting a bridge, even with a continuously ready producer.
-            owner.checkpoint().map_err(|_| Error::tool(
-                "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
-            ))?;
+            owner.checkpoint().map_err(|_| {
+                Error::tool(
+                    "eval",
+                    "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+                )
+            })?;
             session_guard.check_tool().await?;
             if let Ok(bridge) = kernel.bridge.try_recv() {
                 // At most one queue's worth of frames can precede this bridge.
                 // Publish them before entering a potentially slow native tool.
                 drain_js_console(&output_rx, capture)?;
                 capture.publish(true);
-                owner.checkpoint().map_err(|_| Error::tool(
-                    "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
-                ))?;
+                owner.checkpoint().map_err(|_| {
+                    Error::tool(
+                        "eval",
+                        "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+                    )
+                })?;
                 session_guard.check_tool().await?;
                 let mut pending = Box::pin(judgments.dispatch(self, &bridge.tool, bridge.input));
                 let reply = loop {
@@ -309,12 +327,16 @@ impl EvalTool {
                     session_guard.check_tool().await?;
                     drain_js_console(&output_rx, capture)?;
                     capture.publish(false);
-                    owner.checkpoint().map_err(|_| Error::tool(
-                        "eval", "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
-                    ))?;
+                    owner.checkpoint().map_err(|_| {
+                        Error::tool(
+                            "eval",
+                            "EVAL_CANCELLED; EVAL_STATE_RESET: JavaScript kernel discarded",
+                        )
+                    })?;
                     session_guard.check_tool().await?;
                     let sleeper = Box::pin(asupersync::time::sleep(
-                        asupersync::time::wall_now(), Duration::from_millis(15),
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(15),
                     ));
                     match futures::future::select(pending, sleeper).await {
                         futures::future::Either::Left((reply, _)) => break reply,
@@ -339,7 +361,8 @@ impl EvalTool {
                     asupersync::time::sleep(
                         asupersync::time::wall_now(),
                         Duration::from_millis(if received == 0 { 15 } else { 1 }),
-                    ).await;
+                    )
+                    .await;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     return Err(Error::tool(
@@ -427,8 +450,11 @@ impl EvalTool {
 
         // An observed idle exit can be replaced before request delivery. A
         // write failure is ambiguous and must never replay application code.
-        if kernel.child.try_wait_child()
-            .map_err(|error| Error::tool("eval", format!("EVAL_IO: {error}")))?.is_some()
+        if kernel
+            .child
+            .try_wait_child()
+            .map_err(|error| Error::tool("eval", format!("EVAL_IO: {error}")))?
+            .is_some()
         {
             kernel.kill();
             kernel = self.spawn_python(deadline, session_guard).await?;
@@ -439,17 +465,28 @@ impl EvalTool {
         kernel.next_id += 1;
         let request = json!({"id": id, "code": code, "softTimeoutSecs": soft_timeout_secs});
         bridge_io::delivery::send_python(
-            &mut kernel, id, deadline, capture, session_guard, &request,
-        ).await?;
+            &mut kernel,
+            id,
+            deadline,
+            capture,
+            session_guard,
+            &request,
+        )
+        .await?;
 
         // Read lines until the final cell response; bridge requests re-enter
         // pi tools mid-cell and their results resume the kernel.
         let (final_line, soft_timed_out) = loop {
             // A continuously readable stream may not yield Pending to the
             // enclosing watchdog. Observe its captured owner here too.
-            crate::agent_cx::AgentCx::for_current_or_request().checkpoint().map_err(|_| {
-                Error::tool("eval", "EVAL_CANCELLED; EVAL_STATE_RESET: Python kernel discarded")
-            })?;
+            crate::agent_cx::AgentCx::for_current_or_request()
+                .checkpoint()
+                .map_err(|_| {
+                    Error::tool(
+                        "eval",
+                        "EVAL_CANCELLED; EVAL_STATE_RESET: Python kernel discarded",
+                    )
+                })?;
             session_guard.check_tool().await?;
             // Deadline check up front: a cell looping on bridge calls
             // keeps lines flowing, so the Empty-branch check inside
@@ -516,20 +553,36 @@ impl EvalTool {
                 capture.publish(true);
                 session_guard.check_tool().await?;
                 let reply = bridge_io::wait_python(
-                    &kernel.lines, id, deadline, capture, session_guard,
+                    &kernel.lines,
+                    id,
+                    deadline,
+                    capture,
+                    session_guard,
                     self.run_bridge_call(bridge, judgments),
-                ).await?;
+                )
+                .await?;
                 session_guard.check_tool().await?;
                 bridge_io::delivery::send_python(
-                    &mut kernel, id, deadline, capture, session_guard,
+                    &mut kernel,
+                    id,
+                    deadline,
+                    capture,
+                    session_guard,
                     &json!({"bridge_result": reply}),
-                ).await?;
+                )
+                .await?;
                 continue;
             }
             transport::validate_response(&parsed, id)?;
-            let soft_timed_out = parsed.get("softTimeout").and_then(Value::as_bool).unwrap_or(false);
+            let soft_timed_out = parsed
+                .get("softTimeout")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if soft_timed_out && soft_timeout_secs.is_none() {
-                return Err(Error::tool("eval", "EVAL_PROTOCOL: unsolicited soft timeout; EVAL_STATE_RESET: Python kernel discarded"));
+                return Err(Error::tool(
+                    "eval",
+                    "EVAL_PROTOCOL: unsolicited soft timeout; EVAL_STATE_RESET: Python kernel discarded",
+                ));
             }
             capture.finish_response(&mut parsed)?;
             break (serde_json::to_string(&parsed)?, soft_timed_out);
@@ -563,14 +616,25 @@ impl EvalTool {
         Ok(output)
     }
 
-    async fn spawn_python(&self, deadline: Instant, session: &session::CellSession) -> Result<PyKernel> {
-        let runtime = self.python_environment.resolve(&self.python_path, &self.cwd, deadline, session).await?;
+    async fn spawn_python(
+        &self,
+        deadline: Instant,
+        session: &session::CellSession,
+    ) -> Result<PyKernel> {
+        let runtime = self
+            .python_environment
+            .resolve(&self.python_path, &self.cwd, deadline, session)
+            .await?;
         PyKernel::spawn(runtime, &self.cwd)
     }
 
     /// Execute one whitelisted bridge call through the SAME tool
     /// implementations a direct call uses — identical path policy.
-    async fn run_bridge_call(&self, bridge: &Value, judgments: &mut judgment::Invocation<'_>) -> Value {
+    async fn run_bridge_call(
+        &self,
+        bridge: &Value,
+        judgments: &mut judgment::Invocation<'_>,
+    ) -> Value {
         let call = bridge.get("call").cloned().unwrap_or(Value::Null);
         let tool_name = bridge.get("tool").and_then(Value::as_str).unwrap_or("");
         let input = bridge.get("input").cloned().unwrap_or_else(|| json!({}));
@@ -594,7 +658,9 @@ fn drain_js_console(
                 capture.accept(&frame, 1)?;
                 received += 1;
             }
-            Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(
+                std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected,
+            ) => break,
         }
     }
     Ok(received)
@@ -844,7 +910,8 @@ impl Tool for EvalTool {
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, None, None, None).await
+        self.execute_with_mode(input, on_update, None, None, None)
+            .await
     }
 
     async fn execute_with_auxiliary_privacy(
@@ -854,7 +921,8 @@ impl Tool for EvalTool {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, Some(protect), None, None).await
+        self.execute_with_mode(input, on_update, Some(protect), None, None)
+            .await
     }
 
     async fn execute_with_host(
@@ -865,7 +933,8 @@ impl Tool for EvalTool {
         protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
         host: &dyn crate::tools::ToolInvocationHost,
     ) -> Result<ToolOutput> {
-        self.execute_with_mode(input, on_update, Some(protect), Some(host), None).await
+        self.execute_with_mode(input, on_update, Some(protect), Some(host), None)
+            .await
     }
 
     async fn execute_with_invocation(
@@ -876,9 +945,13 @@ impl Tool for EvalTool {
         context: crate::tools::ToolInvocationContext<'_>,
     ) -> Result<ToolOutput> {
         self.execute_with_mode(
-            input, on_update, Some(context.protect), context.host,
+            input,
+            on_update,
+            Some(context.protect),
+            context.host,
             Some(context.snapshot_privacy),
-        ).await
+        )
+        .await
     }
 
     fn effects(&self) -> ToolEffects {

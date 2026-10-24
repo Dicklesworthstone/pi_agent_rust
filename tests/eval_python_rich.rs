@@ -52,27 +52,41 @@ fn matplotlib_available() -> bool {
 }
 
 fn text(output: &ToolOutput) -> String {
-    output.content.iter().filter_map(|block| match block {
-        ContentBlock::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    }).collect::<Vec<_>>().join("\n")
+    output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn cell(tool: &EvalTool, code: &str) -> ToolOutput {
-    tool.execute("rich-cell", json!({"kernel":"python", "code":code, "timeout_secs":60}), None)
-        .await.expect("cell transport")
+    tool.execute(
+        "rich-cell",
+        json!({"kernel":"python", "code":code, "timeout_secs":60}),
+        None,
+    )
+    .await
+    .expect("cell transport")
 }
 
 #[test]
 fn rich_bundle_reaches_native_update_before_cell_can_complete() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let gate = dir.path().join("rich-gate");
     let tool = EvalTool::new(dir.path());
     let observed = Arc::new(AtomicBool::new(false));
     let callback_observed = Arc::clone(&observed);
-    let output = run(tool.execute("rich-progress", json!({
-        "kernel":"python", "timeout_secs":60, "code":r#"
+    let output = run(tool.execute(
+        "rich-progress",
+        json!({
+            "kernel":"python", "timeout_secs":60, "code":r#"
 import asyncio
 from pathlib import Path
 class Report:
@@ -89,33 +103,51 @@ else:
     raise AssertionError('display did not reach native update before completion')
 42
 "#
-    }), Some(Box::new(move |update| {
-        if update.content.iter().any(|block|
+        }),
+        Some(Box::new(move |update| {
+            if update.content.iter().any(|block|
             matches!(block, ContentBlock::Text(text) if text.text.contains("native-rich-ready"))
         ) && std::fs::write(&gate, "observed").is_ok() {
             callback_observed.store(true, Ordering::SeqCst);
         }
-    })))).expect("cell transport");
+        })),
+    ))
+    .expect("cell transport");
     assert!(!output.is_error, "{}", text(&output));
     assert!(observed.load(Ordering::SeqCst));
-    assert_eq!(output.details.as_ref().unwrap()["jsonOutputs"], json!([{"native-rich-ready":42}]));
-    assert_eq!(output.details.as_ref().unwrap()["displays"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        output.details.as_ref().unwrap()["jsonOutputs"],
+        json!([{"native-rich-ready":42}])
+    );
+    assert_eq!(
+        output.details.as_ref().unwrap()["displays"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(text(&output).contains("42"));
 }
 
 #[test]
 fn rich_final_expression_preserves_kernel_and_plain_repr_semantics() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        let first = cell(&tool, r#"
+        let first = cell(
+            &tool,
+            r#"
 class Report:
     def _repr_markdown_(self):
         return '## Rich answer'
 report = Report()
 report
-"#).await;
+"#,
+        )
+        .await;
         assert!(!first.is_error, "{}", text(&first));
         assert!(text(&first).contains("## Rich answer"));
         assert!(!text(&first).contains("Report object"));
@@ -132,20 +164,29 @@ report
 
 #[test]
 fn invalid_rich_data_keeps_prior_output_without_success_or_state_loss() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        let failed = cell(&tool, r#"
+        let failed = cell(
+            &tool,
+            r#"
 keep = 42
 class Report:
     def _repr_mimebundle_(self, **kwargs):
         return {'image/png': 'not a PNG', 'text/plain': 'must not be used'}
 display({'accepted': True})
 display(Report())
-"#).await;
+"#,
+        )
+        .await;
         assert!(failed.is_error);
-        assert_eq!(failed.details.as_ref().unwrap()["jsonOutputs"], json!([{"accepted":true}]));
+        assert_eq!(
+            failed.details.as_ref().unwrap()["jsonOutputs"],
+            json!([{"accepted":true}])
+        );
         assert!(!text(&failed).contains("\nmust not be used\n"));
         let retained = cell(&tool, "keep").await;
         assert!(!retained.is_error);
@@ -156,11 +197,15 @@ display(Report())
 
 #[test]
 fn retained_task_cannot_invoke_rich_formatters_in_a_later_cell() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        let seeded = cell(&tool, r#"
+        let seeded = cell(
+            &tool,
+            r#"
 import asyncio
 ready = asyncio.Event()
 called = []
@@ -177,28 +222,41 @@ async def old():
     return 'unexpected success'
 pending = asyncio.create_task(old())
 await asyncio.sleep(0)
-"#).await;
+"#,
+        )
+        .await;
         assert!(!seeded.is_error, "{}", text(&seeded));
-        let later = cell(&tool, r#"
+        let later = cell(
+            &tool,
+            r#"
 ready.set()
 assert 'EVAL_DISPLAY_CLOSED' in await pending
 assert called == []
 display({'current': True})
-"#).await;
+"#,
+        )
+        .await;
         assert!(!later.is_error, "{}", text(&later));
-        assert_eq!(later.details.as_ref().unwrap()["jsonOutputs"], json!([{"current":true}]));
+        assert_eq!(
+            later.details.as_ref().unwrap()["jsonOutputs"],
+            json!([{"current":true}])
+        );
     });
 }
 
 #[test]
 fn png_representation_becomes_native_image_content_and_live_progress() {
-    if !available() { return; }
+    if !available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let tool = EvalTool::new(dir.path());
     let observed = Arc::new(AtomicBool::new(false));
     let callback_observed = Arc::clone(&observed);
-    let output = run(tool.execute("rich-image", json!({
-        "kernel":"python", "timeout_secs":60, "code":r#"
+    let output = run(tool.execute(
+        "rich-image",
+        json!({
+            "kernel":"python", "timeout_secs":60, "code":r#"
 import struct, zlib
 
 def png_chunk(kind, data):
@@ -213,19 +271,29 @@ class Picture:
         return raster
 Picture()
 "#
-    }), Some(Box::new(move |update| {
-        if update.content.iter().any(|block|
+        }),
+        Some(Box::new(move |update| {
+            if update.content.iter().any(|block|
             matches!(block, ContentBlock::Image(image) if image.mime_type == "image/png")
         ) {
             callback_observed.store(true, Ordering::SeqCst);
         }
-    })))).expect("cell transport");
+        })),
+    ))
+    .expect("cell transport");
     assert!(!output.is_error, "{}", text(&output));
-    assert!(observed.load(Ordering::SeqCst), "PNG must reach the live native content path");
-    let images: Vec<_> = output.content.iter().filter_map(|block| match block {
-        ContentBlock::Image(image) => Some(image),
-        _ => None,
-    }).collect();
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "PNG must reach the live native content path"
+    );
+    let images: Vec<_> = output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(image) => Some(image),
+            _ => None,
+        })
+        .collect();
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].mime_type, "image/png");
     let details = output.details.as_ref().unwrap();
@@ -255,7 +323,14 @@ plt.show()
         )
         .await;
         assert!(!first.is_error, "{}", text(&first));
-        assert_eq!(first.content.iter().filter(|block| matches!(block, ContentBlock::Image(_))).count(), 1);
+        assert_eq!(
+            first
+                .content
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::Image(_)))
+                .count(),
+            1
+        );
         assert_eq!(first.details.as_ref().unwrap()["displays"][0]["width"], 80);
         let retained = cell(
             &tool,
@@ -264,7 +339,14 @@ plt.show()
         .await;
         assert!(!retained.is_error, "{}", text(&retained));
         assert_eq!(retained.details.as_ref().unwrap()["restarted"], false);
-        assert_eq!(retained.content.iter().filter(|block| matches!(block, ContentBlock::Image(_))).count(), 1);
+        assert_eq!(
+            retained
+                .content
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::Image(_)))
+                .count(),
+            1
+        );
     });
 }
 
@@ -289,10 +371,20 @@ raise RuntimeError('original plotting cell failed')
         .await;
         assert!(failed.is_error);
         assert!(text(&failed).contains("original plotting cell failed"));
-        assert!(failed.content.iter().any(|block| matches!(block, ContentBlock::Image(_))));
+        assert!(
+            failed
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+        );
         let later = cell(&tool, "assert plt.get_fignums() == []; 42").await;
         assert!(!later.is_error, "{}", text(&later));
         assert_eq!(text(&later).trim(), "42");
-        assert!(!later.content.iter().any(|block| matches!(block, ContentBlock::Image(_))));
+        assert!(
+            !later
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+        );
     });
 }

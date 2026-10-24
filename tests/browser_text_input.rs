@@ -14,16 +14,36 @@ const TEXT: &str = "PRIVATE-CANARY 🦀";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fault {
-    None, FocusLost, MalformedFocus, LookupNavigation, EditNavigation,
-    InsertNavigation, DownFailure, UpFailure, DownNavigation, RevertedFill,
-    ValueDate, ValueTime, ValueMonth, ValueWeek, ValueDateTime, ValueColor,
-    ValueRange, ValueNoop, ValueMalformed, ValueRejected, ValueNavigation,
+    None,
+    FocusLost,
+    MalformedFocus,
+    LookupNavigation,
+    EditNavigation,
+    InsertNavigation,
+    DownFailure,
+    UpFailure,
+    DownNavigation,
+    RevertedFill,
+    ValueDate,
+    ValueTime,
+    ValueMonth,
+    ValueWeek,
+    ValueDateTime,
+    ValueColor,
+    ValueRange,
+    ValueNoop,
+    ValueMalformed,
+    ValueRejected,
+    ValueNavigation,
 }
 
 fn value_request(fault: Fault) -> Option<(&'static str, &'static str, &'static str)> {
     match fault {
-        Fault::ValueDate | Fault::ValueNoop | Fault::ValueMalformed |
-        Fault::ValueRejected | Fault::ValueNavigation => Some(("date", "2026-10-16", "2026-10-16")),
+        Fault::ValueDate
+        | Fault::ValueNoop
+        | Fault::ValueMalformed
+        | Fault::ValueRejected
+        | Fault::ValueNavigation => Some(("date", "2026-10-16", "2026-10-16")),
         Fault::ValueTime => Some(("time", "12:34", "12:34")),
         Fault::ValueMonth => Some(("month", "2026-10", "2026-10")),
         Fault::ValueWeek => Some(("week", "2026-W42", "2026-W42")),
@@ -53,8 +73,12 @@ fn accept(listener: &TcpListener) -> TcpStream {
         match listener.accept() {
             Ok((socket, _)) => {
                 socket.set_nonblocking(false).unwrap();
-                socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-                socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
                 socket.set_nodelay(true).unwrap();
                 return socket;
             }
@@ -71,7 +95,9 @@ fn headers(socket: &mut TcpStream) -> String {
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         assert!(bytes.len() < 16_384);
-        let mut byte = [0]; socket.read_exact(&mut byte).unwrap(); bytes.push(byte[0]);
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
     }
     String::from_utf8(bytes).unwrap()
 }
@@ -80,28 +106,51 @@ fn receive(socket: &mut TcpStream) -> Option<Value> {
     let mut head = [0; 2];
     match socket.read_exact(&mut head) {
         Ok(()) => {}
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset) => return None,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return None;
+        }
         Err(error) => panic!("text peer receive: {error}"),
     }
-    if head[0] & 0x0f == 8 { return None; }
-    assert_eq!(head[0], 0x81); assert_ne!(head[1] & 0x80, 0);
+    if head[0] & 0x0f == 8 {
+        return None;
+    }
+    assert_eq!(head[0], 0x81);
+    assert_ne!(head[1] & 0x80, 0);
     let count = match head[1] & 0x7f {
-        126 => { let mut bytes = [0; 2]; socket.read_exact(&mut bytes).unwrap(); usize::from(u16::from_be_bytes(bytes)) }
+        126 => {
+            let mut bytes = [0; 2];
+            socket.read_exact(&mut bytes).unwrap();
+            usize::from(u16::from_be_bytes(bytes))
+        }
         127 => panic!("unexpected large input command"),
         value => usize::from(value),
     };
-    let mut mask = [0; 4]; socket.read_exact(&mut mask).unwrap();
-    let mut bytes = vec![0; count]; socket.read_exact(&mut bytes).unwrap();
-    for (index, byte) in bytes.iter_mut().enumerate() { *byte ^= mask[index % 4]; }
+    let mut mask = [0; 4];
+    socket.read_exact(&mut mask).unwrap();
+    let mut bytes = vec![0; count];
+    socket.read_exact(&mut bytes).unwrap();
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
     Some(serde_json::from_slice(&bytes).unwrap())
 }
 
 fn send(socket: &mut TcpStream, value: &Value) {
     let bytes = serde_json::to_vec(value).unwrap();
     let mut frame = vec![0x81];
-    if bytes.len() < 126 { frame.push(u8::try_from(bytes.len()).unwrap()); }
-    else { frame.push(126); frame.extend_from_slice(&u16::try_from(bytes.len()).unwrap().to_be_bytes()); }
-    frame.extend(bytes); socket.write_all(&frame).unwrap();
+    if bytes.len() < 126 {
+        frame.push(u8::try_from(bytes.len()).unwrap());
+    } else {
+        frame.push(126);
+        frame.extend_from_slice(&u16::try_from(bytes.len()).unwrap().to_be_bytes());
+    }
+    frame.extend(bytes);
+    socket.write_all(&frame).unwrap();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -109,47 +158,67 @@ fn serve(socket: &mut TcpStream, scoped: bool, fault: Fault) -> Seen {
     let mut seen = Seen::default();
     let context = if scoped { 2 } else { 1 };
     for _ in 0..1000 {
-        let Some(request) = receive(socket) else { return seen; };
+        let Some(request) = receive(socket) else {
+            return seen;
+        };
         let method = request["method"].as_str().unwrap();
         let params = &request["params"];
         let mut failed = false;
         let result = match method {
             "Browser.setDownloadBehavior" => {
-                assert_eq!(params["behavior"], "deny"); json!({})
+                assert_eq!(params["behavior"], "deny");
+                json!({})
             }
-            "Target.getTargets" => json!({"targetInfos":[{"targetId":"page-1","type":"page","url":"about:blank"}]}),
+            "Target.getTargets" => {
+                json!({"targetInfos":[{"targetId":"page-1","type":"page","url":"about:blank"}]})
+            }
             "Target.attachToTarget" => {
-                assert_eq!(params["targetId"], "page-1"); json!({"sessionId":"page"})
+                assert_eq!(params["targetId"], "page-1");
+                json!({"sessionId":"page"})
             }
             "Target.setAutoAttach" => {
-                assert_eq!(request["sessionId"], "page"); assert_eq!(params["waitForDebuggerOnStart"], false); json!({})
+                assert_eq!(request["sessionId"], "page");
+                assert_eq!(params["waitForDebuggerOnStart"], false);
+                json!({})
             }
             "Page.getFrameTree" => json!({"frameTree":{
                 "frame":{"id":"main","loaderId":if seen.changed { "changed" } else { "initial" },"url":"about:blank"},
                 "childFrames":[{"frame":{"id":"child","parentId":"main","loaderId":"child-loader","url":"about:srcdoc"}}]
             }}),
-            "Page.bringToFront" => { seen.fronts += 1; json!({}) }
+            "Page.bringToFront" => {
+                seen.fronts += 1;
+                json!({})
+            }
             "Page.createIsolatedWorld" => {
                 assert_eq!(params["frameId"], if scoped { "child" } else { "main" });
                 json!({"executionContextId":context})
             }
-            "DOM.getDocument" => { assert!(!scoped); json!({"root":{"nodeId":1}}) }
+            "DOM.getDocument" => {
+                assert!(!scoped);
+                json!({"root":{"nodeId":1}})
+            }
             "DOM.querySelector" => {
-                assert!(!scoped); assert_eq!(params["selector"], "#input");
-                seen.queries += 1; json!({"nodeId":2})
+                assert!(!scoped);
+                assert_eq!(params["selector"], "#input");
+                seen.queries += 1;
+                json!({"nodeId":2})
             }
             "DOM.describeNode" => {
-                if fault == Fault::LookupNavigation { seen.changed = true; }
+                if fault == Fault::LookupNavigation {
+                    seen.changed = true;
+                }
                 json!({"node":{"backendNodeId":7}})
             }
             "DOM.resolveNode" => {
-                assert_eq!(params["backendNodeId"], 7); assert_eq!(params["executionContextId"], context);
+                assert_eq!(params["backendNodeId"], 7);
+                assert_eq!(params["executionContextId"], context);
                 json!({"object":{"objectId":"original"}})
             }
             "Runtime.callFunctionOn" => {
                 let function = params["functionDeclaration"].as_str().unwrap();
                 if function.contains("Document.prototype.querySelector") {
-                    assert!(scoped); assert_eq!(params["arguments"][0]["value"], "#input");
+                    assert!(scoped);
+                    assert_eq!(params["arguments"][0]["value"], "#input");
                     seen.queries += 1;
                     json!({"result":{"type":"object","objectId":"original"}})
                 } else {
@@ -158,25 +227,42 @@ fn serve(socket: &mut TcpStream, scoped: bool, fault: Fault) -> Seen {
                     let value = match params["arguments"][0]["value"].as_str().unwrap() {
                         "edit" | "focus" => {
                             seen.edits += 1;
-                            if fault == Fault::EditNavigation { seen.changed = true; }
+                            if fault == Fault::EditNavigation {
+                                seen.changed = true;
+                            }
                             if let Some((kind, text, value)) = value_request(fault) {
-                                assert_eq!(params["arguments"][1]["value"], json!({"replace":true,"text":text}));
-                                if fault == Fault::ValueNavigation { seen.changed = true; }
+                                assert_eq!(
+                                    params["arguments"][1]["value"],
+                                    json!({"replace":true,"text":text})
+                                );
+                                if fault == Fault::ValueNavigation {
+                                    seen.changed = true;
+                                }
                                 let mut result = json!({"kind":kind,"value":value,"changed":fault != Fault::ValueNoop});
-                                if fault == Fault::ValueMalformed { result["changed"] = json!("PRIVATE-CANARY"); }
+                                if fault == Fault::ValueMalformed {
+                                    result["changed"] = json!("PRIVATE-CANARY");
+                                }
                                 result
-                            } else { json!(true) }
+                            } else {
+                                json!(true)
+                            }
                         }
                         "focused" => {
                             seen.focus_checks += 1;
-                            if fault == Fault::MalformedFocus { json!("true") }
-                            else { json!(fault != Fault::FocusLost) }
+                            if fault == Fault::MalformedFocus {
+                                json!("true")
+                            } else {
+                                json!(fault != Fault::FocusLost)
+                            }
                         }
                         "verify_fill" => json!(fault != Fault::RevertedFill),
                         "verify_value" => {
                             seen.value_checks += 1;
                             let (kind, _, value) = value_request(fault).unwrap();
-                            assert_eq!(params["arguments"][1]["value"], json!({"kind":kind,"value":value}));
+                            assert_eq!(
+                                params["arguments"][1]["value"],
+                                json!({"kind":kind,"value":value})
+                            );
                             json!(fault != Fault::ValueRejected)
                         }
                         action => panic!("unexpected element action {action}"),
@@ -184,22 +270,36 @@ fn serve(socket: &mut TcpStream, scoped: bool, fault: Fault) -> Seen {
                     json!({"result":{"type":if value.is_boolean() {"boolean"} else if value.is_object() {"object"} else {"string"},"value":value}})
                 }
             }
-            "Runtime.releaseObject" => { assert_eq!(params["objectId"], "original"); json!({}) }
-            "DOM.scrollIntoViewIfNeeded" => { assert_eq!(params["backendNodeId"], 7); json!({}) }
+            "Runtime.releaseObject" => {
+                assert_eq!(params["objectId"], "original");
+                json!({})
+            }
+            "DOM.scrollIntoViewIfNeeded" => {
+                assert_eq!(params["backendNodeId"], 7);
+                json!({})
+            }
             "Input.insertText" => {
-                assert_eq!(params["text"], TEXT); seen.inserts += 1;
-                if fault == Fault::InsertNavigation { seen.changed = true; }
+                assert_eq!(params["text"], TEXT);
+                seen.inserts += 1;
+                if fault == Fault::InsertNavigation {
+                    seen.changed = true;
+                }
                 json!({})
             }
             "Input.dispatchKeyEvent" => {
                 assert_eq!(request["sessionId"], "page");
                 if params["type"] == "keyDown" {
-                    seen.downs += 1; failed = fault == Fault::DownFailure;
-                    if fault == Fault::DownNavigation { seen.changed = true; }
+                    seen.downs += 1;
+                    failed = fault == Fault::DownFailure;
+                    if fault == Fault::DownNavigation {
+                        seen.changed = true;
+                    }
                 } else {
                     assert_eq!(params["type"], "keyUp");
-                    assert!(params.get("text").is_none()); assert!(params.get("commands").is_none());
-                    seen.ups += 1; failed = fault == Fault::UpFailure;
+                    assert!(params.get("text").is_none());
+                    assert!(params.get("commands").is_none());
+                    seen.ups += 1;
+                    failed = fault == Fault::UpFailure;
                 }
                 json!({})
             }
@@ -207,119 +307,183 @@ fn serve(socket: &mut TcpStream, scoped: bool, fault: Fault) -> Seen {
         };
         let mut response = if failed {
             json!({"id":request["id"],"error":{"code":-32000,"message":TEXT}})
-        } else { json!({"id":request["id"],"result":result}) };
-        if request.get("sessionId").is_some() { response["sessionId"] = request["sessionId"].clone(); }
+        } else {
+            json!({"id":request["id"],"result":result})
+        };
+        if request.get("sessionId").is_some() {
+            response["sessionId"] = request["sessionId"].clone();
+        }
         send(socket, &response);
     }
     panic!("text peer command budget exceeded")
 }
 
-fn run(action: &str, scoped: bool, fault: Fault, empty: bool) -> (pi::error::Result<ToolOutput>, Seen) {
-    eprintln!("{}", json!({"suite":"browser_text_input","action":action,"frame":scoped,"fault":format!("{fault:?}"),"empty":empty}));
+fn run(
+    action: &str,
+    scoped: bool,
+    fault: Fault,
+    empty: bool,
+) -> (pi::error::Result<ToolOutput>, Seen) {
+    eprintln!(
+        "{}",
+        json!({"suite":"browser_text_input","action":action,"frame":scoped,"fault":format!("{fault:?}"),"empty":empty})
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let peer = thread::spawn(move || {
         let mut discovery = accept(&listener);
         assert!(headers(&mut discovery).starts_with("GET /json/version "));
-        let body = json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/text")}).to_string();
-        write!(discovery,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        let body = json!({"webSocketDebuggerUrl":format!("ws://{address}/devtools/browser/text")})
+            .to_string();
+        write!(
+            discovery,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
         drop(discovery);
         let mut socket = accept(&listener);
         let request = headers(&mut socket);
-        let key = request.lines().find_map(|line| {
-            let (name,value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
-        }).unwrap();
+        let key = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .unwrap();
         let accept = asupersync::net::websocket::compute_accept_key(key);
         write!(socket,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
         serve(&mut socket, scoped, fault)
     });
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(format!("http://{address}"));
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(format!("http://{address}"));
     let mut args = json!({"action":action,"tab":"page-1","selector":"#input","timeout_ms":8000});
-    if action == "press" { args["key"] = json!("Ctrl+a"); }
-    else { args["text"] = json!(value_request(fault).map_or(if empty { "" } else { TEXT }, |(_, text, _)| text)); }
-    if scoped { args["frame"] = json!("child"); }
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    if action == "press" {
+        args["key"] = json!("Ctrl+a");
+    } else {
+        args["text"] =
+            json!(value_request(fault).map_or(if empty { "" } else { TEXT }, |(_, text, _)| text));
+    }
+    if scoped {
+        args["frame"] = json!("child");
+    }
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let result = runtime.block_on(tool.execute("text-transport", args, None));
     (result, peer.join().unwrap())
 }
 
 #[test]
 fn text_and_targeted_keys_share_one_focus_contract_on_main_and_child_documents() {
-    for scoped in [false, true] { for action in ["type", "fill", "press"] {
-        let (result, seen) = run(action, scoped, Fault::None, false);
-        assert!(!result.unwrap().is_error);
-        assert_eq!(seen.queries, 1); assert_eq!(seen.edits, 1);
-        assert_eq!(seen.focus_checks, 1); assert_eq!(seen.fronts, 1);
-        assert_eq!(seen.inserts, usize::from(action != "press"));
-        assert_eq!((seen.downs, seen.ups), if action == "press" { (1,1) } else { (0,0) });
-    }}
+    for scoped in [false, true] {
+        for action in ["type", "fill", "press"] {
+            let (result, seen) = run(action, scoped, Fault::None, false);
+            assert!(!result.unwrap().is_error);
+            assert_eq!(seen.queries, 1);
+            assert_eq!(seen.edits, 1);
+            assert_eq!(seen.focus_checks, 1);
+            assert_eq!(seen.fronts, 1);
+            assert_eq!(seen.inserts, usize::from(action != "press"));
+            assert_eq!(
+                (seen.downs, seen.ups),
+                if action == "press" { (1, 1) } else { (0, 0) }
+            );
+        }
+    }
 }
 
 #[test]
 fn focus_loss_and_malformed_focus_never_deliver_the_requested_text_or_key() {
-    for scoped in [false,true] { for action in ["type","fill","press"] {
-        for fault in [Fault::FocusLost,Fault::MalformedFocus] {
-            let (result,seen) = run(action,scoped,fault,false);
-            assert!(result.is_err()); assert_eq!((seen.inserts,seen.downs,seen.ups),(0,0,0));
-            assert_eq!(seen.queries,1);
+    for scoped in [false, true] {
+        for action in ["type", "fill", "press"] {
+            for fault in [Fault::FocusLost, Fault::MalformedFocus] {
+                let (result, seen) = run(action, scoped, fault, false);
+                assert!(result.is_err());
+                assert_eq!((seen.inserts, seen.downs, seen.ups), (0, 0, 0));
+                assert_eq!(seen.queries, 1);
+            }
         }
-    }}
+    }
 }
 
 #[test]
 fn navigation_during_lookup_or_edit_does_not_authorize_a_replacement_document() {
-    for scoped in [false,true] { for fault in [Fault::LookupNavigation,Fault::EditNavigation] {
-        let (result,seen) = run("fill",scoped,fault,false);
-        assert!(result.is_err()); assert_eq!((seen.inserts,seen.downs),(0,0));
-        assert_eq!(seen.queries,1);
-    }}
+    for scoped in [false, true] {
+        for fault in [Fault::LookupNavigation, Fault::EditNavigation] {
+            let (result, seen) = run("fill", scoped, fault, false);
+            assert!(result.is_err());
+            assert_eq!((seen.inserts, seen.downs), (0, 0));
+            assert_eq!(seen.queries, 1);
+        }
+    }
 }
 
 #[test]
 fn failed_keydown_and_keyup_never_replay_and_do_not_reflect_transport_payloads() {
-    for scoped in [false,true] { for fault in [Fault::DownFailure,Fault::UpFailure] {
-        let (result,seen) = run("press",scoped,fault,false);
-        let failure = result.unwrap_err().to_string();
-        assert!(failure.contains("BROWSER_KEY_INTERRUPTED")); assert!(!failure.contains(TEXT));
-        assert_eq!((seen.downs,seen.ups),(1,1));
-    }}
+    for scoped in [false, true] {
+        for fault in [Fault::DownFailure, Fault::UpFailure] {
+            let (result, seen) = run("press", scoped, fault, false);
+            let failure = result.unwrap_err().to_string();
+            assert!(failure.contains("BROWSER_KEY_INTERRUPTED"));
+            assert!(!failure.contains(TEXT));
+            assert_eq!((seen.downs, seen.ups), (1, 1));
+        }
+    }
 }
 
 #[test]
 fn keyup_reaches_the_original_page_even_when_keydown_navigates_the_child() {
-    let (result,seen) = run("press",true,Fault::DownNavigation,false);
-    assert!(result.is_err()); assert_eq!((seen.downs,seen.ups),(1,1));
-    let (result,seen) = run("press",false,Fault::DownNavigation,false);
-    assert!(!result.unwrap().is_error); assert_eq!((seen.downs,seen.ups),(1,1));
+    let (result, seen) = run("press", true, Fault::DownNavigation, false);
+    assert!(result.is_err());
+    assert_eq!((seen.downs, seen.ups), (1, 1));
+    let (result, seen) = run("press", false, Fault::DownNavigation, false);
+    assert!(!result.unwrap().is_error);
+    assert_eq!((seen.downs, seen.ups), (1, 1));
 }
 
 #[test]
 fn rejected_or_navigated_text_is_not_reported_as_a_successful_fill_or_replayed() {
-    for scoped in [false,true] { for fault in [Fault::InsertNavigation,Fault::RevertedFill] {
-        let (result,seen) = run("fill",scoped,fault,false);
-        assert!(result.is_err()); assert_eq!(seen.inserts,1); assert_eq!(seen.queries,1);
-    }}
+    for scoped in [false, true] {
+        for fault in [Fault::InsertNavigation, Fault::RevertedFill] {
+            let (result, seen) = run("fill", scoped, fault, false);
+            assert!(result.is_err());
+            assert_eq!(seen.inserts, 1);
+            assert_eq!(seen.queries, 1);
+        }
+    }
 }
 
 #[test]
 fn empty_fills_use_the_same_guarded_paired_backspace_path() {
-    for scoped in [false,true] {
-        let (result,seen) = run("fill",scoped,Fault::None,true);
-        assert!(!result.unwrap().is_error); assert_eq!(seen.inserts,0);
-        assert_eq!((seen.downs,seen.ups),(1,1)); assert_eq!(seen.focus_checks,1);
+    for scoped in [false, true] {
+        let (result, seen) = run("fill", scoped, Fault::None, true);
+        assert!(!result.unwrap().is_error);
+        assert_eq!(seen.inserts, 0);
+        assert_eq!((seen.downs, seen.ups), (1, 1));
+        assert_eq!(seen.focus_checks, 1);
     }
 }
 
 #[test]
 fn special_value_fills_use_the_original_node_without_native_text_or_key_fallback() {
     for scoped in [false, true] {
-        for fault in [Fault::ValueDate, Fault::ValueTime, Fault::ValueMonth, Fault::ValueWeek,
-            Fault::ValueDateTime, Fault::ValueColor, Fault::ValueRange] {
+        for fault in [
+            Fault::ValueDate,
+            Fault::ValueTime,
+            Fault::ValueMonth,
+            Fault::ValueWeek,
+            Fault::ValueDateTime,
+            Fault::ValueColor,
+            Fault::ValueRange,
+        ] {
             let (result, seen) = run("fill", scoped, fault, false);
-            let result = result.unwrap(); assert!(!result.is_error);
+            let result = result.unwrap();
+            assert!(!result.is_error);
             let details = result.details.unwrap();
             let (kind, requested, canonical) = value_request(fault).unwrap();
             assert_eq!(details["input_method"], "dom-value");
@@ -346,11 +510,16 @@ fn special_value_noops_are_still_verified_without_additional_input() {
 #[test]
 fn malformed_reverted_or_navigated_value_fills_stop_without_fallback_or_replay() {
     for scoped in [false, true] {
-        for fault in [Fault::ValueMalformed, Fault::ValueRejected, Fault::ValueNavigation] {
+        for fault in [
+            Fault::ValueMalformed,
+            Fault::ValueRejected,
+            Fault::ValueNavigation,
+        ] {
             let (result, seen) = run("fill", scoped, fault, false);
             let failure = result.unwrap_err().to_string();
             assert!(!failure.contains("PRIVATE-CANARY"));
-            assert_eq!(seen.queries, 1); assert_eq!(seen.edits, 1);
+            assert_eq!(seen.queries, 1);
+            assert_eq!(seen.edits, 1);
             assert_eq!((seen.inserts, seen.downs, seen.ups), (0, 0, 0));
         }
     }
@@ -360,12 +529,16 @@ fn malformed_reverted_or_navigated_value_fills_stop_without_fallback_or_replay()
 #[ignore = "requires sandbox-capable Chromium; select explicitly in the DSR browser lane"]
 fn live_value_fill_retains_canonical_values_and_does_not_repeat_handlers() {
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false)
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
         .with_launch_options(pi::browser::BrowserLaunchOptions {
             executable_path: std::env::var_os("PI_BROWSER_EXECUTABLE").map(Into::into),
             ..Default::default()
-        }).with_domain_allowlist(Some(Vec::new()));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        })
+        .with_domain_allowlist(Some(Vec::new()));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         tool.execute("open", json!({"action":"open","tab":"values","url":"about:blank"}), None).await.unwrap();
         for (kind, text, canonical) in [

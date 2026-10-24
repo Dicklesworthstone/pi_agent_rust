@@ -98,7 +98,8 @@ impl Operation {
     }
 }
 
-enum Request {    Completion(CompletionRequest, images::Sources),
+enum Request {
+    Completion(CompletionRequest, images::Sources),
     Judgment(JudgmentRequest, images::Sources),
     Batch(batch::Plan, BatchOptions),
 }
@@ -173,13 +174,19 @@ impl Request {
                 let plan = batch::Plan::parse(&batch_input)?;
                 let retries = match retries {
                     None => 0,
-                    Some(value) => value.as_u64().filter(|value| *value <= 3)
-                        .and_then(|value| usize::try_from(value).ok()).ok_or_else(input_error)?,
+                    Some(value) => value
+                        .as_u64()
+                        .filter(|value| *value <= 3)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(input_error)?,
                 };
                 let min_ok = match min_ok {
                     None => plan.items.len(),
-                    Some(value) => value.as_u64().and_then(|value| usize::try_from(value).ok())
-                        .filter(|value| *value <= plan.items.len()).ok_or_else(input_error)?,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|value| *value <= plan.items.len())
+                        .ok_or_else(input_error)?,
                 };
                 Self::Batch(plan, BatchOptions { retries, min_ok })
             }
@@ -237,12 +244,14 @@ fn checkpoint(owner: &AgentCx, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
-enum Attached {    Completion(CompletionRequest),
+enum Attached {
+    Completion(CompletionRequest),
     Judgment(JudgmentRequest),
     Batch(Vec<(Value, JudgmentRequest)>, usize, BatchOptions),
 }
 
-enum Prepared {    Completion(PreparedCompletion),
+enum Prepared {
+    Completion(PreparedCompletion),
     Judgment(PreparedJudgment),
     Batch(Vec<(Value, PreparedJudgment)>, usize, BatchOptions),
 }
@@ -294,7 +303,8 @@ impl Invocation<'_> {
         operation: Operation,
         mut input: Value,
     ) -> std::result::Result<String, String> {
-        let selection = self.request_selection(&mut input)
+        let selection = self
+            .request_selection(&mut input)
             .map_err(|error| operation.error(error))?;
         let (request, text, timeout) = Request::parse(operation, input)?;
         let snapshot = self.snapshot_privacy.ok_or_else(|| {

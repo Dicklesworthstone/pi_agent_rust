@@ -507,8 +507,11 @@ mod tests {
                 .contains("limit")
         );
         assert_eq!(reader.read_member("ok.txt", 2).unwrap(), b"ok");
-        let error = read_archive(ArchiveReader::new(Cursor::new(&bytes)).unwrap(), "binary.bin")
-            .unwrap_err();
+        let error = read_archive(
+            ArchiveReader::new(Cursor::new(&bytes)).unwrap(),
+            "binary.bin",
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("Binary archive member"));
         let error = read_archive(
             ArchiveReader::new(Cursor::new(&bytes)).unwrap(),
@@ -557,7 +560,10 @@ mod tests {
         }
         assert!(open_error(duplicate).contains("duplicate file names"));
 
-        let mut corrupt = fixture(&[("file.txt", b"checksum payload")], CompressionMethod::Stored);
+        let mut corrupt = fixture(
+            &[("file.txt", b"checksum payload")],
+            CompressionMethod::Stored,
+        );
         let offset = corrupt
             .windows(16)
             .position(|window| window == b"checksum payload")

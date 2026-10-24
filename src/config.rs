@@ -2060,7 +2060,10 @@ fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option
             mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
             pty: other.pty.or(base.pty),
             persistent: other.persistent.or(base.persistent),
-            auto_background: merge_bash_auto_background(base.auto_background, other.auto_background),
+            auto_background: merge_bash_auto_background(
+                base.auto_background,
+                other.auto_background,
+            ),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2569,22 +2572,31 @@ mod tests {
         );
         let global: Config = serde_json::from_value(json!({
             "advisor": {"enabled": false, "timeoutSecs": 25, "continueSeverity": "blocker"}
-        })).expect("global settings");
+        }))
+        .expect("global settings");
         let project: Config = serde_json::from_value(json!({
             "advisor": {"timeoutSecs": 8}
-        })).expect("project settings");
+        }))
+        .expect("project settings");
         let inherited = Config::merge(global, project);
         assert!(!inherited.advisor_enabled());
         assert_eq!(inherited.advisor_timeout_secs(), 8);
-        assert_eq!(inherited.advisor_continue_severity(), ContinueSeverity::Blocker);
+        assert_eq!(
+            inherited.advisor_continue_severity(),
+            ContinueSeverity::Blocker
+        );
 
         let override_config: Config = serde_json::from_value(json!({
             "advisor": {"enabled": true, "continue_severity": "nit"}
-        })).expect("project override");
+        }))
+        .expect("project override");
         let overridden = Config::merge(inherited, override_config);
         assert!(overridden.advisor_enabled());
         assert_eq!(overridden.advisor_timeout_secs(), 8);
-        assert_eq!(overridden.advisor_continue_severity(), ContinueSeverity::Nit);
+        assert_eq!(
+            overridden.advisor_continue_severity(),
+            ContinueSeverity::Nit
+        );
     }
 
     #[test]
@@ -2594,7 +2606,11 @@ mod tests {
             r#"{"bash":{"auto_background":{"enabled":false,"threshold_ms":250}}}"#,
         ] {
             let config: Config = serde_json::from_str(content).expect("bash settings");
-            let settings = config.bash.expect("bash").auto_background.expect("auto background");
+            let settings = config
+                .bash
+                .expect("bash")
+                .auto_background
+                .expect("auto background");
             assert_eq!(settings.enabled, Some(false));
             assert_eq!(settings.threshold_ms, Some(250));
             assert!(unrecognised_setting_keys(content).is_empty());
@@ -2605,10 +2621,12 @@ mod tests {
                 "persistent": false,
                 "autoBackground": {"enabled": false, "thresholdMs": 400}
             }
-        })).expect("global settings");
+        }))
+        .expect("global settings");
         let project: Config = serde_json::from_value(json!({
             "bash": {"autoBackground": {"enabled": true}}
-        })).expect("project settings");
+        }))
+        .expect("project settings");
         let merged = Config::merge(global, project);
         let bash = merged.bash.expect("merged bash");
         assert_eq!(bash.mediation.as_deref(), Some("block-high"));
@@ -2616,9 +2634,12 @@ mod tests {
         let auto = bash.auto_background.expect("merged auto background");
         assert_eq!(auto.enabled, Some(true));
         assert_eq!(auto.threshold_ms, Some(400));
-        assert!(serde_json::from_value::<Config>(json!({
-            "bash": {"autoBackground": {"thresholdMs": -1}}
-        })).is_err());
+        assert!(
+            serde_json::from_value::<Config>(json!({
+                "bash": {"autoBackground": {"thresholdMs": -1}}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -44,7 +44,8 @@ impl<'de> Visitor<'de> for Seed<'_> {
     }
 
     fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
-        Number::from_f64(value).map(Value::Number)
+        Number::from_f64(value)
+            .map(Value::Number)
             .ok_or_else(|| de::Error::custom("non-finite JSON number"))
     }
 
@@ -75,7 +76,9 @@ impl<'de> Visitor<'de> for Seed<'_> {
         let mut values = Map::new();
         while let Some(key) = map.next_key::<String>()? {
             if *self.remaining == 0 || values.contains_key(&key) {
-                return Err(de::Error::custom("duplicate JSON key or exhausted recovery budget"));
+                return Err(de::Error::custom(
+                    "duplicate JSON key or exhausted recovery budget",
+                ));
             }
             *self.remaining -= 1;
             let value = map.next_value_seed(Seed {
@@ -90,7 +93,11 @@ impl<'de> Visitor<'de> for Seed<'_> {
 
 pub(super) fn parse(bytes: &[u8], remaining: &mut usize) -> Result<Value, serde_json::Error> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    let value = Seed { depth: 0, remaining }.deserialize(&mut decoder)?;
+    let value = Seed {
+        depth: 0,
+        remaining,
+    }
+    .deserialize(&mut decoder)?;
     decoder.end()?;
     Ok(value)
 }

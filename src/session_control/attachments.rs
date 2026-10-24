@@ -453,10 +453,7 @@ mod tests {
         assert!(control.run.fetch(InputKind::Steering).is_empty());
         let claimed = control.run.fetch(InputKind::FollowUp);
         assert_eq!(claimed.len(), 1);
-        assert_eq!(
-            claimed[0].keyword_scan_source(),
-            Some("inspect the files")
-        );
+        assert_eq!(claimed[0].keyword_scan_source(), Some("inspect the files"));
         let Message::User(user) = claimed[0].message() else {
             panic!("native user input");
         };
@@ -507,9 +504,9 @@ mod tests {
         assert!(error.to_string().contains("SESSION_CONTROL_FULL"));
         assert_eq!(control.snapshot(), full);
         let corrected = control.replace_pending(old, "a").unwrap().unwrap();
-        let refunded =
-            admitted_bytes(&UserContent::Text("original".to_string()), "original").unwrap()
-                - admitted_bytes(&UserContent::Text("a".to_string()), "a").unwrap();
+        let refunded = admitted_bytes(&UserContent::Text("original".to_string()), "original")
+            .unwrap()
+            - admitted_bytes(&UserContent::Text("a".to_string()), "a").unwrap();
         assert_eq!(
             control.snapshot().pending_bytes,
             MAX_PENDING_BYTES - refunded
@@ -636,7 +633,11 @@ mod tests {
         assert_eq!(Some(pending[0].id), a.or(b));
         assert_eq!(
             pending[0].text,
-            if a.is_some() { "candidate A" } else { "candidate B" }
+            if a.is_some() {
+                "candidate A"
+            } else {
+                "candidate B"
+            }
         );
     }
 
@@ -729,9 +730,7 @@ mod tests {
         assert_eq!(control.snapshot().handed_to_agent, 0);
         let pending = control.take_pending();
         assert_eq!(pending[0].id, existing);
-        for ((input, id), (kind, content, source)) in
-            pending[1..].iter().zip(ids).zip(&inputs)
-        {
+        for ((input, id), (kind, content, source)) in pending[1..].iter().zip(ids).zip(&inputs) {
             assert_eq!(input.id, id);
             assert_eq!(input.kind, *kind);
             assert_eq!(&input.text, source);

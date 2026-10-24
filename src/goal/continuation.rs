@@ -7,7 +7,9 @@
 //! reordered parallel batches and multi-prompt cycles without keeping outputs.
 //! This is a conservative activity heuristic, not verification of deliverables.
 
-use super::{GoalControl, GoalDecision, GoalRun, GoalRunReport, GoalSession, GoalSnapshot, failure};
+use super::{
+    GoalControl, GoalDecision, GoalRun, GoalRunReport, GoalSession, GoalSnapshot, failure,
+};
 use crate::agent::AgentEvent;
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
@@ -63,7 +65,10 @@ impl AgentSessionHandle {
         on_event: impl Fn(&GoalControl, AgentEvent) + Send + Sync + 'static,
     ) -> Result<GoalRun<impl Future<Output = GoalRunReport> + 'a>> {
         if !(1..=MAX_STEPS).contains(&max_steps) {
-            return Err(failure("GOAL_STEPS", "goal run requires between 1 and 32 prompts"));
+            return Err(failure(
+                "GOAL_STEPS",
+                "goal run requires between 1 and 32 prompts",
+            ));
         }
         let tracker = Arc::new(Mutex::new(Tracker::new(max_steps)));
         let observed = Arc::clone(&tracker);
@@ -134,17 +139,22 @@ impl Tracker {
             return;
         }
         let result = match event {
-            AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
-                self.current.start(tool_call_id, tool_name, args)
-            }
-            AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
-                self.current.end(
-                    tool_call_id,
-                    tool_name,
-                    &result.content,
-                    *is_error || result.is_error,
-                )
-            }
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => self.current.start(tool_call_id, tool_name, args),
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => self.current.end(
+                tool_call_id,
+                tool_name,
+                &result.content,
+                *is_error || result.is_error,
+            ),
             // Stream updates, assistant prose, retry messages and timestamps
             // are not evidence of new tool activity.
             _ => Ok(()),
@@ -161,13 +171,25 @@ impl Tracker {
         self.steps = self.steps.saturating_add(1);
         let current = std::mem::take(&mut self.current);
         let reason = if self.steps >= self.max_steps {
-            Some("[GOAL_STEP_LIMIT] Requested prompt limit reached; inspect the results before resuming or attesting completion.")
+            Some(
+                "[GOAL_STEP_LIMIT] Requested prompt limit reached; inspect the results before resuming or attesting completion.",
+            )
         } else if current.invalid || !current.pending.is_empty() {
-            Some("[GOAL_PROGRESS_UNCERTAIN] Tool activity was incomplete or exceeded observation limits; review before continuing.")
+            Some(
+                "[GOAL_PROGRESS_UNCERTAIN] Tool activity was incomplete or exceeded observation limits; review before continuing.",
+            )
         } else if current.completed.is_empty() {
-            Some("[GOAL_NO_TOOL_PROGRESS] No successfully completed tool operation was observed; review the answer before continuing.")
-        } else if current.completed.iter().all(|digest| self.seen.contains(digest)) {
-            Some("[GOAL_REPEATED_TOOL_PROGRESS] This run has already observed all of these successful tool operations and results; review the repeated work before continuing.")
+            Some(
+                "[GOAL_NO_TOOL_PROGRESS] No successfully completed tool operation was observed; review the answer before continuing.",
+            )
+        } else if current
+            .completed
+            .iter()
+            .all(|digest| self.seen.contains(digest))
+        {
+            Some(
+                "[GOAL_REPEATED_TOOL_PROGRESS] This run has already observed all of these successful tool operations and results; review the repeated work before continuing.",
+            )
         } else {
             None
         };
@@ -191,7 +213,9 @@ impl Tracker {
 }
 
 fn pause(reason: &str) -> GoalDecision {
-    GoalDecision::Pause { reason: reason.to_string() }
+    GoalDecision::Pause {
+        reason: reason.to_string(),
+    }
 }
 
 struct Pending {
@@ -210,8 +234,11 @@ struct Observation {
 
 impl Observation {
     fn start(&mut self, id: &str, name: &str, args: &Value) -> Admission {
-        if id.is_empty() || id.len() > MAX_ID_BYTES || name.is_empty()
-            || name.len() > MAX_NAME_BYTES || self.ids.len() >= MAX_CALLS
+        if id.is_empty()
+            || id.len() > MAX_ID_BYTES
+            || name.is_empty()
+            || name.len() > MAX_NAME_BYTES
+            || self.ids.len() >= MAX_CALLS
             || self.ids.contains(id)
         {
             return Err(());
@@ -222,7 +249,13 @@ impl Observation {
         part(&mut digest, &mut self.budget, name.as_bytes())?;
         json(&mut digest, &mut self.budget, args, 0)?;
         self.ids.insert(id.to_string());
-        self.pending.insert(id.to_string(), Pending { name: name.to_string(), digest });
+        self.pending.insert(
+            id.to_string(),
+            Pending {
+                name: name.to_string(),
+                digest,
+            },
+        );
         Ok(())
     }
 
@@ -230,7 +263,10 @@ impl Observation {
         if id.len() > MAX_ID_BYTES || name.len() > MAX_NAME_BYTES {
             return Err(());
         }
-        let Pending { name: expected, mut digest } = self.pending.remove(id).ok_or(())?;
+        let Pending {
+            name: expected,
+            mut digest,
+        } = self.pending.remove(id).ok_or(())?;
         if expected != name {
             return Err(());
         }
@@ -258,7 +294,10 @@ struct Budget {
 
 impl Default for Budget {
     fn default() -> Self {
-        Self { bytes: MAX_BYTES, nodes: MAX_NODES }
+        Self {
+            bytes: MAX_BYTES,
+            nodes: MAX_NODES,
+        }
     }
 }
 
@@ -297,7 +336,14 @@ fn json(digest: &mut Sha256, budget: &mut Budget, value: &Value, depth: usize) -
         Value::Bool(value) => digest.update([1, u8::from(*value)]),
         Value::Number(value) => {
             digest.update([2]);
-            serde_json::to_writer(HashWriter { digest: &mut *digest, budget: &mut *budget }, value).map_err(|_| ())?;
+            serde_json::to_writer(
+                HashWriter {
+                    digest: &mut *digest,
+                    budget: &mut *budget,
+                },
+                value,
+            )
+            .map_err(|_| ())?;
             digest.update([255]);
         }
         Value::String(value) => {
@@ -305,7 +351,9 @@ fn json(digest: &mut Sha256, budget: &mut Budget, value: &Value, depth: usize) -
             part(digest, budget, value.as_bytes())?;
         }
         Value::Array(values) => {
-            if values.len() > budget.nodes { return Err(()); }
+            if values.len() > budget.nodes {
+                return Err(());
+            }
             digest.update([4]);
             count(digest, values.len())?;
             for value in values {
@@ -313,11 +361,18 @@ fn json(digest: &mut Sha256, budget: &mut Budget, value: &Value, depth: usize) -
             }
         }
         Value::Object(values) => {
-            if values.len() > budget.nodes { return Err(()); }
+            if values.len() > budget.nodes {
+                return Err(());
+            }
             // Bound key collection and comparison work before sorting. Borrow
             // values; do not clone a potentially huge/deep JSON object.
-            let key_bytes = values.keys().try_fold(0usize, |total, key| total.checked_add(key.len())).ok_or(())?;
-            if key_bytes > budget.bytes { return Err(()); }
+            let key_bytes = values
+                .keys()
+                .try_fold(0usize, |total, key| total.checked_add(key.len()))
+                .ok_or(())?;
+            if key_bytes > budget.bytes {
+                return Err(());
+            }
             let mut fields = values.iter().collect::<Vec<_>>();
             fields.sort_unstable_by(|left, right| left.0.cmp(right.0));
             digest.update([5]);
@@ -339,12 +394,16 @@ struct HashWriter<'a> {
 
 impl Write for HashWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.budget.charge(bytes.len()).map_err(|()| std::io::Error::other("goal observation limit"))?;
+        self.budget
+            .charge(bytes.len())
+            .map_err(|()| std::io::Error::other("goal observation limit"))?;
         self.digest.update(bytes);
         Ok(bytes.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn content(digest: &mut Sha256, budget: &mut Budget, block: &ContentBlock) -> Admission {
@@ -365,7 +424,11 @@ fn content(digest: &mut Sha256, budget: &mut Budget, block: &ContentBlock) -> Ad
             part(digest, budget, media.mime_type.as_bytes())?;
             part(digest, budget, media.data.as_bytes())?;
             digest.update([u8::from(media.name.is_some())]);
-            part(digest, budget, media.name.as_deref().unwrap_or_default().as_bytes())?;
+            part(
+                digest,
+                budget,
+                media.name.as_deref().unwrap_or_default().as_bytes(),
+            )?;
         }
         ContentBlock::Thinking(thinking) => {
             digest.update([3]);

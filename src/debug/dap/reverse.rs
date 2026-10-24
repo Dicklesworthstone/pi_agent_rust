@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 
-use super::{AgentCx, DapError, DapTransport, Lifetime, ReplyWriter, encode_frame, lock, next_sequence};
+use super::{
+    AgentCx, DapError, DapTransport, Lifetime, ReplyWriter, encode_frame, lock, next_sequence,
+};
 use std::io::Write as _;
 
 /// Return a DAP response body or a refusal. The callback must enforce its own
@@ -70,9 +72,13 @@ impl State {
         if queue.closed {
             return None;
         }
-        let Some(sequence) = message["seq"].as_u64() else { return Some(false) };
-        let Some(command) = message["command"].as_str()
-            .filter(|command| !command.is_empty() && command.len() <= 256) else {
+        let Some(sequence) = message["seq"].as_u64() else {
+            return Some(false);
+        };
+        let Some(command) = message["command"]
+            .as_str()
+            .filter(|command| !command.is_empty() && command.len() <= 256)
+        else {
             return Some(false);
         };
         let empty = json!({});
@@ -86,7 +92,9 @@ impl State {
             return Some(false);
         }
         queue.requests.push_back(Request {
-            sequence, command: command.to_string(), arguments: arguments.clone(),
+            sequence,
+            command: command.to_string(),
+            arguments: arguments.clone(),
         });
         Some(true)
     }
@@ -110,19 +118,30 @@ impl Permit {
         timeout: Duration,
         handler: ReverseRequestHandler,
     ) -> std::result::Result<Self, DapError> {
-        let deadline = Instant::now().checked_add(timeout)
+        let deadline = Instant::now()
+            .checked_add(timeout)
             .ok_or_else(|| DapError::Transport("reverse request timeout is too large".into()))?;
-        let window = Arc::new(Window { queue: Mutex::new(Queue::default()) });
+        let window = Arc::new(Window {
+            queue: Mutex::new(Queue::default()),
+        });
         {
             let mut active = lock(&transport.life.reverse.active);
             if active.is_some() || !transport.life.alive.load(Ordering::SeqCst) {
-                return Err(DapError::Transport("reverse request window busy or connection closed".into()));
+                return Err(DapError::Transport(
+                    "reverse request window busy or connection closed".into(),
+                ));
             }
             *active = Some(Arc::clone(&window));
         }
         Ok(Self {
-            life: Arc::clone(&transport.life), window, owner, deadline, timeout, handler,
-            writer: transport.writer.clone(), sequence: Arc::clone(&transport.next_seq),
+            life: Arc::clone(&transport.life),
+            window,
+            owner,
+            deadline,
+            timeout,
+            handler,
+            writer: transport.writer.clone(),
+            sequence: Arc::clone(&transport.next_seq),
         })
     }
 
@@ -141,31 +160,45 @@ impl Permit {
 
     pub(super) async fn drive(&self) -> DapError {
         loop {
-            if let Err(error) = self.checkpoint() { return error; }
+            if let Err(error) = self.checkpoint() {
+                return error;
+            }
             let request = lock(&self.window.queue).requests.pop_front();
             if let Some(request) = request {
-                let mut reply = Reply { permit: self, request: Some(request) };
+                let mut reply = Reply {
+                    permit: self,
+                    request: Some(request),
+                };
                 let request = reply.request.as_ref().expect("new reply");
                 let command = request.command.clone();
                 let arguments = request.arguments.clone();
                 // Even callback construction and its synchronous destructor
                 // belong to the originating owner. No native mutex is held.
-                let result = self.owner.with_current(async {
-                    (self.handler)(command, arguments).await
-                }).await;
-                if let Err(error) = self.checkpoint() { return error; }
-                if let Err(error) = reply.finish(result) { return error; }
+                let result = self
+                    .owner
+                    .with_current(async { (self.handler)(command, arguments).await })
+                    .await;
+                if let Err(error) = self.checkpoint() {
+                    return error;
+                }
+                if let Err(error) = reply.finish(result) {
+                    return error;
+                }
             } else {
                 self.owner.time().sleep(Duration::from_millis(10)).await;
             }
         }
     }
 
-    fn respond(&self, request: &Request, result: std::result::Result<Value, String>)
-        -> std::result::Result<(), DapError>
-    {
+    fn respond(
+        &self,
+        request: &Request,
+        result: std::result::Result<Value, String>,
+    ) -> std::result::Result<(), DapError> {
         if !self.life.alive.load(Ordering::SeqCst) {
-            return Err(DapError::Transport("reverse reply connection closed".into()));
+            return Err(DapError::Transport(
+                "reverse reply connection closed".into(),
+            ));
         }
         let sequence = next_sequence(&self.sequence)?;
         let result = match result {
@@ -181,7 +214,9 @@ impl Permit {
             Err(mut error) => {
                 if error.len() > MAX_ERROR_BYTES {
                     let mut end = MAX_ERROR_BYTES;
-                    while !error.is_char_boundary(end) { end -= 1; }
+                    while !error.is_char_boundary(end) {
+                        end -= 1;
+                    }
                     error.truncate(end);
                     error.push_str(" [truncated]");
                 }
@@ -190,8 +225,11 @@ impl Permit {
         }
         let result = ReplyWriter(self.writer.clone()).write_all(&encode_frame(&message));
         if let Err(error) = result {
-            self.life.close("reverse reply could not enter the bounded writer");
-            return Err(DapError::Transport(format!("reverse reply failed: {error}")));
+            self.life
+                .close("reverse reply could not enter the bounded writer");
+            return Err(DapError::Transport(format!(
+                "reverse reply failed: {error}"
+            )));
         }
         Ok(())
     }
@@ -203,7 +241,10 @@ impl Drop for Permit {
             let mut active = lock(&self.life.reverse.active);
             let mut queue = lock(&self.window.queue);
             queue.closed = true;
-            if active.as_ref().is_some_and(|window| Arc::ptr_eq(window, &self.window)) {
+            if active
+                .as_ref()
+                .is_some_and(|window| Arc::ptr_eq(window, &self.window))
+            {
                 active.take();
             }
             std::mem::take(&mut queue.requests)
@@ -221,7 +262,10 @@ struct Reply<'a> {
 }
 
 impl Reply<'_> {
-    fn finish(&mut self, result: std::result::Result<Value, String>) -> std::result::Result<(), DapError> {
+    fn finish(
+        &mut self,
+        result: std::result::Result<Value, String>,
+    ) -> std::result::Result<(), DapError> {
         let request = self.request.take().expect("reply sent once");
         self.permit.respond(&request, result)
     }
@@ -230,9 +274,13 @@ impl Reply<'_> {
 impl Drop for Reply<'_> {
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
-            let _ = self.permit.respond(&request, Err(
-                "reverse host request interrupted; completed effects are not rolled back".into(),
-            ));
+            let _ = self.permit.respond(
+                &request,
+                Err(
+                    "reverse host request interrupted; completed effects are not rolled back"
+                        .into(),
+                ),
+            );
         }
     }
 }

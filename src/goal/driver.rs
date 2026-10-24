@@ -15,7 +15,8 @@ use crate::error::{Error, Result};
 use crate::model::{AssistantMessage, ContentBlock, StopReason};
 use crate::sdk::AgentSessionHandle;
 use crate::session_control::{
-    ControllableSession, InputId, PendingInput, SessionControlHandle, TurnDeadline, TurnDeadlineError,
+    ControllableSession, InputId, PendingInput, SessionControlHandle, TurnDeadline,
+    TurnDeadlineError,
 };
 use std::fmt;
 use std::future::Future;
@@ -24,10 +25,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-#[cfg(test)]
-mod tests;
 mod budget;
 mod input;
+#[cfg(test)]
+mod tests;
 mod verification;
 
 /// An explicit host decision after a successful native prompt. Evidence text
@@ -159,10 +160,16 @@ impl GoalControl {
     fn current_turn(&self) -> Result<SessionControlHandle> {
         let state = self.lock();
         if state.paused || state.finished {
-            return Err(failure("GOAL_INPUT_CLOSED", "goal run is paused or finished"));
+            return Err(failure(
+                "GOAL_INPUT_CLOSED",
+                "goal run is paused or finished",
+            ));
         }
         state.turn.clone().ok_or_else(|| {
-            failure("GOAL_INPUT_IDLE", "no prompt is currently accepting live input")
+            failure(
+                "GOAL_INPUT_IDLE",
+                "no prompt is currently accepting live input",
+            )
         })
     }
 
@@ -178,7 +185,10 @@ impl GoalControl {
     /// dropped run. This is also a live retraction operation. Inputs returned
     /// here cannot later appear in the run report; ownership transfers once.
     pub fn take_pending(&self) -> Vec<PendingInput> {
-        self.lock().turn.as_ref().map_or_else(Vec::new, SessionControlHandle::take_pending)
+        self.lock()
+            .turn
+            .as_ref()
+            .map_or_else(Vec::new, SessionControlHandle::take_pending)
     }
 
     /// Install before polling, then honor any pause racing this publication.
@@ -223,7 +233,13 @@ impl fmt::Debug for GoalControl {
         f.debug_struct("GoalControl")
             .field("paused", &state.paused)
             .field("finished", &state.finished)
-            .field("prompt_live", &state.turn.as_ref().is_some_and(|turn| !turn.snapshot().finished))
+            .field(
+                "prompt_live",
+                &state
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| !turn.snapshot().finished),
+            )
             .finish()
     }
 }
@@ -367,7 +383,14 @@ impl AgentSessionHandle {
         let future = async move {
             let _guard = guard;
             owner
-                .with_current(self.drive_goal(&owner, expected, deadline, run_control, on_event, verify))
+                .with_current(self.drive_goal(
+                    &owner,
+                    expected,
+                    deadline,
+                    run_control,
+                    on_event,
+                    verify,
+                ))
                 .await
         };
         Ok(GoalRun {
@@ -445,19 +468,31 @@ impl AgentSessionHandle {
 
             let observed = match self.current_goal() {
                 Ok(Some(goal)) => goal,
-                Ok(None) => return failed(report, failure("GOAL_MISSING", "goal disappeared during execution")),
+                Ok(None) => {
+                    return failed(
+                        report,
+                        failure("GOAL_MISSING", "goal disappeared during execution"),
+                    );
+                }
                 Err(error) => return failed(report, error),
             };
             if let Err(error) = check_intent(&ticket, &observed) {
                 return failed(report, error);
             }
             report.goal = observed;
-            let (decision, stop) = verification::decide_next(
-                &mut report, owner, &deadline, &control, &mut verify,
-            ).await;
+            let (decision, stop) =
+                verification::decide_next(&mut report, owner, &deadline, &control, &mut verify)
+                    .await;
             let (settled, late_stop) = match settle_attempt(
-                self, owner, &report.goal, decision, &deadline, &control,
-            ).await {
+                self,
+                owner,
+                &report.goal,
+                decision,
+                &deadline,
+                &control,
+            )
+            .await
+            {
                 Ok(settled) => settled,
                 Err(error) => {
                     report.stop = match interruption(owner, &deadline, &control).or(stop) {
@@ -495,7 +530,11 @@ fn failed(mut report: GoalRunReport, error: Error) -> GoalRunReport {
     report
 }
 
-fn interruption(owner: &AgentCx, deadline: &TurnDeadline, control: &GoalControl) -> Option<GoalRunStop> {
+fn interruption(
+    owner: &AgentCx,
+    deadline: &TurnDeadline,
+    control: &GoalControl,
+) -> Option<GoalRunStop> {
     if owner.checkpoint().is_err() {
         Some(GoalRunStop::Cancelled)
     } else if control.token_limit_reached() {
@@ -510,23 +549,34 @@ fn interruption(owner: &AgentCx, deadline: &TurnDeadline, control: &GoalControl)
 }
 
 fn pause_decision(reason: &str) -> GoalDecision {
-    GoalDecision::Pause { reason: reason.to_string() }
+    GoalDecision::Pause {
+        reason: reason.to_string(),
+    }
 }
 
 fn successful(message: &AssistantMessage) -> bool {
     message.stop_reason == StopReason::Stop
         && message.error_message.is_none()
-        && !message.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(_)))
-        && message.content.iter().any(|block| {
-            matches!(block, ContentBlock::Text(text) if !text.text.trim().is_empty())
-        })
+        && !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        && message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text(text) if !text.text.trim().is_empty()))
 }
 
 fn prepare_intent(mut record: Record) -> Result<Record> {
     if record.effective_status() != GoalStatus::Active || record.in_flight {
-        return Err(failure("GOAL_NOT_ACTIVE", "explicitly resume an interrupted goal before execution"));
+        return Err(failure(
+            "GOAL_NOT_ACTIVE",
+            "explicitly resume an interrupted goal before execution",
+        ));
     }
-    record.prompts_started = record.prompts_started.checked_add(1)
+    record.prompts_started = record
+        .prompts_started
+        .checked_add(1)
         .ok_or_else(|| failure("GOAL_BUDGET", "prompt counter overflow"))?;
     record.in_flight = true;
     Ok(record)
@@ -540,7 +590,10 @@ fn prompt_for(record: &Record) -> String {
     } else {
         "Continue from the existing conversation. Do not replay completed tool operations. Verify the remaining deliverables."
     };
-    format!("Goal {}:\n{}\n\n{}", record.id, record.objective, instruction)
+    format!(
+        "Goal {}:\n{}\n\n{}",
+        record.id, record.objective, instruction
+    )
 }
 
 fn check_intent(ticket: &GoalSnapshot, observed: &GoalSnapshot) -> Result<()> {
@@ -552,15 +605,21 @@ fn check_intent(ticket: &GoalSnapshot, observed: &GoalSnapshot) -> Result<()> {
         || ticket.record != record
         || observed.tokens_spent() < ticket.tokens_spent()
     {
-        return Err(failure("GOAL_STALE", "goal intent or session changed during the prompt"));
+        return Err(failure(
+            "GOAL_STALE",
+            "goal intent or session changed during the prompt",
+        ));
     }
     Ok(())
 }
 
 fn verify_current(handle: &AgentSessionHandle, expected: &GoalSnapshot) -> Result<()> {
     let store = handle.session_store();
-    let session = store.try_lock().map_err(|_| failure("GOAL_BUSY", "session is busy"))?;
-    let (id, record) = latest(&session)?.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+    let session = store
+        .try_lock()
+        .map_err(|_| failure("GOAL_BUSY", "session is busy"))?;
+    let (id, record) =
+        latest(&session)?.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
     check_snapshot(expected, &store, &session, &id, &record)
 }
 
@@ -570,7 +629,11 @@ fn settle_record(mut record: Record, decision: GoalDecision) -> Result<Record> {
     }
     let (note, status) = match decision {
         GoalDecision::Continue { instruction } => {
-            let status = if record.exhausted() { GoalStatus::BudgetLimited } else { GoalStatus::Active };
+            let status = if record.exhausted() {
+                GoalStatus::BudgetLimited
+            } else {
+                GoalStatus::Active
+            };
             (instruction, status)
         }
         GoalDecision::Pause { reason } => (reason, GoalStatus::Paused),
@@ -592,8 +655,11 @@ async fn write_attempt(
     let enabled = handle.session().save_enabled();
     check_owner(owner, enabled)?;
     let store = handle.session_store();
-    let mut session = store.try_lock_owned().map_err(|_| failure("GOAL_BUSY", "session is busy"))?;
-    let (id, record) = latest(&session)?.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+    let mut session = store
+        .try_lock_owned()
+        .map_err(|_| failure("GOAL_BUSY", "session is busy"))?;
+    let (id, record) =
+        latest(&session)?.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
     check_snapshot(expected, &store, &session, &id, &record)?;
     let record = edit(record)?;
     check_owner(owner, enabled)?;
@@ -604,7 +670,11 @@ async fn write_attempt(
     Ok(GoalChange { goal, persistence })
 }
 
-async fn start_attempt(handle: &mut AgentSessionHandle, owner: &AgentCx, expected: &GoalSnapshot) -> Result<GoalChange> {
+async fn start_attempt(
+    handle: &mut AgentSessionHandle,
+    owner: &AgentCx,
+    expected: &GoalSnapshot,
+) -> Result<GoalChange> {
     write_attempt(handle, owner, expected, prepare_intent).await
 }
 
@@ -619,13 +689,16 @@ async fn settle_attempt(
     let enabled = handle.session().save_enabled();
     check_owner(owner, enabled)?;
     let store = handle.session_store();
-    let mut session = store.try_lock_owned().map_err(|_| failure("GOAL_BUSY", "session is busy"))?;
+    let mut session = store
+        .try_lock_owned()
+        .map_err(|_| failure("GOAL_BUSY", "session is busy"))?;
     let (goal, late_stop) = {
         // Pause and completion have one linearization boundary. A pause that
         // wins this lock cannot be overwritten by an already computed verdict.
         // The synchronous guard is gone before persistence can suspend.
         let state = control.lock();
-        let (id, record) = latest(&session)?.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
+        let (id, record) =
+            latest(&session)?.ok_or_else(|| failure("GOAL_MISSING", "this branch has no goal"))?;
         check_snapshot(expected, &store, &session, &id, &record)?;
         let late_stop = if state.token_limit_reached {
             Some(GoalRunStop::BudgetLimited)

@@ -20,19 +20,29 @@ fn error(code: &str, message: &str) -> Error {
 }
 
 fn checkpoint(owner: &AgentCx) -> Result<()> {
-    owner.checkpoint().map_err(|_| error("URL_READ_CANCELLED", "document retrieval was cancelled"))
+    owner
+        .checkpoint()
+        .map_err(|_| error("URL_READ_CANCELLED", "document retrieval was cancelled"))
 }
 
 fn http_url(input: &str) -> Result<Url> {
     if input.len() > MAX_URL_BYTES || input.chars().any(char::is_control) || input.contains('\\') {
-        return Err(error("URL_READ_URL", "URL exceeds 16 KiB or contains control/backslash characters"));
+        return Err(error(
+            "URL_READ_URL",
+            "URL exceeds 16 KiB or contains control/backslash characters",
+        ));
     }
-    let mut url = Url::parse(input)
-        .map_err(|_| error("URL_READ_URL", "invalid absolute HTTP(S) URL"))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host().is_none()
-        || !url.username().is_empty() || url.password().is_some()
+    let mut url =
+        Url::parse(input).map_err(|_| error("URL_READ_URL", "invalid absolute HTTP(S) URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
     {
-        return Err(error("URL_READ_URL", "use an HTTP(S) URL without embedded credentials"));
+        return Err(error(
+            "URL_READ_URL",
+            "use an HTTP(S) URL without embedded credentials",
+        ));
     }
     url.set_fragment(None);
     if url.as_str().len() > MAX_URL_BYTES {
@@ -43,9 +53,15 @@ fn http_url(input: &str) -> Result<Url> {
 
 fn private_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
-    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-        || ip.is_broadcast() || ip.is_documentation() || ip.is_multicast()
-        || a == 0 || a >= 240
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || a == 0
+        || a >= 240
         || a == 100 && b & 0xc0 == 0x40
         || a == 198 && matches!(b, 18 | 19)
         || a == 192 && b == 0 && c == 0
@@ -56,7 +72,9 @@ fn private_v6(ip: Ipv6Addr) -> bool {
         return private_v4(v4);
     }
     let segments = ip.segments();
-    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
         || segments[0] & 0xffc0 == 0xfe80
         || segments[0] & 0xffc0 == 0xfec0
         || segments[0] & 0xfe00 == 0xfc00
@@ -84,7 +102,10 @@ pub fn host_is_private_target(input: &str) -> bool {
 
 fn admit(url: &Url, policy: SsrfPolicy) -> Result<()> {
     if policy == SsrfPolicy::BlockPrivateTargets && private_host(url) {
-        return Err(error("SSRF_BLOCKED", "refusing a private/loopback/link-local target; read.urlAllowPrivateTargets=true explicitly opts out"));
+        return Err(error(
+            "SSRF_BLOCKED",
+            "refusing a private/loopback/link-local target; read.urlAllowPrivateTargets=true explicitly opts out",
+        ));
     }
     Ok(())
 }
@@ -103,21 +124,35 @@ pub fn github_blob_to_raw(input: &str) -> Option<String> {
     }
     for component in &parts[..2] {
         if matches!(*component, "." | "..")
-            || !component.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         {
             return None;
         }
     }
-    let target = format!("https://raw.githubusercontent.com/{}/{}/{}/{}",
-        parts[0], parts[1], parts[3], parts[4..].join("/"));
+    let target = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/{}",
+        parts[0],
+        parts[1],
+        parts[3],
+        parts[4..].join("/")
+    );
     http_url(&target).ok().map(|url| url.to_string())
 }
 
 pub(super) fn resolve_redirect(base: &str, location: &str) -> Result<String> {
-    if location.len() > MAX_URL_BYTES || location.chars().any(char::is_control) || location.contains('\\') {
-        return Err(error("URL_READ_REDIRECT", "invalid or oversized Location header"));
+    if location.len() > MAX_URL_BYTES
+        || location.chars().any(char::is_control)
+        || location.contains('\\')
+    {
+        return Err(error(
+            "URL_READ_REDIRECT",
+            "invalid or oversized Location header",
+        ));
     }
-    let next = http_url(base)?.join(location.trim())
+    let next = http_url(base)?
+        .join(location.trim())
         .map_err(|_| error("URL_READ_REDIRECT", "cannot resolve Location header"))?;
     http_url(next.as_str()).map(|url| url.to_string())
 }
@@ -134,8 +169,12 @@ struct Route {
 impl Route {
     fn new(input: &str, policy: SsrfPolicy, mode: UrlReadMode) -> Result<Self> {
         let mut route = Self {
-            current: http_url(input)?, visited: HashSet::new(), redirects: 0,
-            mode, policy, github_source: false,
+            current: http_url(input)?,
+            visited: HashSet::new(),
+            redirects: 0,
+            mode,
+            policy,
+            github_source: false,
         };
         route.enter()?;
         Ok(route)
@@ -144,7 +183,10 @@ impl Route {
     fn remember(&mut self) -> Result<()> {
         admit(&self.current, self.policy)?;
         if !self.visited.insert(self.current.as_str().to_owned()) {
-            return Err(error("URL_READ_REDIRECT_LOOP", "redirect revisits an already requested document"));
+            return Err(error(
+                "URL_READ_REDIRECT_LOOP",
+                "redirect revisits an already requested document",
+            ));
         }
         Ok(())
     }
@@ -188,21 +230,33 @@ impl Route {
             });
         }
         if self.mode == UrlReadMode::Raw {
-            return Ok(super::raw_bytes(self.current.as_str(), content_type, bytes, truncated));
+            return Ok(super::raw_bytes(
+                self.current.as_str(),
+                content_type,
+                bytes,
+                truncated,
+            ));
         }
         // Repository HTML is source code, not a page to strip. Documents retain
         // their specialized readers; ordinary files stay text.
         if self.github_source
-            && !matches!(super::classify(self.current.as_str(), content_type, bytes),
-                UrlContentKind::Pdf | UrlContentKind::Notebook
-                    | UrlContentKind::Docx | UrlContentKind::Pptx | UrlContentKind::Xlsx
-                    | UrlContentKind::Epub)
+            && !matches!(
+                super::classify(self.current.as_str(), content_type, bytes),
+                UrlContentKind::Pdf
+                    | UrlContentKind::Notebook
+                    | UrlContentKind::Docx
+                    | UrlContentKind::Pptx
+                    | UrlContentKind::Xlsx
+                    | UrlContentKind::Epub
+            )
         {
             return Ok(UrlReadOutcome {
                 content: String::from_utf8_lossy(bytes).into_owned(),
-                kind: UrlContentKind::PlainText, extractor: "github-blob-raw",
+                kind: UrlContentKind::PlainText,
+                extractor: "github-blob-raw",
                 final_url: self.current.as_str().to_owned(),
-                wire_content_type: content_type.to_owned(), download_truncated: truncated,
+                wire_content_type: content_type.to_owned(),
+                download_truncated: truncated,
             });
         }
         super::convert_bytes(self.current.as_str(), content_type, bytes, truncated)
@@ -218,11 +272,20 @@ pub async fn fetch(input: &str, policy: SsrfPolicy, mode: UrlReadMode) -> Result
     let owner = AgentCx::for_current_or_request();
     let operation = retrieve(route, &owner);
     match timeout {
-        Some(timeout) => crate::text_completion::with_timeout(timeout, operation).await
+        Some(timeout) => crate::text_completion::with_timeout(timeout, operation)
+            .await
             .map_err(|stop| match stop {
-                crate::text_completion::RequestStop::TimedOut => error("URL_READ_TIMEOUT", "document retrieval exceeded its whole-operation deadline"),
-                crate::text_completion::RequestStop::Cancelled => error("URL_READ_CANCELLED", "document retrieval was cancelled"),
-                crate::text_completion::RequestStop::TimeUnavailable => error("URL_READ_DENIED", "document retrieval requires time authority"),
+                crate::text_completion::RequestStop::TimedOut => error(
+                    "URL_READ_TIMEOUT",
+                    "document retrieval exceeded its whole-operation deadline",
+                ),
+                crate::text_completion::RequestStop::Cancelled => {
+                    error("URL_READ_CANCELLED", "document retrieval was cancelled")
+                }
+                crate::text_completion::RequestStop::TimeUnavailable => error(
+                    "URL_READ_DENIED",
+                    "document retrieval requires time authority",
+                ),
             })?,
         None => owner.with_current(operation).await,
     }
@@ -232,18 +295,29 @@ async fn retrieve(mut route: Route, owner: &AgentCx) -> Result<UrlReadOutcome> {
     let client = Client::new();
     loop {
         checkpoint(owner)?;
-        let response = client.get(route.current.as_str())
+        let response = client
+            .get(route.current.as_str())
             .header("User-Agent", "pi_agent_rust/0.2 (url read)")
-            .header("Accept", "text/html,application/pdf,text/plain,application/json,*/*")
-            .send().await
+            .header(
+                "Accept",
+                "text/html,application/pdf,text/plain,application/json,*/*",
+            )
+            .send()
+            .await
             .map_err(|_| error("URL_READ_FETCH", "HTTP request failed"))?;
         checkpoint(owner)?;
         let status = response.status();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            let mut locations = response.headers().iter()
+            let mut locations = response
+                .headers()
+                .iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case("location"));
-            let location = locations.next()
-                .ok_or_else(|| error("URL_READ_REDIRECT", "redirect response has no Location header"))?;
+            let location = locations.next().ok_or_else(|| {
+                error(
+                    "URL_READ_REDIRECT",
+                    "redirect response has no Location header",
+                )
+            })?;
             if locations.next().is_some() {
                 return Err(error("URL_READ_REDIRECT", "ambiguous Location headers"));
             }
@@ -252,18 +326,25 @@ async fn retrieve(mut route: Route, owner: &AgentCx) -> Result<UrlReadOutcome> {
             continue;
         }
         if !(200..300).contains(&status) {
-            return Err(Error::tool("read", format!("[URL_READ_HTTP] HTTP {status} fetching document")));
+            return Err(Error::tool(
+                "read",
+                format!("[URL_READ_HTTP] HTTP {status} fetching document"),
+            ));
         }
-        let content_type = response.headers().iter()
+        let content_type = response
+            .headers()
+            .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.clone()).unwrap_or_default();
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         let mut truncated = false;
         let mut chunks = 0usize;
         while let Some(chunk) = stream.next().await {
             checkpoint(owner)?;
-            let chunk = chunk.map_err(|_| error("URL_READ_BODY", "response body did not complete"))?;
+            let chunk =
+                chunk.map_err(|_| error("URL_READ_BODY", "response body did not complete"))?;
             let remaining = MAX_DOWNLOAD_BYTES.saturating_sub(bytes.len());
             if chunk.len() > remaining {
                 bytes.extend_from_slice(&chunk[..remaining]);
@@ -276,12 +357,15 @@ async fn retrieve(mut route: Route, owner: &AgentCx) -> Result<UrlReadOutcome> {
                 // Ready chunk streams must yield to the enclosing owner timer.
                 let mut yielded = false;
                 std::future::poll_fn(|cx| {
-                    if yielded { std::task::Poll::Ready(()) } else {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
                         yielded = true;
                         cx.waker().wake_by_ref();
                         std::task::Poll::Pending
                     }
-                }).await;
+                })
+                .await;
             }
         }
         drop(stream);

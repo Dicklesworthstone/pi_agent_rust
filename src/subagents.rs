@@ -24,8 +24,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-mod bundled;
 mod background;
+mod bundled;
 mod deadline;
 #[cfg(test)]
 mod deadline_tests;
@@ -35,9 +35,9 @@ mod execution;
 mod execution_tests;
 mod protocol;
 mod seance;
-mod workspace;
-mod workflow;
 mod worker;
+mod workflow;
+mod workspace;
 
 use deadline::Deadline;
 use execution::ChildRunner;
@@ -176,7 +176,9 @@ impl RevivalSpec {
     }
 
     fn check_launch_admission(&self) -> Result<()> {
-        self.launch_admission.as_ref().map_or(Ok(()), |check| check())
+        self.launch_admission
+            .as_ref()
+            .map_or(Ok(()), |check| check())
     }
 }
 
@@ -280,8 +282,13 @@ impl SubagentTool {
     /// Configure privacy for saved-session consultation through direct SDK
     /// calls. Live Agent calls use the invoking session's current vault.
     #[must_use]
-    pub fn with_secrets_settings(mut self, settings: Option<&crate::secrets::SecretsSettings>) -> Self {
-        self.privacy = Some(crate::text_completion::AuxiliaryPrivacy::from_settings(settings));
+    pub fn with_secrets_settings(
+        mut self,
+        settings: Option<&crate::secrets::SecretsSettings>,
+    ) -> Self {
+        self.privacy = Some(crate::text_completion::AuxiliaryPrivacy::from_settings(
+            settings,
+        ));
         self
     }
 
@@ -471,13 +478,19 @@ struct PreparedRequest {
 
 impl PreparedRequest {
     async fn run(self, on_update: Option<UpdateCallback>) -> Vec<SubagentResult> {
-        let Self { runner, agents, mode, concurrency, .. } = self;
+        let Self {
+            runner,
+            agents,
+            mode,
+            concurrency,
+            ..
+        } = self;
         match mode {
-            RequestMode::Single(task) => vec![
-                runner.run_one(&agents, task, None, on_update).await,
-            ],
+            RequestMode::Single(task) => vec![runner.run_one(&agents, task, None, on_update).await],
             RequestMode::Parallel(tasks) => {
-                runner.run_parallel(&agents, tasks, concurrency, on_update).await
+                runner
+                    .run_parallel(&agents, tasks, concurrency, on_update)
+                    .await
             }
             RequestMode::Chain(tasks) => {
                 let mut previous: Option<SubagentResult> = None;
@@ -485,12 +498,7 @@ impl PreparedRequest {
                 for (step, task) in tasks.into_iter().enumerate() {
                     let task = task.with_rendered_previous_result(previous.as_ref());
                     let result = runner
-                        .run_one(
-                            &agents,
-                            task,
-                            Some(step + 1),
-                            on_update.clone(),
-                        )
+                        .run_one(&agents, task, Some(step + 1), on_update.clone())
                         .await;
                     let failed = result.is_error;
                     previous = Some(result.clone());
@@ -579,14 +587,17 @@ impl Tool for SubagentTool {
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let privacy = self.privacy.clone()
+        let privacy = self
+            .privacy
+            .clone()
             .unwrap_or_else(|| crate::text_completion::AuxiliaryPrivacy::from_settings(None));
         if worker::requested(&input)? {
             return worker::execute(
                 self,
                 input,
                 crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
-            ).await;
+            )
+            .await;
         }
         if background::requested(&input)? {
             return background::start(
@@ -597,7 +608,8 @@ impl Tool for SubagentTool {
             .await;
         }
         let protect = |parts: &[&str]| crate::text_completion::redact_inputs(parts, &privacy);
-        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect).await
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect)
+            .await
     }
 
     async fn execute_with_invocation(
@@ -687,11 +699,7 @@ impl Tool for SubagentTool {
     }
 }
 
-fn result_output(
-    results: Vec<SubagentResult>,
-    mode: &str,
-    structured_results: bool,
-) -> ToolOutput {
+fn result_output(results: Vec<SubagentResult>, mode: &str, structured_results: bool) -> ToolOutput {
     let is_error = results.iter().any(|result| result.is_error);
     let mut content = render_results(&results);
     if structured_results {
@@ -1005,12 +1013,23 @@ fn load_agent_dir(
     })?;
     let mut paths = Vec::new();
     for entry in entries {
-        let path = entry.map_err(|error| {
-            Error::tool("subagent", format!("Cannot enumerate agent definitions: {error}"))
-        })?.path();
-        if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("md")) {
+        let path = entry
+            .map_err(|error| {
+                Error::tool(
+                    "subagent",
+                    format!("Cannot enumerate agent definitions: {error}"),
+                )
+            })?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
             if paths.len() >= definition::MAX_DEFINITIONS {
-                return Err(Error::tool("subagent", "PI_AGENT_DEFINITION_LIMIT: too many agent definitions in one directory"));
+                return Err(Error::tool(
+                    "subagent",
+                    "PI_AGENT_DEFINITION_LIMIT: too many agent definitions in one directory",
+                ));
             }
             paths.push(path);
         }
@@ -1020,7 +1039,10 @@ fn load_agent_dir(
     for path in paths {
         let agent = definition::read(&path, source)?;
         if !names.insert(agent.name.clone()) {
-            return Err(Error::tool("subagent", "PI_AGENT_DEFINITION_DUPLICATE: two files declare the same agent name in one directory"));
+            return Err(Error::tool(
+                "subagent",
+                "PI_AGENT_DEFINITION_DUPLICATE: two files declare the same agent name in one directory",
+            ));
         }
         agents.insert(agent.name.clone(), agent);
     }
@@ -1044,7 +1066,12 @@ fn child_args(
     output_schema: Option<&Value>,
 ) -> Vec<OsString> {
     let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
-    args.extend(child_options(agent, role_model_spec, parent_model, output_schema));
+    args.extend(child_options(
+        agent,
+        role_model_spec,
+        parent_model,
+        output_schema,
+    ));
     args.push(format!("Task: {task}").into());
     args
 }
@@ -1079,16 +1106,20 @@ fn child_options(
     }
     let consultant = seance::is_consultant(agent);
     if consultant {
-        args.extend([
-            "--no-mcp",
-            "--no-extensions",
-            "--no-skills",
-            "--no-context-files",
-            "--no-prompt-templates",
-            "--no-themes",
-            "--no-migrations",
-            "--hide-cwd-in-prompt",
-        ].into_iter().map(OsString::from));
+        args.extend(
+            [
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-migrations",
+                "--hide-cwd-in-prompt",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
     }
     // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
     // spec from settings > captured active parent > ambient configuration.
@@ -1129,7 +1160,11 @@ fn child_options(
     if let Some(prompt) = appended_prompt {
         // The historical consultant owns the entire prompt. Ordinary agents
         // continue appending their definitions to the host's context.
-        let flag = if consultant { "--system-prompt" } else { "--append-system-prompt" };
+        let flag = if consultant {
+            "--system-prompt"
+        } else {
+            "--append-system-prompt"
+        };
         args.extend([flag.into(), prompt.into()]);
     }
     args
@@ -1908,7 +1943,10 @@ mod tests {
     fn structured_block_disabled_by_default_keeps_output_byte_identical() {
         let output = execute_unknown_agent(false);
         let text = output_text(&output);
-        assert_eq!(text, "## missing-agent-fixture\nUnknown agent: missing-agent-fixture");
+        assert_eq!(
+            text,
+            "## missing-agent-fixture\nUnknown agent: missing-agent-fixture"
+        );
         assert!(!text.contains(STRUCTURED_BLOCK_OPEN));
         assert!(output.is_error);
     }

@@ -106,8 +106,7 @@ fn duplicate_argument_rejects_the_entire_parallel_tool_batch() {
 
 #[test]
 fn duplicate_argument_diagnostic_does_not_echo_private_payload() {
-    let raw =
-        r#"{"private-key":"private-first","private-key":"private-second"}"#;
+    let raw = r#"{"private-key":"private-first","private-key":"private-second"}"#;
     let mut state = state();
     feed(
         &mut state,

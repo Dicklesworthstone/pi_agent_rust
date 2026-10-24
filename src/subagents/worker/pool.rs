@@ -230,10 +230,14 @@ async fn start(
         .remove(&name)
         .ok_or_else(|| invalid("unknown agent definition"))?;
     let schema = input.get("outputSchema").or(agent.output_schema.as_ref());
-    if input.get("schemaMode").is_some_and(|mode| mode.as_str() != Some("strict"))
+    if input
+        .get("schemaMode")
+        .is_some_and(|mode| mode.as_str() != Some("strict"))
         || (input.get("schemaMode").is_some() && schema.is_none())
     {
-        return Err(invalid("retained output contracts require a schema and strict mode; no corrective retries"));
+        return Err(invalid(
+            "retained output contracts require a schema and strict mode; no corrective retries",
+        ));
     }
     // Every member receives this same owned definition. Validate the complete
     // contract before registering the pool or publishing its carrier; the
@@ -426,7 +430,10 @@ fn prepare_batch(
                     } else {
                         u64::MAX
                     }),
-                    window: worker.context_window.filter(|window| *window > 0).unwrap_or(1),
+                    window: worker
+                        .context_window
+                        .filter(|window| *window > 0)
+                        .unwrap_or(1),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -639,15 +646,21 @@ pub(super) async fn execute(
             let expired = started.elapsed() >= Duration::from_millis(timeout_ms);
             let output = drain_snapshot(&pool, request, &privacy, expired)?;
             let details = output.details.as_ref().ok_or_else(stopped)?;
-            let ready = details.get("items").and_then(Value::as_array)
+            let ready = details
+                .get("items")
+                .and_then(Value::as_array)
                 .is_some_and(|items| !items.is_empty())
                 || details.get("done").and_then(Value::as_bool) == Some(true);
             if ready || expired {
                 return Ok(output);
             }
-            owner.time().sleep(
-                POLL_INTERVAL.min(Duration::from_millis(timeout_ms).saturating_sub(started.elapsed())),
-            ).await;
+            owner
+                .time()
+                .sleep(
+                    POLL_INTERVAL
+                        .min(Duration::from_millis(timeout_ms).saturating_sub(started.elapsed())),
+                )
+                .await;
             continue;
         }
         let output = snapshot(&pool, selected, &privacy)?;
@@ -692,24 +705,38 @@ impl DrainRequest {
             if cursor.get("schema").and_then(Value::as_str) != Some(CURSOR_SCHEMA)
                 || cursor.get("poolId").and_then(Value::as_str) != Some(pool_id)
             {
-                return Err(invalid("cursor must identify this pool with the native cursor schema"));
+                return Err(invalid(
+                    "cursor must identify this pool with the native cursor schema",
+                ));
             }
-            let ids = cursor.get("itemIds").and_then(Value::as_array)
+            let ids = cursor
+                .get("itemIds")
+                .and_then(Value::as_array)
                 .filter(|ids| ids.len() <= MAX_ITEMS)
-                .ok_or_else(|| invalid("cursor itemIds must be a sorted array of at most 32 IDs"))?;
+                .ok_or_else(|| {
+                    invalid("cursor itemIds must be a sorted array of at most 32 IDs")
+                })?;
             for value in ids {
-                let id = value.as_u64().filter(|id| (1..=MAX_TURNS).contains(id))
+                let id = value
+                    .as_u64()
+                    .filter(|id| (1..=MAX_TURNS).contains(id))
                     .ok_or_else(|| invalid("cursor item IDs must be integers from 1 to 32"))?;
                 if acknowledged.last().is_some_and(|previous| *previous >= id) {
-                    return Err(invalid("cursor item IDs must be strictly increasing without duplicates"));
+                    return Err(invalid(
+                        "cursor item IDs must be strictly increasing without duplicates",
+                    ));
                 }
                 acknowledged.push(id);
             }
         }
         let max_items = usize::try_from(
             optional_integer(input, "maxItems", 1, MAX_DRAIN_ITEMS)?.unwrap_or(MAX_DRAIN_ITEMS),
-        ).map_err(|_| invalid("maxItems must be from 1 to 4"))?;
-        Ok(Self { acknowledged, max_items })
+        )
+        .map_err(|_| invalid("maxItems must be from 1 to 4"))?;
+        Ok(Self {
+            acknowledged,
+            max_items,
+        })
     }
 }
 
@@ -728,13 +755,19 @@ fn drain_snapshot(
 ) -> Result<ToolOutput> {
     let (value, policies) = {
         let state = pool.lock().map_err(|_| stopped())?;
-        let workers = state.workers.iter()
+        let workers = state
+            .workers
+            .iter()
             .map(|worker| worker.lock().map_err(|_| stopped()))
             .collect::<Result<Vec<_>>>()?;
-        if request.acknowledged.last().is_some_and(|id| {
-            usize::try_from(*id).map_or(true, |id| id > state.items.len())
-        }) {
-            return Err(invalid("cursor acknowledges an item not admitted by this pool"));
+        if request
+            .acknowledged
+            .last()
+            .is_some_and(|id| usize::try_from(*id).map_or(true, |id| id > state.items.len()))
+        {
+            return Err(invalid(
+                "cursor acknowledges an item not admitted by this pool",
+            ));
         }
         let mut settled = 0usize;
         let mut unseen = 0usize;
@@ -783,25 +816,48 @@ fn drain_snapshot(
         details = policy.project_json(&details)?;
     }
     let identity_preserved = [
-        "schema", "poolId", "jobId", "agent", "status", "sealed", "admittedItems",
-        "settledItems", "pendingItems", "cursor", "nextCursor", "hasMore", "done", "timedOut",
-    ].iter().all(|key| value.get(key) == details.get(key));
-    let results_preserved = value.get("items").and_then(Value::as_array)
+        "schema",
+        "poolId",
+        "jobId",
+        "agent",
+        "status",
+        "sealed",
+        "admittedItems",
+        "settledItems",
+        "pendingItems",
+        "cursor",
+        "nextCursor",
+        "hasMore",
+        "done",
+        "timedOut",
+    ]
+    .iter()
+    .all(|key| value.get(key) == details.get(key));
+    let results_preserved = value
+        .get("items")
+        .and_then(Value::as_array)
         .zip(details.get("items").and_then(Value::as_array))
-        .is_some_and(|(before, after)| before.len() == after.len()
-            && before.iter().zip(after).all(|(before, after)| {
-                before.get("id") == after.get("id")
-                    && before.get("status") == after.get("status")
-                    && before.pointer("/result/isError") == after.pointer("/result/isError")
-                    && before.get("result").zip(after.get("result")).is_some_and(|(before, after)| {
-                        super::output_contract::preserves_typed_result(before, after)
-                    })
-                    && after.get("result").is_some_and(|result| {
-                        serde_json::from_value::<ToolOutput>(result.clone()).is_ok()
-                    })
-            }));
+        .is_some_and(|(before, after)| {
+            before.len() == after.len()
+                && before.iter().zip(after).all(|(before, after)| {
+                    before.get("id") == after.get("id")
+                        && before.get("status") == after.get("status")
+                        && before.pointer("/result/isError") == after.pointer("/result/isError")
+                        && before.get("result").zip(after.get("result")).is_some_and(
+                            |(before, after)| {
+                                super::output_contract::preserves_typed_result(before, after)
+                            },
+                        )
+                        && after.get("result").is_some_and(|result| {
+                            serde_json::from_value::<ToolOutput>(result.clone()).is_ok()
+                        })
+                })
+        });
     if !identity_preserved || !results_preserved {
-        return Err(Error::tool("subagent", "PI_SUBAGENT_POOL_PRIVACY: privacy policy withheld pool drain identity"));
+        return Err(Error::tool(
+            "subagent",
+            "PI_SUBAGENT_POOL_PRIVACY: privacy policy withheld pool drain identity",
+        ));
     }
     let output = ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new(
@@ -811,7 +867,10 @@ fn drain_snapshot(
         is_error: false,
     };
     if serde_json::to_vec(&output).map_err(|_| stopped())?.len() > MAX_SNAPSHOT_BYTES {
-        return Err(Error::tool("subagent", "PI_SUBAGENT_POOL_RESULT_LIMIT: projected pool drain exceeded its bounded result budget"));
+        return Err(Error::tool(
+            "subagent",
+            "PI_SUBAGENT_POOL_RESULT_LIMIT: projected pool drain exceeded its bounded result budget",
+        ));
     }
     Ok(output)
 }
@@ -1054,9 +1113,9 @@ fn projected_snapshot_with(
         || value.pointer("/item/id") != details.pointer("/item/id")
         || value.pointer("/item/status") != details.pointer("/item/status")
         || value.pointer("/item/result").is_some_and(|before| {
-            details.pointer("/item/result").is_none_or(|after| {
-                !super::output_contract::preserves_typed_result(before, after)
-            })
+            details
+                .pointer("/item/result")
+                .is_none_or(|after| !super::output_contract::preserves_typed_result(before, after))
         })
     {
         return Err(Error::tool(
@@ -1658,7 +1717,9 @@ done
                 .details
                 .expect("empty manifest"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The aggregate is structurally identical for zero admitted items.
             assert_eq!(manifest.get("items"), Some(&json!([]))); // ubs:ignore[rust.panic.assert-macros] -- An empty pool must not manufacture member results.
-            let page = fixture.call(json!({"operation":"pool_drain","poolId":pool})).await;
+            let page = fixture
+                .call(json!({"operation":"pool_drain","poolId":pool}))
+                .await;
             assert_eq!(page["items"], json!([]));
             assert_eq!(page["done"], true);
             assert_eq!(page["timedOut"], false);
@@ -1777,12 +1838,12 @@ done
             json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[true]}),
             json!({"schema":CURSOR_SCHEMA,"poolId":"pool","itemIds":[],"extra":true}),
         ] {
-            assert!(DrainRequest::parse(&json!({"cursor":cursor}),"pool").is_err());
+            assert!(DrainRequest::parse(&json!({"cursor":cursor}), "pool").is_err());
         }
-        for max_items in [json!(0),json!(5),json!(1.5),json!("2"),Value::Null] {
-            assert!(DrainRequest::parse(&json!({"maxItems":max_items}),"pool").is_err());
+        for max_items in [json!(0), json!(5), json!(1.5), json!("2"), Value::Null] {
+            assert!(DrainRequest::parse(&json!({"maxItems":max_items}), "pool").is_err());
         }
-        let request = DrainRequest::parse(&json!({}),"pool").expect("empty acknowledgment");
+        let request = DrainRequest::parse(&json!({}), "pool").expect("empty acknowledgment");
         assert!(request.acknowledged.is_empty());
         assert_eq!(request.max_items, 4);
     }
@@ -1790,7 +1851,8 @@ done
     #[test]
     fn idle_pool_assignment_uses_current_context_pressure_after_compaction() {
         let _guard = crate::jobs::process_test_guard();
-        let fixture = Fixture::new(r#"
+        let fixture = Fixture::new(
+            r#"
 printf '%s\n' "$$" >> launches
 memory=empty
 tokens=0
@@ -1815,7 +1877,8 @@ while IFS= read -r line; do
             ;;
     esac
 done
-"#);
+"#,
+        );
         runtime().block_on(async {
             let started = fixture.call(json!({"operation":"pool_start","agent":"worker","concurrency":2,"tasks":["wide context","narrow context"]})).await;
             let pool = field(&started, "poolId");
@@ -1846,13 +1909,39 @@ done
 
     #[test]
     fn busy_workers_balance_queue_depth_without_context_reassignment() {
-        let idle = WorkerLoad { index: 0, active: 0, latest: 20, available: true, tokens: 99, window: 100 };
-        let busy = WorkerLoad { index: 1, active: 1, latest: 1, available: true, tokens: 1, window: 100 };
+        let idle = WorkerLoad {
+            index: 0,
+            active: 0,
+            latest: 20,
+            available: true,
+            tokens: 99,
+            window: 100,
+        };
+        let busy = WorkerLoad {
+            index: 1,
+            active: 1,
+            latest: 1,
+            available: true,
+            tokens: 1,
+            window: 100,
+        };
         assert!(idle.compare(&busy).is_lt());
         let queued = WorkerLoad { active: 2, ..idle };
         assert!(busy.compare(&queued).is_lt());
-        let unknown = WorkerLoad { index: 0, active: 0, latest: 1, available: true, tokens: u64::MAX, window: 1 };
-        let known = WorkerLoad { active: 0, tokens: u64::MAX, window: u64::MAX, ..busy };
+        let unknown = WorkerLoad {
+            index: 0,
+            active: 0,
+            latest: 1,
+            available: true,
+            tokens: u64::MAX,
+            window: 1,
+        };
+        let known = WorkerLoad {
+            active: 0,
+            tokens: u64::MAX,
+            window: u64::MAX,
+            ..busy
+        };
         assert!(known.compare(&unknown).is_lt());
     }
 }

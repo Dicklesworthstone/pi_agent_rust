@@ -27,7 +27,9 @@ impl ToolInvocationHost for Host {
             return Err(Error::tool("jobs", "fixture current host denied"));
         }
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new("controlled job observation"))],
+            content: vec![ContentBlock::Text(TextContent::new(
+                "controlled job observation",
+            ))],
             details: Some(self.snapshot.lock().expect("snapshot").clone()),
             is_error: false,
         })
@@ -69,13 +71,18 @@ fn completed() -> Value {
 
 fn runtime() -> asupersync::runtime::Runtime {
     asupersync::runtime::RuntimeBuilder::current_thread()
-        .blocking_threads(1, 8).build().expect("native runtime")
+        .blocking_threads(1, 8)
+        .build()
+        .expect("native runtime")
 }
 fn kernels() -> Vec<&'static str> {
     let mut result = vec!["js"];
-    if std::process::Command::new("python3").arg("--version")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().is_ok_and(|status| status.success())
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
     {
         result.push("python");
     }
@@ -84,17 +91,36 @@ fn kernels() -> Vec<&'static str> {
 fn fixture(root: &std::path::Path) -> (EvalTool, Host) {
     let mut tool = EvalTool::new(root);
     tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed("batch-drain-handles"));
-    (tool, Host {snapshot:Mutex::new(partial("running")),calls:Mutex::new(Vec::new()),enabled:AtomicBool::new(true)})
+    (
+        tool,
+        Host {
+            snapshot: Mutex::new(partial("running")),
+            calls: Mutex::new(Vec::new()),
+            enabled: AtomicBool::new(true),
+        },
+    )
 }
 fn text(output: &ToolOutput) -> String {
-    output.content.iter().filter_map(|block| match block {
-        ContentBlock::Text(text) => Some(text.text.as_str()), _ => None,
-    }).collect()
+    output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 async fn cell(tool: &EvalTool, host: &Host, kernel: &str, code: &str, reset: bool) -> ToolOutput {
     let protect = |parts: &[&str]| Ok(parts.iter().map(|part| (*part).to_owned()).collect());
-    tool.execute_with_host("batch-drain",json!({"kernel":kernel,"code":code,"reset":reset}),
-        None,&protect,host).await.expect("native eval outcome")
+    tool.execute_with_host(
+        "batch-drain",
+        json!({"kernel":kernel,"code":code,"reset":reset}),
+        None,
+        &protect,
+        host,
+    )
+    .await
+    .expect("native eval outcome")
 }
 const JS_ATTACH: &str = "globalThis.batch = await judgeBatch.attach('batch-fixture');";
 const PY_ATTACH: &str = "batch = await judge_batch.attach('batch-fixture')";
@@ -103,7 +129,7 @@ const PY_ATTACH: &str = "batch = await judge_batch.attach('batch-fixture')";
 fn both_kernels_replay_unacknowledged_pages_and_advance_only_an_explicit_cursor() {
     for kernel in kernels() {
         let root = tempfile::tempdir().expect("fixture");
-        let (tool,host) = fixture(root.path());
+        let (tool, host) = fixture(root.path());
         runtime().block_on(async {
             let setup = if kernel == "js" {JS_ATTACH} else {PY_ATTACH};
             assert!(!cell(&tool,&host,kernel,setup,false).await.is_error);
@@ -131,7 +157,7 @@ fn both_kernels_replay_unacknowledged_pages_and_advance_only_an_explicit_cursor(
 fn reset_reinstalls_the_handle_method_and_accepts_an_externally_saved_cursor() {
     for kernel in kernels() {
         let root = tempfile::tempdir().expect("fixture");
-        let (tool,host) = fixture(root.path());
+        let (tool, host) = fixture(root.path());
         runtime().block_on(async {
             let setup = if kernel == "js" {
                 format!("{JS_ATTACH} globalThis.cursor=(await batch.drain({{timeout:0}})).cursor; display(cursor);")
@@ -160,16 +186,38 @@ fn reset_reinstalls_the_handle_method_and_accepts_an_externally_saved_cursor() {
 #[test]
 fn current_policy_refusal_is_recorded_and_a_retained_handle_cannot_bypass_it() {
     for kernel in kernels() {
-        let root=tempfile::tempdir().expect("fixture");let (tool,host)=fixture(root.path());
+        let root = tempfile::tempdir().expect("fixture");
+        let (tool, host) = fixture(root.path());
         runtime().block_on(async {
-            assert!(!cell(&tool,&host,kernel,if kernel=="js" {JS_ATTACH} else {PY_ATTACH},false).await.is_error);
-            host.enabled.store(false,Ordering::SeqCst);
-            let code=if kernel=="js" {"await batch.drain({timeout:0});"} else {"await batch.drain(timeout=0)"};
-            let output=cell(&tool,&host,kernel,code,false).await;
+            assert!(
+                !cell(
+                    &tool,
+                    &host,
+                    kernel,
+                    if kernel == "js" { JS_ATTACH } else { PY_ATTACH },
+                    false
+                )
+                .await
+                .is_error
+            );
+            host.enabled.store(false, Ordering::SeqCst);
+            let code = if kernel == "js" {
+                "await batch.drain({timeout:0});"
+            } else {
+                "await batch.drain(timeout=0)"
+            };
+            let output = cell(&tool, &host, kernel, code, false).await;
             assert!(output.is_error);
-            assert!(text(&output).contains("EVAL_BATCH_HOST"),"{}",text(&output));
-            assert_eq!(host.calls.lock().expect("calls").len(),2);
-            assert_eq!(output.details.expect("details")["toolCalls"]["calls"][0]["status"],"failed");
+            assert!(
+                text(&output).contains("EVAL_BATCH_HOST"),
+                "{}",
+                text(&output)
+            );
+            assert_eq!(host.calls.lock().expect("calls").len(), 2);
+            assert_eq!(
+                output.details.expect("details")["toolCalls"]["calls"][0]["status"],
+                "failed"
+            );
         });
     }
 }
@@ -177,7 +225,8 @@ fn current_policy_refusal_is_recorded_and_a_retained_handle_cannot_bypass_it() {
 #[test]
 fn interrupted_evidence_remains_incomplete_and_invalid_guest_cursors_do_not_dispatch() {
     for kernel in kernels() {
-        let root=tempfile::tempdir().expect("fixture");let (tool,host)=fixture(root.path());
+        let root = tempfile::tempdir().expect("fixture");
+        let (tool, host) = fixture(root.path());
         runtime().block_on(async {
             assert!(!cell(&tool,&host,kernel,if kernel=="js" {JS_ATTACH} else {PY_ATTACH},false).await.is_error);
             let invalid=if kernel=="js" {"await batch.drain({cursor:{schema:'bad'},timeout:0});"}

@@ -21,11 +21,15 @@ pub(super) struct Options<'a> {
 }
 
 fn word(input: &str) -> (&str, &str) {
-    input.trim_start().split_once(char::is_whitespace)
+    input
+        .trim_start()
+        .split_once(char::is_whitespace)
         .unwrap_or((input.trim_start(), ""))
 }
 
-fn invalid() -> Error { Error::validation(USAGE) }
+fn invalid() -> Error {
+    Error::validation(USAGE)
+}
 
 impl<'a> Options<'a> {
     pub fn parse(args: &'a str) -> Result<Self> {
@@ -34,7 +38,9 @@ impl<'a> Options<'a> {
             return Err(invalid());
         }
         let (verb, mut tail) = word(args.trim());
-        if verb != "--model" { return Err(invalid()); }
+        if verb != "--model" {
+            return Err(invalid());
+        }
         let mut export = None;
         if word(tail).0 == "--export" {
             tail = word(tail).1.trim_start();
@@ -76,8 +82,12 @@ impl<'a> Options<'a> {
 }
 
 fn authorized(owner: &AgentCx) -> Result<()> {
-    owner.checkpoint().map_err(|_| failure("HANDOFF_EXPORT_CANCELLED"))?;
-    if !owner.capabilities().io { return Err(failure("HANDOFF_EXPORT_PERMISSION")); }
+    owner
+        .checkpoint()
+        .map_err(|_| failure("HANDOFF_EXPORT_CANCELLED"))?;
+    if !owner.capabilities().io {
+        return Err(failure("HANDOFF_EXPORT_PERMISSION"));
+    }
     Ok(())
 }
 
@@ -102,30 +112,51 @@ impl Destination {
     pub fn prepare(path: PathBuf) -> Result<Self> {
         let owner = AgentCx::for_current_or_request();
         authorized(&owner)?;
-        let name = path.file_name().ok_or_else(|| failure("HANDOFF_EXPORT_PATH"))?;
-        let parent = path.parent().and_then(|parent| std::fs::canonicalize(parent).ok())
+        let name = path
+            .file_name()
+            .ok_or_else(|| failure("HANDOFF_EXPORT_PATH"))?;
+        let parent = path
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
             .filter(|parent| parent.is_dir())
             .ok_or_else(|| failure("HANDOFF_EXPORT_PATH"))?;
         let path = parent.join(name);
-        if path.to_str().is_none() { return Err(failure("HANDOFF_EXPORT_PATH")); }
+        if path.to_str().is_none() {
+            return Err(failure("HANDOFF_EXPORT_PATH"));
+        }
         require_absent(&path)?;
-        Ok(Self { path, parent, owner })
+        Ok(Self {
+            path,
+            parent,
+            owner,
+        })
     }
 
     pub fn stage(self, bytes: &[u8]) -> Result<Publication> {
         authorized(&self.owner)?;
-        if bytes.len() > MAX_BUNDLE_BYTES { return Err(failure("HANDOFF_EXPORT_LIMIT")); }
-        let mut file = tempfile::Builder::new().prefix(".pi-handoff-")
-            .tempfile_in(&self.parent).map_err(|_| failure("HANDOFF_EXPORT_IO"))?;
+        if bytes.len() > MAX_BUNDLE_BYTES {
+            return Err(failure("HANDOFF_EXPORT_LIMIT"));
+        }
+        let mut file = tempfile::Builder::new()
+            .prefix(".pi-handoff-")
+            .tempfile_in(&self.parent)
+            .map_err(|_| failure("HANDOFF_EXPORT_IO"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|_| failure("HANDOFF_EXPORT_IO"))?;
         }
-        file.write_all(bytes).map_err(|_| failure("HANDOFF_EXPORT_IO"))?;
-        file.as_file().sync_all().map_err(|_| failure("HANDOFF_EXPORT_IO"))?;
-        Ok(Publication { file, destination: self })
+        file.write_all(bytes)
+            .map_err(|_| failure("HANDOFF_EXPORT_IO"))?;
+        file.as_file()
+            .sync_all()
+            .map_err(|_| failure("HANDOFF_EXPORT_IO"))?;
+        Ok(Publication {
+            file,
+            destination: self,
+        })
     }
 }
 
@@ -138,7 +169,10 @@ impl Publication {
     /// The export caller holds its source session lock after rechecking the
     /// snapshot. Import callers own a fully validated, immutable source buffer.
     pub fn publish(self) -> Result<String> {
-        self.publish_named("Saved handoff bundle", "No recipient was contacted and no work was resumed.")
+        self.publish_named(
+            "Saved handoff bundle",
+            "No recipient was contacted and no work was resumed.",
+        )
     }
 
     pub fn publish_session(self) -> Result<String> {
@@ -148,16 +182,23 @@ impl Publication {
 
     fn publish_named(self, label: &str, note: &str) -> Result<String> {
         authorized(&self.destination.owner)?;
-        if std::fs::canonicalize(&self.destination.parent).ok().as_ref()
+        if std::fs::canonicalize(&self.destination.parent)
+            .ok()
+            .as_ref()
             != Some(&self.destination.parent)
         {
             return Err(failure("HANDOFF_EXPORT_PATH"));
         }
         require_absent(&self.destination.path)?;
-        let display = serde_json::to_string(self.destination.path.to_str()
-            .ok_or_else(|| failure("HANDOFF_EXPORT_PATH"))?)?;
+        let display = serde_json::to_string(
+            self.destination
+                .path
+                .to_str()
+                .ok_or_else(|| failure("HANDOFF_EXPORT_PATH"))?,
+        )?;
         let message = format!("{label}: {display}\n{note}");
-        self.file.persist_noclobber(&self.destination.path)
+        self.file
+            .persist_noclobber(&self.destination.path)
             .map_err(|_| failure("HANDOFF_EXPORT_PUBLISH"))?;
         // No fallible operation follows publication. Cancellation afterwards
         // must not misreport an already-published artifact as absent.

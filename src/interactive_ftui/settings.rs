@@ -107,7 +107,10 @@ impl SettingsKey {
             Self::FallbackOn => &[
                 ("any", "Any recoverable provider failure"),
                 ("usage-limit", "Account usage limits only"),
-                ("except-usage-limit", "Failures other than account usage limits"),
+                (
+                    "except-usage-limit",
+                    "Failures other than account usage limits",
+                ),
             ],
             Self::SteeringMode | Self::FollowUpMode => &[
                 ("one-at-a-time", "One message at a time"),
@@ -478,7 +481,9 @@ mod tests {
         settings
             .apply(&mut handle, SettingsKey::ModelFallback, "off")
             .expect("disable model switching");
-        let policy = handle.retry_policy().expect("same-model retries remain enabled");
+        let policy = handle
+            .retry_policy()
+            .expect("same-model retries remain enabled");
         assert!(!policy.model_fallback);
         assert_eq!(policy.max_retries, 7);
 

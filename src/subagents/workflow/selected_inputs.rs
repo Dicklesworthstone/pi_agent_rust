@@ -20,12 +20,20 @@ impl Source {
         needs: &[usize],
     ) -> Result<Self> {
         let resolve = |value: &Value| -> Result<usize> {
-            ids.get(identifier(value)?).copied().filter(|index| needs.contains(index))
-                .ok_or_else(|| invalid("inputs may reference only explicitly named direct dependencies"))
+            ids.get(identifier(value)?)
+                .copied()
+                .filter(|index| needs.contains(index))
+                .ok_or_else(|| {
+                    invalid("inputs may reference only explicitly named direct dependencies")
+                })
         };
         if let Some(value) = fields.get("fromSelected") {
-            let candidates = value.as_array().filter(|values| (2..super::MAX_NODES).contains(&values.len()))
-                .ok_or_else(|| invalid("fromSelected requires 2-31 distinct direct dependency IDs"))?;
+            let candidates = value
+                .as_array()
+                .filter(|values| (2..super::MAX_NODES).contains(&values.len()))
+                .ok_or_else(|| {
+                    invalid("fromSelected requires 2-31 distinct direct dependency IDs")
+                })?;
             let mut seen = BTreeSet::new();
             let mut sources = Vec::with_capacity(candidates.len());
             for candidate in candidates {
@@ -37,7 +45,9 @@ impl Source {
             }
             Ok(Self::Selected(sources))
         } else {
-            let value = fields.get("from").ok_or_else(|| invalid("input source is missing"))?;
+            let value = fields
+                .get("from")
+                .ok_or_else(|| invalid("input source is missing"))?;
             Ok(Self::Exact(resolve(value)?))
         }
     }
@@ -51,7 +61,10 @@ impl Source {
         }
     }
 
-    pub(super) fn data<'a>(&self, records: &'a [Record]) -> std::result::Result<&'a Value, &'static str> {
+    pub(super) fn data<'a>(
+        &self,
+        records: &'a [Record],
+    ) -> std::result::Result<&'a Value, &'static str> {
         let index = match self {
             Self::Exact(index) => *index,
             Self::Selected(indices) => {
@@ -69,20 +82,28 @@ impl Source {
                         _ => return Err("selected_input_dependency_failed"),
                     }
                 }
-                if count > 1 { return Err("selected_input_ambiguous"); }
+                if count > 1 {
+                    return Err("selected_input_ambiguous");
+                }
                 selected.ok_or("selected_input_unavailable")?
             }
         };
-        records.get(index).and_then(Record::validated_data)
+        records
+            .get(index)
+            .and_then(Record::validated_data)
             .ok_or("dependency_data_unavailable")
     }
 }
 
 pub(super) fn validate_join(entry: &Value, inputs: &[Input]) -> Result<()> {
-    if inputs.iter().any(|input| matches!(&input.from, Source::Selected(_)))
+    if inputs
+        .iter()
+        .any(|input| matches!(&input.from, Source::Selected(_)))
         && entry.get("join").and_then(Value::as_str) != Some("selected")
     {
-        return Err(invalid("fromSelected inputs require explicit join:selected on their workflow node"));
+        return Err(invalid(
+            "fromSelected inputs require explicit join:selected on their workflow node",
+        ));
     }
     Ok(())
 }

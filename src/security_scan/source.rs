@@ -72,9 +72,12 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let mut chunk = [0_u8; 64 * 1024];
     loop {
         operation::checkpoint()?;
-        let count = reader.read(&mut chunk)
+        let count = reader
+            .read(&mut chunk)
             .map_err(|_| scan_error(format!("cannot read {}", path.display())))?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         bytes.extend_from_slice(&chunk[..count]);
     }
     operation::checkpoint()?;
@@ -1098,7 +1101,10 @@ impl SecurityScanTool {
         // Pin the publication workspace before scanning or other long work.
         let storage = storage::Storage::open(&self.cwd)?;
         let relative = storage::report_path(
-            input.sarif_out.as_deref().unwrap_or(storage::DEFAULT_REPORT),
+            input
+                .sarif_out
+                .as_deref()
+                .unwrap_or(storage::DEFAULT_REPORT),
         )?;
         let packs = load_rule_packs(&self.cwd)?;
         let outcome = scan_with_packs(&self.cwd, &input.paths, &packs)?;
@@ -1212,8 +1218,8 @@ impl SecurityScanTool {
         let storage = storage::Storage::open(&self.cwd)?;
         let selected = input.baseline.as_deref().unwrap_or(storage::DEFAULT_REPORT);
         let baseline_path = self.cwd.join(storage::report_path(selected)?);
-        let text = String::from_utf8(storage.read_report(selected)?)
-            .map_err(|_| invalid_baseline())?;
+        let text =
+            String::from_utf8(storage.read_report(selected)?).map_err(|_| invalid_baseline())?;
         let baseline = source_baseline(&text)?;
         let mut previous = baseline.findings;
         // Scope-narrowed compare: baseline findings outside the requested

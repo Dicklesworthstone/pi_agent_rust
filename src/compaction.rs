@@ -2926,8 +2926,12 @@ pub(crate) async fn compact_handoff(
     ));
     let mut privacy = privacy.clone();
     let prompts = privacy.screen(&mut preparation, &mut instructions)?;
-    let requests =
-        prepare_summary_requests(&preparation, instructions.as_deref(), &prompts, &mut privacy)?;
+    let requests = prepare_summary_requests(
+        &preparation,
+        instructions.as_deref(),
+        &prompts,
+        &mut privacy,
+    )?;
     if requests.turn_prefix.is_some() {
         return Err(Error::validation(
             "Handoff cannot split a retained authored turn",
@@ -2961,7 +2965,8 @@ pub(crate) async fn compact_handoff(
         Some(abort),
         async {
             let stream = provider.stream(&context, &options).await?;
-            crate::text_completion::collect_text(stream, crate::text_completion::MAX_TEXT_BYTES).await
+            crate::text_completion::collect_text(stream, crate::text_completion::MAX_TEXT_BYTES)
+                .await
         },
     )
     .await
@@ -5359,8 +5364,7 @@ mod tests {
             "read-call",
         ));
         assert!(!overflow_compaction_preserves_current_turn(
-            &entries,
-            "missing",
+            &entries, "missing",
         ));
         assert!(prepare_overflow_compaction(&entries[2..], settings.clone()).is_none());
 
@@ -5408,7 +5412,10 @@ mod tests {
             retained_user.clone(),
             tool_call_entry("retained-call", "read", "evidence.txt"),
             tool_result_entry("retained-result", &"Recorded tool evidence. ".repeat(400)),
-            user_entry("latest-user", "Continue with the evidence already collected."),
+            user_entry(
+                "latest-user",
+                "Continue with the evidence already collected.",
+            ),
             assistant_entry("latest-answer", "The recent follow-up is complete.", 0, 0),
         ];
         let before = serde_json::to_value(&entries).unwrap();

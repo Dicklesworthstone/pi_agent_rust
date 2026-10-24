@@ -37,7 +37,10 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 
 fn decode_reference(reference: &str) -> Result<String> {
     if reference.len() > MAX_REFERENCE_BYTES {
-        return Err(error("PI_URL_SKILL_PATH", "skill reference exceeds 4096 bytes"));
+        return Err(error(
+            "PI_URL_SKILL_PATH",
+            "skill reference exceeds 4096 bytes",
+        ));
     }
     let mut decoded = Vec::with_capacity(reference.len());
     let mut bytes = reference.bytes();
@@ -197,7 +200,9 @@ fn resolve_resource(reference: &str, skill: &Skill, relative: &str) -> Result<Re
         return directory(reference, skill, relative, &root, &target);
     }
     if !metadata.is_file() || relative.ends_with('/') {
-        return Err(invalid("skill path must address a regular file or directory"));
+        return Err(invalid(
+            "skill path must address a regular file or directory",
+        ));
     }
     let content = read_file_with(&root, &target, || {})?;
     let content_type = match target.extension().and_then(|extension| extension.to_str()) {
@@ -222,8 +227,8 @@ fn open_contained(root: &Path, target: &Path) -> std::io::Result<std::fs::File> 
     use std::path::Component;
 
     let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
-    let descriptor = open(root, flags | OFlags::DIRECTORY, Mode::empty())
-        .map_err(std::io::Error::from)?;
+    let descriptor =
+        open(root, flags | OFlags::DIRECTORY, Mode::empty()).map_err(std::io::Error::from)?;
     let mut file = std::fs::File::from(descriptor);
     let relative = target.strip_prefix(root).map_err(std::io::Error::other)?;
     let mut components = relative.components().peekable();
@@ -236,8 +241,7 @@ fn open_contained(root: &Path, target: &Path) -> std::io::Result<std::fs::File> 
         } else {
             flags
         };
-        let descriptor = openat(&file, name, flags, Mode::empty())
-            .map_err(std::io::Error::from)?;
+        let descriptor = openat(&file, name, flags, Mode::empty()).map_err(std::io::Error::from)?;
         file = std::fs::File::from(descriptor);
     }
     Ok(file)
@@ -293,7 +297,10 @@ fn checked_open(
     let current = std::fs::canonicalize(target)
         .map_err(|error| invalid(format!("cannot recheck skill path: {error}")))?;
     if current != target || !current.starts_with(root) {
-        return Err(error("PI_URL_SKILL_SCOPE", "skill path changed containment"));
+        return Err(error(
+            "PI_URL_SKILL_SCOPE",
+            "skill path changed containment",
+        ));
     }
     Ok(file)
 }
@@ -306,19 +313,26 @@ fn read_file_with(root: &Path, target: &Path, before_open: impl FnOnce()) -> Res
         .metadata()
         .map_err(|error| invalid(format!("cannot inspect skill file size: {error}")))?;
     if metadata.len() > max_bytes {
-        return Err(invalid(format!("skill file exceeds the {max_bytes}-byte resource limit")));
+        return Err(invalid(format!(
+            "skill file exceeds the {max_bytes}-byte resource limit"
+        )));
     }
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| invalid(format!("cannot read skill file: {error}")))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
-        return Err(invalid(format!("skill file exceeds the {max_bytes}-byte resource limit")));
+        return Err(invalid(format!(
+            "skill file exceeds the {max_bytes}-byte resource limit"
+        )));
     }
     String::from_utf8(bytes).map_err(|_| invalid("skill supporting file is not valid UTF-8"))
 }
 
-#[cfg(all(unix, not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
 fn directory_names(root: &Path, target: &Path) -> Result<(Vec<OsString>, bool)> {
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -340,7 +354,10 @@ fn directory_names(root: &Path, target: &Path) -> Result<(Vec<OsString>, bool)> 
     Ok((names, false))
 }
 
-#[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "horizon", target_os = "redox")))))]
+#[cfg(not(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+)))]
 fn directory_names(_root: &Path, target: &Path) -> Result<(Vec<OsString>, bool)> {
     let listing = std::fs::read_dir(target)
         .map_err(|error| invalid(format!("cannot list skill directory: {error}")))?;
@@ -382,18 +399,20 @@ fn directory(
             .filter(|path| path.starts_with(root))
             .and_then(|path| std::fs::metadata(path).ok())
             .is_some_and(|metadata| metadata.is_file() || metadata.is_dir());
-        let addressable_name = name.to_str().filter(|name| {
-            !name.contains(['\\', ':']) && !name.chars().any(char::is_control)
-        });
-        let url = addressable_name.filter(|_| target_is_contained).map(|name| {
-            let relative = relative.trim_end_matches('/');
-            let path = if relative == "." {
-                format!("{}/{name}", skill.name)
-            } else {
-                format!("{}/{relative}/{name}", skill.name)
-            };
-            format!("skill://{}", encode_path(&path))
-        });
+        let addressable_name = name
+            .to_str()
+            .filter(|name| !name.contains(['\\', ':']) && !name.chars().any(char::is_control));
+        let url = addressable_name
+            .filter(|_| target_is_contained)
+            .map(|name| {
+                let relative = relative.trim_end_matches('/');
+                let path = if relative == "." {
+                    format!("{}/{name}", skill.name)
+                } else {
+                    format!("{}/{relative}/{name}", skill.name)
+                };
+                format!("skill://{}", encode_path(&path))
+            });
         entries.push(json!({
             "name":name.to_string_lossy(), "kind":kind,
             "readable":url.is_some(), "url":url,
@@ -442,8 +461,11 @@ mod tests {
     fn supporting_files_use_the_skill_base_and_preserve_utf8() {
         let (_root, skill) = fixture("review");
         std::fs::create_dir(skill.base_dir.join("references")).unwrap();
-        std::fs::write(skill.base_dir.join("references/café notes.md"), "one\ntwo\n")
-            .unwrap();
+        std::fs::write(
+            skill.base_dir.join("references/café notes.md"),
+            "one\ntwo\n",
+        )
+        .unwrap();
         let decoded = decode_reference("review/references/caf%C3%A9%20notes.md").unwrap();
         let skills = vec![skill];
         let (skill, relative) = matching_skill(&skills, &decoded).unwrap();
@@ -486,15 +508,17 @@ mod tests {
         assert!(decode_reference(&"x".repeat(MAX_REFERENCE_BYTES + 1)).is_err());
         assert_eq!(decode_reference("review/.").unwrap(), "review/.");
         assert_eq!(decode_reference("review/a+b").unwrap(), "review/a+b");
-        assert_eq!(decode_reference("review/%252E%252E").unwrap(), "review/%2E%2E");
+        assert_eq!(
+            decode_reference("review/%252E%252E").unwrap(),
+            "review/%2E%2E"
+        );
     }
 
     #[test]
     fn directory_inventory_is_sorted_linkable_and_bounded() {
         let (_root, skill) = fixture("review");
         for index in 0..=MAX_DIRECTORY_ENTRIES {
-            std::fs::write(skill.base_dir.join(format!("file-{index:04}.txt")), "x")
-                .unwrap();
+            std::fs::write(skill.base_dir.join(format!("file-{index:04}.txt")), "x").unwrap();
         }
         let doc = resolve_resource("review/.", &skill, ".").unwrap();
         let content: Value = serde_json::from_str(&doc.content).unwrap();
@@ -513,9 +537,15 @@ mod tests {
         let doc = catalog("", vec![skill]).unwrap();
         let content: Value = serde_json::from_str(&doc.content).unwrap();
         assert_eq!(content["skills"][0]["url"], "skill://plugin/review");
-        assert_eq!(content["skills"][0]["description"].as_str().unwrap().len(), 240);
+        assert_eq!(
+            content["skills"][0]["description"].as_str().unwrap().len(),
+            240
+        );
         assert_eq!(content["truncated"], false);
-        assert_eq!(encode_path("review/café #1.md"), "review/caf%C3%A9%20%231.md");
+        assert_eq!(
+            encode_path("review/café #1.md"),
+            "review/caf%C3%A9%20%231.md"
+        );
     }
 
     #[test]
@@ -548,7 +578,11 @@ mod tests {
         std::fs::write(root.path().join("outside"), "private outside bytes").unwrap();
         std::fs::write(skill.base_dir.join("inside"), "inside bytes").unwrap();
         symlink("inside", skill.base_dir.join("internal-link")).unwrap();
-        symlink(root.path().join("outside"), skill.base_dir.join("external-link")).unwrap();
+        symlink(
+            root.path().join("outside"),
+            skill.base_dir.join("external-link"),
+        )
+        .unwrap();
         symlink(root.path(), skill.base_dir.join("external-directory")).unwrap();
         assert_eq!(
             resolve_resource("review/internal-link", &skill, "internal-link")

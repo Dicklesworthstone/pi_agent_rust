@@ -20,7 +20,12 @@ pub(crate) struct Progress {
 
 impl Progress {
     pub(crate) fn new(session: String, job: String, privacy: AuxiliaryPrivacySnapshot) -> Self {
-        Self { session, job, privacy, revision: 0 }
+        Self {
+            session,
+            job,
+            privacy,
+            revision: 0,
+        }
     }
 
     pub(super) fn publish(&mut self, records: &[Record], wave: usize, waves: usize) -> Result<()> {
@@ -66,14 +71,31 @@ struct Checkpoint<'a> {
     nodes: &'a [Record],
 }
 
-fn checkpoint(records: &[Record], wave: usize, waves: usize, revision: usize) -> Result<ToolOutput> {
-    let count = |state| records.iter().filter(|record| record.state == state).count();
+fn checkpoint(
+    records: &[Record],
+    wave: usize,
+    waves: usize,
+    revision: usize,
+) -> Result<ToolOutput> {
+    let count = |state| {
+        records
+            .iter()
+            .filter(|record| record.state == state)
+            .count()
+    };
     let snapshot = Checkpoint {
-        schema: "pi.subagent.workflow.progress.v1", mode: "workflow", complete: false,
-        checkpoint: revision, settled_through_wave: wave, waves_executed: waves,
-        total_nodes: records.len(), accepted_nodes: count(State::Accepted),
-        rejected_nodes: count(State::Rejected), skipped_nodes: count(State::Skipped),
-        not_selected_nodes: count(State::NotSelected), pending_nodes: count(State::Pending),
+        schema: "pi.subagent.workflow.progress.v1",
+        mode: "workflow",
+        complete: false,
+        checkpoint: revision,
+        settled_through_wave: wave,
+        waves_executed: waves,
+        total_nodes: records.len(),
+        accepted_nodes: count(State::Accepted),
+        rejected_nodes: count(State::Rejected),
+        skipped_nodes: count(State::Skipped),
+        not_selected_nodes: count(State::NotSelected),
+        pending_nodes: count(State::Pending),
         nodes: records,
     };
     // Count borrowed records BEFORE materializing another copy of native output.
@@ -86,8 +108,11 @@ fn checkpoint(records: &[Record], wave: usize, waves: usize, revision: usize) ->
     }
     let mut text = format!(
         "Workflow checkpoint {revision} after wave {wave}: {} accepted, {} rejected, {} skipped, {} not selected, {} unresolved. This is not a final result. Unresolved nodes may have started since the checkpoint; never replay them automatically.",
-        snapshot.accepted_nodes, snapshot.rejected_nodes, snapshot.skipped_nodes,
-        snapshot.not_selected_nodes, snapshot.pending_nodes,
+        snapshot.accepted_nodes,
+        snapshot.rejected_nodes,
+        snapshot.skipped_nodes,
+        snapshot.not_selected_nodes,
+        snapshot.pending_nodes,
     );
     for record in records {
         text.push_str(&format!("\n{}: {}", record.id, record.state.label()));

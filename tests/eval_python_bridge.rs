@@ -16,10 +16,15 @@ fn run<F: std::future::Future>(future: F) -> F::Output {
 }
 
 fn text(output: &ToolOutput) -> String {
-    output.content.iter().filter_map(|block| match block {
-        ContentBlock::Text(value) => Some(value.text.as_str()),
-        _ => None,
-    }).collect::<Vec<_>>().join("\n")
+    output
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(value) => Some(value.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn python() -> Option<String> {
@@ -39,7 +44,9 @@ fn python() -> Option<String> {
 
 #[test]
 fn retained_task_cannot_issue_a_host_read_under_the_next_cell() {
-    if python().is_none() { return; }
+    if python().is_none() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("private.txt"), "STALE-READ-CANARY").unwrap();
     std::fs::write(dir.path().join("current.txt"), "current result").unwrap();
@@ -49,11 +56,17 @@ fn retained_task_cannot_issue_a_host_read_under_the_next_cell() {
             "import asyncio\ngate = asyncio.Event()\nasync def old_work():\n    await gate.wait()\n    return await tool.call('read', {'path':'private.txt'})\nold_task = asyncio.create_task(old_work())"
         }), None).await.unwrap();
         assert!(!setup.is_error, "{}", text(&setup));
-        let stale = tool.execute("next", json!({"code":"gate.set(); await old_task"}), None).await.unwrap();
+        let stale = tool
+            .execute("next", json!({"code":"gate.set(); await old_task"}), None)
+            .await
+            .unwrap();
         assert!(stale.is_error);
         assert!(text(&stale).contains("EVAL_BRIDGE_CLOSED"));
         assert!(!text(&stale).contains("STALE-READ-CANARY"));
-        let current = tool.execute("recover", json!({"code":"tool.read('current.txt')"}), None).await.unwrap();
+        let current = tool
+            .execute("recover", json!({"code":"tool.read('current.txt')"}), None)
+            .await
+            .unwrap();
         assert!(!current.is_error, "{}", text(&current));
         assert!(text(&current).contains("current result"));
     });
@@ -61,17 +74,33 @@ fn retained_task_cannot_issue_a_host_read_under_the_next_cell() {
 
 #[test]
 fn copied_worker_context_does_not_own_protocol_stdin() {
-    if python().is_none() { return; }
+    if python().is_none() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("current.txt"), "current result").unwrap();
     let tool = EvalTool::new(dir.path());
     run(async {
-        let denied = tool.execute("worker", json!({"code":
-            "import asyncio; await asyncio.to_thread(tool.read, 'current.txt')"
-        }), None).await.unwrap();
+        let denied = tool
+            .execute(
+                "worker",
+                json!({"code":
+                    "import asyncio; await asyncio.to_thread(tool.read, 'current.txt')"
+                }),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(denied.is_error);
         assert!(text(&denied).contains("EVAL_BRIDGE_THREAD"));
-        let current = tool.execute("foreground", json!({"code":"tool.read('current.txt')"}), None).await.unwrap();
+        let current = tool
+            .execute(
+                "foreground",
+                json!({"code":"tool.read('current.txt')"}),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(!current.is_error, "{}", text(&current));
         assert!(text(&current).contains("current result"));
     });
@@ -79,7 +108,9 @@ fn copied_worker_context_does_not_own_protocol_stdin() {
 
 #[test]
 fn awaited_native_tools_compose_with_asyncio_and_structured_displays() {
-    if python().is_none() { return; }
+    if python().is_none() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("one.txt"), "first native result").unwrap();
     std::fs::write(dir.path().join("two.txt"), "second native result").unwrap();
@@ -88,13 +119,17 @@ fn awaited_native_tools_compose_with_asyncio_and_structured_displays() {
         "import asyncio\nasync def tick():\n    await asyncio.sleep(0)\n    return True\nvalues = await asyncio.gather(tool.call('read', {'path':'one.txt'}), tool.call('read', {'path':'two.txt'}), tick())\ndisplay({'first': 'first native result' in values[0], 'second': 'second native result' in values[1], 'timer': values[2]})"
     }), None)).unwrap();
     assert!(!output.is_error, "{}", text(&output));
-    assert_eq!(output.details.as_ref().unwrap()["jsonOutputs"],
-        json!([{"first":true,"second":true,"timer":true}]));
+    assert_eq!(
+        output.details.as_ref().unwrap()["jsonOutputs"],
+        json!([{"first":true,"second":true,"timer":true}])
+    );
 }
 
 #[test]
 fn awaited_host_denial_preserves_whitelist_and_next_read() {
-    if python().is_none() { return; }
+    if python().is_none() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("current.txt"), "current result").unwrap();
     let tool = EvalTool::new(dir.path());
@@ -102,6 +137,8 @@ fn awaited_host_denial_preserves_whitelist_and_next_read() {
         "denied = False\ntry:\n    await tool.call('bash', {'command':'echo must-not-run'})\nexcept RuntimeError as error:\n    denied = 'EVAL_BRIDGE_DENIED' in str(error)\nvalue = await tool.call('read', {'path':'current.txt'})\ndisplay({'denied':denied, 'recovered':'current result' in value})"
     }), None)).unwrap();
     assert!(!output.is_error, "{}", text(&output));
-    assert_eq!(output.details.as_ref().unwrap()["jsonOutputs"],
-        json!([{"denied":true,"recovered":true}]));
+    assert_eq!(
+        output.details.as_ref().unwrap()["jsonOutputs"],
+        json!([{"denied":true,"recovered":true}])
+    );
 }

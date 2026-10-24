@@ -1,5 +1,5 @@
-use super::*;
 use super::super::Capture;
+use super::*;
 use crate::model::TextContent;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -16,10 +16,21 @@ fn text(value: &str) -> Value {
 fn rich_only_progress_is_a_running_replacement_snapshot() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&events);
-    let mut capture = Capture::new("python", Some(Box::new(move |event| {
-        sink.lock().unwrap().push(event);
-    })));
-    capture.accept(&display(1, json!({"mimeType":"application/json","data":{"answer":42}})), 7).unwrap();
+    let mut capture = Capture::new(
+        "python",
+        Some(Box::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })),
+    );
+    capture
+        .accept(
+            &display(
+                1,
+                json!({"mimeType":"application/json","data":{"answer":42}}),
+            ),
+            7,
+        )
+        .unwrap();
     let now = Instant::now();
     capture.publish_at(now, false);
     capture.accept(&display(2, text("second")), 7).unwrap();
@@ -45,7 +56,10 @@ fn malformed_rich_frames_never_change_or_publish_the_prefix() {
         display(2, text("out of order")),
         display(1, json!({"mimeType":"image/png","data":"aGVsbG8="})),
         display(1, json!({"mimeType":"text/plain","data":42})),
-        display(1, json!({"mimeType":"text/html","data":"<b>not supported</b>"})),
+        display(
+            1,
+            json!({"mimeType":"text/html","data":"<b>not supported</b>"}),
+        ),
         json!({"id":7,"stream":{"sequence":1,"name":"display","text":"not a MIME frame"}}),
         json!({"id":8,"stream":{"sequence":1,"name":"display","display":text("wrong cell")}}),
     ] {
@@ -63,8 +77,18 @@ fn final_rich_values_must_match_the_stream_without_rewriting_console() {
     let frame = text("original");
     let mut capture = Capture::new("python", None);
     capture.accept(&display(1, frame.clone()), 7).unwrap();
-    capture.accept(&json!({"id":7,"stream":{"sequence":1,"name":"stdout","text":"console"}}), 7).unwrap();
-    for frames in [json!([]), json!([text("rewritten")]), json!([frame.clone(),frame.clone()]), Value::Null] {
+    capture
+        .accept(
+            &json!({"id":7,"stream":{"sequence":1,"name":"stdout","text":"console"}}),
+            7,
+        )
+        .unwrap();
+    for frames in [
+        json!([]),
+        json!([text("rewritten")]),
+        json!([frame.clone(), frame.clone()]),
+        Value::Null,
+    ] {
         let mut response = json!({"stdout":"","stderr":"","outputSequence":1,"displays":frames});
         assert!(capture.finish_response(&mut response).is_err());
         assert_eq!(response["stdout"], "");
@@ -73,18 +97,25 @@ fn final_rich_values_must_match_the_stream_without_rewriting_console() {
     capture.finish_response(&mut response).unwrap();
     assert_eq!(response["stdout"], "console");
     let mut output = crate::tools::ToolOutput {
-        content: Vec::new(), details: Some(json!({})), is_error: false,
+        content: Vec::new(),
+        details: Some(json!({})),
+        is_error: false,
     };
     capture.annotate(&mut output);
     assert_eq!(output.details.unwrap()["displayStream"]["complete"], true);
-    assert!(output.content.is_empty(), "final formatter, not annotate, appends displays");
+    assert!(
+        output.content.is_empty(),
+        "final formatter, not annotate, appends displays"
+    );
 }
 
 #[test]
 fn live_admission_reuses_count_aggregate_and_item_limits() {
     let mut capture = Capture::new("js", None);
     for sequence in 1..=32 {
-        capture.accept(&display(sequence, text("small")), 7).unwrap();
+        capture
+            .accept(&display(sequence, text("small")), 7)
+            .unwrap();
     }
     assert!(capture.accept(&display(33, text("overflow")), 7).is_err());
     let mut capture = Capture::new("js", None);
@@ -94,7 +125,11 @@ fn live_admission_reuses_count_aggregate_and_item_limits() {
     assert!(capture.accept(&display(3, large), 7).is_err());
     assert_eq!(capture.displays.len(), 2);
     let oversized = text(&"x".repeat(2 * 1024 * 1024));
-    assert!(Capture::new("python", None).accept(&display(1, oversized), 7).is_err());
+    assert!(
+        Capture::new("python", None)
+            .accept(&display(1, oversized), 7)
+            .is_err()
+    );
 }
 
 #[test]
@@ -109,7 +144,8 @@ fn preview_omission_does_not_discard_or_truncate_final_json() {
     assert_eq!(details["displays"][0]["previewOmitted"], true);
     assert_eq!(details["displayStream"]["omittedDisplays"], 1);
     assert!(matches!(&content[0], ContentBlock::Text(text) if text.text.len() < 256));
-    let mut response = json!({"stdout":"","stderr":"","outputSequence":0,"displays":[frame.clone()]});
+    let mut response =
+        json!({"stdout":"","stderr":"","outputSequence":0,"displays":[frame.clone()]});
     capture.finish_response(&mut response).unwrap();
     assert_eq!(response["displays"], json!([frame]));
 }
@@ -120,12 +156,16 @@ fn watchdog_error_keeps_bounded_rich_progress_but_not_success() {
     capture.accept(&display(1, text("progress")), 7).unwrap();
     let mut output = crate::tools::ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new("EVAL_CANCELLED"))],
-        details: Some(json!({"stateReset":true})), is_error: true,
+        details: Some(json!({"stateReset":true})),
+        is_error: true,
     };
     capture.append_partial(&mut output);
     assert!(output.is_error);
     assert_eq!(output.content.len(), 2);
-    assert_eq!(output.details.as_ref().unwrap()["displayStream"]["complete"], false);
+    assert_eq!(
+        output.details.as_ref().unwrap()["displayStream"]["complete"],
+        false
+    );
     assert_eq!(output.details.as_ref().unwrap()["stateReset"], true);
     let failure = capture.with_error(Error::tool("eval", "EVAL_TIMEOUT"));
     assert!(failure.to_string().contains("EVAL_DISPLAY_INCOMPLETE"));

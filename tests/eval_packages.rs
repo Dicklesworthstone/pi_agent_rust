@@ -110,7 +110,9 @@ fn success(tool: &EvalTool, code: &str) -> String {
 }
 
 fn finish(harness: &TestHarness) {
-    harness.log().info("verify", "eval package assertions passed");
+    harness
+        .log()
+        .info("verify", "eval package assertions passed");
     let path = harness.temp_path("eval-packages.jsonl");
     harness.write_jsonl_logs(&path).expect("write test log");
     let payload = std::fs::read_to_string(path).expect("read test log");
@@ -143,24 +145,40 @@ fn offline_packages_stream_resolve_dependencies_and_keep_the_kernel() {
     .expect("install protocol");
     assert!(!output.is_error, "{}", text(&output));
     assert!(text(&output).contains("EVAL_PACKAGES_READY"));
-    assert!(updates.lock().expect("updates").contains("EVAL_PIP_INSTALLING"));
+    assert!(
+        updates
+            .lock()
+            .expect("updates")
+            .contains("EVAL_PIP_INSTALLING")
+    );
     assert_eq!(
-        success(&tool, concat!(
-            "import pi_eval_dep_probe, pi_eval_transitive_probe\n",
-            "(seed + pi_eval_dep_probe.value, pi_eval_transitive_probe.value, ",
-            "os.getpid() == original_pid, sys.prefix == original_prefix, ",
-            "(workspace / 'pth-side-effect').exists())"
-        )).trim(),
+        success(
+            &tool,
+            concat!(
+                "import pi_eval_dep_probe, pi_eval_transitive_probe\n",
+                "(seed + pi_eval_dep_probe.value, pi_eval_transitive_probe.value, ",
+                "os.getpid() == original_pid, sys.prefix == original_prefix, ",
+                "(workspace / 'pth-side-effect').exists())"
+            )
+        )
+        .trim(),
         "(42, 8, True, True, False)"
     );
-    let package_root: String = serde_json::from_str(success(
-        &tool,
-        "print(json.dumps(str(Path(pi_eval_dep_probe.__file__).parents[2])))",
-    ).trim()).expect("package root");
+    let package_root: String = serde_json::from_str(
+        success(
+            &tool,
+            "print(json.dumps(str(Path(pi_eval_dep_probe.__file__).parents[2])))",
+        )
+        .trim(),
+    )
+    .expect("package root");
     let package_root = PathBuf::from(package_root);
     assert!(package_root.is_dir());
     drop(tool);
-    assert!(!package_root.exists(), "kernel-owned packages survived disposal");
+    assert!(
+        !package_root.exists(),
+        "kernel-owned packages survived disposal"
+    );
     finish(&harness);
 }
 
@@ -172,32 +190,55 @@ fn failed_install_preserves_packages_and_upgrade_requires_explicit_reload() {
     let harness = TestHarness::new("eval_packages_failure_upgrade");
     let tool = EvalTool::new(&harness.temp_path("."));
     success(&tool, FIXTURES);
-    success(&tool, "%pip install --managed --no-index --find-links 'wheel house' pi-eval-dep-probe==1.0");
-    success(&tool, "import pi_eval_dep_probe\nbefore_failure = list(sys.path)");
+    success(
+        &tool,
+        "%pip install --managed --no-index --find-links 'wheel house' pi-eval-dep-probe==1.0",
+    );
+    success(
+        &tool,
+        "import pi_eval_dep_probe\nbefore_failure = list(sys.path)",
+    );
     let unchanged = success(
         &tool,
         "%pip install --managed --no-index \"example; python_version < '0'\"",
     );
     assert!(unchanged.contains("EVAL_PACKAGES_UNCHANGED"));
     assert_eq!(success(&tool, "sys.path == before_failure").trim(), "True");
-    let failed = cell(&tool, "%pip install --managed --no-index pi-eval-nonexistent-probe==99");
+    let failed = cell(
+        &tool,
+        "%pip install --managed --no-index pi-eval-nonexistent-probe==99",
+    );
     assert!(failed.is_error);
     assert!(text(&failed).contains("EVAL_PIP_FAILED"));
     assert_eq!(
-        success(&tool, "(sys.path == before_failure, seed, pi_eval_dep_probe.value)").trim(),
+        success(
+            &tool,
+            "(sys.path == before_failure, seed, pi_eval_dep_probe.value)"
+        )
+        .trim(),
         "(True, 40, 2)"
     );
     success(&tool, "os.chdir('elsewhere')");
-    success(&tool, "%pip install --managed --no-index --find-links='wheel house' pi-eval-dep-probe==2.0");
+    success(
+        &tool,
+        "%pip install --managed --no-index --find-links='wheel house' pi-eval-dep-probe==2.0",
+    );
     assert_eq!(
-        success(&tool, concat!(
-            "import importlib\ncached = pi_eval_dep_probe.value\n",
-            "importlib.reload(pi_eval_dep_probe)\n",
-            "(cached, pi_eval_dep_probe.value, seed, os.getpid() == original_pid)"
-        )).trim(),
+        success(
+            &tool,
+            concat!(
+                "import importlib\ncached = pi_eval_dep_probe.value\n",
+                "importlib.reload(pi_eval_dep_probe)\n",
+                "(cached, pi_eval_dep_probe.value, seed, os.getpid() == original_pid)"
+            )
+        )
+        .trim(),
         "(2, 3, 40, True)"
     );
-    success(&tool, "(workspace / 'use_packages.py').write_text('import asyncio, pi_eval_dep_probe\\nawait asyncio.sleep(0)\\nseed + pi_eval_dep_probe.value\\n')\nNone");
+    success(
+        &tool,
+        "(workspace / 'use_packages.py').write_text('import asyncio, pi_eval_dep_probe\\nawait asyncio.sleep(0)\\nseed + pi_eval_dep_probe.value\\n')\nNone",
+    );
     assert_eq!(success(&tool, "%load use_packages.py").trim(), "43");
     finish(&harness);
 }
@@ -211,11 +252,17 @@ fn invalid_package_commands_do_not_spawn_and_reset_discards_installed_packages()
     let tool = EvalTool::new(&harness.temp_path("."));
     success(&tool, FIXTURES);
     for code in [
-        "%pip", "%pip install --managed", "%pip uninstall sample",
-        "%pip install --managed sample --target /tmp/wrong", "%pip install --managed --user sample",
-        "%pip install --managed --prefix=wrong sample", "%pip install --managed --python other sample",
-        "%pip install --managed --editable .", "%pip install --managed --no-index",
-        "%pip install --managed --find-links --no-index sample", "%pip install --managed 'unterminated",
+        "%pip",
+        "%pip install --managed",
+        "%pip uninstall sample",
+        "%pip install --managed sample --target /tmp/wrong",
+        "%pip install --managed --user sample",
+        "%pip install --managed --prefix=wrong sample",
+        "%pip install --managed --python other sample",
+        "%pip install --managed --editable .",
+        "%pip install --managed --no-index",
+        "%pip install --managed --find-links --no-index sample",
+        "%pip install --managed 'unterminated",
         "%pip install --managed sample\nseed = 0",
     ] {
         let output = cell(&tool, code);
@@ -224,7 +271,10 @@ fn invalid_package_commands_do_not_spawn_and_reset_discards_installed_packages()
         assert!(!text(&output).contains("EVAL_PIP_INSTALLING"), "{code}");
     }
     assert_eq!(success(&tool, "seed").trim(), "40");
-    success(&tool, "%pip install --managed --no-index --find-links 'wheel house' pi-eval-dep-probe==1.0");
+    success(
+        &tool,
+        "%pip install --managed --no-index --find-links 'wheel house' pi-eval-dep-probe==1.0",
+    );
     let root: String = serde_json::from_str(success(
         &tool,
         "import pi_eval_dep_probe\nprint(json.dumps(str(Path(pi_eval_dep_probe.__file__).parents[2])))",
@@ -237,7 +287,10 @@ fn invalid_package_commands_do_not_spawn_and_reset_discards_installed_packages()
     )).expect("reset protocol");
     assert!(!reset.is_error, "{}", text(&reset));
     assert!(text(&reset).contains("True"));
-    assert!(!PathBuf::from(root).exists(), "reset did not retire package storage");
+    assert!(
+        !PathBuf::from(root).exists(),
+        "reset did not retire package storage"
+    );
     finish(&harness);
 }
 
@@ -251,14 +304,19 @@ fn package_install_uses_the_existing_cell_timeout_and_retires_storage() {
     let harness = TestHarness::new("eval_packages_timeout");
     let tool = EvalTool::new(&harness.temp_path("."));
     success(&tool, FIXTURES);
-    success(&tool, "%pip install --managed --no-index --find-links 'wheel house' pi-eval-dep-probe==1.0");
+    success(
+        &tool,
+        "%pip install --managed --no-index --find-links 'wheel house' pi-eval-dep-probe==1.0",
+    );
     let package_root: String = serde_json::from_str(success(
         &tool,
         "import pi_eval_dep_probe\nprint(json.dumps(str(Path(pi_eval_dep_probe.__file__).parents[2])))",
     ).trim()).expect("package root");
     // A real loopback index accepts pip's connection but never answers it.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback index");
-    listener.set_nonblocking(true).expect("nonblocking listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
     let address = listener.local_addr().expect("index address");
     let stop = Arc::new(AtomicBool::new(false));
     let server_stop = Arc::clone(&stop);
@@ -289,11 +347,15 @@ fn package_install_uses_the_existing_cell_timeout_and_retires_storage() {
     ));
     stop.store(true, Ordering::Release);
     server.join().expect("join index server");
-    rx.try_recv().expect("pip reached the loopback index before timeout");
+    rx.try_recv()
+        .expect("pip reached the loopback index before timeout");
     let error = result.expect_err("package installation must honor the cell timeout");
     assert!(error.to_string().contains("EVAL_TIMEOUT"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(15));
-    assert!(!PathBuf::from(package_root).exists(), "timed-out packages survived");
+    assert!(
+        !PathBuf::from(package_root).exists(),
+        "timed-out packages survived"
+    );
     assert_eq!(success(&tool, "'seed' in globals()").trim(), "False");
     finish(&harness);
 }

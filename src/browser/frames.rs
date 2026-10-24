@@ -516,12 +516,21 @@ mod tests {
         let (tree, targets) = scoped_remote_tree();
         let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
         assert!(scope.admit_action("upload").is_ok());
-        assert_eq!(scope.command_session("DOM.setFileInputFiles").unwrap(), "nested-session");
-        assert!(validate(&json!({"action":"upload","tab":"work","frame":"child","selector":"#file"})).is_ok());
+        assert_eq!(
+            scope.command_session("DOM.setFileInputFiles").unwrap(),
+            "nested-session"
+        );
+        assert!(
+            validate(&json!({"action":"upload","tab":"work","frame":"child","selector":"#file"}))
+                .is_ok()
+        );
         assert!(validate(&json!({"action":"upload","tab":"work","frame":"child"})).is_err());
         assert!(validate(&json!({"action":"upload","frame":"child"})).is_err());
         assert!(validate(&json!({"action":"upload","tab":"work","frame":null})).is_err());
-        assert!(validate(&json!({"action":"upload","tab":"work","frame":"child","dialog_response":{}})).is_err());
+        assert!(
+            validate(&json!({"action":"upload","tab":"work","frame":"child","dialog_response":{}}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -529,8 +538,14 @@ mod tests {
         let (tree, targets) = scoped_remote_tree();
         let scope = Scope::pin(&tree, "remote-nested", &targets).unwrap();
         assert!(scope.admit_action("download").is_ok());
-        assert_eq!(scope.command_session("DOM.resolveNode").unwrap(), "nested-session");
-        assert_eq!(scope.command_session("Input.dispatchMouseEvent").unwrap(), "page");
+        assert_eq!(
+            scope.command_session("DOM.resolveNode").unwrap(),
+            "nested-session"
+        );
+        assert_eq!(
+            scope.command_session("Input.dispatchMouseEvent").unwrap(),
+            "page"
+        );
         assert!(validate(&json!({"action":"download","tab":"work","frame":"remote-nested","selector":"#link"})).is_ok());
         for args in [
             json!({"action":"download","frame":"remote-nested","selector":"#link"}),

@@ -124,11 +124,7 @@ fn settle_result_in(hub: &Mutex<AgentHubRegistry>, id: &str, result: &SubagentRe
         let owns_settlement = hub.get(id).is_some_and(|entry| !entry.status.settled());
         hub.settle(id, status);
         hub.finish_native_execution(id);
-        if owns_settlement {
-            hub.get(id)
-        } else {
-            None
-        }
+        if owns_settlement { hub.get(id) } else { None }
     };
     // Result serialization and retention never run with the hub lock held.
     // This path is reached after schema acceptance and worktree disposition,
@@ -159,13 +155,12 @@ impl HubLease {
     /// revival policy. Replacing it would lose the conversation it promises
     /// to retain, so ordinary native revival must remain unavailable.
     #[cfg(unix)]
-    pub(super) fn register_worker(
-        &mut self,
-        name: &str,
-        kind: ChildKind,
-    ) -> Result<ChildEntry> {
+    pub(super) fn register_worker(&mut self, name: &str, kind: ChildKind) -> Result<ChildEntry> {
         if self.id.is_some() {
-            return Err(Error::tool("subagent", "PI_SUBAGENT_HUB: child lease already registered"));
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_HUB: child lease already registered",
+            ));
         }
         let entry = registry()
             .lock()
@@ -509,8 +504,8 @@ mod tests {
         fn accepted_native_result_is_projectable_through_the_read_tool() {
             use crate::tools::Tool as _;
 
-            let text = json!({"findings":[{"path":"src/main.rs"}], "report":"first\nsecond"})
-                .to_string();
+            let text =
+                json!({"findings":[{"path":"src/main.rs"}], "report":"first\nsecond"}).to_string();
             let frame = json!({
                 "type":"agent_end",
                 "messages":[{

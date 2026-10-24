@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    AgentDefinition, AgentSource, ChildRunner, Deadline, Error, Result, SchemaMode,
-    SubagentTask, SubagentTool, UpdateCallback, render_results, structured_result_block,
+    AgentDefinition, AgentSource, ChildRunner, Deadline, Error, Result, SchemaMode, SubagentTask,
+    SubagentTool, UpdateCallback, render_results, structured_result_block,
 };
 use crate::agent_cx::AgentCx;
 use crate::model::{ContentBlock, TextContent};
@@ -64,21 +64,30 @@ pub(super) fn is_request(input: &Value) -> Result<bool> {
             .and_then(Value::as_array)
             .is_some_and(|tasks| tasks.iter().any(control_present))
         {
-            return Err(invalid("seance and sourceSession/model require a single delegation"));
+            return Err(invalid(
+                "seance and sourceSession/model require a single delegation",
+            ));
         }
     }
     if input
         .get("workflow")
         .and_then(Value::as_array)
         .is_some_and(|nodes| {
-            nodes.iter().filter_map(|node| node.get("call")).any(control_present)
+            nodes
+                .iter()
+                .filter_map(|node| node.get("call"))
+                .any(control_present)
         })
     {
-        return Err(invalid("seance is not supported in workflow calls; use a single delegation"));
+        return Err(invalid(
+            "seance is not supported in workflow calls; use a single delegation",
+        ));
     }
     let consultant = input.get("agent").and_then(Value::as_str) == Some(NAME);
     if !consultant && (input.get("sourceSession").is_some() || input.get("model").is_some()) {
-        return Err(invalid("sourceSession and model are only valid for agent: seance"));
+        return Err(invalid(
+            "sourceSession and model are only valid for agent: seance",
+        ));
     }
     Ok(consultant)
 }
@@ -118,7 +127,10 @@ fn bounded_json(value: &impl Serialize, limit: usize) -> Result<String> {
             Ok(())
         }
     }
-    let mut buffer = Buffer { bytes: Vec::new(), limit };
+    let mut buffer = Buffer {
+        bytes: Vec::new(),
+        limit,
+    };
     serde_json::to_writer(&mut buffer, value).map_err(|_| {
         Error::tool(
             "subagent",
@@ -168,7 +180,9 @@ fn saved_selection(report: &RecoveryReport) -> (Option<ToolModelSelection>, Opti
         let record = entry.record();
         match record.get("type").and_then(Value::as_str) {
             Some("model_change") => {
-                model = record.get("provider").and_then(Value::as_str)
+                model = record
+                    .get("provider")
+                    .and_then(Value::as_str)
                     .zip(record.get("modelId").and_then(Value::as_str))
                     .map(|(provider, model)| ToolModelSelection {
                         provider: provider.to_string(),
@@ -176,20 +190,30 @@ fn saved_selection(report: &RecoveryReport) -> (Option<ToolModelSelection>, Opti
                     });
             }
             Some("thinking_level_change") => {
-                thinking = record.get("thinkingLevel").and_then(Value::as_str).map(str::to_string);
+                thinking = record
+                    .get("thinkingLevel")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             _ => {}
         }
     }
-    let has_change = |kind| report.entries().iter()
-        .any(|entry| entry.record().get("type").and_then(Value::as_str) == Some(kind));
+    let has_change = |kind| {
+        report
+            .entries()
+            .iter()
+            .any(|entry| entry.record().get("type").and_then(Value::as_str) == Some(kind))
+    };
     if model.is_none() {
         let (provider, id) = if has_change("model_change") {
             ("fallbackProvider", "fallbackModelId")
         } else {
             ("provider", "modelId")
         };
-        model = report.header().get(provider).and_then(Value::as_str)
+        model = report
+            .header()
+            .get(provider)
+            .and_then(Value::as_str)
             .zip(report.header().get(id).and_then(Value::as_str))
             .map(|(provider, model)| ToolModelSelection {
                 provider: provider.to_string(),
@@ -202,7 +226,11 @@ fn saved_selection(report: &RecoveryReport) -> (Option<ToolModelSelection>, Opti
         } else {
             "thinkingLevel"
         };
-        thinking = report.header().get(key).and_then(Value::as_str).map(str::to_string);
+        thinking = report
+            .header()
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
     (model, thinking)
 }
@@ -253,7 +281,9 @@ fn check_owner(owner: &AgentCx, deadline: Deadline) -> Result<()> {
         ));
     }
     owner.checkpoint().map_err(|_| Error::Aborted)?;
-    deadline.check().map_err(|message| Error::tool("subagent", message))
+    deadline
+        .check()
+        .map_err(|message| Error::tool("subagent", message))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -267,16 +297,30 @@ pub(super) async fn execute(
     let _ = bounded_json(&input, MAX_QUESTION_BYTES + MAX_SCHEMA_BYTES + 4096)?;
     let request: Request = serde_json::from_value(input)
         .map_err(|_| invalid("provide agent, sourceSession, task and optional model/outputSchema/schemaMode/timeoutSeconds only"))?;
-    if request.agent != NAME || request.task.trim().is_empty()
-        || request.task.len() > MAX_QUESTION_BYTES || request.task.contains('\0')
+    if request.agent != NAME
+        || request.task.trim().is_empty()
+        || request.task.len() > MAX_QUESTION_BYTES
+        || request.task.contains('\0')
         || request.source_session.as_os_str().is_empty()
     {
-        return Err(invalid("sourceSession and a nonempty question of at most 8 KiB are required"));
+        return Err(invalid(
+            "sourceSession and a nonempty question of at most 8 KiB are required",
+        ));
     }
-    if request.model.as_deref().is_some_and(|model| !model_field(model)) {
-        return Err(invalid("model must be a nonempty model selector of at most 512 bytes"));
+    if request
+        .model
+        .as_deref()
+        .is_some_and(|model| !model_field(model))
+    {
+        return Err(invalid(
+            "model must be a nonempty model selector of at most 512 bytes",
+        ));
     }
-    if request.output_schema.as_ref().is_some_and(|schema| !schema.is_object()) {
+    if request
+        .output_schema
+        .as_ref()
+        .is_some_and(|schema| !schema.is_object())
+    {
         return Err(invalid("outputSchema must be a JSON Schema object"));
     }
     let owner = AgentCx::for_current_or_request();
@@ -496,13 +540,19 @@ mod tests {
 
     #[test]
     fn reserves_consultation_controls_without_confusing_schema_properties() {
-        assert!(is_request(&json!({
-            "agent": "seance", "sourceSession": "saved.jsonl", "task": "why?"
-        })).unwrap());
-        assert!(!is_request(&json!({
-            "agent": "task", "task": "work",
-            "outputSchema": {"type": "object", "properties": {"model": {"type": "string"}}}
-        })).unwrap());
+        assert!(
+            is_request(&json!({
+                "agent": "seance", "sourceSession": "saved.jsonl", "task": "why?"
+            }))
+            .unwrap()
+        );
+        assert!(
+            !is_request(&json!({
+                "agent": "task", "task": "work",
+                "outputSchema": {"type": "object", "properties": {"model": {"type": "string"}}}
+            }))
+            .unwrap()
+        );
         for input in [
             json!({"agent": "task", "task": "work", "sourceSession": "saved.jsonl"}),
             json!({"agent": "task", "task": "work", "model": "other"}),
@@ -520,12 +570,26 @@ mod tests {
         let path = root.path().join("branch.jsonl");
         let rows = [
             user("root", None, json!("shared evidence")),
-            model("chosen-model", Some("root"), "chosen-provider", "chosen/model"),
+            model(
+                "chosen-model",
+                Some("root"),
+                "chosen-provider",
+                "chosen/model",
+            ),
             effort("chosen-effort", Some("chosen-model"), "medium"),
             user("chosen", Some("chosen-effort"), json!("selected evidence")),
-            model("sibling-model", Some("root"), "sibling-provider", "sibling/model"),
+            model(
+                "sibling-model",
+                Some("root"),
+                "sibling-provider",
+                "sibling/model",
+            ),
             effort("sibling-effort", Some("sibling-model"), "high"),
-            user("sibling", Some("sibling-effort"), json!("sibling-only evidence")),
+            user(
+                "sibling",
+                Some("sibling-effort"),
+                json!("sibling-only evidence"),
+            ),
         ];
         write_session(&path, &header(Some("chosen")), &rows);
         let report = Session::recover_text(&path).unwrap();
@@ -538,8 +602,14 @@ mod tests {
         let text = bounded_json(&snapshot, MAX_CONTEXT_BYTES).unwrap();
         assert!(text.contains("selected evidence"));
         assert!(!text.contains("sibling-only evidence"));
-        assert_eq!(snapshot.records.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
-            ["root", "chosen-model", "chosen-effort", "chosen"]);
+        assert_eq!(
+            snapshot
+                .records
+                .iter()
+                .map(|entry| entry.id())
+                .collect::<Vec<_>>(),
+            ["root", "chosen-model", "chosen-effort", "chosen"]
+        );
     }
 
     #[test]
@@ -556,7 +626,10 @@ mod tests {
         write_session(&path, &saved_header, &rows);
         let report = Session::recover_text(&path).unwrap();
         let (model, effort) = saved_selection(&report);
-        assert!(model.is_none(), "a sibling's tip header is not the selected model");
+        assert!(
+            model.is_none(),
+            "a sibling's tip header is not the selected model"
+        );
         assert!(effort.is_none());
         saved_header.fallback_provider = Some("base-provider".to_string());
         saved_header.fallback_model_id = Some("base-model".to_string());
@@ -574,16 +647,28 @@ mod tests {
     fn snapshot_omits_media_without_touching_source_or_sidecars() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("saved.jsonl");
-        let bytes = write_session(&path, &header(None), &[user("one", None, json!([
-            {"type": "text", "text": "historical evidence"},
-            {"type": "image", "mimeType": "image/png", "data": {
-                "$piBlob": "../../must-not-follow", "sizeBytes": -1
-            }}
-        ]))]);
+        let bytes = write_session(
+            &path,
+            &header(None),
+            &[user(
+                "one",
+                None,
+                json!([
+                    {"type": "text", "text": "historical evidence"},
+                    {"type": "image", "mimeType": "image/png", "data": {
+                        "$piBlob": "../../must-not-follow", "sizeBytes": -1
+                    }}
+                ]),
+            )],
+        );
         let report = Session::recover_text(&path).unwrap();
         let snapshot = snapshot(&report);
         assert_eq!(snapshot.omitted_media.len(), 1);
-        assert!(bounded_json(&snapshot, MAX_CONTEXT_BYTES).unwrap().contains("historical evidence"));
+        assert!(
+            bounded_json(&snapshot, MAX_CONTEXT_BYTES)
+                .unwrap()
+                .contains("historical evidence")
+        );
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
@@ -609,12 +694,17 @@ mod tests {
         let event = json!({"type": "agent_end", "messages": [{
             "role": "assistant", "stopReason": "stop",
             "content": [{"type": "text", "text": "{\"answer\":\"recorded decision\"}"}]
-        }]}).to_string();
+        }]})
+        .to_string();
         let binary = root.path().join("child.sh");
-        fs::write(&binary, format!(
-            "#!/bin/sh\nprintf '%s\\000' \"$@\" > argv.bin\nprintf '%s\\n' '{}'\n",
-            event.replace('\'', "'\"'\"'")
-        )).unwrap();
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\000' \"$@\" > argv.bin\nprintf '%s\\n' '{}'\n",
+                event.replace('\'', "'\"'\"'")
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let tool = SubagentTool::with_paths(root.path().to_path_buf(), global, binary)
             .with_timeout(std::time::Duration::from_secs(5))
@@ -624,13 +714,16 @@ mod tests {
 
     #[cfg(unix)]
     fn run(tool: &SubagentTool, input: Value) -> Result<ToolOutput> {
-        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
             .block_on(tool.execute("seance-test", input, None))
     }
 
     #[cfg(unix)]
     fn argv(root: &TempDir) -> Vec<String> {
-        fs::read(root.path().join("argv.bin")).unwrap()
+        fs::read(root.path().join("argv.bin"))
+            .unwrap()
             .split(|byte| *byte == 0)
             .map(|arg| String::from_utf8(arg.to_vec()).unwrap())
             .collect()
@@ -644,15 +737,17 @@ mod tests {
         let (root, tool) = fixture();
         let path = root.path().join("saved.jsonl");
         let secret = "hunter2hunter2hunter2";
-        let bytes = write_session(&path, &header(Some("chosen")), &[
-            user("root", None, json!(format!("bare echo: {secret}"))),
-            user("chosen", Some("root"), json!("selected evidence")),
-            user("sibling", Some("root"), json!("sibling-only evidence")),
-        ]);
-        let mut vault = crate::secrets::SecretVault::default();
-        let _ = crate::secrets::obfuscate(
-            &format!("API_KEY={secret}"), &mut vault, &[],
+        let bytes = write_session(
+            &path,
+            &header(Some("chosen")),
+            &[
+                user("root", None, json!(format!("bare echo: {secret}"))),
+                user("chosen", Some("root"), json!("selected evidence")),
+                user("sibling", Some("root"), json!("sibling-only evidence")),
+            ],
         );
+        let mut vault = crate::secrets::SecretVault::default();
+        let _ = crate::secrets::obfuscate(&format!("API_KEY={secret}"), &mut vault, &[]);
         assert!(vault.len() > 0);
         let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(None);
         let calls = AtomicUsize::new(0);
@@ -660,26 +755,36 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             crate::text_completion::redact_inputs_with_vault(parts, &privacy, &vault)
         };
-        let progress = std::sync::Arc::new(std::sync::Mutex::new(
-            Vec::<crate::tools::ToolUpdate>::new(),
-        ));
+        let progress =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<crate::tools::ToolUpdate>::new()));
         let captured = std::sync::Arc::clone(&progress);
-        let output = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
-            .block_on(tool.execute_with_auxiliary_privacy("live-seance", json!({
-                "agent": "seance", "sourceSession": "saved.jsonl", "task": "Why was it chosen?",
-                "outputSchema": {
-                    "type": "object", "properties": {"answer": {"type": "string"}},
-                    "required": ["answer"], "additionalProperties": false
-                },
-                "schemaMode": "strict"
-            }), Some(Box::new(move |update| {
-                captured.lock().unwrap().push(update);
-            })), &protect)).unwrap();
+        let output = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(tool.execute_with_auxiliary_privacy(
+                "live-seance",
+                json!({
+                    "agent": "seance", "sourceSession": "saved.jsonl", "task": "Why was it chosen?",
+                    "outputSchema": {
+                        "type": "object", "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"], "additionalProperties": false
+                    },
+                    "schemaMode": "strict"
+                }),
+                Some(Box::new(move |update| {
+                    captured.lock().unwrap().push(update);
+                })),
+                &protect,
+            ))
+            .unwrap();
         assert!(!output.is_error, "{:?}", output.details);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         {
             let updates = progress.lock().unwrap();
-            assert!(!updates.is_empty(), "the real native runner must publish progress");
+            assert!(
+                !updates.is_empty(),
+                "the real native runner must publish progress"
+            );
             for update in updates.iter() {
                 let details = update.details.as_ref().unwrap();
                 assert_eq!(details["result"]["task"], "Why was it chosen?");
@@ -697,8 +802,15 @@ mod tests {
         assert_eq!(value("--thinking"), "low");
         assert_eq!(value("--tools"), "");
         for flag in [
-            "--no-tools", "--no-mcp", "--no-extensions", "--no-skills", "--no-context-files",
-            "--no-prompt-templates", "--no-themes", "--no-migrations", "--hide-cwd-in-prompt",
+            "--no-tools",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-migrations",
+            "--hide-cwd-in-prompt",
         ] {
             assert!(args.iter().any(|arg| arg == flag), "missing {flag}");
         }
@@ -707,8 +819,14 @@ mod tests {
         let all_args = args.join("\n");
         assert!(all_args.contains("selected evidence"));
         assert!(!all_args.contains("sibling-only evidence"));
-        assert!(!all_args.contains(secret), "the live session's bare secret must be protected");
-        assert!(!all_args.contains("pi-secret:"), "no reversible vault IDs may leave the owner");
+        assert!(
+            !all_args.contains(secret),
+            "the live session's bare secret must be protected"
+        );
+        assert!(
+            !all_args.contains("pi-secret:"),
+            "no reversible vault IDs may leave the owner"
+        );
         assert!(!all_args.contains("CUSTOM_DEFINITION_MUST_NOT_LOAD"));
         assert!(!all_args.contains("task-role-must-not-win"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -720,19 +838,33 @@ mod tests {
         assert_eq!(details["results"][0]["task"], "Why was it chosen?");
         assert!(!details.to_string().contains("bare echo"));
         let hub_id = details["consultation"]["hubId"].as_str().unwrap();
-        let entry = crate::agent_hub::registry().lock().unwrap().get(hub_id).unwrap();
+        let entry = crate::agent_hub::registry()
+            .lock()
+            .unwrap()
+            .get(hub_id)
+            .unwrap();
         assert_eq!(entry.task, "Why was it chosen?");
-        let revival = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
-            .block_on(crate::subagents::revive_child(hub_id, None)).unwrap();
+        let revival = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::subagents::revive_child(hub_id, None))
+            .unwrap();
         assert!(!revival.is_error, "{:?}", revival.details);
         let revival_details = revival.details.unwrap();
         assert_eq!(revival_details["result"]["task"], "Why was it chosen?");
         assert_eq!(revival_details["result"]["schemaValid"], true);
         let replacement_id = revival_details["id"].as_str().unwrap();
-        let replacement = crate::agent_hub::registry().lock().unwrap().get(replacement_id).unwrap();
+        let replacement = crate::agent_hub::registry()
+            .lock()
+            .unwrap()
+            .get(replacement_id)
+            .unwrap();
         assert_eq!(replacement.task, "Why was it chosen?");
         let revived_args = argv(&root).join("\n");
-        assert!(revived_args.contains("selected evidence"), "revival must retain private launch history");
+        assert!(
+            revived_args.contains("selected evidence"),
+            "revival must retain private launch history"
+        );
         assert!(!revived_args.contains("sibling-only evidence"));
         assert!(!revived_args.contains(secret));
         assert!(revived_args.contains("--no-mcp"));
@@ -746,16 +878,27 @@ mod tests {
         let mut saved_header = header(None);
         saved_header.provider = None;
         saved_header.model_id = None;
-        write_session(&root.path().join("saved.jsonl"), &saved_header,
-            &[user("one", None, json!("evidence"))]);
+        write_session(
+            &root.path().join("saved.jsonl"),
+            &saved_header,
+            &[user("one", None, json!("evidence"))],
+        );
         let request = json!({"agent": "seance", "sourceSession": "saved.jsonl", "task": "why?"});
-        assert!(run(&tool, request.clone()).unwrap_err().to_string().contains("explicit model override"));
+        assert!(
+            run(&tool, request.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("explicit model override")
+        );
         assert!(!root.path().join("argv.bin").exists());
         let mut request = request;
         request["model"] = json!("anthropic/explicit-model");
         assert!(!run(&tool, request).unwrap().is_error);
         let args = argv(&root);
-        assert!(args.windows(2).any(|pair| pair[0] == "--model" && pair[1] == "anthropic/explicit-model"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == "anthropic/explicit-model")
+        );
         assert!(!args.iter().any(|arg| arg == "--provider"));
         assert!(!args.iter().any(|arg| arg == "--thinking"));
         assert!(!args.iter().any(|arg| arg == "task-role-must-not-win"));
@@ -768,8 +911,11 @@ mod tests {
         let (root, tool) = fixture();
         let external = tempfile::tempdir().unwrap();
         let source = external.path().join("external.jsonl");
-        let bytes = write_session(&source, &header(None),
-            &[user("one", None, json!("external evidence"))]);
+        let bytes = write_session(
+            &source,
+            &header(None),
+            &[user("one", None, json!("external evidence"))],
+        );
         let mut roots = crate::workspace::WorkspaceHandle::single(root.path());
         let tool = tool.with_workspace(roots.clone());
         let request = json!({
@@ -782,9 +928,14 @@ mod tests {
             crate::text_completion::redact_inputs(parts, &privacy)
         };
         let invoke = || {
-            asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap()
                 .block_on(tool.execute_with_auxiliary_privacy(
-                    "seance-scope", request.clone(), None, &protect,
+                    "seance-scope",
+                    request.clone(),
+                    None,
+                    &protect,
                 ))
         };
         assert!(invoke().is_err());
@@ -795,20 +946,34 @@ mod tests {
         let output = invoke().unwrap();
         assert!(!output.is_error, "{:?}", output.details);
         let hub_id = output.details.as_ref().unwrap()["consultation"]["hubId"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(argv(&root).join("\n").contains("external evidence"));
         fs::rename(&capture, root.path().join("admitted-argv.bin")).unwrap();
         assert!(roots.remove_root(external.path()));
         assert!(invoke().is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1,
-            "revoked roots must refuse before projecting historical content");
-        assert!(!capture.exists(), "revoked roots must not launch another child");
-        let revival = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
-            .block_on(crate::subagents::revive_child(&hub_id, None)).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "revoked roots must refuse before projecting historical content"
+        );
+        assert!(
+            !capture.exists(),
+            "revoked roots must not launch another child"
+        );
+        let revival = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::subagents::revive_child(&hub_id, None))
+            .unwrap();
         assert!(revival.is_error, "{:?}", revival.details);
         assert_eq!(revival.details.as_ref().unwrap()["result"]["task"], "why?");
-        assert!(!capture.exists(), "explicit revival must recheck current source admission");
+        assert!(
+            !capture.exists(),
+            "explicit revival must recheck current source admission"
+        );
         assert_eq!(fs::read(&source).unwrap(), bytes);
     }
 
@@ -819,8 +984,11 @@ mod tests {
         let (root, tool) = fixture();
         let external = tempfile::tempdir().unwrap();
         let source = external.path().join("external.jsonl");
-        let bytes = write_session(&source, &header(None),
-            &[user("one", None, json!("external evidence"))]);
+        let bytes = write_session(
+            &source,
+            &header(None),
+            &[user("one", None, json!("external evidence"))],
+        );
         let mut roots = crate::workspace::WorkspaceHandle::single(root.path());
         roots.add_root(external.path());
         let tool = tool.with_workspace(roots.clone());
@@ -835,9 +1003,14 @@ mod tests {
         let request = json!({
             "agent": "seance", "sourceSession": source.to_string_lossy(), "task": "why?"
         });
-        let result = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
+        let result = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
             .block_on(tool.execute_with_auxiliary_privacy(
-                "seance-revoke", request, None, &protect,
+                "seance-revoke",
+                request,
+                None,
+                &protect,
             ));
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -852,8 +1025,11 @@ mod tests {
         let (root, tool) = fixture();
         let external = tempfile::tempdir().unwrap();
         let source = external.path().join("external.jsonl");
-        let bytes = write_session(&source, &header(None),
-            &[user("one", None, json!("external evidence"))]);
+        let bytes = write_session(
+            &source,
+            &header(None),
+            &[user("one", None, json!("external evidence"))],
+        );
         let mut roots = crate::workspace::WorkspaceHandle::single(root.path());
         roots.add_root(external.path());
         let tool = tool.with_workspace(roots.clone());
@@ -869,8 +1045,11 @@ mod tests {
         let request = json!({
             "agent": "seance", "sourceSession": source.to_string_lossy(), "task": "why?"
         });
-        let output = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap()
-            .block_on(tool.execute("seance-progress-revoke", request, Some(on_update))).unwrap();
+        let output = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(tool.execute("seance-progress-revoke", request, Some(on_update)))
+            .unwrap();
         assert!(output.is_error, "{:?}", output.details);
         assert!(calls.load(Ordering::SeqCst) > 0);
         assert!(!root.path().join("argv.bin").exists());
@@ -884,16 +1063,24 @@ mod tests {
         let global = tempfile::tempdir().unwrap();
         fs::create_dir_all(global.path().join("sessions")).unwrap();
         let source = global.path().join("sessions/history.jsonl");
-        let bytes = write_session(&source, &header(None),
-            &[user("one", None, json!("native saved history"))]);
+        let bytes = write_session(
+            &source,
+            &header(None),
+            &[user("one", None, json!("native saved history"))],
+        );
         let tool = SubagentTool::with_paths(
             root.path().to_path_buf(),
             global.path().to_path_buf(),
             fixture_tool.child_binary.clone(),
-        ).with_timeout(std::time::Duration::from_secs(5));
-        let output = run(&tool, json!({
-            "agent": "seance", "sourceSession": source.to_string_lossy(), "task": "why?"
-        })).unwrap();
+        )
+        .with_timeout(std::time::Duration::from_secs(5));
+        let output = run(
+            &tool,
+            json!({
+                "agent": "seance", "sourceSession": source.to_string_lossy(), "task": "why?"
+            }),
+        )
+        .unwrap();
         assert!(!output.is_error, "{:?}", output.details);
         assert!(argv(&root).join("\n").contains("native saved history"));
         assert_eq!(fs::read(&source).unwrap(), bytes);
@@ -904,8 +1091,11 @@ mod tests {
     fn blocking_privacy_oversize_and_unsafe_sources_refuse_before_spawn() {
         let (root, tool) = fixture();
         let path = root.path().join("saved.jsonl");
-        let bytes = write_session(&path, &header(None),
-            &[user("one", None, json!("PRIVATE-CODE"))]);
+        let bytes = write_session(
+            &path,
+            &header(None),
+            &[user("one", None, json!("PRIVATE-CODE"))],
+        );
         let settings = crate::secrets::SecretsSettings {
             mode: Some("block".to_string()),
             extra_patterns: Some(vec!["PRIVATE-CODE".to_string()]),
@@ -918,12 +1108,19 @@ mod tests {
         assert!(!root.path().join("argv.bin").exists());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         for (key, value) in [
-            ("cwd", json!(".")), ("scope", json!("both")),
-            ("isolation", json!("worktree")), ("isoApply", json!("apply")),
+            ("cwd", json!(".")),
+            ("scope", json!("both")),
+            ("isolation", json!("worktree")),
+            ("isoApply", json!("apply")),
         ] {
             let mut unsupported = request.clone();
             unsupported[key] = value;
-            assert!(run(&tool, unsupported).unwrap_err().to_string().contains("PI_SEANCE_INVALID"));
+            assert!(
+                run(&tool, unsupported)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PI_SEANCE_INVALID")
+            );
         }
         std::os::unix::fs::symlink(&path, root.path().join("link.jsonl")).unwrap();
         let mut linked = request.clone();
@@ -932,9 +1129,17 @@ mod tests {
         let mut directory = request.clone();
         directory["sourceSession"] = json!(".");
         assert!(run(&tool, directory).is_err());
-        write_session(&path, &header(None),
-            &[user("one", None, json!("x".repeat(MAX_CONTEXT_BYTES)))]);
-        assert!(run(&tool, request).unwrap_err().to_string().contains("PI_SEANCE_CONTEXT_LIMIT"));
+        write_session(
+            &path,
+            &header(None),
+            &[user("one", None, json!("x".repeat(MAX_CONTEXT_BYTES)))],
+        );
+        assert!(
+            run(&tool, request)
+                .unwrap_err()
+                .to_string()
+                .contains("PI_SEANCE_CONTEXT_LIMIT")
+        );
         assert!(!root.path().join("argv.bin").exists());
     }
 }

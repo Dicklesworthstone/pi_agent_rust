@@ -103,11 +103,15 @@ impl PreparedEdit {
 
     /// Includes guard-only and no-op files, which also constrain approval.
     pub(in crate::lsp) fn summary(&self, cwd: &Path) -> Vec<serde_json::Value> {
-        let mut files: Vec<_> = self.0
+        let mut files: Vec<_> = self
+            .0
             .files
             .iter()
             .map(|(path, file)| {
-                let moved_to = self.0.directory.as_ref()
+                let moved_to = self
+                    .0
+                    .directory
+                    .as_ref()
                     .filter(|moving| path.starts_with(&moving.old))
                     .map(|moving| crate::lsp::display_path(&moving.moved_path(path), cwd));
                 let mut item = serde_json::json!({
