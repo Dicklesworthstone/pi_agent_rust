@@ -653,9 +653,14 @@ mod tests {
             frames.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
-        assert_eq!(
-            writer.write(b"x").expect_err("closed reader fd").kind(),
-            io::ErrorKind::BrokenPipe
+        // A child that another test thread forked while the reader was open
+        // keeps a copy of it until its exec closes the descriptor. Only a
+        // reader that outlives that window was leaked.
+        assert!(
+            wait_until(|| writer
+                .write(b"x")
+                .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)),
+            "the retired reader's fd stayed open"
         );
     }
 

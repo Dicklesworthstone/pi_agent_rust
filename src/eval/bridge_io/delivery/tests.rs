@@ -231,16 +231,27 @@ esac
         .blocking_threads(1, 8)
         .build()
         .unwrap();
-    let started = Instant::now();
-    let error = runtime
-        .block_on(tool.execute(
-            "blocked-input",
-            json!({
-                "code":format!("#{}\n42", "x".repeat(4 * 1024 * 1024)), "timeout_secs":2
-            }),
-            None,
-        ))
-        .unwrap_err();
+    // A child that another test thread forked while the shim was open for
+    // writing holds that descriptor until its exec, and exec of the shim fails
+    // with ETXTBSY meanwhile. The shim never ran, so `launches` is untouched.
+    let mut attempts = 0;
+    let (started, error) = loop {
+        attempts += 1;
+        let started = Instant::now();
+        let error = runtime
+            .block_on(tool.execute(
+                "blocked-input",
+                json!({
+                    "code":format!("#{}\n42", "x".repeat(4 * 1024 * 1024)), "timeout_secs":2
+                }),
+                None,
+            ))
+            .unwrap_err();
+        if attempts == 5 || !error.to_string().contains("(os error 26)") {
+            break (started, error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     assert!(error.to_string().contains("EVAL_TIMEOUT"), "{error}");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(6),

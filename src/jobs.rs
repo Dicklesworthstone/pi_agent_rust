@@ -6184,7 +6184,18 @@ mod tests {
             .write(true)
             .open(artifacts[0].path())
             .expect("rejected job artifact remains inspectable");
-        fs4::FileExt::try_lock(&artifact).expect("rejected job artifact lock must be released");
+        // flock belongs to the open file description, so a child that another
+        // test thread forked while the artifact was open shares the lock until
+        // its exec closes the descriptor. Only a lock that outlives that is
+        // a leak.
+        let started = Instant::now();
+        while let Err(error) = fs4::FileExt::try_lock(&artifact) {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "rejected job artifact lock must be released: {error:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         fs4::FileExt::unlock(&artifact).expect("release test artifact lock");
 
         drop(descendant_cleanup);

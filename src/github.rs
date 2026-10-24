@@ -1262,6 +1262,21 @@ mod tests {
         assert!(out.contains("#7 [open] Broken"));
     }
 
+    /// A root that records its pid and waits on a descendant whose side effect
+    /// is held until the test creates `release`. A timed delay instead lets a
+    /// starved scheduler fire the 100ms timeout after the side effect, so the
+    /// test would blame cleanup for a race it lost. The poll gives up after
+    /// 30s so a survivor of a failing run cannot spin forever.
+    #[cfg(unix)]
+    fn released_descendant_script(root_pid: &Path, release: &Path, leak: &Path) -> String {
+        format!(
+            "echo $$ > '{}'; (i=0; while [ ! -e '{}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; printf leaked > '{}') & wait",
+            root_pid.display(),
+            release.display(),
+            leak.display()
+        )
+    }
+
     #[cfg(any(unix, windows))]
     fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
         let pid = sysinfo::Pid::from_u32(pid);
@@ -1445,12 +1460,9 @@ mod tests {
     fn timeout_kills_descendants_and_reaps_root_before_return() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root_pid_path = dir.path().join("root.pid");
+        let release_path = dir.path().join("release");
         let leak_path = dir.path().join("leaked");
-        let script = format!(
-            "echo $$ > '{}'; (sleep 1; printf leaked > '{}') & wait",
-            root_pid_path.display(),
-            leak_path.display()
-        );
+        let script = released_descendant_script(&root_pid_path, &release_path, &leak_path);
         let tool = GithubTool::new(dir.path(), Some("/bin/sh"));
         let runtime = asupersync::runtime::RuntimeBuilder::new()
             .build()
@@ -1475,6 +1487,7 @@ mod tests {
             wait_for_pid_exit(root_pid, Duration::from_secs(1)),
             "root process {root_pid} was not reaped"
         );
+        std::fs::write(&release_path, "").expect("release a surviving descendant");
         std::thread::sleep(Duration::from_millis(1100));
         assert!(
             !leak_path.exists(),
@@ -1523,12 +1536,9 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let root_pid_path = dir.path().join("root.pid");
+        let release_path = dir.path().join("release");
         let leak_path = dir.path().join("leaked");
-        let script = format!(
-            "echo $$ > '{}'; (sleep 1; printf leaked > '{}') & wait",
-            root_pid_path.display(),
-            leak_path.display()
-        );
+        let script = released_descendant_script(&root_pid_path, &release_path, &leak_path);
         let tool = GithubTool::new(dir.path(), Some("/bin/sh"));
         // Bind the argv outside the async block: `&["-c", &script]` would
         // create a temporary that dies while the future still borrows it.
@@ -1559,6 +1569,7 @@ mod tests {
             wait_for_pid_exit(root_pid, Duration::from_millis(100)),
             "future drop returned before root process {root_pid} was reaped"
         );
+        std::fs::write(&release_path, "").expect("release a surviving descendant");
         std::thread::sleep(Duration::from_millis(1100));
         assert!(
             !leak_path.exists(),

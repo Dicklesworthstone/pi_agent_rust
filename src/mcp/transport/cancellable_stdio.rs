@@ -457,10 +457,20 @@ mod tests {
                 stopped_with_writer_held.expect("worker result"),
                 Err(io::ErrorKind::ConnectionAborted)
             );
-            assert_eq!(
-                writer.write(b"x").expect_err("reader fd was closed").kind(),
-                io::ErrorKind::BrokenPipe
-            );
+            // A child that another test thread forked while the reader was
+            // open keeps a copy of it until its exec closes the descriptor.
+            // Only a reader that outlives that window was leaked.
+            let started = std::time::Instant::now();
+            while !writer
+                .write(b"x")
+                .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+            {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "the retired reader's fd stayed open"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
