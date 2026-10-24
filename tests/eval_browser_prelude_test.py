@@ -317,7 +317,10 @@ class BootstrapTests(unittest.TestCase):
 class Tool:
     async def result(self, name, args):
         return {"schema":"pi.eval.tool_result.v1","content":[],"details":args,"isError":False}
-NAMESPACE = {"__name__":"__main__","tool":Tool()}
+async def _workpool(**options):
+    from types import SimpleNamespace
+    return SimpleNamespace(concurrency=1)
+NAMESPACE = {"__name__":"__main__","tool":Tool(),"workpool":_workpool}
 def main():
     import workspace_module
     assert __name__ == "_pi_eval_kernel"
@@ -326,6 +329,9 @@ def main():
     assert sys.path[0] == ""
     assert len(sys.argv) == 2 and sys.argv[1].endswith("kernel.py")
     assert NAMESPACE["recovery_installed"] is True
+    pipeline = asyncio.run(NAMESPACE["workpool"].map_reduce(
+        [], lambda value, index: str(value), lambda value, item: value, 0))
+    assert pipeline["status"] == "empty" and pipeline["value"] == 0
     result = asyncio.run(NAMESPACE["browser"].tab("app").get_by_label("Email").fill("value"))
     print(json.dumps({"result":result,"workspace":workspace_module.value}))
 if __name__ == "__main__":
@@ -336,9 +342,12 @@ if __name__ == "__main__":
             recovery = staged / "agent_recovery.py"
             recovery.write_text("def install(kernel):\n    kernel.NAMESPACE['recovery_installed'] = True\n", encoding="utf-8")
             (root / "agent_recovery.py").write_text("raise RuntimeError('wrong recovery path')\n", encoding="utf-8")
+            pipeline = staged / "workpool_pipeline.py"
+            pipeline.write_bytes((SOURCE.parent / "python_workpool_pipeline.py").read_bytes())
+            (root / "workpool_pipeline.py").write_text("raise RuntimeError('wrong pipeline path')\n", encoding="utf-8")
             command = [sys.executable, "-c",
                        "import sys\nwith open(sys.argv[1], encoding='utf-8') as source:\n code = source.read()\nexec(compile(code, sys.argv[1], 'exec'))",
-                       str(helper), str(kernel), str(recovery)]
+                       str(helper), str(kernel), str(recovery), str(pipeline)]
             run = subprocess.run(command, cwd=root, text=True, capture_output=True, timeout=10)
             self.assertEqual(run.returncode, 0, run.stderr)
             reply = json.loads(run.stdout)

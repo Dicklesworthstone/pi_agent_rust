@@ -36,6 +36,7 @@ pub(crate) use display::image_dimensions;
 const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
 const PY_BROWSER_BOOTSTRAP: &str = include_str!("eval/python_browser.py");
 const PY_AGENT_RECOVERY: &str = include_str!("eval/python_agent_recovery.py");
+const PY_WORKPOOL_PIPELINE: &str = include_str!("eval/python_workpool_pipeline.py");
 
 /// Default per-cell budget.
 const DEFAULT_CELL_TIMEOUT_SECS: u64 = 30;
@@ -78,6 +79,9 @@ impl PyKernel {
         let recovery = packages.path().join("agent_recovery.py");
         std::fs::write(&recovery, PY_AGENT_RECOVERY)
             .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
+        let pipeline = packages.path().join("workpool_pipeline.py");
+        std::fs::write(&pipeline, PY_WORKPOOL_PIPELINE)
+            .map_err(|err| Error::tool("eval", format!("EVAL_PACKAGE_STORAGE: {err}")))?;
         let mut command = runtime.command();
         command
             // Keep -c's workspace import semantics; only the large bootstrap
@@ -89,6 +93,7 @@ impl PyKernel {
             .arg(&bootstrap)
             .arg(&script)
             .arg(&recovery)
+            .arg(&pipeline)
             .env("_PI_EVAL_PACKAGE_ROOT", packages.path())
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -746,6 +751,10 @@ impl Tool for EvalTool {
          pool.drain(cursor=...,timeout=...,max_items=...) in Python returns up \
          to four finished full results without waiting for earlier items or \
          sealing the pool; save nextCursor only after processing the page. \
+         JS workpool.mapReduce(source,map,reduce,initial,options) and Python \
+         workpool.map_reduce(source,map,reduce,initial,**options) consume \
+         iterables with bounded admission and reduce full results as they settle. \
+         Put launch options in pool; errors retain pool, cursor and progress. \
          Idle workers prefer lower observed active context pressure. \
          await pool.finish() seals admission and returns the aggregate \
          job; await pool.wait() seals and waits for all accepted work to drain. \

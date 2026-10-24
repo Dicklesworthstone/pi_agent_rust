@@ -299,10 +299,11 @@ def _start_kernel():
     import importlib.util
     import sys
 
-    if len(sys.argv) != 4:
-        raise RuntimeError("EVAL_BROWSER_BOOTSTRAP: expected staged kernel and recovery paths")
+    if len(sys.argv) != 5:
+        raise RuntimeError("EVAL_BROWSER_BOOTSTRAP: expected staged kernel, recovery and pipeline paths")
     kernel_path = sys.argv[2]
     recovery_path = sys.argv[3]
+    pipeline_path = sys.argv[4]
     # Restore the same argv shape as the previous direct kernel bootstrap.
     sys.argv[:] = [sys.argv[0], kernel_path]
     spec = importlib.util.spec_from_file_location("_pi_eval_kernel", kernel_path)
@@ -319,6 +320,13 @@ def _start_kernel():
     sys.modules[recovery_spec.name] = recovery
     recovery_spec.loader.exec_module(recovery)
     recovery.install(kernel)
+    pipeline_spec = importlib.util.spec_from_file_location("_pi_eval_workpool_pipeline", pipeline_path)
+    if pipeline_spec is None or pipeline_spec.loader is None:
+        raise RuntimeError("EVAL_BROWSER_BOOTSTRAP: pipeline loader unavailable")
+    pipeline = importlib.util.module_from_spec(pipeline_spec)
+    sys.modules[pipeline_spec.name] = pipeline
+    pipeline_spec.loader.exec_module(pipeline)
+    pipeline.install(kernel)
     kernel.main()
 
 

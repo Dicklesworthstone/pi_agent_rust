@@ -36,6 +36,13 @@ and support inspection and explicit cleanup across cells. `finish()` seals
 admission, drains accepted work, reaps the children and completes one aggregate
 session job.
 
+[Streaming map/reduce](eval-workpool-pipelines.md) is available as
+`workpool.mapReduce()` in JavaScript and `workpool.map_reduce()` in Python.
+It consumes sync/async iterables with bounded admission, reduces full native
+results as they settle, and exposes per-result recovery cursors on failure.
+It uses the existing pool limits and does not implement keyed child yields
+or background execution of an entire eval cell.
+
 [Retained model helpers](eval-structured-results.md#retained-background-model-requests)
 provide `completion()`, `judge()` and `judgeBatch()` / `judge_batch()`, with
 later-cell waits, cancellation and attachment by job ID after a reset. They use
