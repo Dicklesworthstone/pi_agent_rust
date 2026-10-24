@@ -3797,9 +3797,10 @@ impl PiFtuiModel {
             });
             return true;
         }
-        // OMP `/switch` is `/model` with a selector.
+        // OMP `/switch` is `/model` with a selector; `/models` is OMP's alias.
         if token.eq_ignore_ascii_case("/model")
             || token.eq_ignore_ascii_case("/m")
+            || token.eq_ignore_ascii_case("/models")
             || token.eq_ignore_ascii_case("/switch")
         {
             self.route_model_command(rest.trim());
@@ -4226,7 +4227,7 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking [level], /fast [on|off|status], /skillful [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
+                     /thinking or /effort [level], /fast [on|off|status], /skillful [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
@@ -4476,7 +4477,8 @@ impl PiFtuiModel {
                 }
                 return true;
             }
-            "/thinking" | "/think" | "/t" => {
+            // OMP names this command `/effort`.
+            "/thinking" | "/think" | "/t" | "/effort" => {
                 let value = cmd_args.trim();
                 if value.is_empty() {
                     self.send_command(UiCommand::SetThinking(None));
@@ -12886,6 +12888,16 @@ mod tests {
                 UiCommand::SetThinking(Some(crate::model::ThinkingLevel::Low)),
             ]
         );
+        // OMP's `/models` alias takes the same selector.
+        type_str(&mut sim, "/models sonnet");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_iter().collect::<Vec<_>>(),
+            [UiCommand::SetModel {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-5".into(),
+            }]
+        );
     }
 
     /// OMP /queue: idle it is just a prompt; mid-turn it is a follow-up,
@@ -17228,6 +17240,13 @@ mod tests {
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
             UiCommand::SetThinking(Some(crate::model::ThinkingLevel::High))
+        );
+        // OMP's name for the same command.
+        type_str(&mut sim, "/effort low");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetThinking(Some(crate::model::ThinkingLevel::Low))
         );
         // Bare /thinking asks the driver for the current level.
         type_str(&mut sim, "/think");

@@ -82,8 +82,8 @@ command surface implemented in `src/interactive.rs`.
 | `/login [provider]` | Login/setup credentials (OAuth for built-ins; API key prompts for supported providers). Run without args to see status table. |
 | `/logout [provider]` | Remove stored OAuth credentials. |
 | `/clear` (`/cls`) | Clear conversation view/history. |
-| `/model [id|provider/id]` (`/m`) | Show or change the current model. |
-| `/thinking [level]` (`/think`, `/t`) | Set thinking level (`off|minimal|low|medium|high|xhigh|max`). |
+| `/model [id|provider/id]` (`/m`, `/models`) | Show or change the current model. |
+| `/thinking [level]` (`/think`, `/t`, `/effort`) | Set thinking level (`off|minimal|low|medium|high|xhigh|max`). |
 | `/scoped-models [patterns\|clear]` (`/scoped`) | Show or set model patterns used for Ctrl+P cycling. |
 | `/history` (`/hist`) | Show input history. |
 | `/export [path]` | Export conversation to HTML. |

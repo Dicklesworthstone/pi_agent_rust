@@ -350,8 +350,9 @@ impl SlashCommand {
             "/login" => Self::Login,
             "/logout" => Self::Logout,
             "/clear" | "/cls" => Self::Clear,
-            "/model" | "/m" => Self::Model,
-            "/thinking" | "/think" | "/t" => Self::Thinking,
+            // `/models` and `/effort` are OMP's spellings.
+            "/model" | "/m" | "/models" => Self::Model,
+            "/thinking" | "/think" | "/t" | "/effort" => Self::Thinking,
             "/scoped-models" | "/scoped" => Self::ScopedModels,
             "/exit" | "/quit" | "/q" => Self::Exit,
             "/history" | "/hist" => Self::History,
