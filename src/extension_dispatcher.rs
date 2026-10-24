@@ -5861,7 +5861,9 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.err = null;
-                    pi.http({ url: "https://example.com", method: "PUT" })
+                    // PUT/PATCH/DELETE are supported for deployment relays;
+                    // TRACE stays outside the connector's exhaustive verb set.
+                    pi.http({ url: "https://example.com", method: "TRACE" })
                         .catch((e) => { globalThis.err = e.code; });
                 "#,
                 )

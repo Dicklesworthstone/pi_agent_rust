@@ -737,8 +737,11 @@ fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
         return;
     }
 
-    // Check if auth.json parses
-    let auth = match AuthStorage::load(auth_path.clone()) {
+    // Check if auth.json parses. The tolerant load would discard a corrupt
+    // store (and back it up), so parse strictly before loading it.
+    let auth = match AuthStorage::check_parse(&auth_path)
+        .and_then(|()| AuthStorage::load(auth_path.clone()))
+    {
         Ok(auth) => {
             findings.push(Finding::pass(cat, "auth.json parses correctly"));
             Some(auth)

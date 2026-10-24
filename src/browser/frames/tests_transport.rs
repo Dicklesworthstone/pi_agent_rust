@@ -360,6 +360,16 @@ fn serve(socket: &mut TcpStream, fault: Fault) -> Observed {
                 {
                     assert_eq!(params["executionContextId"], 7);
                     json!({"result":{"type":"object","objectId":"field-handle"}})
+                } else if params["functionDeclaration"]
+                    .as_str()
+                    .unwrap()
+                    .contains("BROWSER_WAIT_STALE")
+                {
+                    // `wait_for` probes with wait.js, which returns a typed
+                    // predicate observation rather than a bare boolean.
+                    assert_eq!(params["objectId"], "field-handle");
+                    json!({"result":{"type":"object",
+                        "value":{"attached":true,"visible":true,"textMatches":null}}})
                 } else {
                     assert_eq!(params["objectId"], "field-handle");
                     let result = if params["arguments"][0]["value"] == "verify_fill" {

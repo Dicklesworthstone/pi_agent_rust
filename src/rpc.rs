@@ -2506,7 +2506,13 @@ pub async fn run(
             );
             replayed_plan_mode(&inner)
         };
+        // `--prewalk-into` armed this same session before the server started.
+        // The reset clears it with the other session-scoped state, so re-arm it.
+        let armed_prewalk = guard.agent.prewalk_target().cloned();
         guard.agent.reset_session_scoped_state(initial_plan_mode);
+        if let Some(target) = armed_prewalk {
+            guard.arm_prewalk(target).await?;
+        }
         guard.set_queue_modes(
             options.config.steering_queue_mode(),
             options.config.follow_up_queue_mode(),
@@ -17442,14 +17448,14 @@ mod tests {
                 serde_json::to_value(live.to_messages_for_current_path().last()).unwrap(),
                 current,
             );
-            let expected = serde_json::to_value(live.to_messages_for_current_path()).unwrap();
+            let installed = live.to_messages_for_current_path();
             drop(live);
             let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
             assert_eq!(reopened.header.id, id);
-            assert_eq!(
-                serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
-                expected,
-            );
+            // The summary is re-stamped on every projection; the authored tail
+            // keeps its timestamp, as in `rpc_recovery_message_fingerprint`.
+            let (installed, durable) = reopened.current_path_comparison_values(&installed);
+            assert_eq!(durable, installed);
             assert_eq!(
                 reopened
                     .entries

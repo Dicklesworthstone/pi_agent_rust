@@ -6439,6 +6439,33 @@ impl Session {
         self.rebuild_current_path().messages
     }
 
+    /// Test comparison of a `live` context installed from this session's
+    /// current path, as `(live, projected)` JSON. Summary entries and
+    /// timestamp-less rows read the clock on every rebuild, so only the
+    /// timestamps this projection synthesizes are dropped from both sides;
+    /// authored timestamps and every other field must still agree.
+    #[cfg(test)]
+    pub(crate) fn current_path_comparison_values(&self, live: &[Message]) -> (Value, Value) {
+        let projected = self.to_messages_for_current_path_with_timestamp_provenance();
+        let mut live = serde_json::to_value(live).expect("serialize live context");
+        let mut durable = Value::Array(
+            projected
+                .iter()
+                .map(|(message, _)| serde_json::to_value(message).expect("serialize projection"))
+                .collect(),
+        );
+        for (index, (_, synthetic)) in projected.iter().enumerate() {
+            if *synthetic {
+                for messages in [&mut live, &mut durable] {
+                    if let Some(Value::Object(message)) = messages.get_mut(index) {
+                        message.remove("timestamp");
+                    }
+                }
+            }
+        }
+        (live, durable)
+    }
+
     /// Resolve a checkpoint against the context that is active now. Stored
     /// message counts describe the context at mark time and become stale when
     /// compaction or an earlier rewind changes the projected prefix.

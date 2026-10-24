@@ -356,6 +356,10 @@ fn package_install_uses_the_existing_cell_timeout_and_retires_storage() {
         !PathBuf::from(package_root).exists(),
         "timed-out packages survived"
     );
-    assert_eq!(success(&tool, "'seed' in globals()").trim(), "False");
+    // The timeout retired the kernel, so this is a new kernel's first cell.
+    assert_eq!(
+        success(&tool, "'seed' in globals()").trim(),
+        "(kernel started)\nFalse"
+    );
     finish(&harness);
 }

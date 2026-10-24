@@ -4232,7 +4232,7 @@ impl PiFtuiModel {
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
                      /commit [--dry-run], /review [target], /handoff [focus], \
                      /handoff --report [to] [path], /handoff --model [preview options], \
-                     /handoff --import <bundle> [import options], /approval [mode], \
+                     /handoff --import <bundle> [import options], /prewalk [status|off], /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
@@ -18162,7 +18162,10 @@ mod tests {
             let active = reopened.to_messages_for_current_path();
             assert!(active.iter().any(|message| matches!(message, Message::User(user)
                 if serde_json::to_value(&user.content).unwrap() == serde_json::to_value(&kept).unwrap())));
-            assert_eq!(serde_json::to_value(handle.session().agent.messages()).unwrap(), serde_json::to_value(&active).unwrap());
+            // The summary and both timestamp-less rows are re-stamped on every
+            // projection, so only their timestamps may differ from the reopened file.
+            let (live, durable) = reopened.current_path_comparison_values(handle.session().agent.messages());
+            assert_eq!(live, durable);
             let calls = provider.calls.lock().unwrap();
             assert_eq!(calls.len(), 1);
             assert!(serde_json::to_string(&calls[0].content).unwrap().contains("preserve migration decisions"));

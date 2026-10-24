@@ -24093,17 +24093,36 @@ if (typeof globalThis.TextEncoder === 'undefined') {
 }
 
 if (typeof globalThis.TextDecoder === 'undefined') {
+    // WHATWG UTF-8 decoding: each maximal invalid subpart becomes one U+FFFD
+    // (or a TypeError when `fatal`), `{stream: true}` carries an incomplete
+    // sequence into the next call, and a leading BOM is dropped unless
+    // `ignoreBOM` is set.
+    const INVALID_UTF8 = 'The encoded data was not valid for encoding utf-8';
     class TextDecoder {
-        constructor(encoding = 'utf-8') {
+        constructor(encoding = 'utf-8', options = {}) {
             this.encoding = encoding;
+            this.fatal = Boolean(options && options.fatal);
+            this.ignoreBOM = Boolean(options && options.ignoreBOM);
+            this._reset();
         }
 
-        decode(input, _opts) {
-            if (input === undefined || input === null) return '';
+        _reset() {
+            this._needed = 0;
+            this._seen = 0;
+            this._codePoint = 0;
+            this._lower = 0x80;
+            this._upper = 0xbf;
+            this._bomChecked = false;
+        }
+
+        decode(input, options) {
+            const stream = Boolean(options && options.stream);
             if (typeof input === 'string') return input;
 
             let bytes;
-            if (input instanceof ArrayBuffer) {
+            if (input === undefined || input === null) {
+                bytes = new Uint8Array(0);
+            } else if (input instanceof ArrayBuffer) {
                 bytes = new Uint8Array(input);
             } else if (ArrayBuffer.isView && ArrayBuffer.isView(input)) {
                 bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
@@ -24115,43 +24134,99 @@ if (typeof globalThis.TextDecoder === 'undefined') {
                 return '';
             }
 
-            let outChunks = [];
-            let chunk = [];
-            for (let i = 0; i < bytes.length; ) {
+            let needed = this._needed;
+            let seen = this._seen;
+            let codePoint = this._codePoint;
+            let lower = this._lower;
+            let upper = this._upper;
+            const invalid = () => {
+                if (this.fatal) {
+                    this._reset();
+                    throw new TypeError(INVALID_UTF8);
+                }
+                return 0xfffd;
+            };
+            const outChunks = [];
+            const chunk = [];
+            let i = 0;
+            while (i < bytes.length) {
                 if (chunk.length >= 4096) {
                     outChunks.push(String.fromCharCode.apply(null, chunk));
                     chunk.length = 0;
                 }
-                const b0 = bytes[i++];
-                if (b0 < 0x80) {
-                    chunk.push(b0);
+                const b = bytes[i];
+                if (needed === 0) {
+                    i++;
+                    if (b < 0x80) {
+                        chunk.push(b);
+                    } else if (b >= 0xc2 && b <= 0xdf) {
+                        needed = 1;
+                        codePoint = b & 0x1f;
+                    } else if (b >= 0xe0 && b <= 0xef) {
+                        if (b === 0xe0) lower = 0xa0;
+                        if (b === 0xed) upper = 0x9f;
+                        needed = 2;
+                        codePoint = b & 0x0f;
+                    } else if (b >= 0xf0 && b <= 0xf4) {
+                        if (b === 0xf0) lower = 0x90;
+                        if (b === 0xf4) upper = 0x8f;
+                        needed = 3;
+                        codePoint = b & 0x07;
+                    } else {
+                        chunk.push(invalid());
+                    }
                     continue;
                 }
-                if ((b0 & 0xe0) === 0xc0) {
-                    const b1 = bytes[i++] & 0x3f;
-                    chunk.push(((b0 & 0x1f) << 6) | b1);
+                if (b < lower || b > upper) {
+                    // This byte ends the invalid subpart; decode it afresh.
+                    needed = 0;
+                    seen = 0;
+                    codePoint = 0;
+                    lower = 0x80;
+                    upper = 0xbf;
+                    chunk.push(invalid());
                     continue;
                 }
-                if ((b0 & 0xf0) === 0xe0) {
-                    const b1 = bytes[i++] & 0x3f;
-                    const b2 = bytes[i++] & 0x3f;
-                    chunk.push(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
-                    continue;
+                i++;
+                lower = 0x80;
+                upper = 0xbf;
+                codePoint = (codePoint << 6) | (b & 0x3f);
+                seen++;
+                if (seen === needed) {
+                    if (codePoint > 0xffff) {
+                        const offset = codePoint - 0x10000;
+                        chunk.push(0xd800 + (offset >> 10), 0xdc00 + (offset & 0x3ff));
+                    } else {
+                        chunk.push(codePoint);
+                    }
+                    needed = 0;
+                    seen = 0;
+                    codePoint = 0;
                 }
-                if ((b0 & 0xf8) === 0xf0) {
-                    const b1 = bytes[i++] & 0x3f;
-                    const b2 = bytes[i++] & 0x3f;
-                    const b3 = bytes[i++] & 0x3f;
-                    let cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
-                    cp -= 0x10000;
-                    chunk.push(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-                    continue;
-                }
+            }
+            if (needed !== 0 && !stream) {
+                // A sequence cut off by the end of the input.
+                needed = 0;
+                chunk.push(invalid());
             }
             if (chunk.length > 0) {
                 outChunks.push(String.fromCharCode.apply(null, chunk));
             }
-            return outChunks.join('');
+            let text = outChunks.join('');
+            if (!this.ignoreBOM && !this._bomChecked && text.length > 0) {
+                this._bomChecked = true;
+                if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+            }
+            if (stream) {
+                this._needed = needed;
+                this._seen = seen;
+                this._codePoint = codePoint;
+                this._lower = lower;
+                this._upper = upper;
+            } else {
+                this._reset();
+            }
+            return text;
         }
     }
 
@@ -26650,8 +26725,8 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            235_066,
-            "c97b4c4e52986f21a09c1a6aeda6e3f0364430328b0c74bf75e75e284cd1f8f6",
+            237_923,
+            "ec8680176fdb8d45e609ee6549023d4ea21e0f37d78447f16d13a1cb1f0062f6",
         ),
         (
             "node:fs",
@@ -34974,7 +35049,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
+                    r"
                     globalThis.virtualRestartResult = null;
                     (async () => {
                         const results = {};
@@ -35023,17 +35098,17 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                             '/v1/test',
                         ].every(url => rejected('bound', url));
 
+                        // Every `__pi_*` global, including `__pi_url_parse_native`,
+                        // is non-writable after setup; assigning it in this strict
+                        // eval would throw. Replace the writable parsers only.
                         const originalURL = globalThis.URL;
-                        const originalParser = globalThis.__pi_url_parse_native;
                         const originalJSONParse = JSON.parse;
                         try {
                             globalThis.URL = function() { return { protocol: 'http:', hostname: '127.0.0.1', port: '28180' }; };
-                            globalThis.__pi_url_parse_native = () => '{"protocol":"http:","hostname":"127.0.0.1","port":"28180"}';
                             JSON.parse = () => ({ protocol: 'http:', hostname: '127.0.0.1', port: '28180' });
                             results.replacedParsersRejected = rejected('bound', 'https://example.com/v1/test');
                         } finally {
                             globalThis.URL = originalURL;
-                            globalThis.__pi_url_parse_native = originalParser;
                             JSON.parse = originalJSONParse;
                         }
                         const stream = __pi_virtual_http_start(__pi_test_secret, 'bound', { url: 'http://127.0.0.1:28180/v1/test' });
@@ -35055,7 +35130,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         results.streams = counts.providerStreams;
                         globalThis.virtualRestartResult = results;
                     })();
-                    "#,
+                    ",
                 ))
                 .await
                 .expect("eval route restart isolation");

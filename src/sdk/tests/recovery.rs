@@ -2734,10 +2734,11 @@ fn overflow_compaction_preserves_native_input_tools_and_durable_order_without_re
         .clone()
         .unwrap();
     let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
-    assert_eq!(
-        serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
-        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
-    );
+    // The overflow summary is re-stamped on every projection, so only its
+    // timestamp may differ between the live context and the reopened file.
+    let (live, durable) =
+        reopened.current_path_comparison_values(&run_async(handle.messages()).unwrap());
+    assert_eq!(durable, live);
 }
 
 #[test]
@@ -2840,10 +2841,10 @@ fn overflow_keeps_native_request_and_large_completed_tool_tail_or_stops_without_
             .clone()
             .unwrap();
         let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
-        assert_eq!(
-            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
-            serde_json::to_value(messages).unwrap(),
-        );
+        // The overflow summary is re-stamped on every projection; the retained
+        // native input and tool pairs keep their authored timestamps.
+        let (live, durable) = reopened.current_path_comparison_values(&messages);
+        assert_eq!(durable, live);
     }
 }
 

@@ -209,7 +209,17 @@ fn configured_settings_are_available_during_initialize_then_pushed_before_docume
         inspected["notificationQueued"], false,
         "inspection must not push twice"
     );
-    peer.wire("test/success", json!({}));
+    // A raw `request` only selects the server; a diagnostics pull opens the
+    // document. A non-empty report settles that pull in one round trip.
+    peer.wire(
+        "test/configure",
+        json!({"replies":{"textDocument/diagnostic":[{"result":{"kind":"full","items":[{
+            "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
+            "message":"opened"
+        }]}}]}}),
+    );
+    peer.run(json!({"action":"diagnostics","file":"source.cfgfixture","timeout":5}))
+        .unwrap();
     let frames = peer.frames();
     let init = frames
         .iter()
@@ -474,12 +484,17 @@ fn new_configuration_retires_diagnostics_and_previous_pull_result_ids() {
     let Some(peer) = Peer::new(json!([]), false) else {
         return;
     };
+    // An empty pull during server warmup is not a settled result and is pulled
+    // again, so each report carries one diagnostic to settle in a single pull.
+    let report = |id: &str| {
+        json!({"result":{"kind":"full","resultId":id,"items":[{
+            "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},
+            "message":id
+        }]}})
+    };
     peer.wire(
         "test/configure",
-        json!({"replies":{"textDocument/diagnostic":[
-            {"result":{"kind":"full","resultId":"before","items":[]}},
-            {"result":{"kind":"full","resultId":"after","items":[]}}
-        ]}}),
+        json!({"replies":{"textDocument/diagnostic":[report("before"), report("after")]}}),
     );
     let input = json!({"action":"diagnostics","file":"source.cfgfixture","timeout":5});
     peer.run(input.clone()).unwrap();
@@ -645,9 +660,11 @@ fn refused_notification_does_not_publish_new_settings_or_a_revision() {
     assert!(entry.client.set_workspace_settings(&proposed).is_err());
     assert_eq!(entry.client.workspace_settings(), previous);
     assert!(paused.drain().is_empty());
+    // Batch admission refuses the whole transaction before posting any frame,
+    // so the connection is not indeterminate and stays usable.
     assert!(
-        !entry.client.is_alive(),
-        "failed notification retires an indeterminate connection"
+        entry.client.is_alive(),
+        "a refused, unposted transaction leaves the connection intact"
     );
 }
 

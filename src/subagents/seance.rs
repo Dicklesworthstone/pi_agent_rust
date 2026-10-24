@@ -824,9 +824,20 @@ mod tests {
             !all_args.contains(secret),
             "the live session's bare secret must be protected"
         );
-        assert!(
-            !all_args.contains("pi-secret:"),
+        // The protected snapshot keeps the omission visible as the
+        // irreversible `<pi-secret:redacted>` marker; only vault placeholders
+        // (the grammar in secrets.rs) are restorable. The snapshot is JSON
+        // whose encoder writes `<` as `\u003c`, so match both spellings.
+        let reversible = regex::Regex::new(r"(?:<|\\u003c)pi-secret:[0-9a-f]{6,16}>").unwrap();
+        assert_eq!(
+            reversible.find(&all_args).map(|found| found.as_str()),
+            None,
             "no reversible vault IDs may leave the owner"
+        );
+        assert_eq!(
+            all_args.matches("pi-secret:").count(),
+            all_args.matches("pi-secret:redacted>").count(),
+            "every other secret mention must be the irreversible marker: {all_args}"
         );
         assert!(!all_args.contains("CUSTOM_DEFINITION_MUST_NOT_LOAD"));
         assert!(!all_args.contains("task-role-must-not-win"));

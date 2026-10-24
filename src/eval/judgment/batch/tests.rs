@@ -541,7 +541,13 @@ fn public_python_and_javascript_cells_retain_results_and_report_native_receipts(
                 .await
                 .unwrap();
             assert!(!output.is_error, "{}", text(&output));
-            assert_eq!(text(&output).trim(), "2");
+            // The fresh kernel's first cell carries its start banner.
+            let started = if kernel == "js" {
+                "(js kernel started)\n"
+            } else {
+                "(kernel started)\n"
+            };
+            assert_eq!(text(&output).trim(), format!("{started}2"));
             let details = output.details.unwrap();
             let receipts = details["judgments"]["attempts"].as_array().unwrap();
             assert_eq!(receipts.len(), 3);

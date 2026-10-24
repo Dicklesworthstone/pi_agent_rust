@@ -6008,6 +6008,16 @@ mod tests {
         vision.model.input.push(InputType::Image);
         let text = test_model_entry("dummy", "text-model");
         app.available_models = vec![vision.clone(), text.clone()];
+        // Session restores resolve against the session registry that PiApp
+        // seeds at construction, not the later-replaced picker list.
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                app.available_models.clone(),
+            ));
 
         for entry in [&vision, &text, &vision] {
             {
@@ -6182,7 +6192,17 @@ mod tests {
         app.save_enabled = false;
         let mut native = test_model_entry("openrouter", "vendor/shared");
         native.model.api = "openai-completions".to_string();
-        app.available_models = vec![native];
+        app.available_models = vec![native.clone()];
+        // Explicit commands resolve against the session registry that PiApp
+        // seeds at construction, not the later-replaced picker list.
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                native,
+            ]));
         let _ = app.handle_slash_model("openrouter/vendor/shared");
         let before = session.try_lock().expect("session").entries.len();
         let running = app.agent.try_lock().expect("agent").provider();

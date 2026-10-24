@@ -142,11 +142,15 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
 #[must_use]
 pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
     Some(match name {
-        "read" => "Read the contents of a file",
-        "write" => "Write content to a file",
+        "read" => {
+            "Read local files, document URLs, ZIP archive members, images (jpg, png, gif, webp), and v…"
+        }
+        "write" => "Write content to a file, creating parent directories as needed",
         "edit" => "Edit a file by replacing text",
-        "bash" => "Execute a bash command in the current working directory",
-        "grep" => "Search file contents for a pattern",
+        "bash" => "Execute a bash command",
+        "grep" => {
+            "Search files, internal documents (agent://, skill://, local://, pr://, and other read URL…"
+        }
         "find" => "Search for files by glob pattern",
         "ls" => "List directory contents",
         "hashline_edit" => {
@@ -163,7 +167,9 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "debug" => {
             "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware…"
         }
-        "jobs" => "Manage background bash jobs started with `bash {background: true}`",
+        "jobs" => {
+            "Manage this session's background bash jobs, async subagent tasks and retained eval model …"
+        }
         "hub" => "Supervise long-running processes and manage background jobs",
         "subagent" => "Delegate an isolated task to a named Pi child agent",
         "ask" => "Ask the user structured questions mid-turn instead of guessing",

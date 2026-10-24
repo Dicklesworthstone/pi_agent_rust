@@ -1429,6 +1429,21 @@ impl AuthStorage {
         Self::load_with_lock_timeout(path, Duration::from_secs(30))
     }
 
+    /// Parse auth.json strictly through the same guarded, bounded read.
+    /// `load` recovers from a corrupt store by backing it up and starting
+    /// empty, so diagnostics use this to report the store instead.
+    pub fn check_parse(path: &Path) -> Result<()> {
+        let read = read_auth_file_guarded(path, Duration::from_secs(30), || Ok(()))
+            .map_err(AuthStorageLoadFailure::into_error)?;
+        read.as_ref()
+            .and_then(|read| read.content.as_deref())
+            .map_or(Ok(()), |content| {
+                serde_json::from_str::<AuthFile>(content)
+                    .map(drop)
+                    .map_err(|error| Error::auth(format!("auth.json: {error}")))
+            })
+    }
+
     /// Load auth.json while bounding how long a concurrently held lock may delay the read.
     pub fn load_with_lock_timeout(path: PathBuf, lock_timeout: Duration) -> Result<Self> {
         Self::load_with_lock_timeout_classified(path, lock_timeout)

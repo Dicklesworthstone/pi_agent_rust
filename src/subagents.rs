@@ -1335,7 +1335,9 @@ struct SubagentResult {
     preserved_worktrees: Vec<crate::worktree_iso::IsoOutcome>,
     session_isolation: &'static str,
     /// Agent-hub run id (bd-cv653.5.3) when the registry tracked this run.
-    #[serde(skip)]
+    /// Serialized as `hubId`: callers revive, steer and correlate runs from
+    /// `details.results[]`, so the documented hub reference must reach them.
+    #[serde(skip_serializing_if = "Option::is_none")]
     hub_id: Option<String>,
     #[serde(skip)]
     is_error: bool,

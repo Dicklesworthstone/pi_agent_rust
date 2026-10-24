@@ -157,8 +157,10 @@ fn python_rewritten_final_display_discards_kernel_instead_of_replacing_live_data
     let sink = Arc::clone(&seen);
     let error = run(tool.execute(
         "forged-final",
+        // The browser bootstrap (7084ac850) loads the kernel as its own
+        // module rather than as `__main__`.
         json!({"code":concat!(
-            "keep=7\ndisplay({'value':'original'})\nimport __main__ as server\n",
+            "keep=7\ndisplay({'value':'original'})\nimport sys\nserver = sys.modules['_pi_eval_kernel']\n",
             "server._DISPLAY_CONTEXT.get().frames[0]['data']['value']='rewritten'"
         )}),
         Some(Box::new(move |event: ToolUpdate| {

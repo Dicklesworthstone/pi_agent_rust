@@ -75,10 +75,16 @@ fn drain(
             let frame: Value = serde_json::from_str(&line)
                 .map_err(|_| stopped("EVAL_PROTOCOL", "invalid output during Python tool wait"))?;
             if frame.get("stream").is_none() {
-                return Err(stopped(
-                    "EVAL_PROTOCOL",
-                    "expected output, not another request or completion, during Python tool wait",
-                ));
+                // A completion that races ahead of the host's reply names the
+                // corrupted exchange, the cause `validate_response` reports.
+                return Err(if frame.get("bridgeError").is_some() {
+                    stopped("EVAL_BRIDGE_PROTOCOL", "incomplete tool exchange")
+                } else {
+                    stopped(
+                        "EVAL_PROTOCOL",
+                        "expected output, not another request or completion, during Python tool wait",
+                    )
+                });
             }
             // The ordinary capture validates exact envelope/cell/sequence,
             // console bounds and MIME frames, and writes archives only once.

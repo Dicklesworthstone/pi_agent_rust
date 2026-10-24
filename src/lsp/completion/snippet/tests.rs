@@ -275,7 +275,8 @@ fn substitutions_cannot_bypass_command_or_indentation_rejection() {
     };
     for extra in [
         json!({"command":{"command":"unsafe.run"}}),
-        json!({"insertTextMode":2}),
+        // adjustIndentation (2) is applied now; an unknown mode is still refused.
+        json!({"insertTextMode":3}),
     ] {
         let mut raw = item("${1:value}");
         raw.as_object_mut()

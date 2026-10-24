@@ -178,7 +178,8 @@ fn ignoring_soft_interruption_does_not_extend_the_hard_deadline() {
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         let fresh = cell(&tool, "'keep' in globals()").await;
         assert!(!fresh.is_error, "{}", text(&fresh));
-        assert_eq!(text(&fresh).trim(), "False");
+        // The retired kernel's replacement announces itself on its first cell.
+        assert_eq!(text(&fresh).trim(), "(kernel started)\nFalse");
         assert_eq!(fresh.details.as_ref().unwrap()["cell"], 1);
     });
 }
@@ -203,7 +204,7 @@ fn unsettled_root_retires_instead_of_resuming_in_another_cell() {
         assert!(error.to_string().contains("EVAL_STATE_RESET"), "{error}");
         let fresh = cell(&tool, "'keep' in globals()").await;
         assert!(!fresh.is_error, "{}", text(&fresh));
-        assert_eq!(text(&fresh).trim(), "False");
+        assert_eq!(text(&fresh).trim(), "(kernel started)\nFalse");
         assert_eq!(fresh.details.as_ref().unwrap()["cell"], 1);
     });
 }

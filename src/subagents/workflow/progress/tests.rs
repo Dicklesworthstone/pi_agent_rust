@@ -302,7 +302,9 @@ esac
         assert_eq!(evidence["acceptedNodes"], 1);
         assert_eq!(evidence["rejectedNodes"], 1);
         assert_eq!(evidence["nodes"][0]["state"], "rejected");
-        assert_eq!(evidence["nodes"][0]["result"]["isError"], true);
+        // A node's native error flag is the documented `nativeIsError`; the
+        // embedded native `result` does not serialize `isError`.
+        assert_eq!(evidence["nodes"][0]["nativeIsError"], true);
         assert_eq!(final_job.status, "failed");
         let report = final_job
             .result

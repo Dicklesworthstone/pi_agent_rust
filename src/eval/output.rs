@@ -775,7 +775,11 @@ mod tests {
         .unwrap();
         assert!(!output.is_error, "{}", text(&output.content));
         let rendered = text(&output.content);
-        assert!(rendered.starts_with("BEGIN-"));
+        assert!(
+            rendered.starts_with("(js kernel started)\nBEGIN-"),
+            "{}",
+            rendered.chars().take(32).collect::<String>()
+        );
         assert!(rendered.trim().ends_with("-END"));
         assert!(rendered.contains("EVAL_OUTPUT_TRUNCATED"));
         assert!(rendered.len() < CAPTURE_BYTES + 256);

@@ -152,6 +152,15 @@ fn python() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// The banner on a fresh kernel's first cell.
+fn started(kernel: &str) -> &'static str {
+    if kernel == "js" {
+        "(js kernel started)\n"
+    } else {
+        "(kernel started)\n"
+    }
+}
+
 fn code(kernel: &str, input: &Value) -> String {
     if kernel == "js" {
         format!("JSON.parse(await tool.call('__pi_complete', {input})).text")
@@ -400,7 +409,8 @@ fn public_cell_deadline_owns_completion_and_retired_kernel_state() {
         assert!(provider.dropped.load(Ordering::Acquire));
         assert_eq!(out.details.unwrap()["judgments"]["attempts"][0]["status"],"incomplete");
         let next = tool.execute("fresh",json!({"kernel":"js","code":"typeof beforeCompletion"}),None).await.unwrap();
-        assert_eq!(text(&next).trim(),"undefined");
+        // The timeout retired the realm, so this is a new kernel's first cell.
+        assert_eq!(text(&next).trim(),"(js kernel started)\n\"undefined\"");
     });
     assert!(started.elapsed() < std::time::Duration::from_secs(15));
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
@@ -415,7 +425,8 @@ fn completed_and_caught_requests_remain_in_host_receipts() {
         "try {await tool.call('__pi_complete',{prompt:'first'})} catch(e){}; await tool.call('__pi_complete',{prompt:'second'}); 'handled'"
     }),None)).unwrap();
     assert!(!out.is_error, "{}", text(&out));
-    assert_eq!(text(&out).trim(), "handled");
+    // A string result renders as JSON.
+    assert_eq!(text(&out).trim(), "(js kernel started)\n\"handled\"");
     let details = out.details.unwrap();
     assert_eq!(details["judgments"]["attempts"][0]["status"], "failed");
     assert_eq!(details["judgments"]["attempts"][1]["status"], "completed");
@@ -469,7 +480,10 @@ fn typed_extraction_feeds_native_reads_and_retains_data_in_both_kernels() {
                 .await
                 .unwrap();
             assert!(!out.is_error, "{}", text(&out));
-            assert_eq!(text(&out).trim().to_ascii_lowercase(), "true");
+            assert_eq!(
+                text(&out).trim().to_ascii_lowercase(),
+                format!("{}true", started(kernel))
+            );
             assert_eq!(
                 out.details.unwrap()["judgments"]["attempts"][0]["status"],
                 "completed"
@@ -685,7 +699,7 @@ fn caught_schema_failure_retains_kernel_state_and_failed_native_receipt() {
                 .await
                 .unwrap();
             assert!(!out.is_error, "{}", text(&out));
-            assert_eq!(text(&out).trim(), "42");
+            assert_eq!(text(&out).trim(), format!("{}42", started(kernel)));
             assert_eq!(
                 out.details.unwrap()["judgments"]["attempts"][0]["status"],
                 "failed"

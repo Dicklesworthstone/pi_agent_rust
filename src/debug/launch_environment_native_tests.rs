@@ -124,11 +124,12 @@ fn explicit_environment_reaches_launch_wire_without_mutating_host_or_adapter() {
             .unwrap();
     assert_eq!(adapter["value"], json!(std::env::var(KEY).ok()));
     assert_eq!(std::env::var_os(KEY), before);
-    call(&tool, &runtime, json!({"action":"disconnect"})).unwrap();
+    // `disconnect` preserves attached targets only; a Pi-launched program ends with `terminate`.
+    call(&tool, &runtime, json!({"action":"terminate"})).unwrap();
     // Same tool, new session: overrides are request-local, never sticky.
     call(&tool, &runtime, launch()).unwrap();
     assert!(wire_launch(&tool, &runtime).get("env").is_none());
-    call(&tool, &runtime, json!({"action":"disconnect"})).unwrap();
+    call(&tool, &runtime, json!({"action":"terminate"})).unwrap();
 }
 
 #[test]
@@ -166,7 +167,7 @@ fn incompatible_config_environment_is_refused_before_spawn_and_does_not_poison_r
         );
     }
     call(&tool, &runtime, launch()).unwrap();
-    call(&tool, &runtime, json!({"action":"disconnect"})).unwrap();
+    call(&tool, &runtime, json!({"action":"terminate"})).unwrap();
 }
 
 #[test]

@@ -70,7 +70,8 @@ fn actual_registry_binding_isolates_and_restores_lexical_javascript_state() {
         cell(tool, "js", "const secret = 41; secret").await;
         select(&scope, "session-b");
         let absent = cell(tool, "js", "typeof secret").await;
-        assert_eq!(text(&absent).trim(), "\"undefined\"");
+        // A session's first cell starts its own kernel and says so.
+        assert_eq!(text(&absent).trim(), "(js kernel started)\n\"undefined\"");
         assert_eq!(absent.details.as_ref().unwrap()["cell"], 1);
         cell(tool, "js", "const secret = 99; secret").await;
         select(&scope, "session-a");
@@ -99,7 +100,7 @@ fn python_namespaces_and_both_languages_survive_switch_back_independently() {
         select(&scope, "session-b");
         assert_eq!(
             text(&cell(&tool, "python", "'secret' in globals()").await).trim(),
-            "False"
+            "(kernel started)\nFalse"
         );
         cell(&tool, "python", "secret = 99").await;
         cell(&tool, "js", "const secret = 100").await;
@@ -261,7 +262,7 @@ fn idle_cache_is_bounded_lru_and_evicted_sessions_restart_explicitly() {
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "0");
         select(&scope, "s1");
         let evicted = cell(&tool, "js", "typeof keep").await;
-        assert_eq!(text(&evicted).trim(), "\"undefined\"");
+        assert_eq!(text(&evicted).trim(), "(js kernel started)\n\"undefined\"");
         let details = evicted.details.unwrap();
         assert_eq!(details["restarted"], true);
         assert_eq!(details["cell"], 1);
@@ -281,7 +282,7 @@ fn rebinding_the_tool_to_a_registry_retires_the_previous_storage_incarnation() {
     for session_id in ["session-a", "session-b"] {
         select(&scope, session_id);
         let fresh = run(cell(&tool, "js", "typeof keep"));
-        assert_eq!(text(&fresh).trim(), "\"undefined\"");
+        assert_eq!(text(&fresh).trim(), "(js kernel started)\n\"undefined\"");
         assert_eq!(fresh.details.unwrap()["restarted"], true);
     }
 }
@@ -344,7 +345,7 @@ fn quiet_active_javascript_stops_without_touching_the_new_sessions_kernel() {
         assert_eq!(preserved.details.as_ref().unwrap()["restarted"], false);
         select(&scope, "session-a");
         let fresh = cell(&tool, "js", "typeof keep").await;
-        assert_eq!(text(&fresh).trim(), "\"undefined\"");
+        assert_eq!(text(&fresh).trim(), "(js kernel started)\n\"undefined\"");
         assert_eq!(fresh.details.unwrap()["cell"], 1);
     });
 }
@@ -383,7 +384,11 @@ fn javascript_callback_switch_keeps_partial_output_without_publishing_an_archive
         "no running update after ownership loss"
     );
     assert!(!dir.path().join("interrupted.jsonl").exists());
-    assert_eq!(text(&run(cell(&tool, "js", "42"))).trim(), "42");
+    // The new owner's first cell starts its own kernel.
+    assert_eq!(
+        text(&run(cell(&tool, "js", "42"))).trim(),
+        "(js kernel started)\n42"
+    );
 }
 
 #[test]
@@ -425,7 +430,7 @@ fn python_callback_switch_refuses_the_next_bridge_and_preserves_other_namespaces
         select(&scope, "session-a");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "43");
         let fresh = cell(&tool, "python", "'keep' in globals()").await;
-        assert_eq!(text(&fresh).trim(), "False");
+        assert_eq!(text(&fresh).trim(), "(kernel started)\nFalse");
         assert_eq!(fresh.details.unwrap()["cell"], 1);
     });
 }
@@ -456,7 +461,7 @@ fn unavailable_identity_during_execution_fails_closed_and_releases_admission() {
         select(&scope, "session-a");
         assert_eq!(
             text(&cell(&tool, "js", "typeof keep").await).trim(),
-            "\"undefined\""
+            "(js kernel started)\n\"undefined\""
         );
     });
 }
@@ -492,9 +497,10 @@ fn active_cell_deadline_includes_a_resolver_that_becomes_permanently_pending() {
         assert_eq!(output.details.as_ref().unwrap()["errorKind"], "timeout");
         assert!(tool.execution.try_lock().is_some());
         blocked.store(false, Ordering::SeqCst);
+        // The timeout retired the realm, so this is a new kernel's first cell.
         assert_eq!(
             text(&cell(&tool, "js", "typeof keep").await).trim(),
-            "\"undefined\""
+            "(js kernel started)\n\"undefined\""
         );
     });
 }

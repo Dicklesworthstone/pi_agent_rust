@@ -221,7 +221,9 @@ impl PreparedCopy {
         let mut header = report.header.clone();
         header["id"] = json!(session_id);
         header["timestamp"] = json!(timestamp);
-        header["currentLeaf"] = json!(notice_id);
+        // `leafId` is the native selection key (`SessionHeader::current_leaf`);
+        // an unknown key would leave the source's saved selection in force.
+        header["leafId"] = json!(notice_id);
         // A copied grandparent path would misidentify this fork's origin.
         // Use immutable source identity/digest provenance, not a borrowed path.
         header

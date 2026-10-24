@@ -92,9 +92,11 @@ fn private_python_process_and_descendants_retire_without_touching_retained_state
             .unwrap();
         assert!(!seed.is_error, "{}", text(&seed));
         let retained_pid = seed.details.unwrap()["jsonOutputs"][0]["pid"].clone();
+        // The kernel pops `_PI_EVAL_PACKAGE_ROOT` from the environment at
+        // import (576173a35), so read its owned storage root from the module.
         let private = tool.execute("private", json!({
             "kernel_mode":"per_call", "reset":true,
-            "code":"import os, sys, subprocess\nassert 'keep' not in globals()\nkeep = 99\nchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\ndisplay({'pid': os.getpid(), 'child': child.pid, 'packages': os.environ['_PI_EVAL_PACKAGE_ROOT']})"
+            "code":"import os, sys, subprocess\nassert 'keep' not in globals()\nkeep = 99\nchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\ndisplay({'pid': os.getpid(), 'child': child.pid, 'packages': sys.modules['_pi_eval_kernel']._PACKAGE_ROOT})"
         }), None).await.unwrap();
         assert!(!private.is_error, "{}", text(&private));
         let details = private.details.unwrap();

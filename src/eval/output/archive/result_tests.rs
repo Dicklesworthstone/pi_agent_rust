@@ -226,7 +226,11 @@ fn public_javascript_quiet_cell_saves_its_final_expression_and_no_console_frames
     let rows = records(&directory.path().join("answer.jsonl"));
     assert_eq!(rows.len(), 3);
     let saved: ToolOutput = serde_json::from_value(completed(&rows).clone()).unwrap();
-    assert!(matches!(&saved.content[0], ContentBlock::Text(text) if text.text.trim() == "42"));
+    let ContentBlock::Text(saved_text) = &saved.content[0] else {
+        panic!("saved result is not text: {:?}", saved.content);
+    };
+    // The archive keeps the visible result, including the first cell's banner.
+    assert_eq!(saved_text.text.trim(), "(js kernel started)\n42");
     assert_eq!(rows.last().unwrap()["stdoutBytes"], 0);
     assert_eq!(rows.last().unwrap()["status"], "success");
 }

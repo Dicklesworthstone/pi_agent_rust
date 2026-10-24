@@ -14,7 +14,8 @@ fn source(root: &Path, records: &[Value], leaf: &str) -> PathBuf {
     let mut header = serde_json::to_value(Session::in_memory().header).unwrap();
     header["id"] = json!("original-session");
     header["cwd"] = json!(root.to_str().unwrap());
-    header["currentLeaf"] = json!(leaf);
+    // The native header key; a misspelled one is silently ignored on load.
+    header["leafId"] = json!(leaf);
     header["parentSession"] = json!("old-grandparent.jsonl");
     let mut bytes = serde_json::to_vec(&header).unwrap();
     bytes.push(b'\n');
@@ -103,7 +104,10 @@ fn fork_preserves_all_branches_global_metadata_and_forward_parents_with_new_iden
     assert_eq!(copied[1]["message"]["content"][0]["text"], "original text");
     assert_eq!(copied[1]["message"]["content"][1]["type"], "text");
     let notice = copied.last().unwrap();
-    assert_eq!(copied[0]["currentLeaf"], notice["id"]);
+    assert_eq!(
+        SessionHeader::deserialize(&copied[0]).unwrap().current_leaf,
+        notice["id"].as_str().map(str::to_string)
+    );
     assert_eq!(notice["parentId"], "chosen");
     assert_eq!(notice["message"]["customType"], PROVENANCE);
     assert_eq!(

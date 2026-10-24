@@ -201,7 +201,9 @@ fn explicit_cwd_controls_target_breakpoints_adapter_process_and_launch_wire() {
             .display()
             .to_string()
     );
-    run(&tool, &runtime, json!({"action":"disconnect"})).unwrap();
+    // A Pi-launched program ends with `terminate`, which still sends the DAP
+    // `disconnect` request the adapter records; plain `disconnect` refuses it.
+    run(&tool, &runtime, json!({"action":"terminate"})).unwrap();
     assert!(
         nested.join("disconnect.json").is_file(),
         "adapter process did not inherit the explicit cwd"

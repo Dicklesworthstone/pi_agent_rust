@@ -1167,15 +1167,23 @@ fn invalid_isolation_settings_do_not_launch() {
         emit(&[ended("answer", "stop")]),
     ));
     for (isolation, apply) in [("worktre", "apply"), ("worktree", "aply")] {
-        let output = run(
-            &tool,
-            json!({"tasks":[{
-                "agent":"worker","task":"must not launch","isolation":isolation,"isoApply":apply
-            }]}),
+        // `workspace::validate_request` admits workspace controls before
+        // discovery or launch, so a typo is a tool error, not a failed task.
+        let error = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(tool.execute(
+                "protocol-test",
+                json!({"tasks":[{
+                    "agent":"worker","task":"must not launch","isolation":isolation,"isoApply":apply
+                }]}),
+                None,
+            ))
+            .expect_err("invalid workspace controls must be refused");
+        assert!(
+            error.to_string().contains("PI_SUBAGENT_INVALID_WORKSPACE"),
+            "{error}"
         );
-        assert!(output.is_error, "{output:?}");
-        assert_eq!(result(&output)["status"], "failed");
-        assert!(result(&output)["pid"].is_null());
         assert!(!tool.cwd.join("launched").exists());
     }
 }

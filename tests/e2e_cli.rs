@@ -4351,7 +4351,12 @@ fn e2e_cli_rpc_prewalk_retries_the_destination_without_replaying_tools() {
             .any(|event| event["type"] == "auto_retry_end" && event["success"] == true)
     );
     assert_eq!(events.last().unwrap()["type"], "agent_end");
-    assert!(events.last().unwrap().get("error").is_none());
+    // A successful RPC turn ends with `"error": null`, as in e2e_failover.
+    assert!(
+        events.last().unwrap()["error"].is_null(),
+        "{}",
+        events.last().unwrap()
+    );
 }
 
 #[test]

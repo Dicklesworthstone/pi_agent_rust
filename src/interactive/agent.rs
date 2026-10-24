@@ -5773,10 +5773,11 @@ mod stream_delta_batcher_tests {
         assert_eq!(reopened.entries.len(), 3);
         assert!(reopened.entries.iter().any(|entry| matches!(entry,
             SessionEntry::Compaction(compaction) if compaction.details.as_ref().unwrap()["mode"] == "handoff")));
-        assert_eq!(
-            serde_json::to_value(app.agent.try_lock().unwrap().messages()).unwrap(),
-            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap()
-        );
+        // The summary and these timestamp-less rows are re-stamped on every
+        // projection, so only their timestamps may differ from the reopened file.
+        let (live, durable) =
+            reopened.current_path_comparison_values(app.agent.try_lock().unwrap().messages());
+        assert_eq!(live, durable);
         eprintln!(
             "{}",
             json!({"schema":"pi.handoff.ui.test.v1","case":"classic_native_transaction"})
@@ -6852,6 +6853,16 @@ mod stream_delta_batcher_tests {
         let mut next = model_entry("openai", "gpt-4o");
         next.model.reasoning = false;
         app.available_models.push(next.clone());
+        // Session-header sync resolves against the session registry that PiApp
+        // seeds at construction, not the later-extended picker list.
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                app.available_models.clone(),
+            ));
 
         let session_id = runtime().block_on(async {
             let cx = Cx::for_request();
@@ -6900,6 +6911,16 @@ mod stream_delta_batcher_tests {
         let mut next = model_entry("openai", "gpt-4o");
         next.model.reasoning = false;
         app.available_models.push(next.clone());
+        // Branch sync resolves against the session registry that PiApp seeds
+        // at construction, not the later-extended picker list.
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                app.available_models.clone(),
+            ));
 
         let (session_id, current_leaf_id, target_leaf_id) = runtime().block_on(async {
             let cx = Cx::for_request();

@@ -236,7 +236,14 @@ fn consumer_doctor_preserves_config_and_auth_failures() -> TestResult {
                         args.push("--fix");
                     }
                     let output = run_consumer_doctor(&args, Some(file), false)?.output;
-                    require_eq(&output.status.code(), &Some(1), "ordinary failure exit")?;
+                    require_eq(
+                        &output.status.code(),
+                        &Some(1),
+                        &format!(
+                            "ordinary failure exit with a broken {file} and {args:?}; stdout: {}",
+                            String::from_utf8_lossy(&output.stdout)
+                        ),
+                    )?;
                     let stdout = String::from_utf8(output.stdout)?;
                     if format == "json" {
                         let report: Value = serde_json::from_str(&stdout)?;

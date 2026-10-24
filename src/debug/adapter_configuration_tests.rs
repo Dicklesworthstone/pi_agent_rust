@@ -168,7 +168,8 @@ fn configured_launch_preserves_target_arguments_and_configures_before_execution(
         request(&wire, "initialize")["arguments"]["supportsRunInTerminalRequest"],
         false
     );
-    call(&tool, &runtime, json!({"action":"disconnect"})).unwrap();
+    // `disconnect` preserves attached targets only; a Pi-launched program ends with `terminate`.
+    call(&tool, &runtime, json!({"action":"terminate"})).unwrap();
     assert_adapter_reaped(root.path());
     event("configured_launch", "verified");
 }

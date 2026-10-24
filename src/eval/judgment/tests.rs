@@ -475,7 +475,13 @@ fn both_native_kernels_return_typed_results_and_host_owned_usage_receipts() {
                     .await
                     .unwrap();
                 assert!(!output.is_error, "{}", text(&output));
-                assert_eq!(text(&output).trim(), "0.8");
+                // Only the fresh kernel's first cell carries its start banner.
+                let started = match (cell, kernel) {
+                    (1, "js") => "(js kernel started)\n",
+                    (1, _) => "(kernel started)\n",
+                    _ => "",
+                };
+                assert_eq!(text(&output).trim(), format!("{started}0.8"));
                 let details = output.details.unwrap();
                 assert_eq!(details["cell"], cell);
                 let attempts = details["judgments"]["attempts"].as_array().unwrap();
