@@ -533,10 +533,10 @@ fn extract_result<'js>(ctx: &rquickjs::Ctx<'js>, value: &rquickjs::Value<'js>) -
 fn error_response(ctx: &rquickjs::Ctx<'_>, err: &rquickjs::Error) -> JsCellResponse {
     let detail = if err.is_exception() {
         let thrown = ctx.catch();
-        if let Some(exception) = thrown.as_exception() {
-            format!("{exception}")
-        } else if thrown.is_object() {
-            err.to_string()
+        if thrown.is_object() {
+            thrown
+                .as_exception()
+                .map_or_else(|| err.to_string(), |exception| format!("{exception}"))
         } else {
             // A thrown primitive, such as the import prelude's coded refusals
             // or `throw "boom"`. Converting a primitive runs no guest code.
