@@ -584,6 +584,28 @@ opt-level = 3
 opt-level = 0
 debug = true
 
+# RPC get_state reports contextTokens, a BPE count over the whole active branch
+# on every call. Unoptimized, the tokenizer and its regex engines take seconds
+# on a large session, which buries the RPC latency budgets under debug-build
+# noise. `test` inherits these overrides.
+[profile.dev.package.tiktoken-rs]
+opt-level = 3
+
+[profile.dev.package.fancy-regex]
+opt-level = 3
+
+[profile.dev.package.regex]
+opt-level = 3
+
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.bstr]
+opt-level = 3
+
 [profile.test]
 # Full-suite RCH workers have limited artifact storage; keep test binaries
 # debuggable enough for line traces without emitting full debug sections.
