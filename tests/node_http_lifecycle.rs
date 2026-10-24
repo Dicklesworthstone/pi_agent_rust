@@ -3,13 +3,21 @@
 //! checks cancellation of a real `PiJS` streaming hostcall after headers.
 
 use pi::extensions_js::PiJsRuntime;
+use pi::http_shim::NODE_HTTP_JS;
 use pi::scheduler::{DeterministicClock, HostcallOutcome};
 use serde_json::{Value, json};
+
+/// The shim's one transport lookup. In `PiJS` it names a frozen host global,
+/// so the cases run against a copy of the exact embedded module in which
+/// only this expression reads a global they can replace. The Node diagnostic
+/// makes the same substitution.
+const TRANSPORT_LOOKUP: &str = "globalThis.__pi_fetch_for_node_http || globalThis.fetch";
+const CASE_TRANSPORT: &str = "globalThis.__httpLifecycleFetch";
 
 // Also executed against the exact embedded module by the Node diagnostic.
 const LIFECYCLE_CASES_JS: &str = r"
 globalThis.__httpLifecycleCases = async function(http) {
-  const savedFetch = globalThis.__pi_fetch_for_node_http;
+  const savedFetch = globalThis.__httpLifecycleFetch;
   const results = [];
   const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
   const check = (condition, message) => { if (!condition) throw new Error(message); };
@@ -104,7 +112,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     });
     await run('fetch rejection is terminal', async () => {
       let signal;
-      globalThis.__pi_fetch_for_node_http = (_url, options) => {
+      globalThis.__httpLifecycleFetch = (_url, options) => {
         signal = options.signal;
         return Promise.reject(new Error('relay refused'));
       };
@@ -120,7 +128,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     await run('response callback throw cancels unread body', async () => {
       const body = bodyFixture([], true);
       let signal;
-      globalThis.__pi_fetch_for_node_http = (_url, options) => {
+      globalThis.__httpLifecycleFetch = (_url, options) => {
         signal = options.signal; return Promise.resolve(response(body));
       };
       let incoming;
@@ -135,7 +143,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     });
     await run('header iteration failure releases body', async () => {
       const body = bodyFixture([], true);
-      globalThis.__pi_fetch_for_node_http = () => Promise.resolve({
+      globalThis.__httpLifecycleFetch = () => Promise.resolve({
         status: 200, body, headers: { entries() { throw new Error('bad response headers'); } },
       });
       const req = http.request('https://relay.invalid/');
@@ -146,7 +154,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     });
     await run('finish listener failure aborts pending headers', async () => {
       let signal;
-      globalThis.__pi_fetch_for_node_http = (_url, options) => {
+      globalThis.__httpLifecycleFetch = (_url, options) => {
         signal = options.signal; return new Promise(() => {});
       };
       const req = http.request('https://relay.invalid/');
@@ -157,7 +165,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     });
     await run('end listener failure still closes response and request', async () => {
       const body = bodyFixture();
-      globalThis.__pi_fetch_for_node_http = () => Promise.resolve(response(body));
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
       let closed = 0;
       const req = http.request('https://relay.invalid/', res => {
         res.on('end', () => { throw new Error('end observer failed'); });
@@ -170,7 +178,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     });
     await run('data observer failure cancels remaining frames', async () => {
       const body = bodyFixture([new Uint8Array([1]), new Uint8Array([2])], true);
-      globalThis.__pi_fetch_for_node_http = () => Promise.resolve(response(body));
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
       let data = 0, ended = 0, closed = 0, responseErrors = 0;
       const req = http.request('https://relay.invalid/', res => {
         res.on('data', () => { data++; throw new Error('data observer failed'); });
@@ -188,7 +196,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     await run('body failure reaches request even when response handles error', async () => {
       const failure = new Error('relay disconnected');
       const body = bodyFixture([new Uint8Array([1])], false, failure);
-      globalThis.__pi_fetch_for_node_http = () => Promise.resolve(response(body));
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
       let ended = 0;
       const req = http.request('https://relay.invalid/', res => {
         res.on('error', () => {}); res.on('end', () => ended++);
@@ -202,7 +210,7 @@ globalThis.__httpLifecycleCases = async function(http) {
       await run(`end listener destruction closes once (null body=${empty})`, async () => {
         const body = empty ? null : bodyFixture();
         let signal;
-        globalThis.__pi_fetch_for_node_http = (_url, options) => {
+        globalThis.__httpLifecycleFetch = (_url, options) => {
           signal = options.signal; return Promise.resolve(response(body));
         };
         let closed = 0, ended = 0;
@@ -221,7 +229,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     await run('successful binary response completes without abort', async () => {
       const body = bodyFixture([new Uint8Array([0, 255, 65]), new Uint8Array([66])]);
       let signal, incoming;
-      globalThis.__pi_fetch_for_node_http = (_url, options) => {
+      globalThis.__httpLifecycleFetch = (_url, options) => {
         signal = options.signal; return Promise.resolve(response(body));
       };
       const bytes = [];
@@ -260,7 +268,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     });
     await run('response close listener throw cannot skip request cleanup', async () => {
       const body = bodyFixture([], true);
-      globalThis.__pi_fetch_for_node_http = () => Promise.resolve(response(body));
+      globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
       const req = http.request('https://relay.invalid/', res => {
         res.on('close', () => { throw new Error('close observer failed'); });
       });
@@ -274,7 +282,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     await run('late fetch after cancellation disposes body', async () => {
       const body = bodyFixture([], true);
       let resolveFetch;
-      globalThis.__pi_fetch_for_node_http = () => new Promise(resolve => { resolveFetch = resolve; });
+      globalThis.__httpLifecycleFetch = () => new Promise(resolve => { resolveFetch = resolve; });
       let responses = 0;
       const req = http.request('https://relay.invalid/', () => responses++);
       const events = observe(req);
@@ -286,7 +294,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     for (const paused of [false, true]) {
       await run(`abort releases pending response (paused=${paused})`, async () => {
         const body = bodyFixture([], true);
-        globalThis.__pi_fetch_for_node_http = () => Promise.resolve(response(body));
+        globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
         let closed = 0, ended = 0;
         const req = http.request('https://relay.invalid/', res => {
           if (paused) res.pause();
@@ -308,7 +316,7 @@ globalThis.__httpLifecycleCases = async function(http) {
       globalThis.clearTimeout = id => timers.delete(id);
       try {
         const body = bodyFixture([], true);
-        globalThis.__pi_fetch_for_node_http = () => Promise.resolve(response(body));
+        globalThis.__httpLifecycleFetch = () => Promise.resolve(response(body));
         const req = http.request('https://relay.invalid/', { timeout: 25 });
         const events = observe(req);
         let timedOut = 0;
@@ -324,7 +332,7 @@ globalThis.__httpLifecycleCases = async function(http) {
     });
     await run('http.get observes preflight rejection without egress', async () => {
       let fetches = 0;
-      globalThis.__pi_fetch_for_node_http = () => { fetches++; throw new Error('unexpected egress'); };
+      globalThis.__httpLifecycleFetch = () => { fetches++; throw new Error('unexpected egress'); };
       const req = http.get('https://relay.invalid/', { rejectUnauthorized: false });
       const events = observe(req);
       await flush();
@@ -332,7 +340,7 @@ globalThis.__httpLifecycleCases = async function(http) {
       check(events.errors[0].message.includes('host networking'), 'host trust policy preserved');
     });
   } finally {
-    globalThis.__pi_fetch_for_node_http = savedFetch;
+    globalThis.__httpLifecycleFetch = savedFetch;
   }
   return results;
 };
@@ -340,22 +348,36 @@ globalThis.__httpLifecycleCases = async function(http) {
 
 #[test]
 fn node_http_terminal_lifecycle_contract() {
+    assert_eq!(
+        NODE_HTTP_JS.matches(TRANSPORT_LOOKUP).count(),
+        1,
+        "the shim's transport lookup moved; update TRANSPORT_LOOKUP"
+    );
+    let root = tempfile::tempdir().expect("extension root"); // ubs:ignore test fixture setup
+    let module = root.path().join("node_http_under_test.mjs");
+    // ubs:ignore test fixture setup
+    std::fs::write(
+        &module,
+        NODE_HTTP_JS.replace(TRANSPORT_LOOKUP, CASE_TRANSPORT),
+    )
+    .expect("write module copy");
     futures::executor::block_on(async {
         let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
             .await
             .expect("runtime");
+        runtime.add_extension_root(root.path().to_path_buf());
         runtime
             .eval(LIFECYCLE_CASES_JS)
             .await
             .expect("case definitions");
         runtime
-            .eval(
+            .eval(&format!(
                 "globalThis.lifecycleResults = null; \
-                 import('node:http').then(__httpLifecycleCases).then(\
-                   results => { lifecycleResults = results; }, \
-                   error => { lifecycleResults = [{ passed: false, error: String(error) }]; }\
-                 );",
-            )
+                 import({module:?}).then(__httpLifecycleCases).then(\
+                   results => {{ lifecycleResults = results; }}, \
+                   error => {{ lifecycleResults = [{{ passed: false, error: String(error) }}]; }}\
+                 );"
+            ))
             .await
             .expect("start lifecycle cases");
         for _ in 0..32 {

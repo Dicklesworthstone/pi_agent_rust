@@ -11,16 +11,29 @@ const catchingEmitter = process.argv.includes('--catching-emitter');
 const shim = readFileSync(resolve(root, 'src/http_shim.rs'), 'utf8');
 const tests = readFileSync(resolve(root, 'tests/node_http_lifecycle.rs'), 'utf8');
 function rawConstant(text, name) {
-  const marker = `const ${name}: &str = r#"`;
-  const start = text.indexOf(marker);
-  if (start < 0) throw new Error(`Missing ${name}`);
-  const from = start + marker.length;
-  const end = text.indexOf('"#;', from);
-  if (end < 0) throw new Error(`Unterminated ${name}`);
-  return text.slice(from, end);
+  for (const hashes of ['#', '']) {
+    const marker = `const ${name}: &str = r${hashes}"`;
+    const start = text.indexOf(marker);
+    if (start < 0) continue;
+    const from = start + marker.length;
+    const end = text.indexOf(`"${hashes};`, from);
+    if (end < 0) throw new Error(`Unterminated ${name}`);
+    return text.slice(from, end);
+  }
+  throw new Error(`Missing ${name}`);
+}
+function stringConstant(text, name) {
+  const match = text.match(new RegExp(`const ${name}: &str = "([^"]*)";`));
+  if (!match) throw new Error(`Missing ${name}`);
+  return match[1];
 }
 const source = rawConstant(shim, 'NODE_HTTP_JS');
 const cases = rawConstant(tests, 'LIFECYCLE_CASES_JS');
+// The cases replace the transport through the same one-expression
+// substitution as the Rust regression (TRANSPORT_LOOKUP there).
+const transportLookup = stringConstant(tests, 'TRANSPORT_LOOKUP');
+if (source.split(transportLookup).length !== 2) throw new Error('Transport lookup not found exactly once');
+const caseSource = source.replace(transportLookup, stringConstant(tests, 'CASE_TRANSPORT'));
 globalThis.pi = { http() { throw new Error('Unexpected native hostcall in diagnostic'); } };
 const moduleUrl = text => `data:text/javascript;base64,${Buffer.from(text).toString('base64')}`;
 // A separate sensitivity check models PiJS's documented catch-and-continue
@@ -38,9 +51,9 @@ export default class CatchingEmitter extends EventEmitter {
   }
 }`;
 const executable = catchingEmitter
-  ? source.replace('import EventEmitter from "node:events";', `import EventEmitter from ${JSON.stringify(moduleUrl(emitterModel))};`)
-  : source;
-if (catchingEmitter && executable === source) throw new Error('EventEmitter import not found');
+  ? caseSource.replace('import EventEmitter from "node:events";', `import EventEmitter from ${JSON.stringify(moduleUrl(emitterModel))};`)
+  : caseSource;
+if (catchingEmitter && executable === caseSource) throw new Error('EventEmitter import not found');
 const http = await import(moduleUrl(executable));
 vm.runInThisContext(cases, { filename: 'node_http_lifecycle.rs:shared-cases' });
 const results = await globalThis.__httpLifecycleCases(http);
