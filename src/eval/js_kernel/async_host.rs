@@ -254,6 +254,7 @@ impl AsyncHost {
         )?;
         let handlers: rquickjs::Object<'_> = ctx.eval(include_str!("async_host.js"))?;
         ctx.eval::<(), _>(include_str!("browser.js"))?;
+        ctx.eval::<(), _>(include_str!("workpool_pipeline.js"))?;
         Ok(Self {
             dispatch: Persistent::save(ctx, handlers.get::<_, Function<'_>>("dispatch")?),
             clear_callbacks: Persistent::save(ctx, handlers.get::<_, Function<'_>>("clear")?),
