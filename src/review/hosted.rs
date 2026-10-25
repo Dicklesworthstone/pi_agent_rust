@@ -107,6 +107,8 @@ fn binding(value: &str) -> Option<String> {
     authority(&url)
 }
 
+// A leading dot is a valid repository name (`.github`); a leading dash is not
+// and could read as an option.
 fn valid_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= 255
@@ -114,7 +116,7 @@ fn valid_segment(segment: &str) -> bool {
         && segment
             .as_bytes()
             .first()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.'))
         && segment
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
@@ -146,7 +148,7 @@ impl Target {
         let parts: Vec<&str> = path.split('/').collect();
         let (forge, project, number) = if matches!(
             parts.as_slice(),
-            [_, _, "pull", _] | [_, _, "pull", _, "files"]
+            [_, _, "pull", _] | [_, _, "pull", _, "files" | "changes"]
         ) && host != "gitlab.com"
         {
             (Forge::Github, &parts[..2], parts[3])
@@ -286,7 +288,15 @@ impl Target {
                     .env("CHECK_UPDATE", "false")
                     .env("GLAB_DEBUG", "false")
                     .env("GLAB_DEBUG_HTTP", "false");
-                if token_host.as_deref() != Some(&self.host) {
+                let ci_host = lookup("CI_SERVER_FQDN").or_else(|| lookup("CI_SERVER_URL"));
+                // glab sends an environment token to whichever host it targets.
+                // Without an explicit binding, a CI job's token belongs to the
+                // job's own server, not to gitlab.com.
+                let token_owner = match (&configured, &ci_host) {
+                    (None, Some(ci_host)) => binding(ci_host),
+                    _ => token_host,
+                };
+                if token_owner.as_deref() != Some(&self.host) {
                     for key in GITLAB_TOKENS.into_iter().chain([
                         "GLAB_CLIENT_CERT",
                         "CLIENT_CERT",
@@ -296,7 +306,6 @@ impl Target {
                         command.env_remove(key);
                     }
                 }
-                let ci_host = lookup("CI_SERVER_FQDN").or_else(|| lookup("CI_SERVER_URL"));
                 if ci_host
                     .as_deref()
                     .is_some_and(|value| binding(value).as_deref() != Some(&self.host))
@@ -635,6 +644,16 @@ mod tests {
             target("https://gitlab.com/group/sub-group/repo/-/merge_requests/9/diffs/")?.url(),
             "https://gitlab.com/group/sub-group/repo/-/merge_requests/9"
         );
+        // GitHub's current "Files changed" tab, and an organization's
+        // `.github` repository.
+        assert_eq!(
+            target("https://github.com/team/repo/pull/7/changes#diff-ab")?.url(),
+            "https://github.com/team/repo/pull/7"
+        );
+        assert_eq!(
+            target("https://github.com/team/.github/pull/3")?.url(),
+            "https://github.com/team/.github/pull/3"
+        );
         assert!(Target::parse("branch:main")?.is_none());
         assert!(Target::parse("HEAD~3..HEAD")?.is_none());
         Ok(())
@@ -649,6 +668,8 @@ mod tests {
             "https://github.com/team/repo/../repo/pull/1",
             "https://github.com/team%2Frepo/pull/1",
             "https://github.com/team//repo/pull/1",
+            "https://github.com/team/-repo/pull/1",
+            "https://github.com/team/repo/pull/1/commits",
             "https://github.com/team/repo/pull/0",
             "https://github.com/team/repo/pull/-1",
             "https://github.com/team/repo/pull/18446744073709551616",

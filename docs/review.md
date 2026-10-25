@@ -70,8 +70,8 @@ requires a version supporting `glab mr diff --raw`. Public requests use the
 same CLI transport. A local checkout is unnecessary; the command reads a diff
 without checking out branches, changing the working tree, or posting a review.
 
-Use a complete HTTPS request URL. GitHub's `/files` and GitLab's `/diffs` view
-suffixes and URL fragments are accepted; the report's `target` is the canonical
+Use a complete HTTPS request URL. GitHub's `/files` and `/changes` and
+GitLab's `/diffs` view suffixes and URL fragments are accepted; the report's `target` is the canonical
 request URL. Credentials in URLs, query parameters, encoded path segments,
 ambiguous paths, nonpositive request numbers, and IP-literal hosts are rejected.
 Bare request numbers and `mr://` shorthand are not accepted by review.
@@ -90,7 +90,9 @@ are fixed for each invocation. Pi removes ambient repository overrides and
 prevents CI autologin from changing the target. Tokens bound to another host
 are removed from the child environment; host-specific credentials saved by the
 forge CLI remain available. GitLab CI job tokens are also removed when their
-`CI_SERVER_FQDN` or `CI_SERVER_URL` identifies another server. Self-hosted
+`CI_SERVER_FQDN` or `CI_SERVER_URL` identifies another server, and so are
+`GITLAB_TOKEN` and the other environment tokens when no host binding is set:
+in a CI job they belong to the job's own server, not gitlab.com. Self-hosted
 installations under a URL subpath are not supported.
 
 Acquisition must finish successfully with UTF-8 unified diff output. Empty

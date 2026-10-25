@@ -580,6 +580,13 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
                 "code.example",
                 "GITLAB_TOKEN",
             ),
+            // A self-managed CI job's token with no explicit host binding.
+            (
+                "https://gitlab.com/team/repo/-/merge_requests/1",
+                "CI_SERVER_FQDN",
+                "code.example",
+                "GITLAB_TOKEN",
+            ),
         ] {
             let fixture = Fixture::new(DIFF.as_bytes())?;
             let output = fixture
