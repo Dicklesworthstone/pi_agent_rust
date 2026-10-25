@@ -1902,54 +1902,59 @@ fn split_command_name_and_args(text: &str, prefix_len: usize) -> (&str, &str) {
     (name, args)
 }
 
-/// Cached regex for positional `$1`, `$2`, … substitution.
-fn positional_arg_regex() -> &'static regex::Regex {
+/// Cached regex for every template argument placeholder: `${@:start}` /
+/// `${@:start:length}` (pi), `$@[start]` / `$@[start:]` / `$@[start:length]`
+/// (OMP), `$ARGUMENTS`, `$@` and positional `$1`, `$2`, ….
+fn template_arg_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\$(\d+)").expect("positional arg regex"))
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\$\{@:(\d+)(?::(\d+))?\}|\$@\[(\d+)(?::(\d*))?\]|\$ARGUMENTS|\$@|\$(\d+)",
+        )
+        .expect("template arg regex")
+    })
 }
 
-/// Cached regex for `${@:start}` or `${@:start:length}` substitution.
-fn slice_arg_regex() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\$\{@:(\d+)(?::(\d+))?\}").expect("slice arg regex"))
-}
-
-#[allow(clippy::option_if_let_else)] // Clearer with if-let than map_or_else in the closure
+/// Fill a template's placeholders in one pass, so an argument that itself
+/// contains `$1` or `$@` is inserted as written, not substituted again.
 pub fn substitute_args(content: &str, args: &[String]) -> String {
-    let mut result = content.to_string();
-
-    // Positional $1, $2, ...
-    result = replace_regex(&result, positional_arg_regex(), |caps| {
-        let idx = caps[1].parse::<usize>().unwrap_or(0);
-        if idx == 0 {
-            String::new()
-        } else {
-            args.get(idx.saturating_sub(1)).cloned().unwrap_or_default()
-        }
-    });
-
-    // ${@:start} or ${@:start:length}
-    result = replace_regex(&result, slice_arg_regex(), |caps| {
-        let mut start = caps[1].parse::<usize>().unwrap_or(1);
-        if start == 0 {
-            start = 1;
-        }
-        let start_idx = start.saturating_sub(1);
-        let maybe_len = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
-        let slice = maybe_len.map_or_else(
-            || args.get(start_idx..).unwrap_or(&[]).to_vec(),
-            |len| {
-                let end = start_idx.saturating_add(len).min(args.len());
-                args.get(start_idx..end).unwrap_or(&[]).to_vec()
-            },
-        );
-        slice.join(" ")
-    });
-
     let all_args = args.join(" ");
-    result = result.replace("$ARGUMENTS", &all_args);
-    result = result.replace("$@", &all_args);
-    result
+    let number = |m: Option<regex::Match<'_>>| m.and_then(|m| m.as_str().parse::<usize>().ok());
+    replace_regex(content, template_arg_regex(), |caps| {
+        if let Some(idx) = caps.get(5) {
+            // `$0` names no argument.
+            let idx = idx.as_str().parse::<usize>().unwrap_or(0);
+            return idx
+                .checked_sub(1)
+                .and_then(|idx| args.get(idx))
+                .cloned()
+                .unwrap_or_default();
+        }
+        // `${@:0}` starts at the first argument, as bash's `$@` does.
+        let (start, length) = if caps.get(1).is_some() {
+            (number(caps.get(1)).unwrap_or(1).max(1), number(caps.get(2)))
+        } else if caps.get(3).is_some() {
+            // OMP: `$@[0]` and `$@[n:0]` select nothing.
+            let start = number(caps.get(3)).unwrap_or(0);
+            let length = caps
+                .get(4)
+                .filter(|m| !m.as_str().is_empty())
+                .map(|m| m.as_str().parse::<usize>().unwrap_or(usize::MAX));
+            if start == 0 || length == Some(0) {
+                return String::new();
+            }
+            (start, length)
+        } else {
+            return all_args.clone();
+        };
+        args.get(start.saturating_sub(1)..)
+            .unwrap_or(&[])
+            .iter()
+            .take(length.unwrap_or(usize::MAX))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
 pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> String {
@@ -1960,7 +1965,17 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
 
     if let Some(template) = templates.iter().find(|t| t.name == name) {
         let args = parse_command_args(args);
-        return substitute_args(&template.content, &args);
+        let expanded = substitute_args(&template.content, &args);
+        // A template with no placeholder would drop what was typed after
+        // its name; OMP appends it instead (appendInlineArgsFallback).
+        let args_text = args.join(" ");
+        if args_text.is_empty() || template_arg_regex().is_match(&template.content) {
+            return expanded;
+        }
+        if expanded.is_empty() {
+            return args_text;
+        }
+        return format!("{expanded}\n\n{args_text}");
     }
 
     text.to_string()
@@ -2960,6 +2975,63 @@ mod tests {
         assert_eq!(substitute_args("$ARGUMENTS", &args), "one two three");
         assert_eq!(substitute_args("${@:2}", &args), "two three");
         assert_eq!(substitute_args("${@:2:1}", &args), "two");
+    }
+
+    /// OMP's `$@[start:length]` slices work next to pi's `${@:start:length}`,
+    /// and an argument is inserted as written: the old pass-per-placeholder
+    /// loop substituted a `$@` or `$2` inside an argument a second time.
+    #[test]
+    fn substitute_args_reads_omp_slices_and_never_substitutes_twice() {
+        let args = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(substitute_args("$@[2]", &args), "two three");
+        assert_eq!(substitute_args("$@[2:]", &args), "two three");
+        assert_eq!(substitute_args("$@[2:1]", &args), "two");
+        assert_eq!(
+            substitute_args("[$@[0]] [$@[2:0]] [$@[9]]", &args),
+            "[] [] []"
+        );
+        assert_eq!(substitute_args("${@:0}", &args), "one two three");
+
+        let tricky = vec!["$2".to_string(), "$@".to_string()];
+        assert_eq!(substitute_args("[$1] [$2]", &tricky), "[$2] [$@]");
+        assert_eq!(substitute_args("$ARGUMENTS", &tricky), "$2 $@");
+    }
+
+    /// A template with no placeholder used to drop everything typed after
+    /// its name. OMP appends it (appendInlineArgsFallback).
+    #[test]
+    fn expand_prompt_template_appends_arguments_the_template_does_not_place() {
+        let template = |content: &str| PromptTemplate {
+            name: "review".to_string(),
+            description: "Review code".to_string(),
+            content: content.to_string(),
+            source: "user".to_string(),
+            file_path: PathBuf::from("/tmp/review.md"),
+        };
+        let plain = [template("Review the staged changes.")];
+        assert_eq!(
+            expand_prompt_template("/review focus on \"error paths\"", &plain),
+            "Review the staged changes.\n\nfocus on error paths"
+        );
+        assert_eq!(
+            expand_prompt_template("/review", &plain),
+            "Review the staged changes."
+        );
+        assert_eq!(
+            expand_prompt_template("/review only this", &[template("")]),
+            "only this"
+        );
+        for placed in [
+            "Review $1",
+            "Review $@[2]",
+            "Review ${@:2}",
+            "Review $ARGUMENTS",
+        ] {
+            assert!(
+                !expand_prompt_template("/review a b", &[template(placed)]).contains("\n\n"),
+                "{placed}: placed arguments are not appended again"
+            );
+        }
     }
 
     #[test]

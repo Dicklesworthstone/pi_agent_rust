@@ -18964,7 +18964,12 @@ mod tests {
         .unwrap();
         let prepared = pending.as_ref().expect("prepared initial turn");
         let expanded = "Review the supplied files. workflowz";
-        let text = format!("{}{expanded}", prepared.text.strip_suffix(source).unwrap());
+        // The template places no argument, so `orchestrate` follows it
+        // (OMP appendInlineArgsFallback) rather than being dropped.
+        let text = format!(
+            "{}{expanded}\n\norchestrate",
+            prepared.text.strip_suffix(source).unwrap()
+        );
         let mut expected = vec![ContentBlock::Text(TextContent::new(text))];
         expected.extend_from_slice(&prepared.attachments);
         assert!(matches!(

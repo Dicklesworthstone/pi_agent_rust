@@ -48,10 +48,16 @@ Templates support bash-like variable expansion:
 |----------|-------------|
 | `$1`, `$2`, ... | Positional arguments |
 | `$@`, `$ARGUMENTS` | All arguments joined by spaces |
-| `${@:N}` | Arguments from index N onwards (1-based) |
-| `${@:N:L}` | Slice of L arguments starting at N |
+| `${@:N}`, `$@[N]` | Arguments from index N onwards (1-based) |
+| `${@:N:L}`, `$@[N:L]` | Slice of L arguments starting at N |
 
-Missing positional arguments expand to an empty string.
+Missing positional arguments expand to an empty string. Placeholders are
+filled in one pass: an argument that contains `$1` or `$@` is inserted as
+written.
+
+A template with no placeholder at all still receives its arguments: they
+are appended after a blank line, so `/review focus on error paths` on a
+template that never mentions `$@` does not lose the request.
 
 ### Example: Commit Message
 
