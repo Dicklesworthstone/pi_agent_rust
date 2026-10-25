@@ -17555,27 +17555,28 @@ impl AgentSession {
         Ok(plan.content)
     }
 
-    /// Force-run compaction synchronously (used by `/compact` slash command).
+    /// Force-run compaction synchronously (used by `/compact` slash command),
+    /// below the automatic threshold too. Returns whether the session changed:
+    /// disabled compaction or too little history is `false`, not an error.
     pub async fn compact_now(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
         self.compact_synchronous(Arc::new(on_event), false, None, None)
             .await
-            .map(|_| ())
     }
 
     /// OMP `/shake` (bd-cv653.3.18): compact by dropping bulky tool output
     /// from the older span instead of asking the model for a summary.
-    /// Instant, and no provider request is made.
+    /// Instant, and no provider request is made. Returns whether the session
+    /// changed, as [`Self::compact_now`] does.
     pub async fn shake_now(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.compact_synchronous(Arc::new(on_event), true, None, None)
             .await
-            .map(|_| ())
     }
 
     /// Recover an overflowing request using the same durable compaction
@@ -18369,7 +18370,8 @@ impl AgentSession {
                     .min(u32::try_from(tokens / 2).unwrap_or(u32::MAX));
                 compaction::prepare_overflow_compaction(&entries, settings)
             } else {
-                compaction::prepare_compaction(&entries, settings)
+                // `/compact` and `/shake`; automatic compaction does not run here.
+                compaction::prepare_manual_compaction(&entries, settings)
             };
             (entries, prep, handoff_snapshot)
         };

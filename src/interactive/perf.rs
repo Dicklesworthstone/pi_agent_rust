@@ -1403,7 +1403,8 @@ impl PiApp {
                 keep_recent_tokens,
                 ..Default::default()
             };
-            let Some(prep) = crate::compaction::prepare_compaction(&path_entries, settings) else {
+            let Some(prep) = crate::compaction::prepare_manual_compaction(&path_entries, settings)
+            else {
                 is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
                 spawn_compaction_terminal_event(
                     &completion_runtime_handle,

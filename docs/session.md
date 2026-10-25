@@ -159,7 +159,7 @@ Creates a new session file starting from the current point (or a selected point)
 
 #### Compaction (`/compact`)
 
-Manually triggers context compaction. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
+Manually triggers context compaction, without waiting for the automatic threshold. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
 
 ### Session commands in print mode
 
@@ -176,9 +176,10 @@ pi --session ./run.jsonl -p '/retry'
 `/compact` uses the selected session's native summarizer, privacy policy,
 extension hooks and durable compaction transaction. `/compact shake` uses the
 same transaction with local removal of bulky older tool output and no summary
-model request. Disabled compaction is an error; an eligible session with nothing
-to compact reports that no change was made. Custom compaction instructions are
-not accepted on this surface.
+model request. Neither waits for the automatic threshold. Disabled compaction is
+an error; a session whose history all fits in `keepRecentTokens`, or that has
+nothing new since its last compaction, reports that no change was made. Custom
+compaction instructions are not accepted on this surface.
 
 `/handoff [focus]` asks the selected model for a continuation brief and compacts
 the selected session in place. It preserves the session ID, path, name, branch
@@ -205,7 +206,9 @@ local fallback or a new compaction entry. A changed source session also refuses
 installation. Before-compaction hooks can cancel; replacement summaries from
 those hooks are explicitly refused for handoff. The ordinary post-compaction
 hook runs after durable installation. Optional focus is limited to 4096 UTF-8
-bytes and cannot contain NUL.
+bytes and cannot contain NUL. The terminal's `--report`, `--model` and
+`--import` modes are refused here; write `/handoff -- <focus>` for a focus that
+starts with `-`.
 
 `/retry` immediately repeats the latest retryable user turn from the selected
 branch. It preserves ordered text and image/audio/video content, saves the

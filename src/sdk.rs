@@ -3221,20 +3221,23 @@ impl AgentSessionHandle {
         Ok(f(&guard))
     }
 
-    /// Trigger an immediate compaction pass (if compaction is enabled).
+    /// Trigger an immediate compaction pass (if compaction is enabled),
+    /// regardless of the automatic threshold. Returns whether it changed the
+    /// session; `false` means there was too little history to compact.
     pub async fn compact(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.session.compact_now(on_event).await
     }
 
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
+    /// Returns whether it changed the session.
     pub async fn shake(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.session.shake_now(on_event).await
     }
 
@@ -7444,13 +7447,14 @@ mod tests {
         let mut handle = run_async(create_agent_session(options)).expect("create session");
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_callback = Arc::clone(&events);
-        run_async(handle.compact(move |event| {
+        let changed = run_async(handle.compact(move |event| {
             events_for_callback
                 .lock()
                 .expect("compact callback lock")
                 .push(event);
         }))
         .expect("compact");
+        assert!(!changed, "an empty session reports no change"); // ubs:ignore[rust.panic.assert-macros] -- boolean result; assert_eq! on a bool fails clippy
 
         assert!(
             events

@@ -4625,11 +4625,17 @@ pub async fn run(
                         ..Default::default()
                     };
 
-                    let prep = prepare_compaction(&path_entries, settings).ok_or_else(|| {
-                        Error::session(
-                            "Compaction not available (already compacted or missing IDs)",
-                        )
-                    })?;
+                    // A requested compaction ignores the automatic threshold
+                    // but still honors a disabled configuration.
+                    let enabled = settings.enabled;
+                    let prep = enabled
+                        .then(|| crate::compaction::prepare_manual_compaction(&path_entries, settings))
+                        .flatten()
+                        .ok_or_else(|| {
+                            Error::session(
+                                "Compaction not available (disabled, already compacted, or too little history)",
+                            )
+                        })?;
 
                     let privacy = guard.agent.compaction_privacy();
                     let compact_res = compact(

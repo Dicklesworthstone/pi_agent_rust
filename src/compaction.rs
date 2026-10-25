@@ -2499,6 +2499,17 @@ pub(crate) fn prepare_overflow_compaction(
     prepare_compaction_impl(path_entries, settings, true, false)
 }
 
+/// Manual `/compact` and `/shake` ignore the automatic threshold, as in OMP:
+/// the threshold decides when pi compacts on its own, not whether a user may.
+/// Like overflow recovery, the latest authored turn is never summarized. Too
+/// little history, or nothing new since the last compaction, is a no-op.
+pub(crate) fn prepare_manual_compaction(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_impl(path_entries, settings, true, false)
+}
+
 /// Manual handoff ignores the automatic threshold and enabled flag, but keeps
 /// the complete latest authored turn and its native attachments/tool tail.
 /// A single user turn, or a keep-recent budget covering all history, has no
@@ -5314,6 +5325,42 @@ mod tests {
         );
         assert_eq!(prepared.settings.reserve_tokens, settings.reserve_tokens);
         assert!(prepare_overflow_compaction(&[], settings).is_none());
+    }
+
+    #[test]
+    fn manual_preparation_ignores_the_threshold_but_not_a_small_history() {
+        let entries = vec![
+            user_entry("1", "Earlier task with details to summarize."),
+            assistant_entry("2", "Earlier task completed.", 0, 0),
+            user_entry("3", "Continue the current task."),
+        ];
+        let kept = |prepared: Option<CompactionPreparation>| {
+            prepared.map(|prepared| prepared.first_kept_entry_id)
+        };
+        let settings = ResolvedCompactionSettings {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        // Far below the automatic threshold of a 128k window.
+        assert_eq!(kept(prepare_compaction(&entries, settings.clone())), None);
+        assert_eq!(
+            kept(prepare_manual_compaction(&entries, settings.clone())),
+            Some("3".to_string()),
+            "the latest authored turn is kept, older history is summarized"
+        );
+        assert_eq!(
+            kept(prepare_manual_compaction(
+                &entries,
+                ResolvedCompactionSettings::default()
+            )),
+            None,
+            "everything fits in the keep-recent budget"
+        );
+        assert_eq!(
+            kept(prepare_manual_compaction(&entries[2..], settings)),
+            None,
+            "a single authored turn has no older history"
+        );
     }
 
     #[test]
