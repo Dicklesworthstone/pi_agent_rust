@@ -625,7 +625,10 @@ impl McpManager {
                     || is_cancelled(&error)
                     || !transport.is_alive() =>
             {
-                if guard.abandon(&error) {
+                // A dead transport is retired either way, but a lease its
+                // writer never claimed (now revoked) still proves the call was
+                // not sent; "may have completed" would stop a safe retry.
+                if guard.abandon(&error) || guard.dispatch.revoke_unsent() {
                     // The timeout remains visible, but it is not an uncertain
                     // call and must not enter the reconnect/replay path in
                     // call_tool or spend this healthy generation's budget.
@@ -780,6 +783,97 @@ mod tests {
 
         fn diagnostics_tail(&self) -> String {
             String::new()
+        }
+    }
+
+    /// A connection that dies while a call waits for its writer, as a legacy
+    /// SSE call queued on the lane does when another call's failure aborts
+    /// the stream. With `claim` the writer took the lease first, as a sent
+    /// call's would.
+    struct DiesBeforeDispatch {
+        claim: bool,
+        closed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl McpTransport for DiesBeforeDispatch {
+        async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+            self.request_with_dispatch(method, params, timeout, Arc::new(RequestDispatch::new()))
+                .await
+        }
+
+        async fn request_with_dispatch(
+            &self,
+            _method: &str,
+            _params: Value,
+            _timeout: Duration,
+            dispatch: Arc<RequestDispatch>,
+        ) -> Result<Value> {
+            if self.claim {
+                assert!(dispatch.claim());
+            }
+            self.closed.store(true, Ordering::Release);
+            Err(tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                "legacy SSE connection closed",
+            ))
+        }
+
+        async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_alive(&self) -> bool {
+            !self.closed.load(Ordering::Acquire)
+        }
+
+        fn abort(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+
+        async fn close(&self) {
+            self.abort();
+        }
+
+        fn diagnostics_tail(&self) -> String {
+            String::new()
+        }
+    }
+
+    /// A call that never reached a dying connection is not sent, so it must
+    /// not be reported as an uncertain delivery that "may have completed".
+    /// The same failure after the writer claimed the call stays uncertain.
+    #[test]
+    fn a_dead_transport_reports_an_unclaimed_call_as_not_sent() {
+        for claim in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (manager, entry, _) = fixture(&temp, Ok(json!({"content":[]})));
+            let transport: Arc<dyn McpTransport> = Arc::new(DiesBeforeDispatch {
+                claim,
+                closed: AtomicBool::new(false),
+            });
+            *McpManager::lock(&entry.transport) = Some(Arc::clone(&transport));
+            let error = runtime()
+                .block_on(manager.call_on_transport_with_timeout(
+                    &entry,
+                    &transport,
+                    "execute",
+                    &json!({}),
+                    Duration::from_secs(5),
+                ))
+                .expect_err("the connection closed");
+            let message = error.to_string();
+            assert!(
+                McpManager::lock(&entry.transport).is_none(),
+                "claim={claim}: the dead generation stays mounted"
+            );
+            if claim {
+                assert!(is_indeterminate_call_delivery(&error), "{message}");
+            } else {
+                assert!(message.contains("MCP_REQUEST_NOT_SENT"), "{message}");
+                assert!(message.contains("the call was not sent"), "{message}");
+                assert!(!is_indeterminate_call_delivery(&error), "{message}");
+            }
         }
     }
 
