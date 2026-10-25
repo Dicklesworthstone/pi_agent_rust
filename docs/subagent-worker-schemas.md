@@ -82,8 +82,9 @@ output = await worker.wait(20)
 display(output['details']['results'][0]['data'])
 ```
 
-The high-level factories still reject inline schema options for warm workers;
-use the named definition or the native launch above for an explicit override.
+The factories also forward an inline contract: `outputSchema`/`schemaMode`
+in JavaScript, `output_schema`/`schema_mode` in Python. Native admission then
+applies the same rules as the launch above.
 After a native launch, `agent.attachWorker(workerId)` in JavaScript or
 `agent.attach_worker(worker_id)` in Python restores the ordinary result handle.
 Enable new sends explicitly when recovering, as documented in
@@ -172,8 +173,8 @@ manifests remain redacted descriptive views, not schema-validated answer bodies.
 
 Use the existing [recovery helpers](eval-agent-recovery.md) after a kernel reset;
 reattachment inherits the native contract rather than selecting a new one.
-Inline schema arguments on high-level `agent()` and `workpool()` remain
-unsupported; use a named definition or native launch plus attachment. There is
+High-level `agent(..., keepAlive)` and `workpool()` accept the same inline
+schema options as their native operations. There is
 no automatic reducer, per-item retry, dependent-success scheduling, or rollback
 of completed effects. Schemas establish shape, not correctness or authorization.
 
