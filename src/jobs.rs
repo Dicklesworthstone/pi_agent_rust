@@ -1798,6 +1798,7 @@ fn spawn_managed(
     for (key, value) in crate::http::proxy::child_process_env() {
         cmd.env(key, value);
     }
+    cmd.envs(crate::bash_mediation::NON_INTERACTIVE_ENV.iter().copied());
     crate::tools::isolate_command_process_group(&mut cmd);
 
     let artifact_dir = artifact_root.map_or_else(

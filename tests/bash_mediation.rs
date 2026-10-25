@@ -387,6 +387,37 @@ fn pty_auto_leaves_plain_commands_on_pipes() {
 }
 
 #[test]
+fn every_runner_sets_the_non_interactive_environment() {
+    let case = "every_runner_sets_the_non_interactive_environment";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let probe = r#"printf '[%s,%s,%s,%s]' "$PAGER" "$GIT_TERMINAL_PROMPT" "$EDITOR" "$SSH_ASKPASS_REQUIRE""#;
+    // Direct foreground pipes, the managed (auto-background) pipes, and a PTY.
+    for (label, settings, background) in [
+        ("direct", Some(pty_settings("off")), Some(false)),
+        ("managed", None, None),
+        ("pty", Some(pty_settings("always")), None),
+    ] {
+        let tool = bash_tool(&root, settings);
+        let mut input = json!({ "command": probe });
+        if let Some(background) = background {
+            input["background"] = json!(background);
+        }
+        let out = block_on_local(tool.execute("call-1", input, None)).expect("execute");
+        let text = first_text(&out);
+        harness.log().info("verify", format!("{label}: {text}"));
+        assert!(text.contains("[cat,0,true,force]"), "{label}: {text}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    }
+    // A pager on auto stays on pipes, and the command's own assignment wins.
+    let tool = bash_tool(&root, None);
+    let text = first_text(&execute(&tool, "less /dev/null; test -t 1 || echo PIPE")).to_owned();
+    assert!(text.contains("PIPE"), "less must not get a PTY: {text}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    let out = execute(&tool, r#"EDITOR=vim sh -c 'printf "[%s]" "$EDITOR"'"#);
+    assert!(first_text(&out).contains("[vim]"), "{}", first_text(&out)); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    finish_case(&harness, case);
+}
+
+#[test]
 fn pty_timeout_still_kills() {
     let case = "pty_timeout_still_kills";
     let harness = TestHarness::new(case);

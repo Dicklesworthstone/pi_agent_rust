@@ -8077,6 +8077,7 @@ async fn run_bash_command_with_state(
     for (key, value) in crate::http::proxy::child_process_env() {
         cmd.env(key, value);
     }
+    cmd.envs(crate::bash_mediation::NON_INTERACTIVE_ENV.iter().copied());
 
     // Place the shell in its own process group so background children
     // can be killed reliably even if the shell exits first.
@@ -8448,6 +8449,9 @@ pub(crate) async fn run_bash_command_pty(
     pty_cmd.cwd(cwd);
     // #210: same proxy propagation as the pipe path.
     for (key, value) in crate::http::proxy::child_process_env() {
+        pty_cmd.env(key, value);
+    }
+    for (key, value) in crate::bash_mediation::NON_INTERACTIVE_ENV {
         pty_cmd.env(key, value);
     }
 

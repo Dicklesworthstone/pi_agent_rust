@@ -23,6 +23,25 @@ Automatic mode applies only to non-PTY commands. PTY selection still follows
 the command uses the direct foreground runner, because it cannot usefully
 continue beyond that threshold.
 
+## Commands run without a terminal
+
+Nobody types into a command the agent runs, so every runner (pipes, PTY and
+jobs) sets a non-interactive environment, as OMP does:
+
+- `PAGER`, `GIT_PAGER`, `MANPAGER`, `GH_PAGER` and the other tool pagers are
+  `cat`, `AWS_PAGER` is empty, and `LESS` is `FRX`.
+- `EDITOR`, `VISUAL` and `GIT_EDITOR` are `true`, so `git commit` without
+  `-m` stops with "empty commit message" instead of waiting in an editor.
+- `GIT_TERMINAL_PROMPT=0` and `GH_PROMPT_DISABLED=1`.
+- `SSH_ASKPASS=false` with `SSH_ASKPASS_REQUIRE=force`, so ssh reports a
+  password, passphrase or unknown-host-key prompt as a failure.
+
+These replace the same variables from pi's own environment. An assignment
+in the command itself, such as `EDITOR=vim git commit`, still wins.
+
+With `bash.pty` on `auto`, pagers (`less`, `more`, `man`) run on pipes
+and print their text. On a PTY nobody could page through or quit them.
+
 ## Configure automatic backgrounding
 
 Automatic backgrounding is enabled by default with a 60-second threshold:

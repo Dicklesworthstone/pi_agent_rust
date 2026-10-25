@@ -38,9 +38,42 @@ impl PtyMode {
     }
 }
 
+/// Environment for every agent-run shell command (pipes, PTY and jobs). No one
+/// types into these processes, so pagers print, editors exit at once, and
+/// git, gh and ssh refuse credential and host-key prompts instead of waiting
+/// on input that never comes. On the pipe paths a prompt opened on pi's own
+/// terminal also stops the command (SIGTTIN) and scribbles over the TUI.
+/// Mirrors OMP's non-interactive-env.ts. Assignments in the command itself
+/// (`EDITOR=vim git commit`) still take precedence.
+pub(crate) const NON_INTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("SYSTEMD_PAGER", "cat"),
+    ("BAT_PAGER", "cat"),
+    ("DELTA_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("GLAB_PAGER", "cat"),
+    ("PSQL_PAGER", "cat"),
+    ("MYSQL_PAGER", "cat"),
+    ("HOMEBREW_PAGER", "cat"),
+    ("AWS_PAGER", ""),
+    ("LESS", "FRX"),
+    ("GIT_EDITOR", "true"),
+    ("VISUAL", "true"),
+    ("EDITOR", "true"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GH_PROMPT_DISABLED", "1"),
+    // ssh would otherwise read /dev/tty; forcing askpass makes it fail.
+    ("SSH_ASKPASS", "false"),
+    ("SSH_ASKPASS_REQUIRE", "force"),
+];
+
 /// Commands that require a controlling terminal to behave correctly.
 /// Exact argv0-basename match against this set, plus the `python -i` /
-/// `node -i`-style interactive flags handled below.
+/// `node -i`-style interactive flags handled below. Pagers (`less`, `more`,
+/// `man`) are absent: on a pipe they print the text, while on a PTY nobody
+/// can page or quit them and they wait out the timeout.
 const PTY_REQUIRED_BASENAMES: &[&str] = &[
     "ssh",
     "sftp",
@@ -53,9 +86,6 @@ const PTY_REQUIRED_BASENAMES: &[&str] = &[
     "vi",
     "nano",
     "emacs",
-    "less",
-    "more",
-    "man",
     "watch",
     "tmux",
     "screen",
@@ -658,5 +688,8 @@ mod tests {
         assert!(!pty_required(""));
         assert!(!pty_required("FOO=bar echo hello"));
         assert!(!pty_required("git -C repo status"));
+        for pager in ["man ls", "less README.md", "more notes.txt"] {
+            assert!(!pty_required(pager), "{pager}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        }
     }
 }
