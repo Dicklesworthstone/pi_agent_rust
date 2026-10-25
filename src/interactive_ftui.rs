@@ -2570,19 +2570,25 @@ impl PiFtuiModel {
 
     /// Recompute the completion popup from the editor contents (issue #208).
     /// Runs after every editor mutation; the popup only ever opens for a
-    /// slash-command draft so ordinary prose never grows a dropdown.
+    /// slash-command draft or an `@file` token under the cursor (anywhere in
+    /// the draft, as in OMP's editor), so ordinary prose never grows a
+    /// dropdown.
     fn maybe_trigger_autocomplete(&mut self) {
         if !self.completion_allowed() {
             self.autocomplete.close();
             return;
         }
         let text = self.input.text();
-        if !text.trim_start().starts_with('/') {
+        let editor = self.input.editor();
+        let cursor = ftui::text::CursorNavigator::new(editor.rope()).to_byte_index(editor.cursor());
+        let file_ref = text
+            .get(..cursor)
+            .and_then(|before| before.rsplit(char::is_whitespace).next())
+            .is_some_and(|token| token.starts_with('@'));
+        if !file_ref && !text.trim_start().starts_with('/') {
             self.autocomplete.close();
             return;
         }
-        let editor = self.input.editor();
-        let cursor = ftui::text::CursorNavigator::new(editor.rope()).to_byte_index(editor.cursor());
         let response = self.autocomplete.provider.suggest(&text, cursor);
         // Bare filesystem-path matches are Tab-triggered in the charmed
         // stack; the popup here is for commands and their arguments.
@@ -2598,7 +2604,7 @@ impl PiFtuiModel {
     }
 
     /// Splice the accepted suggestion over the token it completes and park
-    /// the cursor at the end of the draft.
+    /// the cursor right after it (an `@file` may sit mid-draft).
     fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
         let text = self.input.text();
         let range = &self.autocomplete.replace_range;
@@ -2617,7 +2623,9 @@ impl PiFtuiModel {
         next.push_str(&item.insert);
         next.push_str(&text[end..]);
         self.input.set_text(&next);
-        self.input.move_to_document_end();
+        let after = ftui::text::CursorNavigator::new(self.input.editor().rope())
+            .from_byte_index(start + item.insert.len());
+        self.input.set_cursor_position(after);
     }
 
     /// Keys the open popup owns (issue #208). Returns `true` when the key was
@@ -17857,6 +17865,54 @@ mod tests {
             "/help".len(),
             "cursor parks at the end of the accepted draft"
         );
+    }
+
+    /// `@` opens file completion anywhere in the draft, as OMP's editor does;
+    /// the popup used to open only for slash drafts. Accepting parks the
+    /// cursor after the reference, not at the end of the draft.
+    #[test]
+    fn at_reference_opens_file_completion_mid_draft() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "n").expect("write");
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx).with_autocomplete(AutocompleteLaunch {
+            catalog: AutocompleteCatalog::default(),
+            cwd: dir.path().to_path_buf(),
+            max_visible: 5,
+            resources: None,
+            resource_source: None,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "read  please");
+        assert!(!sim.model().autocomplete.open, "prose stays closed"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        for _ in 0.." please".len() {
+            sim.inject_event(key(KeyCode::Left, Modifiers::empty()));
+        }
+        type_str(&mut sim, "@no");
+        // The project file index fills on a background thread.
+        for _ in 0..300 {
+            if sim.model().completion_visible() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            sim.model_mut().maybe_trigger_autocomplete();
+        }
+        assert!(
+            sim.model().completion_visible(),
+            "an @ token opens file completion"
+        ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        assert_eq!(
+            sim.model()
+                .autocomplete
+                .items
+                .first()
+                .map(|item| item.insert.as_str()),
+            Some("@notes.txt")
+        );
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "read @notes.txt please");
+        assert_eq!(sim.model().input.cursor().grapheme, "read @notes.txt".len());
     }
 
     #[test]
