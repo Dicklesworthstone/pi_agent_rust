@@ -5094,6 +5094,34 @@ impl PiFtuiModel {
                 }
                 true
             }
+            "notify" => {
+                // OMP shows an error notice as an error and a warning as a
+                // warning. Printed alike, an extension's failure read as info.
+                let level = text_field(&["level", "notifyType", "notify_type"]).unwrap_or_default();
+                let message = [text_field(&["title"]), text_field(&["message"])]
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let source = request
+                    .extension_id
+                    .as_deref()
+                    .or_else(|| {
+                        request
+                            .payload
+                            .get("extension_id")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .map_or_else(|| String::from("unknown"), |id| sanitize(id).into_owned());
+                let (role, label) = match level.as_str() {
+                    "error" => (EntryRole::Error, ""),
+                    "warning" | "warn" => (EntryRole::System, "warning: "),
+                    _ => (EntryRole::System, ""),
+                };
+                self.push_entry(role, format!("[{source}] {label}{message}"));
+                true
+            }
             "setWidget" | "set_widget"
                 if text_field(&["widgetKey", "widget_key"]).as_deref()
                     == Some(EXT_CUSTOM_OVERLAY_KEY) =>
@@ -14916,6 +14944,44 @@ mod tests {
         );
         assert_eq!(sim.model().widget_rows(), 1);
         assert_eq!(sim.model().transcript.len(), before);
+    }
+
+    /// `ui.notify(message, level)` printed every notice as
+    /// "[ext] Extension message", so an extension's error read as info.
+    #[test]
+    fn extension_notices_keep_their_level() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        send_ui_effect(
+            &mut sim,
+            "notify",
+            serde_json::json!({"message": "Build failed", "level": "error"}),
+        );
+        send_ui_effect(
+            &mut sim,
+            "notify",
+            serde_json::json!({"message": "Disk low", "notifyType": "warning"}),
+        );
+        send_ui_effect(
+            &mut sim,
+            "notify",
+            serde_json::json!({"title": "Done", "message": "\u{1b}[32msaved\u{1b}[0m"}),
+        );
+        let added: Vec<(EntryRole, &str)> = sim.model().transcript[before..]
+            .iter()
+            .map(|entry| (entry.role, entry.text.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                (EntryRole::Error, "[demo-ext] Build failed"),
+                (EntryRole::System, "[demo-ext] warning: Disk low"),
+                (EntryRole::System, "[demo-ext] Done saved"),
+            ]
+        );
     }
 
     #[test]
