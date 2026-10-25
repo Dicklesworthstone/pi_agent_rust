@@ -414,10 +414,19 @@ impl BedrockProvider {
             });
         }
 
-        let mut messages = Vec::new();
+        let mut messages: Vec<BedrockMessage> = Vec::new();
         for message in context.messages.iter() {
             if let Some(converted) = convert_message(message) {
-                messages.push(converted);
+                // Converse requires alternating roles, with every toolResult
+                // for one assistant turn in the next user message. Parallel
+                // tool results, steering and custom context arrive as
+                // separate messages, so merge consecutive same-role ones.
+                match messages.last_mut() {
+                    Some(last) if last.role == converted.role => {
+                        last.content.extend(converted.content);
+                    }
+                    _ => messages.push(converted),
+                }
             }
         }
 
@@ -933,7 +942,14 @@ fn convert_message(message: &Message) -> Option<BedrockMessage> {
         Message::ToolResult(tool_result_message) => {
             Some(convert_tool_result_message(tool_result_message))
         }
-        Message::Custom(_) => None,
+        // Custom context (a handoff import's brief, extension messages) is
+        // user text, as on every other provider.
+        Message::Custom(custom) => (!custom.content.trim().is_empty()).then(|| BedrockMessage {
+            role: "user",
+            content: vec![BedrockContent::Text {
+                text: custom.content.clone(),
+            }],
+        }),
     }
 }
 
@@ -1683,6 +1699,59 @@ mod tests {
             value["toolConfig"]["tools"][0]["toolSpec"]["name"],
             "search"
         );
+    }
+
+    #[test]
+    fn build_request_answers_parallel_tool_calls_in_one_user_message() {
+        let mut context = test_context_with_tools();
+        let messages = context.messages.to_mut();
+        if let Message::Assistant(assistant) = &mut messages[1] {
+            Arc::make_mut(assistant)
+                .content
+                .push(ContentBlock::ToolCall(ToolCall {
+                    id: "tool_2".to_string(),
+                    name: "search".to_string(),
+                    arguments: json!({ "q": "bedrock" }),
+                    thought_signature: None,
+                }));
+        }
+        messages.push(Message::tool_result(ToolResultMessage {
+            tool_call_id: "tool_2".to_string(),
+            tool_name: "search".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("second result"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }));
+        for content in ["Imported brief", "  "] {
+            messages.push(Message::Custom(crate::model::CustomMessage {
+                content: content.to_string(),
+                custom_type: "handoff".to_string(),
+                display: false,
+                details: None,
+                timestamp: 0,
+            }));
+        }
+        messages.push(Message::User(crate::model::UserMessage {
+            content: UserContent::Text("Also check the docs".to_string()),
+            timestamp: 0,
+        }));
+
+        let request = BedrockProvider::build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        let roles: Vec<_> = value["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| message["role"].clone())
+            .collect();
+        assert_eq!(roles, [json!("user"), json!("assistant"), json!("user")]);
+        let answer = &value["messages"][2]["content"];
+        assert_eq!(answer.as_array().map(Vec::len), Some(4));
+        assert_eq!(answer[0]["toolResult"]["toolUseId"], "tool_1");
+        assert_eq!(answer[1]["toolResult"]["toolUseId"], "tool_2");
+        assert_eq!(answer[2]["text"], "Imported brief");
+        assert_eq!(answer[3]["text"], "Also check the docs");
     }
 
     fn replay_context(api: &str, provider: &str, model: &str) -> Context<'static> {
