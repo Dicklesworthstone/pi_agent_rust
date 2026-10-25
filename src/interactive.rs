@@ -2092,11 +2092,9 @@ pub enum PiMsg {
         /// Authored input only; display text may include generated file bodies.
         history_text: String,
     },
-    /// Bash command result (non-agent).
-    BashResult {
-        display: String,
-        content_for_agent: Option<Vec<ContentBlock>>,
-    },
+    /// Bash command result (non-agent). The run is already recorded in the
+    /// session; this only shows it.
+    BashResult { display: String },
     /// Async OAuth device flow start
     OAuthDeviceFlowStarted {
         provider: String,

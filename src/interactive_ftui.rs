@@ -1546,9 +1546,9 @@ pub enum UiCommand {
     Settings,
     /// Save one preference, then apply it to the existing live session.
     SetSetting { key: SettingsKey, value: String },
-    /// Run a shell command. `!cmd` (exclude=false) shows the output AND
-    /// submits it to the agent as a turn — the bubbletea semantics; `!!cmd`
-    /// (exclude=true) is display-only.
+    /// Run a shell command and record it in the session, starting no turn.
+    /// `!cmd` (exclude=false) output reaches the model with the next prompt;
+    /// `!!cmd` (exclude=true) output is kept but never sent.
     Bash { command: String, exclude: bool },
     /// Resume a saved session (`/resume` picker): the driver swaps its
     /// session handle and replays the conversation into the transcript.
@@ -3230,7 +3230,7 @@ impl PiFtuiModel {
                 // user message, as a typed prompt would be.
                 self.push_entry(EntryRole::User, sanitize(&text).into_owned());
             }
-            PiMsg::BashResult { display, .. } => {
+            PiMsg::BashResult { display } => {
                 let text = sanitize(&display).into_owned();
                 if !self.fold_bash_detail(&text) {
                     self.push_entry(EntryRole::System, text);
@@ -3770,7 +3770,7 @@ impl PiFtuiModel {
         self.push_entry(EntryRole::User, clean.clone());
 
         // Bash routing comes before slash commands, matching submit_message:
-        // `!cmd` shows output and submits it to the agent, `!!cmd` shows only.
+        // `!cmd` output joins the next prompt's context, `!!cmd` output does not.
         let bang = clean
             .strip_prefix("!!")
             .map(|rest| (rest.trim(), true))
@@ -9340,8 +9340,8 @@ impl BashUiShell {
 
 /// Run a `!command` for the driver loop: tool-status blips around the shared
 /// bash runner, result rendered via the session display formatter. Returns
-/// the display text on success so the caller can submit it as a turn
-/// (`!` context-inclusion); `!!` gets the exclusion note appended. A
+/// the `BashExecution` record for the caller to save (`!!` marks it
+/// `excludeFromContext` and gets the exclusion note in the display). A
 /// `user_bash` hook that runs the command itself supplies the result.
 async fn run_bash_ui_command(
     cwd: &std::path::Path,
@@ -9350,7 +9350,7 @@ async fn run_bash_ui_command(
     exclude: bool,
     extensions: Option<&crate::extensions::ExtensionManager>,
     agent_tx: &Sender<PiMsg>,
-) -> Option<String> {
+) -> Option<crate::session::SessionMessage> {
     // Bracket the run with AgentStart/AgentDone (submit_bash_command
     // parity: bubbletea flips to ToolRunning so the status region shows the
     // running tool and the editor gates input). Without AgentStart the
@@ -9388,15 +9388,26 @@ async fn run_bash_ui_command(
                 result.truncated,
                 result.full_output_path.as_deref(),
             );
-            let mut shown = display.clone();
+            let mut shown = display;
+            let mut extra = std::collections::HashMap::new();
             if exclude {
                 shown.push_str("\n\n[Output excluded from model context]");
+                extra.insert(
+                    String::from("excludeFromContext"),
+                    serde_json::Value::Bool(true),
+                );
             }
-            let _ = agent_tx.send(PiMsg::BashResult {
-                display: shown,
-                content_for_agent: None,
-            });
-            Some(display)
+            let _ = agent_tx.send(PiMsg::BashResult { display: shown });
+            Some(crate::session::SessionMessage::BashExecution {
+                command: command.to_string(),
+                output: result.output,
+                exit_code: result.exit_code,
+                cancelled: Some(result.cancelled),
+                truncated: Some(result.truncated),
+                full_output_path: result.full_output_path,
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+                extra,
+            })
         }
         Err(err) => {
             // ToolEnd must precede AgentError: the error sweep settles
@@ -9940,10 +9951,11 @@ pub fn run(
                             let _ = agent_tx.send(PiMsg::Settings { snapshot, changed });
                         }
                         Ok(UiCommand::Bash { command, exclude }) => {
-                            // `!` semantics: the output becomes the next
-                            // turn's user content (submit_content parity).
+                            // OMP's bash runner records the run and starts no
+                            // turn: `!` output reaches the model with the next
+                            // prompt, `!!` output is kept but never sent.
                             let extensions = handle.extension_manager().cloned();
-                            if let Some(output) = run_bash_ui_command(
+                            if let Some(record) = run_bash_ui_command(
                                 &bash_cwd,
                                 &bash_shell,
                                 &command,
@@ -9952,16 +9964,11 @@ pub fn run(
                                 &agent_tx,
                             )
                             .await
-                                && !exclude
+                                && let Err(err) = handle.record_bash_execution(record).await
                             {
-                                run_prompt_turn(
-                                    &mut handle,
-                                    output,
-                                    Vec::new(),
-                                    &agent_tx,
-                                    &driver_turn_control,
-                                )
-                                .await;
+                                let _ = agent_tx.send(PiMsg::AgentError(format!(
+                                    "The command ran, but its result could not be saved to the session: {err}",
+                                )));
                             }
                         }
                         Ok(UiCommand::Compact) => {
@@ -10845,8 +10852,10 @@ mod tests {
                 None,
                 &agent_tx,
             )
-            .await
-            .expect("shell command output");
+            .await;
+            let Some(crate::session::SessionMessage::BashExecution { output, .. }) = output else {
+                panic!("shell command output: {output:?}");
+            };
             assert!(output.contains("attached workspace content"), "{output}");
             assert_eq!(
                 std::fs::read_to_string(cwd.join("shell-result.txt")).expect("shell result"),
@@ -15790,8 +15799,28 @@ mod tests {
             None,
             &agent_tx,
         ));
-        let output = output.expect("command ran");
+        let Some(crate::session::SessionMessage::BashExecution { output, extra, .. }) = output
+        else {
+            panic!("command ran: {output:?}");
+        };
         assert!(output.contains("value=prefixed"), "{output}");
+        assert!(extra.is_empty(), "`!` output stays in context: {extra:?}");
+        let excluded = runtime.block_on(run_bash_ui_command(
+            dir.path(),
+            &shell,
+            "true",
+            true,
+            None,
+            &agent_tx,
+        ));
+        let Some(crate::session::SessionMessage::BashExecution { extra, .. }) = excluded else {
+            panic!("command ran: {excluded:?}");
+        };
+        assert_eq!(
+            extra.get("excludeFromContext"),
+            Some(&serde_json::Value::Bool(true)),
+            "`!!` is recorded but excluded from context"
+        );
 
         // A configured shell that does not exist is used, not silently
         // replaced by the default: the run fails and names it.
@@ -17372,7 +17401,6 @@ mod tests {
         // A BashResult renders into the transcript as a system entry.
         sim.send(PiFtuiMsg::Agent(PiMsg::BashResult {
             display: "$ echo hi\nhi".into(),
-            content_for_agent: None,
         }));
         let rendered = buffer_text(sim.capture_frame(40, 10), 40, 10);
         assert!(
@@ -17953,7 +17981,6 @@ mod tests {
         let output = "line-one\nline-two";
         sim.send(PiFtuiMsg::Agent(PiMsg::BashResult {
             display: format!("$ demo\n{output}"),
-            content_for_agent: None,
         }));
         let card = sim
             .model()

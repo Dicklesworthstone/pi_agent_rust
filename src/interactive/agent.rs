@@ -1355,18 +1355,10 @@ impl PiApp {
                 });
                 self.scroll_to_bottom();
             }
-            PiMsg::BashResult {
-                display,
-                content_for_agent,
-            } => {
+            PiMsg::BashResult { display } => {
                 self.bash_running = false;
                 self.current_tool = None;
                 self.agent_state = AgentState::Idle;
-
-                if let Some(content) = content_for_agent {
-                    self.scroll_to_bottom();
-                    return self.submit_content(content);
-                }
 
                 // `!cmd` output is raw terminal bytes; strip escapes/controls
                 // before it enters the transcript (bd-p45xh).

@@ -2852,6 +2852,26 @@ impl AgentSessionHandle {
         self.session.persist_session().await
     }
 
+    /// Record a user `!` / `!!` shell run (a `BashExecution` message), as
+    /// OMP's bash runner does. No turn starts: the next prompt carries the
+    /// output to the model, unless the record says `excludeFromContext`.
+    pub async fn record_bash_execution(
+        &mut self,
+        message: crate::session::SessionMessage,
+    ) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.append_message(message);
+        }
+        self.session.persist_session().await
+    }
+
     /// `/checkpoint [name] [note]` (bd-cv653.3.7): mark the active context so
     /// a later [`Self::rewind_to_checkpoint`] can collapse everything after it.
     pub async fn mark_checkpoint(
@@ -5443,6 +5463,56 @@ mod tests {
 
     /// OMP `/shake`: the older span is compacted by dropping bulky content,
     /// recorded as a `shake` compaction, and the provider is never called.
+    /// OMP's bash runner: a user `!` run is recorded, not prompted. The next
+    /// prompt sends its output; a `!!` run is saved but never sent.
+    #[test]
+    fn recorded_bash_runs_reach_the_next_prompt_unless_excluded() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            }));
+        let run = |command: &str, output: &str, exclude: bool| {
+            let mut extra = HashMap::new();
+            if exclude {
+                extra.insert("excludeFromContext".to_string(), Value::Bool(true));
+            }
+            crate::session::SessionMessage::BashExecution {
+                command: command.to_string(),
+                output: output.to_string(),
+                exit_code: 0,
+                cancelled: Some(false),
+                truncated: Some(false),
+                full_output_path: None,
+                timestamp: Some(1),
+                extra,
+            }
+        };
+        run_async(handle.record_bash_execution(run("echo a", "bang-shown", false))).expect("!");
+        run_async(handle.record_bash_execution(run("echo b", "bang-hidden", true))).expect("!!");
+        assert!(
+            requests.lock().expect("requests").is_empty(),
+            "recording a run starts no turn"
+        );
+
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort("what did it print?", signal, |_| {})).expect("turn");
+        let sent = requests.lock().expect("requests").clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("bang-shown"), "{}", sent[0]);
+        assert!(!sent[0].contains("bang-hidden"), "{}", sent[0]);
+
+        let path = run_async(handle.with_session(|session| session.path.clone()))
+            .expect("session lock")
+            .expect("persisted");
+        let saved = std::fs::read_to_string(path).expect("read session file");
+        assert!(saved.contains("bang-shown") && saved.contains("bang-hidden"));
+    }
+
     /// Auto-compaction is off: it gates pi's own compaction, not the user's
     /// (turning it off used to make `/compact` and `/shake` no-ops).
     #[test]
