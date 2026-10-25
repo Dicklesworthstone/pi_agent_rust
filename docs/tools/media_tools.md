@@ -260,8 +260,9 @@ to the inherited descriptor and pipes.
 Each read admits at most 256 MiB of source data, a 16-megapixel source frame,
 and a 24-hour duration. Frame indices are capped at 10,000,000. Metadata and
 stderr are each capped at 64 KiB, and the PNG output is capped at 4.5 MiB.
-At most two video reads run concurrently, with one 60-second budget covering
-helper checks, metadata, and all frame extractions. Cancellation owns and
+At most two video reads run concurrently; further reads wait for a slot. Each
+read has one 60-second budget covering that wait, helper checks, metadata,
+and all frame extractions. Cancellation owns and
 reaps the helper processes. Decoder allocation limits are per allocation,
 not a total process-memory cap. Length and modification-time checks reject
 detected in-place source changes; the descriptor is not an immutable snapshot.

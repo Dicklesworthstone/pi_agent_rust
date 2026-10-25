@@ -35,6 +35,7 @@ const THUMB_HEIGHT: u32 = 240;
 const FRAME_EDGE: u32 = 1200;
 const CONTACT_FRAMES: usize = 6;
 const MAX_ACTIVE_READS: usize = 2;
+const PERMIT_POLL: Duration = Duration::from_millis(20);
 
 static ACTIVE_READS: AtomicUsize = AtomicUsize::new(0);
 
@@ -194,18 +195,27 @@ fn parse_selector(value: &str) -> Result<VideoSelector> {
 struct Permit;
 
 impl Permit {
-    fn acquire() -> Result<Self> {
+    fn try_acquire() -> Option<Self> {
         ACTIVE_READS
             .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_ACTIVE_READS).then_some(active + 1)
             })
+            .ok()
             .map(|_| Self)
-            .map_err(|_| {
-                failure(
-                    "VIDEO_BUSY",
-                    "Two video reads are active; retry when one completes.",
-                )
-            })
+    }
+
+    /// Read calls in one turn run together, so a read beyond the limit waits
+    /// for a slot inside its own budget instead of failing.
+    async fn acquire(owner: &AgentCx, deadline: &Deadline) -> Result<Self> {
+        loop {
+            if let Some(permit) = Self::try_acquire() {
+                return Ok(permit);
+            }
+            owner
+                .time()
+                .sleep(PERMIT_POLL.min(deadline.remaining(owner)?))
+                .await;
+        }
     }
 }
 
@@ -931,7 +941,7 @@ pub async fn render_open_file(
     }
     let deadline = Deadline::new();
     deadline.check(&owner)?;
-    let _permit = Permit::acquire()?;
+    let _permit = Permit::acquire(&owner, &deadline).await?;
     let stamp = SourceStamp::new(&file.metadata().map_err(process_error)?)?;
     let demuxer = demuxer(&path)
         .ok_or_else(|| failure("VIDEO_FORMAT", "Unsupported video container extension."))?;
@@ -1395,6 +1405,27 @@ mod tests {
             let error = capture(command, &owner, &deadline, 0).await.unwrap_err();
             assert!(error.to_string().contains("VIDEO_TIMEOUT"));
             assert!(started.elapsed() < Duration::from_secs(5));
+        });
+    }
+
+    #[test]
+    fn a_read_beyond_the_concurrency_limit_waits_for_a_slot() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let owner = AgentCx::for_current_or_request();
+            let deadline = Deadline::new();
+            let mut held = Vec::new();
+            for _ in 0..MAX_ACTIVE_READS {
+                held.push(Permit::acquire(&owner, &deadline).await.unwrap());
+            }
+            let mut waiting = Box::pin(Permit::acquire(&owner, &deadline));
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(held.pop());
+            waiting
+                .await
+                .expect("a released slot admits the waiting read");
         });
     }
 
