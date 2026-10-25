@@ -12224,6 +12224,22 @@ impl WriteTool {
     }
 }
 
+/// Whether the last non-empty line is one of read's continue notices
+/// (`[Showing lines …]` or `[N more lines in file. …]`).
+fn ends_with_read_truncation_notice(content: &str) -> bool {
+    content
+        .trim_end()
+        .rsplit(['\n', '\r'])
+        .next()
+        .map(str::trim)
+        .is_some_and(|line| {
+            line.ends_with(" to continue.]")
+                && line.contains("Use offset=")
+                && (line.starts_with("[Showing lines ")
+                    || (line.starts_with('[') && line.contains(" more lines in file.")))
+        })
+}
+
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
@@ -12405,6 +12421,20 @@ impl Tool for WriteTool {
                         _ => format!("Failed to open file for writing: {err}"),
                     };
                     return Err(Error::tool("write", message));
+                }
+                // Content that ends in read's continue notice is a truncated
+                // read written back: it would cut the file to what that read
+                // showed. OMP refuses it the same way.
+                if ends_with_read_truncation_notice(&input.content)
+                    && meta.len() > u64::try_from(input.content.len()).unwrap_or(u64::MAX)
+                {
+                    return Err(Error::tool(
+                        "write",
+                        format!(
+                            "Refusing to overwrite {} with an incomplete read: the content ends with read's truncation notice and is shorter than the file, so the unread rest would be lost. Read the remaining lines and write the whole file, or use edit for a partial change.",
+                            input.path
+                        ),
+                    ));
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -21702,6 +21732,63 @@ mod tests {
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("exist.txt")).unwrap();
             assert_eq!(contents, "new content");
+        });
+    }
+
+    /// A truncated read written back would cut the file to what was shown.
+    #[test]
+    fn write_refuses_a_truncated_read_that_is_shorter_than_the_file() {
+        async fn write_with(tool: &WriteTool, input: serde_json::Value) -> Result<ToolOutput> {
+            tool.execute("t", input, None).await
+        }
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("big.txt");
+            let lines = |n: usize| {
+                (0..n)
+                    .map(|i| format!("line {i}\n"))
+                    .collect::<Vec<_>>()
+                    .concat()
+            };
+            let original = lines(5000);
+            std::fs::write(&path, &original).expect("write");
+            let tool = WriteTool::new(tmp.path());
+            let write = |content: String| {
+                let input =
+                    serde_json::json!({ "path": path.to_string_lossy(), "content": content });
+                write_with(&tool, input)
+            };
+            let shown = lines(2000);
+            for notice in [
+                "[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]",
+                "[3000 more lines in file. Use offset=2001 to continue.]",
+            ] {
+                let err = write(format!("{shown}\n{notice}\n"))
+                    .await
+                    .expect_err("truncated read refused");
+                assert!(err.to_string().contains("incomplete read"), "{err}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+                assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
+            }
+            // A notice-like last line in content as long as the file is the
+            // model's own choice, and a new file has nothing to lose.
+            let longer =
+                format!("{original}[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]\n");
+            write(longer.clone())
+                .await
+                .expect("not shorter than the file");
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), longer);
+            let fresh = tmp.path().join("fresh.txt");
+            WriteTool::new(tmp.path())
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": fresh.to_string_lossy(),
+                        "content": "x\n[2 more lines in file. Use offset=2 to continue.]",
+                    }),
+                    None,
+                )
+                .await
+                .expect("a new file");
         });
     }
 
