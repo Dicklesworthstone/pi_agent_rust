@@ -2903,6 +2903,8 @@ async fn report_prompt_error(out_tx: &AcpOutput, session_id: &str, error: &Error
 const ACP_STOP_REASON_END_TURN: &str = "end_turn";
 const ACP_STOP_REASON_MAX_TOKENS: &str = "max_tokens";
 const ACP_STOP_REASON_CANCELLED: &str = "cancelled";
+// A provider refusal lets the editor show its refusal state (OMP does the same).
+const ACP_STOP_REASON_REFUSAL: &str = "refusal";
 // Spec lists: end_turn | max_tokens | max_turn_requests | refusal | cancelled.
 // Provider/local errors use end_turn to keep the response well-formed;
 // report_prompt_error publishes their safe summary before the response.
@@ -2911,9 +2913,8 @@ const ACP_STOP_REASON_ERROR: &str = "end_turn";
 const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
     use crate::model::StopReason;
     match reason {
-        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn | StopReason::Refusal => {
-            ACP_STOP_REASON_END_TURN
-        }
+        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn => ACP_STOP_REASON_END_TURN,
+        StopReason::Refusal => ACP_STOP_REASON_REFUSAL,
         StopReason::Length => ACP_STOP_REASON_MAX_TOKENS,
         StopReason::Aborted => ACP_STOP_REASON_CANCELLED,
         StopReason::Error => ACP_STOP_REASON_ERROR,
@@ -5002,6 +5003,7 @@ mod tests {
         assert_eq!(map_stop_reason(StopReason::ToolUse), "end_turn");
         assert_eq!(map_stop_reason(StopReason::Length), "max_tokens");
         assert_eq!(map_stop_reason(StopReason::Aborted), "cancelled");
+        assert_eq!(map_stop_reason(StopReason::Refusal), "refusal");
         // Errors collapse to end_turn — the failure has already been streamed
         // via session/update; the response only carries a stopReason string.
         assert_eq!(map_stop_reason(StopReason::Error), "end_turn");
