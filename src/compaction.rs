@@ -1949,6 +1949,11 @@ fn find_cut_point(
 
     for i in (start_index..end_index).rev() {
         let entry = &entries[i];
+        // A compaction record in the span (a previous compaction's retained
+        // tail precedes it) is a summary, not recent history to keep.
+        if entry_is_compaction_boundary(entry) {
+            continue;
+        }
         if let Some(msg) = message_from_entry(entry) {
             accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg));
         } else {
@@ -2539,6 +2544,22 @@ fn overflow_compaction_user_index<E: Borrow<SessionEntry>>(path_entries: &[E]) -
     None
 }
 
+/// Where the retained tail of the compaction at `compaction_index` starts:
+/// its first kept entry, which precedes the compaction record.
+fn retained_tail_start(path_entries: &[SessionEntry], compaction_index: usize) -> Option<usize> {
+    let SessionEntry::Compaction(compaction) = path_entries.get(compaction_index)? else {
+        return None;
+    };
+    path_entries
+        .get(..compaction_index)?
+        .iter()
+        .position(|entry| {
+            entry
+                .base_id()
+                .is_some_and(|id| id == &compaction.first_kept_entry_id)
+        })
+}
+
 /// Validate extension overrides at the durable boundary as well as native
 /// preparation. Unknown cuts, cuts inside the current authored turn, and cuts
 /// that would resurrect history before the latest compaction are refused.
@@ -2584,12 +2605,26 @@ fn prepare_compaction_impl(
         }
     }
 
-    let boundary_start = prev_compaction_index.map_or(0, |i| i + 1);
+    // The previous summary excludes its retained tail, whose entries precede
+    // the compaction record. That tail is live context, so this compaction
+    // must summarize or keep it, as OMP's prepareCompaction does.
+    let boundary_start = prev_compaction_index.map_or(0, |prev| {
+        retained_tail_start(path_entries, prev).unwrap_or(prev + 1)
+    });
     let boundary_end = path_entries.len();
 
-    let usage_start = prev_compaction_index.unwrap_or(0);
+    let usage_start = prev_compaction_index.map_or(0, |prev| prev.min(boundary_start));
     let mut usage_messages = Vec::new();
-    for entry in &path_entries[usage_start..boundary_end] {
+    for (idx, entry) in path_entries
+        .iter()
+        .enumerate()
+        .take(boundary_end)
+        .skip(usage_start)
+    {
+        // Only the latest summary is live; older ones are folded into it.
+        if entry_is_compaction_boundary(entry) && Some(idx) != prev_compaction_index {
+            continue;
+        }
         if let Some(msg) = message_from_entry(entry) {
             usage_messages.push(msg);
         }
@@ -2647,8 +2682,13 @@ fn prepare_compaction_impl(
         cut_point.first_kept_entry_index
     };
 
+    // A compaction record inside the span is not summarized again:
+    // `previous_summary` carries the latest, which folds in the older ones.
     let mut messages_to_summarize = Vec::new();
     for entry in &path_entries[boundary_start..history_end] {
+        if entry_is_compaction_boundary(entry) {
+            continue;
+        }
         if let Some(msg) = message_from_entry(entry) {
             messages_to_summarize.push(msg);
         }
@@ -2658,6 +2698,9 @@ fn prepare_compaction_impl(
     if cut_point.is_split_turn {
         let turn_start = cut_point.turn_start_index?;
         for entry in &path_entries[turn_start..cut_point.first_kept_entry_index] {
+            if entry_is_compaction_boundary(entry) {
+                continue;
+            }
             if let Some(msg) = message_from_entry(entry) {
                 turn_prefix_messages.push(msg);
             }

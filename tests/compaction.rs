@@ -1012,6 +1012,43 @@ fn prepare_compaction_respects_previous_compaction_boundary() {
     assert!(!summarized_text.contains("pre"));
 }
 
+/// A compaction's retained tail precedes its record, so the next compaction
+/// has to summarize it or keep it. Starting after the record dropped it from
+/// context: the first summary did not cover it and the new cut left it out.
+#[test]
+fn second_compaction_summarizes_the_previous_retained_tail() {
+    let harness = TestHarness::new("second_compaction_summarizes_the_previous_retained_tail");
+
+    let entries = vec![
+        message_entry("u1", None, user_text("archived question")),
+        message_entry("a1", Some("u1"), assistant_text("archived answer", 0)),
+        message_entry("u2", Some("a1"), user_text("kept question")),
+        message_entry("a2", Some("u2"), assistant_text(text_of_tokens(1), 0)),
+        compaction_entry("c1", Some("a2"), "PREV_SUMMARY", "u2", 100, None, None),
+        message_entry("u3", Some("c1"), user_text("later question")),
+        message_entry("a3", Some("u3"), assistant_text(text_of_tokens(1), 0)),
+        message_entry("u4", Some("a3"), user_text(text_of_tokens(1))),
+    ];
+
+    dump_timeline(&harness, "setup", &entries);
+    let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
+    log_preparation(&harness, &entries, &prep);
+
+    assert_eq!(prep.first_kept_entry_id, "u4");
+    assert_eq!(prep.previous_summary.as_deref(), Some("PREV_SUMMARY"));
+    let users = prep
+        .messages_to_summarize
+        .iter()
+        .filter_map(|m| match m {
+            SessionMessage::User { content, .. } => Some(user_content_preview(content)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(users, ["kept question", "later question"]);
+    // u2 a2 u3 a3: the previous summary arrives once, as previous_summary.
+    assert_eq!(prep.messages_to_summarize.len(), 4);
+}
+
 #[test]
 fn compact_non_split_turn_calls_provider_once() {
     let harness = TestHarness::new("compact_non_split_turn_calls_provider_once");
