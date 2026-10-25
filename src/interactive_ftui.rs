@@ -1874,8 +1874,9 @@ pub struct PiFtuiModel {
     restart_request: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// `(display label, session path)` entries for the `/resume` picker.
     available_sessions: Vec<(String, String)>,
-    /// The session-index cwd `/resume` re-reads (`None`: keep the launch list).
-    resume_cwd: Option<String>,
+    /// The cwd and session directory (`--session-dir`) `/resume` re-reads
+    /// (`None`: keep the launch list).
+    resume_scope: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     /// Keybinding catalog, loaded from the user's config by the launch path
     /// via [`Self::with_keybindings`] and defaulting to the shipped bindings
     /// otherwise. Shared naming with the bubbletea stack via
@@ -2250,7 +2251,7 @@ impl PiFtuiModel {
             pending_quit: false,
             restart_request: None,
             available_sessions: Vec::new(),
-            resume_cwd: None,
+            resume_scope: None,
             keybindings: KeyBindings::default(),
             ext_status: None,
             active_ask: None,
@@ -2463,11 +2464,15 @@ impl PiFtuiModel {
         self
     }
 
-    /// Refresh the `/resume` list from the session index for `cwd` each
-    /// time the picker opens (otherwise the launch list is used as is).
+    /// Refresh the `/resume` list for `cwd`, from `session_dir` when set,
+    /// each time the picker opens (otherwise the launch list is used as is).
     #[must_use]
-    pub fn with_resume_cwd(mut self, cwd: String) -> Self {
-        self.resume_cwd = Some(cwd);
+    pub fn with_resume_scope(
+        mut self,
+        cwd: std::path::PathBuf,
+        session_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        self.resume_scope = Some((cwd, session_dir));
         self
     }
 
@@ -3571,10 +3576,13 @@ impl PiFtuiModel {
             self.send_command(UiCommand::Prompt(clean));
             return;
         };
+        // The authored text is what Alt+Up restores and keywords scan, not
+        // the file contents read into the message.
+        let content = crate::model::UserContent::Text(steer_text);
         let queued = if follow_up {
-            control.follow_up(&steer_text)
+            control.follow_up_with_content(&content, &clean)
         } else {
-            control.steer(&steer_text)
+            control.steer_with_content(&content, &clean)
         };
         match queued {
             Ok(_) => {
@@ -4190,8 +4198,9 @@ impl PiFtuiModel {
         if canon == "/resume" || canon == "/r" {
             // Re-read the index: sessions saved (and pins set) since launch
             // belong in the list, as in OMP's picker.
-            if let Some(cwd) = &self.resume_cwd {
-                self.available_sessions = session_pins::resume_entries(cwd, &self.pins_dir);
+            if let Some((cwd, session_dir)) = &self.resume_scope {
+                self.available_sessions =
+                    session_pins::resume_entries(cwd, session_dir.as_deref(), &self.pins_dir);
             }
             if self.available_sessions.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
@@ -5508,6 +5517,16 @@ impl PiFtuiModel {
                 }
             }
             Event::Paste(_) if self.settings_pending => {}
+            // Many terminals send a pasted line break as a bare CR, and the
+            // editor drops control characters: without this a multi-line
+            // paste arrives as one line.
+            Event::Paste(paste) if paste.text.contains('\r') => {
+                let text = paste.text.replace("\r\n", "\n").replace('\r', "\n");
+                let normalized = Event::Paste(ftui::PasteEvent::new(text, paste.bracketed));
+                if self.input_active() && self.input.handle_event(&normalized) {
+                    self.maybe_trigger_autocomplete();
+                }
+            }
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
                     // Paste and other editor-relevant events flow through.
@@ -9724,7 +9743,8 @@ pub fn run(
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
-    let resume_cwd = bash_cwd.display().to_string();
+    let resume_cwd = bash_cwd.clone();
+    let resume_session_dir = session_options.session_dir.clone();
     let bash_shell = resource_source
         .as_ref()
         .map(|source| BashUiShell::from_config(&source.config))
@@ -10467,7 +10487,7 @@ pub fn run(
         .with_model_names(model_names)
         .with_restart_request(Arc::clone(&restart_requested))
         .with_available_sessions(available_sessions)
-        .with_resume_cwd(resume_cwd)
+        .with_resume_scope(resume_cwd, resume_session_dir)
         .with_alt_screen(!inline)
         .with_mouse_enabled(!disable_mouse_capture)
         .with_markdown_spacing(markdown_spacing)
@@ -11657,15 +11677,13 @@ mod tests {
         let pending = control.take_pending();
         assert_eq!(pending.len(), 1);
         assert!(
-            pending[0].text.contains("the secret is 42"),
-            "{}",
-            pending[0].text
-        );
-        assert!(
-            !pending[0].text.contains("@notes.txt"),
-            "{}",
-            pending[0].text
-        );
+            matches!(&pending[0].content, crate::model::UserContent::Text(sent)
+                if sent.contains("the secret is 42") && !sent.contains("@notes.txt")),
+            "{:?}",
+            pending[0].content
+        ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        // The authored text, which Alt+Up puts back, is what was typed.
+        assert_eq!(pending[0].text, "use @notes.txt");
     }
 
     #[test]
@@ -15301,6 +15319,20 @@ mod tests {
         // A paste of only control characters leaves the filter alone.
         sim.inject_event(Event::Paste(ftui::PasteEvent::new("\n", true)));
         assert_eq!(sim.model().picker.as_ref().unwrap().query, "claude");
+    }
+
+    /// Terminals that send pasted line breaks as bare CRs used to collapse a
+    /// multi-line paste onto one line: the editor drops control characters.
+    #[test]
+    fn paste_with_carriage_returns_keeps_its_lines() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new(
+            "one\rtwo\r\nthree",
+            true,
+        )));
+        assert_eq!(sim.model().input.text(), "one\ntwo\nthree");
     }
 
     /// GH #182: `!command` on this stack honors `shell_path` and

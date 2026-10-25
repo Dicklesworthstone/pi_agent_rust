@@ -2804,7 +2804,8 @@ async fn run(
         // Sessions pinned with /pin come first, marked (OMP). /resume
         // re-reads the index itself; this is the initial list.
         let ftui_sessions = pi::interactive_ftui::session_pins::resume_entries(
-            &cwd.display().to_string(),
+            &cwd,
+            options.session_dir.as_deref(),
             &Config::global_dir(),
         );
         return pi::interactive_ftui::run(

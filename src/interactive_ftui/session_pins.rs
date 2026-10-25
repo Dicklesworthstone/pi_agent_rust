@@ -68,14 +68,18 @@ pub fn sort_pinned_first<T, S: std::hash::BuildHasher>(
 /// The `/resume` picker rows for `cwd`, newest first with pinned sessions
 /// on top and marked, as `(label, session path)`.
 ///
-/// Read from the session index each time, so sessions saved and pins set
-/// during this run show up. Index failures degrade to an empty list.
-pub fn resume_entries(cwd: &str, pins_dir: &Path) -> Vec<(String, String)> {
+/// Listed as the classic picker lists them: under `session_dir`
+/// (`--session-dir`) when set, without files deleted since they were
+/// indexed, one row per session. Read each time, so sessions saved and pins
+/// set during this run show up.
+pub fn resume_entries(
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    pins_dir: &Path,
+) -> Vec<(String, String)> {
     let pinned = load_pinned(pins_dir);
     sort_pinned_first(
-        crate::session_index::SessionIndex::new()
-            .list_sessions(Some(cwd))
-            .unwrap_or_default(),
+        crate::session_picker::list_sessions_for_project(cwd, session_dir),
         &pinned,
         |meta| meta.id.as_str(),
     )
@@ -131,5 +135,36 @@ mod tests {
         // A corrupt file reads as nothing pinned rather than failing.
         std::fs::write(pins_path(dir.path()), "not json").expect("write");
         assert!(load_pinned(dir.path()).is_empty());
+    }
+
+    /// The FTUI list read the default sessions directory, so sessions saved
+    /// under `--session-dir` never showed up, and it kept deleted files.
+    #[test]
+    fn resume_entries_read_the_session_dir_and_drop_deleted_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(crate::session::encode_cwd(&cwd));
+        std::fs::create_dir_all(&project_dir).expect("project sessions");
+        let mut header = crate::session::SessionHeader::new();
+        header.id = "kept".to_string();
+        header.cwd = cwd.display().to_string();
+        let path = project_dir.join("kept.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&header).expect("header")
+            ),
+        )
+        .expect("write session");
+
+        let rows = resume_entries(&cwd, Some(&base_dir), tmp.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, path.display().to_string());
+
+        std::fs::remove_file(&path).expect("delete session");
+        let rows = resume_entries(&cwd, Some(&base_dir), tmp.path());
+        assert!(rows.is_empty(), "{rows:?}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
     }
 }
