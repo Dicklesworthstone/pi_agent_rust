@@ -120,6 +120,10 @@ struct Credentials {
     access_token: String,
     refresh_token: Option<String>,
     expires_at_ms: Option<i64>,
+    /// The resource the server's metadata advertised when it is a broader
+    /// identifier than the configured endpoint; tokens are requested for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource: Option<String>,
 }
 
 struct Attempt(Arc<AtomicBool>);
@@ -356,6 +360,12 @@ impl AuthBinding {
         Ok(())
     }
 
+    /// RFC 8707 resource indicator: the advertised identifier when discovery
+    /// adopted one, otherwise the configured endpoint.
+    fn resource_indicator<'a>(&'a self, credentials: &'a Credentials) -> &'a str {
+        credentials.resource.as_deref().unwrap_or(&self.resource)
+    }
+
     pub(crate) async fn authorization_header(&self, allow_refresh: bool) -> Result<Option<String>> {
         let owner = AgentCx::for_current_or_request();
         check_owner(&owner)?;
@@ -452,7 +462,10 @@ impl AuthBinding {
         let mut fields = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
-            ("resource".to_string(), self.resource.clone()),
+            (
+                "resource".to_string(),
+                self.resource_indicator(credentials).to_string(),
+            ),
         ];
         let value = token_request(credentials, &mut fields).await?;
         let updated_credentials = parse_tokens(&value, credentials.clone())?;
@@ -543,7 +556,7 @@ impl AuthBinding {
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &state)
-            .append_pair("resource", &self.resource);
+            .append_pair("resource", self.resource_indicator(&credentials));
         if let Some(scope) = &credentials.scope {
             authorization.query_pairs_mut().append_pair("scope", scope);
         }
@@ -569,7 +582,10 @@ impl AuthBinding {
             ("code".to_string(), code),
             ("redirect_uri".to_string(), redirect_uri),
             ("code_verifier".to_string(), verifier),
-            ("resource".to_string(), self.resource.clone()),
+            (
+                "resource".to_string(),
+                self.resource_indicator(&credentials).to_string(),
+            ),
         ];
         let value = token_request(&credentials, &mut fields).await?;
         credentials = parse_tokens(&value, credentials)?;
@@ -615,6 +631,9 @@ fn header_for(record: &Record) -> Result<String> {
 fn validate_credentials(credentials: &Credentials) -> Result<()> {
     checked_url(&credentials.issuer)?;
     checked_url(&credentials.token_endpoint)?;
+    if let Some(resource) = &credentials.resource {
+        checked_url(resource)?;
+    }
     validate_string(&credentials.client_id, 4096)?;
     if !matches!(
         credentials.auth_method.as_str(),
@@ -686,6 +705,7 @@ struct Metadata {
     auth_methods: Vec<String>,
     scope: Option<String>,
     require_iss: bool,
+    resource: Option<String>,
 }
 
 fn checked_url(value: &str) -> Result<Url> {
@@ -755,7 +775,19 @@ fn scope_string(value: &str) -> Result<Option<String>> {
     Ok((!scope.is_empty()).then_some(scope))
 }
 
-async fn fetch_json(url: &str) -> Result<Option<Value>> {
+enum Probe {
+    Found(Value),
+    Missing,
+    /// Kept so a failed discovery can say why the last usable-looking
+    /// candidate was refused.
+    Unusable(Error),
+}
+
+/// One discovery probe. A transport failure or timeout ends discovery. A
+/// location that is absent, refused, or not JSON metadata only fails this
+/// candidate, as in OMP and the MCP SDK: hosts commonly answer unrelated
+/// well-known paths with an error or application page.
+async fn fetch_json(url: &str) -> Result<Probe> {
     checked_url(url)?;
     bounded(
         async {
@@ -768,34 +800,49 @@ async fn fetch_json(url: &str) -> Result<Option<Value>> {
                 .await
                 .map_err(|_| error("DISCOVERY", "cannot fetch OAuth discovery metadata"))?;
             if matches!(response.status(), 404 | 405) {
-                return Ok(None);
+                return Ok(Probe::Missing);
             }
             if response.status() != 200 {
-                return Err(error(
+                return Ok(Probe::Unusable(error(
                     "DISCOVERY",
                     "OAuth discovery endpoint rejected the request",
-                ));
+                )));
             }
-            let bytes = response.bytes_limited(BODY_LIMIT).await.map_err(|_| {
-                error(
+            let Ok(bytes) = response.bytes_limited(BODY_LIMIT).await else {
+                return Ok(Probe::Unusable(error(
                     "DISCOVERY",
                     "OAuth discovery body exceeded its limit or could not be read",
-                )
-            })?;
-            let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-                error(
+                )));
+            };
+            Ok(match serde_json::from_slice::<Value>(&bytes) {
+                Ok(value) if value.is_object() => Probe::Found(value),
+                Ok(_) => Probe::Unusable(error("METADATA", "OAuth metadata must be an object")),
+                Err(_) => Probe::Unusable(error(
                     "METADATA",
                     "OAuth discovery endpoint did not return valid JSON",
-                )
-            })?;
-            if !value.is_object() {
-                return Err(error("METADATA", "OAuth metadata must be an object"));
-            }
-            Ok(Some(value))
+                )),
+            })
         },
         HTTP_TIMEOUT,
     )
     .await
+}
+
+/// RFC 9728 names the protected resource. Like the MCP SDK and OMP, accept
+/// the configured endpoint or a same-origin path prefix of it, so a server
+/// that advertises its origin (`https://mcp.example.com`) still matches its
+/// `/mcp` endpoint. Trailing slashes do not distinguish identifiers.
+fn covers_resource(advertised: &Url, configured: &Url) -> bool {
+    let directory = |url: &Url| format!("{}/", url.path().trim_end_matches('/'));
+    advertised.origin() == configured.origin()
+        && advertised
+            .query()
+            .is_none_or(|query| configured.query() == Some(query))
+        && directory(configured).starts_with(&directory(advertised))
+}
+
+fn same_identifier(left: &Url, right: &Url) -> bool {
+    left.as_str().trim_end_matches('/') == right.as_str().trim_end_matches('/')
 }
 
 /// Split authentication parameters without treating commas inside quoted
@@ -947,19 +994,33 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
         }
     }
     let mut resource_metadata = None;
+    let mut advertised_resource = None;
+    let mut mismatch = None;
     for candidate in candidates {
         check()?;
-        if let Some(metadata) = fetch_json(&candidate).await? {
-            let advertised = checked_url(&string_field(&metadata, "resource")?)?;
-            if advertised != resource_url {
-                return Err(error(
-                    "METADATA",
-                    "protected-resource metadata does not match the configured MCP endpoint",
-                ));
-            }
-            resource_metadata = Some(metadata);
-            break;
+        let Probe::Found(metadata) = fetch_json(&candidate).await? else {
+            continue;
+        };
+        let advertised = checked_url(&string_field(&metadata, "resource")?)?;
+        if !covers_resource(&advertised, &resource_url) {
+            // Another resource's document (a gateway's root, say) is not
+            // this endpoint's; a later candidate may still describe it.
+            mismatch = Some(error(
+                "METADATA",
+                "protected-resource metadata does not match the configured MCP endpoint",
+            ));
+            continue;
         }
+        if advertised != resource_url {
+            advertised_resource = Some(advertised.to_string());
+        }
+        resource_metadata = Some(metadata);
+        break;
+    }
+    if resource_metadata.is_none()
+        && let Some(mismatch) = mismatch
+    {
+        return Err(mismatch);
     }
     if challenge.contains_key("resource_metadata") && resource_metadata.is_none() {
         return Err(error(
@@ -971,15 +1032,18 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
         Some(metadata) => string_list(metadata, "authorization_servers")?,
         None => None,
     };
-    let issuers = match issuers {
+    // Without advertised authorization servers the MCP origin stands in for
+    // one. Its own metadata then names the real issuer, which may be another
+    // host (Atlassian's origin advertises `https://cf.mcp.atlassian.com`).
+    let (issuers, origin_fallback) = match issuers {
         Some(issuers) if issuers.is_empty() => {
             return Err(error(
                 "METADATA",
                 "protected-resource metadata advertised no authorization servers",
             ));
         }
-        Some(issuers) => issuers,
-        None => vec![origin.to_string()],
+        Some(issuers) => (issuers, false),
+        None => (vec![origin.to_string()], true),
     };
     let scope = if let Some(scope) = challenge.get("scope") {
         scope_string(scope)?
@@ -991,6 +1055,8 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
     } else {
         None
     };
+    let mut mismatch = None;
+    let mut unusable = None;
     for issuer in issuers {
         check()?;
         let issuer_url = checked_url(&issuer)?;
@@ -1003,7 +1069,9 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
         let mut issuer_origin = issuer_url.clone();
         issuer_origin.set_path("/");
         let suffix = issuer_url.path().trim_end_matches('/');
-        let candidates = [
+        let base = issuer_url.as_str().trim_end_matches('/');
+        let mut candidates = Vec::with_capacity(4);
+        for candidate in [
             format!(
                 "{}.well-known/oauth-authorization-server{suffix}",
                 issuer_origin.as_str()
@@ -1012,21 +1080,39 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
                 "{}.well-known/openid-configuration{suffix}",
                 issuer_origin.as_str()
             ),
-            format!(
-                "{}/.well-known/openid-configuration",
-                issuer_url.as_str().trim_end_matches('/')
-            ),
-        ];
+            format!("{base}/.well-known/openid-configuration"),
+            // The path-appended RFC 8414 compatibility form, the only one
+            // Plane serves for its path-scoped issuer.
+            format!("{base}/.well-known/oauth-authorization-server"),
+        ] {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
         for candidate in candidates {
             check()?;
-            let Some(value) = fetch_json(&candidate).await? else {
-                continue;
+            let value = match fetch_json(&candidate).await? {
+                Probe::Found(value) => value,
+                Probe::Missing => continue,
+                Probe::Unusable(err) => {
+                    unusable = Some(err);
+                    continue;
+                }
             };
             let advertised_issuer = checked_url(&string_field(&value, "issuer")?)?;
-            if advertised_issuer != issuer_url {
-                return Err(error(
+            if !origin_fallback && !same_identifier(&advertised_issuer, &issuer_url) {
+                // Never adopt an identity the resource did not advertise, but
+                // a later candidate may hold this issuer's own document.
+                mismatch = Some(error(
                     "METADATA",
                     "authorization-server metadata issuer does not match its advertised identity",
+                ));
+                continue;
+            }
+            if advertised_issuer.query().is_some() {
+                return Err(error(
+                    "METADATA",
+                    "OAuth issuer URLs must not contain a query",
                 ));
             }
             if string_list(&value, "code_challenge_methods_supported")?
@@ -1069,22 +1155,25 @@ async fn discover(resource: &str, check: &Admission) -> Result<Metadata> {
                 }
             };
             return Ok(Metadata {
-                issuer: issuer_url.to_string(),
+                issuer: advertised_issuer.to_string(),
                 authorization_endpoint,
                 token_endpoint,
                 registration_endpoint,
                 auth_methods,
                 scope,
                 require_iss,
+                resource: advertised_resource,
             });
         }
     }
     // Never fall back to an unrelated root issuer after a resource advertised
     // its authorization_servers. Only those identities were searched above.
-    Err(error(
-        "DISCOVERY",
-        "no advertised authorization server supplied usable OAuth metadata",
-    ))
+    Err(mismatch.or(unusable).unwrap_or_else(|| {
+        error(
+            "DISCOVERY",
+            "no advertised authorization server supplied usable OAuth metadata",
+        )
+    }))
 }
 
 /// An explicit scope, including an empty one, takes precedence over discovery.
@@ -1348,6 +1437,7 @@ async fn register_client(
         access_token: String::new(),
         refresh_token: None,
         expires_at_ms: None,
+        resource: metadata.resource.clone(),
     })
 }
 
@@ -1470,20 +1560,32 @@ fn parse_tokens(value: &Value, mut credentials: Credentials) -> Result<Credentia
         validate_string(token, 16 * 1024)?;
         credentials.refresh_token = Some(token.to_string());
     }
-    credentials.expires_at_ms = match value.get("expires_in") {
-        None => None,
-        Some(value) => {
-            let seconds = value.as_u64().filter(|value| *value > 0).ok_or_else(|| {
-                error("TOKEN", "OAuth expiry must be a positive number of seconds")
-            })?;
-            let milliseconds = i64::try_from(seconds)
+    let seconds = match value.get("expires_in") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                // Some servers send the RFC 6749 number as a decimal string.
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    error("TOKEN", "OAuth expiry must be a positive number of seconds")
+                })?,
+        ),
+    };
+    // A token without a stated lifetime would otherwise be sent until the
+    // server refuses it, leaving the refresh token unused. Assume an hour, as
+    // OMP does, whenever pi can refresh.
+    let seconds = seconds.or_else(|| credentials.refresh_token.is_some().then_some(3600));
+    credentials.expires_at_ms = seconds
+        .map(|seconds| {
+            i64::try_from(seconds)
                 .ok()
                 .and_then(|seconds| seconds.checked_mul(1000))
                 .and_then(|duration| now_ms().checked_add(duration))
-                .ok_or_else(|| error("TOKEN", "OAuth expiry exceeds the supported range"))?;
-            Some(milliseconds)
-        }
-    };
+                .ok_or_else(|| error("TOKEN", "OAuth expiry exceeds the supported range"))
+        })
+        .transpose()?;
     if let Some(scope) = value.get("scope") {
         credentials.scope = scope_string(
             scope
@@ -1716,6 +1818,14 @@ mod configured_tests {
 
     impl OAuthFixture {
         fn start(methods: &[&str]) -> Self {
+            Self::serve(methods, fixture_response)
+        }
+
+        /// `respond(origin, methods, request)` writes the whole HTTP response.
+        fn serve(
+            methods: &[&str],
+            respond: impl Fn(&str, &[String], &CapturedRequest) -> String + Send + 'static,
+        ) -> Self {
             let listener = TcpListener::bind(("127.0.0.1", 0)).expect("OAuth fixture listener");
             listener.set_nonblocking(true).expect("nonblocking fixture");
             let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
@@ -1734,7 +1844,7 @@ mod configured_tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => match read_fixture_request(&mut stream, &stopped) {
                             Ok(request) => {
-                                let response = fixture_response(&base, &advertised, &request);
+                                let response = respond(&base, &advertised, &request);
                                 captured.lock().expect("request capture").push(request);
                                 if let Err(err) = stream.write_all(response.as_bytes()) {
                                     failed
@@ -1784,6 +1894,7 @@ mod configured_tests {
                 auth_methods: self.methods.clone(),
                 scope: Some("metadata.read offline_access".to_string()),
                 require_iss: true,
+                resource: None,
             }
         }
 
@@ -1945,11 +2056,62 @@ mod configured_tests {
                 json!({"error": "unexpected_request"}),
             ),
         };
-        let body = body.to_string();
+        http_response(status, &extra, "application/json", &body.to_string())
+    }
+
+    fn http_response(status: &str, extra: &str, content_type: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
             body.len(),
         )
+    }
+
+    fn discovered(fixture: &OAuthFixture, path: &str) -> Result<Metadata> {
+        run(discover(&format!("{}{path}", fixture.origin), &admit()))
+    }
+
+    fn targets(fixture: &OAuthFixture) -> Vec<String> {
+        fixture
+            .captured()
+            .into_iter()
+            .map(|request| request.target)
+            .collect()
+    }
+
+    /// A server whose resource metadata names its origin, behind a gateway
+    /// that refuses or answers with a page for the first issuer locations.
+    fn origin_resource_response(
+        origin: &str,
+        methods: &[String],
+        request: &CapturedRequest,
+    ) -> String {
+        let issuer = format!("{origin}/tenant");
+        let document = json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{origin}/token"),
+            "registration_endpoint": format!("{origin}/register"),
+            "token_endpoint_auth_methods_supported": methods,
+            "code_challenge_methods_supported": ["S256"],
+        });
+        match request.target.as_str() {
+            "/resource" => http_response(
+                "200 OK",
+                "",
+                "application/json",
+                &json!({"resource": origin, "authorization_servers": [issuer]}).to_string(),
+            ),
+            "/.well-known/oauth-authorization-server/tenant" => {
+                http_response("500 Internal Server Error", "", "text/plain", "upstream")
+            }
+            "/.well-known/openid-configuration/tenant" => {
+                http_response("200 OK", "", "text/html", "<html>sign in</html>")
+            }
+            "/tenant/.well-known/oauth-authorization-server" => {
+                http_response("200 OK", "", "application/json", &document.to_string())
+            }
+            _ => fixture_response(origin, methods, request),
+        }
     }
 
     fn run<T>(operation: impl Future<Output = Result<T>>) -> Result<T> {
@@ -2579,6 +2741,156 @@ mod configured_tests {
         let response = browser.join().expect("browser thread");
         assert_eq!(response.lines().next(), Some("HTTP/1.1 200 OK"));
     }
+
+    #[test]
+    fn an_origin_wide_resource_is_requested_on_login_and_refresh() {
+        let fixture = OAuthFixture::serve(&["none"], origin_resource_response);
+        let temp = tempfile::tempdir().expect("credential directory");
+        let binding = AuthBinding::new(temp.path(), "origin", &fixture.resource())
+            .expect("origin auth binding");
+        let issuer = format!("{}/tenant", fixture.origin);
+        let browser = Arc::new(Mutex::new(Vec::new()));
+        let callback = browser_callback(Arc::clone(&browser), issuer.clone());
+        let persisted = run(async {
+            binding
+                .reauthenticate(McpOAuthConfig::default(), callback, admit())
+                .await?;
+            assert_eq!(
+                binding.authorization_header(true).await?.as_deref(),
+                Some("Bearer refreshed-access")
+            );
+            binding.read().await
+        })
+        .expect("login and refresh")
+        .expect("persisted login");
+        let advertised = format!("{}/", fixture.origin);
+        assert_eq!(persisted.resource, fixture.resource());
+        let credentials = persisted.credentials.expect("persisted credentials");
+        assert_eq!(credentials.issuer, issuer);
+        assert_eq!(credentials.resource.as_deref(), Some(advertised.as_str()));
+        let authorization = browser.lock().expect("browser capture")[0].clone();
+        assert_eq!(authorization.path(), "/tenant/authorize");
+        let parameters: HashMap<String, String> =
+            authorization.query_pairs().into_owned().collect();
+        assert_eq!(parameters.get("resource"), Some(&advertised));
+        let requests = fixture.captured();
+        let probes: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method == "GET")
+            .map(|request| request.target.as_str())
+            .collect();
+        assert_eq!(
+            probes,
+            [
+                "/mcp",
+                "/resource",
+                "/.well-known/oauth-authorization-server/tenant",
+                "/.well-known/openid-configuration/tenant",
+                "/tenant/.well-known/openid-configuration",
+                "/tenant/.well-known/oauth-authorization-server",
+            ]
+        );
+        let token_resources: Vec<_> = requests
+            .iter()
+            .filter(|request| request.target == "/token")
+            .map(|request| request.form().get("resource").cloned())
+            .collect();
+        assert_eq!(
+            token_resources,
+            [Some(advertised.clone()), Some(advertised)],
+            "the code exchange and the refresh"
+        );
+    }
+
+    #[test]
+    fn discovery_adopts_the_origin_issuer_only_when_no_server_was_advertised() {
+        let fixture = OAuthFixture::serve(&["none"], |origin, _, request| {
+            let json =
+                |body: Value| http_response("200 OK", "", "application/json", &body.to_string());
+            let challenge = |metadata: &str| {
+                http_response(
+                    "401 Unauthorized",
+                    &format!(
+                        "WWW-Authenticate: Bearer resource_metadata=\"{origin}{metadata}\"\r\n"
+                    ),
+                    "application/json",
+                    "{}",
+                )
+            };
+            let document = |issuer: String| {
+                json(json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{origin}/v1/authorize"),
+                    "token_endpoint": "https://cf.mcp.example/v1/token",
+                    "code_challenge_methods_supported": ["S256"],
+                }))
+            };
+            match request.target.as_str() {
+                // Atlassian: no resource metadata, and the origin's own
+                // document names an issuer on another host.
+                "/v1/mcp" => http_response(
+                    "401 Unauthorized",
+                    "WWW-Authenticate: Bearer realm=\"mcp\"\r\n",
+                    "application/json",
+                    "{}",
+                ),
+                "/.well-known/oauth-authorization-server" => {
+                    document("https://cf.mcp.example".to_string())
+                }
+                // An advertised issuer whose every location serves the root document.
+                "/b/mcp" => challenge("/prm-b"),
+                "/prm-b" => json(json!({
+                    "resource": format!("{origin}/b/mcp"),
+                    "authorization_servers": [format!("{origin}/tenant")],
+                })),
+                "/.well-known/oauth-authorization-server/tenant"
+                | "/.well-known/openid-configuration/tenant"
+                | "/tenant/.well-known/openid-configuration"
+                | "/tenant/.well-known/oauth-authorization-server" => {
+                    document(format!("{origin}/"))
+                }
+                // Resource metadata for a sibling resource on the same origin.
+                "/a/mcp" => challenge("/prm-a"),
+                "/prm-a" => json(json!({
+                    "resource": format!("{origin}/other"),
+                    "authorization_servers": [format!("{origin}/")],
+                })),
+                _ => http_response("404 Not Found", "", "application/json", "{}"),
+            }
+        });
+        let atlassian = discovered(&fixture, "/v1/mcp").expect("origin fallback discovery");
+        assert_eq!(atlassian.issuer, "https://cf.mcp.example/");
+        assert_eq!(atlassian.token_endpoint, "https://cf.mcp.example/v1/token");
+        assert_eq!(atlassian.resource, None);
+        for (path, message) in [
+            ("/b/mcp", "does not match its advertised identity"),
+            ("/a/mcp", "does not match the configured MCP endpoint"),
+        ] {
+            let refused = discovered(&fixture, path).err().map(|err| err.to_string());
+            assert_eq!(
+                refused.as_ref().map(|text| text.contains(message)),
+                Some(true),
+                "{path}: {refused:?}"
+            );
+        }
+        assert_eq!(
+            targets(&fixture),
+            [
+                "/v1/mcp",
+                "/.well-known/oauth-protected-resource/v1/mcp",
+                "/.well-known/oauth-protected-resource",
+                "/.well-known/oauth-authorization-server",
+                "/b/mcp",
+                "/prm-b",
+                "/.well-known/oauth-authorization-server/tenant",
+                "/.well-known/openid-configuration/tenant",
+                "/tenant/.well-known/openid-configuration",
+                "/tenant/.well-known/oauth-authorization-server",
+                "/a/mcp",
+                "/prm-a",
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2596,6 +2908,7 @@ mod tests {
             access_token: "old-access".into(),
             refresh_token: Some("old-refresh".into()),
             expires_at_ms: Some(i64::MAX),
+            resource: None,
         }
     }
 
@@ -2827,6 +3140,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unchanged.refresh_token.as_deref(), Some("old-refresh"));
+    }
+
+    #[test]
+    fn token_lifetime_accepts_a_decimal_string_and_defaults_only_when_refreshable() {
+        let lifetime = |response: Value, credentials: Credentials| {
+            let before = now_ms();
+            parse_tokens(&response, credentials)
+                .map(|parsed| parsed.expires_at_ms.map(|at| (at - before) / 1000))
+                .map_err(|err| err.to_string())
+        };
+        let token = |expires_in: Value| json!({"access_token":"new-access", "token_type":"Bearer", "expires_in": expires_in});
+        let mut public = credentials();
+        public.refresh_token = None;
+        assert_eq!(lifetime(token(json!("120")), credentials()), Ok(Some(120)));
+        assert_eq!(lifetime(token(Value::Null), credentials()), Ok(Some(3600)));
+        assert_eq!(
+            lifetime(
+                json!({"access_token":"new-access", "token_type":"Bearer"}),
+                credentials()
+            ),
+            Ok(Some(3600)),
+            "a refresh response that states no lifetime"
+        );
+        assert_eq!(lifetime(token(Value::Null), public), Ok(None));
+        assert_eq!(
+            lifetime(token(json!("soon")), credentials())
+                .err()
+                .map(|err| err.contains("positive number of seconds")),
+            Some(true)
+        );
     }
 
     #[test]

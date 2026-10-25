@@ -185,6 +185,17 @@ loopback listener.
 OAuth endpoints must use HTTPS; loopback HTTP is accepted for local servers
 and development.
 
+Discovery follows the server's `WWW-Authenticate` `resource_metadata`, or else
+the path-inserted and root protected-resource documents. The advertised
+`resource` may be the endpoint itself or a same-origin path prefix of it (a
+server at `https://mcp.example.com/mcp` may advertise `https://mcp.example.com`).
+Tokens are then requested for the advertised resource. Each advertised
+authorization server is looked up at its RFC 8414 and OpenID locations, both
+path-inserted and path-appended. Its metadata must name that same issuer. A
+location that is missing, refused, or not JSON is skipped. When a server
+advertises no authorization server, its origin's own metadata is used, along
+with the issuer it names, which may be on another host.
+
 Review the server's source configuration and acknowledge its trust before
 starting authentication:
 
@@ -218,7 +229,8 @@ configuration or editor-supplied definitions.
 
 Access tokens are attached to every HTTP channel, including event streams,
 cancellation notifications, and session termination. Near-expiry tokens can be
-refreshed before an ordinary request. Refresh rotation is saved before the
+refreshed before an ordinary request. A refreshable token whose response states
+no `expires_in` is treated as valid for one hour. Refresh rotation is saved before the
 replacement token is used; cleanup requests do not initiate refresh or browser
 interaction. Logout invalidates older refresh and browser-flow commits, and old
 connections cannot borrow credentials from a replacement login.
