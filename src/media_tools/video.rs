@@ -556,6 +556,13 @@ struct ProbeStream {
     nb_frames: Option<String>,
     #[serde(default)]
     disposition: ProbeDisposition,
+    #[serde(default)]
+    side_data_list: Vec<ProbeSideData>,
+}
+
+#[derive(Deserialize)]
+struct ProbeSideData {
+    rotation: Option<f64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -641,6 +648,18 @@ fn parse_probe(bytes: &[u8]) -> Result<VideoInfo> {
             "Video dimensions are missing or exceed the 16-megapixel decoded-frame limit.",
         ));
     }
+    // ffmpeg decodes frames upright, so report the size the viewer sees: a
+    // display matrix that turns the picture a quarter turn swaps the stored size.
+    let quarter_turn = video
+        .side_data_list
+        .iter()
+        .find_map(|side_data| side_data.rotation)
+        .is_some_and(|rotation| (rotation.abs() % 180.0 - 90.0).abs() < 1.0);
+    let (width, height) = if quarter_turn {
+        (height, width)
+    } else {
+        (width, height)
+    };
     let duration = probe_duration(video.duration.as_deref())?.or(probe_duration(
         probe
             .format
@@ -688,7 +707,7 @@ async fn probe_video(
     input_options(&mut command, demuxer);
     command.args([
         "-show_entries",
-        "stream=codec_type,codec_name,width,height,duration,avg_frame_rate,r_frame_rate,nb_frames:stream_disposition=attached_pic:format=duration",
+        "stream=codec_type,codec_name,width,height,duration,avg_frame_rate,r_frame_rate,nb_frames:stream_disposition=attached_pic:stream_side_data=rotation:format=duration",
         "-of",
         "json",
     ]);
@@ -1227,6 +1246,26 @@ mod tests {
         ]}"#;
         let error = parse_probe(cover_only).unwrap_err();
         assert!(error.to_string().contains("VIDEO_STREAM"));
+    }
+
+    /// A phone's portrait clip is stored landscape with a display matrix;
+    /// the reported size is the upright one ffmpeg's frames have.
+    #[test]
+    fn metadata_reports_the_displayed_size_of_a_rotated_stream() {
+        for (rotation, expected) in [
+            ("90", (1080, 1920)),
+            ("-90", (1080, 1920)),
+            ("270.0", (1080, 1920)),
+            ("180", (1920, 1080)),
+            ("0", (1920, 1080)),
+        ] {
+            let metadata = format!(
+                r#"{{"streams":[{{"codec_type":"video","codec_name":"hevc","width":1920,
+                   "height":1080,"side_data_list":[{{"rotation":{rotation}}}]}}]}}"#
+            );
+            let video = parse_probe(metadata.as_bytes()).unwrap();
+            assert_eq!((video.width, video.height), expected, "rotation {rotation}");
+        }
     }
 
     #[test]
