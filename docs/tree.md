@@ -4,6 +4,10 @@ Pi sessions are **trees**, not flat message lists. Every entry has an `id` and o
 
 Use `/tree` to navigate the session tree and switch the leaf.
 
+The interactive tree UI described below is in `pi --classic`. In the default
+stack, `/tree` prints the numbered branch tips, each with its latest user
+message, and `/tree <index|id>` (an id prefix works) switches to that tip.
+
 ## `/tree` vs `/fork`
 
 | Feature | `/tree` | `/fork` |

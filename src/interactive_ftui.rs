@@ -1656,10 +1656,10 @@ pub enum UiCommand {
     /// next turn boundary (`/tan`, bd-ydz1t.2). The UI rejects an empty
     /// argument; the driver enforces that the opt-in `subagent` tool is on.
     Tan(String),
-    /// Print a textual branch-tree summary (`/tree`). The interactive tree
-    /// selector overlay arrives with bd-cv653.9.8; until then /tree reports
-    /// branches/entries instead of falling through to extension dispatch.
-    TreeSummary,
+    /// `/tree` lists the session's branches by number; `/tree <index|id>`
+    /// switches the conversation to that branch's tip. The classic stack's
+    /// interactive tree selector has no FTUI overlay yet.
+    Tree { args: String },
     /// Show (`None`) or set (`Some`) the thinking level (`/thinking`).
     /// The UI validates the level against `ThinkingLevel::from_str` before
     /// sending; invalid levels never reach the driver.
@@ -4403,7 +4403,9 @@ impl PiFtuiModel {
                 return true;
             }
             "/tree" => {
-                self.send_command(UiCommand::TreeSummary);
+                self.send_command(UiCommand::Tree {
+                    args: cmd_args.trim().to_string(),
+                });
                 return true;
             }
             "/branch" => {
@@ -4809,7 +4811,9 @@ impl PiFtuiModel {
             match self.double_escape_action {
                 DoubleEscapeAction::Rewind => self.request_message_picker(false),
                 DoubleEscapeAction::Fork => self.request_message_picker(true),
-                DoubleEscapeAction::Tree => self.send_command(UiCommand::TreeSummary),
+                DoubleEscapeAction::Tree => self.send_command(UiCommand::Tree {
+                    args: String::new(),
+                }),
                 DoubleEscapeAction::None => {}
             }
         } else {
@@ -8042,24 +8046,58 @@ async fn run_tree_summary_command(
     agent_tx: &Sender<PiMsg>,
 ) {
     let summary = handle.with_session(|session| {
-        let leaves = session.list_leaves();
-        let entry_count = session.entries.len();
-        if leaves.is_empty() {
-            return format!("Session tree: no branches, {entry_count} entries");
-        }
-        let rendered = leaves
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n  ");
-        format!(
-            "Session tree: {} branch(es), {entry_count} entries\nLeaves:\n  {rendered}",
-            leaves.len()
+        crate::interactive::format_branch_candidates(
+            &crate::interactive::branch_candidates(session),
+            session.entries.len(),
         )
     });
     match summary.await {
         Ok(text) => {
             let _ = agent_tx.send(PiMsg::System(text));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
+        }
+    }
+}
+
+/// `/tree <index|id>`: move the conversation to that branch's tip, the way
+/// `/rewind` moves it back, so a rewound-away branch stays reachable.
+async fn run_tree_switch_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    args: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let selected = handle
+        .with_session(|session| {
+            crate::interactive::select_branch_candidate(
+                &crate::interactive::branch_candidates(session),
+                args,
+            )
+        })
+        .await;
+    let branch = match selected {
+        Ok(Ok(branch)) => branch,
+        Ok(Err(message)) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {message}")));
+            return;
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
+            return;
+        }
+    };
+    if branch.current {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Already on branch {} - {}",
+            branch.leaf_id, branch.summary
+        )));
+        return;
+    }
+    match handle.switch_to_entry(&branch.leaf_id).await {
+        Ok(()) => {
+            let status = format!("Switched to branch {} - {}", branch.leaf_id, branch.summary);
+            send_conversation_reset(handle, agent_tx, &status).await;
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
@@ -9594,9 +9632,15 @@ pub fn run(
     // extension or MCP startup is run on this thread.
     let supplied_workspace =
         session_options.working_directory.is_some() && session_options.workspace.is_some();
-    let session_options =
+    let mut session_options =
         futures::executor::block_on(prepare_driver_session_options(session_options))
             .map_err(std::io::Error::other)?;
+    // One undo history for the process, as on the classic stack. `/new`,
+    // `/resume`, `/reload` and `/fork` rebuild the session from a template
+    // cloned from these options, so every handle shares this recorder.
+    session_options
+        .mutation_recorder
+        .get_or_insert_with(Default::default);
     let bash_cwd = driver_bash_cwd(&session_options);
     let workspace = session_options.workspace.clone();
     autocomplete.cwd.clone_from(&bash_cwd);
@@ -10167,8 +10211,12 @@ pub fn run(
                             )
                             .await;
                         }
-                        Ok(UiCommand::TreeSummary) => {
-                            run_tree_summary_command(&handle, &agent_tx).await;
+                        Ok(UiCommand::Tree { args }) => {
+                            if args.is_empty() {
+                                run_tree_summary_command(&handle, &agent_tx).await;
+                            } else {
+                                run_tree_switch_command(&mut handle, &args, &agent_tx).await;
+                            }
                         }
                         Ok(UiCommand::Fast(request)) => {
                             let _ = agent_tx.send(run_fast_command(&mut handle, request));
@@ -15408,7 +15456,12 @@ mod tests {
         );
         assert_eq!(
             esc_esc(DoubleEscapeAction::Tree, ""),
-            (None, Some(UiCommand::TreeSummary))
+            (
+                None,
+                Some(UiCommand::Tree {
+                    args: String::new()
+                })
+            )
         );
         assert_eq!(esc_esc(DoubleEscapeAction::None, ""), (None, None));
         // A draft in the editor is never thrown away by a stray double-Esc.
@@ -15563,6 +15616,35 @@ mod tests {
             assert!(matches!(
                 agent_rx.try_recv(),
                 Ok(PiMsg::AgentError(text)) if text.starts_with("rewind:")
+            ));
+
+            // The rewound-away path is listed by /tree and reachable again.
+            run_tree_summary_command(&handle, &agent_tx).await;
+            let Ok(PiMsg::System(listing)) = agent_rx.try_recv() else {
+                panic!("expected the branch list");
+            };
+            assert!(listing.contains("1. "), "{listing}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            assert!(listing.contains("second question"), "{listing}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            assert!(listing.contains("partway along a branch"), "{listing}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            run_tree_switch_command(&mut handle, "1", &agent_tx).await;
+            let replies: Vec<PiMsg> = agent_rx.try_iter().collect();
+            let Some(PiMsg::ConversationReset {
+                messages: shown, ..
+            }) = replies.first()
+            else {
+                panic!("expected a conversation reset, got {replies:?}");
+            };
+            assert_eq!(shown.len(), 4, "both questions and answers are back");
+            assert_eq!(handle.session().agent.messages().len(), 4);
+            run_tree_switch_command(&mut handle, "1", &agent_tx).await;
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::System(text)) if text.starts_with("Already on branch")
+            ));
+            run_tree_switch_command(&mut handle, "9", &agent_tx).await;
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::AgentError(text)) if text == "tree: Invalid index: 9 (1-1)"
             ));
         });
     }
@@ -17265,11 +17347,21 @@ mod tests {
             submit_rx.try_recv().expect("routed"),
             UiCommand::SessionInfo
         );
-        type_str(&mut sim, "/tree deep --all");
+        type_str(&mut sim, "/tree");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
-            UiCommand::TreeSummary
+            UiCommand::Tree {
+                args: String::new()
+            }
+        );
+        type_str(&mut sim, "/tree 2 ");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Tree {
+                args: String::from("2")
+            }
         );
         type_str(&mut sim, "/thinking medium");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));

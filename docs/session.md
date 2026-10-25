@@ -153,6 +153,11 @@ Visualizes the branching structure of the current session.
 - Navigate: Up/Down
 - Switch: Enter (switches active context to the selected node)
 
+That selector is in `pi --classic`. In the default stack, `/tree` lists each
+branch's tip with its latest user message, and `/tree <index|id>` switches the
+conversation to that tip. This is how you return to a path you left with
+`/rewind`, `/branch` or double-Esc.
+
 #### Forking (`/fork`)
 
 Creates a new session file starting from the current point (or a selected point). This is useful when you want to explore a significantly different direction without cluttering the current session file.

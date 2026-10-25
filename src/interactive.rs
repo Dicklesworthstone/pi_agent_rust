@@ -107,7 +107,10 @@ use self::commands::{
 // Session→conversation snapshot; re-exported for the ftui migration stack
 // (bd-cv653.9.1) to rebuild its transcript after /resume.
 pub use self::conversation::conversation_from_session;
-pub(crate) use self::tree::{fork_candidates, format_fork_candidates, select_fork_candidate};
+pub(crate) use self::tree::{
+    branch_candidates, fork_candidates, format_branch_candidates, format_fork_candidates,
+    select_branch_candidate, select_fork_candidate,
+};
 
 /// Where `/export` writes when it is given no argument.
 ///

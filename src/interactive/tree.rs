@@ -264,20 +264,45 @@ pub fn select_fork_candidate(
     if args.is_empty() {
         return Ok(last.clone());
     }
+    select_by_index_or_id(candidates, args, |c| &c.id, "user message")
+}
+
+/// A number is a 1-based index; anything else is an id or unique id prefix.
+fn select_by_index_or_id<T: Clone>(
+    items: &[T],
+    args: &str,
+    id: impl Fn(&T) -> &str,
+    noun: &str,
+) -> Result<T, String> {
     if let Ok(index) = args.parse::<usize>() {
-        if index == 0 || index > candidates.len() {
-            return Err(format!("Invalid index: {index} (1-{})", candidates.len()));
-        }
-        return Ok(candidates[index - 1].clone());
+        return index
+            .checked_sub(1)
+            .and_then(|position| items.get(position))
+            .cloned()
+            .ok_or_else(|| format!("Invalid index: {index} (1-{})", items.len()));
     }
-    let matches = candidates
+    let matches = items
         .iter()
-        .filter(|c| c.id == args || c.id.starts_with(args))
+        .filter(|item| id(item).starts_with(args))
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [] => Err(format!("No user message id matches \"{args}\"")),
+        [] => Err(format!("No {noun} id matches \"{args}\"")),
         [only] => Ok((*only).clone()),
         many => Err(format!("Ambiguous id \"{args}\" (matches {})", many.len())),
+    }
+}
+
+fn user_summary(content: &UserContent) -> String {
+    let text = user_content_to_text(content);
+    let first_line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if first_line.is_empty() {
+        "(empty)".to_string()
+    } else {
+        super::truncate(first_line, 80)
     }
 }
 
@@ -297,25 +322,88 @@ pub fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
             continue;
         };
 
-        let text = user_content_to_text(content);
-        let first_line = text
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("")
-            .trim();
-        let summary = if first_line.is_empty() {
-            "(empty)".to_string()
-        } else {
-            super::truncate(first_line, 80)
-        };
-
         out.push(ForkCandidate {
             id: id.clone(),
-            summary,
+            summary: user_summary(content),
         });
     }
 
     out
+}
+
+/// The tip of one session branch, for the FTUI `/tree` (the classic stack
+/// has the interactive selector instead).
+#[derive(Debug, Clone)]
+pub struct BranchCandidate {
+    pub leaf_id: String,
+    /// First line of the branch's latest user message.
+    pub summary: String,
+    /// This tip is the current leaf.
+    pub current: bool,
+}
+
+/// Every branch tip, oldest first.
+pub fn branch_candidates(session: &Session) -> Vec<BranchCandidate> {
+    let current = session.leaf_id();
+    session
+        .list_leaves()
+        .into_iter()
+        .map(|leaf_id| {
+            let summary = session
+                .get_path_to_entry(&leaf_id)
+                .iter()
+                .rev()
+                .find_map(|id| match session.get_entry(id)? {
+                    SessionEntry::Message(entry) => match &entry.message {
+                        SessionMessage::User { content, .. } => Some(user_summary(content)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| "(no user message)".to_string());
+            BranchCandidate {
+                current: current == Some(leaf_id.as_str()),
+                leaf_id,
+                summary,
+            }
+        })
+        .collect()
+}
+
+/// FTUI `/tree`: the numbered branches and how to switch.
+pub fn format_branch_candidates(candidates: &[BranchCandidate], entry_count: usize) -> String {
+    if candidates.is_empty() {
+        return format!("Session tree: no branches, {entry_count} entries");
+    }
+    let list = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let marker = if c.current { "  <- current" } else { "" };
+            format!("  {}. {} - {}{marker}", i + 1, c.leaf_id, c.summary)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let position = if candidates.iter().any(|c| c.current) {
+        ""
+    } else {
+        "\nYou are partway along a branch (after a rewind); new messages start a new one."
+    };
+    format!(
+        "Session tree: {} branch(es), {entry_count} entries. Switch with /tree <index|id>:\n{list}{position}",
+        candidates.len()
+    )
+}
+
+/// Resolve `/tree <args>`: a 1-based index, or a leaf id or unique prefix.
+pub fn select_branch_candidate(
+    candidates: &[BranchCandidate],
+    args: &str,
+) -> Result<BranchCandidate, String> {
+    if candidates.is_empty() {
+        return Err("This session has no branches yet".to_string());
+    }
+    select_by_index_or_id(candidates, args, |c| &c.leaf_id, "branch")
 }
 
 impl PiApp {
