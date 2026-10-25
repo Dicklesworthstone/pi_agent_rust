@@ -4048,7 +4048,7 @@ impl PiFtuiModel {
             self.scroll_from_tail = 0;
             return true;
         }
-        if let Some(arg) = strip_command(clean, "/copy") {
+        if let Some(arg) = strip_command(clean, "/copy").or_else(|| strip_command(clean, "/cp")) {
             // OMP `/copy [code|cmd|link]`: bare opens a picker of replies and
             // their code blocks; the subcommands take the newest one.
             self.scroll_from_tail = 0;
@@ -4332,7 +4332,7 @@ impl PiFtuiModel {
                 }
                 return true;
             }
-            "/scoped-models" => {
+            "/scoped-models" | "/scoped" => {
                 self.send_command(UiCommand::ScopedModels {
                     args: cmd_args.trim().to_string(),
                 });
@@ -16997,6 +16997,15 @@ mod tests {
             UiCommand::Workspace {
                 command: workspace_commands::WorkspaceCommand::Advisor,
                 args: String::new()
+            }
+        );
+        // The classic aliases `/cp` and `/scoped` used to answer "is a pi
+        // command that this stack does not implement yet".
+        assert_eq!(send("/cp cmd"), UiCommand::CopyLastCommand);
+        assert_eq!(
+            send("/scoped anthropic/*"),
+            UiCommand::ScopedModels {
+                args: String::from("anthropic/*")
             }
         );
         assert_eq!(
