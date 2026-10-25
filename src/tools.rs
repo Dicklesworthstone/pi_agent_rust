@@ -10761,23 +10761,17 @@ fn strip_bom(s: &str) -> (&str, bool) {
         .map_or_else(|| (s, false), |stripped| (stripped, true))
 }
 
+/// The first LF decides, as in OMP: CRLF when a CR precedes it. A lone CR
+/// before it is content (a carriage return inside a string literal, or the
+/// first CR of `\r\r\n`); only a file with no LF at all is CR-terminated.
 fn detect_line_ending(content: &str) -> &'static str {
-    let bytes = content.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'\r' => {
-                return if bytes.get(idx + 1) == Some(&b'\n') {
-                    "\r\n"
-                } else {
-                    "\r"
-                };
-            }
-            b'\n' => return "\n",
-            _ => idx += 1,
+    match content.find('\n') {
+        Some(lf) if lf.checked_sub(1).and_then(|cr| content.as_bytes().get(cr)) == Some(&b'\r') => {
+            "\r\n"
         }
+        None if content.contains('\r') => "\r",
+        Some(_) | None => "\n",
     }
-    "\n"
 }
 
 fn normalize_to_lf(text: &str) -> String {
@@ -11394,9 +11388,30 @@ fn apply_unique_text_replacement(
     // occurrence counting (avoids 2x redundant O(n) normalization).
     let precomputed_content = build_normalized_content(content_for_matching.as_ref());
 
-    let mut best_match: Option<(FuzzyMatchResult, String, String)> = None;
+    // A CRLF file matches the LF needle exactly once their line endings
+    // agree. Left to the fuzzy pass, which trims each line's trailing
+    // whitespace (the CR with it), a needle ending in whitespace leaves that
+    // whitespace outside the matched span and the replacement doubles it.
+    let mut best_match: Option<(FuzzyMatchResult, String, String)> = if original_ending == "\r\n" {
+        variants.iter().find_map(|variant| {
+            let crlf = variant.replace('\n', "\r\n");
+            let index = content_for_matching.find(crlf.as_str())?;
+            let found = FuzzyMatchResult {
+                found: true,
+                index,
+                match_length: crlf.len(),
+                exact_match: true,
+            };
+            Some((found, build_normalized_content(&crlf), crlf))
+        })
+    } else {
+        None
+    };
 
     for variant in variants {
+        if best_match.is_some() {
+            break;
+        }
         let precomputed_variant = build_normalized_content(&variant);
         let match_result = fuzzy_find_text_with_normalized(
             content_for_matching.as_ref(),
@@ -24602,6 +24617,79 @@ mod tests {
                     "{old_text:?}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn crlf_edit_keeps_the_needles_trailing_whitespace_once() {
+        // A multi-line needle only matched a CRLF file fuzzily, which trims
+        // each line's trailing whitespace: whitespace ending the needle fell
+        // outside the matched span and the replacement doubled it.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("crlf.rs");
+            let tool = EditTool::new(tmp.path());
+            for (content, old_text, new_text, expected) in [
+                (
+                    "fn a() {\r\n    x();\r\n    y();\r\n}\r\n",
+                    "    x();\n    ",
+                    "    x2();\n    ",
+                    "fn a() {\r\n    x2();\r\n    y();\r\n}\r\n",
+                ),
+                (
+                    "a\r\nfoo  \r\nz\r\n",
+                    "a\nfoo  ",
+                    "a\nbar  ",
+                    "a\r\nbar  \r\nz\r\n",
+                ),
+            ] {
+                std::fs::write(&path, content).expect("write");
+                tool.execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": old_text,
+                        "newText": new_text,
+                    }),
+                    None,
+                )
+                .await
+                .expect("edit");
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("read"),
+                    expected,
+                    "{old_text:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_lone_cr_before_the_first_lf_does_not_make_the_file_cr_terminated() {
+        assert_eq!(detect_line_ending("print('a\rb')\nx = 1\n"), "\n");
+        assert_eq!(detect_line_ending("a\r\r\nb\r\r\n"), "\r\n");
+        assert_eq!(detect_line_ending("\nfirst line empty"), "\n");
+        // The edit used to write the inserted line break as a bare CR.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("cr_in_string.py");
+            std::fs::write(&path, "print('a\rb')\nx = 1\n").expect("write");
+            EditTool::new(tmp.path())
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "x = 1",
+                        "newText": "x = 1\ny = 2",
+                    }),
+                    None,
+                )
+                .await
+                .expect("edit");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                "print('a\rb')\nx = 1\ny = 2\n"
+            );
         });
     }
 
