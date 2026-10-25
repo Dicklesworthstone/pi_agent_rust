@@ -633,6 +633,60 @@ fn dispatch_event_with_response_none_when_no_hooks() {
     assert!(response.is_none(), "Expected None when no hooks registered");
 }
 
+/// Extension whose `user_bash` answer depends on the command.
+const USER_BASH_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("user_bash", (event) => {
+        if (event.command === "observe") return { allow: true };
+        if (event.command === "ops") return { operations: { exec: async () => ({ exitCode: 0 }) } };
+        if (event.command === "local") return undefined;
+        return {
+            result: {
+                output: `${event.cwd}|${event.excludeFromContext}|${event.command}`,
+                exitCode: 3,
+                truncated: true,
+            },
+        };
+    });
+}
+"#;
+
+/// Only `{ result }` replaces the shell run. An observing answer
+/// (`{ allow: true }`) or pi-mono's `{ operations }` used to be read as an
+/// empty successful result, so the command silently never ran.
+#[test]
+fn dispatch_user_bash_takes_only_a_result_answer() {
+    let harness = common::TestHarness::new("dispatch_user_bash_takes_only_a_result_answer");
+    let manager = load_js_extension(&harness, USER_BASH_EXT);
+    let cwd = harness.temp_dir().to_path_buf();
+
+    let (passed_through, hooked) = common::run_async({
+        let manager = manager.clone();
+        let cwd = cwd.clone();
+        async move {
+            let mut passed_through = Vec::new();
+            for command in ["observe", "ops", "local"] {
+                if manager
+                    .dispatch_user_bash(command, false, &cwd)
+                    .await
+                    .is_none()
+                {
+                    passed_through.push(command);
+                }
+            }
+            let hooked = manager.dispatch_user_bash("make", true, &cwd).await;
+            (passed_through, hooked)
+        }
+    });
+
+    assert_eq!(passed_through, ["observe", "ops", "local"]);
+    let hooked = hooked.expect("a result answer replaces the run");
+    assert_eq!(hooked.output, format!("{}|true|make", cwd.display()));
+    assert_eq!(hooked.exit_code, 3);
+    assert!(hooked.truncated); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    assert!(!hooked.cancelled); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+}
+
 fn assert_signal_probe(response: &Value) {
     assert_eq!(
         response.get("hasSignal").and_then(Value::as_bool),

@@ -4795,6 +4795,48 @@ impl ExtensionManager {
         self.dispatch_event_value(event, data, timeout_ms).await
     }
 
+    /// Dispatch `user_bash` for a `!command` the user typed. A hook that ran
+    /// the command itself answers `{ result: BashResult }`, which replaces the
+    /// shell run; any other answer lets the command run.
+    pub async fn dispatch_user_bash(
+        &self,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &Path,
+    ) -> Option<crate::tools::BashRunResult> {
+        let response = match self
+            .dispatch_event_with_response(
+                ExtensionEventName::UserBash,
+                Some(json!({
+                    "command": command,
+                    "excludeFromContext": exclude_from_context,
+                    "cwd": cwd.display().to_string(),
+                })),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await
+        {
+            Ok(response) => response?,
+            Err(err) => {
+                tracing::warn!(
+                    event = "ext.user_bash.failed",
+                    error = %err,
+                    "Failed to dispatch user_bash"
+                );
+                return None;
+            }
+        };
+        if response.get("operations").is_some() {
+            // pi-mono's `{ operations }` (run through the extension's own
+            // exec) cannot cross the bridge: its members are functions.
+            tracing::warn!(
+                event = "ext.user_bash.operations_unsupported",
+                "A user_bash hook returned shell operations; running the command locally"
+            );
+        }
+        user_bash_result(response.get("result")?)
+    }
+
     pub async fn discover_resources(&self, cwd: &Path, reason: &str) -> ExtensionResourcePaths {
         let payload = json!({
             "cwd": cwd.display().to_string(),
@@ -5227,4 +5269,60 @@ impl ExtensionManager {
     pub fn has_any_event_hooks(&self) -> bool {
         self.read_snapshot().has_any_hooks
     }
+}
+
+/// A `user_bash` hook's `result` (OMP's `BashResult`, camelCase or
+/// snake_case keys).
+fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
+    let obj = result.as_object()?;
+
+    let output = obj
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let exit_code = obj
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .or_else(|| obj.get("exit_code").and_then(Value::as_i64))
+        .unwrap_or(0);
+    let cancelled = obj
+        .get("cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let truncated = obj
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let full_output_path = obj
+        .get("fullOutputPath")
+        .or_else(|| obj.get("full_output_path"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let cancellation = obj.get("cancellation").and_then(Value::as_object);
+    let cancellation_reason = cancellation
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .and_then(|reason| match reason {
+            "timeout" => Some(crate::tools::BashCancellationReason::Timeout),
+            "ambient_cancellation" => {
+                Some(crate::tools::BashCancellationReason::AmbientCancellation)
+            }
+            _ => None,
+        });
+    let timeout_ms = cancellation
+        .and_then(|details| details.get("timeoutMs"))
+        .or_else(|| obj.get("timeoutMs"))
+        .and_then(Value::as_u64);
+
+    Some(crate::tools::BashRunResult {
+        output,
+        exit_code: i32::try_from(exit_code).unwrap_or(0),
+        cancelled,
+        cancellation_reason,
+        timeout_ms,
+        truncated,
+        full_output_path,
+        truncation: None,
+    })
 }

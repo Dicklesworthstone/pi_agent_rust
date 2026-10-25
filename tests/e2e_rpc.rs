@@ -4120,6 +4120,60 @@ fn rpc_new_session_can_be_cancelled_by_extension() {
     });
 }
 
+const USER_BASH_RESULT_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("user_bash", (event) => ({
+        result: { output: `hooked:${event.command}`, exitCode: 7 },
+    }));
+}
+"#;
+
+/// The RPC `bash` command consults `user_bash` as OMP's bash runner does; it
+/// used to run the shell directly, so a hook that runs commands elsewhere (a
+/// remote host, a sandbox) never saw them.
+#[test]
+fn rpc_bash_takes_a_user_bash_hook_result() {
+    let harness = TestHarness::new("rpc_bash_takes_a_user_bash_hook_result");
+    let cassette_dir = cassette_root();
+    let marker = harness.temp_path("shell-ran.txt");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, _manager) = build_agent_session_with_js_extension(
+            Session::in_memory(),
+            &cassette_dir,
+            &harness,
+            USER_BASH_RESULT_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+
+        let command = format!(
+            "touch {}",
+            shell_single_quote(&marker.display().to_string())
+        );
+        let bash = json!({ "id": "1", "type": "bash", "command": command }).to_string();
+        let resp = send_recv(&in_tx, &out_rx, &bash, "bash(hooked)").await;
+        assert_ok(&resp, "bash");
+        assert_eq!(resp["data"]["output"], format!("hooked:{command}"));
+        assert_eq!(resp["data"]["exitCode"], 7);
+        assert!(!marker.exists(), "the hook's result replaces the shell run"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    });
+}
+
 #[test]
 fn rpc_switch_session_can_be_cancelled_by_extension() {
     let harness = TestHarness::new("rpc_switch_session_can_be_cancelled_by_extension");

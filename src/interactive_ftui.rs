@@ -9333,12 +9333,14 @@ impl BashUiShell {
 /// Run a `!command` for the driver loop: tool-status blips around the shared
 /// bash runner, result rendered via the session display formatter. Returns
 /// the display text on success so the caller can submit it as a turn
-/// (`!` context-inclusion); `!!` gets the exclusion note appended.
+/// (`!` context-inclusion); `!!` gets the exclusion note appended. A
+/// `user_bash` hook that runs the command itself supplies the result.
 async fn run_bash_ui_command(
     cwd: &std::path::Path,
     shell: &BashUiShell,
     command: &str,
     exclude: bool,
+    extensions: Option<&crate::extensions::ExtensionManager>,
     agent_tx: &Sender<PiMsg>,
 ) -> Option<String> {
     // Bracket the run with AgentStart/AgentDone (submit_bash_command
@@ -9350,15 +9352,24 @@ async fn run_bash_ui_command(
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
     });
-    let result = crate::tools::run_bash_command(
-        cwd,
-        shell.path.as_deref(),
-        shell.command_prefix.as_deref(),
-        command,
-        None,
-        None,
-    )
-    .await;
+    let hooked = match extensions {
+        Some(manager) => manager.dispatch_user_bash(command, exclude, cwd).await,
+        None => None,
+    };
+    let result = match hooked {
+        Some(result) => Ok(result),
+        None => {
+            crate::tools::run_bash_command(
+                cwd,
+                shell.path.as_deref(),
+                shell.command_prefix.as_deref(),
+                command,
+                None,
+                None,
+            )
+            .await
+        }
+    };
     let output = match result {
         Ok(result) => {
             let display = crate::session::bash_execution_to_text(
@@ -9923,11 +9934,13 @@ pub fn run(
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // `!` semantics: the output becomes the next
                             // turn's user content (submit_content parity).
+                            let extensions = handle.extension_manager().cloned();
                             if let Some(output) = run_bash_ui_command(
                                 &bash_cwd,
                                 &bash_shell,
                                 &command,
                                 exclude,
+                                extensions.as_ref(),
                                 &agent_tx,
                             )
                             .await
@@ -10821,6 +10834,7 @@ mod tests {
                 &BashUiShell::default(),
                 "cat probe.txt && printf shell-completed > shell-result.txt",
                 true,
+                None,
                 &agent_tx,
             )
             .await
@@ -15765,6 +15779,7 @@ mod tests {
             &shell,
             "echo \"value=$PI_GH182\"",
             false,
+            None,
             &agent_tx,
         ));
         let output = output.expect("command ran");
@@ -15782,6 +15797,7 @@ mod tests {
             &missing,
             "true",
             false,
+            None,
             &agent_tx,
         ));
         assert!(output.is_none());

@@ -1127,63 +1127,6 @@ fn plan_session_thinking_sync(
     }
 }
 
-fn parse_user_bash_event_result(value: &Value) -> Option<crate::tools::BashRunResult> {
-    let result = value
-        .as_object()
-        .map_or(value, |obj| obj.get("result").unwrap_or(value));
-    let obj = result.as_object()?;
-
-    let output = obj
-        .get("output")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let exit_code = obj
-        .get("exitCode")
-        .and_then(Value::as_i64)
-        .or_else(|| obj.get("exit_code").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let cancelled = obj
-        .get("cancelled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let truncated = obj
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let full_output_path = obj
-        .get("fullOutputPath")
-        .or_else(|| obj.get("full_output_path"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let cancellation = obj.get("cancellation").and_then(Value::as_object);
-    let cancellation_reason = cancellation
-        .and_then(|details| details.get("reason"))
-        .and_then(Value::as_str)
-        .and_then(|reason| match reason {
-            "timeout" => Some(crate::tools::BashCancellationReason::Timeout),
-            "ambient_cancellation" => {
-                Some(crate::tools::BashCancellationReason::AmbientCancellation)
-            }
-            _ => None,
-        });
-    let timeout_ms = cancellation
-        .and_then(|details| details.get("timeoutMs"))
-        .or_else(|| obj.get("timeoutMs"))
-        .and_then(Value::as_u64);
-
-    Some(crate::tools::BashRunResult {
-        output,
-        exit_code: i32::try_from(exit_code).unwrap_or(0),
-        cancelled,
-        cancellation_reason,
-        timeout_ms,
-        truncated,
-        full_output_path,
-        truncation: None,
-    })
-}
-
 pub fn resolve_scoped_model_entries(
     patterns: &[String],
     available_models: &[ModelEntry],
@@ -1883,7 +1826,6 @@ impl PiApp {
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let cwd = self.cwd.clone();
-        let cwd_display = cwd.display().to_string();
         let shell_path = self.config.shell_path.clone();
         let command_prefix = self.config.shell_command_prefix.clone();
         let extensions = self.extensions.clone();
@@ -1891,24 +1833,14 @@ impl PiApp {
         let completion_runtime_handle = runtime_handle.clone();
 
         runtime_handle.spawn_with_cx(move |_command_cx| async move {
-            let mut override_result = None;
-            if let Some(manager) = extensions {
-                let response = manager
-                    .dispatch_event_with_response(
-                        ExtensionEventName::UserBash,
-                        Some(json!({
-                            "command": command.clone(),
-                            "excludeFromContext": exclude_from_context,
-                            "cwd": cwd_display,
-                        })),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(None);
-                if let Some(value) = response {
-                    override_result = parse_user_bash_event_result(&value);
+            let override_result = match extensions {
+                Some(manager) => {
+                    manager
+                        .dispatch_user_bash(&command, exclude_from_context, &cwd)
+                        .await
                 }
-            }
+                None => None,
+            };
 
             let result = match override_result {
                 Some(result) => Ok(result),

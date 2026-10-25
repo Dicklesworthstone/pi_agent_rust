@@ -497,7 +497,7 @@
 
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
-| `user_bash` | Y | Y | User shell with ! prefix; dispatched from interactive/commands.rs |
+| `user_bash` | Y | Y | User shell with ! prefix and RPC `bash`; `ExtensionManager::dispatch_user_bash` (both interactive stacks, rpc.rs). `{ result }` only; pi-mono's `{ operations }` is not supported |
 | `input` | Y | Y | User input (can transform); dispatched from agent.rs |
 
 ---
