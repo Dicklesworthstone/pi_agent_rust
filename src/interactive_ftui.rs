@@ -21,9 +21,9 @@
 //!   catalog via `KeyBinding::from_ftui_key`, inline ask cards, a modal
 //!   picker overlay (`/theme`), the slash-command completion popup above the
 //!   editor (issue #208; shares [`crate::autocomplete`] with the charmed
-//!   stack), and input routing for `/model`, `/help`, and
-//!   display-only `!`/`!!` bash. All agent/tool-originated text passes
-//!   through `ftui::render::sanitize` before it can reach a frame.
+//!   stack), and input routing for `/model`, `/help`, and `!`/`!!` bash.
+//!   All agent/tool-originated text passes through `ftui::render::sanitize`
+//!   before it can reach a frame.
 //! - [`run`]: the `pi --ftui` launch path — a driver thread owns an
 //!   asupersync runtime plus an SDK session; prompts become real agent turns
 //!   ([`agent_event_to_pi_msgs`] pins the translation), asks pair through
@@ -1416,7 +1416,8 @@ impl PickerOverlay {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerKind {
-    /// Built-in theme picker (`/theme`): applies the palette UI-side.
+    /// Theme picker (`/theme`): applies the palette UI-side, and the driver
+    /// saves the choice.
     Theme,
     /// Driver-backed preferences, followed by one setting's validated values.
     Settings,
@@ -1546,6 +1547,9 @@ pub enum UiCommand {
     Settings,
     /// Save one preference, then apply it to the existing live session.
     SetSetting { key: SettingsKey, value: String },
+    /// Save the theme `/theme` just applied (a name or theme spec) as the
+    /// `theme` setting.
+    SaveTheme { spec: String },
     /// Run a shell command and record it in the session, starting no turn.
     /// `!cmd` (exclude=false) output reaches the model with the next prompt;
     /// `!!cmd` (exclude=true) output is kept but never sent.
@@ -4203,10 +4207,16 @@ impl PiFtuiModel {
         if canon == "/theme" {
             self.picker = Some(PickerOverlay::new(
                 "Theme (Enter to apply, Esc to close)",
-                vec![String::from("dark"), String::from("light")],
+                self.theme_names(),
                 Vec::new(),
                 PickerKind::Theme,
             ));
+            return true;
+        }
+        if let Some(spec) = strip_command(clean, "/theme") {
+            // `/theme <name>` (classic parity) used to fall through to
+            // "not implemented".
+            self.choose_theme(spec.trim());
             return true;
         }
         if canon == "/resume" || canon == "/r" {
@@ -4250,7 +4260,7 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /compact [focus], /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking or /effort [level], /fast [on|off|status], /skillful [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
+                     /thinking or /effort [level], /fast [on|off|status], /skillful [on|off|status], /branch (or Esc Esc), /theme [name], /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
@@ -4688,19 +4698,7 @@ impl PiFtuiModel {
                     value: choice.to_string(),
                 });
             }
-            PickerKind::Theme => {
-                let theme = if choice == "light" {
-                    crate::theme::Theme::light()
-                } else {
-                    crate::theme::Theme::dark()
-                };
-                self.palette = FtuiPalette::from_theme(&theme);
-                // Role styling is palette-derived: drop every cached block
-                // so the whole transcript re-renders under the new theme.
-                self.render_cache.borrow_mut().clear();
-                self.push_entry(EntryRole::System, format!("theme set to {choice}"));
-                self.scroll_from_tail = 0;
-            }
+            PickerKind::Theme => self.choose_theme(choice),
             PickerKind::Model => {
                 if let Some((provider, model)) = choice.split_once('/') {
                     self.push_entry(
@@ -4764,6 +4762,71 @@ impl PiFtuiModel {
         self.settings_pending = true;
         self.begin_busy("loading settings ...");
         self.send_settings_command(UiCommand::Settings);
+    }
+
+    /// Every theme `/theme` offers: the built-ins, then the user and project
+    /// themes found on disk, by the names `Theme::resolve_spec` loads (as the
+    /// classic picker lists them).
+    fn theme_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = ["dark", "light", "solarized"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for path in crate::theme::Theme::discover_themes(&self.file_ref_cwd) {
+            if let Ok(theme) = crate::theme::Theme::load(&path)
+                && !names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&theme.name))
+            {
+                names.push(theme.name);
+            }
+        }
+        names
+    }
+
+    /// The theme an extension asks for by name, if `/theme` offers it.
+    fn listed_theme(&self, name: &str) -> Option<crate::theme::Theme> {
+        if !self
+            .theme_names()
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name))
+        {
+            return None;
+        }
+        crate::theme::Theme::resolve_spec(name, &self.file_ref_cwd).ok()
+    }
+
+    /// Switch the palette to the theme `spec` names (a built-in, a discovered
+    /// theme, `auto`, or a theme file).
+    fn apply_theme(&mut self, spec: &str) -> crate::error::Result<()> {
+        let theme = crate::theme::Theme::resolve_spec(spec, &self.file_ref_cwd)?;
+        self.palette = FtuiPalette::from_theme(&theme);
+        // Role styling is palette-derived: drop every cached block so the
+        // whole transcript re-renders under the new theme.
+        self.render_cache.borrow_mut().clear();
+        self.push_entry(EntryRole::System, format!("theme set to {spec}"));
+        self.scroll_from_tail = 0;
+        Ok(())
+    }
+
+    /// `/theme` (picker or `/theme <name>`): apply the theme, then have the
+    /// driver save it as the `theme` setting so the next launch starts with
+    /// it, as the classic stack and OMP's settings do. It used to be lost on
+    /// exit.
+    fn choose_theme(&mut self, spec: &str) {
+        match self.apply_theme(spec) {
+            Ok(()) => {
+                if let Some(tx) = &self.submit_tx {
+                    let _ = tx.send(UiCommand::SaveTheme {
+                        spec: spec.to_string(),
+                    });
+                }
+            }
+            Err(err) => self.push_entry(
+                EntryRole::Error,
+                format!("Theme {spec} could not be loaded: {err}"),
+            ),
+        }
     }
 
     fn send_settings_command(&mut self, command: UiCommand) {
@@ -4979,11 +5042,9 @@ impl PiFtuiModel {
     /// user typed instead of the value it asked for. That is worse than the
     /// printed fallback the effects got, which is why it is handled here.
     ///
-    /// The theme answers describe what THIS stack supports, which is `dark`
-    /// and `light` — the two its `/theme` picker offers. The classic stack
-    /// additionally scans resource-provided themes. Reporting two is the
-    /// truthful answer for this stack rather than a degraded one; the
-    /// divergence is in theme support, not in the query.
+    /// The theme answers list what the `/theme` picker offers: the built-ins
+    /// plus the user and project themes. `setTheme` applies a theme for this
+    /// session only and does not save it, as in OMP.
     fn answer_extension_ui_query(&mut self, request: &ExtensionUiRequest) -> bool {
         let answer = |value: serde_json::Value| ExtensionUiResponse {
             id: request.id.clone(),
@@ -5006,7 +5067,8 @@ impl PiFtuiModel {
                 true
             }
             "getAllThemes" | "get_all_themes" => {
-                let themes = ["dark", "light"]
+                let themes = self
+                    .theme_names()
                     .into_iter()
                     .map(
                         |name| serde_json::json!({ "name": name, "path": serde_json::Value::Null }),
@@ -5016,20 +5078,15 @@ impl PiFtuiModel {
                 true
             }
             "getTheme" | "get_theme" => {
-                let value = match requested_name().as_str() {
-                    "dark" => serde_json::to_value(crate::theme::Theme::dark()).ok(),
-                    "light" => serde_json::to_value(crate::theme::Theme::light()).ok(),
-                    _ => None,
-                };
+                let value = self
+                    .listed_theme(&requested_name())
+                    .and_then(|theme| serde_json::to_value(theme).ok());
                 self.send_ext_reply(answer(value.unwrap_or(serde_json::Value::Null)));
                 true
             }
             "setTheme" | "set_theme" => {
                 let name = requested_name();
-                let applied = matches!(name.as_str(), "dark" | "light");
-                if applied {
-                    self.apply_picker_choice(PickerKind::Theme, &name);
-                }
+                let applied = self.listed_theme(&name).is_some() && self.apply_theme(&name).is_ok();
                 self.send_ext_reply(answer(serde_json::Value::Bool(applied)));
                 true
             }
@@ -9957,6 +10014,20 @@ pub fn run(
                                 };
                             let _ = agent_tx.send(PiMsg::Settings { snapshot, changed });
                         }
+                        Ok(UiCommand::SaveTheme { spec }) => {
+                            match settings_controller.save_theme(&spec) {
+                                Ok(()) => {
+                                    if let Some(source) = &mut resource_source {
+                                        source.config = settings_controller.config().clone();
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = agent_tx.send(PiMsg::AgentError(format!(
+                                        "Theme {spec} applies to this session, but could not be saved: {err}",
+                                    )));
+                                }
+                            }
+                        }
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // OMP's bash runner records the run and starts no
                             // turn: `!` output reaches the model with the next
@@ -14193,10 +14264,19 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["name"].as_str().map(str::to_string))
             .collect();
-        assert_eq!(names, vec!["dark".to_string(), "light".to_string()]);
+        // User themes on this machine may follow the built-ins.
+        assert!(
+            names.starts_with(&["dark", "light", "solarized"].map(String::from)),
+            "{names:?}"
+        );
 
         let (one, _, _) = ask_ui_query("getTheme", serde_json::json!({"name": "light"}));
         assert!(one.is_some_and(|value| !value.is_null()), "light resolves");
+        let (solarized, _, _) = ask_ui_query("getTheme", serde_json::json!({"name": "solarized"}));
+        assert!(
+            solarized.is_some_and(|value| !value.is_null()),
+            "solarized resolves"
+        );
 
         let (missing, _, _) = ask_ui_query("getTheme", serde_json::json!({"name": "nope"}));
         assert_eq!(
@@ -17401,6 +17481,85 @@ mod tests {
         sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
         assert!(sim.model().picker.is_none());
         assert_eq!(sim.model().palette.accent, accent_before);
+    }
+
+    /// `/theme` offered only dark and light, `/theme <name>` fell through to
+    /// "not implemented", and a choice was lost on exit. The picker now also
+    /// lists solarized and the user/project themes, and every theme applied
+    /// from `/theme` is sent to the driver to save.
+    #[test]
+    fn theme_command_offers_every_theme_and_saves_the_choice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes = dir.path().join(".pi").join("themes");
+        std::fs::create_dir_all(&themes).expect("themes dir");
+        let mut ocean = crate::theme::Theme::light();
+        ocean.name = String::from("ocean");
+        std::fs::write(
+            themes.join("ocean.json"),
+            serde_json::to_string(&ocean).expect("theme JSON"),
+        )
+        .expect("write theme");
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.file_ref_cwd = dir.path().to_path_buf();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        type_str(&mut sim, "/theme");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let items = sim.model().picker.as_ref().expect("picker").items.clone();
+        assert!(
+            items.starts_with(&["dark", "light", "solarized"].map(String::from)),
+            "{items:?}"
+        );
+        assert!(items.contains(&String::from("ocean")), "{items:?}");
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "closing the picker saves nothing"
+        );
+
+        let dark_accent = sim.model().palette.accent;
+        type_str(&mut sim, "/theme Solarized");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_ne!(sim.model().palette.accent, dark_accent, "solarized applied");
+        assert_eq!(
+            submit_rx.try_recv().expect("saved"),
+            UiCommand::SaveTheme {
+                spec: String::from("Solarized"),
+            }
+        );
+
+        type_str(&mut sim, "/theme ocean");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("saved"),
+            UiCommand::SaveTheme {
+                spec: String::from("ocean"),
+            }
+        );
+
+        let accent = sim.model().palette.accent;
+        type_str(&mut sim, "/theme nope");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            sim.model().palette.accent,
+            accent,
+            "an unknown theme changes nothing"
+        );
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "an unknown theme is not saved"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|entry| entry.role == EntryRole::Error
+                    && entry.text.contains("Theme nope could not be loaded")),
+            "the failure is reported"
+        );
     }
 
     #[test]

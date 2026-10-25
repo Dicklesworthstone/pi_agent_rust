@@ -373,6 +373,14 @@ impl SettingsController {
         Ok(self.snapshot(handle))
     }
 
+    /// Save a `/theme` choice (a name or theme spec the UI already applied)
+    /// as the `theme` setting, so the next launch starts with it.
+    pub(super) fn save_theme(&mut self, spec: &str) -> Result<()> {
+        Config::patch_settings_to_path(&self.path, serde_json::json!({ "theme": spec }))?;
+        self.config.theme = Some(spec.to_string());
+        Ok(())
+    }
+
     pub(super) const fn config(&self) -> &Config {
         &self.config
     }
@@ -721,5 +729,22 @@ mod tests {
         assert_eq!(loaded.double_escape_action.as_deref(), Some("fork"));
         assert_eq!(loaded.autocomplete_max_visible, Some(15));
         assert!(!temp.path().join(".pi/settings.json").exists());
+    }
+
+    #[test]
+    fn a_saved_theme_is_the_next_launch_theme_and_keeps_other_settings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, r#"{"hideThinkingBlock": true}"#).expect("seed settings");
+        let handle = handle();
+        let mut settings = SettingsController::new(Config::default(), path.clone(), &handle);
+
+        settings.save_theme("solarized").expect("save theme");
+
+        let loaded: Config =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("saved")).expect("JSON");
+        assert_eq!(loaded.theme.as_deref(), Some("solarized"));
+        assert_eq!(loaded.hide_thinking_block, Some(true));
+        assert_eq!(settings.config().theme.as_deref(), Some("solarized"));
     }
 }
