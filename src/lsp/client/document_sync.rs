@@ -557,15 +557,26 @@ impl LspClient {
             let mut prepared = None;
             loop {
                 budget.remaining()?;
-                // Refuse observed deletion, replacement, eviction or links.
+                // A document deleted, replaced, or turned into a link since it
+                // was opened is never read again. Nothing retires it before
+                // the idle sweep, so refusing would fail every later rename;
+                // close it and the server falls back to the disk.
                 // Canonicalization is rechecked during synchronization; this
                 // does not provide an OS sandbox against racing path swaps.
-                let metadata = std::fs::symlink_metadata(&path)?;
-                if !metadata.is_file()
-                    || metadata.file_type().is_symlink()
-                    || try_path_to_uri(&path.canonicalize()?)? != uri
-                {
-                    return Err(refactor_sync_conflict());
+                let current = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                        path.canonicalize()
+                            .ok()
+                            .and_then(|canonical| try_path_to_uri(&canonical).ok())
+                    }
+                    Ok(_) => None,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(err) => return Err(err.into()),
+                };
+                if current.as_deref() != Some(uri.as_str()) {
+                    self.close_document(&mut Self::lock(&self.open_docs), &uri)?;
+                    retained.remove(&uri);
+                    break;
                 }
                 match self.try_ensure_synced(
                     &path,

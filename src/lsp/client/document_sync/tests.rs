@@ -333,6 +333,48 @@ while True:
     }
 
     #[test]
+    fn workspace_refresh_closes_retained_documents_that_were_deleted_or_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(temp.path(), json!({"textDocumentSync":2}), &rt);
+        let deleted = source(temp.path(), "gone\n");
+        let replaced = temp.path().join("replaced.rs");
+        std::fs::write(&replaced, "before\n").unwrap();
+        let replaced = replaced.canonicalize().unwrap();
+        let kept = temp.path().join("kept.rs");
+        std::fs::write(&kept, "before\n").unwrap();
+        let kept = kept.canonicalize().unwrap();
+        let deleted_uri = client.ensure_synced(&deleted, "plaintext").unwrap();
+        let replaced_uri = client.ensure_synced(&replaced, "rust").unwrap();
+        let kept_uri = client.ensure_synced(&kept, "rust").unwrap();
+        // `rm source.txt` and a directory where a file was, as a `git mv`
+        // of a parent can leave; the agent keeps working on kept.rs.
+        std::fs::remove_file(&deleted).unwrap();
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::create_dir(&replaced).unwrap();
+        std::fs::write(&kept, "after\n").unwrap();
+        rt.block_on(client.ensure_open_documents_synced(Duration::from_secs(5)))
+            .unwrap();
+        let messages = frames(&client, &rt);
+        let uris = |method: &str| -> Vec<Value> {
+            messages
+                .iter()
+                .filter(|message| message["method"] == method)
+                .map(|message| message["params"]["textDocument"]["uri"].clone())
+                .collect()
+        };
+        assert_eq!(
+            uris("textDocument/didClose"),
+            [json!(replaced_uri), json!(deleted_uri)]
+        );
+        assert_eq!(uris("textDocument/didChange"), [json!(kept_uri)]);
+        // The next refactor starts from the surviving document alone.
+        rt.block_on(client.ensure_open_documents_synced(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(frames(&client, &rt).len(), messages.len());
+    }
+
+    #[test]
     fn waiting_workspace_refresh_rejects_cancellation_timeout_and_changed_membership() {
         for mode in [
             "timeout",
