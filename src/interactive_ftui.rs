@@ -1414,6 +1414,28 @@ impl PickerOverlay {
     }
 }
 
+/// The widget key the JS bridge streams `ctx.ui.custom` frames under.
+const EXT_CUSTOM_OVERLAY_KEY: &str = "__pi_custom_overlay";
+/// Keys held for a component that has not polled yet (the classic bound).
+const EXT_CUSTOM_MAX_KEYS: usize = 256;
+
+/// A `ctx.ui.custom` component an extension is showing. The JS bridge sends
+/// each rendered frame as `setWidget` under [`EXT_CUSTOM_OVERLAY_KEY`] and
+/// polls `custom` every 16 ms for the next key, as the classic stack's
+/// overlay serves them.
+#[derive(Debug, Default)]
+struct ExtCustomOverlay {
+    title: Option<String>,
+    source: Option<String>,
+    /// The latest frame, sanitized.
+    lines: Vec<String>,
+    /// Keys typed since the last poll, as terminal input bytes.
+    keys: std::collections::VecDeque<String>,
+    /// Ctrl+C closed it. The next poll tells the component, and frames that
+    /// arrive before then do not reopen it.
+    closed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerKind {
     /// Theme picker (`/theme`): applies the palette UI-side, and the driver
@@ -1895,6 +1917,8 @@ pub struct PiFtuiModel {
     /// `ui.setWorkingMessage(text)` (the bridge's `working` status key): shown
     /// in place of the activity while a turn runs, as OMP's loader message.
     ext_working: Option<String>,
+    /// The open `ctx.ui.custom` component, if any.
+    ext_custom: Option<ExtCustomOverlay>,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
     /// Extension UI prompt currently collecting a reply (bd-1eoh4); extras
@@ -2264,6 +2288,7 @@ impl PiFtuiModel {
             keybindings: KeyBindings::default(),
             ext_status: std::collections::BTreeMap::new(),
             ext_working: None,
+            ext_custom: None,
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
@@ -3270,6 +3295,13 @@ impl PiFtuiModel {
                 }
             }
             PiMsg::ExtensionUiRequest(request) => {
+                // `ctx.ui.custom` polls are answered at once. As ordinary
+                // requests they each became a prompt card, and the component
+                // never got a key.
+                if request.method == "custom" {
+                    self.answer_custom_poll(&request);
+                    return Cmd::none();
+                }
                 if !request.expects_response() {
                     // Effects this stack can carry out are applied; the rest
                     // still fall through to a transcript line, which is the
@@ -5040,10 +5072,146 @@ impl PiFtuiModel {
                 }
                 true
             }
-            // `setWidget` has no surface on this stack yet, and anything else
-            // is unknown; both keep the printed fallback.
+            "setWidget" | "set_widget"
+                if text_field(&["widgetKey", "widget_key"]).as_deref()
+                    == Some(EXT_CUSTOM_OVERLAY_KEY) =>
+            {
+                self.apply_custom_frame(request);
+                true
+            }
+            // Other widgets have no surface on this stack yet, and anything
+            // else is unknown; both keep the printed fallback.
             _ => false,
         }
+    }
+
+    /// Whether a custom component owns the body and the keyboard. A picker
+    /// or prompt card opened over it takes both until it closes.
+    fn custom_overlay_open(&self) -> bool {
+        self.ext_custom
+            .as_ref()
+            .is_some_and(|overlay| !overlay.closed)
+            && self.picker.is_none()
+            && self.active_ask.is_none()
+            && self.active_ext.is_none()
+    }
+
+    /// A frame of the custom component, or the bridge's clear when it ends.
+    fn apply_custom_frame(&mut self, request: &ExtensionUiRequest) {
+        let payload = &request.payload;
+        if payload
+            .get("clear")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.ext_custom = None;
+            return;
+        }
+        let overlay = self
+            .ext_custom
+            .get_or_insert_with(ExtCustomOverlay::default);
+        if overlay.closed {
+            return;
+        }
+        if let Some(title) = payload.get("title").and_then(serde_json::Value::as_str) {
+            overlay.title = Some(sanitize(title).into_owned());
+        }
+        if request.extension_id.is_some() {
+            overlay.source.clone_from(&request.extension_id);
+        }
+        overlay.lines = payload
+            .get("lines")
+            .or_else(|| payload.get("widgetLines"))
+            .and_then(serde_json::Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|line| sanitize(line).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    /// Answer a `custom` poll with the width to render at and the next typed
+    /// key, plus `closed` once the component should stop (after Ctrl+C, or
+    /// for the bridge's own `close`).
+    fn answer_custom_poll(&mut self, request: &ExtensionUiRequest) {
+        let payload = &request.payload;
+        let mode = payload
+            .get("mode")
+            .or_else(|| payload.get("phase"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("poll");
+        let closing = mode.eq_ignore_ascii_case("close")
+            || payload
+                .get("close")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        let available = usize::from(self.term.0).saturating_sub(4).max(20);
+        let width = payload
+            .get("width")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|width| usize::try_from(width).ok())
+            .map_or(available, |width| width.clamp(20, available));
+        let mut reply = serde_json::Map::new();
+        reply.insert(String::from("width"), serde_json::Value::from(width));
+        // Only a frame opens the overlay. `custom` called without a component
+        // polls once and never sends one, and must not leave a blank overlay.
+        if closing
+            || self
+                .ext_custom
+                .as_ref()
+                .is_some_and(|overlay| overlay.closed)
+        {
+            self.ext_custom = None;
+            reply.insert(String::from("closed"), serde_json::Value::Bool(true));
+        } else if let Some(key) = self
+            .ext_custom
+            .as_mut()
+            .and_then(|overlay| overlay.keys.pop_front())
+        {
+            reply.insert(String::from("key"), serde_json::Value::String(key));
+        }
+        self.send_ext_reply(ExtensionUiResponse {
+            id: request.id.clone(),
+            value: Some(serde_json::Value::Object(reply)),
+            cancelled: false,
+        });
+    }
+
+    /// The custom component's latest frame under a title row, showing its
+    /// newest rows when it is taller than the body (as the classic overlay).
+    fn custom_overlay_text<'a>(&self, overlay: &'a ExtCustomOverlay, rows: u16) -> Text<'a> {
+        let muted = ftui::Style::new().dim().fg(self.palette.muted);
+        let mut lines = vec![ftui::text::Line::from_spans([
+            ftui::text::Span::styled(
+                overlay.title.as_deref().unwrap_or("Extension"),
+                ftui::Style::new().bold().fg(self.palette.accent),
+            ),
+            ftui::text::Span::styled(
+                format!(
+                    " · {} · keys go to the extension, ctrl+c closes",
+                    overlay.source.as_deref().unwrap_or("extension")
+                ),
+                muted,
+            ),
+        ])];
+        if overlay.lines.is_empty() {
+            lines.push(ftui::text::Line::styled(
+                "  waiting for the extension's first frame ...",
+                muted,
+            ));
+        }
+        let room = usize::from(rows).saturating_sub(1);
+        lines.extend(
+            overlay
+                .lines
+                .iter()
+                .skip(overlay.lines.len().saturating_sub(room))
+                .map(|line| ftui::text::Line::styled(line.as_str(), ftui::Style::new())),
+        );
+        Text::from_lines(lines)
     }
 
     /// Answer an extension UI request that asks for data, reporting whether it
@@ -5180,6 +5348,22 @@ impl PiFtuiModel {
                 // (Esc interrupts a running turn.)
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
+                // An open custom component owns the keyboard, as on the
+                // classic stack. Ctrl+C closes it, also for components that
+                // have no quit key.
+                if self.custom_overlay_open()
+                    && let Some(overlay) = &mut self.ext_custom
+                {
+                    if ctrl_c {
+                        overlay.closed = true;
+                    } else if let Some(encoded) = encode_custom_ui_key(key) {
+                        if overlay.keys.len() >= EXT_CUSTOM_MAX_KEYS {
+                            overlay.keys.pop_front();
+                        }
+                        overlay.keys.push_back(encoded);
+                    }
+                    return Cmd::none();
+                }
                 let double_tap = self
                     .last_ctrl_c
                     .is_some_and(|at| at.elapsed() < CTRL_C_EXIT_WINDOW);
@@ -6198,27 +6382,41 @@ impl PiFtuiModel {
             return;
         }
 
-        // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
-        // sticks to the bottom; scrolling up pins an offset measured from the
-        // tail so streaming appends don't yank the view.
-        let body_text = self.conversation_text(regions.body.width);
-        let total_lines = body_text.lines().len();
-        let visible = usize::from(regions.body.height).max(1);
-        // Record the authoritative total for update()'s scroll clamping
-        // (issue #206); see `rendered_total_lines`.
-        self.rendered_total_lines.set(total_lines);
-        let from_tail = self
-            .scroll_from_tail
-            .min(total_lines.saturating_sub(visible));
-        let offset = total_lines.saturating_sub(visible + from_tail);
-        // Hand the widget just the rows that fit rather than the whole
-        // transcript plus a scroll offset: `Paragraph::scroll` takes a u16,
-        // and past 65535 rows it saturates and draws from the wrong place
-        // instead of the tail — which wrapping (issue #227) makes a long
-        // session reach several times sooner. Slicing also means the widget
-        // measures a screenful instead of the entire history each frame.
-        let window = Text::from_lines(body_text.lines().iter().skip(offset).take(visible).cloned());
-        Paragraph::new(window).render(regions.body, frame);
+        let from_tail = if let Some(overlay) = self
+            .ext_custom
+            .as_ref()
+            .filter(|_| self.custom_overlay_open())
+        {
+            // An open custom component takes the conversation body.
+            Paragraph::new(self.custom_overlay_text(overlay, regions.body.height))
+                .render(regions.body, frame);
+            0
+        } else {
+            // Conversation body with tail-follow scroll. `scroll_from_tail
+            // == 0` sticks to the bottom; scrolling up pins an offset
+            // measured from the tail so streaming appends don't yank the view.
+            let body_text = self.conversation_text(regions.body.width);
+            let total_lines = body_text.lines().len();
+            let visible = usize::from(regions.body.height).max(1);
+            // Record the authoritative total for update()'s scroll clamping
+            // (issue #206); see `rendered_total_lines`.
+            self.rendered_total_lines.set(total_lines);
+            let from_tail = self
+                .scroll_from_tail
+                .min(total_lines.saturating_sub(visible));
+            let offset = total_lines.saturating_sub(visible + from_tail);
+            // Hand the widget just the rows that fit rather than the whole
+            // transcript plus a scroll offset: `Paragraph::scroll` takes a
+            // u16, and past 65535 rows it saturates and draws from the wrong
+            // place instead of the tail — which wrapping (issue #227) makes a
+            // long session reach several times sooner. Slicing also means the
+            // widget measures a screenful instead of the entire history each
+            // frame.
+            let window =
+                Text::from_lines(body_text.lines().iter().skip(offset).take(visible).cloned());
+            Paragraph::new(window).render(regions.body, frame);
+            from_tail
+        };
 
         // Pinned error banner (bd-cv653.9.2): sits between the conversation
         // and the status line until the next sent input dismisses it.
@@ -10773,6 +10971,40 @@ const fn key_event_is_input(key: &ftui::KeyEvent) -> bool {
     !matches!(key.kind, ftui::KeyEventKind::Release)
 }
 
+/// A key as the terminal input bytes a `ctx.ui.custom` component's
+/// `handleInput` reads, encoded as the classic stack's overlay encodes them.
+fn encode_custom_ui_key(key: &ftui::KeyEvent) -> Option<String> {
+    let text = match key.code {
+        KeyCode::Char(ch) if key.modifiers.contains(Modifiers::CTRL) => {
+            let byte = u8::try_from(ch.to_ascii_lowercase()).ok()?;
+            match byte {
+                b'a'..=b'z' => char::from(byte - b'a' + 1).to_string(),
+                b' ' | b'@' => String::from('\u{0}'),
+                _ => return None,
+            }
+        }
+        KeyCode::Char(ch) if key.modifiers.contains(Modifiers::ALT) => format!("\u{1b}{ch}"),
+        KeyCode::Char(ch) => ch.to_string(),
+        KeyCode::Enter => String::from("\r"),
+        KeyCode::Tab => String::from("\t"),
+        KeyCode::BackTab => String::from("\u{1b}[Z"),
+        KeyCode::Escape => String::from("\u{1b}"),
+        KeyCode::Backspace => String::from("\u{7f}"),
+        KeyCode::Up => String::from("\u{1b}[A"),
+        KeyCode::Down => String::from("\u{1b}[B"),
+        KeyCode::Right => String::from("\u{1b}[C"),
+        KeyCode::Left => String::from("\u{1b}[D"),
+        KeyCode::Home => String::from("\u{1b}[H"),
+        KeyCode::End => String::from("\u{1b}[F"),
+        KeyCode::PageUp => String::from("\u{1b}[5~"),
+        KeyCode::PageDown => String::from("\u{1b}[6~"),
+        KeyCode::Delete => String::from("\u{1b}[3~"),
+        KeyCode::Insert => String::from("\u{1b}[2~"),
+        _ => return None,
+    };
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14305,6 +14537,116 @@ mod tests {
             sim.model().active_ext.is_some(),
             sim.model().transcript.len() - before,
         )
+    }
+
+    /// `ctx.ui.custom` components (usage bars, settings panels, the arcade
+    /// games) poll `custom` every 16 ms for keys and stream their frames as
+    /// `setWidget`. On this stack each poll became a prompt card and each
+    /// frame a transcript line, so a component never received a key.
+    #[test]
+    fn custom_components_get_frames_and_keys_and_ctrl_c_closes_them() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+        let poll = |sim: &mut ProgramSimulator<PiFtuiModel>, mode: &str| {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                "poll",
+                "custom",
+                serde_json::json!({"mode": mode, "widgetKey": EXT_CUSTOM_OVERLAY_KEY}),
+            ))));
+            ext_rx
+                .try_recv()
+                .expect("poll answered")
+                .value
+                .expect("poll value")
+        };
+        let frame = |sim: &mut ProgramSimulator<PiFtuiModel>, payload: serde_json::Value| {
+            let mut payload = payload;
+            if let Some(fields) = payload.as_object_mut() {
+                fields.insert(
+                    String::from("widgetKey"),
+                    serde_json::json!(EXT_CUSTOM_OVERLAY_KEY),
+                );
+            }
+            send_ui_effect(sim, "setWidget", payload);
+        };
+
+        sim.inject_event(Event::Resize {
+            width: 64,
+            height: 20,
+        });
+        let first = poll(&mut sim, "poll");
+        assert_eq!(first.get("width"), Some(&serde_json::json!(60)), "{first}");
+        assert!(
+            first.get("key").is_none() && first.get("closed").is_none(),
+            "{first}"
+        );
+        assert!(
+            sim.model().active_ext.is_none(),
+            "a poll is not a prompt card"
+        );
+
+        frame(
+            &mut sim,
+            serde_json::json!({"title": "Tetris", "lines": ["\u{1b}[31mscore 10\u{1b}[0m", "next: L"]}),
+        );
+        assert_eq!(
+            sim.model().transcript.len(),
+            before,
+            "frames are not transcript lines"
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 12), 60, 12);
+        assert!(
+            rendered.contains("Tetris")
+                && rendered.contains("score 10")
+                && rendered.contains("next: L"),
+            "{rendered:?}"
+        );
+
+        // Keys typed while it is open reach the component, in order.
+        sim.inject_event(key(KeyCode::Left, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Char('q'), Modifiers::empty()));
+        assert!(sim.model().input.is_empty(), "keys do not reach the editor");
+        assert_eq!(
+            poll(&mut sim, "poll").get("key"),
+            Some(&serde_json::json!("\u{1b}[D"))
+        );
+        assert_eq!(
+            poll(&mut sim, "poll").get("key"),
+            Some(&serde_json::json!("q"))
+        );
+
+        // Ctrl+C closes it. A frame still in flight does not reopen it, and
+        // the next poll tells the component to stop.
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        frame(&mut sim, serde_json::json!({"lines": ["late frame"]}));
+        let rendered = buffer_text(sim.capture_frame(60, 12), 60, 12);
+        assert!(!rendered.contains("late frame"), "{rendered:?}");
+        assert!(
+            sim.model().error_banner.is_none(),
+            "closing a component is not the first press of an exit"
+        );
+        assert_eq!(
+            poll(&mut sim, "poll").get("closed"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        frame(&mut sim, serde_json::json!({"clear": true, "lines": []}));
+        assert!(sim.model().ext_custom.is_none());
+
+        // A poll alone opens nothing (`custom` without a component), and the
+        // bridge's own close (the component called done) ends it.
+        poll(&mut sim, "poll");
+        assert!(sim.model().ext_custom.is_none());
+        frame(&mut sim, serde_json::json!({"lines": ["again"]}));
+        assert!(sim.model().ext_custom.is_some());
+        assert_eq!(
+            poll(&mut sim, "close").get("closed"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(sim.model().ext_custom.is_none());
     }
 
     #[test]
