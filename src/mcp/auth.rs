@@ -525,20 +525,11 @@ impl AuthBinding {
             .encode(sha2::Sha256::digest(verifier.as_bytes()));
         let state = nonce();
         let mut authorization = checked_url(&metadata.authorization_endpoint)?;
-        if authorization.query_pairs().any(|(name, _)| {
-            matches!(
-                name.as_ref(),
-                "response_type"
-                    | "client_id"
-                    | "redirect_uri"
-                    | "code_challenge"
-                    | "code_challenge_method"
-                    | "state"
-                    | "resource"
-                    | "scope"
-                    | "prompt"
-            )
-        }) {
+        let prompt = authorization_prompt(&configuration, credentials.scope.as_deref());
+        if authorization
+            .query_pairs()
+            .any(|(name, _)| conflicting_authorization_parameter(&name, prompt.is_some()))
+        {
             return Err(error(
                 "METADATA",
                 "authorization endpoint contains conflicting OAuth parameters",
@@ -556,7 +547,7 @@ impl AuthBinding {
         if let Some(scope) = &credentials.scope {
             authorization.query_pairs_mut().append_pair("scope", scope);
         }
-        if let Some(prompt) = authorization_prompt(&configuration, credentials.scope.as_deref()) {
+        if let Some(prompt) = prompt {
             authorization
                 .query_pairs_mut()
                 .append_pair("prompt", prompt);
@@ -1102,6 +1093,23 @@ fn configured_scope(configuration: &McpOAuthConfig, metadata: &Metadata) -> Resu
         .scope
         .as_deref()
         .map_or_else(|| Ok(metadata.scope.clone()), scope_string)
+}
+
+/// Parameters an advertised authorization endpoint may not preset. Its own
+/// `prompt` (`?prompt=select_account`) stands unless Pi sends one.
+fn conflicting_authorization_parameter(name: &str, sends_prompt: bool) -> bool {
+    match name {
+        "response_type"
+        | "client_id"
+        | "redirect_uri"
+        | "code_challenge"
+        | "code_challenge_method"
+        | "state"
+        | "resource"
+        | "scope" => true,
+        "prompt" => sends_prompt,
+        _ => false,
+    }
 }
 
 fn authorization_prompt<'a>(
@@ -1943,6 +1951,26 @@ mod configured_tests {
                 .write_all(request.as_bytes())
                 .expect("browser request");
         })
+    }
+
+    #[test]
+    fn an_endpoint_prompt_conflicts_only_when_pi_sends_one() {
+        for (name, sends_prompt, conflicts) in [
+            ("prompt", false, false),
+            ("prompt", true, true),
+            ("client_id", false, true),
+            ("redirect_uri", false, true),
+            ("state", false, true),
+            ("resource", false, true),
+            ("scope", false, true),
+            ("tenant", true, false),
+        ] {
+            assert_eq!(
+                conflicting_authorization_parameter(name, sends_prompt),
+                conflicts,
+                "{name} (pi sends prompt: {sends_prompt})"
+            );
+        }
     }
 
     #[test]
