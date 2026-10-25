@@ -251,6 +251,33 @@ fn unmatched_inline_backtick_does_not_hide_a_real_call() {
     assert_eq!(calls(&message).len(), 1);
 }
 
+/// A backtick left open on an earlier line, or a fence-length run in the
+/// middle of a sentence, does not quote a later call, even when the call's own
+/// arguments contain the backtick that would have closed the span.
+#[test]
+fn earlier_unmatched_backticks_do_not_quote_a_later_call() {
+    let arguments = json!({"path": "README.md", "content": "Run `cargo build`"});
+    for before in [
+        "I'll note the `--release flag.\n",
+        "Wrap it in ``` fences.\n\n",
+        "A ~~~ divider.\n",
+    ] {
+        let mut state = deepseek_state();
+        feed_characters(
+            &mut state,
+            &format!("{before}{}", template_call("write", &arguments)),
+        );
+        feed(&mut state, &json!({}), Some("stop"));
+        let (_, message) = finish(state);
+        assert_eq!(visible(&message), before, "{before:?}");
+        assert_eq!(message.stop_reason, StopReason::ToolUse, "{before:?}");
+        let calls = calls(&message);
+        assert_eq!(calls.len(), 1, "{before:?}");
+        assert_eq!(calls[0].name, "write");
+        assert_eq!(calls[0].arguments, arguments);
+    }
+}
+
 #[test]
 fn recovery_is_enabled_only_for_deepseek_provider_or_model_components() {
     let input = template_call("read", &json!({"path":"a"}));

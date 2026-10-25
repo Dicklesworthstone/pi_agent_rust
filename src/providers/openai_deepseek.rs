@@ -169,13 +169,19 @@ impl Recovery {
     }
 }
 
+/// Markdown quotation state. Only a run of three or more at the start of a
+/// line opens a fenced block, which lasts until its closing fence. Any other
+/// backtick run opens an inline span that ends with its line, so an unmatched
+/// backtick in earlier prose cannot quote a call on a later line.
 #[derive(Clone, Copy, Default)]
 struct CodeState {
     fence: usize,
     marker: char,
+    block: bool,
     run: usize,
     run_marker: char,
-    newline: bool,
+    run_at_line_start: bool,
+    line_has_text: bool,
 }
 
 impl CodeState {
@@ -183,13 +189,20 @@ impl CodeState {
         if self.run == 0 || character == self.run_marker {
             return;
         }
-        if self.fence == 0 && (self.run_marker == '`' || self.run >= 3) {
-            self.fence = self.run;
-            self.marker = self.run_marker;
+        if self.fence == 0 {
+            if self.run >= 3 && self.run_at_line_start {
+                self.fence = self.run;
+                self.marker = self.run_marker;
+                self.block = true;
+            } else if self.run_marker == '`' {
+                self.fence = self.run;
+                self.marker = self.run_marker;
+            }
         } else if self.marker == self.run_marker
-            && (self.run == self.fence || (self.fence >= 3 && self.run >= self.fence))
+            && (self.run == self.fence || (self.block && self.run >= self.fence))
         {
             self.fence = 0;
+            self.block = false;
         }
         self.run = 0;
     }
@@ -197,16 +210,19 @@ impl CodeState {
     const fn advance(&mut self, character: char) {
         self.settle_before(character);
         if character == '`' || character == '~' {
+            if self.run == 0 {
+                self.run_at_line_start = !self.line_has_text;
+            }
             self.run += 1;
             self.run_marker = character;
-            self.newline = false;
+            self.line_has_text = true;
         } else if character == '\n' {
-            if self.newline && self.fence < 3 {
+            if !self.block {
                 self.fence = 0;
             }
-            self.newline = true;
+            self.line_has_text = false;
         } else if !character.is_whitespace() {
-            self.newline = false;
+            self.line_has_text = true;
         }
     }
 }
@@ -217,11 +233,12 @@ enum InlineSpan {
     Pending,
 }
 
+/// Looks ahead for the run that closes an inline span on the same line; a
+/// newline first means the span quotes nothing, as in `CodeState`.
 #[derive(Default)]
 struct InlineScan {
     scanned: usize,
     run: usize,
-    newline: bool,
 }
 
 impl InlineScan {
@@ -230,7 +247,6 @@ impl InlineScan {
             let index = self.scanned + relative;
             if character == '`' {
                 self.run += 1;
-                self.newline = false;
                 continue;
             }
             if self.run == fence {
@@ -238,12 +254,7 @@ impl InlineScan {
             }
             self.run = 0;
             if character == '\n' {
-                if self.newline {
-                    return InlineSpan::Unclosed;
-                }
-                self.newline = true;
-            } else if !character.is_whitespace() {
-                self.newline = false;
+                return InlineSpan::Unclosed;
             }
         }
         self.scanned = text.len();

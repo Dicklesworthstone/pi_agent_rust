@@ -166,7 +166,9 @@ The parser never repairs missing arguments or invents values.
 Ordinary prose streams as it arrives. Once a possible tool envelope begins,
 its tail is withheld until the terminal response so incomplete markup does
 not enter conversation replay. Code fences and closed inline-code examples
-are protected by a conservative quotation guard. `<think>` envelopes remain
+are protected by a conservative quotation guard: a fence opens only at the
+start of a line, and an inline-code span closes on its own line, so a stray
+backtick in earlier prose does not hide a later call. `<think>` envelopes remain
 text, and their contents are excluded from tool recovery even when a closing
 tag never arrives. Captured markup is limited to 1 MiB and 128 recovered calls
 per response.
