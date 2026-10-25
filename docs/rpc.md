@@ -241,6 +241,9 @@ in-memory content; session resume still hydrates saved sidecar payloads.
 {"id":"handoff-1","type":"handoff","focus":"Preserve the migration decisions and remaining failures"}
 ```
 
+OMP's `customInstructions` is accepted in place of `focus`. A command that
+sends both is rejected.
+
 Handoff retains the session ID and file, the configured recent-context budget,
 and the latest complete authored turn with its native attachments and tool
 results. It uses the native privacy policy and extension hooks and persists a

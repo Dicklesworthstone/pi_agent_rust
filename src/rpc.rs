@@ -217,10 +217,16 @@ fn parse_mcp_auth_request(parsed: &Value, reauth: bool) -> Result<(String, Optio
 }
 
 fn parse_handoff_focus(parsed: &Value) -> Result<&str> {
-    let focus = match parsed.get("focus") {
-        None => "",
-        Some(Value::String(focus)) => focus,
-        Some(_) => return Err(Error::validation("Handoff focus must be a string")),
+    // `customInstructions` is OMP's spelling, which `compact` also accepts.
+    let focus = match (parsed.get("focus"), parsed.get("customInstructions")) {
+        (None, None) => "",
+        (Some(Value::String(focus)), None) | (None, Some(Value::String(focus))) => focus,
+        (Some(_), Some(_)) => {
+            return Err(Error::validation(
+                "Handoff takes focus or customInstructions, not both",
+            ));
+        }
+        _ => return Err(Error::validation("Handoff focus must be a string")),
     };
     if focus.len() > 4096 || focus.contains('\0') {
         return Err(Error::validation(
@@ -17875,10 +17881,16 @@ mod tests {
             parse_handoff_focus(&json!({"focus": "日本語"})).unwrap(),
             "日本語",
         );
+        assert_eq!(
+            parse_handoff_focus(&json!({"customInstructions": "keep the plan"})).unwrap(),
+            "keep the plan",
+        );
         assert!(parse_handoff_focus(&json!({"focus": "é".repeat(2048)})).is_ok());
         for invalid in [
             json!({"focus": null}),
             json!({"focus": 42}),
+            json!({"customInstructions": 42}),
+            json!({"focus": "one", "customInstructions": "two"}),
             json!({"focus": "no\u{0}nul"}),
             json!({"focus": "é".repeat(2049)}),
         ] {
