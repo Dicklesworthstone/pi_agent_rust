@@ -1887,10 +1887,14 @@ pub struct PiFtuiModel {
     /// otherwise. Shared naming with the bubbletea stack via
     /// `KeyBinding::from_ftui_key`.
     keybindings: KeyBindings,
-    /// Status text an extension set via `ui.setStatus` / `ui.setWorkingMessage`.
-    /// Shown on the idle status line, ahead of the todo summary; cleared by an
-    /// empty status.
-    ext_status: Option<String>,
+    /// Status texts extensions set via `ui.setStatus(key, text)`, by key, as
+    /// OMP's status line keeps them: each extension sets and clears its own
+    /// (an empty text clears that key). The idle status line joins them in
+    /// key order, ahead of the todo summary.
+    ext_status: std::collections::BTreeMap<String, String>,
+    /// `ui.setWorkingMessage(text)` (the bridge's `working` status key): shown
+    /// in place of the activity while a turn runs, as OMP's loader message.
+    ext_working: Option<String>,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
     /// Extension UI prompt currently collecting a reply (bd-1eoh4); extras
@@ -2258,7 +2262,8 @@ impl PiFtuiModel {
             available_sessions: Vec::new(),
             resume_scope: None,
             keybindings: KeyBindings::default(),
-            ext_status: None,
+            ext_status: std::collections::BTreeMap::new(),
+            ext_working: None,
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
@@ -5009,9 +5014,17 @@ impl PiFtuiModel {
         match request.method.as_str() {
             "setStatus" | "set_status" => {
                 let status = text_field(&["statusText", "status_text", "text"]).unwrap_or_default();
-                // An empty status clears, matching the classic handler's
-                // treatment of an absent one.
-                self.ext_status = (!status.is_empty()).then_some(status);
+                let key = text_field(&["statusKey", "status_key"]).unwrap_or_default();
+                // One status per key, as in OMP: an empty text (the bridge's
+                // `undefined`) clears only that key. A single slot let one
+                // extension's clear erase another's status.
+                if key == "working" {
+                    self.ext_working = (!status.is_empty()).then_some(status);
+                } else if status.is_empty() {
+                    self.ext_status.remove(&key);
+                } else {
+                    self.ext_status.insert(key, status);
+                }
                 true
             }
             "setTitle" | "set_title" => {
@@ -6217,27 +6230,34 @@ impl PiFtuiModel {
             )]))
             .render(regions.banner, frame);
         }
-        // Status region. While working: spinner + activity (tool > thinking >
-        // responding). While a long out-of-turn driver operation runs
-        // (issue #203): spinner + its label. While idle: the todo summary.
+        // Status region. While working: spinner + an extension's working
+        // message, else the activity (tool > thinking > responding). While a
+        // long out-of-turn driver operation runs (issue #203): spinner + its
+        // label. While idle: extension statuses, else the todo summary.
         let status_line = if self.state == AgentUiState::Working {
             let spin = DOTS[self.spinner.current_frame % DOTS.len()];
-            let activity = self.current_tool.as_ref().map_or_else(
-                || {
-                    if self.streaming.is_empty() && !self.thinking.is_empty() {
-                        String::from("thinking ...")
-                    } else {
-                        String::from("responding ...")
-                    }
-                },
-                |tool| format!("running {tool} ..."),
-            );
+            let activity = self.ext_working.clone().unwrap_or_else(|| {
+                self.current_tool.as_ref().map_or_else(
+                    || {
+                        if self.streaming.is_empty() && !self.thinking.is_empty() {
+                            String::from("thinking ...")
+                        } else {
+                            String::from("responding ...")
+                        }
+                    },
+                    |tool| format!("running {tool} ..."),
+                )
+            });
             format!("{spin} {activity}")
         } else if let Some(busy) = self.busy_label() {
             let spin = DOTS[self.spinner.current_frame % DOTS.len()];
             format!("{spin} {busy}")
-        } else if let Some(status) = &self.ext_status {
-            status.clone()
+        } else if !self.ext_status.is_empty() {
+            self.ext_status
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" · ")
         } else {
             self.todo_summary
                 .as_ref()
@@ -14182,15 +14202,19 @@ mod tests {
         sim.init();
         let before = sim.model().transcript.len();
 
-        send_ui_effect(
-            &mut sim,
-            "setStatus",
-            serde_json::json!({"statusKey": "working", "statusText": "indexing"}),
-        );
-        assert_eq!(
-            sim.model().ext_status.as_deref(),
-            Some("indexing"),
-            "ui.setWorkingMessage should set the status"
+        let status = |sim: &mut ProgramSimulator<PiFtuiModel>, key: &str, text: &str| {
+            send_ui_effect(
+                sim,
+                "setStatus",
+                serde_json::json!({"statusKey": key, "statusText": text}),
+            );
+        };
+        status(&mut sim, "git", "main clean");
+        status(&mut sim, "build", "build ok");
+        let rendered = buffer_text(sim.capture_frame(60, 8), 60, 8);
+        assert!(
+            rendered.contains("build ok · main clean"),
+            "each key's status shows, in key order: {rendered:?}"
         );
         assert_eq!(
             sim.model().transcript.len(),
@@ -14198,10 +14222,50 @@ mod tests {
             "an applied effect should not also print a line"
         );
 
-        // An empty status clears it, as the classic handler treats an absent
-        // one.
-        send_ui_effect(&mut sim, "setStatus", serde_json::json!({"statusText": ""}));
-        assert_eq!(sim.model().ext_status, None);
+        // One extension clearing its status (an empty text) leaves the
+        // others: a single slot used to drop them all.
+        status(&mut sim, "git", "");
+        let rendered = buffer_text(sim.capture_frame(60, 8), 60, 8);
+        assert!(
+            rendered.contains("build ok") && !rendered.contains("main clean"),
+            "{rendered:?}"
+        );
+        status(&mut sim, "build", "");
+        assert!(sim.model().ext_status.is_empty());
+    }
+
+    /// `ui.setWorkingMessage` labels the running turn, as OMP's loader
+    /// message does. It used to show only on the idle status line, after the
+    /// work it described had finished.
+    #[test]
+    fn working_message_labels_the_running_turn_not_the_idle_line() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        send_ui_effect(
+            &mut sim,
+            "setStatus",
+            serde_json::json!({"statusKey": "working", "statusText": "searching docs"}),
+        );
+        let idle = buffer_text(sim.capture_frame(60, 8), 60, 8);
+        assert!(!idle.contains("searching docs"), "{idle:?}");
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("answer".into())));
+        let working = buffer_text(sim.capture_frame(60, 8), 60, 8);
+        assert!(
+            working.contains("searching docs") && !working.contains("responding ..."),
+            "{working:?}"
+        );
+
+        // Calling it with no text restores the default activity.
+        send_ui_effect(
+            &mut sim,
+            "setStatus",
+            serde_json::json!({"statusKey": "working", "statusText": ""}),
+        );
+        let working = buffer_text(sim.capture_frame(60, 8), 60, 8);
+        assert!(working.contains("responding ..."), "{working:?}");
     }
 
     #[test]
