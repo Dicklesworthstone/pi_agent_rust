@@ -2336,11 +2336,11 @@ fn stable_parent_topological_order(entries: Vec<SessionEntry>) -> Result<Vec<Ses
 }
 
 fn resolve_loaded_leaf_id(
-    header: &SessionHeader,
+    current_leaf: Option<&str>,
     natural_leaf_id: Option<String>,
     entry_index: &HashMap<String, usize>,
 ) -> Option<String> {
-    match header.current_leaf.as_deref() {
+    match current_leaf {
         Some(ROOT_LEAF_OVERRIDE_SENTINEL) => None,
         Some(leaf_id) if entry_index.contains_key(leaf_id) => Some(leaf_id.to_string()),
         _ => natural_leaf_id,
@@ -4556,8 +4556,11 @@ impl Session {
 
         let entry_count = entries.len();
         let natural_leaf_id = finalized.leaf_id.clone();
-        let leaf_id =
-            resolve_loaded_leaf_id(&header, natural_leaf_id.clone(), &finalized.entry_index);
+        let leaf_id = resolve_loaded_leaf_id(
+            header.current_leaf.as_deref(),
+            natural_leaf_id.clone(),
+            &finalized.entry_index,
+        );
         let source_integrity_failed = !diagnostics.skipped_entries.is_empty()
             || !diagnostics.orphaned_parent_links.is_empty();
         Ok((
@@ -4629,8 +4632,11 @@ impl Session {
         let finalized = finalize_loaded_entries(&mut entries);
         let entry_count = entries.len();
         let natural_leaf_id = finalized.leaf_id.clone();
-        let leaf_id =
-            resolve_loaded_leaf_id(&header, natural_leaf_id.clone(), &finalized.entry_index);
+        let leaf_id = resolve_loaded_leaf_id(
+            header.current_leaf.as_deref(),
+            natural_leaf_id.clone(),
+            &finalized.entry_index,
+        );
 
         Ok(Self {
             header,
@@ -5305,6 +5311,11 @@ impl Session {
 
     fn accept_persisted_state(&mut self, header: SessionHeader, entries: Vec<SessionEntry>) {
         let previous_leaf = self.leaf_id.clone();
+        // This handle's leaf choice, set from its leaf just before the save.
+        // An incremental append does not rewrite the header, so the header
+        // read back can carry another process's choice. Adopting that moved
+        // this handle off the branch it had just extended.
+        let own_leaf_override = self.header.current_leaf.clone();
         self.header = header;
         self.entries = entries;
         let finalized = finalize_loaded_entries(&mut self.entries);
@@ -5318,9 +5329,18 @@ impl Session {
             .filter(|id| self.entry_index.contains_key(id))
             .or_else(|| finalized.leaf_id.clone());
         // Saving may select an explicit branch or the empty root. Interpret
-        // the accepted header exactly as reopening does; otherwise a root
-        // rewind resurrects the abandoned tip immediately after a good save.
-        self.leaf_id = resolve_loaded_leaf_id(&self.header, fallback_leaf, &self.entry_index);
+        // that choice exactly as reopening does; otherwise a root rewind
+        // resurrects the abandoned tip immediately after a good save.
+        self.leaf_id = resolve_loaded_leaf_id(
+            own_leaf_override.as_deref(),
+            fallback_leaf,
+            &self.entry_index,
+        );
+        if self.header.current_leaf != own_leaf_override {
+            // The next rewrite records this handle's choice.
+            self.header.current_leaf = own_leaf_override;
+            self.header_dirty = true;
+        }
         self.is_linear = finalized.is_linear && self.leaf_id.eq(&finalized.leaf_id);
         self.persisted_entry_count
             .store(self.entries.len(), Ordering::SeqCst);
@@ -8342,7 +8362,11 @@ fn open_jsonl_blocking_with_entry_limit(
 
     let entry_count = entries.len();
     let natural_leaf_id = finalized.leaf_id.clone();
-    let leaf_id = resolve_loaded_leaf_id(&header, natural_leaf_id.clone(), &finalized.entry_index);
+    let leaf_id = resolve_loaded_leaf_id(
+        header.current_leaf.as_deref(),
+        natural_leaf_id.clone(),
+        &finalized.entry_index,
+    );
     let source_integrity_failed =
         !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty();
 
@@ -13237,6 +13261,37 @@ mod tests {
 
         assert_eq!(loaded.leaf_id.as_deref(), Some(id_e.as_str()));
         assert!(loaded.header.current_leaf.is_none());
+    }
+
+    /// Two processes on one file: an incremental append reads back the header
+    /// the other process last wrote. Adopting its leaf moved this handle off
+    /// the branch it had just extended, so its next prompt lost that message.
+    #[test]
+    fn append_keeps_this_handles_leaf_when_another_process_moved_the_disk_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        let id_a = first.append_message(make_test_message("A"));
+        first.append_message(make_test_message("B"));
+        run_async(async { first.save().await }).unwrap();
+        let path = first.path.clone().unwrap();
+        let mut second =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        // The first process rewinds to A; its save records A as the leaf.
+        assert!(first.navigate_to(&id_a)); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        run_async(async { first.save().await }).unwrap();
+
+        let id_c = second.append_message(make_test_message("C"));
+        run_async(async { second.save().await }).unwrap();
+        assert_eq!(second.leaf_id.as_deref(), Some(id_c.as_str()));
+        assert_eq!(second.to_messages_for_current_path().len(), 3);
+
+        // Its next save records its own leaf, so a reopen lands on C too.
+        second.append_message(make_test_message("D"));
+        run_async(async { second.save().await }).unwrap();
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(loaded.to_messages_for_current_path().len(), 4);
     }
 
     #[test]
