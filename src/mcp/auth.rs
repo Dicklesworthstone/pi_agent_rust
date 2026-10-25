@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -517,7 +517,7 @@ impl AuthBinding {
         let expected_epoch = old.as_ref().map(|record| record.epoch.clone());
         let metadata = discover(&self.resource, &check).await?;
         check()?;
-        let (listener, redirect_uri) = bind_callback(&configuration)?;
+        let (listeners, redirect_uri) = bind_callback(&configuration)?;
         let mut credentials =
             register_client(&metadata, &configuration, &redirect_uri, &check).await?;
         let verifier = nonce();
@@ -555,7 +555,7 @@ impl AuthBinding {
         check()?;
         on_url(authorization.as_str());
         let code = await_callback(
-            listener,
+            listeners,
             &redirect_uri,
             &state,
             &metadata.issuer,
@@ -1133,25 +1133,51 @@ fn authorization_prompt<'a>(
 
 /// Bind only a loopback address. A registered redirect remains byte-for-byte
 /// unchanged, and a fixed port never falls back to an unregistered random port.
-fn bind_callback(configuration: &McpOAuthConfig) -> Result<(TcpListener, String)> {
+/// The callback a configured client uses when it names no `redirectUri`:
+/// OMP's `http://localhost:3000/callback`, with `callbackPort` and
+/// `callbackPath` applied. A registered client was registered against one
+/// fixed URI, which a generated port could never match.
+fn registered_client_redirect(configuration: &McpOAuthConfig) -> Option<String> {
+    if configuration.redirect_uri.is_some() || configuration.client_id.is_none() {
+        return None;
+    }
+    Some(format!(
+        "http://localhost:{}{}",
+        configuration.callback_port.unwrap_or(3000),
+        configuration
+            .callback_path
+            .as_deref()
+            .unwrap_or("/callback")
+    ))
+}
+
+fn bind_callback(configuration: &McpOAuthConfig) -> Result<(Vec<TcpListener>, String)> {
     configuration.validate_resolved().map_err(|_| {
         error(
             "CONFIG",
             "configured OAuth client or loopback callback settings are invalid",
         )
     })?;
-    let configured_redirect = configuration
+    let fixed_redirect = configuration
         .redirect_uri
+        .clone()
+        .or_else(|| registered_client_redirect(configuration));
+    let configured_redirect = fixed_redirect
         .as_deref()
         .map(Url::parse)
         .transpose()
         .map_err(|_| error("CONFIG", "configured OAuth callback is invalid"))?;
-    let address = match configured_redirect.as_ref().and_then(Url::host) {
-        Some(url::Host::Ipv4(address)) => IpAddr::V4(address),
-        Some(url::Host::Ipv6(address)) => IpAddr::V6(address),
-        // Pin localhost to a numeric loopback address rather than consulting
+    let addresses = match configured_redirect.as_ref().and_then(Url::host) {
+        Some(url::Host::Ipv4(address)) => vec![IpAddr::V4(address)],
+        Some(url::Host::Ipv6(address)) => vec![IpAddr::V6(address)],
+        // Pin localhost to numeric loopback addresses rather than consulting
         // a resolver or allowing a host-file mapping to change the bind target.
-        Some(url::Host::Domain("localhost")) | None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        // A browser may resolve it to either family, so claim both.
+        Some(url::Host::Domain("localhost")) => vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ],
+        None => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
         _ => {
             return Err(error(
                 "CONFIG",
@@ -1164,24 +1190,44 @@ fn bind_callback(configuration: &McpOAuthConfig) -> Result<(TcpListener, String)
         .and_then(Url::port_or_known_default)
         .or(configuration.callback_port)
         .unwrap_or(0);
-    let listener = TcpListener::bind(SocketAddr::new(address, port))
-        .map_err(|_| error("CALLBACK", "cannot bind the configured OAuth loopback callback; a fixed port may already be in use"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| error("CALLBACK", "cannot configure the OAuth loopback callback"))?;
-    let redirect_uri = if let Some(redirect) = &configuration.redirect_uri {
-        redirect.clone()
+    let mut listeners = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        match TcpListener::bind(SocketAddr::new(address, port)) {
+            Ok(listener) => listeners.push(listener),
+            // Another process on [::1] would receive a browser that resolves
+            // localhost there. Any other failure means this host has no IPv6
+            // loopback, so no browser can arrive that way either.
+            Err(err)
+                if address.is_ipv6()
+                    && !listeners.is_empty()
+                    && err.kind() != std::io::ErrorKind::AddrInUse => {}
+            Err(_) => {
+                return Err(error(
+                    "CALLBACK",
+                    "cannot bind the configured OAuth loopback callback; a fixed port may already be in use",
+                ));
+            }
+        }
+    }
+    for listener in &listeners {
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| error("CALLBACK", "cannot configure the OAuth loopback callback"))?;
+    }
+    let redirect_uri = if let Some(redirect) = fixed_redirect {
+        redirect
     } else {
-        let address = listener
-            .local_addr()
-            .map_err(|_| error("CALLBACK", "cannot read the OAuth callback address"))?;
+        let address = listeners
+            .first()
+            .and_then(|listener| listener.local_addr().ok())
+            .ok_or_else(|| error("CALLBACK", "cannot read the OAuth callback address"))?;
         let path = configuration
             .callback_path
             .as_deref()
             .unwrap_or("/oauth/callback");
         format!("http://127.0.0.1:{}{path}", address.port())
     };
-    Ok((listener, redirect_uri))
+    Ok((listeners, redirect_uri))
 }
 
 #[allow(clippy::too_many_lines)] // configured client, or one dynamic registration exchange
@@ -1556,7 +1602,7 @@ fn reply_callback(stream: &mut TcpStream, accepted: bool) {
 }
 
 async fn await_callback(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     redirect_uri: &str,
     state: &str,
     issuer: &str,
@@ -1572,14 +1618,26 @@ async fn await_callback(
                 "the OAuth browser callback did not arrive before its deadline",
             ));
         }
-        let (mut stream, peer) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+        let accepted = listeners
+            .iter()
+            .find_map(|listener| match listener.accept() {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    None
+                }
+                result => Some(result),
+            });
+        let (mut stream, peer) = match accepted {
+            Some(Ok(pair)) => pair,
+            None => {
                 pause(Duration::from_millis(25)).await;
                 continue;
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
+            Some(Err(_)) => {
                 return Err(error(
                     "CALLBACK",
                     "cannot accept the OAuth loopback callback",
@@ -2137,10 +2195,14 @@ mod configured_tests {
                 .expect("public client binding");
             let browser = Arc::new(Mutex::new(Vec::new()));
             let callback = browser_callback(Arc::clone(&browser), fixture.metadata().issuer);
+            let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("callback port");
+            let port = reservation.local_addr().expect("callback address").port();
+            drop(reservation);
             let options = McpOAuthConfig {
                 client_id: Some("public-configured-client".to_string()),
                 scope: scope.map(str::to_string),
                 prompt: prompt.map(str::to_string),
+                callback_port: Some(port),
                 callback_path: Some("/selected-callback".to_string()),
                 ..McpOAuthConfig::default()
             };
@@ -2156,10 +2218,8 @@ mod configured_tests {
                 expected_prompt
             );
             assert_eq!(
-                Url::parse(parameters.get("redirect_uri").expect("redirect"))
-                    .expect("callback URL")
-                    .path(),
-                "/selected-callback"
+                parameters.get("redirect_uri").map(String::as_str),
+                Some(format!("http://localhost:{port}/selected-callback").as_str())
             );
             let requests = fixture.captured();
             assert!(!requests.iter().any(|request| request.target == "/register"));
@@ -2396,25 +2456,128 @@ mod configured_tests {
             redirect_uri: Some(redirect.clone()),
             ..McpOAuthConfig::default()
         };
-        let (listener, registered) = bind_callback(&options).expect("released registered port");
+        let (listeners, registered) = bind_callback(&options).expect("released registered port");
         assert_eq!(registered, redirect);
         assert_eq!(
-            listener.local_addr().expect("bound registered callback"),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            listeners
+                .first()
+                .and_then(|listener| listener.local_addr().ok()),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
         );
-        drop(listener);
+        drop(listeners);
         let options = McpOAuthConfig {
             callback_path: Some("/custom-callback".to_string()),
             ..McpOAuthConfig::default()
         };
-        let (listener, generated) = bind_callback(&options).expect("ephemeral callback");
+        let (listeners, generated) = bind_callback(&options).expect("ephemeral callback");
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().expect("ephemeral address").port())
+            .collect();
+        assert_eq!(
+            ports.len(),
+            1,
+            "a generated callback binds IPv4 loopback alone"
+        );
         assert_eq!(
             generated,
             format!(
                 "http://127.0.0.1:{}/custom-callback",
-                listener.local_addr().expect("ephemeral address").port()
+                ports.first().copied().unwrap_or_default()
             )
         );
+    }
+
+    #[test]
+    fn a_configured_client_without_a_redirect_uses_omps_callback() {
+        let client = McpOAuthConfig {
+            client_id: Some("registered-client".to_string()),
+            ..McpOAuthConfig::default()
+        };
+        assert_eq!(
+            registered_client_redirect(&client).as_deref(),
+            Some("http://localhost:3000/callback")
+        );
+        let overridden = McpOAuthConfig {
+            callback_port: Some(43121),
+            callback_path: Some("/registered".to_string()),
+            ..client.clone()
+        };
+        assert_eq!(
+            registered_client_redirect(&overridden).as_deref(),
+            Some("http://localhost:43121/registered")
+        );
+        // An explicit redirect stands, and dynamic registration still binds
+        // whatever port is free because it registers the one it binds.
+        for options in [
+            McpOAuthConfig {
+                redirect_uri: Some("http://127.0.0.1:43121/cb".to_string()),
+                ..client
+            },
+            McpOAuthConfig {
+                callback_port: Some(43121),
+                ..McpOAuthConfig::default()
+            },
+        ] {
+            assert_eq!(registered_client_redirect(&options), None);
+        }
+    }
+
+    #[test]
+    fn a_localhost_callback_also_receives_a_browser_on_ipv6_loopback() {
+        let Ok(occupied) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            return; // This host has no IPv6 loopback for a browser to use.
+        };
+        let port = occupied.local_addr().expect("occupied address").port();
+        let redirect = format!("http://localhost:{port}/callback");
+        let options = McpOAuthConfig {
+            redirect_uri: Some(redirect.clone()),
+            ..McpOAuthConfig::default()
+        };
+        // A browser that resolves localhost to ::1 would reach that process.
+        let error = bind_callback(&options).expect_err("[::1] belongs to another listener");
+        assert_eq!(
+            error.to_string().matches("[MCP_AUTH_CALLBACK]").count(),
+            1,
+            "{error}"
+        );
+        drop(occupied);
+        let (listeners, _) = bind_callback(&options).expect("both loopback families");
+        let addresses: Vec<SocketAddr> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().expect("callback address"))
+            .collect();
+        assert_eq!(
+            addresses,
+            [
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+            ]
+        );
+        let browser = std::thread::spawn(move || {
+            let mut stream =
+                TcpStream::connect((Ipv6Addr::LOCALHOST, port)).expect("connect over ::1");
+            write!(
+                stream,
+                "GET /callback?code=approved&state=random HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+            )
+            .expect("browser request");
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+        let code = run(await_callback(
+            listeners,
+            &redirect,
+            "random",
+            "https://issuer.example/",
+            false,
+            &admit(),
+        ))
+        .expect("callback over ::1");
+        assert_eq!(code, "approved");
+        let response = browser.join().expect("browser thread");
+        assert_eq!(response.lines().next(), Some("HTTP/1.1 200 OK"));
     }
 }
 

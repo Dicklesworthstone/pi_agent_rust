@@ -340,14 +340,19 @@ Only include the fields your server requires:
   discovery. The selected scopes also accompany dynamic client registration.
 - `redirectUri` preserves the exact registered HTTP loopback URI in both the
   authorization request and code exchange. Supported hosts are IPv4 loopback,
-  `[::1]`, and `localhost`; localhost binds a numeric IPv4 loopback listener.
+  `[::1]`, and `localhost`. A browser may resolve localhost to either family,
+  so Pi listens on `127.0.0.1` and, where the host has IPv6 loopback, `[::1]`.
   HTTPS callbacks, remote callbacks, credentials, query strings, fragments,
   whitespace, and paths requiring URL normalization are rejected.
 - `callbackPort` selects a fixed port from 1 through 65535. `callbackPath`
   selects an absolute URL path. If also specified with `redirectUri`, they must
-  agree with it. A busy fixed port fails explicitly instead of silently using
-  another port. Without a redirect or port, Pi allocates an available loopback
-  port; the default path is `/oauth/callback`.
+  agree with it. A busy fixed port, on either loopback family, fails explicitly
+  instead of silently using another port.
+- With `clientId` and no `redirectUri`, Pi uses OMP's callback,
+  `http://localhost:3000/callback`, with `callbackPort` and `callbackPath`
+  replacing its port and path. A registered client was registered against one
+  fixed URI. Without `clientId`, dynamic registration registers an available
+  `127.0.0.1` port; the default path is `/oauth/callback`.
 - `prompt` is sent when nonempty. An explicitly empty string omits it. When
   absent, Pi requests `consent` if the effective scopes include `offline_access`.
 
