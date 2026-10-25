@@ -90,10 +90,22 @@ pub fn resume_entries(
         } else {
             ""
         };
-        let label = match &meta.name {
-            Some(name) => format!("{pin}{name} · {} msgs", meta.message_count),
-            None => format!("{pin}{} · {} msgs", meta.id, meta.message_count),
-        };
+        // As the classic picker shows them: the name, or the first eight
+        // characters of the id, then when the session was last saved. Rows
+        // of full ids and message counts gave nothing to tell sessions apart.
+        let title = meta
+            .name
+            .as_deref()
+            .unwrap_or_else(|| crate::session_picker::truncate_session_id(&meta.id, 8));
+        let saved = chrono::DateTime::from_timestamp_millis(meta.last_modified_ms)
+            .filter(|_| meta.last_modified_ms > 0)
+            .map(|time| {
+                time.with_timezone(&chrono::Local)
+                    .format(" · %Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let label = format!("{pin}{title}{saved} · {} msgs", meta.message_count);
         (label, meta.path)
     })
     .collect()
@@ -147,7 +159,7 @@ mod tests {
         let project_dir = base_dir.join(crate::session::encode_cwd(&cwd));
         std::fs::create_dir_all(&project_dir).expect("project sessions");
         let mut header = crate::session::SessionHeader::new();
-        header.id = "kept".to_string();
+        header.id = "kept-session-id".to_string();
         header.cwd = cwd.display().to_string();
         let path = project_dir.join("kept.jsonl");
         std::fs::write(
@@ -162,6 +174,17 @@ mod tests {
         let rows = resume_entries(&cwd, Some(&base_dir), tmp.path());
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].1, path.display().to_string());
+        // An unnamed session shows a short id and when it was last saved.
+        let saved: chrono::DateTime<chrono::Local> = std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime")
+            .into();
+        let label = rows.first().map_or("", |(label, _)| label.as_str());
+        assert!(
+            label.starts_with(&format!("kept-ses · {} · ", saved.format("%Y-%m-%d %H:%M")))
+                && label.ends_with(" msgs"),
+            "{label}"
+        );
 
         std::fs::remove_file(&path).expect("delete session");
         let rows = resume_entries(&cwd, Some(&base_dir), tmp.path());
