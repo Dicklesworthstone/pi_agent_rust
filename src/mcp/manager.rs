@@ -2161,7 +2161,7 @@ fn resolve_oauth_settings(
             };
             check()?;
             if config.provenance != Provenance::Acp
-                && raw.trim().starts_with("$CMD:")
+                && crate::auth::is_command_secret_reference(raw)
                 && !allow_commands
             {
                 return Err(tool_err(
@@ -2328,7 +2328,7 @@ fn resolve_secrets(
     resolve_secrets_with(entries, validate_value, |raw| {
         // Expand literal templates directly. Never feed expanded data back
         // through $CMD/$ENV parsing: an environment value is data, not code.
-        if raw.contains("${") && !raw.trim().starts_with("$CMD:") {
+        if raw.contains("${") && !crate::auth::is_command_secret_reference(raw) {
             return super::config::expand_config_value(raw, workspace).map(Some);
         }
         crate::auth::resolve_secret_reference(raw, cwd)

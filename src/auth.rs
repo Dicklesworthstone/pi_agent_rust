@@ -2179,6 +2179,13 @@ impl AuthStorage {
     }
 }
 
+/// Whether resolving `raw` runs a command: `$CMD:` or its `$COMMAND:` alias.
+/// Process-capability checks must use this rather than one spelling.
+pub(crate) fn is_command_secret_reference(raw: &str) -> bool {
+    let raw = raw.trim();
+    raw.starts_with("$CMD:") || raw.starts_with("$COMMAND:")
+}
+
 /// Resolve an API key string that may contain a `$ENV:VAR_NAME` or
 /// `$CMD:shell command` prefix (crate-internal: MCP server env/header
 /// resolution reuses this — bd-cv653.6.1).

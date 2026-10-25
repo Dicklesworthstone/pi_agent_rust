@@ -32,7 +32,7 @@ fn transport_needs_spawn(config: &super::ConfiguredServer) -> bool {
             && config
                 .headers
                 .iter()
-                .any(|(_, value)| value.trim().starts_with("$CMD:")))
+                .any(|(_, value)| crate::auth::is_command_secret_reference(value)))
 }
 
 /// Armed only after trust and restart admission select a new construction.
@@ -645,6 +645,8 @@ mod tests {
             ("prefix $CMD:literal", false),
             ("$CMD:credential-helper", true),
             ("  $CMD:credential-helper  ", true),
+            ("$COMMAND:credential-helper", true),
+            ("prefix $COMMAND:literal", false),
         ] {
             config.headers = vec![("Authorization".to_string(), value.to_string())];
             assert_eq!(transport_needs_spawn(&config), expected);

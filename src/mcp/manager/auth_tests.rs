@@ -467,6 +467,34 @@ fn public_client_override_skips_both_configured_helpers_and_preserves_authored_s
     );
 }
 
+/// `$COMMAND:` is the resolver's alias for `$CMD:`, so it needs the same
+/// process-spawn capability before it can run.
+#[test]
+fn command_alias_oauth_helpers_also_require_process_capability() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (_manager, entry) = configured_oauth_fixture(
+        &temporary,
+        &json!({
+            "url": "http://127.0.0.1:1/mcp",
+            "oauth": {"clientId": "public-client", "clientSecret": "$COMMAND:exit 98"}
+        }),
+        true,
+    );
+    let error = resolve_oauth_settings(
+        &entry.config,
+        None,
+        temporary.path(),
+        temporary.path(),
+        false,
+        &|| Ok(()),
+    )
+    .expect_err("an aliased helper requires process capability");
+    assert!(
+        error.to_string().contains("MCP_CAPABILITY_DENIED"),
+        "{error}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn configured_oauth_helpers_and_network_wait_for_trust_and_enabled_admission() {
