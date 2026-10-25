@@ -319,8 +319,10 @@ before any model can be selected as a fallback.
 | `except-usage-limit` | Transient failures other than account usage exhaustion |
 
 Explicit per-minute, per-second, and concurrency throttles are distinguished
-from account exhaustion. A bare HTTP 402 or 429 without finer diagnostic
-evidence is treated as a usage limit. These filters do not permit recovery from
+from account exhaustion, including Google quota ids such as
+`GenerateRequestsPerMinutePerProjectPerModel`, unless the same error also
+names a per-day quota. A bare HTTP 402 or 429, whose body is empty or only
+repeats the status, is treated as a usage limit. These filters do not permit recovery from
 authentication failures, context overflow, cancellation, or session-persistence
 failures, and they do not change the same-model retry budget.
 

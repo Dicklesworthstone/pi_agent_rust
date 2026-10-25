@@ -66,6 +66,11 @@ impl FallbackOn {
 fn is_usage_limit(error_text: &str) -> bool {
     let lower = error_text.to_ascii_lowercase();
     let status = recovery_http_status(&lower);
+    // Google quota ids name their window (`GenerateRequestsPerMinutePer...`)
+    // while the message says "quota exceeded" either way. A daily quota in
+    // the same body is real exhaustion.
+    let windowed_quota =
+        (lower.contains("perminute") || lower.contains("persecond")) && !lower.contains("perday");
     if status != Some(402)
         && ([
             "per minute",
@@ -82,7 +87,8 @@ fn is_usage_limit(error_text: &str) -> bool {
         .any(|pattern| lower.contains(pattern))
             || lower
                 .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-                .any(|token| matches!(token, "rpm" | "tpm" | "rps" | "tps")))
+                .any(|token| matches!(token, "rpm" | "tpm" | "rps" | "tps"))
+            || windowed_quota)
     {
         return false;
     }
@@ -111,6 +117,12 @@ fn is_usage_limit(error_text: &str) -> bool {
         .map_or(lower.as_str(), |rest| {
             rest.split_once(": ").map_or(rest, |(_, message)| message)
         });
+    // Providers wrap the body as `<Vendor> API error (HTTP 429): <body>`.
+    // The vendor names the provider, not the failure; only the body counts.
+    let headline = headline
+        .split_once("api error (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map_or(headline, |(_, body)| body);
     headline
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
         .filter(|token| !token.is_empty())
@@ -2521,6 +2533,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn provider_wrapped_errors_are_classified_by_their_body() {
+        let gemini = |quota_id: &str| {
+            format!(
+                "Gemini API error (HTTP 429): {{\"error\":{{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details.\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 10\\nPlease retry in 43.7s.\",\"status\":\"RESOURCE_EXHAUSTED\",\"details\":[{{\"@type\":\"type.googleapis.com/google.rpc.QuotaFailure\",\"violations\":[{{\"quotaId\":\"{quota_id}\"}}]}}]}}}}"
+            )
+        };
+        for (provider, message, usage_limit) in [
+            (
+                "anthropic",
+                "Anthropic API error (HTTP 429): ".to_string(),
+                true,
+            ),
+            (
+                "azure-openai",
+                "Azure OpenAI API error (HTTP 402): {\"error\":{\"message\":\"\"}}".to_string(),
+                true,
+            ),
+            (
+                "openai",
+                "OpenAI API error (HTTP 429): Rate limit reached for requests".to_string(),
+                false,
+            ),
+            (
+                "google",
+                gemini("GenerateRequestsPerMinutePerProjectPerModel-FreeTier"),
+                false,
+            ),
+            (
+                "google",
+                gemini("GenerateRequestsPerDayPerProjectPerModel-FreeTier"),
+                true,
+            ),
+        ] {
+            let error = crate::error::Error::provider(provider, message.as_str()).to_string();
+            for text in [error.as_str(), message.as_str()] {
+                assert_eq!(FallbackOn::UsageLimit.allows(text), usage_limit, "{text}");
+                assert_eq!(
+                    FallbackOn::ExceptUsageLimit.allows(text),
+                    !usage_limit,
+                    "{text}"
+                );
+            }
+        }
+        // A status-only 402 is billing exhaustion and must reach the chain.
+        let error = crate::error::Error::provider("anthropic", "Anthropic API error (HTTP 402): ");
+        assert_eq!(
+            classify_failover(&error.to_string()),
+            Some(FailoverClass::Quota)
+        );
     }
 
     #[test]
