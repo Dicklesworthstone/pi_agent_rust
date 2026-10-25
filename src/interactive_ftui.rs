@@ -1418,6 +1418,8 @@ impl PickerOverlay {
 const EXT_CUSTOM_OVERLAY_KEY: &str = "__pi_custom_overlay";
 /// Keys held for a component that has not polled yet (the classic bound).
 const EXT_CUSTOM_MAX_KEYS: usize = 256;
+/// Lines an extension widget shows before it is cut (OMP's bound).
+const EXT_WIDGET_MAX_LINES: usize = 10;
 
 /// A `ctx.ui.custom` component an extension is showing. The JS bridge sends
 /// each rendered frame as `setWidget` under [`EXT_CUSTOM_OVERLAY_KEY`] and
@@ -1919,6 +1921,10 @@ pub struct PiFtuiModel {
     ext_working: Option<String>,
     /// The open `ctx.ui.custom` component, if any.
     ext_custom: Option<ExtCustomOverlay>,
+    /// Widgets extensions set via `ui.setWidget(key, lines)`, by key, shown
+    /// above the editor as OMP shows them. A missing or empty list removes
+    /// that key.
+    ext_widgets: std::collections::BTreeMap<String, Vec<String>>,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
     /// Extension UI prompt currently collecting a reply (bd-1eoh4); extras
@@ -2098,6 +2104,9 @@ struct Regions {
     /// Pinned error banner row (present only while an error is undissmissed).
     banner: Rect,
     status: Rect,
+    /// Extension widgets (`ui.setWidget`) above the editor; zero rows while
+    /// none are set.
+    widgets: Rect,
     /// Slash-command completion popup, directly above the editor (issue
     /// #208); zero rows while no suggestions are showing.
     completion: Rect,
@@ -2234,7 +2243,13 @@ fn picker_window(selected: usize, len: usize, visible: usize) -> std::ops::Range
     start..(start + visible).min(len)
 }
 
-fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows: u16) -> Regions {
+fn layout_regions(
+    area: Rect,
+    input_rows: u16,
+    banner_rows: u16,
+    widget_rows: u16,
+    completion_rows: u16,
+) -> Regions {
     use ftui::layout::{Constraint, Flex};
     let rects = Flex::vertical()
         .constraints([
@@ -2242,6 +2257,7 @@ fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows
             Constraint::Fill,                   // conversation body
             Constraint::Fixed(banner_rows),     // pinned error banner (0 = none)
             Constraint::Fixed(1),               // status line (tool/todo/messages)
+            Constraint::Fixed(widget_rows),     // extension widgets (0 = none)
             Constraint::Fixed(completion_rows), // completion popup (0 = closed)
             Constraint::Fixed(input_rows),      // input editor
             Constraint::Fixed(1),               // footer (usage)
@@ -2252,9 +2268,10 @@ fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows
         body: rects[1],
         banner: rects[2],
         status: rects[3],
-        completion: rects[4],
-        input: rects[5],
-        footer: rects[6],
+        widgets: rects[4],
+        completion: rects[5],
+        input: rects[6],
+        footer: rects[7],
     }
 }
 
@@ -2289,6 +2306,7 @@ impl PiFtuiModel {
             ext_status: std::collections::BTreeMap::new(),
             ext_working: None,
             ext_custom: None,
+            ext_widgets: std::collections::BTreeMap::new(),
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
@@ -2566,7 +2584,11 @@ impl PiFtuiModel {
     fn body_height(&self) -> usize {
         let banner = u16::from(self.error_banner.is_some());
         usize::from(self.term.1.saturating_sub(
-            FIXED_CHROME_ROWS + banner + self.input_rows() + self.completion_rows(),
+            FIXED_CHROME_ROWS
+                + banner
+                + self.input_rows()
+                + self.widget_rows()
+                + self.completion_rows(),
         ))
         .max(1)
     }
@@ -5079,10 +5101,90 @@ impl PiFtuiModel {
                 self.apply_custom_frame(request);
                 true
             }
-            // Other widgets have no surface on this stack yet, and anything
-            // else is unknown; both keep the printed fallback.
+            "setWidget" | "set_widget" => {
+                self.apply_widget(request);
+                true
+            }
+            // Anything else is unknown and keeps the printed fallback.
             _ => false,
         }
+    }
+
+    /// An extension widget, or its removal when it has no lines (the
+    /// bridge's `setWidget(key, undefined)`). Payload keys match the classic
+    /// handler: `content` wins, else the lines joined.
+    fn apply_widget(&mut self, request: &ExtensionUiRequest) {
+        let payload = &request.payload;
+        let key = ["widgetKey", "widget_key"]
+            .iter()
+            .find_map(|key| payload.get(*key).and_then(serde_json::Value::as_str))
+            .unwrap_or("widget")
+            .to_string();
+        let content = payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                ["widgetLines", "widget_lines", "lines"]
+                    .iter()
+                    .find_map(|key| payload.get(*key).and_then(serde_json::Value::as_array))
+                    .map(|lines| {
+                        lines
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+            })
+            .unwrap_or_default();
+        let lines: Vec<String> = content
+            .lines()
+            .map(|line| sanitize(line).into_owned())
+            .collect();
+        if lines.is_empty() {
+            self.ext_widgets.remove(&key);
+        } else {
+            self.ext_widgets.insert(key, lines);
+        }
+    }
+
+    /// Rows the widgets take above the editor: each widget's lines, cut at
+    /// [`EXT_WIDGET_MAX_LINES`] plus a marker row, and no more than a
+    /// quarter of the terminal. A picker owns the screen while it is open.
+    fn widget_rows(&self) -> u16 {
+        if self.picker.is_some() {
+            return 0;
+        }
+        let rows: usize = self
+            .ext_widgets
+            .values()
+            .map(|lines| lines.len().min(EXT_WIDGET_MAX_LINES + 1))
+            .sum();
+        u16::try_from(rows.min(usize::from(self.term.1 / 4))).unwrap_or(u16::MAX)
+    }
+
+    /// The widgets in key order, each cut at [`EXT_WIDGET_MAX_LINES`] with a
+    /// marker as OMP cuts it, and the whole set cut to `rows` the same way.
+    fn widget_text(&self, rows: u16) -> Text<'_> {
+        let muted = ftui::Style::new().dim().fg(self.palette.muted);
+        let mut lines = Vec::new();
+        for widget in self.ext_widgets.values() {
+            lines.extend(
+                widget
+                    .iter()
+                    .take(EXT_WIDGET_MAX_LINES)
+                    .map(|line| ftui::text::Line::raw(line.as_str())),
+            );
+            if widget.len() > EXT_WIDGET_MAX_LINES {
+                lines.push(ftui::text::Line::styled("... (widget truncated)", muted));
+            }
+        }
+        let rows = usize::from(rows);
+        if lines.len() > rows && rows > 0 {
+            lines.truncate(rows - 1);
+            lines.push(ftui::text::Line::styled("... (widgets truncated)", muted));
+        }
+        Text::from_lines(lines)
     }
 
     /// Whether a custom component owns the body and the keyboard. A picker
@@ -6364,6 +6466,7 @@ impl PiFtuiModel {
             area,
             self.input_rows(),
             u16::from(self.error_banner.is_some()),
+            self.widget_rows(),
             self.completion_rows(),
         );
 
@@ -6498,6 +6601,11 @@ impl PiFtuiModel {
             }
             Paragraph::new(Text::from_lines([ftui::text::Line::from_spans(spans)]))
                 .render(regions.status, frame);
+        }
+
+        // Extension widgets, between the status line and the editor.
+        if regions.widgets.height > 0 {
+            Paragraph::new(self.widget_text(regions.widgets.height)).render(regions.widgets, frame);
         }
 
         // Slash-command completion popup (issue #208), pinned to the editor.
@@ -14710,21 +14818,104 @@ mod tests {
 
     #[test]
     fn an_effect_this_stack_cannot_carry_out_still_prints() {
-        // `setWidget` has no surface here, so the old printed fallback is
-        // still the honest outcome — better than swallowing it.
+        // An effect this stack does not know still prints, which is better
+        // than swallowing it.
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         let before = sim.model().transcript.len();
 
+        send_ui_effect(&mut sim, "frobnicate", serde_json::json!({"text": "a"}));
+        let added = &sim.model().transcript[before..];
+        assert_eq!(added.len(), 1, "an unknown effect should still surface");
+        assert_eq!(added[0].role, EntryRole::System);
+    }
+
+    /// `ui.setWidget` (usage meters, plan trackers, MCP server lists) printed
+    /// every update as a transcript line here. OMP keeps one widget per key
+    /// above the editor.
+    #[test]
+    fn widgets_show_above_the_editor_per_key_instead_of_printing() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+        let body = sim.model().body_height();
+
         send_ui_effect(
             &mut sim,
             "setWidget",
-            serde_json::json!({"widgetKey": "k", "lines": ["a"]}),
+            serde_json::json!({"widgetKey": "b-usage", "lines": ["usage 40%"]}),
         );
-        let added = &sim.model().transcript[before..];
-        assert_eq!(added.len(), 1, "setWidget should still surface somehow");
-        assert_eq!(added[0].role, EntryRole::System);
+        send_ui_effect(
+            &mut sim,
+            "set_widget",
+            serde_json::json!({"widget_key": "a-cost", "content": "\u{1b}[32mcost $0.12\u{1b}[0m"}),
+        );
+        assert_eq!(
+            sim.model().transcript.len(),
+            before,
+            "widgets are not transcript lines"
+        );
+        assert_eq!(sim.model().body_height(), body - 2);
+        let rendered = buffer_text(sim.capture_frame(60, 24), 60, 24);
+        let cost = rendered.find("cost $0.12");
+        let usage = rendered.find("usage 40%");
+        assert!(
+            cost.is_some() && usage.is_some() && cost < usage,
+            "widgets show in key order: {rendered:?}"
+        );
+
+        // An update replaces that key's widget.
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "b-usage", "lines": ["usage 55%"]}),
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 24), 60, 24);
+        assert!(
+            rendered.contains("usage 55%") && !rendered.contains("usage 40%"),
+            "{rendered:?}"
+        );
+
+        // A tall widget is cut at ten lines with a marker, as OMP cuts it.
+        sim.inject_event(Event::Resize {
+            width: 60,
+            height: 80,
+        });
+        let tall: Vec<String> = (1..=12).map(|n| format!("row {n}")).collect();
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "c-tall", "lines": tall}),
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 80), 60, 80);
+        assert!(
+            rendered.contains("row 10")
+                && !rendered.contains("row 11")
+                && rendered.contains("... (widget truncated)"),
+            "{rendered:?}"
+        );
+
+        // A widget set without lines (`setWidget(key, undefined)`) removes
+        // only that key.
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "b-usage"}),
+        );
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "c-tall", "lines": []}),
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 80), 60, 80);
+        assert!(
+            rendered.contains("cost $0.12") && !rendered.contains("usage 55%"),
+            "{rendered:?}"
+        );
+        assert_eq!(sim.model().widget_rows(), 1);
+        assert_eq!(sim.model().transcript.len(), before);
     }
 
     #[test]
@@ -18562,14 +18753,14 @@ mod tests {
     #[test]
     fn layout_reserves_the_completion_rows_above_the_editor() {
         let area = Rect::new(0, 0, 80, 20);
-        let regions = layout_regions(area, 1, 0, 4);
+        let regions = layout_regions(area, 1, 0, 0, 4);
         assert_eq!(regions.completion.height, 4);
         assert_eq!(
             regions.completion.y + regions.completion.height,
             regions.input.y
         );
         assert_eq!(regions.status.y + 1, regions.completion.y);
-        let closed = layout_regions(area, 1, 0, 0);
+        let closed = layout_regions(area, 1, 0, 0, 0);
         assert_eq!(closed.completion.height, 0);
         assert_eq!(closed.body.height, regions.body.height + 4);
     }
