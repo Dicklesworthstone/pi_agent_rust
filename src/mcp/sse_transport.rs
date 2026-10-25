@@ -747,7 +747,7 @@ impl SseState {
         pending: &mut PendingSseRequest,
         rejected: &AtomicBool,
     ) -> Result<Value> {
-        self.connect().await?;
+        self.run_until_abort(self.connect()).await?;
         let id = self
             .next_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -759,9 +759,15 @@ impl SseState {
             "params": if params.is_null() { json!({}) } else { params },
         });
         if let Err(error) = self
-            .post(&frame, timeout, Some(&pending.dispatch), true)
+            .run_until_abort(self.post(&frame, timeout, Some(&pending.dispatch), true))
             .await
         {
+            // A server may write the response before finishing the POST (the
+            // Java SDK does) and then lose the stream. That response still
+            // answers this request.
+            if let Ok(result) = response.try_recv() {
+                return result;
+            }
             // Only a rejection from this POST establishes non-delivery.
             // Authentication failure in an independent server-reply task
             // cannot prove that this already-accepted request did not run.
@@ -770,6 +776,8 @@ impl SseState {
             }
             return Err(error);
         }
+        // Not raced against abort: abort drops the sender, and a response the
+        // stream delivered before closing is still received before `Closed`.
         match await_completion(response, timeout, || {}).await {
             Ok(result) => result,
             Err(CompletionWaitError::Timeout) => {
@@ -843,14 +851,13 @@ impl McpTransport for SseTransport {
                     Arc::clone(&dispatch),
                     method != "initialize",
                 );
-                let result = Box::pin(self.state.run_until_abort(self.state.exchange(
-                    method,
-                    params,
-                    timeout,
-                    &mut pending,
-                    &rejected,
-                )))
-                .await;
+                // exchange races only its connect and POST against abort.
+                let result =
+                    Box::pin(
+                        self.state
+                            .exchange(method, params, timeout, &mut pending, &rejected),
+                    )
+                    .await;
                 match result {
                     Ok(value) => {
                         if method == "initialize" {
@@ -984,6 +991,8 @@ mod tests {
         DropAfterPost,
         HoldPost,
         RejectReply,
+        /// Write the tool result, close the stream, and never finish the POST.
+        AnswerThenDrop,
     }
 
     #[derive(Clone)]
@@ -1137,6 +1146,21 @@ mod tests {
                     }
                     let _ = post_tx.send(());
                     if matches!(mode, Mode::HoldPost) {
+                        held_posts.push(stream);
+                        continue;
+                    }
+                    if matches!(mode, Mode::AnswerThenDrop)
+                        && request.body.get("method").and_then(Value::as_str) == Some("tools/call")
+                    {
+                        if let Some(mut events) = events.take() {
+                            message(
+                                &mut events,
+                                json!({
+                                    "jsonrpc": "2.0", "id": request.body["id"],
+                                    "result": {"content": [{"type": "text", "text": "done"}]},
+                                }),
+                            );
+                        }
                         held_posts.push(stream);
                         continue;
                     }
@@ -1582,6 +1606,23 @@ mod tests {
             1
         );
         assert!(!transport.is_alive());
+    }
+
+    #[test]
+    fn legacy_response_delivered_before_the_stream_closes_still_answers_the_call() {
+        let fixture = Fixture::start(Mode::AnswerThenDrop);
+        let transport = SseTransport::new(&fixture.url(), Vec::new()).expect("transport");
+        let result = runtime()
+            .block_on(transport.request(
+                "tools/call",
+                json!({"name": "side_effect"}),
+                Duration::from_secs(5),
+            ))
+            .expect("the streamed result answers the call");
+        assert_eq!(result["content"][0]["text"], "done");
+        assert_eq!(fixture.tool_posts(), 1);
+        // The closed stream still retires the connection.
+        assert!(!transport.is_alive()); // ubs:ignore[rust.panic.assert-macros] -- boolean test assertion; assert_eq! on a bool fails clippy
     }
 
     #[test]
