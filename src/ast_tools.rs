@@ -705,6 +705,7 @@ impl ProposalStore {
 pub struct AstEditTool {
     cwd: PathBuf,
     proposals: Mutex<ProposalStore>,
+    mutation_recorder: Option<std::sync::Arc<crate::undo::FileMutationRecorder>>,
 }
 
 impl AstEditTool {
@@ -713,7 +714,18 @@ impl AstEditTool {
         Self {
             cwd: cwd.to_path_buf(),
             proposals: Mutex::new(ProposalStore::default()),
+            mutation_recorder: None,
         }
+    }
+
+    /// Record resolved proposals as one `/undo` unit, like `edit` and `write`.
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<std::sync::Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.mutation_recorder = recorder;
+        self
     }
 
     /// Compile every op for `lang`, enforcing the single-node rule on both
@@ -956,7 +968,8 @@ impl AstEditTool {
         Ok(text_output(text, payload))
     }
 
-    fn resolve(&self, input: &AstEditInput) -> Result<ToolOutput> {
+    #[allow(clippy::too_many_lines)] // verify, record, apply with rollback, report
+    fn resolve(&self, tool_call_id: &str, input: &AstEditInput) -> Result<ToolOutput> {
         let proposal_id = input
             .proposal_id
             .as_deref()
@@ -1004,9 +1017,19 @@ impl AstEditTool {
         }
 
         // Apply: temp-file + rename per file; roll back on mid-failure.
+        // The whole proposal is one undo unit.
+        let recorder = self.mutation_recorder.as_deref();
+        for file in &proposal.files {
+            if let Some(recorder) = recorder {
+                recorder.begin_file(tool_call_id, "ast_edit", &file.path);
+            }
+        }
         let mut written = 0_usize;
         for file in &proposal.files {
             if let Err(error) = write_file_atomic(&file.path, &file.new_content) {
+                if let Some(recorder) = recorder {
+                    recorder.abort(tool_call_id);
+                }
                 let mut rollback_errors = Vec::new();
                 for previous in &proposal.files[..written] {
                     if let Err(rollback_error) =
@@ -1031,6 +1054,9 @@ impl AstEditTool {
                 return Err(Error::tool("ast_edit", message));
             }
             written += 1;
+        }
+        if let Some(recorder) = recorder {
+            recorder.commit(tool_call_id);
         }
 
         let files_json: Vec<serde_json::Value> = proposal
@@ -1159,7 +1185,7 @@ impl Tool for AstEditTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
@@ -1167,7 +1193,7 @@ impl Tool for AstEditTool {
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         match input.action.as_deref().unwrap_or("stage") {
             "stage" => self.stage(&input),
-            "resolve" => self.resolve(&input),
+            "resolve" => self.resolve(tool_call_id, &input),
             "reject" => self.reject(&input),
             other => Err(Error::validation(format!(
                 "unknown action '{other}'; expected stage|resolve|reject"

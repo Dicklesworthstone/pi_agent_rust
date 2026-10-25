@@ -210,6 +210,56 @@ fn ast_edit_staging_lifecycle_resolve_applies_atomically() {
 }
 
 #[test]
+fn ast_edit_resolve_is_one_undo_unit() {
+    // Unrecorded, /undo after an ast_edit blamed "changes made outside the
+    // agent" and a forced undo of an earlier edit clobbered the proposal.
+    asupersync::test_utils::run_test(|| async {
+        let harness = TestHarness::new("ast_edit_resolve_is_one_undo_unit");
+        let alpha = "pub fn a() -> i32 {\n    compute().unwrap()\n}\n";
+        let beta = "pub fn b() -> i32 {\n    compute().unwrap()\n}\n";
+        write_file(&harness, "src/alpha.rs", alpha);
+        write_file(&harness, "src/beta.rs", beta);
+        let recorder = std::sync::Arc::new(pi::undo::FileMutationRecorder::default());
+        let registry = ToolRegistry::with_mutation_recorder(
+            &["ast_edit"],
+            harness.temp_dir(),
+            None,
+            Some(std::sync::Arc::clone(&recorder)),
+            None,
+        );
+        let edit = registry.get("ast_edit").expect("ast_edit registered");
+        let staged = stage(
+            &harness,
+            edit,
+            json!({
+                "ops": [{"pat": "$EXPR.unwrap()", "out": "$EXPR.expect(\"boom\")"}],
+                "path": "src",
+            }),
+        )
+        .await;
+        let proposal_id = output_json(&staged)["proposalId"]
+            .as_str()
+            .expect("proposalId")
+            .to_string();
+        resolve_raw(
+            edit,
+            json!({"action": "resolve", "proposalId": proposal_id, "reason": "diagnostics"}),
+        )
+        .await
+        .expect("resolve");
+        assert_ne!(read_file(&harness, "src/alpha.rs"), alpha);
+
+        let outcome = recorder.undo(1, false);
+        assert_eq!(outcome.applied.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.applied[0].tool_name, "ast_edit");
+        assert_eq!(outcome.applied[0].files.len(), 2);
+        assert_eq!(read_file(&harness, "src/alpha.rs"), alpha);
+        assert_eq!(read_file(&harness, "src/beta.rs"), beta);
+        finish_case(&harness, "ast_edit_resolve_is_one_undo_unit");
+    });
+}
+
+#[test]
 fn ast_edit_reject_discards_with_zero_writes() {
     asupersync::test_utils::run_test(|| async {
         let harness = TestHarness::new("ast_edit_reject_discards_with_zero_writes");

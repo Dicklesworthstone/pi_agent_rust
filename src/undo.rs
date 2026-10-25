@@ -1,11 +1,12 @@
 //! File-mutation recording with `/undo` and `/redo` (bd-cv653.3.13).
 //!
 //! The [`FileMutationRecorder`] snapshots file content around every
-//! successful `write`/`edit`/`hashline_edit` tool call so agent edits can be
-//! rolled back without git. Snapshots live in an in-memory content-addressed
-//! store (dedup by SHA-256) bounded by a byte budget with oldest-unit
-//! eviction; history therefore dies with the process — git remains the
-//! durable layer.
+//! successful `write`/`edit`/`hashline_edit`/`ast_edit` tool call so agent
+//! edits can be rolled back without git. Snapshots live in an in-memory
+//! content-addressed store (dedup by SHA-256) bounded by a byte budget with
+//! oldest-unit eviction; history therefore dies with the process — git
+//! remains the durable layer. `lsp` workspace edits and subagent processes
+//! are not recorded yet.
 //!
 //! Recording contract: one mutation unit per tool call (`begin_file` before
 //! persisting, `commit` after success, `abort` on failure). Only tool-path
@@ -397,6 +398,16 @@ fn restore_file(
             staged.write_all(content)?;
             if let Some(metadata) = metadata {
                 staged.as_file().set_permissions(metadata.permissions())?;
+            } else {
+                // A recreated file gets the write tool's new-file mode, not
+                // the temp file's private 0600.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    staged
+                        .as_file()
+                        .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+                }
             }
             staged.as_file().sync_all()?;
             validate_replay_state(file, expected, force)?;
@@ -776,6 +787,15 @@ mod tests {
         let outcome = recorder.redo(1, false);
         assert_eq!(outcome.applied[0].files[0].action, "recreated");
         assert_eq!(read(&file), "created\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&file)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o644, "not the temp file's 0600");
+        }
     }
 
     #[test]

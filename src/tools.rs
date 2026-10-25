@@ -5846,7 +5846,10 @@ impl ToolRegistry {
                 // installed by the interactive host) and joins via
                 // extend_tools in main.rs/sdk.rs, like "todo".
                 "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
-                "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
+                "ast_edit" => tools.push(Box::new(
+                    crate::ast_tools::AstEditTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone()),
+                )),
                 "lsp" => tools.push(Box::new(crate::lsp::LspTool::new(cwd, config))),
                 "debug" => tools.push(Box::new(crate::debug::DebugTool::new(cwd, config))),
                 "inspect_image" => {
