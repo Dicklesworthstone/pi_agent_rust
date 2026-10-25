@@ -22587,7 +22587,12 @@ function __pi_build_extension_ui_template(hasUI) {
                 text: text, // compat: some UI surfaces only consume `text`
             }).catch(() => {});
         },
+        // OMP and pi-mono pass these a component factory. The host cannot
+        // draw one, so it is ignored, as pi-mono's RPC mode ignores it.
+        // Turned into text, it put the factory's source in the status line
+        // and the terminal title.
         setFooter: (text) => {
+            if (typeof text === 'function') return;
             const value = toUiText(text);
             void pi.ui('setStatus', {
                 statusKey: 'footer',
@@ -22596,6 +22601,7 @@ function __pi_build_extension_ui_template(hasUI) {
             }).catch(() => {});
         },
         setHeader: (text) => {
+            if (typeof text === 'function') return;
             const value = toUiText(text);
             void pi.ui('setTitle', {
                 title: value,
@@ -31311,6 +31317,46 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             }
 
             unreachable!("did not observe a width-change reflow frame");
+        });
+    }
+
+    /// `ui.setFooter` and `ui.setHeader` take a component factory. Sent as
+    /// text, the factory's source became the footer status and the terminal
+    /// title.
+    #[test]
+    fn pijs_footer_and_header_factories_send_no_source_text() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    const ui = __pi_make_extension_ui(__pi_test_secret, true);
+                    ui.setFooter((_tui, _theme, footerData) => ({ render: () => ['footer'] }));
+                    ui.setHeader((_tui, _theme) => ({ render: () => ['header'] }));
+                    ui.setFooter('plain footer');
+                    ",
+                ))
+                .await
+                .expect("eval");
+
+            let sent: Vec<(String, serde_json::Value)> = runtime
+                .drain_hostcall_requests()
+                .into_iter()
+                .filter_map(|request| match &request.kind {
+                    HostcallKind::Ui { op } => Some((op.clone(), request.payload.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), 1, "factories send nothing: {sent:?}");
+            assert_eq!(
+                sent.first()
+                    .map(|(op, payload)| (op.as_str(), &payload["statusText"])),
+                Some(("setStatus", &serde_json::json!("plain footer")))
+            );
         });
     }
 
