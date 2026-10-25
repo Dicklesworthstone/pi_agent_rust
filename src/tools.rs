@@ -5072,6 +5072,17 @@ fn escaped_file_tag_name(path: &Path) -> String {
     escape_file_tag_attribute(&path.display().to_string())
 }
 
+/// The window git sniffs for binary content.
+const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// A NUL byte, or bytes that are not UTF-8, in the first 8 KiB. A multibyte
+/// character cut off at the window edge is still text.
+fn looks_binary(bytes: &[u8]) -> bool {
+    let header = bytes.get(..BINARY_SNIFF_BYTES).unwrap_or(bytes);
+    header.contains(&0)
+        || std::str::from_utf8(header).is_err_and(|error| error.error_len().is_some())
+}
+
 fn append_file_notice_block(out: &mut String, path: &Path, notice: &str) {
     let path_str = escaped_file_tag_name(path);
     let _ = writeln!(out, "<file name=\"{path_str}\">\n{notice}\n</file>");
@@ -5296,6 +5307,14 @@ pub fn process_file_arguments(
 
         if let Some(mime_type) = media_mime_type {
             append_media_argument(&mut out, &absolute_path, &bytes, mime_type);
+        } else if looks_binary(&bytes) {
+            // Decoded as text it would be up to a megabyte of replacement
+            // characters. OMP skips binary mentions the same way.
+            append_file_notice_block(
+                &mut out.text,
+                &absolute_path,
+                &format!("[Binary file ({} bytes), not included.]", bytes.len()), // ubs:ignore[rust.perf.string-alloc-in-loop] -- once per binary @file argument
+            );
         } else {
             append_text_file_block(&mut out.text, &absolute_path, &bytes);
         }

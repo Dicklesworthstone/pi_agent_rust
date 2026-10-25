@@ -964,6 +964,43 @@ fn process_file_arguments_empty_file_skipped() {
     assert_eq!(file_tag_count, 1);
 }
 
+/// Binary files used to be decoded lossily and inlined: up to a megabyte of
+/// replacement characters in the prompt.
+#[test]
+fn process_file_arguments_binary_file_gets_a_notice() {
+    let harness = TestHarness::new("process_file_arguments_binary_file_gets_a_notice");
+    let mut bytes = b"\x7fELF\x02\x01\x01\x00".to_vec();
+    bytes.extend(std::iter::repeat_n(0xff_u8, 4096));
+    let binary = harness.create_file("tool.bin", &bytes);
+    // A multibyte character cut off by the 8 KiB sniff window is still text.
+    let mut text = "a".repeat(8191);
+    text.push_str("é and more\n");
+    let utf8 = harness.create_file("wide.txt", &text);
+    let args = [&binary, &utf8]
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
+
+    assert!(
+        processed.text.contains(&format!(
+            "[Binary file ({} bytes), not included.]",
+            bytes.len()
+        )),
+        "{}",
+        processed.text
+    ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    assert!(!processed.text.contains('\u{FFFD}')); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    assert!(processed.text.contains("é and more")); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+}
+
 #[test]
 fn process_file_arguments_mixed_text_and_image() {
     let harness = TestHarness::new("process_file_arguments_mixed_text_and_image");
