@@ -803,8 +803,11 @@ async fn extract_frame(
         command.args(["-ss", &format!("{seconds:.6}")]);
     }
     attach_source(&mut command, file, stamp)?;
+    // force_original_aspect_ratio fits the stored size, so square anamorphic
+    // pixels first, shrinking one axis so the frame never grows.
     let scale = format!(
-        "scale={width}:{height}:force_original_aspect_ratio=decrease,\
+        "scale=if(gt(sar\\,1)\\,iw\\,iw*sar):if(gt(sar\\,1)\\,ih/sar\\,ih),\
+         scale={width}:{height}:force_original_aspect_ratio=decrease,\
          pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
     );
     let filter = match selector {
