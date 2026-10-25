@@ -145,7 +145,7 @@ pub(crate) fn resolve_output_path(cwd: &Path, raw: &str) -> PathBuf {
 }
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
 pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
-pub(crate) use self::file_refs::extract_file_references;
+pub(crate) use self::file_refs::{extract_file_references, names_an_empty_file};
 use self::file_refs::{
     file_url_to_path, format_file_ref, path_for_display, strip_wrapping_quotes,
     unescape_dragged_path,
@@ -1528,11 +1528,14 @@ impl PiApp {
         let cwd = &self.cwd;
         let provider = &mut self.autocomplete.provider;
         file_refs::extract_file_references(message, |path| {
-            provider.resolve_file_ref(path).or_else(|| {
-                resolve_read_path(path, cwd)
-                    .exists()
-                    .then(|| path.to_string())
-            })
+            provider
+                .resolve_file_ref(path)
+                .or_else(|| {
+                    resolve_read_path(path, cwd)
+                        .exists()
+                        .then(|| path.to_string())
+                })
+                .filter(|resolved| !names_an_empty_file(&resolve_read_path(resolved, cwd)))
         })
     }
 

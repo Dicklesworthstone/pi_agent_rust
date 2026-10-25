@@ -218,6 +218,14 @@ fn consume_single_linebreak(text: &str, start: usize) -> usize {
     first_len
 }
 
+/// Whether an `@` reference names an empty regular file. Its token stays in
+/// the prompt text: the file processor attaches nothing for an empty file
+/// (as for CLI `@file` arguments), so also removing the token erased the
+/// mention, and "fill in @todo.md" reached the model as "fill in".
+pub fn names_an_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == 0)
+}
+
 /// Split `@file` references out of a message: returns the message with each
 /// resolved reference removed (and its surrounding whitespace tidied) plus
 /// the resolved paths, in order. `resolve` maps a written path to the path

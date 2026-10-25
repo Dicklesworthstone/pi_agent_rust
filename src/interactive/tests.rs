@@ -206,6 +206,21 @@ fn extract_file_references_removes_indented_ref_line_without_leaving_blank_white
     assert_eq!(refs, vec!["notes.txt".to_string()]);
 }
 
+/// An `@` reference to an empty file keeps its token: nothing is attached
+/// for an empty file, so stripping the token too erased the mention.
+#[test]
+fn extract_file_references_keeps_a_reference_to_an_empty_file() {
+    let dir = tempdir();
+    std::fs::write(dir.path().join("notes.txt"), "hi").expect("write file");
+    std::fs::write(dir.path().join("todo.md"), "").expect("write file");
+    let mut app = build_test_app(dir.path().to_path_buf());
+
+    let (cleaned, refs) = app.extract_file_references("use @notes.txt to fill in @todo.md");
+
+    assert_eq!(cleaned, "use to fill in @todo.md");
+    assert_eq!(refs, vec!["notes.txt".to_string()]);
+}
+
 #[test]
 fn extract_file_references_preserves_newline_before_trailing_punctuation() {
     let dir = tempdir();

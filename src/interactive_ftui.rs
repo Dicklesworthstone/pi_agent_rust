@@ -7204,8 +7204,8 @@ fn prepare_prompt_with_source(
 ) -> std::result::Result<(String, Vec<crate::model::ContentBlock>, String), String> {
     let expand = |text: &str| resources.map_or_else(|| text.to_string(), |r| r.expand_input(text));
     let (without_refs, refs) = crate::interactive::extract_file_references(prompt, |path| {
-        crate::tools::resolve_read_path(path, cwd)
-            .exists()
+        let resolved = crate::tools::resolve_read_path(path, cwd);
+        (resolved.exists() && !crate::interactive::names_an_empty_file(&resolved))
             .then(|| path.to_string())
     });
     if refs.is_empty() {
@@ -19188,6 +19188,24 @@ mod tests {
                 .expect("prepared");
         assert_eq!(plain, "no refs, @missing.txt stays");
         assert!(none.is_empty());
+    }
+
+    /// An `@` reference to an empty file stays in the text. Nothing is
+    /// attached for an empty file, so the mention used to vanish.
+    #[test]
+    fn prepare_prompt_keeps_a_reference_to_an_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("todo.md"), "").expect("write");
+        let (text, images) = prepare_prompt(
+            "fill in @todo.md with a plan",
+            None,
+            dir.path(),
+            None,
+            false,
+        )
+        .expect("prepared");
+        assert_eq!(text, "fill in @todo.md with a plan");
+        assert!(images.is_empty());
     }
 
     /// A template invoked with an `@file` argument gets both: the file read
