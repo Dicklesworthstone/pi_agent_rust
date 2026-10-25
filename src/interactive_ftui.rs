@@ -1553,9 +1553,10 @@ pub enum UiCommand {
     /// Resume a saved session (`/resume` picker): the driver swaps its
     /// session handle and replays the conversation into the transcript.
     ResumeSession { path: String },
-    /// Compact the conversation (`/compact`): the driver runs compaction and
-    /// replays the rewritten history into the transcript.
-    Compact,
+    /// Compact the conversation (`/compact [focus]`): the driver runs
+    /// compaction, with any focus text as summary instructions, and replays
+    /// the rewritten history into the transcript.
+    Compact { instructions: Option<String> },
     /// Generate and install a continuation brief without changing sessions.
     Handoff {
         focus: String,
@@ -4110,18 +4111,23 @@ impl PiFtuiModel {
             return true;
         }
         let canon = clean.to_ascii_lowercase();
-        if canon == "/compact" {
+        if canon == "/shake" || canon == "/compact shake" {
+            self.begin_busy("shaking conversation ...");
+            self.send_command(UiCommand::Shake);
+            return true;
+        }
+        if let Some(focus) = strip_command(clean, "/compact") {
+            // OMP parseCompactArgs: text after `/compact` is focus for the
+            // summary (it used to fall through to "not implemented").
+            let focus = focus.trim();
             self.push_entry(
                 EntryRole::System,
                 String::from("compacting conversation ..."),
             );
             self.begin_busy("compacting conversation ...");
-            self.send_command(UiCommand::Compact);
-            return true;
-        }
-        if canon == "/shake" || canon == "/compact shake" {
-            self.begin_busy("shaking conversation ...");
-            self.send_command(UiCommand::Shake);
+            self.send_command(UiCommand::Compact {
+                instructions: (!focus.is_empty()).then(|| focus.to_string()),
+            });
             return true;
         }
         if let Some(rest) = strip_command(clean, "/undo") {
@@ -4241,7 +4247,7 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from(
                     "pi commands: /model or /switch [model[:level]], /queue <message>, /resume, /new, \
-                     /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
+                     /session, /name <name>, /plan, /compact [focus], /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking or /effort [level], /fast [on|off|status], /skillful [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
@@ -7864,6 +7870,7 @@ async fn run_prewalk_command(
 async fn run_compact_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     shake: bool,
+    instructions: Option<&str>,
     agent_tx: &Sender<PiMsg>,
 ) {
     // ubs:ignore Sender clone per command — the event callback must own its sender
@@ -7876,7 +7883,7 @@ async fn run_compact_command(
     let result = if shake {
         handle.shake(on_event).await
     } else {
-        handle.compact(on_event).await
+        handle.compact(instructions, on_event).await
     };
     let (label, done) = if shake {
         ("shake", "conversation shaken: bulky tool output dropped")
@@ -9971,14 +9978,20 @@ pub fn run(
                                 )));
                             }
                         }
-                        Ok(UiCommand::Compact) => {
-                            run_compact_command(&mut handle, false, &agent_tx).await;
+                        Ok(UiCommand::Compact { instructions }) => {
+                            run_compact_command(
+                                &mut handle,
+                                false,
+                                instructions.as_deref(),
+                                &agent_tx,
+                            )
+                            .await;
                         }
                         Ok(UiCommand::Handoff { focus, request }) => {
                             run_handoff_command(&mut handle, &focus, request, &agent_tx).await;
                         }
                         Ok(UiCommand::Shake) => {
-                            run_compact_command(&mut handle, true, &agent_tx).await;
+                            run_compact_command(&mut handle, true, None, &agent_tx).await;
                         }
                         Ok(UiCommand::Plan { action }) => {
                             plans.run(&mut handle, &action, &agent_tx).await;
@@ -16011,7 +16024,10 @@ mod tests {
         sim.init();
         type_str(&mut sim, "/compact");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert_eq!(submit_rx.try_recv().expect("routed"), UiCommand::Compact);
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Compact { instructions: None }
+        );
         assert!(
             sim.model()
                 .transcript
@@ -16019,6 +16035,32 @@ mod tests {
                 .any(|e| e.text.contains("compacting")),
             "compact note missing"
         );
+    }
+
+    /// `/compact <focus>` fell through to extension dispatch and reported
+    /// "/compact is a pi command that this stack does not implement yet".
+    /// As in OMP and on the classic stack, the text steers the summary.
+    #[test]
+    fn slash_compact_passes_focus_text_as_instructions() {
+        for (typed, routed) in [
+            (
+                "/compact keep the Auth decision",
+                UiCommand::Compact {
+                    instructions: Some(String::from("keep the Auth decision")),
+                },
+            ),
+            ("/COMPACT", UiCommand::Compact { instructions: None }),
+            ("/compact shake", UiCommand::Shake),
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let mut sim =
+                ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+            sim.init();
+            type_str(&mut sim, typed);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(submit_rx.try_recv().ok(), Some(routed), "{typed}");
+        }
     }
 
     /// bd-ydz1t.2: `/tan` existed only on the classic stack, so on the default

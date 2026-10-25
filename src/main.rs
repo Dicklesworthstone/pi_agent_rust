@@ -9884,7 +9884,7 @@ async fn execute_print_command(
                 } else if command == PrintCommand::Shake {
                     session.shake_now(event_handler).await?;
                 } else {
-                    session.compact_now(event_handler).await?;
+                    session.compact_now(None, event_handler).await?;
                 }
                 let state = observed
                     .lock()

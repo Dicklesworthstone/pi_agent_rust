@@ -50,7 +50,7 @@ fn main() -> std::io::Result<()> {
                     let _ = agent_tx.send(PiMsg::System(note));
                     continue;
                 }
-                UiCommand::Compact => {
+                UiCommand::Compact { .. } => {
                     let _ = agent_tx.send(PiMsg::System(String::from(
                         "(fake agent) would compact the conversation",
                     )));

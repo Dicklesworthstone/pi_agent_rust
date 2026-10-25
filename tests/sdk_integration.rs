@@ -770,7 +770,7 @@ fn sdk_compact_empty_session() {
     let events_ref = Arc::clone(&events);
     run_async(async move {
         handle
-            .compact(move |event| {
+            .compact(None, move |event| {
                 events_ref.lock().expect("lock").push(event);
             })
             .await

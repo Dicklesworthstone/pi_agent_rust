@@ -3272,14 +3272,16 @@ impl AgentSessionHandle {
         Ok(f(&guard))
     }
 
-    /// Trigger an immediate compaction pass (if compaction is enabled),
-    /// regardless of the automatic threshold. Returns whether it changed the
-    /// session; `false` means there was too little history to compact.
+    /// Trigger an immediate compaction pass, regardless of the automatic
+    /// threshold and with auto-compaction off too. `instructions`
+    /// (`/compact <focus>`) steer the summary. Returns whether it changed
+    /// the session; `false` means there was too little history to compact.
     pub async fn compact(
         &mut self,
+        instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.session.compact_now(on_event).await
+        self.session.compact_now(instructions, on_event).await
     }
 
     /// OMP `/shake`: compaction that drops bulky tool output from the older
@@ -7576,7 +7578,7 @@ mod tests {
         let mut handle = run_async(create_agent_session(options)).expect("create session");
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_callback = Arc::clone(&events);
-        let changed = run_async(handle.compact(move |event| {
+        let changed = run_async(handle.compact(None, move |event| {
             events_for_callback
                 .lock()
                 .expect("compact callback lock")
@@ -7592,6 +7594,62 @@ mod tests {
                 .is_empty(),
             "expected no compaction lifecycle events for empty session"
         );
+    }
+
+    /// `/compact <focus>`: the focus text reaches the summary request.
+    #[test]
+    fn compact_instructions_reach_the_summary_request() {
+        run_async(async {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            });
+            let mut stored = Session::in_memory();
+            for i in 0..3 {
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text(format!("question {i} ").repeat(100)),
+                    timestamp: Some(i),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new(format!("answer {i}")))],
+                        stop_reason: StopReason::Stop,
+                        ..AssistantMessage::default()
+                    },
+                });
+            }
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            agent.replace_messages(stored.to_messages_for_current_path());
+            let mut handle = AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::new(AsyncMutex::new(stored)),
+                    false,
+                    ResolvedCompactionSettings {
+                        keep_recent_tokens: 1,
+                        ..ResolvedCompactionSettings::default()
+                    },
+                ),
+                EventListeners::new(),
+            );
+
+            let changed = handle
+                .compact(Some("keep the retry-count decision"), |_| {})
+                .await
+                .expect("compact");
+            assert!(changed, "the history compacts"); // ubs:ignore[rust.panic.assert-macros] -- boolean result
+            let sent = requests.lock().expect("requests").clone();
+            assert!(
+                sent.iter()
+                    .any(|request| request
+                        .contains("Additional focus: keep the retry-count decision")),
+                "{sent:?}"
+            );
+        });
     }
 
     #[test]

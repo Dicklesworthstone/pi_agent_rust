@@ -17618,14 +17618,15 @@ impl AgentSession {
 
     /// Force-run compaction synchronously (used by `/compact` slash command),
     /// below the automatic threshold and with auto-compaction off too.
-    /// Returns whether the session changed: too little history is `false`,
-    /// not an error.
+    /// `instructions` (`/compact <focus>`) steer the summary. Returns whether
+    /// the session changed: too little history is `false`, not an error.
     pub async fn compact_now(
         &mut self,
+        instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, None, None)
+        self.compact_synchronous(Arc::new(on_event), false, instructions, None, None)
             .await
     }
 
@@ -17637,7 +17638,7 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.compact_synchronous(Arc::new(on_event), true, None, None)
+        self.compact_synchronous(Arc::new(on_event), true, None, None, None)
             .await
     }
 
@@ -17652,7 +17653,7 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, Some(abort), None)
+        self.compact_synchronous(Arc::new(on_event), false, None, Some(abort), None)
             .await
     }
 
@@ -17680,7 +17681,7 @@ impl AgentSession {
             ));
         }
         let changed = self
-            .compact_synchronous(Arc::new(on_event), false, None, Some((focus, abort)))
+            .compact_synchronous(Arc::new(on_event), false, None, None, Some((focus, abort)))
             .await?;
         if !changed {
             return Err(Error::session(
@@ -18385,6 +18386,7 @@ impl AgentSession {
         &mut self,
         on_event: AgentEventHandler,
         shake: bool,
+        instructions: Option<&str>,
         overflow_abort: Option<&AbortSignal>,
         handoff: Option<(&str, &AbortSignal)>,
     ) -> Result<bool> {
@@ -18454,7 +18456,11 @@ impl AgentSession {
             let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
             let before_outcome = self
-                .dispatch_before_compact(&prep, &entries, handoff.map(|(focus, _)| focus))
+                .dispatch_before_compact(
+                    &prep,
+                    &entries,
+                    handoff.map(|(focus, _)| focus).or(instructions),
+                )
                 .await;
             if before_outcome.cancel || abort.is_some_and(AbortSignal::is_aborted) {
                 on_event(AgentEvent::AutoCompactionEnd {
@@ -18571,7 +18577,8 @@ impl AgentSession {
             } else if shake {
                 Ok(compaction::compact_shake(prep, &privacy))
             } else {
-                let compact = compaction::compact(prep, provider, &stream_options, None, &privacy);
+                let compact =
+                    compaction::compact(prep, provider, &stream_options, instructions, &privacy);
                 if let Some(abort) = overflow_abort {
                     let cancelled = abort.wait();
                     futures::pin_mut!(compact, cancelled);

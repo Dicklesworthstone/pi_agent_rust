@@ -6452,7 +6452,7 @@ mod tests {
             drop(session);
 
             let compact_err = agent_session
-                .compact_now(|_| {})
+                .compact_now(None, |_| {})
                 .await
                 .expect_err("compaction must honor transition quarantine");
             assert!(compact_err.is_session_persistence());
