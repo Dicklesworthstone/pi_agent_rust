@@ -786,7 +786,7 @@ fn run_persistence_failpoint_child(
         .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT", failpoint)
         .env(
             "PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION",
-            if save_mode == Some("append-retry") {
+            if matches!(save_mode, Some("append-retry" | "short-write")) {
                 "error"
             } else {
                 "hard_exit"
@@ -853,11 +853,19 @@ fn persistence_failpoint_worker_process_entrypoint() {
         let save_mode = std::env::var("PI_SESSION_PERSISTENCE_TEST_SAVE_MODE");
         let rewrite = match save_mode.as_deref() {
             Ok("rewrite") => true,
-            Ok("append" | "append-retry") => false,
+            Ok("append" | "append-retry" | "short-write") => false,
             _ => backend == "jsonl",
         };
         if rewrite {
             session.set_model_header(Some(format!("failpoint-{backend}")), None, None);
+        }
+        if save_mode.as_deref() == Ok("short-write") {
+            let error = session
+                .save()
+                .await
+                .expect_err("the injected short write must fail the save");
+            assert!(error.to_string().contains(&failpoint), "{error}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            return;
         }
         if save_mode.as_deref() == Ok("append-retry") {
             let initial_metrics = session.autosave_metrics();
@@ -3366,6 +3374,65 @@ fn jsonl_append_fault_windows_preserve_integrity() {
             vec!["append-base", "append-written-unsynced", "append-synced"]
         );
         assert_no_duplicate_user_texts(&texts, "jsonl append after fsync");
+    });
+}
+
+/// A short write (a full disk) must not leave a torn row behind: every later
+/// open refuses to append past one, which strands the session.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn jsonl_append_short_write_leaves_the_log_appendable() {
+    let harness = TestHarness::new("e2e_jsonl_append_short_write");
+    run_async_test(async {
+        let mut session = Session::create_with_dir_and_store(
+            Some(harness.temp_dir().to_path_buf()),
+            SessionStoreKind::Jsonl,
+        );
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("short-write-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save short-write baseline");
+        let path = session.path.clone().expect("jsonl session path");
+        drop(session);
+        let before = std::fs::read(&path).expect("read baseline bytes");
+
+        let child = run_persistence_failpoint_child(
+            &path,
+            &harness.temp_path("short-write.marker"),
+            "jsonl",
+            "jsonl_append_short_write",
+            "torn-row",
+            Some("short-write"),
+        );
+        assert!(
+            child.status.success(),
+            "short-write worker failed: {}\nstdout:\n{}\nstderr:\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        assert_eq!(
+            std::fs::read(&path).expect("read bytes after the short write"),
+            before,
+            "the torn row must be cut off"
+        );
+
+        let mut reopened = reopen_strict(&path, "short write").await;
+        reopened.append_message(SessionMessage::User {
+            content: UserContent::Text("after-short-write".to_string()),
+            timestamp: Some(0),
+        });
+        reopened
+            .save()
+            .await
+            .expect("the session stays appendable after a short write");
+        drop(reopened);
+        let reopened = reopen_strict(&path, "append after short write").await;
+        assert_eq!(
+            user_texts_in_order(&reopened.to_messages_for_current_path()),
+            vec!["short-write-base", "after-short-write"]
+        );
     });
 }
 

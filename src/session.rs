@@ -1842,7 +1842,22 @@ fn append_jsonl_entries_blocking(
         if !serialized_entries.is_empty() {
             attachments.validate()?;
             mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
-            file.write_all(&serialized_entries)?;
+            let committed_len = file.metadata()?.len();
+            if let Err(error) = write_jsonl_append_bytes(&mut file, &serialized_entries) {
+                // A short write (a full disk, a file-size limit) leaves a torn
+                // row that every later open refuses to append past. No other
+                // writer can append while the lock is held, so cut the file
+                // back to its last complete row and let the caller retry.
+                return Err(
+                    match file.set_len(committed_len).and_then(|()| file.sync_all()) {
+                        Ok(()) => error,
+                        Err(truncate_error) => Error::session(format!(
+                            "session append failed and its partial row could not be removed from {}: {error}; truncate: {truncate_error}",
+                            path.display()
+                        )),
+                    },
+                );
+            }
         }
         // A failed or cancelled append can leave every requested row visible
         // without a durable acknowledgement. Deduplicating that replay must
@@ -1869,6 +1884,17 @@ fn append_jsonl_entries_blocking(
         header,
         entries: persisted_entries,
     })
+}
+
+fn write_jsonl_append_bytes(file: &mut std::fs::File, bytes: &[u8]) -> Result<()> {
+    // The fault-injection build publishes a torn prefix and fails, as a full
+    // disk would.
+    if let Err(error) = persistence_test_failpoint("jsonl_append_short_write", None) {
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        return Err(error);
+    }
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 fn session_persistence_lock_path(path: &Path) -> PathBuf {
