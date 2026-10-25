@@ -20,6 +20,16 @@ Filename format: `YYYY-MM-DDTHH-MM-SS.sssZ_id.jsonl`
 1. Header: the first line is always a `SessionHeader` object containing metadata (ID, timestamp, CWD, initial settings).
 2. Entries: subsequent lines are `SessionEntry` objects representing events in the conversation.
 
+### When a session is saved
+
+A prompt is saved before the provider sees it. Each completed turn (the
+assistant message and its tool results) is saved before the next provider
+request, so a crash mid-run loses at most the turn in flight.
+`--session-durability throughput` skips those mid-run saves and saves when the
+run returns. An append that fails partway, on a full disk for example, is cut
+back to the last complete line, so the session takes the next save once there
+is room.
+
 ### Entry types
 
 - `message`: User or Assistant message.

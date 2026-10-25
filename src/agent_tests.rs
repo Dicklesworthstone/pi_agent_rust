@@ -1104,6 +1104,116 @@ mod tests {
         });
     }
 
+    /// Answers the first request with one `write` call and never answers the
+    /// second, so the run is still in flight when the test drops it.
+    struct StallAfterToolTurnProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StallAfterToolTurnProvider {
+        fn name(&self) -> &str {
+            "stall-fixture"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _: &Context<'_>,
+            _: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(Box::pin(futures::stream::pending::<Result<StreamEvent>>()));
+            }
+            let call = batch_write_call("checkpointed", "turn-one.txt", "kept");
+            let mut message = assistant_message("Writing the file.");
+            message.content.push(ContentBlock::ToolCall(call.clone()));
+            message.stop_reason = StopReason::ToolUse;
+            Ok(Box::pin(futures::stream::iter([
+                Ok::<_, Error>(StreamEvent::Start {
+                    partial: assistant_message(""),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "Writing the file.".to_string(),
+                }),
+                Ok(StreamEvent::ToolCallEnd {
+                    content_index: 1,
+                    tool_call: call,
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    /// A crash mid-run used to lose every completed turn, because the
+    /// transcript was saved only when the run returned. Dropping the run while
+    /// its second request is in flight skips that final save, as a crash would.
+    #[test]
+    fn completed_turns_reach_disk_before_the_run_returns() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("workspace");
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent::new(
+                Arc::new(StallAfterToolTurnProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                ToolRegistry::new(&["write"], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let saved = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            ))));
+            let mut session = AgentSession::new(
+                agent,
+                Arc::clone(&saved),
+                true,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            let run = Box::pin(session.run_text_with_abort(
+                "Write the file".to_string(),
+                None,
+                |_| {},
+            ));
+            let second_request = Box::pin(async {
+                while calls.load(Ordering::SeqCst) < 2 {
+                    asupersync::runtime::yield_now().await;
+                }
+            });
+            drop(futures::future::select(run, second_request).await);
+            assert!(temp.path().join("turn-one.txt").exists()); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+
+            let path = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                saved.lock(cx.cx()).await.expect("saved session").path.clone().expect("path")
+            };
+            let reopened = Session::open(path.to_string_lossy().as_ref()).await.expect("reopen");
+            let history = reopened.to_messages_for_current_path();
+            assert!(
+                matches!(
+                    history.as_slice(),
+                    [Message::User(_), Message::Assistant(_), Message::ToolResult(_)]
+                ),
+                "{history:?}"
+            ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+        });
+    }
+
     #[test]
     fn stream_rule_cap_survives_continuation_but_a_new_prompt_gets_an_allowance() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");

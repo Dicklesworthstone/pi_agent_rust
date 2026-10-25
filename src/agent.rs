@@ -1089,6 +1089,10 @@ impl RegisteredMessageFetcher {
 
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
 
+/// Persists completed messages mid-run, resolving to whether they reached the
+/// session. Each pair carries whether the message is an authored queued input.
+type TurnCheckpoint = Arc<dyn Fn(Vec<(Message, bool)>) -> BoxFuture<'static, bool> + Send + Sync>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMode {
     All,
@@ -1846,6 +1850,13 @@ pub struct Agent {
     /// provenance after the ephemeral delivery envelope is consumed.
     authored_queue_delivery_indices: Vec<usize>,
 
+    /// Set by an [`AgentSession`] run: receives each completed turn's
+    /// messages before the next provider request, so a crash mid-run loses
+    /// at most the turn in flight. `turn_checkpoint_cursor` is the first
+    /// message index it has not received.
+    turn_checkpoint: Option<TurnCheckpoint>,
+    turn_checkpoint_cursor: usize,
+
     /// Fetchers for queued steering messages (interrupts).
     steering_fetchers: Vec<RegisteredMessageFetcher>,
 
@@ -2070,6 +2081,8 @@ impl Agent {
             extensions: None,
             messages: Vec::new(),
             authored_queue_delivery_indices: Vec::new(),
+            turn_checkpoint: None,
+            turn_checkpoint_cursor: 0,
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
@@ -2427,6 +2440,52 @@ impl Agent {
             .is_ok()
     }
 
+    /// Hand completed turns to `checkpoint` during the next run, starting at
+    /// message index `cursor`.
+    fn arm_turn_checkpoint(&mut self, checkpoint: TurnCheckpoint, cursor: usize) {
+        self.turn_checkpoint = Some(checkpoint);
+        self.turn_checkpoint_cursor = cursor;
+    }
+
+    /// The first message index the checkpoint has not persisted, or `None`
+    /// when no checkpoint was armed.
+    fn disarm_turn_checkpoint(&mut self) -> Option<usize> {
+        self.turn_checkpoint
+            .take()
+            .map(|_| self.turn_checkpoint_cursor)
+    }
+
+    /// At a turn boundary every message is complete. Stop at a failed or
+    /// aborted assistant: the run's final save decides whether it is kept and
+    /// where.
+    async fn checkpoint_completed_turns(&mut self) {
+        let Some(checkpoint) = self.turn_checkpoint.clone() else {
+            return;
+        };
+        let start = self.turn_checkpoint_cursor.min(self.messages.len());
+        let end = self.messages[start..]
+            .iter()
+            .position(is_incomplete_assistant_message)
+            .map_or(self.messages.len(), |offset| start + offset);
+        if start == end {
+            return;
+        }
+        let completed = (start..end)
+            .map(|index| {
+                (
+                    self.messages[index].clone(),
+                    self.is_authored_queue_delivery(index),
+                )
+            })
+            .collect();
+        if !checkpoint(completed).await {
+            return;
+        }
+        self.turn_checkpoint_cursor = end;
+        self.authored_queue_delivery_indices
+            .retain(|index| *index >= end);
+    }
+
     /// Add a message to the history.
     pub fn add_message(&mut self, message: Message) {
         if self.messages.len() >= MAX_AGENT_MESSAGES {
@@ -2441,6 +2500,7 @@ impl Agent {
                     true
                 })
             });
+            self.turn_checkpoint_cursor = self.turn_checkpoint_cursor.saturating_sub(1);
         }
         self.messages.push(message);
     }
@@ -3774,6 +3834,7 @@ impl Agent {
                     pending_messages = current_follow_up;
                 }
 
+                self.checkpoint_completed_turns().await;
                 let current_turn_index = turn_index;
                 let turn_latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
                 let turn_start_event = AgentEvent::TurnStart {
@@ -19899,6 +19960,7 @@ impl AgentSession {
             ));
         let on_event_for_run = Arc::clone(&on_event);
         prompts.extend(semantic_context_messages);
+        self.arm_turn_checkpoint(start_len + 1);
         let result = self
             .agent
             .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
@@ -19996,6 +20058,7 @@ impl AgentSession {
                 semantic_context.as_ref(),
             ));
         let on_event_for_run = Arc::clone(&on_event);
+        self.arm_turn_checkpoint(start_len + 1);
         let result = self
             .agent
             .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
@@ -20095,6 +20158,7 @@ impl AgentSession {
                 semantic_context.as_ref(),
             ));
         let on_event_for_run = Arc::clone(&on_event);
+        self.arm_turn_checkpoint(start_len + 1);
         let result = self
             .agent
             .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
@@ -20243,6 +20307,7 @@ impl AgentSession {
             // Some(ZERO) is the native stop boundary, never an unlimited run.
             prompt_scope.session.agent.config.max_time = turn.remaining_time();
         }
+        prompt_scope.session.arm_turn_checkpoint(start_len);
         let result = if follow_up_first {
             prompt_scope
                 .session
@@ -20285,12 +20350,68 @@ impl AgentSession {
     /// appended last, after audit and queued-steering entries, so
     /// `revert_incomplete_response` can remove it without discarding the
     /// durable audit trail or replaying completed tool effects.
+    /// Save each completed turn while the run goes on, as OMP saves at every
+    /// message end, instead of only when the run returns. Messages before
+    /// `cursor` are already in the session.
+    fn arm_turn_checkpoint(&mut self, cursor: usize) {
+        if !self.save_enabled {
+            return;
+        }
+        let session = Arc::clone(&self.session);
+        let admission = self.provider_admission.clone();
+        let reset_advisor = self.advisor.is_some();
+        let checkpoint: TurnCheckpoint = Arc::new(
+            move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, bool> {
+                let session = Arc::clone(&session);
+                let admission = admission.clone();
+                Box::pin(async move {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let Ok(mut session) = OwnedMutexGuard::lock(session, cx.cx()).await else {
+                        return false;
+                    };
+                    for (message, authored) in messages {
+                        let reset =
+                            reset_advisor && authored && matches!(&message, Message::User(_));
+                        let entry_id = session.append_model_message(message);
+                        if reset
+                            && let Err(err) = append_advisor_input_reset(&mut session, &entry_id)
+                        {
+                            tracing::warn!(error = %err, "mid-run advisor input reset failed");
+                        }
+                    }
+                    if session.autosave_durability_mode()
+                        != crate::session::AutosaveDurabilityMode::Throughput
+                        && let Err(err) = flush_turn_autosave(
+                            &mut session,
+                            &admission,
+                            AutosaveFlushTrigger::Periodic,
+                        )
+                        .await
+                    {
+                        // The rows stay queued; the run's final save retries them
+                        // and reports a failure.
+                        tracing::warn!(error = %err, "mid-run session checkpoint failed");
+                    }
+                    true
+                })
+            },
+        );
+        self.agent.arm_turn_checkpoint(checkpoint, cursor);
+    }
+
     async fn persist_turn_artifacts(
         &mut self,
         start_len: usize,
         run_failed: bool,
         run_incomplete: bool,
     ) -> Result<()> {
+        // Turns a mid-run checkpoint saved are already in the session.
+        let start_len = self
+            .agent
+            .disarm_turn_checkpoint()
+            .map_or(start_len, |cursor| {
+                cursor.clamp(start_len, self.agent.messages().len().max(start_len))
+            });
         let mut new_messages = self.agent.messages()[start_len..]
             .iter()
             .cloned()

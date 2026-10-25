@@ -430,8 +430,10 @@ mod tests {
         Session::open(&path.display().to_string()).await.unwrap()
     }
 
+    /// The completed tool turn was saved before the stalled request, but the
+    /// dropped turn still never reported its outcome: re-entry stays closed.
     #[test]
-    fn dropping_after_a_real_tool_write_refuses_to_rehydrate_older_durable_history() {
+    fn dropping_after_a_real_tool_write_keeps_the_saved_turn_and_refuses_reentry() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
@@ -451,8 +453,8 @@ mod tests {
             let durable = reopen(&handle).await.to_messages_for_current_path();
             assert_eq!(
                 tool_results(&durable),
-                0,
-                "the abandoned tail was not saved"
+                1,
+                "the completed tool turn was saved before the stalled request"
             );
             assert_eq!(
                 durable
