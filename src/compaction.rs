@@ -2504,14 +2504,16 @@ pub(crate) fn prepare_overflow_compaction(
     prepare_compaction_impl(path_entries, settings, true, false)
 }
 
-/// Manual `/compact` and `/shake` ignore the automatic threshold, as in OMP:
-/// the threshold decides when pi compacts on its own, not whether a user may.
-/// Like overflow recovery, the latest authored turn is never summarized. Too
-/// little history, or nothing new since the last compaction, is a no-op.
+/// Manual `/compact` and `/shake` ignore the automatic threshold and the
+/// auto-compaction switch, as in OMP: both decide when pi compacts on its
+/// own, not whether a user may. Like overflow recovery, the latest authored
+/// turn is never summarized. Too little history, or nothing new since the
+/// last compaction, is a no-op.
 pub(crate) fn prepare_manual_compaction(
     path_entries: &[SessionEntry],
-    settings: ResolvedCompactionSettings,
+    mut settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
+    settings.enabled = true;
     prepare_compaction_impl(path_entries, settings, true, false)
 }
 

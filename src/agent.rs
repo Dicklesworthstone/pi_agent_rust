@@ -17617,8 +17617,9 @@ impl AgentSession {
     }
 
     /// Force-run compaction synchronously (used by `/compact` slash command),
-    /// below the automatic threshold too. Returns whether the session changed:
-    /// disabled compaction or too little history is `false`, not an error.
+    /// below the automatic threshold and with auto-compaction off too.
+    /// Returns whether the session changed: too little history is `false`,
+    /// not an error.
     pub async fn compact_now(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
@@ -18387,7 +18388,9 @@ impl AgentSession {
         overflow_abort: Option<&AbortSignal>,
         handoff: Option<(&str, &AbortSignal)>,
     ) -> Result<bool> {
-        if !self.compaction_settings.enabled && handoff.is_none() {
+        // `compaction.enabled` is the automatic switch, as in OMP: it stops
+        // overflow recovery, not a user's `/compact`, `/shake` or handoff.
+        if !self.compaction_settings.enabled && overflow_abort.is_some() {
             return Ok(false);
         }
         let abort = handoff.map(|(_, abort)| abort).or(overflow_abort);

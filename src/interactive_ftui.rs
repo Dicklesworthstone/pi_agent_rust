@@ -7887,7 +7887,7 @@ async fn run_compact_command(
         Ok(true) => send_conversation_reset(handle, agent_tx, done).await,
         Ok(false) => {
             let _ = agent_tx.send(PiMsg::System(format!(
-                "Nothing to {label}: compaction is disabled, or there is too little history since the last compaction"
+                "Nothing to {label}: there is too little history since the last compaction"
             )));
         }
         Err(err) => {

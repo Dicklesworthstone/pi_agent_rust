@@ -5443,6 +5443,8 @@ mod tests {
 
     /// OMP `/shake`: the older span is compacted by dropping bulky content,
     /// recorded as a `shake` compaction, and the provider is never called.
+    /// Auto-compaction is off: it gates pi's own compaction, not the user's
+    /// (turning it off used to make `/compact` and `/shake` no-ops).
     #[test]
     fn shake_compacts_without_a_provider_request() {
         let dir = tempdir().expect("tempdir");
@@ -5459,9 +5461,8 @@ mod tests {
             crate::tools::ToolRegistry::new(&[], Path::new("."), None),
             crate::agent::AgentConfig::default(),
         );
-        // A small window so ~3k tokens of history crosses the threshold.
         let settings = crate::compaction::ResolvedCompactionSettings {
-            enabled: true,
+            enabled: false,
             context_window_tokens: 2_000,
             reserve_tokens: 1_000,
             keep_recent_tokens: 1,
