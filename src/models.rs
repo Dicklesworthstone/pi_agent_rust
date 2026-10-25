@@ -3513,7 +3513,10 @@ fn apply_custom_models_with_provider_headers(
                     entry.api_key.clone_from(&provider_key);
                 }
                 if provider_cfg.compat.is_some() {
-                    entry.compat.clone_from(&provider_cfg.compat);
+                    // Field by field, as `modelOverrides` does: an unrelated
+                    // provider setting must not erase discovered reasoning tiers.
+                    entry.compat =
+                        merge_compat(entry.compat.as_ref(), provider_cfg.compat.as_ref());
                 }
                 if provider_cfg.auth_header.is_some() {
                     entry.auth_header = auth_header;
@@ -3795,10 +3798,14 @@ fn apply_model_override(
         entry.compat = merge_compat(entry.compat.as_ref(), override_cfg.compat.as_ref());
     }
     if let Some(map) = override_cfg.thinking_level_map.clone() {
+        // Per-level: each entry (`null` withdraws a level) refines the map in
+        // place, a discovered ladder included, rather than replacing it.
         entry
             .compat
             .get_or_insert_with(CompatConfig::default)
-            .thinking_level_map = Some(map);
+            .thinking_level_map
+            .get_or_insert_with(HashMap::new)
+            .extend(map);
     }
     if let Some(dialect) = override_cfg.dialect {
         entry
@@ -8365,6 +8372,61 @@ mod tests {
                 Some(7)
             );
         }
+    }
+
+    #[test]
+    fn models_json_overrides_refine_discovered_reasoning_tiers() {
+        use crate::model::ThinkingLevel;
+
+        let (dir, auth) = test_auth_storage();
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            serde_json::json!({"providers": {"openai": {
+                "compat": {"maxTokensField": "max_completion_tokens"},
+                "modelOverrides": {"gpt-4o": {"thinkingLevelMap": {"xhigh": null}}}
+            }}})
+            .to_string(),
+        )
+        .expect("write models.json");
+        let route = resolve_model_catalog_provider_config("openai", &models_path)
+            .expect("resolve OpenAI route")
+            .expect("built-in OpenAI route");
+        let mut provider = fetched_provider_json("openai", &route, &["gpt-4o"]);
+        provider["models"][0]["reasoningLevels"] =
+            serde_json::json!(["low", "medium", "high", "xhigh"]);
+        std::fs::write(
+            fetched_models_path(&models_path),
+            serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA, "providers": {"openai": provider}
+            })
+            .to_string(),
+        )
+        .expect("write advertised reasoning");
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        assert_eq!(registry.error(), None);
+        let entry = registry.find("openai", "gpt-4o").expect("discovered model");
+        let compat = entry.compat.as_ref().expect("merged compatibility");
+        // The provider's unrelated setting merges with the discovered tiers.
+        assert_eq!(
+            compat.max_tokens_field.as_deref(),
+            Some("max_completion_tokens")
+        );
+        assert_eq!(compat.supports_reasoning_effort, Some(true));
+        // The null entry withdraws xhigh and nothing else: off and minimal,
+        // which the model never advertised, stay withdrawn.
+        assert_eq!(
+            compat.thinking_level_map.as_ref().map(HashMap::len),
+            Some(7)
+        );
+        assert_eq!(
+            entry.available_thinking_levels(),
+            vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ]
+        );
     }
 
     #[test]

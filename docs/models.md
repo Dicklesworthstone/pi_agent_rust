@@ -40,7 +40,9 @@ tiers are explicitly disabled so sparse ladders such as only `xhigh` clamp
 correctly. The selected effort still comes from your configuration; a provider's
 `default_reasoning_level` does not change it. Manual provider and model overrides
 load last, including explicit `reasoning: false`, `supportsReasoningEffort: false`,
-and null `thinkingLevelMap` entries. Generated rows cannot supply endpoints,
+and null `thinkingLevelMap` entries. A provider's `compat` merges field by field
+with the discovered settings, and each `thinkingLevelMap` entry refines the
+discovered map for its level only. Generated rows cannot supply endpoints,
 credentials, headers, or arbitrary compatibility settings.
 
 Legacy `pi.models.fetched.v1` files lack the endpoint and transport provenance
