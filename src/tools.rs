@@ -7585,6 +7585,19 @@ impl Tool for ReadTool {
         truncation.total_lines = total_lines;
 
         let mut output_text = std::mem::take(&mut truncation.content);
+        // A line the byte limit cut off would read as complete and the
+        // continue offset would skip its tail; with hashline its tag (of the
+        // whole line) still validates, so an edit of it dropped the unseen
+        // tail. Show whole lines only; the next read starts at the cut line.
+        if truncation.last_line_partial
+            && !truncation.first_line_exceeds_limit
+            && let Some(last_newline) = output_text.rfind('\n')
+        {
+            output_text.truncate(last_newline);
+            truncation.output_lines = truncation.output_lines.saturating_sub(1);
+            truncation.output_bytes = output_text.len();
+            truncation.last_line_partial = false;
+        }
         let mut details: Option<serde_json::Value> = None;
 
         if truncation.first_line_exceeds_limit {
@@ -21452,6 +21465,52 @@ mod tests {
             assert!(out.details.is_some(), "expected truncation details");
             let text = get_text(&out.content);
             assert!(text.contains("offset="));
+        });
+    }
+
+    #[test]
+    fn read_byte_limit_shows_whole_lines_and_continues_at_the_cut_line() {
+        // The byte limit used to cut the last shown line mid-way, with no
+        // marker, and point the continue offset past it.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let body = "x".repeat(2995);
+            let content = (0..1000)
+                .map(|i| format!("{i:04}{body}\n"))
+                .collect::<Vec<_>>()
+                .concat();
+            let path = tmp.path().join("wide.txt");
+            std::fs::write(&path, &content).expect("write");
+            let tool = ReadTool::new(tmp.path());
+            for hashline in [false, true] {
+                let out = tool
+                    .execute(
+                        "t",
+                        serde_json::json!({ "path": path.to_string_lossy(), "hashline": hashline }),
+                        None,
+                    )
+                    .await
+                    .expect("read");
+                let text = get_text(&out.content);
+                let notice_at = text.find("\n\n[Showing lines").expect("byte-limit notice");
+                let (shown, notice) = text.split_at(notice_at);
+                let next: usize = notice
+                    .split("offset=")
+                    .nth(1)
+                    .map(|rest| {
+                        rest.chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>()
+                    })
+                    .and_then(|digits| digits.parse().ok())
+                    .expect("continue offset");
+                // The last shown line is whole and is the one before `next`.
+                let last = shown.lines().last().expect("a shown line");
+                let whole = format!("{:04}{body}", next - 2);
+                assert!(last.ends_with(&whole), "hashline={hashline}: {last:.40}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+                let cut = format!("{:04}x", next - 1);
+                assert!(!shown.contains(&cut), "hashline={hashline}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            }
         });
     }
 
