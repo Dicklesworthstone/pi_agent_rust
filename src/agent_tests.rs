@@ -5509,6 +5509,34 @@ mod tests {
     }
 
     #[test]
+    fn handoff_is_not_refused_for_a_background_compaction_left_by_the_last_turn() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+            let mut agent_session = build_switch_test_session(&auth);
+            // The last turn started a background compaction; nothing applies or
+            // clears it until the next prompt.
+            agent_session.park_pending_compaction_for_test(&handle, None);
+            let (_abort, signal) = AbortHandle::new();
+            let error = agent_session
+                .handoff_now("", &signal, |_| {})
+                .await
+                .expect_err("an empty session has nothing to hand off");
+            let message = error.to_string();
+            assert_eq!(
+                message.matches("Nothing safe to hand off").count(),
+                1,
+                "{message}"
+            );
+        });
+    }
+
+    #[test]
     fn set_thinking_level_quarantines_failed_persistence_without_live_mutation() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()

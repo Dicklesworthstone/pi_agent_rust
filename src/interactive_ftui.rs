@@ -4880,12 +4880,17 @@ impl PiFtuiModel {
         }
     }
 
-    fn abort_handoff(&mut self) {
+    /// Cancel a running handoff, reporting whether this call cancelled it.
+    fn abort_handoff(&mut self) -> bool {
         if let Some(busy) = &mut self.busy
             && let Some(request) = &busy.handoff
+            && !request.abort.signal().is_aborted()
         {
             request.abort.abort();
             busy.label = "cancelling handoff ...".to_string();
+            true
+        } else {
+            false
         }
     }
 
@@ -5081,7 +5086,12 @@ impl PiFtuiModel {
                 let double_tap = self
                     .last_ctrl_c
                     .is_some_and(|at| at.elapsed() < CTRL_C_EXIT_WINDOW);
-                if ctrl_c && self.busy.is_some() && self.abort_driver_operation() {
+                // A handoff has no driver abort lane, so without its own arm
+                // the press fell through and cleared the draft instead.
+                if ctrl_c
+                    && self.busy.is_some()
+                    && (self.abort_handoff() || self.abort_driver_operation())
+                {
                     self.last_ctrl_c = None;
                     return Cmd::none();
                 }
@@ -13202,6 +13212,34 @@ mod tests {
             "{}",
             serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"request_owned_busy"})
         );
+    }
+
+    #[test]
+    fn ctrl_c_during_a_handoff_cancels_it_and_keeps_the_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let slot: TurnAbortSlot = Arc::default();
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_turn_abort(Arc::clone(&slot));
+        model.displayed_session_id = Some("current-session".into());
+        model.input.set_text("/handoff");
+        model.submit_input();
+        let request = match submit_rx.try_recv() {
+            Ok(UiCommand::Handoff { request, .. }) => Some(request),
+            _ => None,
+        }
+        .expect("native handoff route");
+        model.input.set_text("Keep this draft");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        assert_eq!(sim.model().busy_label(), Some("cancelling handoff ..."));
+        assert_eq!(
+            request.abort.signal().is_aborted().then_some("cancelled"),
+            Some("cancelled")
+        );
+        assert_eq!(sim.model().input.text(), "Keep this draft");
     }
 
     #[test]

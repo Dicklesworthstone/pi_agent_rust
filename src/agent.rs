@@ -17608,11 +17608,12 @@ impl AgentSession {
                 "Handoff focus must fit 4096 bytes and contain no NUL",
             ));
         }
-        if self.extensions_turn_active.load(Ordering::SeqCst)
-            || self.extensions_is_compacting.load(Ordering::SeqCst)
-        {
+        // A set compacting flag here is a background compaction left running
+        // by the last turn (this borrow excludes a foreground one). The
+        // handoff's own compaction supersedes it, as an explicit compact does.
+        if self.extensions_turn_active.load(Ordering::SeqCst) {
             return Err(Error::session(
-                "Wait for the current turn or compaction before handing off",
+                "Wait for the current turn before handing off",
             ));
         }
         let changed = self
