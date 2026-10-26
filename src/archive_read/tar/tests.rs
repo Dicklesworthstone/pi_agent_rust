@@ -241,3 +241,139 @@ fn public_read_tool_routes_tar_members_through_pagination_and_hashline_admission
         assert!(rejected.to_string().contains("ARCHIVE_HASHLINE"));
     });
 }
+
+fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+    let mut length = key.len() + value.len() + 4;
+    loop {
+        let actual = length.to_string().len() + 1 + key.len() + 1 + value.len() + 1;
+        if actual == length { break; }
+        length = actual;
+    }
+    let mut bytes = format!("{length} {key}=").into_bytes();
+    bytes.extend_from_slice(value);
+    bytes.push(b'\n');
+    bytes
+}
+
+fn extension(bytes: &mut Vec<u8>, kind: u8, fields: &[(&str, &[u8])]) {
+    let data: Vec<u8> = fields.iter().flat_map(|(key, value)| pax_record(key, value)).collect();
+    append(bytes, &header("PaxHeader", data.len() as u64, kind), &data);
+}
+
+#[test]
+fn pax_utf8_path_and_size_override_only_the_next_regular_member() {
+    let name = format!("release/{}notes.txt", "évidence/".repeat(20));
+    let mut bytes = Vec::new();
+    extension(&mut bytes, b'x', &[("path", name.as_bytes()), ("size", b"2"), ("mtime", b"0.25")]);
+    append(&mut bytes, &header("placeholder", 0, b'0'), b"ok");
+    append(&mut bytes, &header("ordinary", 3, b'0'), b"yes");
+    bytes.resize(bytes.len() + BLOCK * 2, 0);
+    let result = read(Cursor::new(&bytes), &name, false).unwrap();
+    assert_eq!(result.content, "ok");
+    assert_eq!(result.entry_count, 2, "extension headers are not visible members");
+    assert_eq!(read(Cursor::new(&bytes), "ordinary", false).unwrap().content, "yes");
+    assert!(error(&bytes, "placeholder").contains("not found"));
+}
+
+#[test]
+fn pax_global_values_local_deletion_and_global_deletion_follow_header_scope() {
+    let mut bytes = Vec::new();
+    extension(&mut bytes, b'g', &[("size", b"2"), ("comment", b"git archive commit")]);
+    append(&mut bytes, &header("inherited", 0, b'0'), b"ab");
+    extension(&mut bytes, b'x', &[("size", b"")]);
+    append(&mut bytes, &header("local-reset", 3, b'0'), b"xyz");
+    append(&mut bytes, &header("inherited-again", 0, b'0'), b"cd");
+    extension(&mut bytes, b'g', &[("size", b"")]);
+    append(&mut bytes, &header("global-reset", 1, b'0'), b"q");
+    bytes.resize(bytes.len() + BLOCK * 2, 0);
+    for (name, content) in [("inherited", "ab"), ("local-reset", "xyz"),
+        ("inherited-again", "cd"), ("global-reset", "q")] {
+        assert_eq!(read(Cursor::new(&bytes), name, false).unwrap().content, content);
+    }
+}
+
+#[test]
+fn gnu_long_names_do_not_leak_into_the_next_entry() {
+    let name = format!("{}file", "nested/".repeat(30));
+    let mut long = name.as_bytes().to_vec();
+    long.push(0);
+    let mut bytes = Vec::new();
+    append(&mut bytes, &header("././@LongLink", long.len() as u64, b'L'), &long);
+    append(&mut bytes, &header("truncated", 2, b'0'), b"ok");
+    append(&mut bytes, &header("next", 3, b'0'), b"yes");
+    bytes.resize(bytes.len() + BLOCK * 2, 0);
+    assert_eq!(read(Cursor::new(&bytes), &name, false).unwrap().content, "ok");
+    assert_eq!(read(Cursor::new(&bytes), "next", false).unwrap().content, "yes");
+}
+
+#[test]
+fn malformed_duplicate_or_unsupported_pax_records_are_not_ignored() {
+    for data in [b"0 path=x\n".to_vec(), b"999 path=x\n".to_vec(),
+        b"11 path=x".to_vec(), b"999999999999999999999999 path=x\n".to_vec(),
+        [pax_record("path", b"one"), pax_record("path", b"two")].concat(),
+        pax_record("size", b"-1"), pax_record("size", b"+1"),
+        pax_record("path", b"\xff"), pax_record("GNU.sparse.map", b"0,100"),
+        pax_record("SCHILY.filetype", b"sparse"), pax_record("linkpath", b"target"),
+        pax_record("hdrcharset", b"BINARY")] {
+        assert!(pax(&data).is_err(), "{data:?}");
+    }
+    let too_many: Vec<u8> = (0..=MAX_PAX_RECORDS)
+        .flat_map(|index| pax_record(&format!("SCHILY.xattr.key{index}"), b"v")).collect();
+    assert!(pax(&too_many).is_err());
+}
+
+#[test]
+fn orphan_ambiguous_and_oversized_extensions_fail_before_publication() {
+    for kind in [b'x', b'L'] {
+        let data = if kind == b'x' { pax_record("path", b"file") } else { b"file\0".to_vec() };
+        let mut bytes = Vec::new();
+        append(&mut bytes, &header("metadata", data.len() as u64, kind), &data);
+        bytes.resize(bytes.len() + BLOCK * 2, 0);
+        assert!(error(&bytes, "").contains("no following member"));
+    }
+    let mut bytes = Vec::new();
+    extension(&mut bytes, b'x', &[("path", b"one")]);
+    extension(&mut bytes, b'x', &[("path", b"two")]);
+    assert!(error(&bytes, "").contains("consecutive"));
+    assert!(error(&header("metadata", MAX_EXTENSION_BYTES + 1, b'x'), "").contains("64 KiB"));
+    assert!(error(&header("metadata", MAX_MEMBER_NAME_BYTES as u64 + 2, b'L'), "").contains("path limit"));
+    let mut bytes = Vec::new();
+    append(&mut bytes, &header("metadata", 4, b'L'), b"file");
+    assert!(error(&bytes, "").contains("NUL terminator"));
+}
+
+#[test]
+fn extended_names_and_sizes_cannot_bypass_archive_admission() {
+    for path in [b"../outside".as_slice(), b"/absolute", b"C:\\outside", b"nul\0name"] {
+        assert!(pax(&pax_record("path", path)).is_err());
+    }
+    let mut bytes = Vec::new();
+    append(&mut bytes, &header("safe", 2, b'0'), b"ok");
+    extension(&mut bytes, b'x', &[("path", b"./safe")]);
+    append(&mut bytes, &header("other", 2, b'0'), b"no");
+    bytes.resize(bytes.len() + BLOCK * 2, 0);
+    assert!(error(&bytes, "safe").contains("duplicate"));
+    let mut oversized = Vec::new();
+    extension(&mut oversized, b'x', &[("size", (MAX_TOTAL_MEMBER_BYTES + 1).to_string().as_bytes())]);
+    oversized.extend(header("large", 0, b'0'));
+    assert!(error(&oversized, "").contains("64 MiB"));
+}
+
+#[test]
+fn standard_python_tarfile_producers_are_native_reader_fixtures() {
+    use base64::Engine as _;
+    // Produced with Python tarfile in PAX/GNU/USTAR modes and gzip(mtime=0).
+    // Independently read by Python and GNU tar; these embedded bytes do not
+    // depend on this module's test header writer or a subprocess at test time.
+    for (encoded, path) in [
+        ("H4sIAAAAAAAC/+3TTQqCQBjG8Vl7Ck+g46i5kgoS2gTRDQadSEgLtfBKnaOL9YVBC1dhFP1/m3l4NwPvy+O4jjtZ6nZudGYqMQj50PdKFUXPfJ97Uilf2K34gEPd6Or6vfhPXhTZe91s4spsja6Nez4d88yU6XelVTKdLRKnyCwvsIsmL0wsHRVaAu/pzj7uNj1AuJV6FAS9/Zde+Np/X6pAClvS/8Gt86purNqkuzKjTQAAAAAAAAAAAAAAAL/nAkBepQkAKAAA",
+            format!("release/{}README.md", "évidence/".repeat(15))),
+        ("H4sIAAAAAAAC/+3TMQ6CMBSA4c6cohcQSqCwaiIbLt6AQDVEaAnF+6shMXFgxEj8v+W1XV//MAqjfenstWztTaxDzZamSlT2Ps/vea5TIUvxBXc/VaOU4k+NpjOVN1H3/AK72vWDs8ZO27iei8PxVIR9I/DL+39FnaXpYv8q1p/9J3GilZCK/ld3aUc/Bd7UzjYBOQAAAAAAAAAAAAAAAGzOA22a8c4AKAAA",
+            format!("release/{}README.md", "long-component/".repeat(12))),
+        ("H4sIAAAAAAAC/+3QsQqDMBDG8Zt9ij5BjZq6F+rYpW8QaqSFWiVJ37/RRXBWUfj/hvuOG+7gehNeab9GeVTX2706t7WoqNR6zGieSmWXqR/mRZHrTE5KNvDzwbh4fum9zn6s8XZ6iOxS83Y+JN4+u2+dCAAAAAAAAAAAAAAAAADgKP6au+CIACgAAA==",
+            format!("release/{}README.md", "path/".repeat(20))),
+    ] {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        assert_eq!(read(Cursor::new(bytes), &path, true).unwrap().content, "first\nsecond\n");
+    }
+}
