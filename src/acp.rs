@@ -29,6 +29,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::significant_drop_tightening)]
 
+mod client_files;
 mod content;
 mod history;
 mod mcp;
@@ -182,6 +183,7 @@ struct AcpOutputShared {
     failed: AbortHandle,
     failure: AbortSignal,
     pending_permissions: PendingPermissionMap,
+    files: client_files::Requests,
 }
 
 #[derive(Default)]
@@ -210,6 +212,7 @@ impl AcpOutputShared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.files.close();
         self.failed.abort();
     }
 
@@ -232,6 +235,7 @@ impl AcpOutput {
                 failed,
                 failure,
                 pending_permissions: Arc::new(StdMutex::new(HashMap::new())),
+                files: client_files::Requests::default(),
             }),
         }
     }
@@ -309,6 +313,11 @@ impl AcpOutput {
         if state.prompts.contains_key(&session_id) {
             return Err(Error::session("ACP session already has an active prompt"));
         }
+        if self.shared.files.has_write(&session_id) {
+            return Err(Error::session(
+                "Waiting for the editor to acknowledge a previous file write",
+            ));
+        }
         let input = Arc::new(steering::Mailbox::new());
         state.prompts.insert(
             session_id.clone(),
@@ -378,7 +387,7 @@ impl AcpOutput {
     }
 
     fn abort_prompt(&self, session_id: &str) {
-        let cancelled = {
+        let (cancelled, reads) = {
             let state = self
                 .shared
                 .state
@@ -388,9 +397,18 @@ impl AcpOutput {
                 prompt.input.seal();
                 prompt.abort.abort();
             }
-            self.take_permissions(session_id)
+            (
+                self.take_permissions(session_id),
+                self.shared.files.cancel_reads(session_id),
+            )
         };
         self.cancel_permissions(cancelled);
+        for request_id in reads {
+            let _ = self.send(json_rpc_notification(
+                "$/cancel_request",
+                json!({"requestId":request_id}),
+            ));
+        }
     }
 
     /// Detach under the output-state lock so admission cannot race a new
@@ -451,8 +469,19 @@ impl AcpOutput {
         } else {
             Vec::new()
         };
+        let reads = if admitted.is_ok() && steer {
+            self.shared.files.cancel_reads(session_id)
+        } else {
+            Vec::new()
+        };
         drop(state);
         self.cancel_permissions(cancelled);
+        for request_id in reads {
+            let _ = self.send(json_rpc_notification(
+                "$/cancel_request",
+                json!({"requestId":request_id}),
+            ));
+        }
         match admitted {
             Ok(()) => {}
             Err((input, false)) => {
@@ -482,6 +511,7 @@ impl AcpOutput {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.shared.files.close();
         let drain = async {
             loop {
                 if self
@@ -929,7 +959,9 @@ async fn run(
                 };
 
                 if raw_message.get("method").is_none() {
-                    let _ = route_permission_response(&raw_message, &pending_permissions, &cx);
+                    if !route_permission_response(&raw_message, &pending_permissions, &cx) {
+                        out_tx.shared.files.route_response(&raw_message, &cx);
+                    }
                     continue;
                 }
 
@@ -962,6 +994,7 @@ async fn run(
 
                 match request.method.as_str() {
                     "initialize" => {
+                        out_tx.shared.files.negotiate(&request.params);
                         let result = handle_initialize();
                         initialized.store(true, Ordering::SeqCst);
                         let _ = out_tx.send(json_rpc_ok(id, result));
@@ -1177,7 +1210,17 @@ async fn run(
 
                         let (abort_handle, abort_signal) = AbortHandle::new();
                         let mut prompt_guard =
-                            out_tx.begin_prompt(session_id.clone(), abort_handle)?;
+                            match out_tx.begin_prompt(session_id.clone(), abort_handle) {
+                                Ok(guard) => guard,
+                                Err(error) => {
+                                    let _ = out_tx.send(json_rpc_error(
+                                        id,
+                                        PROMPT_IN_PROGRESS,
+                                        error.to_string(),
+                                    ));
+                                    continue;
+                                }
+                            };
 
                         // Per ACP, the server replies to session/prompt only after the
                         // turn completes — with a stopReason. Spawn the work and have
@@ -1336,12 +1379,13 @@ async fn run(
                         };
                         // Check the reservation as well as agent_session: a spawned
                         // prompt may not yet have taken the agent out of its state.
-                        let busy = out_tx.prompt_is_active(session_id);
+                        let busy = out_tx.prompt_is_active(session_id)
+                            || out_tx.shared.files.has_write(session_id);
                         if busy {
                             let _ = out_tx.send(json_rpc_error(
                                 id,
                                 PROMPT_IN_PROGRESS,
-                                "Cannot load or resume a session while a prompt is in progress",
+                                "Cannot load or resume a session while a prompt or editor file write is in progress",
                             ));
                             continue;
                         }
@@ -2161,6 +2205,13 @@ fn build_acp_session(
     } else {
         ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config))
     };
+    client_files::bind(
+        &tools,
+        permission_client,
+        &session_id,
+        &cwd,
+        options.session_dir.as_ref(),
+    )?;
 
     let selection = resolve_acp_selection(&session, &cwd, options, &mut cli)?;
     if let Some(message) = &selection.fallback_message {

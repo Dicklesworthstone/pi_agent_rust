@@ -35,8 +35,10 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 pub(crate) mod bash_session;
+mod client_files;
 mod structured_json;
 mod structured_sqlite;
+pub use client_files::{TextFileClient, TextFileClientScope};
 
 /// Run an internal, resource-bounded data query before normal Pi startup.
 /// The worker receives admitted bytes and never loads project configuration,
@@ -362,6 +364,9 @@ pub trait Tool: Send + Sync {
     /// Attach the owning registry's live provider/model identity.
     /// Tools that do not delegate model work intentionally ignore it.
     fn bind_model_scope(&mut self, _scope: ToolModelScope) {}
+
+    /// Attach the owning host's editor filesystem without changing tool policy.
+    fn bind_text_file_client_scope(&mut self, _scope: TextFileClientScope) {}
 
     /// Where the tool comes from. Extension-registered tools answer
     /// [`ToolOrigin::Extension`] so `setActiveTools` can shelve and restore
@@ -5602,6 +5607,7 @@ pub struct ToolRegistry {
     job_session_scope: crate::jobs::JobSessionScope,
     /// Shared by delegating tools and updated on every host provider switch.
     model_scope: ToolModelScope,
+    text_file_client_scope: TextFileClientScope,
     /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
     /// schema until promoted via `xdev promote`. Everything not in this set
     /// is in the schema (essential tier).
@@ -5792,6 +5798,7 @@ impl ToolRegistry {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
+        let text_file_client_scope = TextFileClientScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
         let image_auto_resize = config.is_none_or(Config::image_auto_resize);
@@ -6092,6 +6099,7 @@ impl ToolRegistry {
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
+            tool.bind_text_file_client_scope(text_file_client_scope.clone());
         }
 
         Self {
@@ -6099,6 +6107,7 @@ impl ToolRegistry {
             inactive: Vec::new(),
             job_session_scope,
             model_scope,
+            text_file_client_scope,
             discoverable: discoverable_names,
             mutation_recorder,
             host_ask,
@@ -6121,16 +6130,19 @@ impl ToolRegistry {
     pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
+        let text_file_client_scope = TextFileClientScope::default();
         let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
+            tool.bind_text_file_client_scope(text_file_client_scope.clone());
         }
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
             inactive: Vec::new(),
             job_session_scope,
             model_scope,
+            text_file_client_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
             host_ask,
@@ -6149,6 +6161,7 @@ impl ToolRegistry {
             inactive: self.inactive.clone(),
             job_session_scope: self.job_session_scope.clone(),
             model_scope: self.model_scope.clone(),
+            text_file_client_scope: self.text_file_client_scope.clone(),
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
             host_ask: self.host_ask.clone(),
@@ -6231,6 +6244,7 @@ impl ToolRegistry {
     pub fn push(&mut self, mut tool: Box<dyn Tool>) {
         tool.bind_job_session_scope(self.job_session_scope.clone());
         tool.bind_model_scope(self.model_scope.clone());
+        tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
         let name = tool.name();
         if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
             self.tools[pos] = Arc::from(tool);
@@ -6247,6 +6261,7 @@ impl ToolRegistry {
         for mut tool in tools {
             tool.bind_job_session_scope(self.job_session_scope.clone());
             tool.bind_model_scope(self.model_scope.clone());
+            tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
             let name = tool.name();
             if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
                 self.tools[pos] = Arc::from(tool);
@@ -6284,6 +6299,7 @@ impl ToolRegistry {
             if next.description() != tool.description() || next.parameters() != tool.parameters() {
                 next.bind_job_session_scope(self.job_session_scope.clone());
                 next.bind_model_scope(self.model_scope.clone());
+                next.bind_text_file_client_scope(self.text_file_client_scope.clone());
                 *tool = Arc::from(next);
                 changed += 1;
             }
@@ -6300,6 +6316,7 @@ impl ToolRegistry {
             }
             next.bind_job_session_scope(self.job_session_scope.clone());
             next.bind_model_scope(self.model_scope.clone());
+            next.bind_text_file_client_scope(self.text_file_client_scope.clone());
             self.tools.push(Arc::from(next));
             changed += 1;
         }
@@ -6334,6 +6351,10 @@ impl ToolRegistry {
             .iter()
             .find(|t| t.name() == name)
             .map(|tool| &**tool)
+    }
+
+    pub(crate) fn set_text_file_client(&self, client: Arc<dyn TextFileClient>) -> Result<()> {
+        self.text_file_client_scope.set(client)
     }
 }
 
@@ -6514,6 +6535,7 @@ struct ReadInput {
 
 pub struct ReadTool {
     cwd: PathBuf,
+    text_file_client: TextFileClientScope,
     /// Whether to auto-resize images to fit token limits.
     auto_resize: bool,
     block_images: bool,
@@ -6530,6 +6552,7 @@ impl ReadTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -6550,6 +6573,7 @@ impl ReadTool {
     pub fn with_settings(cwd: &Path, auto_resize: bool, block_images: bool) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             auto_resize,
             block_images,
@@ -6571,6 +6595,7 @@ impl ReadTool {
     fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -6587,6 +6612,7 @@ impl ReadTool {
     ) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -6914,6 +6940,10 @@ fn document_read_output(
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ReadTool {
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "read"
     }
@@ -7034,6 +7064,14 @@ impl Tool for ReadTool {
         );
         let path = resolve_read_path(source_path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
+
+        if sqlite_request.is_none()
+            && archive_path.is_none()
+            && video_target.is_none()
+            && let Some(output) = self.execute_client_read(&input, &path).await?
+        {
+            return Ok(output);
+        }
 
         let path_for_open = path.clone();
         let mut allowed_roots = self.workspace.snapshot_or(&self.cwd).all();
@@ -10727,6 +10765,7 @@ struct EditInput {
 
 pub struct EditTool {
     cwd: PathBuf,
+    text_file_client: TextFileClientScope,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
     workspace: WorkspaceHandle,
@@ -10736,6 +10775,7 @@ impl EditTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: None,
             mutation_recorder: None,
@@ -10763,6 +10803,7 @@ impl EditTool {
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: Some(Arc::new(hook)),
             mutation_recorder: None,
@@ -11877,6 +11918,10 @@ impl HashlineEditTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EditTool {
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "edit"
     }
@@ -11935,6 +11980,10 @@ impl Tool for EditTool {
 
         let absolute_path = resolve_read_path(&input.path, &self.cwd);
         let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit", &self.workspace)?;
+
+        if let Some(output) = self.execute_client_edit(&input, &absolute_path).await? {
+            return Ok(output);
+        }
 
         let meta = std_metadata_async(&absolute_path).await.map_err(|err| {
             let message = match err.kind() {
@@ -12117,6 +12166,7 @@ struct WriteInput {
 
 pub struct WriteTool {
     cwd: PathBuf,
+    text_file_client: TextFileClientScope,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
     workspace: WorkspaceHandle,
@@ -12126,6 +12176,7 @@ impl WriteTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: None,
             mutation_recorder: None,
@@ -12218,6 +12269,7 @@ impl WriteTool {
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: Some(Arc::new(hook)),
             mutation_recorder: None,
@@ -12244,6 +12296,10 @@ fn ends_with_read_truncation_notice(content: &str) -> bool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "write"
     }
@@ -12391,6 +12447,10 @@ impl Tool for WriteTool {
 
         let path = resolve_path(&input.path, &self.cwd);
         let path = enforce_cwd_scope(&path, &self.cwd, "write", &self.workspace)?;
+
+        if let Some(output) = self.execute_client_write(&input, &path).await? {
+            return Ok(output);
+        }
 
         match std_metadata_async(&path).await {
             Ok(meta) => {
@@ -17258,6 +17318,7 @@ struct ResolvedEdit<'a> {
 
 pub struct HashlineEditTool {
     cwd: PathBuf,
+    text_file_client: TextFileClientScope,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
     workspace: WorkspaceHandle,
@@ -17267,6 +17328,7 @@ impl HashlineEditTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             before_persist_hook: None,
             mutation_recorder: None,
             workspace: WorkspaceHandle::default(),
@@ -17294,6 +17356,7 @@ impl HashlineEditTool {
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
             before_persist_hook: Some(Arc::new(hook)),
             mutation_recorder: None,
             workspace: WorkspaceHandle::default(),
@@ -17408,6 +17471,10 @@ fn op_precedence(op: &str) -> u8 {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for HashlineEditTool {
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "hashline_edit"
     }
@@ -17489,6 +17556,13 @@ impl Tool for HashlineEditTool {
         let resolved = resolve_read_path(&input.path, &self.cwd);
         let absolute_path =
             enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit", &self.workspace)?;
+
+        if let Some(output) = self
+            .execute_client_hashline_edit(&input, &absolute_path)
+            .await?
+        {
+            return Ok(output);
+        }
 
         // Check file size
         let metadata = std_metadata_async(&absolute_path).await.map_err(|err| {

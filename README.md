@@ -647,6 +647,33 @@ holds at most 100 requests and 8 MiB; each request is limited to 128 blocks,
 4 MiB for serialized content and request ID together, and 256 KiB of authored prose.
 An overflowing queue returns `"failed"` without accepting the input.
 
+**ACP editor files.** Clients can advertise `clientCapabilities.fs.readTextFile`
+and `writeTextFile` in `initialize`. Pi then sends standard outbound
+`fs/read_text_file` and `fs/write_text_file` requests, scoped to the owning
+`sessionId` and an absolute workspace path. Native `read`, `write`, `edit`, and
+`hashline_edit` work with unsaved editor buffers, including new files that do
+not yet exist on disk. Tool approval and workspace/symlink checks run before
+any editor request. Text buffers are limited to 10 MiB; read pagination and
+hashline tags are derived from the editor text. Rendered documents, notebooks,
+binary media, internal artifacts, and non-file URLs keep their native routes.
+
+Capabilities are independent: without an advertised capability the corresponding
+operation remains local. A failed advertised editor read never falls back to
+stale disk content. With a read-only client, an edit can write locally only if
+disk still matches the exact editor preimage. Edits re-read their source before
+writing to catch intervening changes; ACP does not provide atomic versioned
+compare-and-swap. After an acknowledged editor write, Pi reads back when
+possible and reports formatter changes from the resulting buffer. If read-back
+is unavailable, Pi reports an acknowledged, unverified write and does not claim
+a verified diff or a disk undo record.
+
+Cancellation discards pending reads and ignores their late responses. A write
+already published to the editor may still complete: cancellation or timeout
+stops the current prompt and holds further prompts or reloads for that session
+until its matching valid acknowledgment or error arrives. Pi explicitly reports
+that the write was not rolled back. Malformed or unrelated responses cannot
+clear this hold, and other sessions can continue normally.
+
 **Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
