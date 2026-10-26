@@ -1,4 +1,4 @@
-//! Bounded, read-only navigation of ZIP archives and ZIP-based packages.
+//! Bounded, read-only navigation of ZIP packages and TAR source archives.
 //!
 //! The caller admits and opens the outer file within the active workspace.
 //! This module consumes that descriptor (or document bytes), never reopens a
@@ -15,6 +15,8 @@ use std::rc::Rc;
 use zip::{CompressionMethod, ZipArchive};
 
 use crate::error::{Error, Result};
+
+mod tar;
 
 const MAX_ARCHIVE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_TOTAL_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
@@ -53,10 +55,17 @@ pub fn parse_path(path: &str) -> Result<Option<ArchivePath>> {
 }
 
 fn is_archive_path(path: &str) -> bool {
-    Path::new(path).extension().is_some_and(|extension| {
-        ["zip", "jar", "war", "ear", "apk", "whl"]
+    let path = Path::new(path);
+    path.extension().is_some_and(|extension| {
+        ["zip", "jar", "war", "ear", "apk", "whl", "tar", "tgz", "crate"]
             .iter()
             .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            || (extension.eq_ignore_ascii_case("gz")
+                && path.file_stem().is_some_and(|stem| {
+                    Path::new(stem)
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("tar"))
+                }))
     })
 }
 
@@ -325,7 +334,18 @@ pub struct ArchiveReadOutcome {
     pub entry_count: usize,
 }
 
-pub fn read_open_file(file: File, member: &str) -> Result<ArchiveReadOutcome> {
+pub fn read_open_file(mut file: File, member: &str) -> Result<ArchiveReadOutcome> {
+    // Detect from the admitted descriptor, not by reopening its path. The ZIP
+    // reader used for Office/EPUB stays ZIP-only; TAR cannot alter that contract.
+    let mut signature = Vec::new();
+    file.by_ref().take(512).read_to_end(&mut signature)?;
+    file.seek(SeekFrom::Start(0))?;
+    if signature.starts_with(&[0x1f, 0x8b]) {
+        return tar::read(file, member, true);
+    }
+    if tar::recognizes(&signature) {
+        return tar::read(file, member, false);
+    }
     read_archive(ArchiveReader::new(file)?, member)
 }
 
