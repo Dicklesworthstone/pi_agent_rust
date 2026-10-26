@@ -33,6 +33,7 @@ mod definition;
 mod execution;
 #[cfg(test)]
 mod execution_tests;
+mod model_selection;
 mod protocol;
 mod seance;
 mod worker;
@@ -133,6 +134,8 @@ pub struct SubagentTool {
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
     role_model_spec: Option<String>,
+    /// Effective host policy used when admitting explicit task model choices.
+    model_config: Option<Config>,
     /// Live host identity for tools mounted in an agent's registry.
     model_scope: Option<ToolModelScope>,
     /// An explicit launch-time snapshot for background host commands.
@@ -263,6 +266,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            model_config: None,
             model_scope: None,
             parent_model: None,
             timeout: None,
@@ -297,6 +301,15 @@ impl SubagentTool {
     #[must_use]
     pub fn with_role_model_spec(mut self, spec: Option<String>) -> Self {
         self.role_model_spec = spec.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Retain the host's already trust-filtered provider policy. Standalone
+    /// callers without a snapshot use global settings, never untrusted project
+    /// settings, when admitting an explicit model override.
+    #[must_use]
+    pub fn with_model_config(mut self, config: Option<Config>) -> Self {
+        self.model_config = config;
         self
     }
 
@@ -371,6 +384,8 @@ impl SubagentTool {
         let request = SubagentTask {
             agent: TAN_AGENT_NAME.to_string(),
             task: task.to_string(),
+            model: None,
+            model_selection: None,
             cwd: Some(self.cwd.clone()),
             isolation: None,
             iso_apply: None,
@@ -407,6 +422,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            model_config: None,
             model_scope: None,
             parent_model: None,
             timeout: None,
@@ -442,7 +458,16 @@ impl SubagentTool {
         deadline: Deadline,
     ) -> Result<PreparedRequest> {
         let parent_model = self.capture_parent_model();
+        let mut mode = request.mode()?;
         let agents = self.discover(request.scope)?;
+        match &mut mode {
+            RequestMode::Single(task) => {
+                model_selection::prepare(self, std::iter::once(task), deadline)?;
+            }
+            RequestMode::Parallel(tasks) | RequestMode::Chain(tasks) => {
+                model_selection::prepare(self, tasks.iter_mut(), deadline)?;
+            }
+        }
         let concurrency = request
             .concurrency
             .unwrap_or(DEFAULT_CONCURRENCY)
@@ -458,7 +483,7 @@ impl SubagentTool {
             )
             .with_parent_model(parent_model),
             agents,
-            mode: request.mode()?,
+            mode,
             concurrency,
             deadline,
         })
@@ -526,6 +551,7 @@ impl Tool for SubagentTool {
     fn description(&self) -> &'static str {
         concat!(
             "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
+            " Model selection: an optional model on one task or workflow call accepts an exact provider/model[:thinking] or unambiguous catalog ID, overriding definition/task-role/parent defaults. Every explicit selector is checked before any child or worktree is created; unknown, unavailable, disabled or unsupported destinations fail without fallback. Put model on each tasks/chain entry, not the batch. worker_start and pool_start freeze the same option for their entire lifetime; send/push cannot switch models.",
             " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
             " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback.",
             " Set async: true on a single, parallel tasks, chain, or workflow request to return a session-owned background job immediately. Use jobs list/wait/cancel with its jobId; a settled wait includes the native subagent or workflow result. Completion also arrives through the normal background follow-up queue. Definitions, model and request deadline freeze before acknowledgment; queued work does not get a fresh timeout. Background delegation does not retain an eval cell or an Agent callback. Seance remains foreground.",
@@ -550,7 +576,7 @@ impl Tool for SubagentTool {
                 "task": {"type": "string", "description": "Task for a single delegation."},
                 "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, chain, or workflow request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance."},
                 "sourceSession": {"type": "string", "minLength": 1, "description": "Required only for agent: seance. Explicit v3 JSONL file path, absolute or relative to the host workspace, admitted only within the workspace, live added roots, or configured agent data directory. The source is inspected read only; IDs, discovery and SQLite sessions are not supported."},
-                "model": {"type": "string", "minLength": 1, "description": "Optional model selector override for a single seance consultation. Otherwise use the saved active branch model; task/smol and parent defaults are not substituted."},
+                "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit model for one delegation, worker_start or pool_start: provider/model with optional :thinking, or an unambiguous exact model ID. Overrides agent definition and task/smol/parent defaults. Validated before launch; unknown, unavailable or disabled models fail without fallback. Put model on each tasks/chain entry or workflow call. Workers/pools freeze it for their lifetime. Seance instead defaults to its saved branch model."},
                 "cwd": {"type": "string", "minLength": 1, "description": "Single delegation working directory, absolute or relative to the host workspace. For tasks/chain, put this on each entry."},
                 "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "Single delegation isolation. worktree uses the existing captured-baseline and acceptance gates; non-Git directories refuse rather than falling back."},
                 "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "description": "Single delegation worktree disposition, requiring isolation: worktree. Defaults to apply; keep preserves it for inspection, drop reports the patch without writeback."},
@@ -569,6 +595,7 @@ impl Tool for SubagentTool {
                     "properties": {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
+                        "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit provider/model[:thinking] or unambiguous exact model ID. Overrides the definition and task/smol/parent defaults, frozen before any child or worktree is created."},
                         "cwd": {"type": "string", "minLength": 1},
                         "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
                         "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion; requires isolation: worktree."},
@@ -677,6 +704,7 @@ impl Tool for SubagentTool {
             return plan.execute(self, on_update.map(Arc::from)).await;
         }
         workspace::validate_request(&input)?;
+        model_selection::validate_request(&input)?;
         let request: SubagentRequest = serde_json::from_value(input)
             .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
         let update = on_update.map(Arc::from);
@@ -725,6 +753,8 @@ struct SubagentRequest {
     agent: Option<String>,
     #[serde(default)]
     task: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     /// Single-delegation workspace controls use the same runner as array entries.
     #[serde(default)]
     cwd: Option<PathBuf>,
@@ -751,6 +781,12 @@ struct SubagentRequest {
 
 impl SubagentRequest {
     fn mode(&self) -> Result<RequestMode> {
+        if (self.tasks.is_some() || self.chain.is_some()) && self.model.is_some() {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_MODEL: model belongs on each tasks/chain entry, not the batch",
+            ));
+        }
         if (self.tasks.is_some() || self.chain.is_some())
             && (self.cwd.is_some() || self.isolation.is_some() || self.iso_apply.is_some())
         {
@@ -766,6 +802,8 @@ impl SubagentRequest {
             .map(|(agent, task)| SubagentTask {
                 agent: agent.clone(),
                 task: task.clone(),
+                model: self.model.clone(),
+                model_selection: None,
                 cwd: self.cwd.clone(),
                 isolation: self.isolation.clone(),
                 iso_apply: self.iso_apply.clone(),
@@ -834,6 +872,12 @@ enum RequestMode {
 struct SubagentTask {
     agent: String,
     task: String,
+    #[serde(default)]
+    model: Option<String>,
+    /// Admission resolves the public selector once. Retries, queues and hub
+    /// revival retain this identity; callers cannot inject a resolved target.
+    #[serde(skip)]
+    model_selection: Option<model_selection::Selection>,
     #[serde(default)]
     cwd: Option<PathBuf>,
     /// Workspace isolation: `none` (default) or `worktree` (bd-cv653.5.2).
@@ -1063,6 +1107,7 @@ fn child_args(
     task: &str,
     role_model_spec: Option<&str>,
     parent_model: Option<&ToolModelSelection>,
+    selection: Option<&model_selection::Selection>,
     output_schema: Option<&Value>,
 ) -> Vec<OsString> {
     let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
@@ -1070,6 +1115,7 @@ fn child_args(
         agent,
         role_model_spec,
         parent_model,
+        selection,
         output_schema,
     ));
     args.push(format!("Task: {task}").into());
@@ -1080,9 +1126,16 @@ fn worker_args(
     agent: &AgentDefinition,
     role_model_spec: Option<&str>,
     parent_model: Option<&ToolModelSelection>,
+    selection: Option<&model_selection::Selection>,
 ) -> Vec<OsString> {
     let mut args = vec!["--mode".into(), "rpc".into()];
-    args.extend(child_options(agent, role_model_spec, parent_model, None));
+    args.extend(child_options(
+        agent,
+        role_model_spec,
+        parent_model,
+        selection,
+        None,
+    ));
     args
 }
 
@@ -1090,6 +1143,7 @@ fn child_options(
     agent: &AgentDefinition,
     role_model_spec: Option<&str>,
     parent_model: Option<&ToolModelSelection>,
+    selection: Option<&model_selection::Selection>,
     output_schema: Option<&Value>,
 ) -> Vec<OsString> {
     let mut args = vec![
@@ -1121,9 +1175,16 @@ fn child_options(
             .map(OsString::from),
         );
     }
-    // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
-    // spec from settings > captured active parent > ambient configuration.
-    if let Some(model) = &agent.model {
+    // An admitted per-call identity wins over the definition, task/smol role,
+    // captured parent and ambient configuration. Never reparse its model ID.
+    if let Some(selection) = selection {
+        args.extend([
+            "--provider".into(),
+            selection.provider.clone().into(),
+            "--model".into(),
+            selection.model.clone().into(),
+        ]);
+    } else if let Some(model) = &agent.model {
         args.extend(["--model".into(), model.clone().into()]);
     } else if let Some(spec) = role_model_spec {
         args.extend(["--model".into(), spec.into()]);
@@ -1137,7 +1198,9 @@ fn child_options(
             parent.model.clone().into(),
         ]);
     }
-    if let Some(reasoning) = &agent.reasoning {
+    if let Some(thinking) = selection.and_then(|selection| selection.thinking) {
+        args.extend(["--thinking".into(), thinking.to_string().into()]);
+    } else if let Some(reasoning) = &agent.reasoning {
         args.extend(["--thinking".into(), reasoning.clone().into()]);
     }
     for skill in &agent.skills {
@@ -1625,7 +1688,7 @@ mod tests {
         };
         let args_of =
             |agent: &AgentDefinition, spec: Option<&str>, parent: Option<&ToolModelSelection>| {
-                child_args(agent, "inspect provider", spec, parent, None)
+                child_args(agent, "inspect provider", spec, parent, None, None)
                     .iter()
                     .map(|arg| arg.to_string_lossy().to_string())
                     .collect::<Vec<_>>()
@@ -1689,7 +1752,7 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider", None, None, None)
+        let args = child_args(&agent, "inspect provider", None, None, None, None)
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -1711,6 +1774,30 @@ mod tests {
             args.last().map(String::as_str),
             Some("Task: inspect provider")
         );
+        let selected = model_selection::Selection {
+            provider: "local".to_string(),
+            model: "vendor/model:literal".to_string(),
+            thinking: Some(crate::model::ThinkingLevel::Low),
+        };
+        let args = child_args(
+            &agent,
+            "inspect provider",
+            Some("role/model"),
+            None,
+            Some(&selected),
+            None,
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--provider", "local"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "vendor/model:literal"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--thinking", "low"]));
+        assert_eq!(args.iter().filter(|arg| *arg == "--thinking").count(), 1);
+        assert!(args.windows(2).any(|pair| pair == ["--tools", "read,grep"]));
     }
 
     #[test]
@@ -1719,6 +1806,7 @@ mod tests {
             &tan_agent_definition(),
             "update the changelog",
             Some("ai-router/gpt-5.6-terra"),
+            None,
             None,
             None,
         )
@@ -1751,6 +1839,8 @@ mod tests {
         let task = SubagentTask {
             agent: TAN_AGENT_NAME.to_string(),
             task: "update the changelog".to_string(),
+            model: None,
+            model_selection: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1783,6 +1873,8 @@ mod tests {
         let task = SubagentTask {
             agent: "review".to_string(),
             task: concat!("review {", "previous}").to_string(),
+            model: None,
+            model_selection: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1807,6 +1899,8 @@ mod tests {
             agent: "review".to_string(),
             task: "verdict {{previous.data.verdict}} n {{previous.data.stats.count}} miss {{previous.data.absent}}"
                 .to_string(),
+            model: None,
+            model_selection: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1980,6 +2074,8 @@ mod tests {
         let task = |name: &str| SubagentTask {
             agent: name.to_string(),
             task: "t".to_string(),
+            model: None,
+            model_selection: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -2028,6 +2124,8 @@ mod tests {
         let task = SubagentTask {
             agent: "inj".to_string(),
             task: "t".to_string(),
+            model: None,
+            model_selection: None,
             cwd: None,
             isolation: None,
             iso_apply: None,

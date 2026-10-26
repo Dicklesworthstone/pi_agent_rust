@@ -198,6 +198,7 @@ impl Actor {
             &self.agent,
             self.runner.role_model_spec.as_deref(),
             self.runner.parent_model.as_ref(),
+            self.runner.worker_model_selection.as_ref(),
         );
         let mut command = Command::new(&self.runner.child_binary);
         crate::agent_hub::ipc::ChildChannel::configure_child(&mut command, channel.as_ref());
@@ -521,6 +522,8 @@ fn task(agent: &AgentDefinition, text: String) -> SubagentTask {
     SubagentTask {
         agent: agent.name.clone(),
         task: text,
+        model: None,
+        model_selection: None,
         cwd: None,
         isolation: None,
         iso_apply: None,

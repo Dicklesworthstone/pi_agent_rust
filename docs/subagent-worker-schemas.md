@@ -34,6 +34,13 @@ always strict), but an explicit value must be `strict` and requires a schema.
 A send cannot change the contract. Explicit null is an invalid schema, not a way
 to silently disable validation; boolean JSON Schemas are accepted.
 
+Launches also accept `model: "provider/model[:thinking]"` under the
+[per-call selector contract](subagent-definitions.md#per-call-model-selection).
+The selected model overrides definition/task-role/parent defaults and remains
+fixed for every turn; every child in a pool uses the same admitted destination.
+`worker_send` and `pool_push` reject model changes. Eval's `agent()` and
+`workpool()` forward the `model` option in JavaScript and Python.
+
 Use the returned `workerId` with `worker_wait`, `worker_status`, `worker_send`,
 and `worker_close`, as before. Successful results include:
 

@@ -26,6 +26,18 @@ fn event(case: &str) {
 const CHILD: &str = r#"#!/bin/sh
 set -eu
 printf '%s\n' "$$" >> launches
+provider=
+model=
+thinking=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --provider) shift; provider="$1" ;;
+      --model) shift; model="$1" ;;
+      --thinking) shift; thinking="$1" ;;
+    esac
+    shift
+done
+printf '%s|%s|%s\n' "$provider" "$model" "$thinking" >> model-selections
 count=0
 busy=0
 while IFS= read -r line; do
@@ -82,6 +94,7 @@ impl Fixture {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let owner = format!("typed-worker-{}", uuid::Uuid::new_v4());
         let mut tool = SubagentTool::with_paths(root.path().to_path_buf(), global, binary)
+            .with_model_config(Some(crate::config::Config::default()))
             .with_timeout(Duration::from_secs(15));
         tool.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(&owner));
         Self { root, tool, owner }
@@ -376,6 +389,99 @@ async fn finish_pool(fixture: &Fixture, pool: &str, job: &str) -> crate::jobs::J
     crate::jobs::wait_async(&fixture.owner, job, Duration::from_secs(5))
         .await
         .unwrap()
+}
+
+#[test]
+fn worker_and_pool_models_freeze_at_launch_and_cannot_change_on_send() -> TestResult {
+    let _guard = crate::jobs::process_test_guard();
+    let fixture = Fixture::new(Some(&schema()));
+    std::fs::write(
+        fixture.root.path().join("global/models.json"),
+        json!({"providers": {
+            "worker-selection-local": {
+                "baseUrl":"http://127.0.0.1:1/v1", "api":"openai-completions", "authHeader":false,
+                "models":[{"id":"worker-selected", "reasoning":true}]
+            }
+        }})
+        .to_string(),
+    )?;
+    run(async {
+        let started = fixture
+            .call(
+                json!({"operation":"worker_start", "agent":"typed", "task":"valid",
+            "model":"worker-selection-local/worker-selected:high"}),
+            )
+            .await?;
+        let id = started["workerId"].as_str().unwrap();
+        assert_eq!(fixture.wait(id, 1).await["turn"]["status"], "completed");
+        let pooled = fixture
+            .call(
+                json!({"operation":"pool_start", "agent":"typed", "concurrency":2,
+            "tasks":["valid", "valid"], "model":"worker-selection-local/worker-selected:low"}),
+            )
+            .await?;
+        let pool = pooled["poolId"].as_str().unwrap();
+        for item in [1, 2] {
+            assert_eq!(
+                wait_item(&fixture, pool, item).await["item"]["status"],
+                "completed"
+            );
+        }
+        std::fs::write(
+            fixture.root.path().join("global/models.json"),
+            "{\"providers\":{}}",
+        )?;
+        assert!(
+            fixture
+                .call(
+                    json!({"operation":"worker_send", "workerId":id, "task":"valid",
+            "model":"another/model"})
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .call(
+                    json!({"operation":"pool_push", "poolId":pool, "tasks":["valid"],
+            "model":"another/model"})
+                )
+                .await
+                .is_err()
+        );
+        fixture
+            .call(json!({"operation":"worker_send", "workerId":id, "task":"valid again"}))
+            .await?;
+        assert_eq!(fixture.wait(id, 2).await["turn"]["status"], "completed");
+        fixture
+            .call(json!({"operation":"pool_push", "poolId":pool, "tasks":["valid again"]}))
+            .await?;
+        assert_eq!(
+            wait_item(&fixture, pool, 3).await["item"]["status"],
+            "completed"
+        );
+        fixture.close(id).await;
+        assert_eq!(
+            finish_pool(&fixture, pool, pooled["jobId"].as_str().unwrap())
+                .await
+                .status,
+            "exited"
+        );
+        let mut selections = std::fs::read_to_string(fixture.root.path().join("model-selections"))?
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        selections.sort();
+        assert_eq!(
+            selections,
+            vec![
+                "worker-selection-local|worker-selected|high",
+                "worker-selection-local|worker-selected|low",
+                "worker-selection-local|worker-selected|low",
+            ]
+        );
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
 }
 
 #[test]

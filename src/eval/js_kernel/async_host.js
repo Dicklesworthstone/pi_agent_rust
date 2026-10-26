@@ -648,7 +648,7 @@
         async cancel() { return this.close(); }
     }
     const agentOptions = new Set([
-        'agent', 'cwd', 'isolation', 'isoApply', 'outputSchema', 'schemaMode', 'timeoutSeconds', 'scope', 'keepAlive',
+        'agent', 'model', 'cwd', 'isolation', 'isoApply', 'outputSchema', 'schemaMode', 'timeoutSeconds', 'scope', 'keepAlive',
     ]);
     const hasAgentOption = agentOptions.has.bind(agentOptions);
     const launchAgent = async (prompt, options = {}) => {
@@ -1154,8 +1154,8 @@
             } else if (key === 'timeoutSeconds') {
                 if (!integer(value) || value < 1 || value > 86400) throw new RangeErrorType('EVAL_POOL_INPUT: timeoutSeconds must be an integer from 1 to 86400');
                 native.timeoutSeconds = value;
-            } else if (key === 'outputSchema' || key === 'schemaMode') {
-                // Native pool_start validates the frozen contract before admission.
+            } else if (key === 'model' || key === 'outputSchema' || key === 'schemaMode') {
+                // Native pool_start validates the frozen model and contract before admission.
                 native[key] = value;
             } else throw new TypeErrorType(`EVAL_POOL_INPUT: unknown option ${key}`);
         }

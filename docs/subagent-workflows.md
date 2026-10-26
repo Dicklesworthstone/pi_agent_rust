@@ -66,12 +66,18 @@ later wave receives no fresh allowance. Arbitrary child activity and synchronous
 filesystem/Git operations have the same cooperative boundaries as ordinary
 delegation. This does not add recursive delegation or a new guest interpreter.
 
-Each node's `call` contains ordinary per-task fields: `agent`, `task`, `cwd`,
+Each node's `call` contains ordinary per-task fields: `agent`, `task`, `model`, `cwd`,
 `isolation`, `isoApply`, `outputSchema` and `schemaMode`. All call shapes and
 workspace options are validated up front. Agent discovery and all effective
 schema compilation also finish before the first child. Native filesystem
 conditions are still checked at execution; this is not a transactional dry run.
 Mixed modes and unknown fields are refused rather than silently ignored.
+
+An explicit `model` uses the [per-call selector contract](subagent-definitions.md#per-call-model-selection).
+Every node's provider, model and optional thinking suffix is resolved before
+the first wave, even for a node whose dependencies have not run. A bad selector
+refuses the graph before any work starts. Dependency inputs and fan-out items
+only supply task data; they cannot change the frozen model or effort.
 
 ## Typed handoffs between predecessors and dependants
 

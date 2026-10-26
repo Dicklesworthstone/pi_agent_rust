@@ -1605,7 +1605,7 @@ async def _agent(prompt, **options):
     if type(prompt) is not str or not prompt.strip():
         raise TypeError("EVAL_AGENT_INPUT: agent requires a nonempty prompt")
     fields = {
-        "agent": "agent", "cwd": "cwd", "isolation": "isolation", "iso_apply": "isoApply",
+        "agent": "agent", "model": "model", "cwd": "cwd", "isolation": "isolation", "iso_apply": "isoApply",
         "output_schema": "outputSchema", "schema_mode": "schemaMode",
         "timeout_seconds": "timeoutSeconds", "scope": "scope",
     }
@@ -2158,6 +2158,9 @@ async def _workpool(**options):
             if type(value) is not int or not 1 <= value <= 86400:
                 raise ValueError("EVAL_POOL_INPUT: timeout_seconds must be an integer from 1 to 86400")
             native["timeoutSeconds"] = value
+        elif key == "model":
+            # Native pool_start resolves and freezes the destination before admission.
+            native[key] = value
         elif key in ("output_schema", "schema_mode"):
             # Native pool_start validates the frozen contract before admission.
             native["outputSchema" if key == "output_schema" else "schemaMode"] = value

@@ -78,6 +78,7 @@ impl Request {
             return Ok(Self::Workflow(plan));
         }
         workspace::validate_request(&input)?;
+        super::model_selection::validate_request(&input)?;
         let request: SubagentRequest = serde_json::from_value(input)
             .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
         request.mode_name()?;

@@ -57,6 +57,7 @@ pub(super) struct ChildRunner {
     child_binary: PathBuf,
     role_model_spec: Option<String>,
     parent_model: Option<crate::tools::ToolModelSelection>,
+    worker_model_selection: Option<super::model_selection::Selection>,
     hub_kind: ChildKind,
     deadline: Deadline,
     revival: Option<(String, RevivalSpec)>,
@@ -80,6 +81,7 @@ impl ChildRunner {
             child_binary,
             role_model_spec,
             parent_model: None,
+            worker_model_selection: None,
             hub_kind,
             deadline,
             revival: None,
@@ -127,6 +129,14 @@ impl ChildRunner {
         model: Option<crate::tools::ToolModelSelection>,
     ) -> Self {
         self.parent_model = model;
+        self
+    }
+
+    pub(super) fn with_worker_model_selection(
+        mut self,
+        model: Option<super::model_selection::Selection>,
+    ) -> Self {
+        self.worker_model_selection = model;
         self
     }
 
@@ -443,6 +453,7 @@ impl ChildRunner {
             &task.task,
             self.role_model_spec.as_deref(),
             launch.parent_model.as_ref(),
+            task.model_selection.as_ref(),
             schema,
         );
         let policy = isolation_policy(&task);

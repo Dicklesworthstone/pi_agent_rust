@@ -5948,7 +5948,8 @@ impl ToolRegistry {
                             .with_secrets_settings(
                                 config.and_then(|config| config.secrets.as_ref()),
                             )
-                            .with_role_model_spec(role_model_spec),
+                            .with_role_model_spec(role_model_spec)
+                            .with_model_config(config.cloned()),
                     ));
                 }
                 // Nothing to build: either a host-coupled tool the session host

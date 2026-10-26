@@ -50,9 +50,7 @@ fn invalid(message: &'static str) -> Error {
 }
 
 fn control_present(value: &Value) -> bool {
-    value.get("agent").and_then(Value::as_str) == Some(NAME)
-        || value.get("sourceSession").is_some()
-        || value.get("model").is_some()
+    value.get("agent").and_then(Value::as_str) == Some(NAME) || value.get("sourceSession").is_some()
 }
 
 /// Reserve the consultant name and its controls before definition discovery.
@@ -65,7 +63,7 @@ pub(super) fn is_request(input: &Value) -> Result<bool> {
             .is_some_and(|tasks| tasks.iter().any(control_present))
         {
             return Err(invalid(
-                "seance and sourceSession/model require a single delegation",
+                "seance and sourceSession require a single delegation",
             ));
         }
     }
@@ -84,10 +82,8 @@ pub(super) fn is_request(input: &Value) -> Result<bool> {
         ));
     }
     let consultant = input.get("agent").and_then(Value::as_str) == Some(NAME);
-    if !consultant && (input.get("sourceSession").is_some() || input.get("model").is_some()) {
-        return Err(invalid(
-            "sourceSession and model are only valid for agent: seance",
-        ));
+    if !consultant && input.get("sourceSession").is_some() {
+        return Err(invalid("sourceSession is only valid for agent: seance"));
     }
     Ok(consultant)
 }
@@ -409,6 +405,8 @@ pub(super) async fn execute(
         let task = SubagentTask {
             agent: NAME.to_string(),
             task: prompt,
+            model: None,
+            model_selection: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -556,12 +554,18 @@ mod tests {
         );
         for input in [
             json!({"agent": "task", "task": "work", "sourceSession": "saved.jsonl"}),
-            json!({"agent": "task", "task": "work", "model": "other"}),
             json!({"tasks": [{"agent": "seance", "task": "why?"}]}),
             json!({"chain": [{"agent": "task", "task": "why?", "sourceSession": "saved.jsonl"}]}),
             json!({"workflow": [{"id": "consult", "call": {"agent": "seance", "task": "why?"}}]}),
         ] {
             assert!(is_request(&input).is_err(), "{input}");
+        }
+        for input in [
+            json!({"agent": "task", "task": "work", "model": "other"}),
+            json!({"tasks": [{"agent": "task", "task": "work", "model": "other"}]}),
+            json!({"workflow": [{"id": "work", "call": {"agent": "task", "task": "work", "model": "other"}}]}),
+        ] {
+            assert!(!is_request(&input).unwrap(), "{input}");
         }
     }
 

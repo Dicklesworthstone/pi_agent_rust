@@ -232,6 +232,7 @@ async fn start(
             "operation",
             "agent",
             "task",
+            "model",
             "cwd",
             "scope",
             "timeoutSeconds",
@@ -306,6 +307,7 @@ async fn start(
     if !cwd.is_dir() {
         return Err(invalid("cwd must name an existing directory"));
     }
+    let model_selection = super::model_selection::prepare_worker(tool, &input, &cwd, deadline)?;
     if background::resolve_session(&tool.job_session_scope, &owner, deadline).await? != owner_id {
         return Err(Error::tool(
             "subagent",
@@ -352,7 +354,8 @@ async fn start(
         crate::agent_hub::ChildKind::Subagent,
         deadline,
     )
-    .with_parent_model(parent_model);
+    .with_parent_model(parent_model)
+    .with_worker_model_selection(model_selection);
     let cleanup = FinishGuard(Arc::clone(&state));
     let actor_state = Arc::clone(&state);
     let artifacts = tool.global_dir.join("tool-output-artifacts");

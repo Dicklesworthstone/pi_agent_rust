@@ -83,6 +83,112 @@ fn recorded_models(tool: &SubagentTool) -> Vec<String> {
         .collect()
 }
 
+fn explicit_model_catalog(tool: &SubagentTool) {
+    std::fs::write(tool.global_dir.join("models.json"), json!({"providers": {
+        "selection-local": {
+            "baseUrl":"http://127.0.0.1:1/v1", "api":"openai-completions", "authHeader":false,
+            "models":[{"id":"selection-fast", "reasoning":false}, {"id":"selection-careful", "reasoning":true}]
+        }
+    }}).to_string()).unwrap();
+}
+
+#[test]
+fn explicit_models_override_definition_role_and_parent_in_every_one_shot_mode() {
+    let first =
+        json!({"agent":"worker", "task":"inspect", "model":"selection-local/selection-fast"});
+    let second = json!({"agent":"worker", "task":"review {previous}", "model":"selection-local/selection-careful:high"});
+    for input in [
+        first.clone(),
+        json!({"tasks":[first.clone(), second.clone()], "concurrency":1}),
+        json!({"chain":[first.clone(), second.clone()]}),
+        json!({"workflow":[
+            {"id":"inspect", "call":first.clone()},
+            {"id":"review", "needs":["inspect"], "call":second.clone()}
+        ]}),
+    ] {
+        let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+        explicit_model_catalog(&tool);
+        std::fs::write(tool.global_dir.join("agents/worker.md"),
+            "---\nname: worker\ndescription: pinned fixture\nmodel: definition/model\n---\nComplete the task.").unwrap();
+        let tool = tool
+            .with_model_config(Some(Config::default()))
+            .with_role_model_spec(Some("role/model".to_string()))
+            .with_parent_model(Some(ToolModelSelection {
+                provider: "parent".to_string(),
+                model: "parent-model".to_string(),
+            }));
+        let expected = if input.get("agent").is_some() {
+            vec!["selection-local|selection-fast"]
+        } else {
+            vec![
+                "selection-local|selection-fast",
+                "selection-local|selection-careful",
+            ]
+        };
+        let output = run(&tool, input);
+        assert!(!output.is_error, "{output:?}");
+        assert_eq!(recorded_models(&tool), expected);
+    }
+}
+
+#[test]
+fn invalid_later_model_rejects_entire_request_before_process_or_isolation() {
+    for key in ["tasks", "chain", "workflow"] {
+        let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+        explicit_model_catalog(&tool);
+        let tool = tool.with_model_config(Some(Config::default()));
+        let first = json!({"agent":"worker", "task":"must not run", "model":"selection-fast", "isolation":"worktree"});
+        let second = json!({"agent":"worker", "task":"invalid destination", "model":"missing-provider/private-selector-sentinel"});
+        let input = if key == "workflow" {
+            json!({"workflow":[{"id":"first", "call":first}, {"id":"second", "needs":["first"], "call":second}]})
+        } else {
+            let mut input = json!({});
+            input[key] = json!([first, second]);
+            input
+        };
+        let error = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(tool.execute("invalid-model", input, None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PI_SUBAGENT_MODEL"), "{error}");
+        assert!(!error.contains("private-selector-sentinel"), "{error}");
+        assert!(!tool.global_dir.join("models-used").exists());
+    }
+}
+
+#[test]
+fn prepared_model_identity_survives_catalog_and_parent_changes() {
+    let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+    explicit_model_catalog(&tool);
+    let scope = ToolModelScope::default();
+    scope.set("first-parent", "first-model");
+    let tool = tool
+        .with_model_config(Some(Config::default()))
+        .with_model_scope(scope.clone());
+    let request: SubagentRequest = serde_json::from_value(json!({
+        "chain":[{"agent":"worker", "task":"inspect", "model":"selection-fast"},
+                 {"agent":"worker", "task":"review", "model":"selection-careful:high"}]
+    }))
+    .unwrap();
+    let prepared = tool.prepare_request(&request).unwrap();
+    scope.set("changed-parent", "changed-model");
+    std::fs::write(tool.global_dir.join("models.json"), "{\"providers\":{}}").unwrap();
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepared.run(None));
+    assert!(results.iter().all(|result| !result.is_error));
+    assert_eq!(
+        recorded_models(&tool),
+        vec![
+            "selection-local|selection-fast",
+            "selection-local|selection-careful"
+        ]
+    );
+}
+
 #[test]
 fn subagent_launch_model_precedence_keeps_resolved_parent_ids_exact() {
     let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));

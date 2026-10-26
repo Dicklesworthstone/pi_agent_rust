@@ -40,6 +40,67 @@ corrective retry count. Invalid output after that retry fails a strict task;
 `schemaMode: "permissive"` retains its existing warning behavior. A task's explicit
 `outputSchema` still overrides the definition's schema.
 
+## Per-call model selection
+
+A single delegation, each `tasks`/`chain` entry, and each workflow `call` may
+select its own model. This lets a cheap mechanical agent and a deeper reviewer
+use different destinations without maintaining duplicate agent definitions:
+
+```json
+{
+  "tasks": [
+    {"agent": "sonic", "task": "Update the named references.", "model": "openai/gpt-5-mini:low"},
+    {"agent": "reviewer", "task": "Inspect the parser for correctness defects.", "model": "anthropic/claude-sonnet-4-6:high"}
+  ]
+}
+```
+
+Use an exact `provider/model` selector, optionally followed by `:thinking`, or
+an exact model ID that belongs to only one provider. Available thinking names
+are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; the selected
+model must support the requested level. A registered literal model ID wins
+before suffix parsing, preserving local IDs such as `vendor/model:1`.
+
+Precedence is **per-call model → definition model → task role → smol role →
+captured parent → ordinary child configuration**. An explicit thinking suffix
+overrides the definition's `thinking`; omitting it preserves existing effort
+selection. Unknown or ambiguous models, missing configured credentials,
+disabled providers and unsupported effort fail before any child, isolated
+worktree, or background acknowledgment. Batch-wide `model` is rejected: put it
+on each task. Null, arrays, patterns and role aliases are rejected too.
+
+Admission uses the host's effective provider policy and the longest matching
+workspace scope at both host and task directories. As with explicit CLI model
+selection, `enabled_models` is a cycling/startup preference; provider disables
+remain enforced. Catalog lookup includes native models, `models.json`, and
+validated persisted model catalogs, without remote discovery or extension
+initialization. Extension-only registrations must first be represented in the
+native catalog to use this override. Credential commands resolve once per
+provider during admission; child startup still loads its own model metadata and
+credentials. The frozen request carries only provider, model ID, and optional
+thinking level, so changing the parent's model cannot reroute queued work,
+schema retries, workflow descendants, or explicit hub revival.
+
+`worker_start` and `pool_start` accept the same `model` field and freeze it for
+the entire retained conversation or pool. `worker_send` and `pool_push` cannot
+change it. Eval factories forward it in both languages:
+
+```javascript
+const reviewer = await agent('Review the parser.', {
+  agent: 'reviewer', model: 'anthropic/claude-sonnet-4-6:high', keepAlive: true
+});
+const pool = await workpool({agent: 'sonic', model: 'openai/gpt-5-mini:low'});
+```
+
+```python
+reviewer = await agent('Review the parser.', agent='reviewer',
+                       model='anthropic/claude-sonnet-4-6:high', keep_alive=True)
+pool = await workpool(agent='sonic', model='openai/gpt-5-mini:low')
+```
+
+Saved-session `seance` consultations retain their separate saved-branch model
+selection contract; these ordinary task defaults do not replace it.
+
 ## Accepted frontmatter
 
 This is a bounded **agent-definition subset**, not a general YAML implementation

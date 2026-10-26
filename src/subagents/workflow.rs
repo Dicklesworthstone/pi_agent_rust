@@ -439,7 +439,7 @@ impl Plan {
     /// Keep the caller's original deadline across owner lookup and discovery;
     /// an asynchronous launch must not buy a fresh budget or rediscover files.
     pub(super) fn prepare(
-        self,
+        mut self,
         tool: &SubagentTool,
         deadline: Deadline,
     ) -> Result<PreparedWorkflow> {
@@ -451,6 +451,11 @@ impl Plan {
             .map_err(|message| Error::tool("subagent", message))?;
         let agents = tool.discover(self.scope)?;
         self.validate_definitions(&agents)?;
+        super::model_selection::prepare(
+            tool,
+            self.nodes.iter_mut().map(|node| &mut node.call),
+            deadline,
+        )?;
         let runner = ChildRunner::new(
             tool.cwd.clone(),
             tool.global_dir.clone(),
@@ -604,7 +609,14 @@ fn parse_call(value: &Value) -> Result<SubagentTask> {
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "agent" | "task" | "cwd" | "isolation" | "isoApply" | "outputSchema" | "schemaMode"
+            "agent"
+                | "task"
+                | "model"
+                | "cwd"
+                | "isolation"
+                | "isoApply"
+                | "outputSchema"
+                | "schemaMode"
         )
     }) {
         return Err(invalid("node call contains unsupported native task fields"));
@@ -619,6 +631,7 @@ fn parse_call(value: &Value) -> Result<SubagentTask> {
         }
     }
     workspace::validate_request(value)?;
+    super::model_selection::validate_request(value)?;
     if fields
         .get("outputSchema")
         .is_some_and(|schema| !schema.is_object() && !schema.is_boolean())
