@@ -24,7 +24,7 @@
         if (options === null || typeof options !== 'object' || isArray(options)) throw inputError();
         const fields = create(null);
         for (const key of ownKeys(options)) {
-            if (!['pool', 'maxItems', 'timeout', 'raiseErrors', 'onPool'].includes(key)) throw inputError();
+            if (!['pool', 'maxItems', 'timeout', 'raiseErrors', 'onPool', 'ordered'].includes(key)) throw inputError();
             const field = descriptor(options, key);
             if (!field || !hasOwn(field, 'value')) throw inputError();
             fields[key] = field.value;
@@ -50,12 +50,13 @@
         const maxItems = hasOwn(fields, 'maxItems') ? fields.maxItems : 32;
         const timeout = hasOwn(fields, 'timeout') ? fields.timeout : 30;
         const raiseErrors = hasOwn(fields, 'raiseErrors') ? fields.raiseErrors : true;
+        const ordered = hasOwn(fields, 'ordered') ? fields.ordered : false;
         const onPool = fields.onPool;
         const poolOptions = hasOwn(fields, 'pool') ? fields.pool : {};
         if (typeof mapTask !== 'function' || typeof reduce !== 'function'
             || !integer(maxItems) || maxItems < 1 || maxItems > 32
             || typeof timeout !== 'number' || !finite(timeout) || timeout <= 0 || timeout > 600
-            || typeof raiseErrors !== 'boolean'
+            || typeof raiseErrors !== 'boolean' || typeof ordered !== 'boolean'
             || (onPool !== undefined && typeof onPool !== 'function')
             || source === null || source === undefined || typeof source === 'string'
             || (isArray(source) && source.length > maxItems)) throw inputError();
@@ -66,8 +67,13 @@
         const next = iterator.next.bind(iterator);
         const deadline = clock() + timeout * 1000;
         const pending = new MapType();
+        const buffered = new MapType();
         let pool = null;
         let cursor = null;
+        // Private receive position: buffered results must not be fetched
+        // repeatedly while waiting for an earlier source item. Only `cursor`
+        // acknowledges successful reductions and is exposed for recovery.
+        let received = null;
         let value = initial;
         let admitted = 0;
         let completed = 0;
@@ -136,13 +142,32 @@
                     remaining();
                 }
             };
+            const reduceOne = async (id, outcome) => {
+                const {item, ok} = outcome;
+                current = item;
+                stage = 'result';
+                remaining();
+                if (raiseErrors && !ok) {
+                    throw new ErrorType('EVAL_PIPELINE_ITEM_FAILED: a native pool item did not succeed');
+                }
+                stage = 'reduce';
+                value = await reduce(value, current);
+                // Receiving is not acknowledgment. Retain an exact successful
+                // reduction cursor even if another buffered reducer fails.
+                cursor = cursorAfter(cursor, pool.id, id);
+                pending.delete(id);
+                buffered.delete(id);
+                completed++;
+                if (ok) succeeded++; else failed++;
+                remaining();
+            };
             await fill();
             // workpool() is lazy: empty input creates no native pool or worker.
             if (admitted === 0) return freeze({...progress(), pool, cursor, status: 'empty'});
             for (;;) {
                 stage = 'drain';
                 current = null;
-                const page = await pool.drain({cursor, timeout: remaining(), maxItems: 4});
+                const page = await pool.drain({cursor: received, timeout: remaining(), maxItems: 4});
                 if (!page || !isArray(page.items) || typeof page.done !== 'boolean'
                     || page.poolId !== pool.id) throw protocolError();
                 for (const item of page.items) {
@@ -152,22 +177,19 @@
                         || !hasOwn(item.result, 'details')) throw protocolError();
                     const id = item.id;
                     const ok = item.status === 'completed' && !item.result.isError;
-                    current = freeze({...item, index: record.index, input: record.input});
-                    stage = 'result';
-                    remaining();
-                    if (raiseErrors && !ok) {
-                        throw new ErrorType('EVAL_PIPELINE_ITEM_FAILED: a native pool item did not succeed');
+                    const outcome = {ok, item: freeze({...item, index: record.index, input: record.input})};
+                    received = cursorAfter(received, pool.id, id);
+                    if (ordered) {
+                        buffered.set(id, outcome);
+                        // Pending includes buffered results: the original
+                        // admission window bounds both input and reordering.
+                        while (buffered.has(completed + 1)) {
+                            const nextId = completed + 1;
+                            await reduceOne(nextId, buffered.get(nextId));
+                        }
+                    } else {
+                        await reduceOne(id, outcome);
                     }
-                    stage = 'reduce';
-                    value = await reduce(value, current);
-                    // Acknowledge only after the reducer returns. In particular,
-                    // a later failure on this SAME page must not cause earlier
-                    // successful reductions to be delivered again on recovery.
-                    cursor = cursorAfter(cursor, pool.id, id);
-                    pending.delete(id);
-                    completed++;
-                    if (ok) succeeded++; else failed++;
-                    remaining();
                 }
                 if (page.done) {
                     if (!exhausted || !sealed || pending.size !== 0) throw protocolError();
