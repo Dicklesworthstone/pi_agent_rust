@@ -133,7 +133,11 @@ pub(super) fn prepare(
         let description = format!(
             "{}: {}; {} arguments, {} environment entries, {} headers. Inspect the definition in your editor before trusting it.",
             server.name,
-            if server.is_http() { "HTTP" } else { "stdio" },
+            match server.transport_hint.as_deref() {
+                Some("sse") => "legacy SSE over HTTP(S)",
+                _ if server.is_http() => "Streamable HTTP(S)",
+                _ => "stdio",
+            },
             server.args.len(), server.env.len(), server.headers.len(),
         );
         (server.name.clone(), description)
@@ -248,7 +252,7 @@ fn status(state: &SessionMcp) -> String {
             row.name, row.trust, health, row.tools
         ));
     }
-    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp reauth NAME signs in to a trusted HTTP server; /mcp unauth NAME removes its managed login. /mcp refresh reloads trusted tool catalogs; /mcp deny NAME revokes a server.".into());
+    lines.push("Use /mcp inspect NAME, then /mcp trust NAME to approve a server. /mcp reauth NAME signs in to a trusted Streamable HTTP or legacy SSE server; /mcp unauth NAME removes its managed login. /mcp refresh reloads trusted tool catalogs; /mcp deny NAME revokes a server.".into());
     lines.join("\n")
 }
 
@@ -408,7 +412,7 @@ async fn execute(
             Err(error) if error.to_string().contains("[MCP_AUTH_RECONNECT_FAILED]") =>
                 "MCP login was saved, but reconnecting or loading tools failed. Use /mcp list and /mcp test NAME after checking the server.".to_string(),
             Err(_) =>
-                "MCP sign-in did not complete. The server must be trusted, enabled, and HTTP-based without a configured Authorization header; inspect its configuration and use /mcp list.".to_string(),
+                "MCP sign-in did not complete. The server must be trusted, enabled, and use Streamable HTTP or legacy SSE without a configured Authorization header; inspect its configuration and use /mcp list.".to_string(),
         },
         Command::Unauth(name) => match state.manager.unauthenticate(&name).await {
             Ok(()) => format!("Removed the managed login for MCP server {name}; its connection and tools were retired. Trust is unchanged."),
@@ -1098,6 +1102,23 @@ mod tests {
         assert!(denied.contains("Denied"));
         assert_eq!(state.manager.list()[0].trust, "denied");
         assert_eq!(state.manager.list()[0].tools, 0);
+    }
+
+    #[test]
+    fn sse_inspection_identifies_the_transport_without_disclosing_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let mut servers = http_servers(root.path());
+        servers[0].transport_hint = Some("sse".into());
+        let state = prepare(root.path(), root.path(), servers).unwrap();
+        let text = runtime().block_on(execute(
+            &state,
+            Command::Inspect("remote".into()),
+            Arc::new(|_| {}),
+        ));
+        assert!(text.contains("legacy SSE over HTTP(S)"));
+        assert!(text.contains("1 headers"));
+        assert!(!text.contains("PRIVATE-HEADER-VALUE"));
+        assert!(!text.contains("https://"));
     }
 
     #[test]

@@ -175,6 +175,43 @@ or an ambiguous POST failure after dispatch is reported as an indeterminate
 outcome; Pi does not reconnect and replay that request. A later operator
 reconnect or eligible new operation establishes a new connection.
 
+### Editor-supplied ACP servers
+
+ACP clients may supply `stdio`, `http` (Streamable HTTP), or `sse` (legacy
+HTTP+SSE) definitions in the session's `mcpServers` array. The initialize
+response advertises both `mcpCapabilities.http` and `mcpCapabilities.sse`.
+For example, the server portion of a `session/new` request can contain:
+
+```json
+{
+  "mcpServers": [
+    {
+      "type": "sse",
+      "name": "legacy-docs",
+      "url": "https://mcp.example.com/sse",
+      "headers": [{ "name": "Authorization", "value": "Bearer editor-token" }]
+    }
+  ]
+}
+```
+
+Session creation and restore do not connect to these servers. Inspect the
+definition in the editor, then send `/mcp trust legacy-docs` as a standalone
+text prompt. Trust binds the exact definition, transport, and workspace.
+Tool calls still require the editor's ordinary permission decision. Header
+and environment values remain literal, including strings starting with
+`$ENV:` or `$CMD:`; Pi does not evaluate them. Definitions and credentials are
+not copied into the session transcript or project configuration.
+
+A failed connection leaves the session available. `/mcp list` reports the
+server's status, `/mcp test legacy-docs` retries an already-trusted server,
+and `/mcp reauth legacy-docs` supports managed OAuth for either HTTP transport
+when no explicit `Authorization` header is configured. Cancelling setup retires
+its in-flight connection. `--no-mcp` rejects all nonempty client server lists,
+including SSE. Changing a live session's definitions requires a new session
+or restarting ACP; omitting `mcpServers` while reattaching preserves its
+existing definition.
+
 ## Native HTTP OAuth
 
 Trusted HTTP MCP servers can use a native browser sign-in flow through both

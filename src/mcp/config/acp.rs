@@ -133,7 +133,7 @@ pub fn parse_acp_servers(
                     return Err(format!("Invalid args at mcpServers[{index}]"));
                 }
             }
-            "http" => {
+            "http" | "sse" => {
                 if wire.command.is_some() || wire.args.is_some() || wire.env.is_some() {
                     return Err(format!(
                         "HTTP server at mcpServers[{index}] cannot define command, args, or env"
@@ -157,9 +157,6 @@ pub fn parse_acp_servers(
                         "Invalid HTTP URL at mcpServers[{index}]; use HTTP(S) with credentials in headers"
                     ));
                 }
-            }
-            "sse" => {
-                return Err("ACP MCP SSE transport is not supported; use stdio or HTTP".to_string());
             }
             _ => return Err(format!("Unsupported MCP transport at mcpServers[{index}]")),
         }
@@ -226,18 +223,24 @@ mod tests {
     }
 
     #[test]
-    fn decodes_stdio_and_http_without_resolving_literal_values() {
+    fn decodes_stdio_http_and_sse_without_resolving_literal_values() {
         let servers = parse(&json!([
             {"name":"stdio","command":command(),"args":["--flag","a b"],
              "env":[{"name":"TOKEN","value":"$CMD:must-not-run"}]},
             {"type":"http","name":"remote","url":"https://example.invalid/mcp",
-             "headers":[{"name":"Authorization","value":"$ENV:NOT_A_LOOKUP"}]}
+             "headers":[{"name":"Authorization","value":"$ENV:NOT_A_LOOKUP"}]},
+            {"type":"sse","name":"legacy","url":"https://example.invalid/sse",
+             "headers":[{"name":"Authorization","value":"$CMD:must-not-run"}]}
         ]))
         .unwrap();
-        assert_eq!(servers[0].name, "remote");
-        assert_eq!(servers[0].headers[0].1, "$ENV:NOT_A_LOOKUP");
-        assert_eq!(servers[1].args, ["--flag", "a b"]);
-        assert_eq!(servers[1].env[0].1, "$CMD:must-not-run");
+        assert_eq!(servers[0].name, "legacy");
+        assert_eq!(servers[0].transport_hint.as_deref(), Some("sse"));
+        assert_eq!(servers[0].headers[0].1, "$CMD:must-not-run");
+        assert!(servers[0].is_http());
+        assert_eq!(servers[1].name, "remote");
+        assert_eq!(servers[1].headers[0].1, "$ENV:NOT_A_LOOKUP");
+        assert_eq!(servers[2].args, ["--flag", "a b"]);
+        assert_eq!(servers[2].env[0].1, "$CMD:must-not-run");
         assert!(
             servers
                 .iter()
@@ -256,8 +259,12 @@ mod tests {
             json!([{"name":"one","command":command(),"env":null}]),
             json!([{"name":"one","command":command(),"type":null}]),
             json!([{"name":"one","command":command(),"surprise":"value"}]),
-            json!([{"name":"one","type":"sse","url":"https://example.invalid"}]),
+            json!([{"name":"one","type":"websocket","url":"https://example.invalid"}]),
             json!([{"name":"one","type":"http","url":"https://example.invalid","args":[]}]),
+            json!([{"name":"one","type":"sse","url":"https://example.invalid","args":[]}]),
+            json!([{"name":"one","type":"sse","url":"https://example.invalid","command":command()}]),
+            json!([{"name":"one","type":"sse","url":"https://example.invalid","env":[]}]),
+            json!([{"name":"one","type":"sse"}]),
             json!([{"name":"one","command":command(),"headers":[]}]),
             json!([{"name":"one","command":"relative-command"}]),
         ] {
@@ -267,24 +274,26 @@ mod tests {
 
     #[test]
     fn rejects_duplicates_reserved_headers_controls_and_unsafe_urls() {
-        for headers in [
-            json!([{"name":"TOKEN","value":"a"},{"name":"token","value":"b"}]),
-            json!([{"name":"Mcp-Session-Id","value":"forged"}]),
-            json!([{"name":"Authorization","value":"a\r\nb"}]),
-        ] {
-            assert!(
-                parse(&json!([{"type":"http","name":"remote",
-                "url":"https://example.invalid/mcp","headers":headers}]))
-                .is_err()
-            );
-        }
-        for url in [
-            "file:///secret",
-            "https://user:secret@example.invalid",
-            "https://example.invalid/#x",
-        ] {
-            let error = parse(&json!([{"type":"http","name":"remote","url":url}])).unwrap_err();
-            assert!(!error.contains("secret"));
+        for kind in ["http", "sse"] {
+            for headers in [
+                json!([{"name":"TOKEN","value":"a"},{"name":"token","value":"b"}]),
+                json!([{"name":"Mcp-Session-Id","value":"forged"}]),
+                json!([{"name":"Authorization","value":"a\r\nb"}]),
+            ] {
+                assert!(
+                    parse(&json!([{"type":kind,"name":"remote",
+                    "url":"https://example.invalid/mcp","headers":headers}]))
+                    .is_err()
+                );
+            }
+            for url in [
+                "file:///secret",
+                "https://user:secret@example.invalid",
+                "https://example.invalid/#x",
+            ] {
+                let error = parse(&json!([{"type":kind,"name":"remote","url":url}])).unwrap_err();
+                assert!(!error.contains("secret"));
+            }
         }
         assert!(
             parse(&json!([{"name":"one","command":command(),"env":[
@@ -320,5 +329,18 @@ mod tests {
         server.provenance = Provenance::Acp;
         server.args.push("changed".into());
         assert_ne!(first, server.fingerprint(Path::new("/workspace")));
+    }
+
+    #[test]
+    fn http_and_sse_definitions_cannot_reuse_the_same_trust_identity() {
+        let servers = parse(&json!([{
+            "type":"sse","name":"remote","url":"https://example.invalid/mcp",
+            "headers":[{"name":"Authorization","value":"literal-token"}],
+        }]))
+        .unwrap();
+        let mut server = servers[0].clone();
+        let sse_identity = server.fingerprint(Path::new("/workspace"));
+        server.transport_hint = Some("http".to_string());
+        assert_ne!(sse_identity, server.fingerprint(Path::new("/workspace")));
     }
 }

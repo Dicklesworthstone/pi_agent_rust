@@ -1868,7 +1868,7 @@ fn handle_initialize() -> Value {
             "loadSession": true,
             "mcpCapabilities": {
                 "http": true,
-                "sse": false,
+                "sse": true,
             },
             "promptCapabilities": content::prompt_capabilities(),
             "sessionCapabilities": { "list": {} },
@@ -4441,7 +4441,7 @@ mod tests {
         );
         // mcpCapabilities advertised explicitly so the client knows transports.
         assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["http"], true);
-        assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["sse"], false);
+        assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["sse"], true);
         // Tool approval is exposed as implementation metadata; the standard
         // permission request itself is an Agent -> Client JSON-RPC call.
         assert_eq!(
