@@ -40,6 +40,9 @@ pub(super) fn identity(path: &str, generation: u32) -> String {
 
 impl ModuleFiles {
     pub(in crate::eval::js_kernel) fn install_reload(&self, ctx: &Ctx<'_>) -> rquickjs::Result<()> {
+        // All module helpers capture the pristine realm before cells run.
+        // This does not read files or acquire a cell's authority at install.
+        self.install_commonjs(ctx)?;
         let files = self.clone();
         ctx.globals().set(
             "reloadModules",

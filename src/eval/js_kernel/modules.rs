@@ -5,7 +5,9 @@
 //! and TypeScript modules share one linker/cache; TypeScript is lowered to
 //! JavaScript before QuickJS sees it. JSON and text imports require their
 //! explicit type and export native values, never executable source.
-//! Workspace-installed ESM packages share that boundary. No native libraries,
+//! CommonJS default imports and workspace-installed packages share that boundary.
+//! CommonJS dependencies use the same owner, graph generation and file budgets.
+//! No native libraries,
 //! remote URLs, package installation or implicit file-extension search.
 
 use std::cell::RefCell;
@@ -23,6 +25,7 @@ use rquickjs::{Ctx, Exception, Module};
 use crate::agent_cx::AgentCx;
 use crate::eval::lifecycle::source;
 
+mod commonjs;
 mod data;
 mod packages;
 mod reload;
@@ -39,6 +42,7 @@ type Admission<T> = std::result::Result<T, String>;
 enum ModuleLanguage {
     JavaScript,
     TypeScript,
+    CommonJs,
     Json,
     Text,
 }
@@ -48,7 +52,7 @@ impl ModuleLanguage {
         match self {
             Self::Json => Some("json"),
             Self::Text => Some("text"),
-            Self::JavaScript | Self::TypeScript => None,
+            Self::JavaScript | Self::TypeScript | Self::CommonJs => None,
         }
     }
 }
@@ -199,6 +203,8 @@ impl ModuleFiles {
         // versa), even when QuickJS already cached the canonical target.
         if module_language(&requested).and_then(ModuleLanguage::data_type)
             != module_language(&resolved).and_then(ModuleLanguage::data_type)
+            || (module_language(&requested) == Some(ModuleLanguage::CommonJs))
+                != (module_language(&resolved) == Some(ModuleLanguage::CommonJs))
         {
             return Err("EVAL_MODULE_TYPE: module alias changes its data/code type".into());
         }
@@ -290,6 +296,7 @@ fn module_language(path: &Path) -> Option<ModuleLanguage> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("js" | "mjs") => Some(ModuleLanguage::JavaScript),
         Some("ts" | "mts") => Some(ModuleLanguage::TypeScript),
+        Some("cjs") => Some(ModuleLanguage::CommonJs),
         Some("json") => Some(ModuleLanguage::Json),
         Some(
             "txt" | "md" | "csv" | "tsv" | "svg" | "html" | "css" | "xml" | "yaml" | "yml" | "toml"
@@ -365,15 +372,21 @@ impl Loader for ModuleFiles {
             .module_path(name)
             .map_err(|error| Exception::throw_message(ctx, &error))?;
         validate_attributes(ctx, &path, attributes)?;
-        let source = self
-            .read_module(name)
-            .map_err(|error| Exception::throw_message(ctx, &error))?;
         // Linking can recursively invoke our callbacks. Do not retain a
         // RefCell borrow (or any open file) across the engine boundary.
-        let module = match module_language(Path::new(&path)) {
-            Some(ModuleLanguage::Json) => data::declare_json(ctx, name, &source.code)?,
-            Some(ModuleLanguage::Text) => data::declare_text(ctx, name, &source.code)?,
-            _ => Module::declare(ctx.clone(), name, source.code)?,
+        let module = if module_language(Path::new(&path)) == Some(ModuleLanguage::CommonJs) {
+            // Declare now, execute only at native module evaluation. A failed
+            // ESM link must not already have run a CommonJS module body.
+            commonjs::declare(ctx, name)?
+        } else {
+            let source = self
+                .read_module(name)
+                .map_err(|error| Exception::throw_message(ctx, &error))?;
+            match module_language(Path::new(&path)) {
+                Some(ModuleLanguage::Json) => data::declare_json(ctx, name, &source.code)?,
+                Some(ModuleLanguage::Text) => data::declare_text(ctx, name, &source.code)?,
+                _ => Module::declare(ctx.clone(), name, source.code)?,
+            }
         };
         self.0
             .borrow()

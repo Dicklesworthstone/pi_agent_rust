@@ -125,7 +125,6 @@ fn exact_exports_seal_private_paths_and_reject_target_escapes() {
         "./index",
         "./directory/",
         "file:///x.mjs",
-        "./x.cjs",
         "./x.node",
     ] {
         assert!(
@@ -133,6 +132,10 @@ fn exact_exports_seal_private_paths_and_reject_target_escapes() {
             "{target}"
         );
     }
+    assert_eq!(
+        target_path(Path::new("/workspace"), "./x.cjs").unwrap(),
+        Path::new("/workspace").join("x.cjs")
+    );
 }
 
 #[test]

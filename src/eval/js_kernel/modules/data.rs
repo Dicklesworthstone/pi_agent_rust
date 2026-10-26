@@ -40,7 +40,7 @@ impl ModuleDef for DataModule {
 /// Bound nesting before entering the engine parser. This scanner is only a
 /// depth gate; QuickJS still validates the complete JSON grammar and retains
 /// its native duplicate-key, number, key-order and __proto__ data semantics.
-fn check_json_depth(source: &str) -> Result<(), &'static str> {
+pub(super) fn check_json_depth(source: &str) -> Result<(), &'static str> {
     let mut depth = 0_usize;
     let mut quoted = false;
     let mut escaped = false;
