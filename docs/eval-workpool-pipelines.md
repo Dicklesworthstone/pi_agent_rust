@@ -28,6 +28,7 @@ const report = await workpool.mapReduce(
     {
         pool: {agent: 'reviewer', concurrency: 3, timeoutSeconds: 120},
         timeout: 90,
+        ordered: true,
         onPool: pool => { globalThis.reviewPool = pool; },
     },
 );
@@ -49,6 +50,7 @@ report = await workpool.map_reduce(
     [],
     pool={'agent': 'reviewer', 'concurrency': 3, 'timeout_seconds': 120},
     timeout=90,
+    ordered=True,
 )
 display(report['value'])
 ```
@@ -65,11 +67,32 @@ most `pool.concurrency` admitted-but-not-yet-reduced inputs (1–8), rather than
 materializing the whole source or submitting every task at once. A completed
 result frees a slot only after its reducer returns successfully.
 
-The mapper runs in source order. The reducer runs sequentially in **result
-arrival order**, not necessarily source order. Use the supplied `index` to
-assemble a source-ordered result when order matters. At most four completed
-items are read per native drain call; an early unfinished item does not hold
-up later completed results.
+The mapper runs in source order. By default the reducer runs sequentially in
+**result arrival order**, not necessarily source order. Set `ordered: true`
+in JavaScript or `ordered=True` in Python to invoke the reducer in **source
+order**, while native workers still execute concurrently. This is useful for
+ordered report assembly and reducers whose result depends on processing order.
+The option must be a boolean; its default is false in both languages.
+
+At most four completed items are read per native drain call. Ordered pipelines
+buffer later results until the next source item arrives. Buffered outcomes
+still count against the original 1–8 item admission window, so a slow first
+item cannot cause unbounded input pulls or result retention. The tradeoff is
+head-of-line blocking: workers can become idle behind an earlier slow task.
+Leave ordering disabled when completion-order throughput matters more. This
+does not make model outputs deterministic or order child-agent tool effects;
+it orders only parent-side reducer invocations. User-owned accumulators remain
+unrestricted, and result sizes keep the existing native limits.
+
+The helper keeps a private receive cursor so buffered outcomes are not fetched
+again while waiting. Its public success/error `cursor` acknowledges only
+**returned reducers**, never mere receipt. For example, if items 3 and 2 arrive
+before item 1 and reducing item 2 fails, the recovery cursor contains only item
+1: both 2 and 3 remain readable from the retained native pool. Buffered outcomes
+remain represented in `error.pending`; no successful reduction is replayed
+automatically. Item-failure policy follows the chosen reduction order; protocol,
+timeout and cancellation failures can still stop immediately. The original
+shared deadline is never restarted while waiting for an earlier item.
 
 `maxItems` / `max_items` defaults to 32 and accepts integers from 1 through 32,
 matching the existing pool's lifetime capacity. A larger array/list is rejected
@@ -164,6 +187,8 @@ controlled native-pool receipts:
 ```sh
 node --test tests/eval_workpool_pipeline.test.cjs
 python3 -m unittest discover -s tests -p 'eval_workpool_pipeline_test.py'
+node --test tests/eval_workpool_ordered.test.cjs
+python3 -m unittest discover -s tests -p 'eval_workpool_ordered_test.py'
 ```
 
 The Python bootstrap regression also checks installation before kernel main

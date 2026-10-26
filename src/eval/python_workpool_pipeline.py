@@ -33,17 +33,20 @@ def install(kernel):
         return RuntimeError("EVAL_PIPELINE_PROTOCOL: inconsistent native pool result")
 
     async def map_reduce(source, map_task, reduce, initial, *, pool=None,
-                         max_items=32, timeout=30, raise_errors=True, on_pool=None):
+                         max_items=32, timeout=30, raise_errors=True, on_pool=None,
+                         ordered=False):
         """Reduce full native results as they settle, with bounded input demand.
 
         Both callbacks may be synchronous or async. `timeout` is shared across
         result waits and checked between callback/iterator steps; the cell's
         native watchdog, not a detached Python task, bounds guest code itself.
+        `ordered=True` reduces in source order without serializing the workers.
         """
         if (not callable(map_task) or not callable(reduce)
                 or type(max_items) is not int or not 1 <= max_items <= 32
                 or type(timeout) not in (int, float) or not finite(timeout)
                 or not 0 < timeout <= 600 or type(raise_errors) is not bool
+                or type(ordered) is not bool
                 or (on_pool is not None and not callable(on_pool))
                 or (pool is not None and type(pool) is not dict)
                 or isinstance(source, (str, bytes, bytearray))
@@ -55,12 +58,16 @@ def install(kernel):
         deadline = clock() + timeout
         carrier = None
         cursor = None
+        # Receiving a result is not a successful reduction acknowledgment.
+        # Keep this cursor private so buffered results remain recoverable.
+        received = None
         value = initial
         admitted = completed = succeeded = failed = 0
         exhausted = sealed = False
         stage = "create"
         current = None
         pending = {}
+        buffered = {}
 
         def remaining():
             seconds = deadline - clock()
@@ -71,6 +78,14 @@ def install(kernel):
         def progress():
             return {"value": value, "admitted": admitted, "completed": completed,
                     "succeeded": succeeded, "failed": failed}
+
+        def cursor_after(previous, item_id):
+            ids = [] if previous is None else list(previous["itemIds"])
+            if item_id in ids:
+                raise protocol()
+            ids.append(item_id)
+            return {"schema": "pi.subagent.pool.cursor.v1", "poolId": carrier.id,
+                    "itemIds": sorted(ids)}
 
         async def pull():
             if asynchronous:
@@ -135,13 +150,34 @@ def install(kernel):
                     sealed = True
                     remaining()
 
+            async def reduce_one(item_id, outcome):
+                nonlocal current, stage, value, cursor, completed, succeeded, failed
+                current, ok = outcome
+                stage = "result"
+                remaining()
+                if raise_errors and not ok:
+                    raise RuntimeError("EVAL_PIPELINE_ITEM_FAILED: a native pool item did not succeed")
+                stage = "reduce"
+                value = await resolve(reduce(value, current))
+                # Only a returned reducer commits progress. Cancellation or a
+                # later failing result cannot acknowledge buffered outcomes.
+                cursor = cursor_after(cursor, item_id)
+                del pending[item_id]
+                buffered.pop(item_id, None)
+                completed += 1
+                if ok:
+                    succeeded += 1
+                else:
+                    failed += 1
+                remaining()
+
             await fill()
             if admitted == 0:
                 return {**progress(), "pool": carrier, "cursor": cursor, "status": "empty"}
             while True:
                 stage = "drain"
                 current = None
-                page = await carrier.drain(cursor=cursor, timeout=remaining(), max_items=4)
+                page = await carrier.drain(cursor=received, timeout=remaining(), max_items=4)
                 if (type(page) is not dict or type(page.get("items")) is not list
                         or type(page.get("done")) is not bool or page.get("poolId") != carrier.id):
                     raise protocol()
@@ -156,28 +192,17 @@ def install(kernel):
                     item_id = item["id"]
                     index, input_value = pending[item_id]
                     ok = item["status"] == "completed" and not item["result"].get("isError", False)
-                    current = {**item, "index": index, "input": input_value}
-                    stage = "result"
-                    remaining()
-                    if raise_errors and not ok:
-                        raise RuntimeError("EVAL_PIPELINE_ITEM_FAILED: a native pool item did not succeed")
-                    stage = "reduce"
-                    value = await resolve(reduce(value, current))
-                    # Commit the acknowledgment one successful reduction at a
-                    # time, including partial progress within one drain page.
-                    ids = [] if cursor is None else list(cursor["itemIds"])
-                    if item_id in ids:
-                        raise protocol()
-                    ids.append(item_id)
-                    cursor = {"schema": "pi.subagent.pool.cursor.v1", "poolId": carrier.id,
-                              "itemIds": sorted(ids)}
-                    del pending[item_id]
-                    completed += 1
-                    if ok:
-                        succeeded += 1
+                    outcome = ({**item, "index": index, "input": input_value}, ok)
+                    received = cursor_after(received, item_id)
+                    if ordered:
+                        buffered[item_id] = outcome
+                        # Keep buffered outcomes pending: slow earlier work
+                        # cannot open more than the existing admission window.
+                        while completed + 1 in buffered:
+                            next_id = completed + 1
+                            await reduce_one(next_id, buffered[next_id])
                     else:
-                        failed += 1
-                    remaining()
+                        await reduce_one(item_id, outcome)
                 if page["done"]:
                     if not exhausted or not sealed or pending:
                         raise protocol()
