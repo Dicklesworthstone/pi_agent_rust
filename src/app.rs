@@ -1420,10 +1420,16 @@ pub fn resolve_prewalk_model_spec(
 /// inherits the parent ambient environment). Returns the raw spec string; the
 /// child process resolves it through its own startup registry.
 pub fn subagent_role_spec(config: &Config) -> Option<String> {
+    subagent_role_selection(config).map(|(_, spec)| spec)
+}
+
+/// Keep the selected role alongside its raw spec so a child can retain the
+/// role's fallback chain after model resolution or automatic model changes.
+pub fn subagent_role_selection(config: &Config) -> Option<(ModelRole, String)> {
     let roles = config.model_roles.as_ref()?;
-    role_spec_from_settings(roles, ModelRole::Task)
-        .or_else(|| role_spec_from_settings(roles, ModelRole::Smol))
-        .map(str::to_string)
+    [ModelRole::Task, ModelRole::Smol]
+        .into_iter()
+        .find_map(|role| role_spec_from_settings(roles, role).map(|spec| (role, spec.to_string())))
 }
 
 /// Resolve the model entry used for automatic session titling.

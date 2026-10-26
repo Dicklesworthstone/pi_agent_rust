@@ -7326,7 +7326,8 @@ async fn run_share_command(
 async fn run_tan_command(
     handle: &crate::sdk::AgentSessionHandle,
     cwd: &std::path::Path,
-    role_spec: Option<String>,
+    role_selection: Option<(crate::models::ModelRole, String)>,
+    config: crate::config::Config,
     work: String,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
@@ -7358,7 +7359,8 @@ async fn run_tan_command(
         .model_scope()
         .current();
     let tool = crate::subagents::SubagentTool::new(cwd)
-        .with_role_model_spec(role_spec)
+        .with_role_model_selection(role_selection)
+        .with_model_config(Some(config))
         .with_parent_model(parent_model);
     // ubs:ignore Sender clone per background job — the task must own its sender
     let tx = agent_tx.clone();
@@ -10033,10 +10035,9 @@ pub struct FtuiSettings {
     /// With capture on, the terminal routes mouse events to the app and
     /// native drag-to-select stops working (pi_agent_rust#78).
     pub disable_mouse_capture: bool,
-    /// Model spec a `/tan` child agent runs under, from the `task` role falling
-    /// back to `smol` (`app::subagent_role_spec`). `None` lets the child pick
-    /// its own default.
-    pub subagent_role_spec: Option<String>,
+    /// Role and model spec a `/tan` child runs under, from `task` falling
+    /// back to `smol`. Role ownership survives automatic model changes.
+    pub subagent_role_selection: Option<(crate::models::ModelRole, String)>,
     /// `provider/id` models ctrl+p cycles through: the resolved scope
     /// (`--models`, path overrides, `enabledModels`) when one is configured.
     /// Empty means the whole available list, as on the classic stack.
@@ -10137,7 +10138,7 @@ pub fn run(
         markdown_spacing,
         gh_path,
         disable_mouse_capture,
-        subagent_role_spec,
+        subagent_role_selection,
         cycle_models,
         btw_client,
         title_client,
@@ -10704,7 +10705,8 @@ pub fn run(
                             run_tan_command(
                                 &handle,
                                 &bash_cwd,
-                                subagent_role_spec.clone(),
+                                subagent_role_selection.clone(),
+                                settings_controller.config().clone(),
                                 work,
                                 &agent_tx,
                                 &runtime_handle,

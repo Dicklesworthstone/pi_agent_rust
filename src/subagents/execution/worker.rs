@@ -194,11 +194,14 @@ impl Actor {
         } else {
             None
         };
-        let args = crate::subagents::worker_args(
-            &self.agent,
-            self.runner.role_model_spec.as_deref(),
-            self.runner.parent_model.as_ref(),
-            self.runner.worker_model_selection.as_ref(),
+        let args = crate::subagents::with_fallback_policy_args(
+            crate::subagents::worker_args(
+                &self.agent,
+                self.runner.role_model_spec.as_deref(),
+                self.runner.parent_model.as_ref(),
+                self.runner.worker_model_selection.as_ref(),
+            ),
+            self.runner.worker_fallback_policy.as_deref(),
         );
         let mut command = Command::new(&self.runner.child_binary);
         crate::agent_hub::ipc::ChildChannel::configure_child(&mut command, channel.as_ref());
@@ -524,6 +527,7 @@ fn task(agent: &AgentDefinition, text: String) -> SubagentTask {
         task: text,
         model: None,
         model_selection: None,
+        fallback_policy: None,
         cwd: None,
         isolation: None,
         iso_apply: None,

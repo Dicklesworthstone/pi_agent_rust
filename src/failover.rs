@@ -388,8 +388,121 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
 /// One resolved chain: the specs the controller walks on failure.
 #[derive(Debug, Clone)]
 pub struct FailoverChain {
-    /// Ordered `provider/model` specs after the primary.
+    /// Ordered `provider/model[:thinking]` specs after the primary.
     pub entries: Vec<String>,
+}
+
+/// The host's recovery policy captured when native child work is admitted.
+/// Role ownership is explicit provenance, never inferred from a model ID.
+/// The wire representation contains routing settings only, never credentials.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildFallbackPolicy {
+    role: String,
+    retry: crate::config::RetrySettings,
+    disabled_providers: Vec<String>,
+}
+
+impl ChildFallbackPolicy {
+    /// Freeze both host and task workspace exclusions before isolation changes
+    /// the child's cwd. An absent map is frozen as an empty map as well.
+    #[must_use]
+    pub fn capture(
+        config: &crate::config::Config,
+        role: crate::models::ModelRole,
+        directories: &[&std::path::Path],
+    ) -> Self {
+        let mut retry = config.retry.clone().unwrap_or_default();
+        retry.fallback_chains.get_or_insert_with(HashMap::new);
+        let mut disabled_providers = config.disabled_providers.clone().unwrap_or_default();
+        if let Some(overrides) = config.model_scope_overrides.as_deref() {
+            for directory in directories {
+                if let Some(scope) = best_scope_override(overrides, directory)
+                    && let Some(disabled) = scope.disabled_providers.as_ref()
+                {
+                    disabled_providers.extend(disabled.iter().cloned());
+                }
+            }
+        }
+        disabled_providers.sort();
+        disabled_providers.dedup();
+        Self {
+            role: role.as_str().to_string(),
+            retry,
+            disabled_providers,
+        }
+    }
+
+    /// Validate and bound the hidden process argument before publishing work.
+    pub fn to_cli_arg(&self) -> Result<String, String> {
+        let encoded = serde_json::to_string(self)
+            .map_err(|_| "could not encode child fallback policy".to_string())?;
+        if encoded.len() > 32 * 1024 {
+            return Err("child fallback policy exceeds 32 KiB".to_string());
+        }
+        Ok(encoded)
+    }
+
+    /// Startup recovery drivers use this same snapshot for their retry gates,
+    /// cooldowns and budgets even when the child has a different working tree.
+    pub fn apply_to_config(&self, config: &mut crate::config::Config) {
+        config.retry = Some(self.retry.clone());
+        let disabled = config.disabled_providers.get_or_insert_with(Vec::new);
+        disabled.extend(self.disabled_providers.iter().cloned());
+        disabled.sort();
+        disabled.dedup();
+    }
+
+    #[must_use]
+    pub fn allows_provider(&self, provider: &str) -> bool {
+        !provider_is_disabled(&self.disabled_providers, None, provider)
+    }
+
+    /// An explicit user selection retires role ownership while retaining the
+    /// admitted host policy and provider exclusions for this child lifetime.
+    pub(crate) fn use_default_role(&mut self) {
+        self.role = "default".to_string();
+    }
+
+    #[must_use]
+    pub fn chain(
+        &self,
+        provider: &str,
+        model_id: &str,
+        models: &[crate::models::ModelEntry],
+    ) -> Option<FailoverChain> {
+        if self.retry.enabled == Some(false) || self.retry.model_fallback == Some(false) {
+            return None;
+        }
+        let chains = self.retry.fallback_chains.as_ref()?;
+        // A missing role inherits default; an explicitly empty role owns the
+        // decision and disables fallback, including exact-model chains.
+        let role = if chains.contains_key(&self.role) {
+            self.role.as_str()
+        } else {
+            "default"
+        };
+        chain_for(chains, role, provider, model_id, models)
+    }
+}
+
+impl std::str::FromStr for ChildFallbackPolicy {
+    type Err = String;
+
+    fn from_str(encoded: &str) -> Result<Self, Self::Err> {
+        if encoded.len() > 32 * 1024 {
+            return Err("child fallback policy exceeds 32 KiB".to_string());
+        }
+        let policy: Self = serde_json::from_str(encoded)
+            .map_err(|_| "invalid child fallback policy".to_string())?;
+        if crate::models::ModelRole::from_name(&policy.role)
+            .is_none_or(|role| role.as_str() != policy.role)
+            || policy.retry.fallback_chains.is_none()
+        {
+            return Err("invalid child fallback role or chain map".to_string());
+        }
+        Ok(policy)
+    }
 }
 
 /// Resolve the chain for a role name or an exact `provider/model` spec.
@@ -400,6 +513,7 @@ pub struct FailoverChain {
 /// declared providers cannot borrow each other's policy through a built-in alias.
 /// An exact key wins over equivalent spellings; otherwise the lexicographically
 /// first matching key wins, independent of `HashMap` iteration order.
+/// An explicitly empty chain owns its key and disables further fallback.
 pub fn chain_for<S: std::hash::BuildHasher>(
     chains: &HashMap<String, Vec<String>, S>,
     role: &str,
@@ -407,26 +521,20 @@ pub fn chain_for<S: std::hash::BuildHasher>(
     model_id: &str,
     models: &[crate::models::ModelEntry],
 ) -> Option<FailoverChain> {
-    if let Some(entries) = chains.get(role)
-        && !entries.is_empty()
-    {
+    if let Some(entries) = chains.get(role) {
         return Some(FailoverChain {
             entries: entries.clone(),
         });
     }
     let full = format!("{provider}/{model_id}");
-    if let Some(entries) = chains.get(&full)
-        && !entries.is_empty()
-    {
+    if let Some(entries) = chains.get(&full) {
         return Some(FailoverChain {
             entries: entries.clone(),
         });
     }
     chains
         .iter()
-        .filter(|(key, entries)| {
-            !entries.is_empty() && model_spec_matches(key, provider, model_id, models)
-        })
+        .filter(|(key, _)| model_spec_matches(key, provider, model_id, models))
         .min_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, entries)| FailoverChain {
             entries: entries.clone(),
@@ -455,10 +563,10 @@ fn model_spec_matches(
 
 fn model_specs_match(left: &str, right: &str, models: &[crate::models::ModelEntry]) -> bool {
     match (
-        crate::provider_metadata::split_provider_model_spec(left),
-        crate::provider_metadata::split_provider_model_spec(right),
+        chain_spec_parts(left, models),
+        chain_spec_parts(right, models),
     ) {
-        (Some((left_provider, left_model)), Some((right_provider, right_model))) => {
+        (Some((left_provider, left_model, _)), Some((right_provider, right_model, _))) => {
             crate::models::model_identities_match(
                 models,
                 left_provider,
@@ -1066,17 +1174,15 @@ impl<'a> FailoverWalk<'a> {
             let index = self.position;
             let spec = self.entries[index].as_str();
             self.position += 1;
-            let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
-                |(provider, model)| {
-                    crate::models::model_identities_match(
-                        models,
-                        provider,
-                        model,
-                        self.current_provider,
-                        self.current_model,
-                    )
-                },
-            );
+            let is_current = chain_spec_parts(spec, models).is_some_and(|(provider, model, _)| {
+                crate::models::model_identities_match(
+                    models,
+                    provider,
+                    model,
+                    self.current_provider,
+                    self.current_model,
+                )
+            });
             let is_duplicate = self.entries[..index]
                 .iter()
                 .any(|earlier| model_specs_match(earlier, spec, models));
@@ -1105,8 +1211,35 @@ pub fn resolve_chain_spec(
     spec: &str,
     models: &[crate::models::ModelEntry],
 ) -> Option<crate::models::ModelEntry> {
+    resolve_chain_selection(spec, models).map(|(entry, _)| entry)
+}
+
+/// Resolve a fallback destination and its optional effort. A registered literal
+/// ID wins over suffix parsing, preserving local model tags such as `:high`.
+#[must_use]
+pub fn resolve_chain_selection(
+    spec: &str,
+    models: &[crate::models::ModelEntry],
+) -> Option<(
+    crate::models::ModelEntry,
+    Option<crate::model::ThinkingLevel>,
+)> {
+    let (provider, model_id, thinking) = chain_spec_parts(spec, models)?;
+    crate::models::resolve_model_entry(models, provider, model_id).map(|entry| (entry, thinking))
+}
+
+fn chain_spec_parts<'a>(
+    spec: &'a str,
+    models: &[crate::models::ModelEntry],
+) -> Option<(&'a str, &'a str, Option<crate::model::ThinkingLevel>)> {
     let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
-    crate::models::resolve_model_entry(models, provider, model_id)
+    if crate::models::find_model_entry(models, provider, model_id).is_none()
+        && let Some((model, suffix)) = model_id.rsplit_once(':')
+        && let Ok(thinking) = suffix.parse::<crate::model::ThinkingLevel>()
+    {
+        return Some((provider, model, Some(thinking)));
+    }
+    Some((provider, model_id, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -1734,8 +1867,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_role_and_exact_chains_do_not_hide_a_nonempty_alias_chain() {
-        let chains = HashMap::from([
+    fn explicit_empty_role_and_exact_chains_disable_inherited_fallback() {
+        let mut chains = HashMap::from([
             ("task".to_string(), Vec::new()),
             ("google/gemini-z".to_string(), Vec::new()),
             (
@@ -1743,11 +1876,126 @@ mod tests {
                 vec!["openai/gpt-y".to_string()],
             ),
         ]);
+        assert!(
+            chain_for(&chains, "task", "google", "gemini-z", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        chains.remove("task");
+        assert!(
+            chain_for(&chains, "task", "google", "gemini-z", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        chains.remove("google/gemini-z");
         assert_eq!(
             chain_for(&chains, "task", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["openai/gpt-y".to_string()]
+        );
+    }
+
+    #[test]
+    fn child_policy_freezes_role_ownership_empty_opt_out_and_retry_controls() {
+        let mut config = crate::config::Config {
+            retry: Some(crate::config::RetrySettings {
+                fallback_chains: Some(HashMap::from([
+                    ("task".to_string(), vec![]),
+                    ("default".to_string(), vec!["openai/default".to_string()]),
+                    (
+                        "openai/primary".to_string(),
+                        vec!["openai/exact".to_string()],
+                    ),
+                ])),
+                fallback_on: Some(FallbackOn::UsageLimit),
+                max_failovers_per_turn: Some(2),
+                failover_cooldown_secs: Some(17),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let task = ChildFallbackPolicy::capture(&config, crate::models::ModelRole::Task, &[]);
+        assert!(
+            task.chain("openai", "primary", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let smol = ChildFallbackPolicy::capture(&config, crate::models::ModelRole::Smol, &[]);
+        assert_eq!(
+            smol.chain("openai", "primary", &[]).unwrap().entries,
+            vec!["openai/default"]
+        );
+        config
+            .retry
+            .as_mut()
+            .unwrap()
+            .fallback_chains
+            .as_mut()
+            .unwrap()
+            .insert("task".to_string(), vec!["openai/later".to_string()]);
+        assert!(
+            task.chain("openai", "changed-by-prewalk", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let encoded = task.to_cli_arg().unwrap();
+        let restored: ChildFallbackPolicy = encoded.parse().unwrap();
+        let mut child_config = crate::config::Config::default();
+        restored.apply_to_config(&mut child_config);
+        assert_eq!(child_config.retry_fallback_on(), FallbackOn::UsageLimit);
+        assert_eq!(child_config.max_failovers_per_turn(), 2);
+        assert_eq!(child_config.failover_cooldown_secs(), 17);
+        assert!(
+            restored
+                .chain("openai", "primary", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn child_policy_preserves_host_and_task_exclusions_after_explicit_selection() {
+        let config = crate::config::Config {
+            disabled_providers: Some(vec!["open-router".to_string()]),
+            model_scope_overrides: Some(vec![
+                crate::config::ModelScopeOverride {
+                    path: "/host".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["anthropic".to_string()]),
+                },
+                crate::config::ModelScopeOverride {
+                    path: "/task".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["google".to_string()]),
+                },
+            ]),
+            ..Default::default()
+        };
+        let mut policy = ChildFallbackPolicy::capture(
+            &config,
+            crate::models::ModelRole::Task,
+            &[
+                std::path::Path::new("/host/project"),
+                std::path::Path::new("/task/project"),
+            ],
+        );
+        policy.use_default_role();
+        for provider in ["openrouter", "anthropic", "gemini"] {
+            assert!(!policy.allows_provider(provider), "{provider}");
+        }
+        assert!(policy.allows_provider("openai"));
+        assert!(policy.chain("openai", "primary", &[]).is_none());
+        assert!("{}".parse::<ChildFallbackPolicy>().is_err());
+        assert!(
+            " ".repeat(32 * 1024 + 1)
+                .parse::<ChildFallbackPolicy>()
+                .is_err()
         );
     }
 
@@ -2295,6 +2543,28 @@ mod tests {
             "openai"
         ));
         assert!(entry.model.id.eq_ignore_ascii_case("gpt-y"));
+    }
+
+    #[test]
+    fn fallback_effort_suffixes_respect_literal_ids_and_skip_duplicate_models() {
+        let (entry, thinking) = resolve_chain_selection("openai/gpt-y:low", &[]).unwrap();
+        assert_eq!(entry.model.id, "gpt-y");
+        assert_eq!(thinking, Some(crate::model::ThinkingLevel::Low));
+        let literal = crate::models::ad_hoc_model_entry("openai", "gpt-y:high").unwrap();
+        let (selected, thinking) =
+            resolve_chain_selection("openai/gpt-y:high", &[literal]).unwrap();
+        assert_eq!(selected.model.id, "gpt-y:high");
+        assert_eq!(thinking, None);
+        let chain = chain(&[
+            "openai/current:high",
+            "openai/gpt-y:low",
+            "openai/gpt-y:high",
+            "openai/gpt-z",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 0, "openai", "current");
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y:low")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "openai/gpt-z")));
+        assert_eq!(walk.next_spec(&[]), None);
     }
 
     #[test]

@@ -7582,9 +7582,8 @@ async fn try_failover_to_next_chain_entry(
     // A fallback chain belongs to the original primary identity. Once the
     // first entry is active, resolving from the live fallback would make an
     // exact primary chain disappear and prevent later entries from running.
-    let Some(chain) = crate::failover::chain_for(
+    let Some(chain) = guard.resolve_fallback_chain(
         chains,
-        "default",
         &primary_model.provider,
         &primary_model.model_id,
         rpc_model_catalog(&guard, options),

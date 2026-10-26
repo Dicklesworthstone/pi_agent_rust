@@ -453,6 +453,7 @@ impl Plan {
         self.validate_definitions(&agents)?;
         super::model_selection::prepare(
             tool,
+            &agents,
             self.nodes.iter_mut().map(|node| &mut node.call),
             deadline,
         )?;

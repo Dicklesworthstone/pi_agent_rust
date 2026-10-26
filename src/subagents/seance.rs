@@ -407,6 +407,7 @@ pub(super) async fn execute(
             task: prompt,
             model: None,
             model_selection: None,
+            fallback_policy: Some(super::model_selection::prepare_saved_session(tool, deadline)?),
             cwd: None,
             isolation: None,
             iso_apply: None,

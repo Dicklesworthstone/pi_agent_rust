@@ -260,8 +260,8 @@ async fn start(
     if !cwd.is_dir() {
         return Err(invalid("cwd must name an existing directory"));
     }
-    let model_selection =
-        crate::subagents::model_selection::prepare_worker(tool, &input, &cwd, deadline)?;
+    let (model_selection, fallback_policy) =
+        crate::subagents::model_selection::prepare_worker(tool, &input, &agent, &cwd, deadline)?;
     recheck_owner(tool, &owner, &owner_id, deadline).await?;
     let workers: Vec<_> = (0..concurrency)
         .map(|_| worker(&owner_id, &name, deadline))
@@ -295,7 +295,8 @@ async fn start(
                     deadline,
                 )
                 .with_parent_model(parent_model.clone())
-                .with_worker_model_selection(model_selection.clone()),
+                .with_worker_model_selection(model_selection.clone())
+                .with_worker_fallback_policy(fallback_policy.clone()),
                 agent.clone(),
             )
         })

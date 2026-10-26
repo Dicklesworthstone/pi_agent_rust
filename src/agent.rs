@@ -7061,6 +7061,8 @@ pub struct AgentSession {
     /// A CLI/API override belongs to the provider selected when it was set.
     /// Role switches must not forward that secret to a different provider.
     api_key_override_provider: Option<String>,
+    /// Frozen role ownership and exclusions for admitted native child work.
+    child_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
     semantic_context_bundle: Option<SemanticContextBundleInjection>,
     /// One process-local authority for provider admission and transition
     /// quarantine. Extension hostcalls hold its permit across the complete
@@ -15793,6 +15795,7 @@ impl AgentSession {
             auth_storage: None,
             api_key_override: None,
             api_key_override_provider: None,
+            child_fallback_policy: None,
             semantic_context_bundle: None,
             provider_admission: ProviderAdmissionGate::default(),
             session_action_admission: SessionActionAdmissionGate::default(),
@@ -15946,6 +15949,37 @@ impl AgentSession {
             .as_deref()
             .filter(|bound| bound.eq_ignore_ascii_case(provider))
             .and(self.api_key_override.as_deref())
+    }
+
+    /// Install the parent's admission snapshot once at native child startup.
+    /// Automatic role/prewalk/failover changes retain this ownership.
+    pub fn set_child_fallback_policy(
+        &mut self,
+        policy: Option<crate::failover::ChildFallbackPolicy>,
+    ) {
+        self.child_fallback_policy = policy;
+    }
+
+    /// All recovery drivers use the same role ownership. Unbound sessions
+    /// retain their existing default/exact-model chain behavior.
+    #[must_use]
+    pub fn resolve_fallback_chain(
+        &self,
+        ambient: &std::collections::HashMap<String, Vec<String>>,
+        provider: &str,
+        model_id: &str,
+        models: &[crate::models::ModelEntry],
+    ) -> Option<crate::failover::FailoverChain> {
+        self.child_fallback_policy.as_ref().map_or_else(
+            || crate::failover::chain_for(ambient, "default", provider, model_id, models),
+            |policy| policy.chain(provider, model_id, models),
+        )
+    }
+
+    fn fallback_provider_allowed(&self, provider: &str) -> bool {
+        self.child_fallback_policy
+            .as_ref()
+            .is_none_or(|policy| policy.allows_provider(provider))
     }
 
     pub fn refresh_extension_completion_host_state(&self) {
@@ -16213,6 +16247,9 @@ impl AgentSession {
         )
         .await?;
         self.agent.disarm_prewalk();
+        if let Some(policy) = &mut self.child_fallback_policy {
+            policy.use_default_role();
+        }
         Ok(())
     }
 
@@ -16688,6 +16725,11 @@ impl AgentSession {
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
+        if runtime_model_changed
+            && let Some(policy) = &mut self.child_fallback_policy
+        {
+            policy.use_default_role();
+        }
         if runtime_model_changed || current_thinking != effective {
             self.agent.disarm_prewalk();
         }
@@ -17098,6 +17140,15 @@ impl AgentSession {
             return Ok(None);
         };
 
+        if !self.fallback_provider_allowed(&entry.model.provider) {
+            if request.strict_invariants {
+                return Err(Error::validation(
+                    "Unable to restore primary: provider is excluded by the admitted child policy",
+                ));
+            }
+            return Ok(None);
+        }
+
         let registered =
             crate::models::find_model_entry(catalog, &primary.provider, &primary.model_id)
                 .is_some();
@@ -17275,9 +17326,13 @@ impl AgentSession {
                 break;
             };
             let next_position = walk.position();
-            let Some(entry) = crate::failover::resolve_chain_spec(spec, catalog) else {
+            let Some((entry, thinking)) = crate::failover::resolve_chain_selection(spec, catalog)
+            else {
                 continue;
             };
+            if !self.fallback_provider_allowed(&entry.model.provider) {
+                continue;
+            }
             let registered =
                 crate::models::find_model_entry(catalog, &entry.model.provider, &entry.model.id)
                     .is_some();
@@ -17322,7 +17377,7 @@ impl AgentSession {
                 from_model: &from_model,
                 class: attempt.class,
                 chain_position: next_position,
-                thinking_level_to_clamp: attempt.thinking_level_to_clamp,
+                thinking_level_to_clamp: thinking.unwrap_or(attempt.thinking_level_to_clamp),
                 require_incomplete_tail: attempt.require_incomplete_tail,
                 primary: attempt.primary,
                 cooldown_secs: attempt.cooldown_secs,

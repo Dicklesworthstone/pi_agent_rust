@@ -2065,6 +2065,9 @@ async fn run(
         &cwd,
         workspace_trusted,
     )?;
+    if let Some(policy) = &cli.subagent_fallback_policy {
+        policy.apply_to_config(&mut config);
+    }
     for warning in pi::http::proxy::configure(config.http.as_ref()) {
         tracing::warn!("{warning}");
     }
@@ -2852,7 +2855,7 @@ async fn run(
                 // `/tan` (bd-ydz1t.2) resolves its child model exactly as
                 // the classic stack does: the `task` role, falling back to
                 // `smol`.
-                subagent_role_spec: pi::app::subagent_role_spec(&config),
+                subagent_role_selection: pi::app::subagent_role_selection(&config),
                 title_client: pi::app::titling_model_entry(&cli, &config, &model_registry)
                     .and_then(|entry| {
                         pi::session_title::TitleClient::for_model_entry(
@@ -2980,6 +2983,7 @@ async fn run(
         compaction_settings,
     )
     .with_runtime_handle(runtime_handle.clone());
+    agent_session.set_child_fallback_policy(cli.subagent_fallback_policy.clone());
     agent_session.set_api_key_override(cli.api_key.clone());
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
@@ -10622,13 +10626,9 @@ async fn try_print_failover(
     let catalog = session
         .model_registry()
         .map_or(ctx.available_models, ModelRegistry::models);
-    let Some(chain) = pi::failover::chain_for(
-        chains,
-        "default",
-        &primary.provider,
-        &primary.model_id,
-        catalog,
-    ) else {
+    let Some(chain) =
+        session.resolve_fallback_chain(chains, &primary.provider, &primary.model_id, catalog)
+    else {
         return Ok(None);
     };
     // The walk, the credential check, the provider construction and the

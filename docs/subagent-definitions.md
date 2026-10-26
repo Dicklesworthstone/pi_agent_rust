@@ -77,7 +77,7 @@ validated persisted model catalogs, without remote discovery or extension
 initialization. Extension-only registrations must first be represented in the
 native catalog to use this override. Credential commands resolve once per
 provider during admission; child startup still loads its own model metadata and
-credentials. The frozen request carries only provider, model ID, and optional
+credentials. The frozen model selection carries only provider, model ID, and optional
 thinking level, so changing the parent's model cannot reroute queued work,
 schema retries, workflow descendants, or explicit hub revival.
 
@@ -100,6 +100,46 @@ pool = await workpool(agent='sonic', model='openai/gpt-5-mini:low')
 
 Saved-session `seance` consultations retain their separate saved-branch model
 selection contract; these ordinary task defaults do not replace it.
+
+## Role-owned recovery
+
+When the `task` role selects a child model, that child uses
+`retry.fallbackChains.task`. If `smol` supplies the model instead, it uses
+`retry.fallbackChains.smol`. An absent role chain inherits the `default` chain;
+an explicitly empty role chain (`[]`) disables fallback for that role. Role
+ownership stays attached after automatic model changes, including prewalk and
+earlier fallback hops. A per-call `model` or definition `model:` uses the default
+policy even if it happens to name the same model as a configured role.
+
+```json
+{
+  "modelRoles": {"task": "openai/gpt-5-mini:low"},
+  "retry": {
+    "fallbackChains": {
+      "default": ["anthropic/claude-sonnet-4-6:high"],
+      "task": ["google/gemini-3-flash:low"],
+      "smol": []
+    }
+  }
+}
+```
+
+Fallback entries accept `provider/model[:thinking]`. Each hop applies its own
+effort, clamped to the destination's supported levels; restoring the primary
+restores its original effort. Registered literal IDs take precedence over suffix
+parsing. Repeating the same model with a different effort does not spend another
+fallback hop.
+
+Admission freezes the host's retry controls, chains, selected role, and provider
+exclusions from both the host and task workspace. The snapshot follows queued
+tasks, parallel and sequential batches, workflow descendants, schema retries,
+hub revival, `/tan`, and the entire lifetime of a retained worker or pool.
+Changing settings after admission or entering an isolated worktree does not
+replace it. A successful explicit model selection inside a child retires role
+ownership while retaining its host exclusions. Saved-session consultations use
+the default policy with their saved or explicit model. The process handoff is
+bounded to 32 KiB and contains no credentials; oversized policy is rejected
+before launching work.
 
 ## Accepted frontmatter
 

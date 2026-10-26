@@ -307,7 +307,8 @@ async fn start(
     if !cwd.is_dir() {
         return Err(invalid("cwd must name an existing directory"));
     }
-    let model_selection = super::model_selection::prepare_worker(tool, &input, &cwd, deadline)?;
+    let (model_selection, fallback_policy) =
+        super::model_selection::prepare_worker(tool, &input, &agent, &cwd, deadline)?;
     if background::resolve_session(&tool.job_session_scope, &owner, deadline).await? != owner_id {
         return Err(Error::tool(
             "subagent",
@@ -355,7 +356,8 @@ async fn start(
         deadline,
     )
     .with_parent_model(parent_model)
-    .with_worker_model_selection(model_selection);
+    .with_worker_model_selection(model_selection)
+    .with_worker_fallback_policy(fallback_policy);
     let cleanup = FinishGuard(Arc::clone(&state));
     let actor_state = Arc::clone(&state);
     let artifacts = tool.global_dir.join("tool-output-artifacts");

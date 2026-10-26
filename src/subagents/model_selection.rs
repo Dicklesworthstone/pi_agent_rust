@@ -1,7 +1,10 @@
 //! Explicit task destinations are resolved before publishing work. Keep only
 //! the destination and effort in queued requests, never registry credentials.
 
-use super::{Config, Deadline, Error, Path, Result, SubagentTask, SubagentTool, Value};
+use super::{
+    AgentDefinition, BTreeMap, Config, Deadline, Error, Path, Result, SubagentTask, SubagentTool,
+    Value,
+};
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::model::ThinkingLevel;
@@ -89,17 +92,7 @@ struct Admission {
 }
 
 impl Admission {
-    fn load(tool: &SubagentTool, deadline: Deadline) -> Result<Self> {
-        let config = match &tool.model_config {
-            Some(config) => config.clone(),
-            None => Config::load_with_roots_and_project_trust(
-                Config::config_path_override_from_env(&tool.cwd).as_deref(),
-                &tool.global_dir,
-                &tool.cwd,
-                false,
-            )
-            .map_err(|_| invalid("could not load the host's model policy"))?,
-        };
+    fn load(tool: &SubagentTool, config: Config, deadline: Deadline) -> Result<Self> {
         let mut auth = AuthStorage::load_with_lock_timeout(
             tool.global_dir.join("auth.json"),
             deadline.remaining().min(Duration::from_secs(1)),
@@ -173,6 +166,38 @@ impl Admission {
     }
 }
 
+fn host_config(tool: &SubagentTool) -> Result<Config> {
+    match &tool.model_config {
+        Some(config) => Ok(config.clone()),
+        None => Config::load_with_roots_and_project_trust(
+            Config::config_path_override_from_env(&tool.cwd).as_deref(),
+            &tool.global_dir,
+            &tool.cwd,
+            false,
+        )
+        .map_err(|_| invalid("could not load the host's model policy")),
+    }
+}
+
+fn fallback_policy(
+    tool: &SubagentTool,
+    config: &Config,
+    agent: Option<&AgentDefinition>,
+    explicit_model: bool,
+    host: &Path,
+    cwd: &Path,
+) -> Result<String> {
+    let role = if explicit_model || agent.is_some_and(|agent| agent.model.is_some()) {
+        crate::models::ModelRole::Default
+    } else {
+        tool.role_model_role
+            .unwrap_or(crate::models::ModelRole::Default)
+    };
+    crate::failover::ChildFallbackPolicy::capture(config, role, &[host, cwd])
+        .to_cli_arg()
+        .map_err(|message| Error::tool("subagent", format!("PI_SUBAGENT_FALLBACK: {message}")))
+}
+
 fn unknown() -> Error {
     invalid(
         "unknown model; use a native or configured models.json catalog entry (extension-only models are not available for explicit delegation)",
@@ -208,30 +233,79 @@ fn directory(host: &Path, cwd: Option<&Path>) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Conditional workflow branches may name a workspace that will never be
+/// used. Freeze path policy without requiring or preparing that directory.
+fn policy_directory(host: &Path, cwd: Option<&Path>) -> std::path::PathBuf {
+    let path = cwd.map_or_else(|| host.to_path_buf(), |path| host.join(path));
+    std::fs::canonicalize(&path).unwrap_or_else(|_| {
+        let mut normalized = std::path::PathBuf::new();
+        for component in path.components() {
+            if component == std::path::Component::ParentDir {
+                normalized.pop();
+            } else {
+                normalized.push(component);
+            }
+        }
+        normalized
+    })
+}
+
+/// Saved-session consultation deliberately uses the saved or explicit model,
+/// never the host's task/smol role. Its recovery still freezes host exclusions.
+pub(super) fn prepare_saved_session(tool: &SubagentTool, deadline: Deadline) -> Result<String> {
+    let owner = AgentCx::for_current_or_request();
+    check(&owner, deadline)?;
+    let host = directory(&tool.cwd, None)?;
+    let config = host_config(tool)?;
+    let policy = fallback_policy(tool, &config, None, true, &host, &host)?;
+    check(&owner, deadline)?;
+    Ok(policy)
+}
+
 pub(super) fn prepare<'a>(
     tool: &SubagentTool,
+    agents: &BTreeMap<String, AgentDefinition>,
     tasks: impl IntoIterator<Item = &'a mut SubagentTask>,
     deadline: Deadline,
 ) -> Result<()> {
-    let pending: Vec<_> = tasks
-        .into_iter()
-        .filter(|task| task.model.is_some())
-        .collect();
+    let pending: Vec<_> = tasks.into_iter().collect();
     if pending.is_empty() {
         return Ok(());
     }
     for task in &pending {
-        validate_selector(task.model.as_deref().unwrap_or_default())?;
+        if let Some(spec) = &task.model {
+            validate_selector(spec)?;
+        }
     }
     let owner = AgentCx::for_current_or_request();
     check(&owner, deadline)?;
     let host = directory(&tool.cwd, None)?;
-    let admission = Admission::load(tool, deadline)?;
+    let config = host_config(tool)?;
+    let admission = pending
+        .iter()
+        .any(|task| task.model.is_some())
+        .then(|| Admission::load(tool, config.clone(), deadline))
+        .transpose()?;
     for task in pending {
         check(&owner, deadline)?;
-        let cwd = directory(&tool.cwd, task.cwd.as_deref())?;
-        task.model_selection =
-            Some(admission.resolve(task.model.as_deref().unwrap_or_default(), &host, &cwd)?);
+        let cwd = if task.model.is_some() {
+            directory(&tool.cwd, task.cwd.as_deref())?
+        } else {
+            policy_directory(&host, task.cwd.as_deref())
+        };
+        task.fallback_policy = Some(fallback_policy(
+            tool,
+            &config,
+            agents.get(&task.agent),
+            task.model.is_some(),
+            &host,
+            &cwd,
+        )?);
+        if let Some(spec) = task.model.as_deref()
+            && let Some(admission) = &admission
+        {
+            task.model_selection = Some(admission.resolve(spec, &host, &cwd)?);
+        }
     }
     check(&owner, deadline)
 }
@@ -241,25 +315,67 @@ pub(super) fn prepare<'a>(
 pub(super) fn prepare_worker(
     tool: &SubagentTool,
     input: &Value,
+    agent: &AgentDefinition,
     cwd: &Path,
     deadline: Deadline,
-) -> Result<Option<Selection>> {
-    let Some(spec) = field(input)? else {
-        return Ok(None);
-    };
+) -> Result<(Option<Selection>, String)> {
+    let spec = field(input)?;
     let owner = AgentCx::for_current_or_request();
     check(&owner, deadline)?;
     let host = directory(&tool.cwd, None)?;
-    let admission = Admission::load(tool, deadline)?;
-    let selected = admission.resolve(spec, &host, cwd)?;
+    let config = host_config(tool)?;
+    let policy = fallback_policy(tool, &config, Some(agent), spec.is_some(), &host, cwd)?;
+    let selected = spec
+        .map(|spec| Admission::load(tool, config, deadline)?.resolve(spec, &host, cwd))
+        .transpose()?;
     check(&owner, deadline)?;
-    Ok(Some(selected))
+    Ok((selected, policy))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn worker_admission_freezes_role_policy_and_the_shared_rpc_launch_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            retry: Some(crate::config::RetrySettings {
+                fallback_chains: Some(std::collections::HashMap::from([
+                    ("task".to_string(), vec![]),
+                    ("default".to_string(), vec!["openai/alternate:low".to_string()]),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut tool = SubagentTool::with_paths(
+            dir.path().to_path_buf(), dir.path().join("global"), dir.path().join("unused-child"),
+        ).with_model_config(Some(config)).with_role_model_selection(Some((
+            crate::models::ModelRole::Task, "openai/primary".to_string(),
+        )));
+        let mut agent = super::super::tan_agent_definition();
+        let deadline = Deadline::for_request(None, None).unwrap();
+        let (selection, frozen) = prepare_worker(&tool, &json!({}), &agent, dir.path(), deadline).unwrap();
+        assert!(selection.is_none());
+        tool.model_config.as_mut().unwrap().retry.as_mut().unwrap().fallback_chains.as_mut().unwrap()
+            .insert("task".to_string(), vec!["openai/later".to_string()]);
+        let policy: crate::failover::ChildFallbackPolicy = frozen.parse().unwrap();
+        assert!(policy.chain("openai", "primary", &[]).unwrap().entries.is_empty());
+        let args = super::super::with_fallback_policy_args(
+            super::super::worker_args(&agent, tool.role_model_spec.as_deref(), None, selection.as_ref()),
+            Some(&frozen),
+        );
+        assert_eq!(args[0], "--subagent-fallback-policy");
+        assert_eq!(args[1], frozen.as_str());
+        assert!(args.windows(2).any(|pair| pair[0] == "--mode" && pair[1] == "rpc"));
+        // An explicit definition pin to the same ID does not inherit task.
+        agent.model = Some("openai/primary".to_string());
+        let (_, pinned) = prepare_worker(&tool, &json!({}), &agent, dir.path(), deadline).unwrap();
+        let pinned: serde_json::Value = serde_json::from_str(&pinned).unwrap();
+        assert_eq!(pinned["role"], "default");
+    }
 
     fn admission(config: Config) -> Admission {
         let root = tempfile::tempdir().unwrap();

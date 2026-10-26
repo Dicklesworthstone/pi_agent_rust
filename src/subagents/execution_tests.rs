@@ -92,6 +92,144 @@ fn explicit_model_catalog(tool: &SubagentTool) {
     }}).to_string()).unwrap();
 }
 
+fn fallback_config() -> Config {
+    Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(std::collections::HashMap::from([
+                (
+                    "task".to_string(),
+                    vec!["selection-local/selection-careful:high".to_string()],
+                ),
+                ("default".to_string(), vec![]),
+            ])),
+            ..Default::default()
+        }),
+        disabled_providers: Some(vec!["excluded-provider".to_string()]),
+        ..Default::default()
+    }
+}
+
+fn record_fallback_script(body: &str) -> String {
+    format!(
+        "while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             --subagent-fallback-policy) shift; printf '%s\\n' \"$1\" >> \"$PI_CODING_AGENT_DIR/fallback-used\" ;;\n\
+           esac\n\
+           shift\n\
+         done\n{body}"
+    )
+}
+
+fn recorded_fallbacks(tool: &SubagentTool) -> Vec<Value> {
+    std::fs::read_to_string(tool.global_dir.join("fallback-used"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn task_role_provenance_is_carried_in_all_modes_without_model_id_inference() {
+    let role = json!({"agent":"worker", "task":"role-owned work"});
+    let explicit =
+        json!({"agent":"worker", "task":"explicit work", "model":"selection-local/selection-fast"});
+    for input in [
+        role.clone(),
+        json!({"tasks":[role.clone(), explicit.clone()], "concurrency":1}),
+        json!({"chain":[role.clone(), explicit.clone()]}),
+        json!({"workflow":[
+            {"id":"role", "call":role.clone()},
+            {"id":"explicit", "needs":["role"], "call":explicit.clone()}
+        ]}),
+    ] {
+        let (_dir, tool) = fixture(&record_fallback_script(&emit(&[ended("complete", "stop")])));
+        explicit_model_catalog(&tool);
+        let tool = tool
+            .with_model_config(Some(fallback_config()))
+            .with_role_model_selection(Some((
+                crate::models::ModelRole::Task,
+                "selection-local/selection-fast".to_string(),
+            )));
+        let output = run(&tool, input.clone());
+        assert!(!output.is_error, "{output:?}");
+        let policies = recorded_fallbacks(&tool);
+        assert_eq!(policies[0]["role"], "task");
+        assert_eq!(
+            policies[0]["disabled_providers"],
+            json!(["excluded-provider"])
+        );
+        if input.get("agent").is_none() {
+            assert_eq!(policies.len(), 2);
+            assert_eq!(
+                policies[1]["role"], "default",
+                "same model does not imply same role"
+            );
+        }
+        std::fs::write(tool.global_dir.join("agents/worker.md"),
+            "---\nname: worker\ndescription: pinned\nmodel: selection-local/selection-fast\n---\nComplete the task.").unwrap();
+        assert!(!run(&tool, request()).is_error);
+        assert_eq!(recorded_fallbacks(&tool).last().unwrap()["role"], "default");
+    }
+}
+
+#[test]
+fn admitted_fallback_snapshot_survives_configuration_changes_schema_retry_and_revival() {
+    let body = format!(
+        "if [ -f \"$PI_CODING_AGENT_DIR/retried\" ]; then\n{}\
+         else\n: > \"$PI_CODING_AGENT_DIR/retried\"\n{}\
+         fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (_dir, mut tool) = fixture(&record_fallback_script(&body));
+    tool = tool
+        .with_model_config(Some(fallback_config()))
+        .with_role_model_selection(Some((
+            crate::models::ModelRole::Task,
+            "selection-local/selection-fast".to_string(),
+        )));
+    let request: SubagentRequest = serde_json::from_value(json!({
+        "chain":[
+            {"agent":"worker", "task":format!("frozen-policy-{}", uuid::Uuid::new_v4()),
+             "outputSchema":{"type":"object", "required":["accepted"]}, "schemaMode":"strict"},
+            {"agent":"worker", "task":"follow-up"}
+        ]
+    }))
+    .unwrap();
+    let prepared = tool.prepare_request(&request).unwrap();
+    tool.model_config
+        .as_mut()
+        .unwrap()
+        .retry
+        .as_mut()
+        .unwrap()
+        .fallback_chains
+        .as_mut()
+        .unwrap()
+        .insert("task".to_string(), vec![]);
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepared.run(None));
+    assert!(results.iter().all(|result| !result.is_error));
+    assert_eq!(results[0].schema_retries, Some(1));
+    let policies = recorded_fallbacks(&tool);
+    assert_eq!(policies.len(), 3);
+    assert!(policies.iter().all(|policy| policy == &policies[0]));
+    assert_eq!(
+        policies[0]["retry"]["fallback_chains"]["task"],
+        json!(["selection-local/selection-careful:high"])
+    );
+    let revived = revive_through_hub(&tool.cwd, results[0].hub_id.as_deref().unwrap());
+    assert!(!revived.is_error, "{revived:?}");
+    assert_eq!(recorded_fallbacks(&tool)[3], policies[0]);
+    assert!(!run(&tool, json!({"agent":"worker", "task":"new policy"})).is_error);
+    assert_eq!(
+        recorded_fallbacks(&tool)[4]["retry"]["fallback_chains"]["task"],
+        json!([])
+    );
+}
+
 #[test]
 fn explicit_models_override_definition_role_and_parent_in_every_one_shot_mode() {
     let first =

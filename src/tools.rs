@@ -5947,7 +5947,7 @@ impl ToolRegistry {
                     let structured_results = config
                         .and_then(|c| c.subagent_structured_results)
                         .unwrap_or(false);
-                    let role_model_spec = config.and_then(crate::app::subagent_role_spec);
+                    let role_model_selection = config.and_then(crate::app::subagent_role_selection);
                     tools.push(Box::new(
                         crate::subagents::SubagentTool::new(cwd)
                             .with_structured_results(structured_results)
@@ -5955,7 +5955,7 @@ impl ToolRegistry {
                             .with_secrets_settings(
                                 config.and_then(|config| config.secrets.as_ref()),
                             )
-                            .with_role_model_spec(role_model_spec)
+                            .with_role_model_selection(role_model_selection)
                             .with_model_config(config.cloned()),
                     ));
                 }

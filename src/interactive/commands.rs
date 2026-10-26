@@ -3803,7 +3803,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
-            .with_role_model_spec(pi::app::subagent_role_spec(&self.config))
+            .with_role_model_selection(pi::app::subagent_role_selection(&self.config))
+            .with_model_config(Some(self.config.clone()))
             .with_parent_model(parent_model);
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();

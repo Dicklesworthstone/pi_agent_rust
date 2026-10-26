@@ -650,9 +650,8 @@ impl AgentSessionHandle {
             }
         };
         let primary = self.failover_state.primary_for_swap(live);
-        let Some(chain) = crate::failover::chain_for(
+        let Some(chain) = self.session.resolve_fallback_chain(
             &options.chains,
-            "default",
             &primary.provider,
             &primary.model_id,
             self.session.model_registry().map_or(

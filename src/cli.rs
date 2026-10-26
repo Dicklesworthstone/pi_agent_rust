@@ -119,6 +119,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "plan"
         | "advisor"
         | "prewalk-into"
+        | "subagent-fallback-policy"
         | "approval-mode"
         | "thinking"
         | "system-prompt"
@@ -385,6 +386,10 @@ pub struct Cli {
     /// Model spec for the `advisor` role (turn-review second model).
     #[arg(long, value_name = "PROVIDER/MODEL")]
     pub advisor: Option<String>,
+
+    /// Frozen host routing policy for an admitted native child process.
+    #[arg(long, hide = true)]
+    pub subagent_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
 
     /// Plan with the initial model, then hand off to @smol after the first edit.
     #[arg(long, conflicts_with = "no_prewalk")]
@@ -1928,6 +1933,30 @@ mod tests {
         assert!(!parsed.cli.no_extensions);
         assert!(parsed.extension_flags.is_empty());
         assert!(!Cli::parse_from(["pi"]).no_mcp);
+    }
+
+    #[test]
+    fn native_child_fallback_policy_survives_extension_flag_preprocessing() {
+        let policy = crate::failover::ChildFallbackPolicy::capture(
+            &crate::config::Config::default(),
+            crate::models::ModelRole::Task,
+            &[],
+        )
+        .to_cli_arg()
+        .unwrap();
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--subagent-fallback-policy".to_string(),
+            policy,
+            "--mode".to_string(),
+            "json".to_string(),
+            "--print".to_string(),
+            "Task: finish delegated work".to_string(),
+        ])
+        .unwrap();
+        assert!(parsed.extension_flags.is_empty());
+        assert!(parsed.cli.subagent_fallback_policy.is_some());
+        assert!(Cli::try_parse_from(["pi", "--subagent-fallback-policy", "{}"]).is_err());
     }
 
     #[test]

@@ -134,6 +134,8 @@ pub struct SubagentTool {
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
     role_model_spec: Option<String>,
+    /// The role that actually supplied the spec, distinct from model identity.
+    role_model_role: Option<crate::models::ModelRole>,
     /// Effective host policy used when admitting explicit task model choices.
     model_config: Option<Config>,
     /// Live host identity for tools mounted in an agent's registry.
@@ -266,6 +268,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            role_model_role: None,
             model_config: None,
             model_scope: None,
             parent_model: None,
@@ -301,6 +304,20 @@ impl SubagentTool {
     #[must_use]
     pub fn with_role_model_spec(mut self, spec: Option<String>) -> Self {
         self.role_model_spec = spec.filter(|s| !s.trim().is_empty());
+        self.role_model_role = None;
+        self
+    }
+
+    /// Preserve the selected task/smol role's recovery policy. An unlabeled
+    /// explicit model spec never acquires role ownership by matching its ID.
+    #[must_use]
+    pub fn with_role_model_selection(
+        mut self,
+        selection: Option<(crate::models::ModelRole, String)>,
+    ) -> Self {
+        let selection = selection.filter(|(_, spec)| !spec.trim().is_empty());
+        self.role_model_role = selection.as_ref().map(|(role, _)| *role);
+        self.role_model_spec = selection.map(|(_, spec)| spec);
         self
     }
 
@@ -381,17 +398,19 @@ impl SubagentTool {
         let deadline = Deadline::for_request(self.timeout, None)?;
         let definition = tan_agent_definition();
         let agents = BTreeMap::from([(TAN_AGENT_NAME.to_string(), definition)]);
-        let request = SubagentTask {
+        let mut request = SubagentTask {
             agent: TAN_AGENT_NAME.to_string(),
             task: task.to_string(),
             model: None,
             model_selection: None,
+            fallback_policy: None,
             cwd: Some(self.cwd.clone()),
             isolation: None,
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::Permissive,
         };
+        model_selection::prepare(self, &agents, std::iter::once(&mut request), deadline)?;
         let result = ChildRunner::new(
             self.cwd.clone(),
             self.global_dir.clone(),
@@ -422,6 +441,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            role_model_role: None,
             model_config: None,
             model_scope: None,
             parent_model: None,
@@ -462,10 +482,10 @@ impl SubagentTool {
         let agents = self.discover(request.scope)?;
         match &mut mode {
             RequestMode::Single(task) => {
-                model_selection::prepare(self, std::iter::once(task), deadline)?;
+                model_selection::prepare(self, &agents, std::iter::once(task), deadline)?;
             }
             RequestMode::Parallel(tasks) | RequestMode::Chain(tasks) => {
-                model_selection::prepare(self, tasks.iter_mut(), deadline)?;
+                model_selection::prepare(self, &agents, tasks.iter_mut(), deadline)?;
             }
         }
         let concurrency = request
@@ -804,6 +824,7 @@ impl SubagentRequest {
                 task: task.clone(),
                 model: self.model.clone(),
                 model_selection: None,
+                fallback_policy: None,
                 cwd: self.cwd.clone(),
                 isolation: self.isolation.clone(),
                 iso_apply: self.iso_apply.clone(),
@@ -878,6 +899,9 @@ struct SubagentTask {
     /// revival retain this identity; callers cannot inject a resolved target.
     #[serde(skip)]
     model_selection: Option<model_selection::Selection>,
+    /// Bounded, credential-free launch snapshot; never accepted from callers.
+    #[serde(skip)]
+    fallback_policy: Option<String>,
     #[serde(default)]
     cwd: Option<PathBuf>,
     /// Workspace isolation: `none` (default) or `worktree` (bd-cv653.5.2).
@@ -1100,6 +1124,15 @@ fn split_csv(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn with_fallback_policy_args(args: Vec<OsString>, policy: Option<&str>) -> Vec<OsString> {
+    let Some(policy) = policy else {
+        return args;
+    };
+    let mut launch = vec!["--subagent-fallback-policy".into(), policy.into()];
+    launch.extend(args);
+    launch
 }
 
 fn child_args(
@@ -1841,6 +1874,7 @@ mod tests {
             task: "update the changelog".to_string(),
             model: None,
             model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1875,6 +1909,7 @@ mod tests {
             task: concat!("review {", "previous}").to_string(),
             model: None,
             model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1901,6 +1936,7 @@ mod tests {
                 .to_string(),
             model: None,
             model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -2076,6 +2112,7 @@ mod tests {
             task: "t".to_string(),
             model: None,
             model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -2126,6 +2163,7 @@ mod tests {
             task: "t".to_string(),
             model: None,
             model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,

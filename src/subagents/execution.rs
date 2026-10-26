@@ -58,6 +58,7 @@ pub(super) struct ChildRunner {
     role_model_spec: Option<String>,
     parent_model: Option<crate::tools::ToolModelSelection>,
     worker_model_selection: Option<super::model_selection::Selection>,
+    worker_fallback_policy: Option<String>,
     hub_kind: ChildKind,
     deadline: Deadline,
     revival: Option<(String, RevivalSpec)>,
@@ -82,6 +83,7 @@ impl ChildRunner {
             role_model_spec,
             parent_model: None,
             worker_model_selection: None,
+            worker_fallback_policy: None,
             hub_kind,
             deadline,
             revival: None,
@@ -137,6 +139,11 @@ impl ChildRunner {
         model: Option<super::model_selection::Selection>,
     ) -> Self {
         self.worker_model_selection = model;
+        self
+    }
+
+    pub(super) fn with_worker_fallback_policy(mut self, policy: String) -> Self {
+        self.worker_fallback_policy = Some(policy);
         self
     }
 
@@ -448,13 +455,16 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let args = child_args(
-            agent,
-            &task.task,
-            self.role_model_spec.as_deref(),
-            launch.parent_model.as_ref(),
-            task.model_selection.as_ref(),
-            schema,
+        let args = super::with_fallback_policy_args(
+            child_args(
+                agent,
+                &task.task,
+                self.role_model_spec.as_deref(),
+                launch.parent_model.as_ref(),
+                task.model_selection.as_ref(),
+                schema,
+            ),
+            task.fallback_policy.as_deref(),
         );
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(

@@ -419,7 +419,8 @@ pub struct RetrySettings {
     pub max_delay_ms: Option<u32>,
     /// Cross-model failover chains (bd-cv653.3.2): maps a role name
     /// (`default`/`smol`/…) or an exact `provider/model` spec to an ordered
-    /// list of fallback `provider/model` specs. On a classified transient
+    /// list of fallback `provider/model[:thinking]` specs. An explicit empty
+    /// role chain disables fallback for that role. On a classified transient
     /// failure (429/quota/overload after the retry budget) the NEXT entry
     /// continues the turn; the primary is restored after the cooldown.
     #[serde(alias = "fallbackChains")]

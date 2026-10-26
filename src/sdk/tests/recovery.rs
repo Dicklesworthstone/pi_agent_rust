@@ -4015,3 +4015,172 @@ fn recovery_without_a_native_key_binding_preserves_explicit_embedder_override() 
         Some("explicit-embedder-pin")
     );
 }
+
+#[test]
+fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() {
+    use crate::model::ThinkingLevel;
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("child-primary", "primary");
+    let mut first = recovery_route_entry("child-first", "first");
+    let mut second = recovery_route_entry("child-second", "second");
+    primary.model.reasoning = true;
+    first.model.reasoning = true;
+    second.model.reasoning = true;
+    let excluded = recovery_route_entry("child-excluded", "excluded");
+    let wrong = recovery_route_entry("child-default", "wrong");
+    let entries = vec![primary, first, second, excluded, wrong];
+    let config = Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(HashMap::from([
+                (
+                    "task".to_string(),
+                    vec![
+                        "child-excluded/excluded".to_string(),
+                        "child-first/first:low".to_string(),
+                        "child-second/second:high".to_string(),
+                    ],
+                ),
+                (
+                    "default".to_string(),
+                    vec!["child-default/wrong".to_string()],
+                ),
+            ])),
+            ..Default::default()
+        }),
+        disabled_providers: Some(vec!["child-excluded".to_string()]),
+        ..Default::default()
+    };
+    let mut handle =
+        credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
+            // A different live driver map cannot replace the child's frozen role.
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec!["child-default/wrong".to_string()],
+            )]),
+            available_models: entries,
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: Some("explicit-pin-cannot-enable-excluded-provider".to_string()),
+            cooldown_secs: 0,
+        }));
+    handle.session.agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    handle.session_store().try_lock().unwrap().set_model_header(
+        Some("child-primary".to_string()),
+        Some("primary".to_string()),
+        Some("high".to_string()),
+    );
+    handle
+        .session
+        .set_child_fallback_policy(Some(crate::failover::ChildFallbackPolicy::capture(
+            &config,
+            crate::models::ModelRole::Task,
+            &[],
+        )));
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider("child-primary", "503 service unavailable"));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("child-first".to_string(), "first".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().thinking_level,
+        Some(ThinkingLevel::Low)
+    );
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 2, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("child-second".to_string(), "second".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().thinking_level,
+        Some(ThinkingLevel::High)
+    );
+    assert_eq!(
+        handle
+            .failover_state
+            .primary()
+            .unwrap()
+            .requested_thinking_level,
+        ThinkingLevel::High
+    );
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("child-primary".to_string(), "primary".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().thinking_level,
+        Some(ThinkingLevel::High)
+    );
+}
+
+#[test]
+fn explicit_model_selection_retires_child_role_but_automatic_changes_preserve_it() {
+    let dir = tempdir().unwrap();
+    let primary = recovery_route_entry("role-primary", "primary");
+    let automatic = recovery_route_entry("role-automatic", "automatic");
+    let fallback = recovery_route_entry("role-fallback", "fallback");
+    let entries = vec![primary, automatic, fallback];
+    let config = Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(HashMap::from([
+                ("task".to_string(), vec![]),
+                (
+                    "default".to_string(),
+                    vec!["role-fallback/fallback".to_string()],
+                ),
+                (
+                    "role-automatic/automatic".to_string(),
+                    vec!["role-fallback/fallback".to_string()],
+                ),
+            ])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut handle =
+        credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
+            chains: config
+                .retry
+                .as_ref()
+                .unwrap()
+                .fallback_chains
+                .clone()
+                .unwrap(),
+            available_models: entries,
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: None,
+            cooldown_secs: 300,
+        }));
+    handle
+        .session
+        .set_child_fallback_policy(Some(crate::failover::ChildFallbackPolicy::capture(
+            &config,
+            crate::models::ModelRole::Task,
+            &[],
+        )));
+    let origin = handle
+        .session
+        .session_action_admission_gate()
+        .capture_origin();
+    assert!(
+        run_async(handle.session.set_automatic_model_selection(
+            "role-automatic",
+            "automatic",
+            crate::model::ThinkingLevel::Off,
+            &origin,
+        ))
+        .unwrap()
+    );
+    run_async(handle.session.sync_runtime_selection_from_session_header()).unwrap();
+    let (events, callback) = event_log();
+    let failure = Err(Error::provider("role-automatic", "503 service unavailable"));
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(events.lock().unwrap().is_empty());
+    run_async(handle.set_model("role-automatic", "automatic")).unwrap();
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("role-fallback".to_string(), "fallback".to_string())
+    );
+}
