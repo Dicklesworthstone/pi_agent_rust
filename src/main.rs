@@ -2828,6 +2828,14 @@ async fn run(
                 hide_thinking_block: config.hide_thinking_block.unwrap_or(false),
                 model_names: ftui_model_names,
                 start_in_plan_mode: cli.plan_mode,
+                plan_model_spec: cli.plan.clone().or_else(|| {
+                    config
+                        .model_roles
+                        .as_ref()
+                        .and_then(|roles| roles.plan.clone())
+                }),
+                plan_disabled_providers: disabled_providers.clone(),
+                plan_scope_overrides: config.model_scope_overrides.clone().unwrap_or_default(),
                 prewalk_target: pi::app::resolve_prewalk_target(
                     "@smol",
                     &cli,

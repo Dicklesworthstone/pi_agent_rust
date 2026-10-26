@@ -7,6 +7,7 @@
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::interactive::PiMsg;
+use crate::model::ThinkingLevel;
 use crate::plan::{PlanChange, PlanMode, PlanPersistence, SessionPlanReview};
 use crate::sdk::AgentSessionHandle;
 use std::fmt::Write as _;
@@ -64,12 +65,127 @@ struct DisplayedPlan {
     review: SessionPlanReview,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelSelection {
+    provider: String,
+    model: String,
+    thinking: ThinkingLevel,
+}
+
+impl ModelSelection {
+    fn current(handle: &AgentSessionHandle) -> Self {
+        let (provider, model) = handle.model();
+        Self {
+            provider,
+            model,
+            thinking: handle.thinking_level().unwrap_or_default(),
+        }
+    }
+
+    fn label(&self) -> String {
+        format!("{}/{}:{}", self.provider, self.model, self.thinking)
+    }
+
+    fn is_current(
+        &self,
+        handle: &AgentSessionHandle,
+        origin: &crate::extensions::SessionActionOrigin,
+    ) -> bool {
+        handle
+            .session()
+            .session_action_admission_gate()
+            .origin_source()
+            .accepts(origin)
+            && Self::current(handle) == *self
+    }
+}
+
+struct PlanModelRestore {
+    origin: crate::extensions::SessionActionOrigin,
+    previous: ModelSelection,
+    planner: ModelSelection,
+}
+
+impl PlanModelRestore {
+    async fn still_owned(&self, handle: &AgentSessionHandle) -> Result<bool> {
+        if !handle
+            .session()
+            .session_action_admission_gate()
+            .origin_source()
+            .accepts(&self.origin)
+        {
+            return Ok(false);
+        }
+        let current = ModelSelection::current(handle);
+        if current == self.planner {
+            return Ok(true);
+        }
+        // A fallback remains part of the planning role. Its durable primary
+        // identifies the planner; an explicit model selection clears this
+        // provenance. Wait for the store rather than treating contention as a
+        // newer selection and losing the execution model permanently.
+        let store = handle.session_store();
+        let owner = AgentCx::for_current_or_request();
+        let session = store.lock(owner.cx()).await.map_err(|error| {
+            Error::session(format!("Unable to confirm plan model ownership: {error}"))
+        })?;
+        let fallback_thinking = handle.session().clamp_thinking_level_for_model(
+            &current.provider,
+            &current.model,
+            self.planner.thinking,
+        );
+        Ok(current.thinking == fallback_thinking
+            && session
+                .active_failover_provenance_for_current_path()
+                .is_some_and(|provenance| {
+                    provenance.primary_provider == self.planner.provider
+                        && provenance.primary_model_id == self.planner.model
+                        && provenance
+                            .primary_thinking_level
+                            .as_deref()
+                            .and_then(|level| level.parse::<ThinkingLevel>().ok())
+                            == Some(self.planner.thinking)
+                        && provenance.fallback_provider == current.provider
+                        && provenance.fallback_model_id == current.model
+                }))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PlanController {
     displayed: Option<DisplayedPlan>,
+    model_spec: Option<String>,
+    disabled_providers: Vec<String>,
+    scope_overrides: Vec<crate::config::ModelScopeOverride>,
+    model_restore: Option<PlanModelRestore>,
+    pending_model_selection: Option<(crate::extensions::SessionActionOrigin, ModelSelection)>,
 }
 
 impl PlanController {
+    pub(super) fn new(model_spec: Option<String>) -> Self {
+        Self {
+            model_spec: model_spec.filter(|spec| !spec.trim().is_empty()),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_provider_policy(
+        mut self,
+        disabled_providers: Vec<String>,
+        scope_overrides: Vec<crate::config::ModelScopeOverride>,
+    ) -> Self {
+        self.disabled_providers = disabled_providers;
+        self.scope_overrides = scope_overrides;
+        self
+    }
+
+    /// Successful explicit model/thinking selection owns the resulting model,
+    /// even when the user selected the planner that was already active.
+    pub(super) fn forget_model_restore(&mut self) {
+        self.model_restore = None;
+        self.pending_model_selection = None;
+    }
+
     /// Session replacement and a disconnected UI retire the display capability.
     /// SDK session-incarnation checks independently reject foreign reviews.
     pub(super) fn clear_review(&mut self) {
@@ -91,18 +207,37 @@ impl PlanController {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(&mut self, handle: &mut AgentSessionHandle, args: &str) -> Result<String> {
         // Invalid commands neither change live state nor replace the review.
         let command = parse(args)?;
+        let restore_stale = match self.model_restore.as_ref() {
+            Some(restore) => !restore.still_owned(handle).await?,
+            None => false,
+        };
+        if restore_stale
+            || self
+                .pending_model_selection
+                .as_ref()
+                .is_some_and(|(origin, current)| !current.is_current(handle, origin))
+        {
+            self.forget_model_restore();
+        }
+        let before = handle.session().agent.plan_state().mode();
+        let entering = matches!(command, PlanCommand::Enter)
+            && matches!(before, PlanMode::Off | PlanMode::Approved);
         let owner = AgentCx::for_current_or_request();
         let change = match command {
             PlanCommand::Status => {
                 let mode = handle.session().agent.plan_state().mode();
-                return Ok(format!(
-                    "Plan mode: {}. {}\n{USAGE}",
-                    mode.as_str(),
-                    mode_hint(mode),
-                ));
+                let hint = if handle.session().ensure_provider_reentry_allowed().is_err() {
+                    PROVIDER_BLOCKED_HINT
+                } else if self.pending_model_selection.is_some() {
+                    "Planning model selection is pending. Use /plan save to confirm the checkpoint and finish selecting the configured model."
+                } else {
+                    mode_hint(mode, self.model_restore.is_some())
+                };
+                return Ok(format!("Plan mode: {}. {}\n{USAGE}", mode.as_str(), hint,));
             }
             PlanCommand::Review => {
                 // A failed refresh must not leave an earlier display authorizing
@@ -122,10 +257,19 @@ impl PlanController {
             }
             PlanCommand::Save => {
                 let persistence = handle.checkpoint_plan(&owner).await?;
-                return Ok(format!(
-                    "Plan checkpoint. {}",
-                    render_persistence(&persistence)
-                ));
+                let mut text = format!("Plan checkpoint. {}", render_persistence(&persistence));
+                if !matches!(persistence, PlanPersistence::Unconfirmed { .. }) {
+                    if self.pending_model_selection.take().is_some()
+                        && matches!(
+                            handle.session().agent.plan_state().mode(),
+                            PlanMode::Planning | PlanMode::PendingApproval
+                        )
+                    {
+                        self.select_plan_model(handle, &mut text).await;
+                    }
+                    self.restore_model(handle, &mut text).await;
+                }
+                return Ok(text);
             }
             PlanCommand::Enter => handle.enter_plan_mode(&owner).await?,
             PlanCommand::Exit => handle.exit_plan_mode(&owner).await?,
@@ -155,11 +299,222 @@ impl PlanController {
             }
         };
         self.clear_review();
-        Ok(render_change(&change))
+        if matches!(command, PlanCommand::Approve(_) | PlanCommand::Exit) {
+            self.pending_model_selection = None;
+        }
+        let mut model_message = String::new();
+        // A failed checkpoint never authorizes the automatic model transition.
+        // The live gate remains as reported; save it before starting more work.
+        if matches!(change.persistence, PlanPersistence::Unconfirmed { .. }) {
+            if entering && self.model_spec.is_some() {
+                self.pending_model_selection = Some((
+                    handle
+                        .session()
+                        .session_action_admission_gate()
+                        .capture_origin(),
+                    ModelSelection::current(handle),
+                ));
+            }
+        } else if entering {
+            self.pending_model_selection = None;
+            self.select_plan_model(handle, &mut model_message).await;
+        } else if matches!(command, PlanCommand::Approve(_) | PlanCommand::Exit) {
+            self.restore_model(handle, &mut model_message).await;
+        }
+        let mut text = render_change(
+            &change,
+            self.model_restore.is_some(),
+            handle.session().ensure_provider_reentry_allowed().is_err(),
+        );
+        text.push_str(&model_message);
+        Ok(text)
+    }
+
+    async fn select_plan_model(&mut self, handle: &mut AgentSessionHandle, text: &mut String) {
+        let Some(spec) = self.model_spec.as_deref() else {
+            return;
+        };
+        let previous = self.model_restore.as_ref().map_or_else(
+            || ModelSelection::current(handle),
+            |restore| restore.previous.clone(),
+        );
+        let origin = handle
+            .session()
+            .session_action_admission_gate()
+            .capture_origin();
+        let selection = resolve_plan_model(
+            handle,
+            spec,
+            &self.disabled_providers,
+            &self.scope_overrides,
+        )
+        .await;
+        let result = match selection {
+            Ok(selection) => {
+                handle
+                    .set_plan_role_model(
+                        &selection.provider,
+                        &selection.model,
+                        selection.thinking,
+                        &origin,
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(true) => {
+                let planner = ModelSelection::current(handle);
+                let _ = write!(text, "\nPlanning model: {}.", planner.label());
+                self.model_restore = (planner != previous).then_some(PlanModelRestore {
+                    origin,
+                    previous,
+                    planner,
+                });
+            }
+            Ok(false) => {
+                self.forget_model_restore();
+                text.push_str("\nPlanning model was not changed: a newer model selection won.");
+            }
+            Err(error) => {
+                let recovery = if handle.session().ensure_provider_reentry_allowed().is_err() {
+                    PROVIDER_BLOCKED_HINT
+                } else {
+                    "Use /model to select a usable model explicitly."
+                };
+                let _ = write!(
+                    text,
+                    "\nPlanning remains read-only, but the plan model could not be selected: {}. \
+                     Current model: {}. {}",
+                    escape_review_text(&error.to_string()),
+                    ModelSelection::current(handle).label(),
+                    recovery,
+                );
+            }
+        }
+    }
+
+    async fn restore_model(&mut self, handle: &mut AgentSessionHandle, text: &mut String) {
+        if !matches!(
+            handle.session().agent.plan_state().mode(),
+            PlanMode::Off | PlanMode::Approved
+        ) {
+            return;
+        }
+        let Some(restore) = self.model_restore.as_ref() else {
+            return;
+        };
+        match restore.still_owned(handle).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.forget_model_restore();
+                return;
+            }
+            Err(error) => {
+                let _ = write!(
+                    text,
+                    "\nExecution model ownership could not be confirmed: {}. Use /plan save to retry; no model was changed.",
+                    escape_review_text(&error.to_string()),
+                );
+                return;
+            }
+        }
+        let previous = restore.previous.clone();
+        match handle
+            .set_plan_role_model(
+                &previous.provider,
+                &previous.model,
+                previous.thinking,
+                &restore.origin,
+            )
+            .await
+        {
+            Ok(true) => {
+                self.forget_model_restore();
+                let _ = write!(
+                    text,
+                    "\nRestored execution model: {}.",
+                    ModelSelection::current(handle).label(),
+                );
+            }
+            Ok(false) => {
+                self.forget_model_restore();
+                text.push_str(
+                    "\nKept the newer model selection; no automatic restoration applied.",
+                );
+            }
+            Err(error) => {
+                let recovery = if handle.session().ensure_provider_reentry_allowed().is_err() {
+                    PROVIDER_BLOCKED_HINT
+                } else {
+                    "Use /plan save to retry after resolving the error, or choose /model explicitly."
+                };
+                let _ = write!(
+                    text,
+                    "\nExecution model restoration was NOT confirmed: {}. \
+                     No execution was started. {}",
+                    escape_review_text(&error.to_string()),
+                    recovery,
+                );
+            }
+        }
     }
 }
 
-const fn mode_hint(mode: PlanMode) -> &'static str {
+async fn resolve_plan_model(
+    handle: &AgentSessionHandle,
+    spec: &str,
+    disabled_providers: &[String],
+    scope_overrides: &[crate::config::ModelScopeOverride],
+) -> Result<ModelSelection> {
+    let registry = handle
+        .session()
+        .model_registry()
+        .ok_or_else(|| Error::validation("Plan model selection requires a model registry"))?;
+    let catalog = registry
+        .models()
+        .iter()
+        .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+        .collect::<Vec<_>>();
+    let (provider, model, thinking) =
+        super::resolve_model_selector(&catalog, spec).map_err(Error::validation)?;
+    let entry = registry
+        .find(&provider, &model)
+        .ok_or_else(|| Error::validation(format!("Plan model {spec:?} is not registered")))?;
+    // Keep the full registry for exact identity and CLI-key admission. A role
+    // must still respect disabled providers, independently of picker scopes.
+    // Resolve the current session's attachment, not the launch process cwd.
+    let cwd = if scope_overrides.is_empty() {
+        None
+    } else {
+        Some(
+            handle
+                .with_session(crate::session_workdir::require_session_workdir)
+                .await??,
+        )
+    };
+    let scope = cwd
+        .as_deref()
+        .and_then(|cwd| crate::failover::best_scope_override(scope_overrides, cwd));
+    if crate::failover::provider_is_disabled(disabled_providers, scope, &entry.model.provider) {
+        return Err(Error::validation(format!(
+            "Plan destination provider is disabled: {}",
+            entry.model.provider
+        )));
+    }
+    Ok(ModelSelection {
+        provider: entry.model.provider,
+        model: entry.model.id,
+        thinking: thinking.unwrap_or_else(|| handle.thinking_level().unwrap_or_default()),
+    })
+}
+
+const PROVIDER_BLOCKED_HINT: &str = "Provider access is blocked after an indeterminate transition. Resolve the storage error, reopen the saved session, and explicitly select the intended model; /plan save cannot clear this block.";
+
+const fn mode_hint(mode: PlanMode, restore_pending: bool) -> &'static str {
+    if restore_pending && matches!(mode, PlanMode::Off | PlanMode::Approved) {
+        return "Execution model restoration is pending. Use /plan save to retry, or choose /model explicitly before continuing.";
+    }
     match mode {
         PlanMode::Off => "Normal tool policy remains in effect.",
         PlanMode::Planning => {
@@ -169,7 +524,7 @@ const fn mode_hint(mode: PlanMode) -> &'static str {
             "The proposal is awaiting review; mutations remain blocked. Use /plan review to display it."
         }
         PlanMode::Approved => {
-            "The reviewed plan is pinned. No execution turn was started and tool permissions were not changed. Send a prompt to begin execution."
+            "The reviewed proposal is approved in the live session. No execution turn was started and tool permissions were not changed."
         }
     }
 }
@@ -187,11 +542,18 @@ fn render_persistence(persistence: &PlanPersistence) -> String {
     }
 }
 
-fn render_change(change: &PlanChange) -> String {
+fn render_change(change: &PlanChange, restore_pending: bool, provider_blocked: bool) -> String {
+    let hint = if provider_blocked {
+        PROVIDER_BLOCKED_HINT
+    } else if matches!(change.persistence, PlanPersistence::Unconfirmed { .. }) {
+        "Persistence is unconfirmed. Save the plan state before starting another turn."
+    } else {
+        mode_hint(change.mode, restore_pending)
+    };
     format!(
         "Plan mode: {}. {}\n{}",
         change.mode.as_str(),
-        mode_hint(change.mode),
+        hint,
         render_persistence(&change.persistence),
     )
 }

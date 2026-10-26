@@ -3854,3 +3854,164 @@ fn interactive_auth_adoption_updates_fallback_credentials_and_preserves_cli_pin(
         );
     }
 }
+
+fn credential_binding_handle(
+    entries: &[crate::models::ModelEntry],
+    bound_key: Option<&str>,
+) -> AgentSessionHandle {
+    let initial = &entries[0];
+    let (mut handle, _) = flaky_handle_as(0, &initial.model.provider, &initial.model.id);
+    handle
+        .session
+        .set_api_key_override(bound_key.map(str::to_string));
+    handle
+        .session
+        .set_model_registry(ModelRegistry::from_entries_for_tests(entries.to_vec()));
+    handle.session_store().try_lock().unwrap().set_model_header(
+        Some(initial.model.provider.clone()),
+        Some(initial.model.id.clone()),
+        Some("off".to_string()),
+    );
+    handle
+}
+
+#[test]
+fn bound_cli_key_cannot_admit_an_unready_foreign_fallback_and_survives_restoration() {
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("bound-primary", "execution");
+    primary.api_key = None;
+    let mut unready = recovery_route_entry("unready-other", "unready");
+    unready.api_key = None;
+    let fallback = recovery_route_entry("ready-other", "fallback");
+    let entries = vec![primary, unready, fallback.clone()];
+    let mut handle = credential_binding_handle(&entries, Some("execution-only-pin")).with_failover(
+        Some(FailoverOptions {
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec![
+                    "unready-other/unready".to_string(),
+                    "ready-other/fallback".to_string(),
+                ],
+            )]),
+            available_models: vec![fallback.clone()],
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: Some("execution-only-pin".to_string()),
+            cooldown_secs: 0,
+        }),
+    );
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider("bound-primary", "503 service unavailable"));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("ready-other".to_string(), "fallback".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key,
+        fallback.api_key
+    );
+
+    // A temporary planning role may remove the SDK's active-provider pin.
+    // The native execution binding still admits its otherwise unready primary.
+    Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key = None;
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("bound-primary".to_string(), "execution".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("execution-only-pin")
+    );
+}
+
+#[test]
+fn planner_fallback_recovers_original_pin_without_reusing_it_for_planner_restore() {
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("bound-executor", "execution");
+    primary.api_key = None;
+    let planner = recovery_route_entry("separate-planner", "planning");
+    let entries = vec![primary, planner.clone()];
+    let mut handle = credential_binding_handle(&entries, Some("bound-execution-pin"));
+    run_async(handle.set_model("separate-planner", "planning")).unwrap();
+    handle = handle.with_failover(Some(FailoverOptions {
+        chains: HashMap::from([(
+            "default".to_string(),
+            vec!["bound-executor/execution".to_string()],
+        )]),
+        available_models: vec![planner.clone()],
+        auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+        cli_api_key: None,
+        cooldown_secs: 0,
+    }));
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider(
+        "separate-planner",
+        "503 service unavailable",
+    ));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("bound-executor".to_string(), "execution".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("bound-execution-pin")
+    );
+
+    Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key =
+        Some("bound-execution-pin".to_string());
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("separate-planner".to_string(), "planning".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key,
+        planner.api_key
+    );
+}
+
+#[test]
+fn recovery_without_a_native_key_binding_preserves_explicit_embedder_override() {
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("embedder-primary", "primary");
+    primary.api_key = None;
+    let mut fallback = recovery_route_entry("embedder-fallback", "fallback");
+    fallback.api_key = None;
+    let entries = vec![primary, fallback];
+    let mut handle =
+        credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec!["embedder-fallback/fallback".to_string()],
+            )]),
+            available_models: Vec::new(),
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: Some("explicit-embedder-pin".to_string()),
+            cooldown_secs: 0,
+        }));
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider(
+        "embedder-primary",
+        "503 service unavailable",
+    ));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("embedder-fallback".to_string(), "fallback".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("explicit-embedder-pin")
+    );
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("embedder-primary".to_string(), "primary".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("explicit-embedder-pin")
+    );
+}

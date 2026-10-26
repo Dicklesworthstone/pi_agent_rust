@@ -7058,6 +7058,9 @@ pub struct AgentSession {
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
     api_key_override: Option<String>,
+    /// A CLI/API override belongs to the provider selected when it was set.
+    /// Role switches must not forward that secret to a different provider.
+    api_key_override_provider: Option<String>,
     semantic_context_bundle: Option<SemanticContextBundleInjection>,
     /// One process-local authority for provider admission and transition
     /// quarantine. Extension hostcalls hold its permit across the complete
@@ -15789,6 +15792,7 @@ impl AgentSession {
             model_registry: None,
             auth_storage: None,
             api_key_override: None,
+            api_key_override_provider: None,
             semantic_context_bundle: None,
             provider_admission: ProviderAdmissionGate::default(),
             session_action_admission: SessionActionAdmissionGate::default(),
@@ -15895,11 +15899,13 @@ impl AgentSession {
         let key = entry.as_ref().map_or_else(
             || {
                 let provider = self.agent.provider();
-                normalize_api_key_opt(self.api_key_override.clone()).or_else(|| {
-                    self.auth_storage.as_ref().and_then(|auth| {
-                        normalize_api_key_opt(auth.resolve_api_key(provider.name(), None))
+                self.api_key_override_for_provider(provider.name())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        self.auth_storage.as_ref().and_then(|auth| {
+                            normalize_api_key_opt(auth.resolve_api_key(provider.name(), None))
+                        })
                     })
-                })
             },
             |entry| self.resolve_stream_api_key_for_model(entry),
         );
@@ -15929,6 +15935,17 @@ impl AgentSession {
 
     pub fn set_api_key_override(&mut self, api_key: Option<String>) {
         self.api_key_override = normalize_api_key_opt(api_key);
+        self.api_key_override_provider = self
+            .api_key_override
+            .as_ref()
+            .map(|_| self.agent.provider().name().to_string());
+    }
+
+    pub(crate) fn api_key_override_for_provider(&self, provider: &str) -> Option<&str> {
+        self.api_key_override_provider
+            .as_deref()
+            .filter(|bound| bound.eq_ignore_ascii_case(provider))
+            .and(self.api_key_override.as_deref())
     }
 
     pub fn refresh_extension_completion_host_state(&self) {
@@ -16261,15 +16278,35 @@ impl AgentSession {
         target: &crate::prewalk::PrewalkTarget,
         origin: &SessionActionOrigin,
     ) -> Result<bool> {
+        self.set_automatic_model_selection(
+            &target.provider,
+            &target.model,
+            target.thinking.unwrap_or_default(),
+            origin,
+        )
+        .await
+    }
+
+    /// Install a host-owned automatic selection without disarming a pending
+    /// prewalk. Model, reasoning, credentials and capabilities use the same
+    /// durable transition as explicit selection; session navigation or newer
+    /// persisted model intent wins before the destination is installed.
+    pub(crate) async fn set_automatic_model_selection(
+        &mut self,
+        provider: &str,
+        model: &str,
+        thinking: crate::model::ThinkingLevel,
+        origin: &SessionActionOrigin,
+    ) -> Result<bool> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let admission = self.provider_admission.clone();
         let authority = admission.acquire_transition_authority(cx.cx()).await?;
         let session_actions = self.session_action_admission.clone();
         let _session_action = session_actions.acquire_origin(origin).await?;
         self.set_provider_model_selection(
-            &target.provider,
-            &target.model,
-            target.thinking.unwrap_or_default(),
+            provider,
+            model,
+            thinking,
             ProviderSwapAdmission::Held(&authority),
             true,
         )
@@ -16546,7 +16583,8 @@ impl AgentSession {
             })
         };
 
-        normalize(self.api_key_override.clone())
+        self.api_key_override_for_provider(&entry.model.provider)
+            .map(str::to_string)
             .or_else(|| {
                 self.auth_storage
                     .as_ref()
@@ -17019,6 +17057,21 @@ impl AgentSession {
         }))
     }
 
+    /// Native CLI/API overrides retain their original provider binding across
+    /// automatic role changes and recovery. Standalone RPC/embedding recovery
+    /// requests without a session binding keep their explicit override contract.
+    fn recovery_api_key_override<'a>(
+        &'a self,
+        provider: &str,
+        external_override: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.api_key_override_provider.is_some() {
+            self.api_key_override_for_provider(provider)
+        } else {
+            external_override
+        }
+    }
+
     /// Resolve the primary to a model entry and a credential, or decline.
     ///
     /// `Ok(None)` is the lenient decline; the same conditions are hard errors
@@ -17056,9 +17109,9 @@ impl AgentSession {
                 .eq_ignore_ascii_case(entry.model.provider.trim())
                 && candidate.model.id.eq_ignore_ascii_case(&entry.model.id)
         });
-        let explicit_key_recovers_unready = request
-            .cli_api_key
-            .is_some_and(|key| !key.trim().is_empty())
+        let cli_api_key =
+            self.recovery_api_key_override(&entry.model.provider, request.cli_api_key);
+        let explicit_key_recovers_unready = cli_api_key.is_some_and(|key| !key.trim().is_empty())
             && !crate::models::model_entry_is_ready(&entry);
         if registered && !admitted && !explicit_key_recovers_unready {
             // Availability and disabled-provider filtering happen after the
@@ -17073,7 +17126,7 @@ impl AgentSession {
             return Ok(None);
         }
 
-        let key = crate::models::resolve_model_key(request.cli_api_key, request.auth, &entry);
+        let key = crate::models::resolve_model_key(cli_api_key, request.auth, &entry);
         if crate::models::model_requires_configured_credential(&entry) && key.is_none() {
             // Restoring into an auth error would be strictly worse than staying
             // on a working fallback.
@@ -17236,8 +17289,9 @@ impl AgentSession {
                     .eq_ignore_ascii_case(entry.model.provider.trim())
                     && candidate.model.id.eq_ignore_ascii_case(&entry.model.id)
             });
-            let explicit_key_recovers_unready = attempt
-                .cli_api_key
+            let cli_api_key =
+                self.recovery_api_key_override(&entry.model.provider, attempt.cli_api_key);
+            let explicit_key_recovers_unready = cli_api_key
                 .is_some_and(|key| !key.trim().is_empty())
                 && !crate::models::model_entry_is_ready(&entry);
             if registered && !admitted && !explicit_key_recovers_unready {
@@ -17246,8 +17300,7 @@ impl AgentSession {
                 // to make an otherwise unready configured route usable.
                 continue;
             }
-            let api_key =
-                crate::models::resolve_model_key(attempt.cli_api_key, attempt.auth, &entry);
+            let api_key = crate::models::resolve_model_key(cli_api_key, attempt.auth, &entry);
             if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
                 continue;
             }

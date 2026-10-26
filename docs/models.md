@@ -2,6 +2,60 @@
 
 Pi loads available models from a built-in registry and an optional user-defined `models.json`.
 
+## Planning model in the default terminal
+
+The default terminal can use a dedicated planning model while keeping the model
+you selected for execution. Set `modelRoles.plan` in your settings, or override it
+for one launch with `--plan provider/model[:thinking]`:
+
+```json
+{
+  "modelRoles": {
+    "plan": "anthropic/claude-opus-4-7:high"
+  }
+}
+```
+
+`/plan enter` first enables the read-only planning gate and checkpoints it, then
+selects the configured planning model. `--plan-mode` starts the terminal in this
+mode. The model must exist in the live registry, including your custom models.
+Automatic planning selection respects `disabledProviders` and the most specific
+`modelScopeOverrides` for the current session's working directory. `enabledModels`
+continues to limit the picker and model cycling, without excluding an explicitly
+assigned planning model.
+Its credentials, headers, context limit, output limit, and image support come
+from its own registered provider. With no planning model configured, planning
+uses your current model. An omitted thinking suffix retains your current level,
+clamped to the planning model's supported levels.
+
+After the agent submits a proposal, use `/plan review` and approve the displayed
+review ID. Approval pins that proposal and restores your previous model and
+thinking level; `/plan off` also restores them. These controls do not start an
+execution turn or change tool permissions. A successful explicit model or
+thinking selection while planning takes precedence over restoration, including
+reselecting the current value. Automatic planning transitions preserve an armed
+`/prewalk`; explicit selections keep their existing disarm behavior. A provider
+failover during planning remains part of that planning role, so approving or
+leaving the plan still restores the execution model.
+
+If a checkpoint or model restoration fails, the terminal reports the failure
+and does not advertise execution readiness. Resolve a checkpoint or credential
+error and use `/plan save` to retry; an accepted approval does not need to be
+repeated. If entering plan mode could not save its checkpoint, a later
+successful `/plan save` finishes the deferred planning-model selection unless
+you explicitly selected a model or thinking level in the meantime. An
+indeterminate native model save blocks provider access separately:
+resolve the storage error, reopen the saved session, and select the intended
+model explicitly. `/plan save` cannot clear that block. If the configured
+planning model cannot be selected, the read-only gate remains active and the
+terminal reports the current model. An explicit API key stays with the provider
+selected when the key was supplied, including when that provider is restored.
+
+Automatic restoration belongs to the current running session and branch. A
+session replacement, navigation to a different branch, or a newer model
+selection retires that restoration. After restarting during planning, explicitly
+select your intended execution model when leaving plan mode.
+
 ## Location
 
 | Path | Description |

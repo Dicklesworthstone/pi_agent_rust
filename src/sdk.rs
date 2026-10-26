@@ -2714,6 +2714,27 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// The terminal's plan role is an automatic temporary selection. Preserve
+    /// prewalk, but retire an older fallback cycle only after durable install:
+    /// its cooldown must not silently replace the newly selected planner.
+    #[cfg(feature = "ftui")]
+    pub(crate) async fn set_plan_role_model(
+        &mut self,
+        provider: &str,
+        model: &str,
+        thinking: crate::model::ThinkingLevel,
+        origin: &crate::extensions::SessionActionOrigin,
+    ) -> Result<bool> {
+        let installed = self
+            .session
+            .set_automatic_model_selection(provider, model, thinking, origin)
+            .await?;
+        if installed {
+            self.failover_state.clear();
+        }
+        Ok(installed)
+    }
+
     /// Arm a one-shot prewalk. Repeated calls preserve an already armed target.
     /// `None` means the destination already matches the active model/reasoning.
     pub async fn arm_prewalk(

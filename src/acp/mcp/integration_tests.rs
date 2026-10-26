@@ -155,6 +155,7 @@ impl HttpFixture {
                     ("x-acp-literal", LITERAL_HEADER),
                     ("authorization", LITERAL_AUTH),
                 ] {
+                    // ubs:ignore[rust.panic.assert-macros] -- Altered editor credentials must fail this loopback fixture.
                     assert!(headers.lines().any(|line| {
                         line.split_once(':').is_some_and(|(name, value)| {
                             name.eq_ignore_ascii_case(expected) && value.trim() == literal
@@ -220,6 +221,7 @@ impl HttpFixture {
                         let _ = sse_event(
                             events.as_mut().expect("SSE GET precedes messages"),
                             "message",
+                            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each bounded fixture reply needs its own JSON SSE payload.
                             &response.to_string(),
                         );
                     }
@@ -771,12 +773,10 @@ fn sse_authentication_failure_is_repairable_without_sharing_session_tool_authori
         // endpoint; a live reattach cannot silently make that replacement.
         let mut changed = server.config();
         changed[0]["type"] = json!("http");
-        let changed = crate::mcp::config::parse_acp_servers(
-            &json!({"mcpServers":changed}),
-            root.path(),
-        )
-        .unwrap()
-        .unwrap();
+        let changed =
+            crate::mcp::config::parse_acp_servers(&json!({"mcpServers":changed}), root.path())
+                .unwrap()
+                .unwrap();
         assert!(check_reattach(Some(&mcp), Some(&changed), root.path()).is_err());
 
         // A repaired static credential/server needs an explicit test; no new

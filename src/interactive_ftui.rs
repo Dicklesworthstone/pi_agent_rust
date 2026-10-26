@@ -8222,8 +8222,10 @@ async fn run_set_model_command(
     provider: &str,
     model: &str,
     agent_tx: &Sender<PiMsg>,
-) {
-    let msg = match handle.set_model(provider, model).await {
+) -> bool {
+    let result = handle.set_model(provider, model).await;
+    let selected = result.is_ok();
+    let msg = match result {
         Ok(()) => {
             // The registry resolves the canonical entry, whose name the
             // label adds when it differs from the id (gh #214).
@@ -8236,6 +8238,7 @@ async fn run_set_model_command(
         Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
     };
     let _ = agent_tx.send(msg);
+    selected
 }
 
 async fn run_prewalk_command(
@@ -8883,7 +8886,8 @@ async fn run_set_thinking_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     level: Option<crate::model::ThinkingLevel>,
     agent_tx: &Sender<PiMsg>,
-) {
+) -> bool {
+    let mut selected = false;
     let msg = match level {
         None => match handle.state().await {
             Ok(state) => PiMsg::System(format!(
@@ -8896,11 +8900,15 @@ async fn run_set_thinking_command(
             Err(err) => PiMsg::AgentError(format!("thinking: {err}")),
         },
         Some(level) => match handle.set_thinking_level(level).await {
-            Ok(()) => PiMsg::System(format!("Thinking level: {level}")),
+            Ok(()) => {
+                selected = true;
+                PiMsg::System(format!("Thinking level: {level}"))
+            }
             Err(err) => PiMsg::AgentError(format!("thinking: {err}")),
         },
     };
     let _ = agent_tx.send(msg);
+    selected
 }
 
 /// Capture what the status line shows from the live session and send it to
@@ -9133,7 +9141,7 @@ async fn run_cycle_model_command(
     models: &[String],
     forward: bool,
     agent_tx: &Sender<PiMsg>,
-) {
+) -> bool {
     let (provider, model_id) = handle.model();
     let current = format!("{provider}/{model_id}");
     let Some(next) = next_cycle_model(models, &current, forward) else {
@@ -9143,15 +9151,15 @@ async fn run_cycle_model_command(
             "Only one model available"
         };
         let _ = agent_tx.send(PiMsg::System(String::from(message)));
-        return;
+        return false;
     };
     let Some((provider, model)) = next.split_once('/') else {
         let _ = agent_tx.send(PiMsg::AgentError(format!(
             "model cycle: {next} is not provider/model"
         )));
-        return;
+        return false;
     };
-    run_set_model_command(handle, provider, model, agent_tx).await;
+    run_set_model_command(handle, provider, model, agent_tx).await
 }
 
 /// Handle `AppAction::CycleThinkingLevel` (shift+tab): step to the next
@@ -9162,13 +9170,16 @@ async fn run_cycle_model_command(
 async fn run_cycle_thinking_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     agent_tx: &Sender<PiMsg>,
-) {
-    let msg = match handle.cycle_thinking_level().await {
+) -> bool {
+    let result = handle.cycle_thinking_level().await;
+    let selected = matches!(&result, Ok(Some(_)));
+    let msg = match result {
         Ok(Some(level)) => PiMsg::System(format!("Thinking level: {level}")),
         Ok(None) => PiMsg::System(String::from("Current model does not support thinking")),
         Err(err) => PiMsg::AgentError(format!("thinking: {err}")),
     };
     let _ = agent_tx.send(msg);
+    selected
 }
 
 /// Handle `/export [path]`: write the conversation to an HTML file.
@@ -10046,6 +10057,13 @@ pub struct FtuiSettings {
     pub model_names: HashMap<String, String>,
     /// `--plan-mode`: start in planning, as the classic stack does.
     pub start_in_plan_mode: bool,
+    /// Explicit planning role: CLI `--plan` overrides `modelRoles.plan`.
+    /// Resolved on entry against the live session's complete model registry.
+    pub plan_model_spec: Option<String>,
+    /// Effective launch policy for automatic planning-model admission.
+    pub plan_disabled_providers: Vec<String>,
+    /// Workspace restrictions are matched against the current session workdir.
+    pub plan_scope_overrides: Vec<crate::config::ModelScopeOverride>,
     /// Resolved @smol destination for `/prewalk`; admission checks credentials.
     pub prewalk_target: Option<crate::prewalk::PrewalkTarget>,
     /// CLI files and their first authored message, already read and bounded.
@@ -10127,6 +10145,9 @@ pub fn run(
         double_escape_action,
         model_names,
         start_in_plan_mode,
+        plan_model_spec,
+        plan_disabled_providers,
+        plan_scope_overrides,
         prewalk_target,
         mut initial_content,
         initial_messages,
@@ -10272,7 +10293,8 @@ pub fn run(
                         .await
                         .unwrap_or_default(),
                 );
-                let mut plans = plan_commands::PlanController::default();
+                let mut plans = plan_commands::PlanController::new(plan_model_spec)
+                    .with_provider_policy(plan_disabled_providers, plan_scope_overrides);
                 let mut replacement_failure = None;
                 // The `/login` waiting for input, if any (boxed: the driver
                 // future sits near clippy's large_futures threshold).
@@ -10319,7 +10341,9 @@ pub fn run(
                             .await;
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
-                            run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
+                            if run_set_model_command(&mut handle, &provider, &model, &agent_tx).await {
+                                plans.forget_model_restore();
+                            }
                         }
                         Ok(UiCommand::Prewalk { action }) => {
                             run_prewalk_command(&mut handle, &action, prewalk_target.as_ref(), &agent_tx).await;
@@ -10734,10 +10758,14 @@ pub fn run(
                             run_rewind_command(&mut handle, &entry_id, &agent_tx).await;
                         }
                         Ok(UiCommand::SetThinking(level)) => {
-                            run_set_thinking_command(&mut handle, level, &agent_tx).await;
+                            if run_set_thinking_command(&mut handle, level, &agent_tx).await {
+                                plans.forget_model_restore();
+                            }
                         }
                         Ok(UiCommand::CycleThinking) => {
-                            run_cycle_thinking_command(&mut handle, &agent_tx).await;
+                            if run_cycle_thinking_command(&mut handle, &agent_tx).await {
+                                plans.forget_model_restore();
+                            }
                         }
                         Ok(UiCommand::ScopedModels { args }) => {
                             let _ = agent_tx.send(run_scoped_models_command(
@@ -10748,8 +10776,11 @@ pub fn run(
                             ));
                         }
                         Ok(UiCommand::CycleModel { forward }) => {
-                            run_cycle_model_command(&mut handle, &cycle_models, forward, &agent_tx)
-                                .await;
+                            if run_cycle_model_command(&mut handle, &cycle_models, forward, &agent_tx)
+                                .await
+                            {
+                                plans.forget_model_restore();
+                            }
                         }
                         Ok(UiCommand::Export { path }) => {
                             run_export_command(&handle, &bash_cwd, &path, &agent_tx).await;
