@@ -2789,16 +2789,17 @@ impl Agent {
         // would only spend context budget. Until 2026-09-02 every hidden
         // custom message was dropped here, which silently discarded hidden
         // hook injections.
-        let has_excluded = self
-            .messages
-            .iter()
-            .any(|m| matches!(m, Message::Custom(c) if context_excluded_custom_message(c)));
+        let has_excluded = self.messages.iter().any(|m| {
+            matches!(m, Message::Custom(c) if context_excluded_custom_message(c))
+                || crate::turn_recovery::context_excludes_empty_response(m)
+        });
         let needs_image_filter = (self.config.block_images || !self.config.model_accepts_images)
             && self.messages.iter().any(message_has_images);
         let messages: Cow<'_, [Message]> = if needs_image_filter || has_excluded {
             let mut msgs = self.messages.clone();
             msgs.retain(|m| match m {
                 Message::Custom(c) => !context_excluded_custom_message(c),
+                Message::Assistant(_) => !crate::turn_recovery::context_excludes_empty_response(m),
                 _ => true,
             });
             apply_image_input_policy(
@@ -3899,12 +3900,15 @@ impl Agent {
                 }
 
                 let provider_streaming_started_at = Instant::now();
+                let empty_response_limit_reached = self.automatic_follow_up_dispatch
+                    && turn_recovery.empty_response_limit_reached();
                 let assistant_result = self
                     .stream_assistant_response(
                         Arc::clone(&on_event),
                         abort.clone(),
                         &loop_cx,
                         &mut new_messages,
+                        empty_response_limit_reached,
                     )
                     .await;
                 record_provider_streaming_latency(
@@ -4283,9 +4287,9 @@ impl Agent {
                 if self.automatic_follow_up_dispatch
                     && pending_messages.is_empty()
                     && !has_more_tool_calls
+                    && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
                 {
-                    let text = assistant_text_content(&assistant_arc.content);
-                    if let Some(action) = turn_recovery.evaluate(assistant_arc.stop_reason, &text) {
+                    if let Some(action) = turn_recovery.evaluate_assistant(&assistant_arc) {
                         pending_messages =
                             vec![QueuedAgentMessage::generated(Message::User(UserMessage {
                                 content: UserContent::Text(action.nudge_text),
@@ -4599,12 +4603,18 @@ impl Agent {
         abort: Option<AbortSignal>,
         checkpoint_cx: &crate::agent_cx::AgentCx,
         new_messages: &mut Vec<Message>,
+        empty_response_limit_reached: bool,
     ) -> Result<AssistantMessage> {
         loop {
             self.stream_rule_coordinator.reset_attempt();
             let attempt_start = self.messages.len();
             match self
-                .stream_assistant_attempt(Arc::clone(&on_event), abort.clone(), checkpoint_cx)
+                .stream_assistant_attempt(
+                    Arc::clone(&on_event),
+                    abort.clone(),
+                    checkpoint_cx,
+                    empty_response_limit_reached,
+                )
                 .await?
             {
                 AssistantStreamAttempt::Complete(message) => return Ok(message),
@@ -4785,6 +4795,7 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
         checkpoint_cx: &crate::agent_cx::AgentCx,
+        empty_response_limit_reached: bool,
     ) -> Result<AssistantStreamAttempt> {
         // Refresh admitted MCP catalogs before capturing the provider's tool
         // schema, under the same owner and cancellation as this request.
@@ -5547,6 +5558,10 @@ impl Agent {
                         message.stop_reason = StopReason::Error;
                         message.error_message = Some(TRUNCATED_TOOL_CALL_ERROR.to_string());
                     }
+                    crate::turn_recovery::finish_empty_response(
+                        &mut message,
+                        empty_response_limit_reached,
+                    );
                     return Ok(self.finalize_assistant_message(message, &on_event, added_partial));
                 }
                 StreamEvent::Error { reason, mut error } => {
@@ -21276,21 +21291,6 @@ fn is_truncated_before_tool_call(
 }
 
 /// Extract tool calls from content blocks.
-/// Concatenated visible text of an assistant message, for stop
-/// classification (bd-cv653.3.15).
-fn assistant_text_content(content: &[ContentBlock]) -> String {
-    let mut text = String::new();
-    for block in content {
-        if let ContentBlock::Text(part) = block {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&part.text);
-        }
-    }
-    text
-}
-
 fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
     content
         .iter()
