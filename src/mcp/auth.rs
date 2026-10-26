@@ -87,6 +87,8 @@ pub struct AuthBinding {
     resource: String,
     observed: Arc<Mutex<ObservedLogin>>,
     managed: Arc<AtomicBool>,
+    static_fingerprint: Option<String>,
+    static_authorization: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -99,6 +101,10 @@ struct Record {
     revision: String,
     revoked: bool,
     credentials: Option<Credentials>,
+    /// An explicit reauth/unauth may take over this exact authored header.
+    /// A different header never inherits an older managed grant implicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    static_fingerprint: Option<String>,
 }
 
 enum ExpectedWrite {
@@ -161,7 +167,32 @@ impl AuthBinding {
             resource: resource_url.to_string(),
             observed: Arc::new(Mutex::new(ObservedLogin::Unobserved)),
             managed: Arc::new(AtomicBool::new(false)),
+            static_fingerprint: None,
+            static_authorization: None,
         })
+    }
+
+    pub(crate) fn for_static_authorization(mut self, fingerprint: String) -> Self {
+        self.static_fingerprint = Some(fingerprint);
+        self
+    }
+
+    pub(crate) fn with_static_authorization(mut self, value: Option<String>) -> Self {
+        self.static_authorization = value;
+        self
+    }
+
+    fn applies(&self, record: &Record) -> bool {
+        self.static_fingerprint.as_ref().is_none_or(|fingerprint| {
+            record.static_fingerprint.as_ref() == Some(fingerprint)
+        })
+    }
+
+    /// Called in the manager's blocking construction phase. A revoked record
+    /// still owns the header: logout must never restore a stale bearer.
+    pub(crate) fn has_managed_record(&self) -> Result<bool> {
+        self.read_sync()
+            .map(|record| record.as_ref().is_some_and(|record| self.applies(record)))
     }
 
     fn observe(&self, record: Option<&Record>) -> Result<()> {
@@ -341,6 +372,7 @@ impl AuthBinding {
         // Check withdrawal after waiting for the lock and immediately before
         // admitting the atomic tombstone write.
         check()?;
+        let previous = self.read_sync().ok().flatten();
         let record = Record {
             version: 1,
             identity: self.identity.clone(),
@@ -349,6 +381,9 @@ impl AuthBinding {
             revision: nonce(),
             revoked: true,
             credentials: None,
+            static_fingerprint: self.static_fingerprint.clone().or_else(|| {
+                previous.and_then(|record| record.static_fingerprint)
+            }),
         };
         let mut store = AuthStorage::empty_at(self.path.clone());
         store.set(
@@ -369,10 +404,10 @@ impl AuthBinding {
     pub(crate) async fn authorization_header(&self, allow_refresh: bool) -> Result<Option<String>> {
         let owner = AgentCx::for_current_or_request();
         check_owner(&owner)?;
-        let record = self.read().await?;
+        let record = self.read().await?.filter(|record| self.applies(record));
         self.observe(record.as_ref())?;
         let Some(record) = record else {
-            return Ok(None);
+            return Ok(self.static_authorization.clone());
         };
         let credentials = record.credentials.as_ref().ok_or_else(required)?;
         validate_credentials(credentials)?;
@@ -598,6 +633,9 @@ impl AuthBinding {
             revision: nonce(),
             revoked: false,
             credentials: Some(credentials),
+            static_fingerprint: self.static_fingerprint.clone().or_else(|| {
+                old.and_then(|record| record.static_fingerprint)
+            }),
         };
         let binding = self.clone();
         asupersync::runtime::spawn_blocking(move || {
@@ -1788,15 +1826,15 @@ async fn await_callback(
 }
 
 #[cfg(test)]
-mod configured_tests {
+pub(crate) mod configured_tests {
     use super::*;
 
     #[derive(Clone)]
-    struct CapturedRequest {
-        method: String,
-        target: String,
-        headers: HashMap<String, String>,
-        body: Vec<u8>,
+    pub(crate) struct CapturedRequest {
+        pub(crate) method: String,
+        pub(crate) target: String,
+        pub(crate) headers: HashMap<String, String>,
+        pub(crate) body: Vec<u8>,
     }
 
     impl CapturedRequest {
@@ -1807,8 +1845,8 @@ mod configured_tests {
         }
     }
 
-    struct OAuthFixture {
-        origin: String,
+    pub(crate) struct OAuthFixture {
+        pub(crate) origin: String,
         methods: Vec<String>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
         failures: Arc<Mutex<Vec<String>>>,
@@ -1822,7 +1860,7 @@ mod configured_tests {
         }
 
         /// `respond(origin, methods, request)` writes the whole HTTP response.
-        fn serve(
+        pub(crate) fn serve(
             methods: &[&str],
             respond: impl Fn(&str, &[String], &CapturedRequest) -> String + Send + 'static,
         ) -> Self {
@@ -1881,7 +1919,7 @@ mod configured_tests {
             }
         }
 
-        fn resource(&self) -> String {
+        pub(crate) fn resource(&self) -> String {
             format!("{}/mcp", self.origin)
         }
 
@@ -1898,7 +1936,7 @@ mod configured_tests {
             }
         }
 
-        fn captured(&self) -> Vec<CapturedRequest> {
+        pub(crate) fn captured(&self) -> Vec<CapturedRequest> {
             let failures = self.failures.lock().expect("failure capture");
             assert!(failures.is_empty(), "fixture failures: {failures:?}");
             drop(failures);
@@ -1986,7 +2024,7 @@ mod configured_tests {
         Err("fixture request deadline elapsed or fixture stopped".to_string())
     }
 
-    fn fixture_response(origin: &str, methods: &[String], request: &CapturedRequest) -> String {
+    pub(crate) fn fixture_response(origin: &str, methods: &[String], request: &CapturedRequest) -> String {
         let (status, extra, body) = match (request.method.as_str(), request.target.as_str()) {
             ("GET", "/mcp") => (
                 "401 Unauthorized",
@@ -2059,7 +2097,7 @@ mod configured_tests {
         http_response(status, &extra, "application/json", &body.to_string())
     }
 
-    fn http_response(status: &str, extra: &str, content_type: &str, body: &str) -> String {
+    pub(crate) fn http_response(status: &str, extra: &str, content_type: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
             body.len(),
@@ -2126,7 +2164,7 @@ mod configured_tests {
         Arc::new(|| Ok(()))
     }
 
-    fn browser_callback(
+    pub(crate) fn browser_callback(
         captured: Arc<Mutex<Vec<Url>>>,
         issuer: String,
     ) -> Arc<dyn Fn(&str) + Send + Sync> {
@@ -2921,6 +2959,7 @@ mod tests {
             revision: "revision-one".into(),
             revoked: false,
             credentials: Some(credentials()),
+            static_fingerprint: binding.static_fingerprint.clone(),
         }
     }
 
@@ -2934,6 +2973,72 @@ mod tests {
             !global.exists(),
             "anonymous HTTP must not require writable auth storage"
         );
+    }
+
+    #[test]
+    fn managed_credentials_take_over_only_the_explicitly_selected_authored_header() {
+        let temp = tempfile::tempdir().expect("credential directory");
+        let identity = "header-free-definition";
+        let resource = "http://127.0.0.1:9/mcp";
+        let ordinary = AuthBinding::new(temp.path(), identity, resource).expect("ordinary binding");
+        let first = record(&ordinary);
+        ordinary.write_sync(None, first.clone(), None).expect("existing managed login");
+        let authored = AuthBinding::new(temp.path(), identity, resource).expect("authored binding")
+            .for_static_authorization("authored-first".to_string())
+            .with_static_authorization(Some("Bearer configured-first".to_string()));
+        assert!(!authored.has_managed_record().expect("unrelated managed login"));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            assert_eq!(authored.authorization_header(false).await.expect("configured header").as_deref(),
+                Some("Bearer configured-first"));
+        });
+        let takeover = Record {
+            epoch: "explicit-takeover".to_string(),
+            revision: "explicit-takeover-revision".to_string(),
+            static_fingerprint: Some("authored-first".to_string()),
+            ..first.clone()
+        };
+        ordinary.write_sync(Some((first.epoch, first.revision)), takeover, None).expect("explicit takeover");
+        runtime.block_on(async {
+            assert!(authored.authorization_header(false).await.expect_err("retire prior session")
+                .to_string().contains("MCP_AUTH_CHANGED"));
+            let fresh = AuthBinding::new(temp.path(), identity, resource).expect("fresh binding")
+                .for_static_authorization("authored-first".to_string());
+            assert!(fresh.has_managed_record().expect("matching takeover"));
+            assert_eq!(fresh.authorization_header(false).await.expect("managed header").as_deref(),
+                Some("Bearer old-access"));
+            let edited = AuthBinding::new(temp.path(), identity, resource).expect("edited binding")
+                .for_static_authorization("authored-second".to_string())
+                .with_static_authorization(Some("Bearer configured-second".to_string()));
+            assert!(!edited.has_managed_record().expect("different authored credentials"));
+            assert_eq!(edited.authorization_header(false).await.expect("new authored header").as_deref(),
+                Some("Bearer configured-second"));
+        });
+    }
+
+    #[test]
+    fn logout_after_source_repair_retains_the_marker_that_suppresses_the_old_header() {
+        let temp = tempfile::tempdir().expect("credential directory");
+        let binding = AuthBinding::new(temp.path(), "header-free-definition", "http://127.0.0.1:9/mcp")
+            .expect("repaired binding");
+        let mut login = record(&binding);
+        login.static_fingerprint = Some("original-authored-header".to_string());
+        binding.write_sync(None, login, None).expect("takeover login");
+        let admit: Admission = Arc::new(|| Ok(()));
+        binding.forget_sync(&admit).expect("logout from repaired configuration");
+        let tombstone = binding.read_sync().expect("stored logout").expect("tombstone");
+        assert!(tombstone.revoked);
+        assert_eq!(tombstone.static_fingerprint.as_deref(), Some("original-authored-header"));
+        let old_definition = AuthBinding::new(temp.path(), "header-free-definition", "http://127.0.0.1:9/mcp")
+            .expect("old definition")
+            .for_static_authorization("original-authored-header".to_string())
+            .with_static_authorization(Some("Bearer stale".to_string()));
+        assert!(old_definition.has_managed_record().expect("logout owns the old header"));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            assert!(old_definition.authorization_header(false).await.expect_err("no static fallback after logout")
+                .to_string().contains("MCP_AUTH_REQUIRED"));
+        });
     }
 
     #[test]

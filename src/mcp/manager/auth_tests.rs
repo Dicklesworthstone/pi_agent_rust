@@ -333,21 +333,14 @@ fn get_channel_authentication_rejection_prevents_catalog_publication() {
 }
 
 #[test]
-fn operator_authentication_requires_trust_and_cannot_replace_static_authorization() {
-    for (headers, trusted, expected) in [
-        (Vec::new(), false, "MCP_TRUST_PENDING"),
-        (
-            vec![(
-                "aUtHoRiZaTiOn".to_string(),
-                "Bearer explicit-fixture".to_string(),
-            )],
-            true,
-            "MCP_AUTH_STATIC_HEADER",
-        ),
+fn operator_authentication_requires_trust_even_with_static_authorization() {
+    for headers in [
+        Vec::new(),
+        vec![("aUtHoRiZaTiOn".to_string(), "Bearer explicit-fixture".to_string())],
     ] {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let server = AuthHttpServer::start(None, 401, 405);
-        let (manager, _) = fixture(&temporary, server.url(), headers, trusted);
+        let (manager, _) = fixture(&temporary, server.url(), headers, false);
         runtime().block_on(async {
             let error = manager
                 .reauthenticate(
@@ -357,14 +350,7 @@ fn operator_authentication_requires_trust_and_cannot_replace_static_authorizatio
                 )
                 .await
                 .expect_err("operator authentication admission rejected");
-            assert!(error.to_string().contains(expected), "{error}");
-            if trusted {
-                let error = manager
-                    .unauthenticate("remote auth")
-                    .await
-                    .expect_err("static credentials are owned by configuration");
-                assert!(error.to_string().contains("MCP_AUTH_STATIC_HEADER"));
-            }
+            assert!(error.to_string().contains("MCP_TRUST_PENDING"), "{error}");
             assert_eq!(
                 server.count(),
                 0,

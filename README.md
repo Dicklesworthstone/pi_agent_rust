@@ -2025,6 +2025,51 @@ retries within a three-correction turn budget. Project rules require workspace
 trust; triggered corrections survive compaction on their active branch. See
 [Stream rules](docs/stream-rules.md) for configuration and examples.
 
+### MCP server authentication and project configuration
+
+Use `/mcp list` to inspect each server's selected source, trust decision, and
+connection health. `/mcp trust <name>` acknowledges that exact definition;
+HTTP servers that need OAuth can then sign in with `/mcp reauth <name>`.
+Follow the authorization URL and complete the browser callback. A successful
+reauthentication replaces the live connection and reloads its tools, including
+in RPC and ACP sessions.
+
+Reauthentication also repairs an expired configured `Authorization` header.
+After login succeeds, Pi removes that header from the file that supplied the
+winning definition and preserves its existing trust acknowledgement for that
+specific repair. Explicit `--mcp-config` files take precedence over `.pi`,
+`.agents`, global Pi, and imported tool configurations. Shadowed files,
+unrelated settings, and authored variable or secret references remain intact.
+If the selected file changes while the browser is open, Pi preserves the edit
+and refuses the repair. ACP and extension definitions remain owned by their
+clients: their explicit login takes over only the exact supplied definition
+without creating a replacement configuration file.
+
+`/mcp unauth <name>` removes the managed login and retires the connection and
+tools. Logout suppresses the old configured bearer as well, and a late browser
+callback cannot restore a logged-out session. Cancelling the browser wait
+preserves the previous credentials, source, and trust. If login succeeds
+but source persistence or reconnection fails, Pi reports that the login was
+saved so the remaining problem can be repaired without mistaking it for a
+failed authorization.
+
+Native settings support the OMP project-configuration switch:
+
+```json
+{
+  "mcp": {
+    "enableProjectConfig": false
+  }
+}
+```
+
+The default is `true`. When the merged setting is `false`, automatic discovery
+skips project `.pi` and `.agents` MCP files and imported project configurations.
+Global Pi configuration and explicit `--mcp-config` arguments remain eligible.
+Project configuration also requires workspace trust when the setting is
+enabled. Client-supplied ACP servers remain explicit session definitions, and
+each server still requires its own trust acknowledgement.
+
 ### RPC Protocol
 
 The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin/stdout for programmatic integration. Each line is a self-contained JSON object.

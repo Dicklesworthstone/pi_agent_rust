@@ -27,6 +27,7 @@ mod connection;
 #[cfg(test)]
 mod live_catalog_tests;
 mod output_schema;
+mod reauth;
 
 pub use output_schema::McpOutputSchema;
 
@@ -541,6 +542,12 @@ impl McpManager {
     /// the eager connect fails (the trust decision still stands).
     pub async fn trust(&self, name: &str) -> Result<Vec<McpToolMeta>> {
         let entry = self.entry(name)?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let _connect_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
+                .await
+                .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while trusting server"))?;
+        let entry = self.current_entry_for_lane(&entry)?;
         entry.check_enabled()?;
         let fingerprint = self.trust_fingerprint_for(&entry);
         {
@@ -568,7 +575,8 @@ impl McpManager {
                 store.acknowledge(name, &fingerprint, "operator")?;
             }
         }
-        self.connect_and_list(&entry).await
+        self.ensure_ready_in_lane(&entry).await?;
+        self.list_and_cache_tools_in_lane(&entry).await
     }
 
     /// Deny a server (fail-closed; kills this manager's live connection).
@@ -591,6 +599,7 @@ impl McpManager {
             asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx())
                 .await
                 .map_err(|_| tool_err("MCP_CANCELLED", "cancelled while denying server"))?;
+        let entry = self.current_entry_for_lane(&entry)?;
         let fingerprint = self.trust_fingerprint_for(&entry);
         {
             let _guard = Self::lock(&self.inner.trust_lock);
@@ -613,25 +622,11 @@ impl McpManager {
                 "OAuth authentication is available for HTTP MCP servers only",
             ));
         }
-        if entry
-            .config
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        {
-            return Err(tool_err(
-                "MCP_AUTH_STATIC_HEADER",
-                "this server has an explicit Authorization header; remove it from the source configuration before using managed OAuth",
-            ));
-        }
-        let url =
-            entry.config.url.as_deref().ok_or_else(|| {
-                tool_err("MCP_CONFIG_INVALID", "HTTP MCP server has no endpoint URL")
-            })?;
-        super::auth::AuthBinding::new(
+        reauth::binding_for(
+            &entry.config,
+            &entry.effective_cwd(&self.inner.cwd),
+            &self.inner.cwd,
             &self.inner.global_dir,
-            &self.trust_fingerprint_for(entry),
-            url,
         )
     }
 
@@ -646,13 +641,30 @@ impl McpManager {
         self.check_trust(entry)
     }
 
+    /// A header repair replaces the immutable definition but retains its
+    /// connection lane. Queued lifecycle operations must act on that current
+    /// entry instead of revoking only the superseded transport and fingerprint.
+    fn current_entry_for_lane(&self, previous: &Arc<ServerEntry>) -> Result<Arc<ServerEntry>> {
+        let current = self.entry(&previous.config.name)?;
+        if !Arc::ptr_eq(&current.connect_lane, &previous.connect_lane) {
+            return Err(tool_err(
+                "MCP_SERVER_SUPERSEDED",
+                "the MCP server definition changed while waiting for its connection lane",
+            ));
+        }
+        Ok(current)
+    }
+
     /// Sign in to a trusted HTTP server using discovery, PKCE, and a loopback
     /// callback, then replace its live connection and refresh the tool catalog.
     /// The URL observer is operator output; it must not invoke a model or tool.
     ///
     /// Cancelling the browser wait does not clear an existing login. Once new
     /// credentials are saved, reconnect failure or cancellation cannot undo them.
-    /// Authentication never grants trust or rewrites a server's source config.
+    /// An explicit login replaces stale authored Authorization. For a file
+    /// definition, remove that header from its winning source only and preserve
+    /// the existing trust acknowledgement for that exact repair. ACP/extension
+    /// definitions keep their original source and use a fingerprint-bound login.
     /// Configured OAuth settings apply to every operator surface. Supplying a
     /// public client ID overrides the configured client and discards its secret.
     ///
@@ -670,12 +682,14 @@ impl McpManager {
         let entry = self.entry(name)?;
         self.check_authentication_entry(&entry)?;
         let binding = self.authentication_binding(&entry)?;
-        if entry.config.headers.len() > 95 {
+        if entry.config.headers.iter().filter(|(name, _)| !name.eq_ignore_ascii_case("authorization")).count() > 95 {
             return Err(tool_err(
                 "MCP_CONFIG_INVALID",
                 "managed OAuth requires room for its Authorization header; at most 95 custom headers are supported",
             ));
         }
+        let repair = reauth::Repair::prepare(&entry, &self.inner.cwd).await?;
+        let check_repair = Arc::clone(&repair);
         let check_manager = Self {
             inner: Arc::clone(&self.inner),
         };
@@ -683,7 +697,8 @@ impl McpManager {
         let check_owner = owner.clone();
         let check: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
             catalog::check_request_owner(&check_owner)?;
-            check_manager.check_authentication_entry(&check_entry)
+            check_manager.check_authentication_entry(&check_entry)?;
+            check_repair.check_unchanged()
         });
         catalog::operation_with_owner(
             &owner,
@@ -694,14 +709,25 @@ impl McpManager {
                     .resolve_authentication_configuration(&entry, client_id)
                     .await?;
                 binding.reauthenticate(configuration, on_url, check).await?;
-                let _lane = asupersync::sync::OwnedMutexGuard::lock(
+                let lane = asupersync::sync::OwnedMutexGuard::lock(
                     Arc::clone(&entry.connect_lane),
                     owner.cx(),
                 )
                 .await
                 .map_err(|_| tool_err("MCP_CANCELLED", "cancelled after saving MCP login"))?;
-                self.check_authentication_entry(&entry)?;
+                self.check_authentication_entry(&entry).map_err(|error| {
+                    tool_err(
+                        "MCP_AUTH_RECONNECT_FAILED",
+                        format!("login saved, but the MCP definition or trust changed: {error}"),
+                    )
+                })?;
                 Self::retire_authenticated_connection(&entry);
+                let (entry, _lane) = repair.publish(self, &entry, &owner, lane).await.map_err(|error| {
+                    tool_err(
+                        "MCP_AUTH_REPAIR_FAILED",
+                        format!("login saved, but the source repair could not be completed: {error}"),
+                    )
+                })?;
                 self.ensure_ready_in_lane(&entry).await.map_err(|error| {
                     tool_err(
                         "MCP_AUTH_RECONNECT_FAILED",
@@ -789,7 +815,7 @@ impl McpManager {
     /// been denied or disabled, and never sends a request using removed tokens.
     ///
     /// # Errors
-    /// Returns unknown-server, static-header, cancellation, or storage errors.
+    /// Returns unknown-server, unsupported-transport, cancellation, or storage errors.
     pub async fn unauthenticate(&self, name: &str) -> Result<()> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         catalog::check_request_owner(&owner)?;
@@ -802,6 +828,8 @@ impl McpManager {
                 // Refresh and browser callbacks cannot resurrect this login.
                 binding.forget().await?;
                 Self::retire_authenticated_connection(&entry);
+                let current = self.current_entry_for_lane(&entry)?;
+                Self::retire_authenticated_connection(&current);
                 let _lane = asupersync::sync::OwnedMutexGuard::lock(
                     Arc::clone(&entry.connect_lane),
                     owner.cx(),
@@ -815,6 +843,7 @@ impl McpManager {
                 })?;
                 // A constructor already inside the lane can only have used a
                 // pre-removal generation. Retire any publication it completed.
+                let entry = self.current_entry_for_lane(&entry)?;
                 Self::retire_authenticated_connection(&entry);
                 *Self::lock(&entry.health) = ServerHealth::AuthenticationRequired {
                     reason: "managed login removed; use /mcp reauth to sign in".to_string(),
@@ -1508,38 +1537,35 @@ impl McpManager {
                         format!("server {:?} is http-shaped but has no url", config.name),
                     )
                 })?;
-                let headers = resolve_server_secrets(
-                    &config.headers,
+                let binding = reauth::binding_for(&config, &cwd, &workspace, &global_dir)?;
+                let managed = binding.has_managed_record()?;
+                let definitions: Vec<_> = config
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| !managed || !name.eq_ignore_ascii_case("authorization"))
+                    .cloned()
+                    .collect();
+                let mut headers = resolve_server_secrets(
+                    &definitions,
                     config.provenance,
                     super::config::validate_http_header_value,
                     &cwd,
                     &workspace,
                 )?;
                 ensure_active()?;
-                let has_static_auth = headers
+                let static_auth = headers
                     .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
-                let authentication = if has_static_auth {
-                    None
-                } else {
-                    Some(super::auth::AuthBinding::new(
-                        &global_dir,
-                        &config.fingerprint_for_workspace(&cwd, &workspace),
-                        &url,
-                    )?)
-                };
+                    .position(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|index| headers.remove(index).1);
+                let authentication = binding.with_static_authorization(static_auth);
                 let transport: Box<dyn McpTransport> =
                     if config.transport_hint.as_deref().map(str::trim) == Some("sse") {
-                        let mut transport = super::transport::SseTransport::new(&url, headers)?;
-                        if let Some(binding) = authentication {
-                            transport = transport.with_authentication(binding)?;
-                        }
+                        let transport = super::transport::SseTransport::new(&url, headers)?
+                            .with_authentication(authentication)?;
                         Box::new(transport)
                     } else {
-                        let mut transport = super::transport::HttpTransport::new(&url, headers)?;
-                        if let Some(binding) = authentication {
-                            transport = transport.with_authentication(binding)?;
-                        }
+                        let transport = super::transport::HttpTransport::new(&url, headers)?
+                            .with_authentication(authentication)?;
                         Box::new(transport)
                     };
                 transport.configure_workspace_root(&workspace)?;

@@ -97,6 +97,8 @@ pub struct Config {
     pub bash: Option<BashSettings>,
     /// Memory-bank settings (bd-cv653.4.1).
     pub memory: Option<MemorySettings>,
+    /// MCP discovery controls. Explicit files and client definitions remain eligible.
+    pub mcp: Option<McpSettings>,
     /// Opt-in media trio settings (bd-cv653.2.7).
     pub media: Option<crate::media_tools::MediaSettings>,
     /// Opt-in computer tool settings (bd-cv653.2.5).
@@ -677,6 +679,15 @@ impl MemorySettings {
     }
 }
 
+/// Controls automatic discovery of project MCP configuration files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSettings {
+    /// Default true; false skips every discovered project-native and foreign file.
+    #[serde(alias = "enableProjectConfig")]
+    pub enable_project_config: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -973,6 +984,12 @@ impl Config {
             read: merge_read(base.read, other.read),
             bash: merge_bash(base.bash, other.bash),
             memory: merge_memory(base.memory, other.memory),
+            mcp: match (base.mcp, other.mcp) {
+                (Some(base), Some(other)) => Some(McpSettings {
+                    enable_project_config: other.enable_project_config.or(base.enable_project_config),
+                }),
+                (base, other) => other.or(base),
+            },
             media: merge_media(base.media, other.media),
             computer: merge_computer(base.computer, other.computer),
             browser: merge_browser(base.browser, other.browser),
@@ -1064,6 +1081,17 @@ impl Config {
     }
 
     // === Accessor methods with defaults ===
+
+    /// Discover project-local MCP definitions when the workspace is also trusted.
+    /// Explicit CLI files, global definitions, and ACP client declarations are
+    /// independent of this setting.
+    #[must_use]
+    pub fn mcp_project_config_enabled(&self) -> bool {
+        self.mcp
+            .as_ref()
+            .and_then(|settings| settings.enable_project_config)
+            .unwrap_or(true)
+    }
 
     pub fn compaction_enabled(&self) -> bool {
         self.compaction
@@ -2566,6 +2594,28 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn mcp_project_discovery_setting_aliases_defaults_and_layering() {
+        assert!(Config::default().mcp_project_config_enabled());
+        for content in [
+            r#"{"mcp":{"enableProjectConfig":false}}"#,
+            r#"{"mcp":{"enable_project_config":false}}"#,
+        ] {
+            let disabled: Config = serde_json::from_str(content).expect("MCP settings");
+            assert!(!disabled.mcp_project_config_enabled());
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let empty: Config = serde_json::from_str(r#"{"mcp":{}}"#).expect("empty override");
+            let inherited = Config::merge(disabled, empty);
+            assert!(!inherited.mcp_project_config_enabled());
+            let enabled: Config = serde_json::from_str(r#"{"mcp":{"enableProjectConfig":true}}"#)
+                .expect("explicit override");
+            assert!(Config::merge(inherited, enabled).mcp_project_config_enabled());
+        }
+        assert!(
+            serde_json::from_str::<Config>(r#"{"mcp":{"enableProjectConfig":"false"}}"#).is_err()
+        );
+    }
 
     #[test]
     fn advisor_continuation_threshold_aliases_defaults_and_layering() {

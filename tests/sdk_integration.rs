@@ -1188,6 +1188,81 @@ fn sdk_mcp_discovery_honors_workspace_trust() {
     assert_eq!(trusted_names, vec!["global-server", "project-server"]);
 }
 
+#[test]
+fn sdk_mcp_project_opt_out_skips_malformed_sources_and_keeps_explicit_files() {
+    let harness = TestHarness::new("sdk_mcp_project_opt_out");
+    let global = harness.temp_path("mcp-global");
+    std::fs::create_dir_all(&global).expect("global MCP directory");
+    for relative in [".pi/mcp.json", ".agents/mcp.json", ".claude/mcp.json"] {
+        harness.create_file(relative, b"{ malformed project definition");
+    }
+    harness.create_file(
+        ".pi/settings.json",
+        br#"{"mcp":{"enableProjectConfig":false}}"#,
+    );
+    std::fs::write(
+        global.join("mcp.json"),
+        r#"{"mcpServers":{"global":{"url":"https://global.example.test/mcp"}}}"#,
+    )
+    .expect("global MCP definition");
+    let explicit = harness.create_file(
+        "explicit-mcp.json",
+        br#"{"mcpServers":{"explicit":{"url":"https://explicit.example.test/mcp"}}}"#,
+    );
+    let mut options = default_session_options(&harness);
+    options.workspace_trusted = true;
+    options.mcp = Some(McpSessionOptions {
+        config_paths: vec![explicit],
+        global_dir: Some(global),
+    });
+    let disabled =
+        run_async(create_agent_session(options.clone())).expect("disabled project session");
+    let manager = disabled.mcp_manager().expect("MCP manager");
+    let mut names = manager
+        .list()
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, vec!["explicit", "global"]);
+    assert!(
+        manager.warnings().is_empty(),
+        "disabled files must not be read"
+    );
+
+    harness.create_file(
+        ".pi/settings.json",
+        br#"{"mcp":{"enableProjectConfig":true}}"#,
+    );
+    let enabled =
+        run_async(create_agent_session(options.clone())).expect("enabled project session");
+    let manager = enabled.mcp_manager().expect("MCP manager");
+    assert_eq!(
+        manager
+            .list()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["explicit"]
+    );
+    assert!(
+        !manager.warnings().is_empty(),
+        "malformed project source blocks lower layers"
+    );
+
+    options.workspace_trusted = false;
+    let untrusted = run_async(create_agent_session(options)).expect("untrusted session");
+    let manager = untrusted.mcp_manager().expect("MCP manager");
+    let mut names = manager
+        .list()
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, vec!["explicit", "global"]);
+    assert!(manager.warnings().is_empty());
+}
+
 // ============================================================================
 // 13. Conformance: Event ordering guarantees
 // ============================================================================

@@ -2145,7 +2145,7 @@ async fn run(
             &cli,
             &cwd,
             &Config::global_dir(),
-            workspace_trusted,
+            workspace_trusted && config.mcp_project_config_enabled(),
         ))
         .await;
     }
@@ -3110,7 +3110,7 @@ async fn run(
             &cwd,
             &pi::config::Config::global_dir(),
             &cli.mcp_config,
-            workspace_trusted,
+            workspace_trusted && config.mcp_project_config_enabled(),
         )?))
     };
     let mut extension_bindings = Vec::new();

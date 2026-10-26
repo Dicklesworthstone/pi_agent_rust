@@ -52,7 +52,7 @@ pub enum TrustState {
 pub struct TrustAuditEntry {
     /// ISO-8601 timestamp.
     pub at: String,
-    /// `acknowledged` | `denied` | `reset`.
+    /// `acknowledged` | `denied` | `reset` | `reauthenticated`.
     pub action: String,
     /// Who acted (`operator` for the local CLI user).
     pub by: String,
@@ -129,7 +129,7 @@ pub(crate) type TrustWriteGuard = crate::file_lock::DirLock;
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct WindowsTrustDirectoryGuard {
+pub(crate) struct WindowsTrustDirectoryGuard {
     path: PathBuf,
     identity: FileIdentity,
     handle: std::fs::File,
@@ -190,7 +190,7 @@ fn trust_target_parts(path: &Path) -> std::io::Result<(&Path, &OsStr)> {
 }
 
 #[cfg(unix)]
-fn open_trust_directory_nofollow(path: &Path, create: bool) -> std::io::Result<File> {
+pub(crate) fn open_trust_directory_nofollow(path: &Path, create: bool) -> std::io::Result<File> {
     use std::path::Component;
 
     let flags = rustix::fs::OFlags::RDONLY
@@ -500,7 +500,7 @@ fn validate_windows_trust_directory_guard(
 }
 
 #[cfg(windows)]
-fn validate_windows_trust_directory_guards(
+pub(crate) fn validate_windows_trust_directory_guards(
     guards: &[WindowsTrustDirectoryGuard],
 ) -> std::io::Result<()> {
     for guard in guards {
@@ -510,7 +510,7 @@ fn validate_windows_trust_directory_guards(
 }
 
 #[cfg(windows)]
-fn open_or_create_windows_trust_parent(
+pub(crate) fn open_or_create_windows_trust_parent(
     path: &Path,
     create: bool,
 ) -> std::io::Result<(PathBuf, Vec<WindowsTrustDirectoryGuard>)> {
@@ -944,6 +944,56 @@ impl TrustStore {
     ) -> Result<(TrustDecision, TrustWriteGuard)> {
         let guard = self.lock_and_reload()?;
         Ok((self.decision(name, fingerprint), guard))
+    }
+
+    /// Preserve an existing acknowledgement while an explicit OAuth login
+    /// removes only that definition's authored Authorization header. Recheck
+    /// under the durable mutation lock: a deny/reset during the browser wait
+    /// must win over the stale acknowledgement held by the caller.
+    pub(crate) fn repair_authorization<F>(
+        &mut self,
+        name: &str,
+        expected_fingerprint: &str,
+        repaired_fingerprint: &str,
+        commit_source: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let guard = self.lock_and_reload()?;
+        if self.decision(name, expected_fingerprint) != TrustDecision::Acknowledged {
+            return Err(Error::tool(
+                "mcp",
+                "[MCP_AUTH_SUPERSEDED] the MCP trust decision changed during authentication",
+            ));
+        }
+        // The caller verifies the original definition and publishes its exact
+        // header-only repair here. No cancellation check splits the admitted
+        // source replacement from the corresponding trust write.
+        commit_source()?;
+        let previous = self.servers.get(name).cloned().ok_or_else(|| {
+            Error::tool("mcp", "[MCP_AUTH_SUPERSEDED] the MCP trust record disappeared")
+        })?;
+        let mut repaired = previous.clone();
+        let at = now_iso();
+        repaired.fingerprint = repaired_fingerprint.to_string();
+        repaired.execution = None;
+        repaired.by = "operator".to_string();
+        repaired.at.clone_from(&at);
+        repaired.audit.push(TrustAuditEntry {
+            at,
+            action: "reauthenticated".to_string(),
+            by: "operator".to_string(),
+            fingerprint: repaired_fingerprint.to_string(),
+        });
+        self.servers.insert(name.to_string(), repaired);
+        if let Err(error) = self.save(&guard) {
+            // A failure never grants trust in memory. The source may already
+            // have committed; its new fingerprint must be checked on reload.
+            self.servers.insert(name.to_string(), previous);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Record an acknowledgement.
@@ -1473,6 +1523,47 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_repair_reloads_trust_and_never_overrides_an_intervening_denial() {
+        let temp = tempfile::tempdir().expect("trust directory");
+        let path = temp.path().join("trust.json");
+        let mut operator = TrustStore::load(&path).expect("initial store");
+        operator.acknowledge("remote", "authored", "operator").expect("acknowledgement");
+        let mut stale = TrustStore::load(&path).expect("pre-browser snapshot");
+        operator.deny("remote", "authored", "operator").expect("intervening denial");
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let result = stale.repair_authorization("remote", "authored", "repaired", || {
+            published.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!published.load(std::sync::atomic::Ordering::Acquire));
+        let final_store = TrustStore::load(&path).expect("durable denial");
+        assert_eq!(final_store.decision("remote", "authored"), TrustDecision::Denied);
+        assert_eq!(final_store.decision("remote", "repaired"), TrustDecision::Pending);
+    }
+
+    #[test]
+    fn failed_source_repair_preserves_trust_and_success_audits_the_exact_transition() {
+        let temp = tempfile::tempdir().expect("trust directory");
+        let path = temp.path().join("trust.json");
+        let mut store = TrustStore::load(&path).expect("store");
+        store.acknowledge("remote", "authored", "operator").expect("acknowledgement");
+        let before = std::fs::read(&path).expect("trust snapshot");
+        store.repair_authorization("remote", "authored", "repaired", || {
+            Err(Error::tool("mcp", "[MCP_AUTH_SOURCE_CHANGED] fixture source edit"))
+        }).expect_err("source CAS failed");
+        assert_eq!(std::fs::read(&path).expect("unchanged trust"), before);
+        assert_eq!(store.decision("remote", "authored"), TrustDecision::Acknowledged);
+        store.repair_authorization("remote", "authored", "repaired", || Ok(()))
+            .expect("explicit header-only repair");
+        let reloaded = TrustStore::load(&path).expect("repaired trust");
+        assert_eq!(reloaded.decision("remote", "authored"), TrustDecision::Pending);
+        assert_eq!(reloaded.decision("remote", "repaired"), TrustDecision::Acknowledged);
+        assert_eq!(reloaded.records()["remote"].audit.len(), 2);
+        assert_eq!(reloaded.records()["remote"].audit.last().expect("audit").action, "reauthenticated");
+    }
 
     #[test]
     fn pending_by_default_and_after_fingerprint_change() {

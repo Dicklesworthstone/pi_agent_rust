@@ -5163,6 +5163,66 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
     assert_contains(&harness.harness, &result.stdout, "ok");
 }
 
+#[test]
+fn e2e_cli_print_mcp_honors_project_discovery_setting() {
+    let harness = CliTestHarness::new("e2e_cli_print_mcp_project_setting");
+    let global = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&global).expect("global MCP directory");
+    fs::write(
+        global.join("mcp.json"),
+        r#"{"mcpServers":{"shared":{"url":"https://global.example.test/mcp"}}}"#,
+    )
+    .expect("global MCP definition");
+    harness.harness.create_file(
+        ".pi/mcp.json",
+        br#"{"mcpServers":{"shared":{"url":"https://project.example.test/mcp"},"project-only":{"command":"project-bin"}}}"#,
+    );
+    let explicit = harness.harness.create_file(
+        "explicit-mcp.json",
+        br#"{"mcpServers":{"explicit":{"command":"explicit-bin"}}}"#,
+    );
+    let settings = PathBuf::from(&harness.env["PI_CONFIG_PATH"]);
+    for (enabled, expected_provenance, expected_names) in [
+        (false, "global", vec!["explicit", "shared"]),
+        (true, ".pi", vec!["explicit", "project-only", "shared"]),
+    ] {
+        fs::write(
+            &settings,
+            json!({"mcp":{"enableProjectConfig":enabled}}).to_string(),
+        )
+        .expect("MCP discovery setting");
+        let result = harness.run(&[
+            "--trust",
+            "-p",
+            "--mode",
+            "json",
+            "--mcp-config",
+            explicit.to_str().expect("explicit path"),
+            "/mcp list",
+        ]);
+        assert_eq!(result.exit_code, 0, "{}\n{}", result.stdout, result.stderr);
+        let record = result
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["type"] == "mcp_result")
+            .expect("MCP command result");
+        assert_eq!(record["success"], true);
+        let servers = record["data"]["servers"].as_array().expect("server list");
+        let mut names = servers
+            .iter()
+            .map(|server| server["name"].as_str().expect("name"))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, expected_names);
+        let shared = servers
+            .iter()
+            .find(|server| server["name"] == "shared")
+            .expect("shared server");
+        assert_eq!(shared["provenance"], expected_provenance);
+    }
+}
+
 /// A process isolation flag must also skip already acknowledged MCP servers
 /// and command-based credential resolvers, not merely hide their tool names.
 #[cfg(unix)]

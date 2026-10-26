@@ -4146,7 +4146,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             &cwd,
             &global_dir,
             &mcp.config_paths,
-            options.workspace_trusted,
+            options.workspace_trusted && config.mcp_project_config_enabled(),
         )?);
         if let Some(extension_manager) = agent_session
             .extensions

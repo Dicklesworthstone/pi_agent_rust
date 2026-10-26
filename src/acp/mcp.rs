@@ -412,12 +412,12 @@ async fn execute(
             Err(error) if error.to_string().contains("[MCP_AUTH_RECONNECT_FAILED]") =>
                 "MCP login was saved, but reconnecting or loading tools failed. Use /mcp list and /mcp test NAME after checking the server.".to_string(),
             Err(_) =>
-                "MCP sign-in did not complete. The server must be trusted, enabled, and use Streamable HTTP or legacy SSE without a configured Authorization header; inspect its configuration and use /mcp list.".to_string(),
+                "MCP sign-in did not complete. Check /mcp list, the server's trust and OAuth settings, and any changes to its selected source. A completed browser login may already have been saved.".to_string(),
         },
         Command::Unauth(name) => match state.manager.unauthenticate(&name).await {
             Ok(()) => format!("Removed the managed login for MCP server {name}; its connection and tools were retired. Trust is unchanged."),
             Err(_) =>
-                "MCP credential removal did not complete. An explicit Authorization header must be removed from the server configuration; otherwise check the credential store and retry.".to_string(),
+                "MCP credential removal did not complete. Check that the server uses HTTP or SSE and its credential store is writable, then retry. Its trust decision is unchanged.".to_string(),
         },
     }
 }
