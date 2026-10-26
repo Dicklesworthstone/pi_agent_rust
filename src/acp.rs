@@ -30,6 +30,7 @@
 #![allow(clippy::significant_drop_tightening)]
 
 mod client_files;
+mod client_terminals;
 mod content;
 mod history;
 mod mcp;
@@ -184,6 +185,7 @@ struct AcpOutputShared {
     failure: AbortSignal,
     pending_permissions: PendingPermissionMap,
     files: client_files::Requests,
+    terminals: client_terminals::Requests,
 }
 
 #[derive(Default)]
@@ -213,6 +215,7 @@ impl AcpOutputShared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.files.close();
+        self.terminals.close();
         self.failed.abort();
     }
 
@@ -236,6 +239,7 @@ impl AcpOutput {
                 failure,
                 pending_permissions: Arc::new(StdMutex::new(HashMap::new())),
                 files: client_files::Requests::default(),
+                terminals: client_terminals::Requests::default(),
             }),
         }
     }
@@ -316,6 +320,11 @@ impl AcpOutput {
         if self.shared.files.has_write(&session_id) {
             return Err(Error::session(
                 "Waiting for the editor to acknowledge a previous file write",
+            ));
+        }
+        if self.shared.terminals.has_unsettled(&session_id) {
+            return Err(Error::session(
+                "Editor terminal cleanup is unconfirmed; cancel this session to retry cleanup or reconnect the editor",
             ));
         }
         let input = Arc::new(steering::Mailbox::new());
@@ -409,6 +418,7 @@ impl AcpOutput {
                 json!({"requestId":request_id}),
             ));
         }
+        self.shared.terminals.cancel_session(self, session_id);
     }
 
     /// Detach under the output-state lock so admission cannot race a new
@@ -512,6 +522,7 @@ impl AcpOutput {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.shared.files.close();
+        self.shared.terminals.shutdown(self);
         let drain = async {
             loop {
                 if self
@@ -529,7 +540,11 @@ impl AcpOutput {
         };
         timeout(wall_now(), Duration::from_secs(30), Box::pin(drain))
             .await
-            .map_err(|_| Error::session("ACP prompt cleanup timed out; persistence is incomplete"))
+            .map_err(|_| Error::session("ACP prompt cleanup timed out; persistence is incomplete"))?;
+        if self.shared.terminals.has_pending() {
+            return Err(Error::session("Editor terminal cleanup could not be confirmed before ACP shutdown"));
+        }
+        Ok(())
     }
 }
 
@@ -959,7 +974,9 @@ async fn run(
                 };
 
                 if raw_message.get("method").is_none() {
-                    if !route_permission_response(&raw_message, &pending_permissions, &cx) {
+                    if !route_permission_response(&raw_message, &pending_permissions, &cx)
+                        && !out_tx.shared.terminals.route_response(&out_tx, &raw_message, &cx)
+                    {
                         out_tx.shared.files.route_response(&raw_message, &cx);
                     }
                     continue;
@@ -995,6 +1012,7 @@ async fn run(
                 match request.method.as_str() {
                     "initialize" => {
                         out_tx.shared.files.negotiate(&request.params);
+                        out_tx.shared.terminals.negotiate(&request.params);
                         let result = handle_initialize();
                         initialized.store(true, Ordering::SeqCst);
                         let _ = out_tx.send(json_rpc_ok(id, result));
@@ -1380,12 +1398,13 @@ async fn run(
                         // Check the reservation as well as agent_session: a spawned
                         // prompt may not yet have taken the agent out of its state.
                         let busy = out_tx.prompt_is_active(session_id)
-                            || out_tx.shared.files.has_write(session_id);
+                            || out_tx.shared.files.has_write(session_id)
+                            || out_tx.shared.terminals.has_unsettled(session_id);
                         if busy {
                             let _ = out_tx.send(json_rpc_error(
                                 id,
                                 PROMPT_IN_PROGRESS,
-                                "Cannot load or resume a session while a prompt or editor file write is in progress",
+                                "Cannot load or resume a session while a prompt, editor file write, or terminal cleanup is in progress",
                             ));
                             continue;
                         }
@@ -2212,6 +2231,7 @@ fn build_acp_session(
         &cwd,
         options.session_dir.as_ref(),
     )?;
+    client_terminals::bind(&tools, permission_client, &session_id, &cwd)?;
 
     let selection = resolve_acp_selection(&session, &cwd, options, &mut cli)?;
     if let Some(message) = &selection.fallback_message {
@@ -3072,7 +3092,10 @@ fn build_acp_event_handler(
                 args: _,
                 partial_result,
             } => {
-                let tool_content = content::tool_result_content(&partial_result.content);
+                let tool_content = client_terminals::tool_content(
+                    &partial_result.content,
+                    partial_result.details.as_ref(),
+                );
                 let mut update = json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_call_id,
@@ -3090,7 +3113,7 @@ fn build_acp_event_handler(
                 result,
                 is_error,
             } => {
-                let tool_content = content::tool_result_content(&result.content);
+                let tool_content = client_terminals::tool_content(&result.content, result.details.as_ref());
 
                 Some(json!({
                     "sessionUpdate": "tool_call_update",

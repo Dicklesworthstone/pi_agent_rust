@@ -36,9 +36,11 @@ use uuid::Uuid;
 
 pub(crate) mod bash_session;
 mod client_files;
+mod client_terminals;
 mod structured_json;
 mod structured_sqlite;
 pub use client_files::{TextFileClient, TextFileClientScope};
+pub use client_terminals::{TerminalClient, TerminalClientScope, TerminalCommand};
 
 /// Run an internal, resource-bounded data query before normal Pi startup.
 /// The worker receives admitted bytes and never loads project configuration,
@@ -367,6 +369,9 @@ pub trait Tool: Send + Sync {
 
     /// Attach the owning host's editor filesystem without changing tool policy.
     fn bind_text_file_client_scope(&mut self, _scope: TextFileClientScope) {}
+
+    /// Attach an editor terminal backend without changing approval or mediation.
+    fn bind_terminal_client_scope(&mut self, _scope: TerminalClientScope) {}
 
     /// Where the tool comes from. Extension-registered tools answer
     /// [`ToolOrigin::Extension`] so `setActiveTools` can shelve and restore
@@ -5608,6 +5613,7 @@ pub struct ToolRegistry {
     /// Shared by delegating tools and updated on every host provider switch.
     model_scope: ToolModelScope,
     text_file_client_scope: TextFileClientScope,
+    terminal_client_scope: TerminalClientScope,
     /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
     /// schema until promoted via `xdev promote`. Everything not in this set
     /// is in the schema (essential tier).
@@ -5799,6 +5805,7 @@ impl ToolRegistry {
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
         let text_file_client_scope = TextFileClientScope::default();
+        let terminal_client_scope = TerminalClientScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
         let image_auto_resize = config.is_none_or(Config::image_auto_resize);
@@ -6100,6 +6107,7 @@ impl ToolRegistry {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
             tool.bind_text_file_client_scope(text_file_client_scope.clone());
+            tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
 
         Self {
@@ -6108,6 +6116,7 @@ impl ToolRegistry {
             job_session_scope,
             model_scope,
             text_file_client_scope,
+            terminal_client_scope,
             discoverable: discoverable_names,
             mutation_recorder,
             host_ask,
@@ -6131,11 +6140,13 @@ impl ToolRegistry {
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
         let text_file_client_scope = TextFileClientScope::default();
+        let terminal_client_scope = TerminalClientScope::default();
         let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
             tool.bind_text_file_client_scope(text_file_client_scope.clone());
+            tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
         Self {
             tools: tools.into_iter().map(Arc::from).collect(),
@@ -6143,6 +6154,7 @@ impl ToolRegistry {
             job_session_scope,
             model_scope,
             text_file_client_scope,
+            terminal_client_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
             host_ask,
@@ -6162,6 +6174,7 @@ impl ToolRegistry {
             job_session_scope: self.job_session_scope.clone(),
             model_scope: self.model_scope.clone(),
             text_file_client_scope: self.text_file_client_scope.clone(),
+            terminal_client_scope: self.terminal_client_scope.clone(),
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
             host_ask: self.host_ask.clone(),
@@ -6245,6 +6258,7 @@ impl ToolRegistry {
         tool.bind_job_session_scope(self.job_session_scope.clone());
         tool.bind_model_scope(self.model_scope.clone());
         tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
+        tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
         let name = tool.name();
         if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
             self.tools[pos] = Arc::from(tool);
@@ -6262,6 +6276,7 @@ impl ToolRegistry {
             tool.bind_job_session_scope(self.job_session_scope.clone());
             tool.bind_model_scope(self.model_scope.clone());
             tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
+            tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
             let name = tool.name();
             if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
                 self.tools[pos] = Arc::from(tool);
@@ -6300,6 +6315,7 @@ impl ToolRegistry {
                 next.bind_job_session_scope(self.job_session_scope.clone());
                 next.bind_model_scope(self.model_scope.clone());
                 next.bind_text_file_client_scope(self.text_file_client_scope.clone());
+                next.bind_terminal_client_scope(self.terminal_client_scope.clone());
                 *tool = Arc::from(next);
                 changed += 1;
             }
@@ -6317,6 +6333,7 @@ impl ToolRegistry {
             next.bind_job_session_scope(self.job_session_scope.clone());
             next.bind_model_scope(self.model_scope.clone());
             next.bind_text_file_client_scope(self.text_file_client_scope.clone());
+            next.bind_terminal_client_scope(self.terminal_client_scope.clone());
             self.tools.push(Arc::from(next));
             changed += 1;
         }
@@ -6355,6 +6372,10 @@ impl ToolRegistry {
 
     pub(crate) fn set_text_file_client(&self, client: Arc<dyn TextFileClient>) -> Result<()> {
         self.text_file_client_scope.set(client)
+    }
+
+    pub(crate) fn set_terminal_client(&self, client: Arc<dyn TerminalClient>) -> Result<()> {
+        self.terminal_client_scope.set(client)
     }
 }
 
@@ -7737,6 +7758,7 @@ pub struct BashTool {
     command_prefix: Option<String>,
     artifact_root: Option<PathBuf>,
     job_session_scope: crate::jobs::JobSessionScope,
+    terminal_client: TerminalClientScope,
     /// Mediation settings (`bash.mediation*`, bd-cv653.1.7).
     mediation: Option<crate::config::BashSettings>,
 }
@@ -8687,6 +8709,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
     }
@@ -8702,6 +8725,7 @@ impl BashTool {
             command_prefix,
             artifact_root: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
     }
@@ -9030,6 +9054,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: Some(artifact_root.to_path_buf()),
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
     }
@@ -9045,7 +9070,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Execute a bash command. On Unix, foreground calls retain Bash variables, arrays, functions, aliases, options, and working directory within this session, including after automatic promotion. State is saved when a command returns normally; exit, shell abort, timeout, or cancellation retain the previously saved state. Overlapping calls use a temporary shell and report that their state will not persist; explicit background jobs are isolated. Returns stdout and stderr, limited to the last 2000 lines or 1MB. Non-PTY calls automatically continue as background jobs after 60 seconds unless configured otherwise; manage them with jobs (list/wait/cancel). Automatic mode retains an artifact capped at 16MiB even when the command finishes inline. background:true starts immediately; background:false stays in the foreground with the larger direct-runner spill limit. Foreground/automatic timeout defaults to 120 seconds and still applies after promotion; explicit background defaults to 1800 seconds. Set timeout:0 to disable."
+        "Execute a bash command. On Unix, foreground calls retain Bash variables, arrays, functions, aliases, options, and working directory within this session, including after automatic promotion. State is saved when a command returns normally; exit, shell abort, timeout, or cancellation retain the previously saved state. Overlapping calls use a temporary shell and report that their state will not persist; explicit background jobs are isolated. Returns stdout and stderr, limited to the last 2000 lines or 1MB. Non-PTY calls automatically continue as background jobs after 60 seconds unless configured otherwise; manage them with jobs (list/wait/cancel). Automatic mode retains an artifact capped at 16MiB even when the command finishes inline. background:true starts immediately; background:false stays in the foreground with the larger direct-runner spill limit. Foreground/automatic timeout defaults to 120 seconds and still applies after promotion; explicit background defaults to 1800 seconds. Set timeout:0 to disable. When an ACP editor provides terminals, foreground commands use an isolated editor shell with a live terminal card: shell state does not persist and automatic local backgrounding is disabled. Explicit background:true still starts a local managed job."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -9062,7 +9087,7 @@ impl Tool for BashTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "true: start a background job immediately; false: keep this call in the foreground with the direct runner. If omitted, long-running non-PTY calls automatically background according to bash.autoBackground (default after 60 seconds). Automatic mode uses the 16MiB job artifact cap even before promotion. A completion notice arrives later; manage with jobs (list/wait/cancel)."
+                    "description": "true: start a local managed background job immediately; false: keep this call in the foreground. When an ACP editor provides terminals, false or omitted uses an isolated editor terminal without automatic backgrounding. Otherwise omitted long-running non-PTY calls automatically background according to bash.autoBackground (default after 60 seconds). Automatic local mode uses the 16MiB job artifact cap even before promotion. A completion notice arrives later; manage local jobs with jobs (list/wait/cancel)."
                 }
             },
             "required": ["command"]
@@ -9077,6 +9102,10 @@ impl Tool for BashTool {
         self.job_session_scope = scope;
     }
 
+    fn bind_terminal_client_scope(&mut self, scope: TerminalClientScope) {
+        self.terminal_client = scope;
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
@@ -9086,6 +9115,11 @@ impl Tool for BashTool {
     ) -> Result<ToolOutput> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let client_terminal = if input.background == Some(true) {
+            None
+        } else {
+            self.terminal_client.get()?
+        };
         // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
         // real pseudo-terminal when `bash.pty` is auto/always; the tool
         // contract is identical either way.
@@ -9111,12 +9145,14 @@ impl Tool for BashTool {
         // A deadline that comes before promotion uses the ordinary foreground
         // runner, avoiding a pointless job transition just before it expires.
         let auto_background = input.background.is_none()
+            && client_terminal.is_none()
             && !use_pty
             && auto_settings
                 .and_then(|settings| settings.enabled)
                 .unwrap_or(true)
             && (timeout_secs == 0 || timeout_secs.saturating_mul(1000) > threshold_ms);
         let persistent = cfg!(unix)
+            && client_terminal.is_none()
             && input.background != Some(true)
             && self
                 .mediation
@@ -9262,6 +9298,13 @@ impl Tool for BashTool {
         }
 
         // Every execution route passes the same mediation gate above.
+        if let Some(client) = client_terminal {
+            let command = self.client_terminal_command(&input)?;
+            return client
+                .execute(command, on_update.as_deref())
+                .await
+                .map(|output| Self::annotate_bash_mediation(output, mediation_warning.as_ref()));
+        }
         if input.background == Some(true) {
             let job = match crate::jobs::spawn_background(
                 background_session_id.as_deref().ok_or_else(|| {
