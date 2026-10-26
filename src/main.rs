@@ -2985,6 +2985,7 @@ async fn run(
     .with_runtime_handle(runtime_handle.clone());
     agent_session.set_child_fallback_policy(cli.subagent_fallback_policy.clone());
     agent_session.set_api_key_override(cli.api_key.clone());
+    agent_session.set_memory_settings(config.memory.as_ref());
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent

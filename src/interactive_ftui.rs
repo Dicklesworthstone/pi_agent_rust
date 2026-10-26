@@ -4326,7 +4326,7 @@ impl PiFtuiModel {
                      /commit [--dry-run], /review [target], /handoff [focus], \
                      /handoff --report [to] [path], /handoff --model [preview options], \
                      /handoff --import <bundle> [import options], /prewalk [status|off], /approval [mode], \
-                     /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
+                     /advisor [on|off|status], /memory [view|list|search|forget|sync], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
                      /context, /todo, /jobs, /stats, /settings (F2), /help, \

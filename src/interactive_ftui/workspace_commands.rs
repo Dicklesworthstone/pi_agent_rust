@@ -78,11 +78,26 @@ pub async fn run(
             return;
         }
         WorkspaceCommand::Advisor => render(workspace_reports::advisor(advisor, args)),
-        WorkspaceCommand::Memory => render(workspace_reports::memory(
-            cwd,
-            args,
-            handle.session().agent.secrets_settings(),
-        )),
+        WorkspaceCommand::Memory => {
+            if args.trim().eq_ignore_ascii_case("sync") {
+                match handle.sync_memory().await {
+                    Ok(report) => PiMsg::System(report.summary()),
+                    Err(error) => PiMsg::AgentError(format!("memory: {error}")),
+                }
+            } else {
+                match handle
+                    .with_session(crate::session_workdir::require_session_workdir)
+                    .await
+                {
+                    Ok(Ok(workdir)) => render(workspace_reports::memory(
+                        &workdir,
+                        args,
+                        handle.session().agent.secrets_settings(),
+                    )),
+                    Ok(Err(error)) | Err(error) => PiMsg::AgentError(format!("memory: {error}")),
+                }
+            }
+        }
         WorkspaceCommand::Hub => render(workspace_reports::hub(args)),
         WorkspaceCommand::Security => render(workspace_reports::security(cwd, args)),
         WorkspaceCommand::Plugins => packages.map_or_else(

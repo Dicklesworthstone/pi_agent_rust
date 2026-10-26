@@ -6238,6 +6238,7 @@ async fn preserve_terminal_rpc_state(
     // stable entry metadata against the pinned persistence target.
     let mut candidate = inner.clone();
     let reset_advisor_on_authored_input = guard.advisor.is_some();
+    let track_memory_inputs = guard.memory_enabled();
     let mut parent_id = candidate.leaf_id().map(str::to_string);
     for delivery in state.completed_tool_transcript_entries() {
         let message = delivery.message().clone();
@@ -6252,6 +6253,12 @@ async fn preserve_terminal_rpc_state(
         )?;
         if reset_advisor_on_authored_input && delivery.keyword_scan_source().is_some() {
             parent_id = Some(crate::agent::append_advisor_input_reset(
+                &mut candidate,
+                &entry_id,
+            )?);
+        }
+        if track_memory_inputs && delivery.keyword_scan_source().is_some() {
+            parent_id = Some(crate::memory::extraction::record_authored_input(
                 &mut candidate,
                 &entry_id,
             )?);
@@ -6286,6 +6293,12 @@ async fn preserve_terminal_rpc_state(
                     &entry_id,
                 )?);
             }
+            if track_memory_inputs && in_flight.delivery.keyword_scan_source().is_some() {
+                parent_id = Some(crate::memory::extraction::record_authored_input(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
         }
         for delivery in state.steering.iter_mut().chain(&mut state.follow_up) {
             let message = delivery.message().clone();
@@ -6300,6 +6313,12 @@ async fn preserve_terminal_rpc_state(
             )?;
             if reset_advisor_on_authored_input && delivery.keyword_scan_source().is_some() {
                 parent_id = Some(crate::agent::append_advisor_input_reset(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
+            if track_memory_inputs && delivery.keyword_scan_source().is_some() {
+                parent_id = Some(crate::memory::extraction::record_authored_input(
                     &mut candidate,
                     &entry_id,
                 )?);

@@ -6201,6 +6201,15 @@ impl Agent {
         crate::text_completion::redact_inputs_with_vault(parts, privacy, &self.secrets_vault)
     }
 
+    pub(crate) fn auxiliary_privacy_snapshot(
+        &self,
+    ) -> crate::text_completion::AuxiliaryPrivacySnapshot {
+        crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
+            crate::text_completion::AuxiliaryPrivacy::from_settings(self.secrets_settings()),
+            &self.secrets_vault,
+        )
+    }
+
     /// Export hygiene (bd-cv653.7.9): mask known secret values in arbitrary
     /// text (e.g. transcript exports or shares) back to their placeholders.
     /// A no-op when the secrets vault is disabled or empty.
@@ -7053,6 +7062,7 @@ pub struct AgentSession {
     /// The advisor runtime (bd-cv653.3.3): Some only when the advisor role
     /// resolved a model. None = zero-overhead path (no digest is built).
     pub advisor: Option<crate::advisor::AdvisorRuntime>,
+    memory_settings: Option<crate::config::MemorySettings>,
     runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
@@ -15789,6 +15799,7 @@ impl AgentSession {
             compaction_settings,
             compaction_runtime: None,
             advisor: None,
+            memory_settings: None,
             runtime_handle: None,
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
@@ -15804,6 +15815,33 @@ impl AgentSession {
 
     pub const fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
+    }
+
+    /// Configure project memory learning without opening a store or making a request.
+    pub fn set_memory_settings(&mut self, settings: Option<&crate::config::MemorySettings>) {
+        self.memory_settings = settings.filter(|settings| settings.enabled()).cloned();
+    }
+
+    #[must_use]
+    pub fn with_memory_settings(
+        mut self,
+        settings: Option<&crate::config::MemorySettings>,
+    ) -> Self {
+        self.set_memory_settings(settings);
+        self
+    }
+
+    pub(crate) const fn memory_enabled(&self) -> bool {
+        self.memory_settings.is_some()
+    }
+
+    /// Extract and incrementally consolidate facts from the current saved branch.
+    /// This uses the active provider and resolves the current session workdir.
+    pub async fn sync_memory(&self) -> Result<crate::memory::MemorySyncReport> {
+        let settings = self.memory_settings.as_ref().ok_or_else(|| {
+            Error::validation("Memory is disabled; set memory.backend to local or cass")
+        })?;
+        crate::memory::extraction::synchronize(self, settings, false, None, None).await
     }
 
     /// Attach the MCP client registry that serves this session so its turn
@@ -19353,6 +19391,34 @@ impl AgentSession {
             Ok(message)
         }
         .await;
+        if result.as_ref().is_ok_and(|message| {
+            message.stop_reason == StopReason::Stop && time_cap_marker(message).is_none()
+        }) && !self
+            .agent
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+            && !abort.is_some_and(AbortSignal::is_aborted)
+            && !turn.time_exhausted()
+            && let Some(settings) = self
+                .memory_settings
+                .as_ref()
+                .filter(|settings| settings.auto_extract == Some(true))
+            && crate::memory::extraction::synchronize(
+                self,
+                settings,
+                true,
+                abort,
+                turn.remaining_time(),
+            )
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                event = "pi.memory.extraction_deferred",
+                "Optional memory extraction did not complete; the completed turn is unchanged"
+            );
+        }
         turn.finish(result)
     }
 
@@ -20150,7 +20216,10 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.append_model_message(user_message.clone());
+            let input_id = session.append_model_message(user_message.clone());
+            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+                crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
+            }
             if self.advisor.is_some() && self.input_source != InputSource::Extension {
                 session.append_custom_entry(
                     ADVISOR_CONTINUATION_ENTRY.to_string(),
@@ -20250,7 +20319,10 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.append_model_message(user_message.clone());
+            let input_id = session.append_model_message(user_message.clone());
+            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+                crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
+            }
             if self.advisor.is_some() && self.input_source != InputSource::Extension {
                 session.append_custom_entry(
                     ADVISOR_CONTINUATION_ENTRY.to_string(),
@@ -20478,6 +20550,7 @@ impl AgentSession {
         let session = Arc::clone(&self.session);
         let admission = self.provider_admission.clone();
         let reset_advisor = self.advisor.is_some();
+        let track_memory_inputs = self.memory_settings.is_some();
         let checkpoint: TurnCheckpoint = Arc::new(
             move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, bool> {
                 let session = Arc::clone(&session);
@@ -20488,6 +20561,8 @@ impl AgentSession {
                         return false;
                     };
                     for (message, authored) in messages {
+                        let memory_input =
+                            track_memory_inputs && authored && matches!(&message, Message::User(_));
                         let reset =
                             reset_advisor && authored && matches!(&message, Message::User(_));
                         let entry_id = session.append_model_message(message);
@@ -20495,6 +20570,15 @@ impl AgentSession {
                             && let Err(err) = append_advisor_input_reset(&mut session, &entry_id)
                         {
                             tracing::warn!(error = %err, "mid-run advisor input reset failed");
+                        }
+                        if memory_input
+                            && crate::memory::extraction::record_authored_input(
+                                &mut session,
+                                &entry_id,
+                            )
+                            .is_err()
+                        {
+                            tracing::warn!("mid-run memory input provenance could not be recorded");
                         }
                     }
                     if session.autosave_durability_mode()
@@ -20558,9 +20642,15 @@ impl AgentSession {
                 let reset_advisor = self.advisor.is_some()
                     && self.agent.is_authored_queue_delivery(message_index)
                     && matches!(&message, Message::User(_));
+                let memory_input = self.memory_settings.is_some()
+                    && self.agent.is_authored_queue_delivery(message_index)
+                    && matches!(&message, Message::User(_));
                 let entry_id = session.append_model_message(message);
                 if reset_advisor {
                     append_advisor_input_reset(&mut session, &entry_id)?;
+                }
+                if memory_input {
+                    crate::memory::extraction::record_authored_input(&mut session, &entry_id)?;
                 }
             }
             self.agent.authored_queue_delivery_indices.clear();

@@ -3356,6 +3356,12 @@ impl AgentSessionHandle {
         &mut self.session
     }
 
+    /// Learn durable project facts from the current completed, persisted branch.
+    /// The explicit operation works independently of `memory.autoExtract`.
+    pub async fn sync_memory(&self) -> Result<crate::memory::MemorySyncReport> {
+        self.session.sync_memory().await
+    }
+
     /// The recovery policy used by the next turn. `None` disables both
     /// transient-error retries and fallback-provider requests. Automatic
     /// context-overflow compaction is controlled by the session's compaction
@@ -3999,6 +4005,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // whatever was configured. Extensions enabled below copy these modes.
     agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
+    agent_session.set_memory_settings(config.memory.as_ref());
     agent_session.advisor = options.advisor.as_ref().map(|options| {
         options
             .runtime()

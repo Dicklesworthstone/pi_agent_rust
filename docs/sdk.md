@@ -463,6 +463,57 @@ fn main() -> pi::sdk::Result<()> {
 }
 ```
 
+## Native Project Memory Synchronization
+
+`AgentSessionHandle::sync_memory()` extracts reusable facts from the current
+completed, persisted branch using its live provider and request options. Enable
+`memory.backend` (`local` or `cass`) in the configuration and create the SDK
+session with `no_session: false`. The operation works whether or not automatic
+extraction is enabled:
+
+```rust,ignore
+let report = handle.sync_memory().await?;
+println!("{}", report.summary());
+```
+
+The returned `MemorySyncReport` contains `status`, `retained`, `superseded`,
+`duplicates` and `source_messages`; it does not echo extracted source text.
+`updated` means an atomic extraction checkpoint was committed, including when
+there were no durable facts to retain. `unchanged` means the same completed
+source was already processed. `busy` means another extraction currently holds
+the project's lease and the caller can retry. Automatic hooks can additionally
+return `cadence` or `ineligible` without making a provider request.
+
+For direct native construction, install settings with
+`AgentSession::with_memory_settings(config.memory.as_ref())` or
+`set_memory_settings`. The normal CLI, SDK and ACP builders already apply this
+configuration. The native `AgentSession::sync_memory()` method exposes the same
+explicit operation. Configure `memory.autoExtract: true` to extract after
+completed saved turns and `memory.extractEveryTurns` to set the authored-turn
+cadence (default 3, clamped to 1–100). Advisor and extension-generated user rows
+do not advance the cadence. Automatic extraction is disabled by default and
+does not run for ephemeral or delegated child sessions.
+
+The operation is inline and tool-free, uses a 30-second abort-aware deadline,
+and never changes the current model or starts a conversation turn. Automatic
+calls also observe the native turn's remaining time budget; optional failures
+do not fail a completed answer. The source is revalidated before committing
+against the current session identity, branch content and attached workdir.
+Processed-source checkpoints survive reopening and branch navigation. Project
+leases prevent simultaneous extraction requests; expired leases can be retried.
+
+Privacy discovery covers the complete bounded branch text and active memory
+bank before a recent window is selected. The traversal admits at most 512 KiB
+of branch text, 512 KiB of active memory evidence and 256 active memories; larger
+inputs are refused. Requests include at most 48 recent text messages and 16
+existing facts, with a combined source window of 128 KiB before JSON overhead.
+Image, audio, hidden thinking and executable tool arguments are not sent as
+learning evidence. The model may return at most eight 2 KiB facts. All facts,
+FTS updates, audit events and the successful checkpoint share one transaction.
+Only supplied generated facts whose original content, kind, tags and timestamp
+still match can be superseded. Manual facts and later human edits are preserved;
+replaced generated versions remain in the audited history.
+
 ## Compatibility Notes for Migrating Integrators
 
 - `SessionOptions::default().no_session` is `true` (ephemeral by default).

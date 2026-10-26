@@ -457,6 +457,44 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 | `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Gemini, Gemini CLI, and Vertex Gemini models receive it natively as `inline_data`; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 5 MiB per file (`media.maxBytes`); settings-gated |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
+### Project memory learning
+
+The local memory bank can extract reusable facts, lessons, preferences and
+decisions from completed saved sessions, and consolidate facts learned earlier.
+Enable the bank in settings, then run `/memory sync` in the default interactive
+UI to learn from the current completed branch:
+
+```json
+{
+  "memory": {
+    "backend": "local",
+    "autoExtract": true,
+    "extractEveryTurns": 3
+  }
+}
+```
+
+`autoExtract` is off unless explicitly enabled. When enabled, one bounded,
+tool-free request runs after every three newly authored turns by default; the
+cadence accepts 1–100. The request uses the session's current model and provider
+credentials, has a 30-second deadline, and shares any remaining foreground time
+budget. Extraction failure leaves the completed foreground answer intact and
+can be retried with `/memory sync`. Explicit synchronization works with
+`autoExtract` off. Ephemeral sessions and delegated child agents do not extract
+project memories. The `cass` backend uses the same local learning pipeline.
+
+Extraction resolves the session's current attached workdir, screens complete
+bounded text evidence before selecting a recent request window, and redacts
+both request and stored results. Oversized evidence is refused rather than
+partially screened. Each successful extraction commits facts, search indexes,
+audit records and a durable branch checkpoint together, so reopening or revisiting
+an already synchronized branch does not repeat the provider request. Automatic
+consolidation can supersede only unchanged generated memories supplied to the
+request; manually retained or edited facts keep their ownership. Historical
+versions remain auditable. Learned facts become available through `recall`,
+`reflect` and the existing startup memory block. `/memory view`, `list`, `search`
+and `forget` remain available for inspection and management.
+
 All tools include automatic truncation for large outputs (2000 lines /
 1MB), detailed metadata in responses, and process-tree cleanup for bash.
 Background-job logs live in a dedicated directory with a 256 MiB / 4096-entry

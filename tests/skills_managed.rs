@@ -69,6 +69,7 @@ fn memory_config(backend: &str) -> pi::config::Config {
     pi::config::Config {
         memory: Some(pi::config::MemorySettings {
             backend: Some(backend.to_string()),
+            ..Default::default()
         }),
         ..Default::default()
     }

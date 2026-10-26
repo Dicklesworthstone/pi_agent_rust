@@ -2309,7 +2309,8 @@ fn build_acp_session(
         .with_runtime_handle(options.runtime_handle.clone())
         .with_model_registry(registry.clone())
         .with_auth_storage(auth.clone())
-        .with_api_key_override(cli.api_key.clone());
+        .with_api_key_override(cli.api_key.clone())
+        .with_memory_settings(options.config.memory.as_ref());
     // Keep the exact configured AgentSession for the lifetime of the editor
     // session. The SDK owns one durable recovery driver and its cross-turn
     // fallback state; rebuilding a handle per prompt would lose that state.

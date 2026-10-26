@@ -37,11 +37,13 @@ use crate::error::{Error, Result};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
 
 mod cass;
+pub(crate) mod extraction;
 mod reflection;
 pub mod shared;
 #[cfg(test)]
 mod shared_tests;
 mod transactions;
+pub use extraction::MemorySyncReport;
 pub use reflection::ReflectTool;
 
 /// Tool-result schema tag for memory operations (stable audit contract).

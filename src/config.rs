@@ -657,6 +657,24 @@ pub struct BashAutoBackgroundSettings {
 pub struct MemorySettings {
     /// Memory backend: off | local | cass.
     pub backend: Option<String>,
+    /// Learn durable facts from completed saved turns. Explicitly opt-in.
+    #[serde(alias = "autoExtract")]
+    pub auto_extract: Option<bool>,
+    /// Authored turns between automatic extractions (default 3; range 1..=100).
+    #[serde(alias = "extractEveryTurns")]
+    pub extract_every_turns: Option<u32>,
+}
+
+impl MemorySettings {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        matches!(self.backend.as_deref().map(str::trim), Some("local" | "cass"))
+    }
+
+    #[must_use]
+    pub fn extraction_cadence(&self) -> usize {
+        self.extract_every_turns.unwrap_or(3).clamp(1, 100) as usize
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2095,6 +2113,8 @@ fn merge_memory(
     match (base, other) {
         (Some(base), Some(other)) => Some(MemorySettings {
             backend: other.backend.or(base.backend),
+            auto_extract: other.auto_extract.or(base.auto_extract),
+            extract_every_turns: other.extract_every_turns.or(base.extract_every_turns),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
