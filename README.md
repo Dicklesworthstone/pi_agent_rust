@@ -544,7 +544,7 @@ pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
 ### Model Spend Limits
 
 Use `--warn-cost` to show a one-time notice and `--max-cost` to stop admitting
-model requests once recorded spend reaches a USD threshold:
+model requests once known spend reaches a USD threshold:
 
 ```bash
 pi --warn-cost 2 --max-cost 5 "Implement and test the change."
@@ -557,6 +557,13 @@ cover the active session tree: foreground turns, retries, native subagents,
 advisor reviews, compaction, titles, memory extraction and side questions
 share the same account. Child requests consult the parent's live balance;
 missing or ambiguous accounting acknowledgements block further child requests.
+
+Known partial usage from an in-flight request counts toward the next admission.
+The provider's final bill replaces that request's provisional estimate exactly
+once, including when the final bill is lower. Cancelling or reaping a native
+child retains partial usage already acknowledged by its parent, so siblings
+cannot spend that allowance again. An already-admitted request may settle its
+bill during cancellation; this does not permit new model requests.
 
 ```json
 {
@@ -583,6 +590,8 @@ These are request-boundary limits based on known provider costs or catalog
 token pricing. Requests already in flight may finish above the cap, and
 unreported/unpriced usage cannot be estimated. Spend is checkpointed with
 session saves, including normal turn completion, replacement and SDK shutdown.
+Only settled charges enter saved cost checkpoints; an in-flight estimate
+cannot permanently inflate the restored balance if its final bill is lower.
 A crash before a checkpoint, or background work that finishes after its
 owning session has been replaced, can leave auxiliary spend absent from the
 saved session; that work still charges its original in-memory account.

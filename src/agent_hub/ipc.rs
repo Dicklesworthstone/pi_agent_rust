@@ -434,6 +434,7 @@ pub(crate) struct ChildChannel {
     connections: Vec<Connection>,
     messaging: bool,
     cost_budget: Option<crate::cost::CostBudget>,
+    cost_attempts: cost::AttemptLedger,
 }
 
 impl ChildChannel {
@@ -476,6 +477,7 @@ impl ChildChannel {
             connections: Vec::new(),
             messaging: true,
             cost_budget: None,
+            cost_attempts: cost::AttemptLedger::default(),
         })
     }
 
@@ -507,6 +509,7 @@ impl ChildChannel {
         self.connections.clear();
         self.listener = None;
         self.token.clear();
+        self.cost_attempts.retire();
     }
 
     pub(crate) fn poll(&mut self) {
@@ -540,8 +543,15 @@ impl ChildChannel {
                 self.deadline,
                 self.messaging,
                 self.cost_budget.as_ref(),
+                &mut self.cost_attempts,
             )
         });
+    }
+}
+
+impl Drop for ChildChannel {
+    fn drop(&mut self) {
+        self.deactivate();
     }
 }
 
@@ -604,6 +614,7 @@ impl Connection {
 
     #[allow(clippy::option_if_let_else)]
     #[allow(clippy::too_many_lines)] // One bounded read/dispatch/write pass per poll.
+    #[allow(clippy::too_many_arguments)] // Channel-owned routing and accounting share one frame boundary.
     fn poll(
         &mut self,
         sender: &str,
@@ -612,6 +623,7 @@ impl Connection {
         deadline: Instant,
         messaging: bool,
         cost_budget: Option<&crate::cost::CostBudget>,
+        cost_attempts: &mut cost::AttemptLedger,
     ) -> bool {
         if Instant::now() >= self.deadline.min(deadline) || owner.checkpoint().is_err() {
             return false;
@@ -709,6 +721,7 @@ impl Connection {
                                         request,
                                         owner,
                                         cost_budget,
+                                        cost_attempts,
                                     ));
                                 }
                                 Ok(_) => self.refuse(
@@ -1211,12 +1224,21 @@ mod tests {
         connection.set_response(&WireResponse::Ok(Reply::Wait { result }));
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut response = Vec::new();
+        let mut cost_attempts = cost::AttemptLedger::default();
         while !response.ends_with(b"\n") {
             assert!(
                 Instant::now() < deadline,
                 "wait acknowledgement did not arrive"
             );
-            assert!(connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
+            assert!(connection.poll(
+                &sender.id,
+                &"a".repeat(64),
+                &owner,
+                deadline,
+                true,
+                None,
+                &mut cost_attempts,
+            ));
             let mut bytes = [0_u8; 4096];
             match client.read(&mut bytes) {
                 Ok(0) => panic!("acknowledged lease closed early"),
@@ -1231,7 +1253,15 @@ mod tests {
             serde_json::from_slice::<WireResponse>(&response).unwrap(),
             WireResponse::Ok(Reply::Wait { .. })
         ));
-        assert!(connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
+        assert!(connection.poll(
+            &sender.id,
+            &"a".repeat(64),
+            &owner,
+            deadline,
+            true,
+            None,
+            &mut cost_attempts,
+        ));
         assert_eq!(
             hub.wait_snapshot(&peer.id, Some(&sender.id), 0)
                 .unwrap()
@@ -1239,7 +1269,15 @@ mod tests {
             super::super::InboxWaitStatus::PeerBlocked
         );
         owner.set_cancel_requested(true);
-        assert!(!connection.poll(&sender.id, &"a".repeat(64), &owner, deadline));
+        assert!(!connection.poll(
+            &sender.id,
+            &"a".repeat(64),
+            &owner,
+            deadline,
+            true,
+            None,
+            &mut cost_attempts,
+        ));
         drop(connection);
         assert_eq!(
             hub.wait_snapshot(&peer.id, Some(&sender.id), 0)

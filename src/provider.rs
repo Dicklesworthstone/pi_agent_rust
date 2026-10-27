@@ -143,14 +143,15 @@ impl Provider for CostGuardedProvider {
         options: &StreamOptions,
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>>
     {
-        self.budget.admit()?;
+        let attempt = self.budget.start_attempt()?;
         let inner = self.inner.stream(context, options).await?;
         Ok(Box::pin(CostMeteredStream {
             inner,
-            budget: self.budget.clone(),
+            attempt,
             rates: self.inner.model_cost(),
             known_cost: 0.0,
             settled: false,
+            accounting_failed: false,
         }))
     }
 
@@ -159,7 +160,7 @@ impl Provider for CostGuardedProvider {
         request_body: &serde_json::Value,
         options: &StreamOptions,
     ) -> crate::error::Result<serde_json::Value> {
-        self.budget.admit()?;
+        let mut attempt = self.budget.start_attempt()?;
         let response = self.inner.compact_native(request_body, options).await?;
         if let Some(usage) = response.get("usage") {
             let input = usage
@@ -191,7 +192,7 @@ impl Provider for CostGuardedProvider {
             {
                 rates.price_usage(&mut priced);
             }
-            if let Err(error) = self.budget.record(priced.cost.total) {
+            if let Err(error) = attempt.finish(priced.cost.total) {
                 tracing::warn!(%error, "native compaction spend accounting failed; budget quarantined");
             }
         }
@@ -204,40 +205,54 @@ impl Provider for CostGuardedProvider {
 /// guess charges from text length when a cancelled provider reports none.
 struct CostMeteredStream {
     inner: Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-    budget: crate::cost::CostBudget,
+    attempt: crate::cost::CostAttempt,
     rates: Option<ModelCost>,
     known_cost: f64,
     settled: bool,
+    accounting_failed: bool,
 }
 
 impl CostMeteredStream {
-    fn observe(&mut self, usage: &mut crate::model::Usage, terminal: bool) {
+    fn observe(
+        &mut self,
+        usage: &mut crate::model::Usage,
+        terminal: bool,
+    ) -> crate::error::Result<()> {
         if self.settled {
-            return;
+            return Ok(());
         }
         // price_usage treats nonpositive/NaN totals as missing billing. The
         // spend guard must distinguish an absent zero from invalid usage
         // before that fallback can erase evidence of an accounting failure.
         if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
             self.known_cost = f64::NAN;
-            return;
+            return self.attempt.observe(f64::NAN);
         }
         if let Some(rates) = &self.rates {
             rates.price_usage(usage);
         }
         if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
             self.known_cost = f64::NAN;
+            return self.attempt.observe(f64::NAN);
         } else if self.known_cost.is_finite()
             && ((terminal && usage.cost.total > 0.0) || usage.cost.total > self.known_cost)
         {
             self.known_cost = usage.cost.total;
+        }
+        if terminal {
+            Ok(())
+        } else {
+            // The parent must own known partial usage before this stream can
+            // be interrupted or its child process reaped. Terminal billing
+            // replaces this estimate rather than charging it a second time.
+            self.attempt.observe(self.known_cost)
         }
     }
 
     fn settle(&mut self) {
         if !self.settled {
             self.settled = true;
-            if let Err(error) = self.budget.record(self.known_cost) {
+            if let Err(error) = self.attempt.finish(self.known_cost) {
                 tracing::warn!(%error, "provider spend accounting failed; budget quarantined");
             }
         }
@@ -248,20 +263,30 @@ impl Stream for CostMeteredStream {
     type Item = crate::error::Result<StreamEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if self.accounting_failed {
+            return Poll::Ready(None);
+        }
         let item = self.inner.as_mut().poll_next(cx);
         match item {
             Poll::Ready(Some(Ok(mut event))) => {
-                match &mut event {
+                let observed = match &mut event {
                     StreamEvent::Start { partial } => self.observe(&mut partial.usage, false),
                     StreamEvent::Done { message, .. } => {
-                        self.observe(&mut message.usage, true);
+                        let result = self.observe(&mut message.usage, true);
                         self.settle();
+                        result
                     }
                     StreamEvent::Error { error, .. } => {
-                        self.observe(&mut error.usage, true);
+                        let result = self.observe(&mut error.usage, true);
                         self.settle();
+                        result
                     }
-                    _ => {}
+                    _ => Ok(()),
+                };
+                if let Err(error) = observed {
+                    self.accounting_failed = true;
+                    self.settle();
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(event)))
             }

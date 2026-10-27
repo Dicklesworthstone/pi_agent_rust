@@ -7,9 +7,20 @@
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const CHECKPOINT_TYPE: &str = "cost_budget";
+const MAX_PENDING_ATTEMPTS: usize = 1024;
+static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_attempt_id() -> Result<u64> {
+    NEXT_ATTEMPT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| Error::session("model cost attempt identities exhausted"))
+}
 
 /// Positive finite USD values accepted by the CLI, settings and SDK.
 pub fn parse_threshold(value: &str) -> std::result::Result<f64, String> {
@@ -42,7 +53,12 @@ fn add_cost(total: f64, cost: f64) -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CostSnapshot {
+    /// Finalized charges only. Pending estimates never enter durable checkpoints.
     pub spent: f64,
+    /// Known usage from live requests, replaced by final billing on settlement.
+    pub pending: f64,
+    /// Account-local revision orders receipts whose pending estimates may fall.
+    pub revision: u64,
     pub warn_cost: Option<f64>,
     pub max_cost: Option<f64>,
     pub warned: bool,
@@ -52,10 +68,18 @@ impl CostSnapshot {
     fn validate(&self) -> Result<()> {
         validate_threshold(self.warn_cost, "session.warnCost")?;
         validate_threshold(self.max_cost, "session.maxCost")?;
-        if !self.spent.is_finite() || self.spent < 0.0 {
+        if !self.spent.is_finite()
+            || self.spent < 0.0
+            || !self.pending.is_finite()
+            || self.pending < 0.0
+        {
             return Err(Error::session("invalid recorded model spend"));
         }
         Ok(())
+    }
+
+    fn admission_spend(&self) -> f64 {
+        add_cost(self.spent, self.pending)
     }
 }
 
@@ -80,15 +104,58 @@ pub struct CostWarning {
 pub trait CostRemote: Send + Sync {
     fn snapshot(&self) -> Result<CostSnapshot>;
     fn record(&self, cost: f64) -> Result<CostSnapshot>;
+    fn start_attempt(&self) -> Result<(CostSnapshot, Box<dyn CostRemoteAttempt>)>;
+}
+
+/// A capability for one already-admitted request's accounting. Settlement may
+/// outlive work cancellation, but cannot admit another request or alter limits.
+pub trait CostRemoteAttempt: Send {
+    fn observe(&mut self, cost: f64) -> Result<CostSnapshot>;
+    /// `None` reports invalid billing and quarantines the owning account while
+    /// retaining the last valid partial charge. This operation is never replayed.
+    /// A supplied deadline bounds cleanup of a group of owned attempts, so
+    /// nested channel teardown cannot spend a fresh timeout on every charge.
+    fn finish(&mut self, cost: Option<f64>, deadline: Option<Instant>) -> Result<CostSnapshot>;
 }
 
 struct CostState {
     snapshot: CostSnapshot,
+    pending: BTreeMap<u64, f64>,
     warning: Option<CostWarning>,
     failure: Option<String>,
 }
 
-/// Clones share one monotonic account, including across model changes/retries.
+impl CostState {
+    fn changed(&mut self) -> Result<()> {
+        self.snapshot.pending = self
+            .pending
+            .values()
+            .fold(0.0, |sum, cost| add_cost(sum, *cost));
+        let Some(revision) = self.snapshot.revision.checked_add(1) else {
+            self.failure = Some("model cost account revisions exhausted".to_string());
+            return Err(Error::session("model cost account revisions exhausted"));
+        };
+        self.snapshot.revision = revision;
+        if !self.snapshot.warned
+            && let Some(threshold) = self.snapshot.warn_cost
+            && self.snapshot.spent >= threshold
+        {
+            self.snapshot.warned = true;
+            let spent = self.snapshot.spent;
+            self.warning = Some(CostWarning {
+                spent,
+                threshold,
+                message: format!(
+                    "Cost warning: this session has spent ${spent:.4}, reaching its ${threshold:.4} warning threshold (--warn-cost / session.warnCost)."
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Clones share monotonic finalized spend, including across model changes and
+/// retries. Provisional charges belong to active attempts, not completed bills.
 #[derive(Clone)]
 pub struct CostBudget {
     state: Arc<Mutex<CostState>>,
@@ -108,6 +175,8 @@ impl CostBudget {
     pub fn new(warn_cost: Option<f64>, max_cost: Option<f64>, recorded_spend: f64) -> Result<Self> {
         let snapshot = CostSnapshot {
             spent: recorded_spend,
+            pending: 0.0,
+            revision: 0,
             warn_cost,
             max_cost,
             // A resumed account has already crossed this warning threshold.
@@ -117,6 +186,7 @@ impl CostBudget {
         Ok(Self {
             state: Arc::new(Mutex::new(CostState {
                 snapshot,
+                pending: BTreeMap::new(),
                 warning: None,
                 failure: None,
             })),
@@ -130,6 +200,7 @@ impl CostBudget {
         Ok(Self {
             state: Arc::new(Mutex::new(CostState {
                 snapshot,
+                pending: BTreeMap::new(),
                 warning: None,
                 failure: None,
             })),
@@ -207,8 +278,12 @@ impl CostBudget {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match result {
             Ok(mut snapshot) => {
-                // Concurrent observations may arrive out of order. Never
-                // lower the locally known balance on a later-arriving reply.
+                // Final bills never fall, but provisional estimates can be
+                // replaced by smaller final bills. Only a newer receipt may
+                // change pending spend; late replies cannot resurrect it.
+                if snapshot.revision <= state.snapshot.revision {
+                    return Ok(());
+                }
                 snapshot.spent = snapshot.spent.max(state.snapshot.spent);
                 snapshot.warned |= state.snapshot.warned;
                 state.snapshot = snapshot;
@@ -226,28 +301,64 @@ impl CostBudget {
     pub fn check(&self) -> Option<CostCapRefusal> {
         let snapshot = self.snapshot();
         let cap = snapshot.max_cost?;
-        (snapshot.spent >= cap).then(|| CostCapRefusal {
-            spent: snapshot.spent,
+        let spent = snapshot.admission_spend();
+        (spent >= cap).then(|| CostCapRefusal {
+            spent,
             cap,
-            message: Error::CostCap {
-                spent: snapshot.spent,
-                cap,
-            }
-            .to_string(),
+            message: Error::CostCap { spent, cap }.to_string(),
         })
     }
 
     pub fn admit(&self) -> Result<()> {
         let snapshot = self.refresh()?;
+        let spent = snapshot.admission_spend();
         if let Some(cap) = snapshot.max_cost
-            && snapshot.spent >= cap
+            && spent >= cap
         {
-            return Err(Error::CostCap {
-                spent: snapshot.spent,
-                cap,
-            });
+            return Err(Error::CostCap { spent, cap });
         }
         Ok(())
+    }
+
+    /// Establish ownership before provider dispatch. Parent processes retain
+    /// the matching attempt until final billing or child-channel teardown.
+    pub fn start_attempt(&self) -> Result<CostAttempt> {
+        self.admit()?;
+        let source = if let Some(remote) = &self.remote {
+            let (snapshot, attempt) = remote.start_attempt().inspect_err(|error| {
+                if !matches!(error, Error::CostCap { .. }) {
+                    self.quarantine(&error.to_string());
+                }
+            })?;
+            self.accept_remote(Ok(snapshot))?;
+            AttemptSource::Remote(attempt)
+        } else {
+            let id = next_attempt_id()?;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.pending.len() >= MAX_PENDING_ATTEMPTS {
+                return Err(Error::session("too many active model cost attempts"));
+            }
+            state.pending.insert(id, 0.0);
+            state.changed()?;
+            AttemptSource::Local(id)
+        };
+        Ok(CostAttempt {
+            budget: self.clone(),
+            source,
+            known_cost: 0.0,
+            invalid_usage: false,
+            settled: false,
+        })
+    }
+
+    fn quarantine(&self, message: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure = Some(message.to_string());
     }
 
     /// Record exactly once per provider attempt, including known usage from a
@@ -274,21 +385,7 @@ impl CostBudget {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.snapshot.spent = add_cost(state.snapshot.spent, cost);
-        if !state.snapshot.warned
-            && let Some(threshold) = state.snapshot.warn_cost
-            && state.snapshot.spent >= threshold
-        {
-            state.snapshot.warned = true;
-            let spent = state.snapshot.spent;
-            state.warning = Some(CostWarning {
-                spent,
-                threshold,
-                message: format!(
-                    "Cost warning: this session has spent ${spent:.4}, reaching its ${threshold:.4} warning threshold (--warn-cost / session.warnCost)."
-                ),
-            });
-        }
-        Ok(())
+        state.changed()
     }
 
     pub fn take_warning(&self) -> Option<CostWarning> {
@@ -346,6 +443,112 @@ impl CostBudget {
             }
         }
         Ok(())
+    }
+}
+
+enum AttemptSource {
+    Local(u64),
+    Remote(Box<dyn CostRemoteAttempt>),
+}
+
+/// Owned accounting for a single provider request. Dropping it settles the last
+/// valid partial usage even after work cancellation; it never starts new work.
+pub struct CostAttempt {
+    budget: CostBudget,
+    source: AttemptSource,
+    known_cost: f64,
+    invalid_usage: bool,
+    settled: bool,
+}
+
+impl CostAttempt {
+    pub fn observe(&mut self, cost: f64) -> Result<()> {
+        if self.settled {
+            return Err(Error::session("model cost attempt is already settled"));
+        }
+        if !cost.is_finite() || cost < 0.0 {
+            self.invalid_usage = true;
+            self.budget.quarantine("provider returned invalid model cost");
+            return Err(Error::session("provider returned invalid model cost"));
+        }
+        if cost <= self.known_cost {
+            return Ok(());
+        }
+        self.known_cost = cost;
+        match &mut self.source {
+            AttemptSource::Local(id) => {
+                let mut state = self
+                    .budget
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = state
+                    .pending
+                    .get_mut(id)
+                    .ok_or_else(|| Error::session("model cost attempt is unavailable"))?;
+                *entry = cost;
+                state.changed()
+            }
+            AttemptSource::Remote(remote) => self.budget.accept_remote(remote.observe(cost)),
+        }
+    }
+
+    /// Replace a provisional estimate with one final bill. Invalid billing
+    /// retains known partial usage and quarantines the entire accounting path.
+    /// Existing attempts may settle after quarantine; new admission cannot.
+    pub fn finish(&mut self, cost: f64) -> Result<()> {
+        self.finish_before(cost, None)
+    }
+
+    pub(crate) fn finish_known_before(&mut self, deadline: Instant) -> Result<()> {
+        self.finish_before(self.known_cost, Some(deadline))
+    }
+
+    fn finish_before(&mut self, cost: f64, deadline: Option<Instant>) -> Result<()> {
+        if self.settled {
+            return Ok(());
+        }
+        self.settled = true;
+        let valid = !self.invalid_usage && cost.is_finite() && cost >= 0.0;
+        if !valid {
+            self.budget.quarantine("provider returned invalid model cost");
+        }
+        let result = match &mut self.source {
+            AttemptSource::Local(id) => {
+                let mut state = self
+                    .budget
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let known = state
+                    .pending
+                    .remove(id)
+                    .ok_or_else(|| Error::session("model cost attempt is unavailable"))?;
+                state.snapshot.spent =
+                    add_cost(state.snapshot.spent, if valid { cost } else { known });
+                state.changed()
+            }
+            AttemptSource::Remote(remote) => {
+                self.budget
+                    .accept_remote(remote.finish(valid.then_some(cost), deadline))
+            }
+        };
+        result?;
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::session("provider returned invalid model cost"))
+        }
+    }
+}
+
+impl Drop for CostAttempt {
+    fn drop(&mut self) {
+        if !self.settled
+            && let Err(error) = self.finish(self.known_cost)
+        {
+            tracing::warn!(%error, "provider attempt accounting could not settle");
+        }
     }
 }
 
@@ -538,6 +741,76 @@ mod tests {
     }
 
     #[test]
+    fn provisional_usage_blocks_admission_and_final_billing_replaces_it_once() {
+        let budget = CostBudget::new(Some(1.0), Some(2.0), 0.0).unwrap();
+        let mut attempt = budget.start_attempt().unwrap();
+        attempt.observe(2.0).unwrap();
+        let provisional = budget.snapshot();
+        assert_eq!(provisional.spent, 0.0);
+        assert_eq!(provisional.pending, 2.0);
+        assert!(matches!(
+            budget.admit(),
+            Err(Error::CostCap { spent: 2.0, cap: 2.0 })
+        ));
+        assert!(
+            budget.take_warning().is_none(),
+            "a provisional estimate is not a final bill"
+        );
+
+        let mut session = Session::in_memory();
+        budget.checkpoint(&mut session).unwrap();
+        assert_eq!(
+            recorded_spend(&session).unwrap(),
+            0.0,
+            "pending estimates cannot become irreversible checkpoints"
+        );
+
+        attempt.finish(0.5).unwrap();
+        attempt.finish(9.0).unwrap();
+        drop(attempt);
+        assert_eq!(budget.spent(), 0.5);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        budget.admit().unwrap();
+        budget.accept_remote(Ok(provisional)).unwrap();
+        assert_eq!(
+            budget.snapshot().pending,
+            0.0,
+            "a late provisional receipt cannot resurrect the estimate"
+        );
+        budget.checkpoint(&mut session).unwrap();
+        assert_eq!(recorded_spend(&session).unwrap(), 0.5);
+    }
+
+    #[test]
+    fn dropped_attempts_preserve_known_usage_and_invalid_bills_do_not_refund_it() {
+        let budget = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        let mut first = budget.start_attempt().unwrap();
+        let mut second = budget.start_attempt().unwrap();
+        first.observe(0.25).unwrap();
+        second.observe(0.5).unwrap();
+        drop(first);
+        assert_eq!(budget.spent(), 0.25);
+        assert_eq!(budget.snapshot().pending, 0.5);
+        assert!(second.finish(f64::NAN).is_err());
+        assert_eq!(budget.spent(), 0.75);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert!(budget.admit().is_err());
+    }
+
+    #[test]
+    fn provisional_attempt_storage_is_bounded_and_released_on_drop() {
+        let budget = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        let attempts = (0..MAX_PENDING_ATTEMPTS)
+            .map(|_| budget.start_attempt().unwrap())
+            .collect::<Vec<_>>();
+        assert!(budget.start_attempt().is_err());
+        drop(attempts);
+        drop(budget.start_attempt().unwrap());
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert_eq!(budget.spent(), 0.0);
+    }
+
+    #[test]
     fn checkpoints_preserve_auxiliary_spend_and_all_branches_without_double_charge() {
         let mut session = Session::in_memory();
         let first = session.append_message(assistant(2.0));
@@ -687,6 +960,8 @@ mod tests {
             self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
             Ok(CostSnapshot {
                 spent: 1.0,
+                pending: 0.0,
+                revision: 0,
                 warn_cost: None,
                 max_cost: Some(5.0),
                 warned: false,
@@ -698,6 +973,10 @@ mod tests {
             Err(Error::session(
                 "parent applied charge but acknowledgement was lost",
             ))
+        }
+
+        fn start_attempt(&self) -> Result<(CostSnapshot, Box<dyn CostRemoteAttempt>)> {
+            Err(Error::session("this fixture admits only one direct charge"))
         }
     }
 
@@ -726,6 +1005,8 @@ mod tests {
         budget
             .accept_remote(Ok(CostSnapshot {
                 spent: 1.0,
+                pending: 0.0,
+                revision: 0,
                 warn_cost: None,
                 max_cost: Some(5.0),
                 warned: false,
@@ -738,6 +1019,8 @@ mod tests {
         budget
             .accept_remote(Ok(CostSnapshot {
                 spent: 2.0,
+                pending: 0.0,
+                revision: 0,
                 warn_cost: None,
                 max_cost: Some(5.0),
                 warned: false,

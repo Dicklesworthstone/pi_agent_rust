@@ -5,10 +5,12 @@
 //! are never replayed. The remote budget quarantines itself when an exchange
 //! fails, so losing the parent cannot silently create a fresh allowance.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::{ChildChannel, EXCHANGE_TIMEOUT, VERSION, ipc_error, matches_token};
 use crate::agent_cx::AgentCx;
 use crate::agent_hub::{ChildStatus, registry};
-use crate::cost::{CostBudget, CostRemote, CostSnapshot};
+use crate::cost::{CostAttempt, CostBudget, CostRemote, CostRemoteAttempt, CostSnapshot};
 use crate::error::{Error, Result};
 
 const ADDRESS_ENV: &str = "PI_SUBAGENT_COST_ADDRESS";
@@ -24,12 +26,30 @@ const TOKEN_ENV: &str = "PI_SUBAGENT_COST_TOKEN";
 const MAX_FRAME_BYTES: usize = 4096;
 const CONNECT_LIMIT: Duration = Duration::from_millis(100);
 const IDLE_POLL: Duration = Duration::from_millis(2);
+const SETTLEMENT_LIMIT: Duration = Duration::from_millis(250);
+const MAX_ACTIVE_ATTEMPTS: usize = 128;
+const MAX_SETTLED_RECEIPTS: usize = 256;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
 enum Operation {
     Snapshot,
-    Record { amount: f64 },
+    Record {
+        amount: f64,
+    },
+    Begin {
+        attempt: u64,
+    },
+    Observe {
+        attempt: u64,
+        sequence: u64,
+        amount: f64,
+    },
+    Finish {
+        attempt: u64,
+        sequence: u64,
+        amount: Option<f64>,
+    },
 }
 
 // Separate from messaging: no caller-selected identity, model, cap, path or
@@ -46,12 +66,15 @@ pub(super) struct WireRequest {
 #[serde(tag = "status", content = "payload", rename_all = "camelCase")]
 pub(super) enum WireResponse {
     Ok(CostSnapshot),
+    CostCap(crate::cost::CostCapRefusal),
     Error(String),
 }
 
+#[derive(Clone)]
 struct RemoteBudget {
     address: SocketAddr,
     token: String,
+    unavailable: Arc<AtomicBool>,
 }
 
 impl CostRemote for RemoteBudget {
@@ -62,6 +85,226 @@ impl CostRemote for RemoteBudget {
     fn record(&self, cost: f64) -> Result<CostSnapshot> {
         validate_amount(cost)?;
         self.exchange(Operation::Record { amount: cost })
+    }
+
+    fn start_attempt(&self) -> Result<(CostSnapshot, Box<dyn CostRemoteAttempt>)> {
+        let attempt = crate::cost::next_attempt_id()?;
+        let snapshot = self.exchange(Operation::Begin { attempt })?;
+        Ok((
+            snapshot,
+            Box::new(RemoteAttempt {
+                parent: self.clone(),
+                attempt,
+                sequence: 0,
+                known_cost: 0.0,
+                finished: false,
+            }),
+        ))
+    }
+}
+
+/// Constructed only after authenticated, live Begin admission. Its one terminal
+/// accounting frame is cleanup of that request, not new work under a fresh Cx.
+struct RemoteAttempt {
+    parent: RemoteBudget,
+    attempt: u64,
+    sequence: u64,
+    known_cost: f64,
+    finished: bool,
+}
+
+impl CostRemoteAttempt for RemoteAttempt {
+    fn observe(&mut self, cost: f64) -> Result<CostSnapshot> {
+        if self.finished {
+            return Err(ipc_error("COST_SETTLED", "model cost attempt is settled"));
+        }
+        validate_amount(cost)?;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| ipc_error("COST_LIMIT", "cost attempt sequence exhausted"))?;
+        self.known_cost = self.known_cost.max(cost);
+        self.parent.exchange(Operation::Observe {
+            attempt: self.attempt,
+            sequence: self.sequence,
+            amount: cost,
+        })
+    }
+
+    fn finish(&mut self, cost: Option<f64>, deadline: Option<Instant>) -> Result<CostSnapshot> {
+        if self.finished {
+            return Err(ipc_error("COST_SETTLED", "model cost attempt is settled"));
+        }
+        self.finished = true;
+        if let Some(cost) = cost {
+            validate_amount(cost)?;
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| ipc_error("COST_LIMIT", "cost attempt sequence exhausted"))?;
+        // This captured capability permits only one terminal charge for its
+        // own attempt. A cancelled task cannot use it for snapshots, another
+        // attempt, messaging, or a model call. No new AgentCx is manufactured.
+        self.parent.exchange_settlement(
+            Operation::Finish {
+                attempt: self.attempt,
+                sequence: self.sequence,
+                amount: cost,
+            },
+            deadline,
+        )
+    }
+}
+
+impl Drop for RemoteAttempt {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.finish(Some(self.known_cost), None);
+        }
+    }
+}
+
+struct ActiveAttempt {
+    charge: CostAttempt,
+    sequence: u64,
+    amount: f64,
+}
+
+struct SettledReceipt {
+    attempt: u64,
+    sequence: u64,
+    amount: Option<f64>,
+}
+
+/// The channel, rather than the child's last packet, owns unfinalized usage.
+/// Dropping a channel settles every acknowledged partial charge locally (or
+/// through the already-owned ancestor attempt for a nested delegation).
+#[derive(Default)]
+pub(super) struct AttemptLedger {
+    active: BTreeMap<u64, ActiveAttempt>,
+    settled: VecDeque<SettledReceipt>,
+    retired_through: u64,
+}
+
+impl AttemptLedger {
+    pub(super) fn retire(&mut self) {
+        let deadline = Instant::now() + SETTLEMENT_LIMIT;
+        for active in self.active.values_mut() {
+            if let Err(error) = active.charge.finish_known_before(deadline) {
+                tracing::warn!(%error, "child cost attempt accounting could not settle");
+            }
+        }
+        self.active.clear();
+    }
+
+    fn begin(&mut self, budget: &CostBudget, attempt: u64) -> Result<CostSnapshot> {
+        if attempt == 0 {
+            return Err(ipc_error("COST_INPUT", "invalid cost attempt identity"));
+        }
+        if self.active.contains_key(&attempt) {
+            return Ok(budget.snapshot());
+        }
+        if attempt <= self.retired_through
+            || self.settled.iter().any(|receipt| receipt.attempt == attempt)
+        {
+            return Err(ipc_error("COST_SETTLED", "cost attempt is already settled"));
+        }
+        if self.active.len() >= MAX_ACTIVE_ATTEMPTS {
+            return Err(ipc_error("COST_LIMIT", "too many active child cost attempts"));
+        }
+        let charge = budget.start_attempt()?;
+        self.active.insert(
+            attempt,
+            ActiveAttempt {
+                charge,
+                sequence: 0,
+                amount: 0.0,
+            },
+        );
+        Ok(budget.snapshot())
+    }
+
+    #[allow(clippy::float_cmp)] // Identical receipts must replay exactly, without charging again.
+    fn observe(
+        &mut self,
+        budget: &CostBudget,
+        attempt: u64,
+        sequence: u64,
+        amount: f64,
+    ) -> Result<CostSnapshot> {
+        validate_amount(amount)?;
+        if sequence == 0 {
+            return Err(ipc_error("COST_INPUT", "invalid cost attempt sequence"));
+        }
+        if let Some(receipt) = self.settled.iter().find(|receipt| receipt.attempt == attempt) {
+            if sequence < receipt.sequence {
+                return Ok(budget.snapshot());
+            }
+            return Err(ipc_error("COST_SETTLED", "cost attempt is already settled"));
+        }
+        let active = self
+            .active
+            .get_mut(&attempt)
+            .ok_or_else(|| ipc_error("COST_UNKNOWN", "cost attempt is not owned by this child"))?;
+        if sequence < active.sequence || (sequence == active.sequence && amount == active.amount) {
+            return Ok(budget.snapshot());
+        }
+        if sequence == active.sequence || amount < active.amount {
+            return Err(ipc_error("COST_PROTOCOL", "conflicting partial cost receipt"));
+        }
+        active.charge.observe(amount)?;
+        active.sequence = sequence;
+        active.amount = amount;
+        Ok(budget.snapshot())
+    }
+
+    #[allow(clippy::float_cmp)] // Terminal receipt identity includes the exact reported bill.
+    fn finish(
+        &mut self,
+        budget: &CostBudget,
+        attempt: u64,
+        sequence: u64,
+        amount: Option<f64>,
+    ) -> Result<CostSnapshot> {
+        if let Some(amount) = amount {
+            validate_amount(amount)?;
+        }
+        if let Some(receipt) = self.settled.iter().find(|receipt| receipt.attempt == attempt) {
+            if sequence < receipt.sequence
+                || (sequence == receipt.sequence && amount == receipt.amount)
+            {
+                return Ok(budget.snapshot());
+            }
+            return Err(ipc_error("COST_PROTOCOL", "conflicting final cost receipt"));
+        }
+        let active = self
+            .active
+            .get(&attempt)
+            .ok_or_else(|| ipc_error("COST_UNKNOWN", "cost attempt is not owned by this child"))?;
+        if sequence <= active.sequence {
+            return Err(ipc_error("COST_PROTOCOL", "stale final cost receipt"));
+        }
+        let mut active = self
+            .active
+            .remove(&attempt)
+            .ok_or_else(|| ipc_error("COST_UNKNOWN", "cost attempt is not owned by this child"))?;
+        let result = active.charge.finish(amount.unwrap_or(f64::NAN));
+        self.settled.push_back(SettledReceipt {
+            attempt,
+            sequence,
+            amount,
+        });
+        if self.settled.len() > MAX_SETTLED_RECEIPTS
+            && let Some(retired) = self.settled.pop_front()
+        {
+            // Never reopen an old identity after its exact receipt ages out.
+            // Already-active requests remain owned even below this watermark;
+            // a very old, never-admitted Begin must fail closed instead.
+            self.retired_through = self.retired_through.max(retired.attempt);
+        }
+        result?;
+        Ok(budget.snapshot())
     }
 }
 
@@ -81,7 +324,11 @@ fn parse_endpoint(
         .and_then(|value| value.into_string().ok())
         .filter(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or_else(|| ipc_error("COST_CONFIG", "missing or invalid parent cost credential"))?;
-    Ok(Some(RemoteBudget { address, token }))
+    Ok(Some(RemoteBudget {
+        address,
+        token,
+        unavailable: Arc::new(AtomicBool::new(false)),
+    }))
 }
 
 /// Join the parent's live budget, if this is a native delegated process.
@@ -116,6 +363,7 @@ fn validate_amount(amount: f64) -> Result<()> {
 
 fn validate_snapshot(snapshot: &CostSnapshot) -> Result<()> {
     validate_amount(snapshot.spent)?;
+    validate_amount(snapshot.pending)?;
     if [snapshot.warn_cost, snapshot.max_cost]
         .into_iter()
         .flatten()
@@ -169,6 +417,7 @@ pub(super) fn dispatch_authenticated(
     request: WireRequest,
     owner: &AgentCx,
     budget: Option<&CostBudget>,
+    attempts: &mut AttemptLedger,
 ) -> WireResponse {
     let result = (|| {
         if request.version != VERSION || !matches_token(token, &request.token) {
@@ -193,18 +442,40 @@ pub(super) fn dispatch_authenticated(
                 budget.record(amount)?;
                 Ok(budget.snapshot())
             }
+            Operation::Begin { attempt } => attempts.begin(budget, attempt),
+            Operation::Observe {
+                attempt,
+                sequence,
+                amount,
+            } => attempts.observe(budget, attempt, sequence, amount),
+            Operation::Finish {
+                attempt,
+                sequence,
+                amount,
+            } => attempts.finish(budget, attempt, sequence, amount),
         }
     })();
     match result {
         Ok(snapshot) => WireResponse::Ok(snapshot),
+        Err(Error::CostCap { spent, cap }) => WireResponse::CostCap(crate::cost::CostCapRefusal {
+            spent,
+            cap,
+            message: Error::CostCap { spent, cap }.to_string(),
+        }),
         Err(error) => WireResponse::Error(error.to_string()),
     }
 }
 
 fn check_remaining(owner: &AgentCx, deadline: Instant) -> Result<Duration> {
-    owner
-        .checkpoint()
-        .map_err(|_| ipc_error("COST_CANCELLED", "parent cost exchange was cancelled"))?;
+    check_exchange_remaining(Some(owner), deadline)
+}
+
+fn check_exchange_remaining(owner: Option<&AgentCx>, deadline: Instant) -> Result<Duration> {
+    if let Some(owner) = owner {
+        owner
+            .checkpoint()
+            .map_err(|_| ipc_error("COST_CANCELLED", "parent cost exchange was cancelled"))?;
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(ipc_error(
@@ -242,13 +513,40 @@ impl RemoteBudget {
     fn exchange(&self, operation: Operation) -> Result<CostSnapshot> {
         let owner = AgentCx::for_current_or_request();
         let deadline = exchange_deadline(&owner)?;
-        self.exchange_owned(&owner, operation, deadline)
+        self.exchange_owned(Some(&owner), operation, deadline)
+    }
+
+    fn exchange_settlement(
+        &self,
+        operation: Operation,
+        deadline: Option<Instant>,
+    ) -> Result<CostSnapshot> {
+        if !matches!(&operation, Operation::Finish { .. }) {
+            return Err(ipc_error(
+                "COST_PERMISSION",
+                "cleanup permits only attempt settlement",
+            ));
+        }
+        if self.unavailable.load(Ordering::Acquire) {
+            return Err(ipc_error(
+                "COST_UNAVAILABLE",
+                "parent cost settlement was interrupted",
+            ));
+        }
+        let limit = Instant::now() + SETTLEMENT_LIMIT;
+        let result = self.exchange_owned(None, operation, deadline.map_or(limit, |end| end.min(limit)));
+        if result.is_err() {
+            // One failed bounded cleanup exchange is enough. Other attempts
+            // retain their parent-owned partial charges until channel teardown.
+            self.unavailable.store(true, Ordering::Release);
+        }
+        result
     }
 
     #[allow(clippy::too_many_lines)] // One bounded nonblocking exchange, with no retry after dispatch.
     fn exchange_owned(
         &self,
-        owner: &AgentCx,
+        owner: Option<&AgentCx>,
         operation: Operation,
         deadline: Instant,
     ) -> Result<CostSnapshot> {
@@ -264,7 +562,7 @@ impl RemoteBudget {
                 "cost request exceeds its frame limit",
             ));
         }
-        let wait = check_remaining(owner, deadline)?.min(CONNECT_LIMIT);
+        let wait = check_exchange_remaining(owner, deadline)?.min(CONNECT_LIMIT);
         let mut socket = TcpStream::connect_timeout(&self.address, wait)
             .map_err(|_| ipc_error("COST_UNAVAILABLE", "parent cost channel is unavailable"))?;
         socket
@@ -273,7 +571,7 @@ impl RemoteBudget {
         let mut written = 0;
         let mut response = Vec::new();
         loop {
-            check_remaining(owner, deadline)?;
+            check_exchange_remaining(owner, deadline)?;
             let mut progressed = false;
             if written < frame.len() {
                 match socket.write(&frame[written..]) {
@@ -325,12 +623,16 @@ impl RemoteBudget {
                             .map_err(|_| {
                                 ipc_error("COST_PROTOCOL", "invalid parent cost acknowledgment")
                             })?;
-                        check_remaining(owner, deadline)?;
+                        check_exchange_remaining(owner, deadline)?;
                         return match reply {
                             WireResponse::Ok(snapshot) => {
                                 validate_snapshot(&snapshot)?;
                                 Ok(snapshot)
                             }
+                            WireResponse::CostCap(refusal) => Err(Error::CostCap {
+                                spent: refusal.spent,
+                                cap: refusal.cap,
+                            }),
                             WireResponse::Error(error) => Err(Error::tool("cost", error)),
                         };
                     }
@@ -348,15 +650,17 @@ impl RemoteBudget {
                 }
             }
             if !progressed {
-                std::thread::sleep(IDLE_POLL.min(check_remaining(owner, deadline)?));
+                std::thread::sleep(IDLE_POLL.min(check_exchange_remaining(owner, deadline)?));
             }
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // Quarter-dollar fixtures require exact replacement and replay invariants.
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -399,6 +703,7 @@ mod tests {
         let remote = RemoteBudget {
             address: channel.address,
             token: channel.token.clone(),
+            unavailable: Arc::new(AtomicBool::new(false)),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
@@ -501,6 +806,328 @@ mod tests {
         assert!(parent.take_warning().is_none());
     }
 
+    struct PartialCostProvider;
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for PartialCostProvider {
+        fn name(&self) -> &str {
+            "partial-cost-fixture"
+        }
+
+        fn api(&self) -> &str {
+            "test"
+        }
+
+        fn model_id(&self) -> &str {
+            "metered"
+        }
+
+        async fn stream(
+            &self,
+            _: &crate::provider::Context<'_>,
+            _: &crate::provider::StreamOptions,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+        > {
+            let mut partial = crate::model::AssistantMessage::default();
+            partial.usage.cost.total = 0.75;
+            Ok(Box::pin(
+                futures::stream::iter([Ok(crate::model::StreamEvent::Start { partial })])
+                    .chain(futures::stream::pending()),
+            ))
+        }
+    }
+
+    #[test]
+    fn retiring_a_child_channel_preserves_streamed_partial_cost_before_child_drop() {
+        let owner = AgentCx::for_testing_with_io();
+        let _current = owner.cx().clone().set_current_restricted();
+        let parent = CostBudget::new(None, Some(0.5), 0.0).unwrap();
+        let (remote, server) = serve_budget(&parent);
+        let child = CostBudget::remote(Arc::new(remote)).unwrap();
+        let provider =
+            crate::provider::guard_with_cost_budget(Arc::new(PartialCostProvider), child.clone());
+        let mut stream = futures::executor::block_on(provider.stream(
+            &crate::provider::Context::default(),
+            &crate::provider::StreamOptions::default(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            futures::executor::block_on(stream.next()).unwrap().unwrap(),
+            crate::model::StreamEvent::Start { .. }
+        ));
+        assert_eq!(parent.spent(), 0.0);
+        assert_eq!(parent.snapshot().pending, 0.75);
+        assert!(
+            matches!(parent.admit(), Err(Error::CostCap { .. })),
+            "siblings must see known partial usage immediately"
+        );
+
+        // Retire the actual listener without any terminal packet or child-side
+        // destructor. This is the ordering imposed by native process reaping.
+        drop(server);
+        assert_eq!(parent.spent(), 0.75);
+        assert_eq!(parent.snapshot().pending, 0.0);
+        owner.set_cancel_requested(true);
+        drop(stream);
+        assert!(
+            child.start_attempt().is_err(),
+            "cancelled work cannot borrow settlement authority"
+        );
+        assert_eq!(
+            parent.spent(),
+            0.75,
+            "a late failed child settlement cannot refund or duplicate spend"
+        );
+    }
+
+    #[test]
+    fn cancelled_work_can_only_settle_its_previously_admitted_attempt() {
+        let owner = AgentCx::for_testing_with_io();
+        let _current = owner.cx().clone().set_current_restricted();
+        let parent = CostBudget::new(None, Some(2.0), 0.0).unwrap();
+        let (remote, _server) = serve_budget(&parent);
+        let child = CostBudget::remote(Arc::new(remote)).unwrap();
+        let mut attempt = child.start_attempt().unwrap();
+        attempt.observe(1.0).unwrap();
+        owner.set_cancel_requested(true);
+        attempt.finish(0.25).unwrap();
+        assert_eq!(
+            parent.spent(),
+            0.25,
+            "final billing replaces the provisional estimate during cleanup"
+        );
+        assert_eq!(parent.snapshot().pending, 0.0);
+        assert!(
+            child.admit().is_err(),
+            "cleanup cannot refresh ordinary admission under cancellation"
+        );
+        assert!(child.start_attempt().is_err());
+        assert_eq!(parent.spent(), 0.25);
+    }
+
+    #[test]
+    fn retiring_a_nested_child_settles_known_partial_usage_at_the_root() {
+        let owner = AgentCx::for_testing_with_io();
+        let _current = owner.cx().clone().set_current_restricted();
+        let root = CostBudget::new(None, Some(0.5), 0.0).unwrap();
+        let (middle_remote, _middle_server) = serve_budget(&root);
+        let middle = CostBudget::remote(Arc::new(middle_remote)).unwrap();
+        let (leaf_remote, leaf_server) = serve_budget(&middle);
+        let leaf = CostBudget::remote(Arc::new(leaf_remote)).unwrap();
+        let mut attempt = leaf.start_attempt().unwrap();
+        attempt.observe(0.75).unwrap();
+        assert_eq!(root.snapshot().pending, 0.75);
+        drop(leaf_server);
+        assert_eq!(root.spent(), 0.75);
+        assert_eq!(root.snapshot().pending, 0.0);
+        assert!(matches!(root.admit(), Err(Error::CostCap { .. })));
+        drop(attempt);
+        assert_eq!(root.spent(), 0.75);
+    }
+
+    #[test]
+    fn socket_attempt_receipts_are_idempotent_and_cannot_reopen_settled_charges() {
+        let parent = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        let (remote, _server) = serve_budget(&parent);
+        let send = |operation: serde_json::Value| {
+            exchange_frame(
+                remote.address,
+                &json!({"version": VERSION, "token": remote.token, "cost": operation}),
+            )
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                send(json!({"operation":"begin", "attempt":7}))["status"],
+                "ok"
+            );
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                send(json!({"operation":"observe", "attempt":7, "sequence":1, "amount":2.0}))
+                    ["status"],
+                "ok"
+            );
+        }
+        send(json!({"operation":"observe", "attempt":7, "sequence":2, "amount":3.0}));
+        send(json!({"operation":"observe", "attempt":7, "sequence":1, "amount":2.0}));
+        assert_eq!(parent.snapshot().pending, 3.0);
+        let finished = json!({"operation":"finish", "attempt":7, "sequence":3, "amount":0.75});
+        for _ in 0..2 {
+            assert_eq!(send(finished.clone())["status"], "ok");
+        }
+        send(json!({"operation":"observe", "attempt":7, "sequence":2, "amount":3.0}));
+        assert_eq!(
+            send(json!({"operation":"finish", "attempt":7, "sequence":3, "amount":8.0}))
+                ["status"],
+            "error"
+        );
+        assert_eq!(
+            send(json!({"operation":"begin", "attempt":7}))["status"],
+            "error"
+        );
+        assert_eq!(
+            send(json!({"operation":"finish", "attempt":99, "sequence":1, "amount":4.0}))
+                ["status"],
+            "error"
+        );
+        assert_eq!(parent.spent(), 0.75);
+        assert_eq!(parent.snapshot().pending, 0.0);
+    }
+
+    #[test]
+    fn invalid_terminal_billing_quarantines_parent_without_losing_partial_usage() {
+        let owner = AgentCx::for_testing_with_io();
+        let _current = owner.cx().clone().set_current_restricted();
+        let parent = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        let (remote, _server) = serve_budget(&parent);
+        let child = CostBudget::remote(Arc::new(remote)).unwrap();
+        let mut attempt = child.start_attempt().unwrap();
+        attempt.observe(0.5).unwrap();
+        assert!(attempt.finish(f64::NAN).is_err());
+        assert_eq!(parent.spent(), 0.5);
+        assert_eq!(parent.snapshot().pending, 0.0);
+        assert!(
+            parent.admit().is_err(),
+            "invalid child billing must quarantine the shared account"
+        );
+    }
+
+    #[test]
+    fn bounded_receipt_history_never_reopens_old_attempts_or_drops_active_charges() {
+        let parent = CostBudget::new(None, None, 0.0).unwrap();
+        let mut attempts = AttemptLedger::default();
+        attempts.begin(&parent, 1).unwrap();
+        attempts.observe(&parent, 1, 1, 0.5).unwrap();
+
+        // Keep an early request live while later requests exhaust the exact
+        // replay window. Eviction must not release or reopen either identity.
+        let last = u64::try_from(MAX_SETTLED_RECEIPTS).unwrap() + 2;
+        for attempt in 2..=last {
+            attempts.begin(&parent, attempt).unwrap();
+            attempts.finish(&parent, attempt, 1, Some(0.25)).unwrap();
+        }
+        assert_eq!(attempts.settled.len(), MAX_SETTLED_RECEIPTS);
+        assert_eq!(attempts.retired_through, 2);
+        assert!(attempts.begin(&parent, 2).is_err());
+        assert!(attempts.finish(&parent, 2, 1, Some(0.25)).is_err());
+        attempts.begin(&parent, 1).unwrap();
+        attempts.finish(&parent, 1, 2, Some(0.25)).unwrap();
+        assert_eq!(parent.spent(), 64.5);
+        assert_eq!(parent.snapshot().pending, 0.0);
+
+        for attempt in 1000..1000 + u64::try_from(MAX_ACTIVE_ATTEMPTS).unwrap() {
+            attempts.begin(&parent, attempt).unwrap();
+            attempts.observe(&parent, attempt, 1, 0.25).unwrap();
+        }
+        assert!(attempts.begin(&parent, 2000).is_err());
+        attempts.retire();
+        assert_eq!(parent.snapshot().pending, 0.0);
+        assert_eq!(parent.spent(), 96.5);
+    }
+
+    struct DeadlineRecordingRemote {
+        budget: CostBudget,
+        deadlines: Arc<std::sync::Mutex<Vec<Option<Instant>>>>,
+    }
+
+    struct DeadlineRecordingAttempt {
+        charge: CostAttempt,
+        budget: CostBudget,
+        deadlines: Arc<std::sync::Mutex<Vec<Option<Instant>>>>,
+    }
+
+    impl CostRemote for DeadlineRecordingRemote {
+        fn snapshot(&self) -> Result<CostSnapshot> {
+            Ok(self.budget.snapshot())
+        }
+
+        fn record(&self, cost: f64) -> Result<CostSnapshot> {
+            self.budget.record(cost)?;
+            Ok(self.budget.snapshot())
+        }
+
+        fn start_attempt(&self) -> Result<(CostSnapshot, Box<dyn CostRemoteAttempt>)> {
+            let charge = self.budget.start_attempt()?;
+            Ok((
+                self.budget.snapshot(),
+                Box::new(DeadlineRecordingAttempt {
+                    charge,
+                    budget: self.budget.clone(),
+                    deadlines: Arc::clone(&self.deadlines),
+                }),
+            ))
+        }
+    }
+
+    impl CostRemoteAttempt for DeadlineRecordingAttempt {
+        fn observe(&mut self, cost: f64) -> Result<CostSnapshot> {
+            self.charge.observe(cost)?;
+            Ok(self.budget.snapshot())
+        }
+
+        fn finish(&mut self, cost: Option<f64>, deadline: Option<Instant>) -> Result<CostSnapshot> {
+            self.deadlines.lock().unwrap().push(deadline);
+            self.charge.finish(cost.unwrap_or(f64::NAN))?;
+            Ok(self.budget.snapshot())
+        }
+    }
+
+    #[test]
+    fn channel_retirement_shares_one_deadline_across_all_ancestor_settlements() {
+        let root = CostBudget::new(None, None, 0.0).unwrap();
+        let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parent = CostBudget::remote(Arc::new(DeadlineRecordingRemote {
+            budget: root.clone(),
+            deadlines: Arc::clone(&deadlines),
+        }))
+        .unwrap();
+        let mut attempts = AttemptLedger::default();
+        for attempt in 1..=4 {
+            attempts.begin(&parent, attempt).unwrap();
+            attempts.observe(&parent, attempt, 1, 0.25).unwrap();
+        }
+        assert_eq!(root.snapshot().pending, 1.0);
+        attempts.retire();
+        let deadlines = deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 4);
+        assert!(deadlines[0].is_some());
+        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
+        assert_eq!(root.spent(), 1.0);
+        assert_eq!(root.snapshot().pending, 0.0);
+    }
+
+    #[test]
+    fn expired_cleanup_deadline_cannot_write_or_release_an_ancestor_charge() {
+        let root = CostBudget::new(None, None, 0.0).unwrap();
+        let mut ancestor_charge = root.start_attempt().unwrap();
+        ancestor_charge.observe(0.5).unwrap();
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut attempt = RemoteAttempt {
+            parent: RemoteBudget {
+                address: listener.local_addr().unwrap(),
+                token: "a".repeat(64),
+                unavailable: Arc::new(AtomicBool::new(false)),
+            },
+            attempt: 1,
+            sequence: 1,
+            known_cost: 0.5,
+            finished: false,
+        };
+        let error = attempt.finish(Some(0.5), Some(Instant::now())).unwrap_err();
+        assert!(error.to_string().contains("PI_HUB_IPC_COST_TIMEOUT"));
+        drop(attempt);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "expired cleanup must not connect or retry from Drop"
+        );
+        assert_eq!(root.snapshot().pending, 0.5);
+        drop(ancestor_charge);
+        assert_eq!(root.spent(), 0.5);
+        assert_eq!(root.snapshot().pending, 0.0);
+    }
+
     #[test]
     fn cost_only_socket_rejects_wrong_credentials_messaging_and_reaped_children() {
         let parent = CostBudget::new(None, Some(1.0), 0.0).unwrap();
@@ -563,6 +1190,7 @@ mod tests {
         let remote = RemoteBudget {
             address: listener.local_addr().unwrap(),
             token: "a".repeat(64),
+            unavailable: Arc::new(AtomicBool::new(false)),
         };
         let recorded = parent.clone();
         let thread = std::thread::spawn(move || {
@@ -609,6 +1237,7 @@ mod tests {
                         // The provider response was charged, but the connection
                         // closes before an ACK: replay would double the spend.
                     }
+                    _ => panic!("direct-charge fixture received an attempt operation"),
                 }
             }
             let deadline = Instant::now() + Duration::from_millis(100);
@@ -676,6 +1305,8 @@ mod tests {
         assert!(validate_amount(0.0).is_ok());
         let mut snapshot = CostSnapshot {
             spent: 0.5,
+            pending: 0.0,
+            revision: 0,
             warn_cost: Some(0.5),
             max_cost: Some(1.0),
             warned: true,
