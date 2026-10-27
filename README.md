@@ -505,6 +505,23 @@ every log instead; Pi then refuses new background jobs once the budget is
 full. Job snapshots report the applied policy, removed-file count, and
 reclaimed bytes in `artifactCleanup`.
 
+Print mode can keep working after a background job finishes. Add `--wait-async`
+or set `"async": {"printWake": true}` to wait for the current session's jobs,
+deliver their completion notices to the agent, and run follow-up turns in the
+same session. A follow-up may start further jobs. The process exits when all
+owned work has settled and its notices have been delivered. Text continues
+streaming each answer; JSON mode emits the corresponding agent lifecycles.
+
+```bash
+pi -p --wait-async --max-time 3600 \
+  "Run the integration suite in the background and fix any failures."
+```
+
+The flag is opt-in; ordinary print mode exits after its prompts and cancels
+unfinished jobs. With async waiting, `--max-time` covers the original run,
+idle waits, follow-up turns and retry delays. Reaching it fails the run and
+cancels owned jobs. Ctrl+C also interrupts idle waits and retry delays.
+
 Hub service logs retain the first 16 MiB of raw output per run. Pi continues
 draining the service after that limit or an artifact write failure, so live
 tail logs, readiness checks, and PTY input continue working. `logs`, `ps`, and
@@ -2256,6 +2273,8 @@ Search files, internal documents, or a web page:
 
 ```json
 { "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+{ "pattern": "FEATURE_X", "path": ".;!vendor;!gen" }
+{ "pattern": "track\\(", "path": "src;!*.test.ts;!src/legacy" }
 { "pattern": "critical|warning", "path": "agent://reviewer/findings;local://review-notes", "ignoreCase": true }
 { "pattern": "migration", "path": "skill://release/references/checklist.md" }
 { "pattern": "deprecated", "path": "https://example.com/changelog" }
@@ -2264,6 +2283,7 @@ Search files, internal documents, or a web page:
 
 - Regex and literal matching, case folding, and merged context lines work across all sources. Each result identifies its source and line number.
 - Filesystem searches respect `.gitignore` and workspace boundaries. `hashline: true` provides edit anchors for filesystem results.
+- Exclude files or entire directory trees with `path: "root;!glob;!glob"` (up to 64 entries and 64 KiB). A bare name such as `!vendor` matches at any depth below the root; a slash-containing pattern such as `!src/legacy` or `!./gen` is anchored to the working directory. Use `!**/generated` to match a directory at any depth. Exclusions alone default to the working directory, and explicitly named roots remain searchable. Existing filenames containing `!` or semicolons retain their literal meaning. Both search backends prune exclusions before counting matches, while included paths retain normal permission checks. Use separate calls for multiple filesystem roots or resource URLs.
 - Internal documents use the same resolver as `read`, including accepted `agent://` results and JSON fields, skills, prompts, scratch notes, merge conflicts, PRs, issues, and SSH documents. Pending or rejected child output retains its normal access restrictions. Separate up to 16 internal URLs with semicolons; filesystem paths and HTTP URLs use separate calls.
 - HTTP(S) searches use reader text by default; append `:raw` to search the fetched source. Semicolons inside an HTTP URL remain part of that URL. The existing `read.urlAllowPrivateTargets` setting governs private-network access, with the same redirect checks as `read`. PR, issue, SSH, and conflict lookups retain their process effects for execution approval.
 - The match limit applies across the entire resource list. Resource searches accept up to 10,000 matches and 10 MiB per document; output still truncates at 1 MiB and 500 characters per line. Results report skipped resources and partial source documents. `glob` and `hashline` apply to filesystem searches; virtual document line numbers are search locations.

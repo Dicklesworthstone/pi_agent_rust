@@ -3894,6 +3894,7 @@ fn recursive_scan_walk_builder(
     access: RecursiveScanAccess,
     glob: Option<&str>,
     global_git_ignore: Option<&Path>,
+    include_workspace_ignore: bool,
 ) -> std::io::Result<ignore::WalkBuilder> {
     let mut builder = ignore::WalkBuilder::new(path);
     builder
@@ -3934,8 +3935,11 @@ fn recursive_scan_walk_builder(
     // addition to native discovery. Explicit ignore files are interpreted
     // relative to the command cwd, which can exclude a different (larger)
     // surface than the same file discovered natively below `path`.
+    // Sibling workspace roots use their own controls, without inheriting
+    // the primary workspace's explicit ignore file.
     let workspace_gitignore = cwd.join(".gitignore");
-    if workspace_gitignore.exists()
+    if include_workspace_ignore
+        && workspace_gitignore.exists()
         && let Some(err) = builder.add_ignore(&workspace_gitignore)
     {
         return Err(std::io::Error::other(format!(
@@ -4027,6 +4031,7 @@ fn find_inproc_scan_sync(
         RecursiveScanAccess::DirectoriesOnly,
         None,
         global_git_ignore.as_deref(),
+        true,
     )?;
 
     let mut results = Vec::new();
@@ -4088,12 +4093,25 @@ fn find_inproc_scan_sync(
 /// The entire visible tree is checked:
 /// an output limit cannot prove which candidates an external scanner will open
 /// before it reaches that limit.
+#[cfg(test)]
 fn ensure_recursive_scan_access_sync(
     path: &Path,
     cwd: &Path,
     operation: &str,
     access: RecursiveScanAccess,
     glob: Option<&str>,
+) -> std::io::Result<()> {
+    ensure_recursive_scan_access_filtered_sync(path, cwd, operation, access, glob, None, true)
+}
+
+fn ensure_recursive_scan_access_filtered_sync(
+    path: &Path,
+    cwd: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    glob: Option<&str>,
+    exclusions: Option<Arc<GrepExclusions>>,
+    include_workspace_ignore: bool,
 ) -> std::io::Result<()> {
     let access_context = EffectiveModeAccessContext::current()?;
     ensure_ancestors_searchable_with_context_sync(path, &access_context)?;
@@ -4127,10 +4145,25 @@ fn ensure_recursive_scan_access_sync(
     let denied_from_filter = std::sync::Arc::clone(&denied);
     let operation_owned = operation.to_string();
 
-    let mut builder =
-        recursive_scan_walk_builder(path, cwd, access, glob, global_git_ignore.as_deref())?;
+    let mut builder = recursive_scan_walk_builder(
+        path,
+        cwd,
+        access,
+        glob,
+        global_git_ignore.as_deref(),
+        include_workspace_ignore,
+    )?;
 
+    let exclusion_root = path.to_path_buf();
     builder.filter_entry(move |entry| {
+        if exclusions.as_ref().is_some_and(|exclusions| {
+            entry
+                .path()
+                .strip_prefix(&exclusion_root)
+                .is_ok_and(|relative| exclusions.excludes(relative))
+        }) {
+            return false;
+        }
         if entry.path_is_symlink() {
             return true;
         }
@@ -4248,11 +4281,21 @@ async fn ensure_recursive_scan_access(
     operation: &'static str,
     access: RecursiveScanAccess,
     glob: Option<String>,
+    exclusions: Option<Arc<GrepExclusions>>,
+    include_workspace_ignore: bool,
 ) -> std::io::Result<()> {
     let path = path.to_path_buf();
     let cwd = cwd.to_path_buf();
     asupersync::runtime::spawn_blocking_io(move || {
-        ensure_recursive_scan_access_sync(&path, &cwd, operation, access, glob.as_deref())
+        ensure_recursive_scan_access_filtered_sync(
+            &path,
+            &cwd,
+            operation,
+            access,
+            glob.as_deref(),
+            exclusions,
+            include_workspace_ignore,
+        )
     })
     .await
 }
@@ -12639,9 +12682,191 @@ const MAX_GREP_RESOURCE_PATHS: usize = 16;
 const MAX_GREP_RESOURCE_PATH_BYTES: usize = 64 * 1024;
 const MAX_GREP_RESOURCE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_GREP_RESOURCE_MATCHES: usize = 10_000;
+const MAX_GREP_PATH_ENTRIES: usize = 64;
 
-/// Only internal URL operands use semicolon lists. A semicolon in an HTTP
-/// URL or an ordinary filename keeps its normal meaning. Validate list syntax
+/// One filesystem root plus explicit exclusions. A real filename always
+/// wins over the list syntax, including names beginning with `!` and names
+/// containing semicolons. Failed or inconclusive probes remain paths so the
+/// ordinary scoped access checks report them instead of widening the search.
+#[derive(Debug)]
+struct GrepFilesystemScope {
+    path: String,
+    exclusions: Vec<String>,
+}
+
+fn grep_path_is_missing(path: &str, cwd: &Path) -> bool {
+    let path = resolve_to_cwd(path, cwd);
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::InvalidFilename
+        )
+    )
+}
+
+fn grep_exclusion_glob(pattern: &str) -> Result<globset::Glob> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()
+        .map_err(|error| {
+            Error::tool(
+                "grep",
+                format!("[GREP_EXCLUSION] Invalid exclusion pattern: {error}"),
+            )
+        })
+}
+
+fn grep_filesystem_scope(path: Option<&str>, cwd: &Path) -> Result<GrepFilesystemScope> {
+    let path = path.unwrap_or(".");
+    let literal = || GrepFilesystemScope {
+        path: path.to_string(),
+        exclusions: Vec::new(),
+    };
+    if !path.split(';').any(|part| part.trim().starts_with('!')) {
+        return Ok(literal());
+    }
+    if path.len() > MAX_GREP_RESOURCE_PATH_BYTES {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_PATH_LIMIT] Search paths exceed 64 KiB",
+        ));
+    }
+    if path.contains('\0') {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_PATH_LIST] Search paths and exclusions cannot contain NUL bytes",
+        ));
+    }
+    if !grep_path_is_missing(path, cwd) {
+        return Ok(literal());
+    }
+
+    let mut root = None;
+    let mut exclusions = Vec::new();
+    for (index, entry) in path.split(';').map(str::trim).enumerate() {
+        if index >= MAX_GREP_PATH_ENTRIES {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_PATH_LIMIT] Search at most 64 path/exclusion entries per call",
+            ));
+        }
+        if entry.is_empty() || crate::url_router::has_scheme(entry) {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_PATH_LIST] Use one filesystem path and !glob exclusions; search resource URLs separately",
+            ));
+        }
+        if let Some(pattern) = entry.strip_prefix('!')
+            && grep_path_is_missing(entry, cwd)
+        {
+            let normalized = pattern.trim().replace('\\', "/");
+            let normalized = normalized.trim_end_matches('/');
+            if normalized.is_empty() || normalized.contains('\0') {
+                return Err(Error::tool(
+                    "grep",
+                    "[GREP_EXCLUSION] An exclusion needs a non-empty glob",
+                ));
+            }
+            // Validate even exclusions that later rebase outside the chosen
+            // root. A malformed suffix must never be silently ignored.
+            grep_exclusion_glob(normalized)?;
+            exclusions.push(normalized.to_string());
+        } else if root.replace(entry.to_string()).is_some() {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_PATH_LIST] Use one filesystem root per search; separate it from exclusions with semicolons",
+            ));
+        }
+    }
+
+    Ok(GrepFilesystemScope {
+        path: root.unwrap_or_else(|| ".".to_string()),
+        exclusions,
+    })
+}
+
+/// Root-relative filters shared by permission admission, the native walker,
+/// and external ripgrep. Rebase from logical paths before entering descriptor
+/// space, so a pinned cwd cannot change slash-containing glob semantics.
+struct GrepExclusions {
+    matcher: ignore::overrides::Override,
+    rg_globs: Vec<String>,
+}
+
+impl GrepExclusions {
+    fn for_root(
+        cwd: &Path,
+        root: &Path,
+        lexical_root: &Path,
+        patterns: &[String],
+    ) -> Result<Option<Arc<Self>>> {
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        let mut builder = ignore::overrides::OverrideBuilder::new("");
+        let mut rg_globs = Vec::new();
+        for pattern in patterns {
+            let (relative, anchored) = if !pattern.contains('/') || pattern.starts_with("**") {
+                let relative = if pattern.contains('/') {
+                    pattern.clone()
+                } else {
+                    format!("**/{pattern}")
+                };
+                (relative, false)
+            } else {
+                let target = normalize_dot_segments(&resolve_to_cwd(pattern, cwd));
+                let Ok(relative) = target
+                    .strip_prefix(lexical_root)
+                    .or_else(|_| target.strip_prefix(root))
+                else {
+                    continue;
+                };
+                // Explicit roots are always searched, even when named by an
+                // exclusion. Only their descendants can be filtered out.
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                let relative = relative.to_str().ok_or_else(|| {
+                    Error::tool("grep", "[GREP_EXCLUSION] Exclusion path is not UTF-8")
+                })?;
+                (relative.replace('\\', "/"), true)
+            };
+            let rg_glob = if anchored {
+                format!("!/{relative}")
+            } else {
+                format!("!{relative}")
+            };
+            builder.add(&rg_glob).map_err(|error| {
+                Error::tool(
+                    "grep",
+                    format!("[GREP_EXCLUSION] Invalid exclusion: {error}"),
+                )
+            })?;
+            rg_globs.push(rg_glob);
+        }
+        let matcher = builder.build().map_err(|error| {
+            Error::tool(
+                "grep",
+                format!("[GREP_EXCLUSION] Invalid exclusions: {error}"),
+            )
+        })?;
+        Ok(Some(Arc::new(Self { matcher, rg_globs })))
+    }
+
+    fn excludes(&self, relative: &Path) -> bool {
+        relative
+            .ancestors()
+            .take_while(|path| !path.as_os_str().is_empty())
+            .any(|path| self.matcher.matched(path, false).is_ignore())
+    }
+}
+
+/// Internal URL operands have their own semicolon-list syntax. A semicolon
+/// in an HTTP URL keeps its normal meaning. Validate the complete URL list
 /// before resolving anything, so a malformed suffix cannot be skipped.
 fn grep_resource_paths(path: Option<&str>) -> Result<Option<Vec<&str>>> {
     let Some(path) = path else {
@@ -13177,6 +13402,7 @@ fn process_rg_json_match_line(
         None,
         None,
         None,
+        None,
         matches,
         match_count,
         match_limit_reached,
@@ -13190,6 +13416,7 @@ fn process_rg_json_match_line_with_filter(
     scoped_root: Option<&ScopedScanRoot>,
     glob_override: Option<&ignore::overrides::Override>,
     workspace_ignore: Option<&ignore::gitignore::Gitignore>,
+    exclusions: Option<&GrepExclusions>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
@@ -13231,7 +13458,7 @@ fn process_rg_json_match_line_with_filter(
 
     let file_path = path_from_rg_json(&event)?;
     if let Some(scoped_root) = scoped_root
-        && (glob_override.is_some() || workspace_ignore.is_some())
+        && (glob_override.is_some() || workspace_ignore.is_some() || exclusions.is_some())
     {
         let mapped = scoped_root.map_child_output(&file_path).map_err(|error| {
             Error::tool(
@@ -13253,6 +13480,12 @@ fn process_rg_json_match_line_with_filter(
             && workspace_ignore
                 .matched_path_or_any_parents(&mapped.logical_path, false)
                 .is_ignore()
+        {
+            return Ok(());
+        }
+        if let Some(exclusions) = exclusions
+            && let Ok(relative) = mapped.logical_path.strip_prefix(scoped_root.logical_path())
+            && exclusions.excludes(relative)
         {
             return Ok(());
         }
@@ -13278,6 +13511,7 @@ fn drain_rg_stdout(
     scoped_root: &ScopedScanRoot,
     glob_override: Option<&ignore::overrides::Override>,
     workspace_ignore: Option<&ignore::gitignore::Gitignore>,
+    exclusions: Option<&GrepExclusions>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
@@ -13289,6 +13523,7 @@ fn drain_rg_stdout(
             Some(scoped_root),
             glob_override,
             workspace_ignore,
+            exclusions,
             matches,
             match_count,
             match_limit_reached,
@@ -13351,6 +13586,8 @@ fn grep_inproc_scan_sync(
     scoped_root: ScopedScanRoot,
     glob_override: Option<ignore::overrides::Override>,
     workspace_ignore: Option<ignore::gitignore::Gitignore>,
+    exclusions: Option<Arc<GrepExclusions>>,
+    include_workspace_ignore: bool,
     operation_cwd: &Path,
     is_directory: bool,
     pattern: &str,
@@ -13389,13 +13626,23 @@ fn grep_inproc_scan_sync(
     if is_directory {
         let scan_root = scoped_root.io_path();
         let global_git_ignore = resolved_global_git_ignore_for_scan(operation_cwd)?;
-        let builder = recursive_scan_walk_builder(
+        let mut builder = recursive_scan_walk_builder(
             &scan_root,
             operation_cwd,
             RecursiveScanAccess::ReadableFiles,
             None,
             global_git_ignore.as_deref(),
+            include_workspace_ignore,
         )?;
+        if let Some(exclusions) = exclusions {
+            let exclusion_root = scan_root.clone();
+            builder.filter_entry(move |entry| {
+                !entry
+                    .path()
+                    .strip_prefix(&exclusion_root)
+                    .is_ok_and(|relative| exclusions.excludes(relative))
+            });
+        }
         'walk: for entry in builder.build() {
             if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(std::io::Error::new(
@@ -13574,7 +13821,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search files, internal documents (agent://, skill://, local://, pr://, and other read URLs), or an HTTP(S) URL for a pattern. Separate up to 16 internal URLs with semicolons. HTTP URLs use reader text; append :raw for source. Returns matching lines with source paths and line numbers. Filesystem searches respect .gitignore. Output defaults to 100 matches or 1MB; long lines are truncated to 500 chars. Use hashline=true for filesystem edit anchors only."
+        "Search files, internal documents (agent://, skill://, local://, pr://, and other read URLs), or an HTTP(S) URL for a pattern. Separate up to 16 internal URLs with semicolons. For files, use one root plus !glob exclusions, e.g. 'src;!*.test.ts' or '.;!vendor;!gen'; exclusions prune files and directories below that root. HTTP URLs use reader text; append :raw for source. Returns matching lines with source paths and line numbers. Filesystem searches respect .gitignore. Output defaults to 100 matches or 1MB; long lines are truncated to 500 chars. Use hashline=true for filesystem edit anchors only."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -13587,7 +13834,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory/file (default: current directory), internal document URL, semicolon-separated internal URLs, or one HTTP(S) URL (optional :raw suffix)"
+                    "description": "Directory/file (default: current directory), optionally followed by ;!glob exclusions. Bare !vendor matches anywhere below the root; !src/legacy is relative to cwd. Only exclusions imply cwd. Existing filenames stay literal. Alternatively, internal document URLs separated by semicolons, or one HTTP(S) URL (optional :raw suffix)."
                 },
                 "glob": {
                     "type": "string",
@@ -13680,6 +13927,8 @@ impl Tool for GrepTool {
                 .await;
         }
 
+        let filesystem_scope = grep_filesystem_scope(input.path.as_deref(), &self.cwd)?;
+
         if self.backend == SearchBackend::External && !rg_available() {
             return Err(Error::tool(
                 "grep",
@@ -13701,7 +13950,7 @@ impl Tool for GrepTool {
             })?;
         let operation_cwd = cwd_scope.io_path();
 
-        let search_dir = input.path.as_deref().unwrap_or(".");
+        let search_dir = &filesystem_scope.path;
         let lexical_search_path = resolve_read_path(search_dir, &self.cwd);
         let search_path =
             enforce_cwd_scope(&lexical_search_path, &self.cwd, "grep", &self.workspace)?;
@@ -13754,19 +14003,58 @@ impl Tool for GrepTool {
         let after_scope_hook = self.after_scope_hook.clone();
         #[cfg(not(test))]
         let after_scope_hook = None;
-        let scoped_root = open_scoped_scan_root(&search_path, &self.cwd, true, after_scope_hook)
-            .await
-            .map_err(|err| {
-                Error::tool(
-                    "grep",
-                    format!(
-                        "Cannot pin path {} for scanning: {}",
-                        path_for_line_output(&search_path),
-                        error_for_line_output(&err)
-                    ),
-                )
-            })?;
+        // Pin within the same live workspace authority used for admission.
+        // A sibling --add-dir root is authorized without becoming a child of
+        // the primary cwd. Revoked roots must fail before any content scan.
+        let roots = self.workspace.snapshot_or(&self.cwd);
+        let allowed_roots = if roots.additional().is_empty() {
+            vec![cwd_scope.logical_path().to_path_buf()]
+        } else {
+            roots.all()
+        };
+        let scan_scope_root = allowed_roots
+            .into_iter()
+            .filter(|root| search_path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .ok_or_else(|| Error::tool("grep", "Search root is no longer in the workspace"))?;
+        let scoped_root =
+            open_scoped_scan_root(&search_path, &scan_scope_root, true, after_scope_hook)
+                .await
+                .map_err(|err| {
+                    Error::tool(
+                        "grep",
+                        format!(
+                            "Cannot pin path {} for scanning: {}",
+                            path_for_line_output(&search_path),
+                            error_for_line_output(&err)
+                        ),
+                    )
+                })?;
+        if !scoped_root.logical_path().starts_with(&scan_scope_root) {
+            return Err(Error::tool(
+                "grep",
+                "Search root changed outside the workspace while being pinned",
+            ));
+        }
         let scan_io_path = scoped_root.io_path();
+        let include_workspace_ignore = scoped_root
+            .logical_path()
+            .starts_with(cwd_scope.logical_path());
+        // Keep a symlinked search root's spelling for cwd-relative patterns
+        // such as alias;!alias/vendor. Normalize only the cwd alias here;
+        // resolving the root alias would silently discard those exclusions.
+        let lexical_root = lexical_search_path
+            .strip_prefix(normalize_dot_segments(&self.cwd))
+            .map_or_else(
+                |_| lexical_search_path.clone(),
+                |relative| cwd_scope.logical_path().join(relative),
+            );
+        let exclusions = GrepExclusions::for_root(
+            cwd_scope.logical_path(),
+            scoped_root.logical_path(),
+            &lexical_root,
+            &filesystem_scope.exclusions,
+        )?;
         if is_directory {
             ensure_recursive_scan_access(
                 &scan_io_path,
@@ -13774,6 +14062,8 @@ impl Tool for GrepTool {
                 "recursive content scanning",
                 RecursiveScanAccess::ReadableFiles,
                 input.glob.clone(),
+                exclusions.clone(),
+                include_workspace_ignore,
             )
             .await
             .map_err(|err| {
@@ -13804,12 +14094,19 @@ impl Tool for GrepTool {
             ToolCacheFingerprintMode::FileContent
         };
         let recursive_cache_access = is_directory.then_some(RecursiveScanAccess::ReadableFiles);
-        let cache_deps = cache_dependencies_for_scoped_scan(
-            &scoped_root,
-            &cwd_scope,
-            cache_mode,
-            recursive_cache_access,
-        );
+        // Recursive cache fingerprints read the entire tree. Until those
+        // fingerprints carry the search filter, bypass the cache rather than
+        // opening files the caller explicitly excluded from this search.
+        let cache_deps = if exclusions.is_some() {
+            None
+        } else {
+            cache_dependencies_for_scoped_scan(
+                &scoped_root,
+                &cwd_scope,
+                cache_mode,
+                recursive_cache_access,
+            )
+        };
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
@@ -13827,7 +14124,7 @@ impl Tool for GrepTool {
         // for why --ignore-file cannot express them). Explicit file operands
         // bypass ignore filtering entirely, so neither applies to
         // single-file scans.
-        let workspace_ignore = if is_directory {
+        let workspace_ignore = if is_directory && include_workspace_ignore {
             build_workspace_ignore_matcher(&cwd_scope)
         } else {
             None
@@ -13844,11 +14141,14 @@ impl Tool for GrepTool {
             let pattern = input.pattern.clone();
             let ignore_case = input.ignore_case.unwrap_or(false);
             let literal = input.literal.unwrap_or(false);
+            let exclusions_for_scan = exclusions.clone();
             let mut scan = Box::pin(asupersync::runtime::spawn_blocking_io(move || {
                 grep_inproc_scan_sync(
                     scoped_root,
                     glob_override,
                     workspace_ignore,
+                    exclusions_for_scan,
+                    include_workspace_ignore,
                     &operation_cwd_owned,
                     is_directory,
                     &pattern,
@@ -13902,6 +14202,12 @@ impl Tool for GrepTool {
                 args.push(OsString::from("--fixed-strings"));
             }
             if is_directory {
+                if let Some(exclusions) = &exclusions {
+                    for glob in &exclusions.rg_globs {
+                        args.push(OsString::from("--glob"));
+                        args.push(OsString::from(glob));
+                    }
+                }
                 let root_gitignore = scoped_root.child_operand().join(".gitignore");
                 if scoped_root.logical_path() != cwd_scope.logical_path()
                     && scan_io_path.join(".gitignore").exists()
@@ -14014,6 +14320,7 @@ impl Tool for GrepTool {
                     &scoped_root,
                     glob_override.as_ref(),
                     workspace_ignore.as_ref(),
+                    exclusions.as_deref(),
                     &mut matches,
                     &mut match_count,
                     &mut match_scan_limit_reached,
@@ -14040,6 +14347,7 @@ impl Tool for GrepTool {
                 &scoped_root,
                 glob_override.as_ref(),
                 workspace_ignore.as_ref(),
+                exclusions.as_deref(),
                 &mut matches,
                 &mut match_count,
                 &mut match_scan_limit_reached,
@@ -14071,6 +14379,7 @@ impl Tool for GrepTool {
                         &scoped_root,
                         glob_override.as_ref(),
                         workspace_ignore.as_ref(),
+                        exclusions.as_deref(),
                         &mut matches,
                         &mut match_count,
                         &mut match_scan_limit_reached,
@@ -14105,6 +14414,7 @@ impl Tool for GrepTool {
                     &scoped_root,
                     glob_override.as_ref(),
                     workspace_ignore.as_ref(),
+                    exclusions.as_deref(),
                     &mut matches,
                     &mut match_count,
                     &mut match_scan_limit_reached,
@@ -14180,6 +14490,7 @@ impl Tool for GrepTool {
                 .push(*line_number);
         }
 
+        let scan_read_scope = scoped_root.io_path();
         for file_path in file_order {
             let Some(mut match_lines) = matches_by_file.remove(&file_path) else {
                 continue;
@@ -14194,7 +14505,7 @@ impl Tool for GrepTool {
             let lines = if scoped_root.is_file_root() {
                 get_pinned_file_lines_async(&scoped_root).await
             } else {
-                get_file_lines_async(&file_path, &operation_cwd).await
+                get_file_lines_async(&file_path, &scan_read_scope).await
             };
 
             if lines.is_empty() {
@@ -14560,6 +14871,8 @@ impl Tool for FindTool {
             "recursive path scanning",
             RecursiveScanAccess::DirectoriesOnly,
             None,
+            None,
+            true,
         )
         .await
         .map_err(|err| {
@@ -19256,6 +19569,7 @@ mod tests {
             RecursiveScanAccess::ReadableFiles,
             None,
             Some(&global_ignore),
+            true,
         )
         .expect("build recursive walker")
         .build();
@@ -22749,6 +23063,353 @@ mod tests {
     // ========================================================================
     // Grep Tool Tests
     // ========================================================================
+
+    #[test]
+    fn grep_exclusion_lists_preserve_literal_paths_and_validate_all_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["!notes.txt", "ordinary;name.txt", "literal;!skip.txt"] {
+            std::fs::write(temp.path().join(name), "needle\n").unwrap();
+            let scope = grep_filesystem_scope(Some(name), temp.path()).unwrap();
+            assert_eq!(scope.path, name);
+            assert!(scope.exclusions.is_empty());
+        }
+        let scope = grep_filesystem_scope(Some("missing;name"), temp.path()).unwrap();
+        assert_eq!(scope.path, "missing;name");
+        assert!(scope.exclusions.is_empty());
+
+        let scope = grep_filesystem_scope(Some("!vendor;!*.test.rs"), temp.path()).unwrap();
+        assert_eq!(scope.path, ".");
+        assert_eq!(scope.exclusions, ["vendor", "*.test.rs"]);
+        let scope = grep_filesystem_scope(Some(r"src;!src\legacy/"), temp.path()).unwrap();
+        assert_eq!(scope.path, "src");
+        assert_eq!(scope.exclusions, ["src/legacy"]);
+        std::fs::write(temp.path().join("gen"), "needle\n").unwrap();
+        let scope = grep_filesystem_scope(Some(".;!vendor/../gen"), temp.path()).unwrap();
+        assert_eq!(scope.path, ".");
+        assert_eq!(scope.exclusions, ["vendor/../gen"]);
+
+        for path in [
+            ".;!",
+            "missing;![",
+            ".;;!vendor",
+            "src;tests;!vendor",
+            ".;local://notes;!vendor",
+            ".;!bad\0name",
+        ] {
+            let error = grep_filesystem_scope(Some(path), temp.path()).unwrap_err();
+            assert!(error.to_string().contains("[GREP_"), "{path:?}: {error}");
+        }
+        let too_many = vec!["!vendor"; MAX_GREP_PATH_ENTRIES + 1].join(";");
+        let error = grep_filesystem_scope(Some(&too_many), temp.path()).unwrap_err();
+        assert!(error.to_string().contains("GREP_PATH_LIMIT"), "{error}");
+        let too_long = format!("!{}", "v".repeat(MAX_GREP_RESOURCE_PATH_BYTES));
+        let error = grep_filesystem_scope(Some(&too_long), temp.path()).unwrap_err();
+        assert!(error.to_string().contains("GREP_PATH_LIMIT"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_exclusion_lists_preserve_dangling_literal_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing", temp.path().join("!dangling")).unwrap();
+        let scope = grep_filesystem_scope(Some("!dangling"), temp.path()).unwrap();
+        assert_eq!(scope.path, "!dangling");
+        assert!(scope.exclusions.is_empty());
+    }
+
+    #[test]
+    fn grep_exclusions_prune_before_regex_limits_in_both_backends() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                for directory in ["src/vendor", "vendor", "gen"] {
+                    std::fs::create_dir_all(temp.path().join(directory)).unwrap();
+                }
+                for name in [
+                    "vendor/noise.rs",
+                    "src/vendor/noise.rs",
+                    "gen/noise.rs",
+                    "src/main.test.rs",
+                    "src/irrelevant.txt",
+                    "ignored.rs",
+                ] {
+                    std::fs::write(temp.path().join(name), "needle999\n".repeat(64)).unwrap();
+                }
+                std::fs::write(temp.path().join(".gitignore"), "ignored.rs\n").unwrap();
+                std::fs::write(temp.path().join("src/main.rs"), "Needle1\nneedle2\nplain\n")
+                    .unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                for path in [".;!vendor;!gen;!*.test.rs", "!vendor;!gen;!*.test.rs"] {
+                    let output = tool
+                        .execute(
+                            "excluded-regex-limit",
+                            serde_json::json!({
+                                "pattern":"^needle[0-9]+$", "ignoreCase":true,
+                                "path":path, "glob":"*.rs", "limit":2,
+                            }),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains("main.rs:1: Needle1"), "{text}");
+                    assert!(text.contains("main.rs:2: needle2"), "{text}");
+                    assert_eq!(text.lines().count(), 2, "{text}");
+                    assert!(
+                        output
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("matchLimitReached"))
+                            .is_none()
+                    );
+                }
+                let output = tool
+                    .execute(
+                        "included-regex-limit",
+                        serde_json::json!({
+                            "pattern":"^needle[0-9]+$", "ignoreCase":true,
+                            "path":".;!vendor;!gen;!*.test.rs", "glob":"*.rs", "limit":1,
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(output.details.unwrap()["matchLimitReached"], 1);
+            }
+        });
+    }
+
+    #[test]
+    fn grep_exclusions_rebase_from_logical_cwd_and_keep_explicit_roots() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let cwd = temp.path().join("tree");
+                for directory in ["gen", "src/legacy", "src/gen"] {
+                    std::fs::create_dir_all(cwd.join(directory)).unwrap();
+                }
+                for name in [
+                    "gen/noise.txt",
+                    "src/legacy/noise.txt",
+                    "src/gen/keep.txt",
+                    "src/main.test.txt",
+                    "src/main.txt",
+                ] {
+                    std::fs::write(cwd.join(name), "needle\n").unwrap();
+                }
+                #[cfg(unix)]
+                let cwd = {
+                    let link = temp.path().join("linked-cwd");
+                    std::os::unix::fs::symlink(&cwd, &link).unwrap();
+                    link
+                };
+                let tool = GrepTool::with_backend(&cwd, backend);
+                for path in [
+                    ".;!./gen;!src/legacy;!*.test.txt",
+                    "src;!./gen;!src/legacy;!*.test.txt",
+                    r"src;!src\legacy;!*.test.txt",
+                ] {
+                    let output = tool
+                        .execute(
+                            "anchored-exclusions",
+                            serde_json::json!({"pattern":"needle", "path":path}),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains("keep.txt:1: needle"), "{path}: {text}");
+                    assert!(text.contains("main.txt:1: needle"), "{path}: {text}");
+                    assert_eq!(text.lines().count(), 2, "{path}: {text}");
+                }
+                for (path, expected) in [
+                    ("src/legacy;!src/legacy", "noise.txt:1: needle"),
+                    ("src/main.test.txt;!*.test.txt", "main.test.txt:1: needle"),
+                    ("src;!**/gen;!src/legacy;!*.test.txt", "main.txt:1: needle"),
+                    ("src;!{gen,legacy};!*.test.txt", "main.txt:1: needle"),
+                ] {
+                    let output = tool
+                        .execute(
+                            "explicit-and-glob-exclusions",
+                            serde_json::json!({"pattern":"needle", "path":path}),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains(expected), "{path}: {text}");
+                    assert_eq!(text.lines().count(), 1, "{path}: {text}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_exclusions_rebase_symlinked_search_roots_without_following_descendants() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                std::fs::create_dir_all(temp.path().join("actual/vendor")).unwrap();
+                std::fs::write(temp.path().join("actual/vendor/noise.rs"), "needle\n").unwrap();
+                std::fs::write(temp.path().join("actual/main.rs"), "needle\n").unwrap();
+                std::os::unix::fs::symlink("actual", temp.path().join("alias")).unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                std::fs::write(outside.path().join("outside.rs"), "needle\n").unwrap();
+                std::os::unix::fs::symlink(outside.path(), temp.path().join("actual/escape"))
+                    .unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                let output = tool
+                    .execute(
+                        "symlink-root-exclusions",
+                        serde_json::json!({"pattern":"needle", "path":"alias;!alias/vendor"}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let text = get_text(&output.content);
+                assert!(text.contains("main.rs:1: needle"), "{text}");
+                assert_eq!(text.lines().count(), 1, "{text}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_literal_bang_and_semicolon_files_are_searchable_in_both_backends() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                for name in ["!notes.txt", "ordinary;name.txt", "literal;!skip.txt"] {
+                    std::fs::write(temp.path().join(name), "a+b\n").unwrap();
+                    let output = tool
+                        .execute(
+                            "literal-exclusion-syntax",
+                            serde_json::json!({"pattern":"a+b", "literal":true, "path":name}),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(get_text(&output.content), format!("{name}:1: a+b"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn grep_exclusions_respect_added_roots_and_live_workspace_revocation() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let cwd = temp.path().join("primary");
+                let extra = temp.path().join("extra");
+                std::fs::create_dir_all(&cwd).unwrap();
+                std::fs::write(cwd.join(".gitignore"), "*.rs\n").unwrap();
+                for directory in ["vendor", "generated", "src"] {
+                    std::fs::create_dir_all(extra.join(directory)).unwrap();
+                }
+                for name in [
+                    "vendor/noise.rs",
+                    "generated/noise.rs",
+                    "src/main.rs",
+                    "ignored.rs",
+                ] {
+                    std::fs::write(extra.join(name), "needle\n").unwrap();
+                }
+                std::fs::write(extra.join(".gitignore"), "ignored.rs\n").unwrap();
+                let mut workspace = WorkspaceHandle::single(&cwd);
+                workspace.add_root(&extra);
+                let tool = GrepTool::with_backend(&cwd, backend).with_workspace(workspace.clone());
+                let input = serde_json::json!({
+                    "pattern":"needle",
+                    "path":format!("{};!vendor;!../extra/generated", extra.display()),
+                });
+                let output = tool
+                    .execute("extra-root-exclusions", input.clone(), None)
+                    .await
+                    .unwrap();
+                let text = get_text(&output.content);
+                assert!(text.contains("main.rs:1: needle"), "{text}");
+                assert_eq!(text.lines().count(), 1, "{text}");
+                assert!(workspace.remove_root(&extra));
+                let error = tool
+                    .execute("revoked-root-exclusions", input, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("outside the working directory"),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_exclusions_prune_permissions_without_weakening_included_path_checks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                std::fs::create_dir(temp.path().join("secret")).unwrap();
+                std::fs::write(temp.path().join("secret/hidden.rs"), "needle\n").unwrap();
+                std::fs::write(temp.path().join("secret/.gitignore"), "").unwrap();
+                std::fs::write(temp.path().join("visible.rs"), "needle\n").unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                for name in ["secret", "secret/hidden.rs", "secret/.gitignore"] {
+                    let unreadable = temp.path().join(name);
+                    let original = std::fs::metadata(&unreadable).unwrap().permissions();
+                    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0))
+                        .unwrap();
+                    let excluded = tool
+                        .execute(
+                            "excluded-permissions",
+                            serde_json::json!({
+                                "pattern":"needle", "path":".;!secret", "limit":1,
+                            }),
+                            None,
+                        )
+                        .await;
+                    let included = tool
+                        .execute(
+                            "included-permissions",
+                            serde_json::json!({
+                                "pattern":"needle", "path":".;!elsewhere", "limit":1,
+                            }),
+                            None,
+                        )
+                        .await;
+                    std::fs::set_permissions(&unreadable, original).unwrap();
+                    let output = excluded.unwrap();
+                    assert_eq!(get_text(&output.content), "visible.rs:1: needle");
+                    let error = included.unwrap_err();
+                    assert!(
+                        error.to_string().contains("Permission denied"),
+                        "{name}: {error}"
+                    );
+                }
+            }
+        });
+    }
 
     #[test]
     fn grep_agent_resources_use_accepted_results_and_reject_provisional_output() {
