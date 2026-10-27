@@ -150,12 +150,13 @@ fn remaining_budget(deadline: Instant, now: Instant) -> Result<Duration> {
 struct CatalogRequestGuard {
     entry: Arc<ServerEntry>,
     transport: Arc<dyn McpTransport>,
+    generation: u64,
     armed: bool,
 }
 
 impl Drop for CatalogRequestGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed && self.transport.abort_in_generation(self.generation) {
             McpManager::fail_transport_generation(
                 &self.entry,
                 &self.transport,
@@ -168,9 +169,21 @@ impl Drop for CatalogRequestGuard {
     }
 }
 
+fn fail_catalog_generation(
+    entry: &Arc<ServerEntry>,
+    transport: &Arc<dyn McpTransport>,
+    generation: u64,
+    error: &crate::error::Error,
+) {
+    if transport.abort_in_generation(generation) {
+        McpManager::fail_transport_generation(entry, transport, error);
+    }
+}
+
 fn check_catalog_generation(
     entry: &Arc<ServerEntry>,
     transport: &Arc<dyn McpTransport>,
+    generation: u64,
 ) -> Result<()> {
     let is_current = McpManager::lock(&entry.transport)
         .as_ref()
@@ -187,8 +200,14 @@ fn check_catalog_generation(
             "MCP_TRANSPORT_CLOSED",
             "connection closed before tools/list completed",
         );
-        McpManager::fail_transport_generation(entry, transport, &error);
+        fail_catalog_generation(entry, transport, generation, &error);
         return Err(error);
+    }
+    if transport.progress_generation() != generation {
+        return Err(tool_err(
+            "MCP_SESSION_CHANGED",
+            "protocol session changed during tools/list traversal; the partial catalog was discarded",
+        ));
     }
     Ok(())
 }
@@ -351,8 +370,9 @@ impl McpManager {
         &self,
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
+        generation: u64,
     ) -> Result<Vec<McpToolMeta>> {
-        self.collect_tool_catalog_with_timeout(entry, transport, entry.timeout())
+        self.collect_tool_catalog_with_timeout(entry, transport, generation, entry.timeout())
             .await
     }
 
@@ -360,6 +380,7 @@ impl McpManager {
         &self,
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
+        generation: u64,
         timeout: Duration,
     ) -> Result<Vec<McpToolMeta>> {
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
@@ -375,21 +396,33 @@ impl McpManager {
                 Self::close_revoked_transport(entry, transport).await;
                 return Err(error);
             }
-            check_catalog_generation(entry, transport)?;
+            check_catalog_generation(entry, transport, generation)?;
             let remaining = match remaining_budget(deadline, Instant::now()) {
                 Ok(remaining) => remaining,
                 Err(error) => {
-                    Self::fail_transport_generation(entry, transport, &error);
+                    fail_catalog_generation(entry, transport, generation, &error);
                     return Err(error);
                 }
             };
             let mut request_guard = CatalogRequestGuard {
                 entry: Arc::clone(entry),
                 transport: Arc::clone(transport),
+                generation,
                 armed: true,
             };
-            let result =
-                request_with_owner(&owner, transport, "tools/list", params, remaining).await;
+            let result = operation_with_owner(
+                &owner,
+                transport.request_in_task_generation(
+                    "tools/list",
+                    params,
+                    remaining,
+                    Arc::new(super::super::transport::RequestDispatch::new()),
+                    generation,
+                ),
+                remaining,
+            )
+            .await
+            .and_then(std::convert::identity);
             // A returned error is handled by the existing failure taxonomy;
             // only abandonment of the pending future belongs to the guard.
             request_guard.armed = false;
@@ -406,8 +439,12 @@ impl McpManager {
                 {
                     json!({"tools": []})
                 }
+                Err(error) if transport.progress_generation() != generation => {
+                    check_catalog_generation(entry, transport, generation)?;
+                    return Err(error);
+                }
                 Err(error) => {
-                    Self::fail_transport_generation(entry, transport, &error);
+                    fail_catalog_generation(entry, transport, generation, &error);
                     return Err(error);
                 }
             };
@@ -416,26 +453,26 @@ impl McpManager {
                 Self::close_revoked_transport(entry, transport).await;
                 return Err(error);
             }
-            check_catalog_generation(entry, transport)?;
+            check_catalog_generation(entry, transport, generation)?;
             // A transport that returns after its allotted deadline cannot
             // publish a late success or buy a fresh timeout for another page.
             if let Err(error) = remaining_budget(deadline, Instant::now()) {
-                Self::fail_transport_generation(entry, transport, &error);
+                fail_catalog_generation(entry, transport, generation, &error);
                 return Err(error);
             }
             let next = match catalog.append_page(&result) {
                 Ok(next) => next,
                 Err(error) => {
-                    Self::fail_transport_generation(entry, transport, &error);
+                    fail_catalog_generation(entry, transport, generation, &error);
                     return Err(error);
                 }
             };
             if let Err(error) = remaining_budget(deadline, Instant::now()) {
-                Self::fail_transport_generation(entry, transport, &error);
+                fail_catalog_generation(entry, transport, generation, &error);
                 return Err(error);
             }
             if let Err(error) = check_request_owner(&owner) {
-                Self::fail_transport_generation(entry, transport, &error);
+                fail_catalog_generation(entry, transport, generation, &error);
                 return Err(error);
             }
             match next {
@@ -450,7 +487,7 @@ impl McpManager {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use async_trait::async_trait;
 
@@ -463,12 +500,17 @@ mod tests {
         pages: Mutex<VecDeque<Value>>,
         requests: Mutex<Vec<(Value, Duration)>>,
         closed: AtomicBool,
+        generation: AtomicU64,
         after_page: Mutex<Option<Arc<PageHook>>>,
         pause_at: Mutex<Option<usize>>,
     }
 
     #[async_trait]
     impl McpTransport for PagedTransport {
+        fn progress_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+
         async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
             assert_eq!(
                 method, "tools/list",
@@ -581,6 +623,7 @@ mod tests {
             pages: Mutex::new(pages.into()),
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             after_page: Mutex::new(hook),
             pause_at: Mutex::new(None),
         });
@@ -857,6 +900,7 @@ mod tests {
             pages: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             after_page: Mutex::new(None),
             pause_at: Mutex::new(None),
         });
@@ -876,6 +920,7 @@ mod tests {
                     description: String::new(),
                     input_schema: json!({}),
                     output_schema: None,
+                    task_support: crate::mcp::tasks::TaskSupport::Forbidden,
                 }],
             ));
             *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -953,6 +998,7 @@ mod tests {
             pages: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             after_page: Mutex::new(None),
             pause_at: Mutex::new(None),
         });
@@ -972,6 +1018,7 @@ mod tests {
                     description: String::new(),
                     input_schema: json!({}),
                     output_schema: None,
+                    task_support: crate::mcp::tasks::TaskSupport::Forbidden,
                 }],
             ));
             *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -1079,6 +1126,7 @@ mod tests {
             .block_on(manager.collect_tool_catalog_with_timeout(
                 &entry,
                 &erased,
+                erased.progress_generation(),
                 RECORDED_REQUEST_DEADLINE,
             ))
             .expect_err("manager enforces deadline");
@@ -1292,6 +1340,91 @@ mod tests {
             *McpManager::lock(&entry.health),
             ServerHealth::Ready { tools: 0 }
         ));
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn logical_session_renewal_requires_fresh_catalog_discovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                json!({"tools":[tool("old-session")]}),
+                json!({"tools":[tool("new-session")]}),
+            ],
+            None,
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect("initial catalog");
+        assert_eq!(manager.mounted_tool_metas()[0].1[0].name, "old-session");
+
+        transport.generation.store(1, Ordering::Release);
+        assert!(manager.mounted_tool_metas().is_empty());
+        assert!(McpManager::lock(&entry.tools_cache).is_none());
+        let tools = runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect("renewed session can rediscover");
+        assert_eq!(tools[0].name, "new-session");
+        assert_eq!(manager.mounted_tool_metas()[0].1[0].name, "new-session");
+        assert_eq!(entry.tools_cache_generation.load(Ordering::Acquire), 1);
+        assert_eq!(McpManager::lock(&transport.requests).len(), 2);
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        assert!(!transport.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn logical_session_change_discards_partial_catalog_without_reusing_its_cursor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![
+                json!({"tools":[tool("obsolete")],"nextCursor":"old-session-cursor"}),
+                json!({"tools":[tool("fresh")]}),
+            ],
+            None,
+        );
+        let weak = Arc::downgrade(&transport);
+        *McpManager::lock(&transport.after_page) = Some(Arc::new(move |index| {
+            assert_eq!(index, 1, "obsolete traversal stops after its first page");
+            weak.upgrade()
+                .expect("live transport")
+                .generation
+                .store(1, Ordering::Release);
+        }));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect_err("a traversal cannot cross logical sessions");
+        assert!(error.to_string().contains("MCP_SESSION_CHANGED"));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(McpManager::lock(&entry.tools_cache).is_none());
+        assert!(!transport.closed.load(Ordering::Acquire));
+
+        *McpManager::lock(&transport.after_page) = None;
+        let tools = runtime
+            .block_on(manager.refresh_tools("catalog"))
+            .expect("a new traversal begins without the obsolete cursor");
+        assert_eq!(tools[0].name, "fresh");
+        let requests = McpManager::lock(&transport.requests);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(params, _)| params == &json!({})));
+    }
+
+    #[test]
+    fn catalog_publication_cannot_stamp_old_metadata_as_a_new_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, Vec::new(), None);
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let tools = parse_tool_list(&json!({"tools":[tool("obsolete")]})).unwrap();
+        transport.generation.store(1, Ordering::Release);
+        assert!(!manager.publish_tools_if_current(&entry, &erased, 0, &tools));
+        assert!(McpManager::lock(&entry.tools_cache).is_none());
         assert!(!transport.closed.load(Ordering::Acquire));
     }
 

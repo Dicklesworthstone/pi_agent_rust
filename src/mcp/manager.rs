@@ -4,13 +4,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use super::config::{ConfiguredServer, McpDiscovery, McpOAuthConfig, Provenance};
+use super::tasks::TaskSupport;
 #[cfg(test)]
 use super::transport::MCP_PROTOCOL_VERSION;
 use super::transport::{DEFAULT_MCP_TIMEOUT, McpTransport};
@@ -125,6 +126,7 @@ fn parse_tool_list(result: &Value) -> Result<Vec<McpToolMeta>> {
     let mut names = std::collections::HashSet::with_capacity(tools.len());
     let mut parsed = Vec::with_capacity(tools.len());
     for (index, tool) in tools.iter().enumerate() {
+        let task_support = TaskSupport::from_tool(tool)?;
         let tool = tool.as_object().ok_or_else(|| {
             tool_err(
                 "MCP_PROTOCOL",
@@ -189,6 +191,7 @@ fn parse_tool_list(result: &Value) -> Result<Vec<McpToolMeta>> {
             description: description.to_string(),
             input_schema,
             output_schema,
+            task_support,
         });
     }
     Ok(parsed)
@@ -206,6 +209,9 @@ pub struct McpToolMeta {
     /// Optional, compiled contract for successful structured tool results.
     /// Clones share a validator so in-flight calls retain their own contract.
     pub output_schema: Option<McpOutputSchema>,
+    /// Whether this tool permits or requires task-augmented execution.
+    /// Server capabilities must independently permit task-based tools/call.
+    pub task_support: TaskSupport,
 }
 
 /// Runtime health for the `/mcp` view.
@@ -253,6 +259,9 @@ struct ServerEntry {
     connect_lane: Arc<asupersync::sync::Mutex<()>>,
     transport: Mutex<Option<Arc<dyn McpTransport>>>,
     tools_cache: Mutex<Option<(Instant, Vec<McpToolMeta>)>>,
+    /// Logical HTTP session owning the catalog. Read and publish this stamp
+    /// while holding tools_cache; Arc identity alone does not bind renewal.
+    tools_cache_generation: AtomicU64,
     health: Mutex<ServerHealth>,
     restarts: Mutex<RestartState>,
     /// bd-hyik7: extension-supplied working-directory override for this
@@ -396,6 +405,7 @@ impl McpManager {
                     connect_lane: Arc::new(asupersync::sync::Mutex::new(())),
                     transport: Mutex::new(None),
                     tools_cache: Mutex::new(None),
+                    tools_cache_generation: AtomicU64::new(0),
                     health: Mutex::new(ServerHealth::NotStarted),
                     restarts: Mutex::new(RestartState::default()),
                 });
@@ -1016,7 +1026,10 @@ impl McpManager {
         for attempt in 0..2 {
             // A server's catalog may span several opaque cursor pages. Retain
             // the connection lane and publish only a complete validated set.
-            let tools = self.collect_tool_catalog(entry, &transport).await?;
+            let generation = transport.progress_generation();
+            let tools = self
+                .collect_tool_catalog(entry, &transport, generation)
+                .await?;
             if transport.take_tools_list_changed() {
                 Self::lock(&entry.tools_cache).take();
                 if attempt == 0 {
@@ -1034,7 +1047,13 @@ impl McpManager {
                 Self::close_revoked_transport(entry, &transport).await;
                 return Err(err);
             }
-            if !self.publish_tools_if_current(entry, &transport, &tools) {
+            if !self.publish_tools_if_current(entry, &transport, generation, &tools) {
+                if transport.progress_generation() != generation {
+                    return Err(tool_err(
+                        "MCP_SESSION_CHANGED",
+                        "protocol session changed before tool catalog publication; rediscover tools before calling them",
+                    ));
+                }
                 transport.abort();
                 return Err(tool_err(
                     "MCP_TRANSPORT_SUPERSEDED",
@@ -1069,6 +1088,7 @@ impl McpManager {
         &self,
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
+        generation: u64,
         tools: &[McpToolMeta],
     ) -> bool {
         let current = Self::lock(&entry.transport);
@@ -1079,7 +1099,19 @@ impl McpManager {
         {
             return false;
         }
-        *Self::lock(&entry.tools_cache) = Some((Instant::now(), tools.to_vec()));
+        let mut cache = Self::lock(&entry.tools_cache);
+        if transport.progress_generation() != generation || !transport.is_alive() {
+            return false;
+        }
+        entry
+            .tools_cache_generation
+            .store(generation, Ordering::Release);
+        *cache = Some((Instant::now(), tools.to_vec()));
+        if transport.progress_generation() != generation {
+            cache.take();
+            return false;
+        }
+        drop(cache);
         *Self::lock(&entry.health) = ServerHealth::Ready { tools: tools.len() };
         true
     }
@@ -1359,7 +1391,10 @@ impl McpManager {
                 entry.timeout(),
             )
             .await
-            .and_then(|result| super::transport::validate_initialize_result(&result).map(|_| ()))
+            .and_then(|result| {
+                super::transport::validate_initialize_result(&result)?;
+                transport.record_initialize_result(&result)
+            })
         {
             transport.close().await;
             Self::record_failure(entry, &err);
@@ -1607,18 +1642,33 @@ impl McpManager {
         &self,
         entry: &Arc<ServerEntry>,
         failed_transport: &Arc<dyn McpTransport>,
+        failed_generation: u64,
         failure: &Error,
     ) -> String {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let connect_guard =
             asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&entry.connect_lane), cx.cx()).await;
         let Ok(connect_guard) = connect_guard else {
-            failed_transport.abort();
+            failed_transport.abort_in_generation(failed_generation);
             return "recovery was cancelled before the connection lane became available"
                 .to_string();
         };
 
-        Self::detach_failed_call_transport(entry, failed_transport, failure);
+        let retired = Self::detach_failed_call_transport_in_generation(
+            entry,
+            failed_transport,
+            failed_generation,
+            failure,
+        );
+        if !retired
+            && Self::lock(&entry.transport)
+                .as_ref()
+                .is_some_and(|current| current.is_alive())
+        {
+            drop(connect_guard);
+            return "a newer connection is available for subsequent calls; its session was retained"
+                .to_string();
+        }
 
         let recovery = match self.ensure_ready_in_lane(entry).await {
             Ok(()) => self.list_and_cache_tools_in_lane(entry).await.map(|_| ()),
@@ -1633,36 +1683,44 @@ impl McpManager {
         }
     }
 
-    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
-    #[allow(clippy::significant_drop_tightening)]
     fn detach_failed_call_transport(
         entry: &Arc<ServerEntry>,
         failed_transport: &Arc<dyn McpTransport>,
         failure: &Error,
     ) -> bool {
-        let removed_failed_transport = {
-            let mut current = Self::lock(&entry.transport);
-            if current
+        Self::detach_failed_call_transport_in_generation(
+            entry,
+            failed_transport,
+            failed_transport.progress_generation(),
+            failure,
+        )
+    }
+
+    // Seal the logical session before removing its manager publication. The
+    // native HTTP conditional abort holds its session lock, so renewal cannot
+    // win between this ownership check and the terminal transition.
+    #[allow(clippy::significant_drop_tightening)]
+    fn detach_failed_call_transport_in_generation(
+        entry: &Arc<ServerEntry>,
+        failed_transport: &Arc<dyn McpTransport>,
+        generation: u64,
+        failure: &Error,
+    ) -> bool {
+        let mut current = Self::lock(&entry.transport);
+        if !failed_transport.abort_in_generation(generation)
+            || !current
                 .as_ref()
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, failed_transport))
-            {
-                let removed = current.take();
-                // Keep transport ownership and its derived state in one
-                // generation-checked critical section. Otherwise a replacement
-                // could publish between `take` and `mark_unhealthy` and then be
-                // poisoned by the stale failure.
-                if failed_transport.authentication_required() {
-                    Self::mark_unhealthy(entry, &authentication_transport_error());
-                } else {
-                    Self::mark_unhealthy(entry, failure);
-                }
-                removed
-            } else {
-                None
-            }
-        };
-        failed_transport.abort();
-        removed_failed_transport.is_some()
+        {
+            return false;
+        }
+        current.take();
+        if failed_transport.authentication_required() {
+            Self::mark_unhealthy(entry, &authentication_transport_error());
+        } else {
+            Self::mark_unhealthy(entry, failure);
+        }
+        true
     }
 
     // Guard scope is deliberate; tightening drops would change lock-hold semantics.
@@ -1733,10 +1791,24 @@ impl McpManager {
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
     ) -> bool {
+        Self::record_operational_success_in_generation(
+            entry,
+            transport,
+            transport.progress_generation(),
+        )
+    }
+
+    fn record_operational_success_in_generation(
+        entry: &Arc<ServerEntry>,
+        transport: &Arc<dyn McpTransport>,
+        generation: u64,
+    ) -> bool {
         let current = Self::lock(&entry.transport);
         if !current
             .as_ref()
             .is_some_and(|candidate| Arc::ptr_eq(candidate, transport))
+            || !transport.is_alive()
+            || transport.progress_generation() != generation
         {
             return false;
         }
@@ -1766,8 +1838,20 @@ impl McpManager {
                 if !Self::catalog_is_fresh(entry) {
                     return None;
                 }
-                let tools = Self::lock(&entry.tools_cache).clone()?.1;
-                Some((entry.config.name.clone(), tools))
+                // Bind the cloned snapshot to the current logical session
+                // while retaining transport -> cache publication lock order.
+                let current = Self::lock(&entry.transport);
+                let transport = current.as_ref()?;
+                let cache = Self::lock(&entry.tools_cache);
+                let (at, tools) = cache.as_ref()?;
+                if !transport.is_alive()
+                    || at.elapsed() > TOOL_CACHE_TTL
+                    || entry.tools_cache_generation.load(Ordering::Acquire)
+                        != transport.progress_generation()
+                {
+                    return None;
+                }
+                Some((entry.config.name.clone(), tools.clone()))
             })
             .collect()
     }
@@ -1848,9 +1932,7 @@ impl McpManager {
     // Guard scope is deliberate; tightening drops would change lock-hold semantics.
     #[allow(clippy::significant_drop_tightening)]
     fn invalidate_notified_catalog(entry: &ServerEntry, transport: &Arc<dyn McpTransport>) -> bool {
-        if !transport.take_tools_list_changed() {
-            return false;
-        }
+        let notified = transport.take_tools_list_changed();
         let current = Self::lock(&entry.transport);
         if !current
             .as_ref()
@@ -1858,13 +1940,22 @@ impl McpManager {
         {
             return false;
         }
-        Self::lock(&entry.tools_cache).take();
+        let mut cache = Self::lock(&entry.tools_cache);
+        let renewed = cache.is_some()
+            && entry.tools_cache_generation.load(Ordering::Acquire)
+                != transport.progress_generation();
+        if !notified && !renewed {
+            return false;
+        }
+        cache.take();
+        drop(cache);
         if matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. }) {
             *Self::lock(&entry.health) = ServerHealth::Ready { tools: 0 };
         }
         true
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn catalog_is_fresh(entry: &ServerEntry) -> bool {
         let Some(transport) = Self::lock(&entry.transport).clone() else {
             return false;
@@ -1873,8 +1964,20 @@ impl McpManager {
             return false;
         }
         Self::invalidate_notified_catalog(entry, &transport);
-        matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. })
-            && Self::lock(&entry.tools_cache)
+        let current = Self::lock(&entry.transport);
+        if !current
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &transport))
+        {
+            return false;
+        }
+        let ready = matches!(&*Self::lock(&entry.health), ServerHealth::Ready { .. });
+        let cache = Self::lock(&entry.tools_cache);
+        ready
+            && transport.is_alive()
+            && entry.tools_cache_generation.load(Ordering::Acquire)
+                == transport.progress_generation()
+            && cache
                 .as_ref()
                 .is_some_and(|(at, _)| at.elapsed() <= TOOL_CACHE_TTL)
     }
@@ -2114,6 +2217,7 @@ impl McpManager {
             connect_lane: Arc::new(asupersync::sync::Mutex::new(())),
             transport: Mutex::new(None),
             tools_cache: Mutex::new(None),
+            tools_cache_generation: AtomicU64::new(0),
             health: Mutex::new(ServerHealth::NotStarted),
             restarts: Mutex::new(RestartState::default()),
         });
@@ -2853,6 +2957,7 @@ mod tests {
                     description: String::new(),
                     input_schema: serde_json::json!({}),
                     output_schema: None,
+                    task_support: TaskSupport::Forbidden,
                 }],
             ));
             *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -3056,6 +3161,7 @@ mod tests {
                 description: String::new(),
                 input_schema: serde_json::json!({}),
                 output_schema: None,
+                task_support: TaskSupport::Forbidden,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -3398,6 +3504,7 @@ mod tests {
                         description: String::new(),
                         input_schema: serde_json::json!({}),
                         output_schema: None,
+                        task_support: TaskSupport::Forbidden,
                     }],
                 ));
                 *McpManager::lock(&contender_entry.health) = ServerHealth::Ready { tools: 1 };
@@ -3618,6 +3725,7 @@ mod tests {
                 description: String::new(),
                 input_schema: serde_json::json!({}),
                 output_schema: None,
+                task_support: TaskSupport::Forbidden,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
@@ -3880,6 +3988,7 @@ mod tests {
                 description: String::new(),
                 input_schema: serde_json::json!({}),
                 output_schema: None,
+                task_support: TaskSupport::Forbidden,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };

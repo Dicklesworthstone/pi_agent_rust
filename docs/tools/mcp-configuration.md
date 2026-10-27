@@ -130,13 +130,49 @@ execution directory and the exposed workspace. A prior acknowledgment must be
 renewed through the existing trust flow after this update; an acknowledgment
 from another project cannot authorize a new root even when server `cwd` is fixed.
 
-These connections advertise no sampling, elicitation, or task capabilities.
+Connections advertise task-aware result handling with `tasks: {}`. When the
+server negotiates MCP 2025-11-25 and task-augmented tool calls, mounted tools can
+wait for their remote task to finish within the original call deadline.
+Sampling and elicitation are not advertised.
 HTTP OAuth is available through the native authentication flow below.
 Configured authentication headers and credential references remain supported.
 
 Protocol references: [OMP v18.12.6 client](https://github.com/can1357/oh-my-pi/blob/v18.12.6/packages/coding-agent/src/mcp/client.ts),
 [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
 and [workspace roots](https://modelcontextprotocol.io/specification/2025-11-25/client/roots).
+
+## Task-augmented tools
+
+Pi supports the experimental
+[MCP 2025-11-25 task protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks)
+for mounted tool calls. The server must advertise
+`capabilities.tasks.requests.tools.call`. A tool's `execution.taskSupport`
+controls its invocation: `required` requires negotiated task support,
+`optional` uses tasks when available, and `forbidden` or an omitted field uses
+an ordinary call. A required task with no negotiated support fails before
+execution. An older protocol revision cannot enable tasks.
+
+No extra user command or model tool is required. Pi keeps the original
+`tools/call` pending after receiving a task receipt, polls `tasks/get`, and
+retrieves the actual tool output with `tasks/result`. An `input_required`
+status opens `tasks/result` immediately; it does not enable unsupported
+sampling or elicitation. Successful output still has to satisfy the tool's
+captured `outputSchema`. Task status and live progress use the existing
+tool-update callback; see [MCP progress](../mcp-progress.md).
+
+Polling, waiting, and result retrieval share the initiating call's deadline
+and cancellation owner. If cancellation is negotiated, abandoning a named
+task attempts a bounded `tasks/cancel` request for that exact task and session.
+Cancellation is best effort and does not prove the server stopped its effects.
+Pi does not cancel task creation with `notifications/cancelled`, replay the
+originating tool call, or move task identifiers into a replacement session.
+Tool catalogs and opaque pagination cursors are also bound to the session
+that advertised them, including ordinary calls on a task-capable connection.
+
+Tasks are scoped to a running tool invocation. Pi does not persist remote tasks
+for detached execution, list unrelated tasks, or resume them after restart.
+Native stdio, Streamable HTTP, and legacy SSE share this behavior when they
+negotiate the required protocol revision and capabilities.
 
 ## Legacy HTTP+SSE servers
 

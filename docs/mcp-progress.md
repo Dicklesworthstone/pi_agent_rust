@@ -19,8 +19,9 @@ The stdio reader and both Streamable HTTP SSE receive paths route validated
 connection. HTTP routing also uses the receiving stream's session generation;
 an old stream cannot publish into a replacement generation's subscription.
 If an HTTP session renews during a call, observation of the old generation stops.
-The existing HTTP renewal/result policy is unchanged; progress is not replayed
-or rebound to the replacement session automatically.
+Mounted calls and their admitted tool catalogs are bound to their original
+logical session; neither calls nor progress are replayed or rebound to a
+replacement session automatically.
 
 These are the MCP 2025-06-18 progress utility's request metadata and notification
 fields, not a new server capability negotiation:
@@ -73,7 +74,30 @@ existing callback to that operation automatically. Consumers can read
 `messageTruncated` and `deliveryLimited`. This data is informational, not a
 completion verdict or permission to execute another operation.
 
-## Validation status for this patch
+## Remote task status
+
+For a negotiated MCP 2025-11-25 task-augmented tool, the creation receipt is
+intermediate. Pi retains the original progress token while it polls the task
+and retrieves the final `tasks/result`. Only that underlying tool result
+completes the invocation, and normal output-schema validation still applies.
+Polling honors the server's interval with a 100 ms minimum; omitted intervals
+default to one second. Waiting never extends the original tool-call deadline.
+
+Changed task status and status messages produce advisory `ToolUpdate` values
+on the same calling task. `details.mcpTask` contains `status`, escaped
+`statusMessage`, `statusMessageTruncated`, and `deliveryLimited`. Status text
+uses the same 4,096-byte display bound as progress messages, and at most 128
+changed task statuses are delivered per invocation. Task identifiers are not
+included in these user-facing updates. A completed status still requires a
+valid final result; it does not itself authorize another operation.
+
+Task creation, polling, result retrieval, and cleanup retain the exact
+connection generation. Late results cannot replace a renewed session's catalog
+or retire that session. Cancellation uses a bounded `tasks/cancel` request when
+the server advertises it; it never uses the original creation request ID.
+See [task configuration and scope](tools/mcp-configuration.md#task-augmented-tools).
+
+## Validation status
 
 Nineteen Rust tests are authored, **not executed**. They cover correlation,
 HTTP generation isolation, malformed and duplicate updates, integer precision,
@@ -103,4 +127,14 @@ or deadline enforcement, or interoperability with a third-party MCP server.
 The required `dsr quality --tool pi_agent_rust` command could not start because
 `dsr` was absent (exit 127). Rust compilation, tests, rustfmt and Clippy remain
 unverified. Source/patch inspection is not a passing DSR gate. No workflow,
-dependency, Bead status or quality-gate configuration is changed by this patch.
+dependency, or quality-gate configuration was changed by that progress patch.
+
+The task extension adds protocol-validation, logical-session isolation, and
+native stdio/HTTP fixture regressions. They cover required/optional/forbidden
+negotiation, polling and immediate completion, `input_required`, task failures,
+original-token progress, malformed and miscorrelated replies, output-schema
+validation, session expiry without replay, cancellation, and deadline cleanup.
+Additional transport regressions cover legacy SSE task cancellation and queued
+requests that lose their logical session before dispatch. These Rust tests are
+authored but remain unexecuted until the required DSR quality run is available;
+source syntax and patch checks do not establish Rust type or runtime correctness.

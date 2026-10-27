@@ -260,6 +260,7 @@ fn mounted_tools_report_live_progress_over_stdio_and_http_without_changing_resul
             description: "Work".to_string(),
             input_schema: json!({"type":"object"}),
             output_schema: None,
+            task_support: TaskSupport::Forbidden,
         };
         let tool = McpTool::new("progress", &meta, Arc::clone(&manager));
         let runtime = runtime();
@@ -380,6 +381,8 @@ fn continuous_progress_does_not_restart_the_manager_deadline() {
                 &json!({}),
                 Duration::from_millis(250),
                 contract.output_schema,
+                contract.task_support,
+                contract.transport_generation,
                 Some(&callback),
             )
             .await;
@@ -418,6 +421,7 @@ fn a_live_progress_callback_can_cancel_its_native_call_without_replay() {
         description: "Work".to_string(),
         input_schema: json!({"type":"object"}),
         output_schema: None,
+        task_support: TaskSupport::Forbidden,
     };
     let tool = McpTool::new("progress", &meta, Arc::clone(&manager));
     runtime.block_on(owner.with_current(async {

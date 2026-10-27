@@ -570,6 +570,7 @@ fn queued_trust_deny_and_logout_act_on_the_repaired_entry_and_its_live_catalog()
                 super::super::McpToolMeta {
                     name:"echo".to_string(), description:String::new(),
                     input_schema:json!({"type":"object"}), output_schema:None,
+                    task_support:crate::mcp::tasks::TaskSupport::Forbidden,
                 },
             ]));
             *McpManager::lock(&current.health) = ServerHealth::Ready { tools:1 };

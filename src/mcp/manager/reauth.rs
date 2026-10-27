@@ -141,6 +141,7 @@ impl Repair {
                 connect_lane: Arc::clone(&entry.connect_lane),
                 transport: Mutex::new(None),
                 tools_cache: Mutex::new(None),
+                tools_cache_generation: std::sync::atomic::AtomicU64::new(0),
                 health: Mutex::new(ServerHealth::NotStarted),
                 restarts: Mutex::new(RestartState::default()),
             });

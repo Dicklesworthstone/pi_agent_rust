@@ -21,11 +21,13 @@ use super::super::{auth, config, manager};
 use super::{
     ClientRoots, DEFAULT_MCP_TIMEOUT, HTTP_CANCEL_TIMEOUT, HttpTransport, MAX_HTTP_BODY,
     McpTransport, RequestDispatch, is_server_error, redacted_origin, reject_authentication_status,
+    request_allows_cancellation_notification, spawn_task_cleanup, task_cleanup_has_authority,
     tool_err, validate_initialize_result, validate_jsonrpc_response, validate_outgoing_params,
 };
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{CompletionWaitError, await_completion};
 use crate::mcp::progress::ProgressRegistry;
+use crate::mcp::tasks::TaskCapabilities;
 
 const MAX_SERVER_REPLIES: usize = 8;
 const MAX_ENDPOINT_BYTES: usize = 16 * 1024;
@@ -53,6 +55,7 @@ struct SseState {
     progress: Arc<ProgressRegistry>,
     roots: ClientRoots,
     tools_list_changed: AtomicBool,
+    task_capabilities: Mutex<TaskCapabilities>,
 }
 
 struct SsePending {
@@ -120,6 +123,7 @@ impl SseTransport {
                 progress: Arc::new(ProgressRegistry::default()),
                 roots: ClientRoots::default(),
                 tools_list_changed: AtomicBool::new(false),
+                task_capabilities: Mutex::new(TaskCapabilities::default()),
             }),
             lane: Arc::new(asupersync::sync::Mutex::new(())),
         })
@@ -806,6 +810,42 @@ impl McpTransport for SseTransport {
         self.state.roots.capabilities()
     }
 
+    fn task_capabilities(&self) -> TaskCapabilities {
+        *lock(&self.state.task_capabilities)
+    }
+
+    fn record_initialize_result(&self, result: &Value) -> Result<()> {
+        validate_initialize_result(result)?;
+        *lock(&self.state.task_capabilities) = TaskCapabilities::from_initialize(result)?;
+        Ok(())
+    }
+
+    fn cancel_task(&self, task_id: &str, generation: u64) {
+        if generation != 0
+            || !self.task_capabilities().cancel
+            || !task_cleanup_has_authority(task_id)
+            || self.state.endpoint.get().is_none()
+        {
+            return;
+        }
+        let Ok(id) = self
+            .state
+            .next_id
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        else {
+            return;
+        };
+        let frame = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tasks/cancel",
+            "params": {"taskId": task_id},
+        });
+        // The immutable endpoint and auth binding are owned by this connection,
+        // so cleanup cannot address a replacement transport or refresh a grant.
+        // Its eventual SSE reply is not interpreted as an acknowledged outcome.
+        let state = Arc::clone(&self.state);
+        spawn_task_cleanup(async move { state.post(&frame, HTTP_CANCEL_TIMEOUT, None, false).await });
+    }
+
     fn progress_registry(&self) -> Option<&Arc<ProgressRegistry>> {
         Some(&self.state.progress)
     }
@@ -849,7 +889,7 @@ impl McpTransport for SseTransport {
                 let mut pending = PendingSseRequest::new(
                     Arc::clone(&self.state),
                     Arc::clone(&dispatch),
-                    method != "initialize",
+                    request_allows_cancellation_notification(method, &params),
                 );
                 // exchange races only its connect and POST against abort.
                 let result =
@@ -861,7 +901,7 @@ impl McpTransport for SseTransport {
                 match result {
                     Ok(value) => {
                         if method == "initialize" {
-                            validate_initialize_result(&value)?;
+                            self.record_initialize_result(&value)?;
                         }
                         pending.disarm();
                         Ok(value)
@@ -1311,6 +1351,71 @@ mod tests {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime")
+    }
+
+    #[test]
+    fn task_cleanup_retains_the_legacy_endpoint_and_owner_after_abort() {
+        let fixture = Fixture::start(Mode::Working);
+        let transport = SseTransport::new(
+            &fixture.url(),
+            vec![("Authorization".into(), "Bearer original".into())],
+        )
+        .expect("transport");
+        // Cleanup needs only the immutable endpoint learned by this connection;
+        // it cannot reconnect a GET reader or discover a replacement endpoint.
+        transport
+            .state
+            .endpoint
+            .set(format!("http://{}/original-messages", fixture.addr))
+            .expect("original endpoint");
+        let mut handshake = initialized(Value::Null)["result"].clone();
+        handshake["capabilities"]["tasks"] = json!({
+            "requests": {"tools": {"call": {}}}, "cancel": {},
+        });
+        transport
+            .record_initialize_result(&handshake)
+            .expect("legacy handshake");
+        assert_eq!(transport.task_capabilities(), TaskCapabilities::default());
+        let runtime = runtime();
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(owner.with_current(async {
+            transport.cancel_task("old-protocol", 0);
+            handshake["protocolVersion"] = json!("2025-11-25");
+            transport
+                .record_initialize_result(&handshake)
+                .expect("task-capable handshake");
+            {
+                let _restricted = owner
+                    .cx()
+                    .restrict::<asupersync::cx::cap::None>()
+                    .set_current_restricted();
+                transport.cancel_task("forbidden", 0);
+            }
+            transport.cancel_task("wrong-generation", 1);
+            transport.cancel_task("owned", 0);
+            transport.abort();
+            for _ in 0..200 {
+                if !fixture.captured().is_empty() {
+                    break;
+                }
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(10),
+                )
+                .await;
+            }
+        }));
+        let requests = fixture.captured();
+        assert_eq!(requests.len(), 1, "only the admitted cleanup POST is sent");
+        assert!(requests[0].line.starts_with("POST /original-messages "));
+        assert_eq!(requests[0].body["method"], "tasks/cancel");
+        assert_eq!(requests[0].body["params"], json!({"taskId":"owned"}));
+        assert!(requests[0].body["id"].is_number());
+        assert!(requests[0].headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Authorization") && value == "Bearer original"
+        }));
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod config;
 mod content;
 pub mod manager;
 pub mod progress;
+pub mod tasks;
 pub mod transport;
 pub mod trust;
 mod uri_template;

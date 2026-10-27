@@ -10,6 +10,7 @@ use super::{
 };
 use crate::agent_cx::AgentCx;
 use crate::mcp::progress::{self, ProgressSubscription};
+use crate::mcp::tasks::TaskSupport;
 use crate::mcp::transport::RequestDispatch;
 use crate::tools::ToolUpdate;
 use std::future::{Future, poll_fn};
@@ -22,6 +23,11 @@ use super::DEFAULT_MCP_TIMEOUT;
 
 #[cfg(all(test, unix))]
 mod progress_tests;
+
+#[cfg(all(test, unix))]
+mod task_tests;
+
+mod tasks;
 
 /// Setup and recovery include more than JSON-RPC requests: lock admission,
 /// secret resolution, initialization notifications and receive activation can
@@ -159,13 +165,19 @@ struct ToolCallGuard {
     entry: Arc<ServerEntry>,
     transport: Arc<dyn McpTransport>,
     dispatch: Arc<RequestDispatch>,
+    generation: u64,
     armed: bool,
 }
 
 impl ToolCallGuard {
     fn retire(&mut self, error: &Error) {
         if self.armed {
-            McpManager::detach_failed_call_transport(&self.entry, &self.transport, error);
+            McpManager::detach_failed_call_transport_in_generation(
+                &self.entry,
+                &self.transport,
+                self.generation,
+                error,
+            );
             self.armed = false;
         }
     }
@@ -231,6 +243,8 @@ fn is_cancelled(error: &Error) -> bool {
 struct ToolCallContract {
     input_schema: Value,
     output_schema: Option<super::McpOutputSchema>,
+    task_support: TaskSupport,
+    transport_generation: u64,
 }
 
 impl std::fmt::Debug for ToolCallContract {
@@ -263,6 +277,15 @@ fn contract_for_call(
         ));
     }
     let cache = McpManager::lock(&entry.tools_cache);
+    let transport_generation = entry
+        .tools_cache_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    if transport.progress_generation() != transport_generation {
+        return Err(tool_err(
+            "MCP_CATALOG_UNAVAILABLE",
+            "tool metadata belongs to an expired protocol session; the call was not sent",
+        ));
+    }
     let (_, tools) = cache.as_ref().ok_or_else(|| {
         tool_err(
             "MCP_CATALOG_UNAVAILABLE",
@@ -281,6 +304,8 @@ fn contract_for_call(
     Ok(ToolCallContract {
         input_schema: metadata.input_schema.clone(),
         output_schema: metadata.output_schema.clone(),
+        task_support: metadata.task_support,
+        transport_generation,
     })
 }
 
@@ -368,14 +393,11 @@ impl McpManager {
                         "the connection disappeared before tools/call was dispatched",
                     )
                 })?;
-                Self::invalidate_notified_catalog(entry, &transport);
                 let catalog_is_fresh = publication
                     .original
                     .as_ref()
                     .is_some_and(|original| Arc::ptr_eq(original, &transport))
-                    && Self::lock(&entry.tools_cache)
-                        .as_ref()
-                        .is_some_and(|(at, _)| at.elapsed() <= super::TOOL_CACHE_TTL);
+                    && Self::catalog_is_fresh(entry);
                 if !catalog_is_fresh {
                     self.list_and_cache_tools_in_lane(entry).await?;
                 }
@@ -450,6 +472,8 @@ impl McpManager {
                         &arguments,
                         timeout,
                         contract.output_schema,
+                        contract.task_support,
+                        contract.transport_generation,
                         on_update.as_deref(),
                     )
                     .await
@@ -463,7 +487,12 @@ impl McpManager {
                             &owner,
                             async {
                                 Ok(self
-                                    .recover_after_indeterminate_call(&entry, &transport, &error)
+                                    .recover_after_indeterminate_call(
+                                        &entry,
+                                        &transport,
+                                        contract.transport_generation,
+                                        &error,
+                                    )
                                     .await)
                             },
                             deadline,
@@ -510,8 +539,18 @@ impl McpManager {
         arguments: &Value,
         timeout: Duration,
     ) -> Result<Value> {
-        self.execute_tool_call(entry, transport, tool, arguments, timeout, None, None)
-            .await
+        self.execute_tool_call(
+            entry,
+            transport,
+            tool,
+            arguments,
+            timeout,
+            None,
+            TaskSupport::Forbidden,
+            transport.progress_generation(),
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -523,6 +562,8 @@ impl McpManager {
         arguments: &Value,
         timeout: Duration,
         output_schema: Option<super::McpOutputSchema>,
+        task_support: TaskSupport,
+        expected_generation: u64,
         on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
@@ -547,9 +588,19 @@ impl McpManager {
                 "MCP_TRANSPORT_UNAVAILABLE",
                 "connection closed before tools/call dispatch; the call was not sent",
             );
-            Self::detach_failed_call_transport(entry, transport, &error);
+            Self::detach_failed_call_transport_in_generation(
+                entry,
+                transport,
+                expected_generation,
+                &error,
+            );
             return Err(error);
         }
+
+        // A required task cannot be downgraded to a synchronous call. Capture
+        // both negotiation and logical-session generation before dispatch.
+        let task_execution =
+            tasks::Execution::capture(transport, task_support, expected_generation)?;
 
         // The contract was captured in the setup lane. Never re-read the
         // mutable catalog here or after dispatch: a refresh may have cleared it.
@@ -557,12 +608,13 @@ impl McpManager {
             entry: Arc::clone(entry),
             transport: Arc::clone(transport),
             dispatch: Arc::new(RequestDispatch::new()),
+            generation: expected_generation,
             armed: true,
         };
         let progress = on_update
             .and_then(|_| transport.progress_registry())
             .and_then(|registry| {
-                registry.subscribe(Arc::clone(&guard.dispatch), transport.progress_generation())
+                registry.subscribe(Arc::clone(&guard.dispatch), expected_generation)
             });
         let generation = progress.as_ref().map(ProgressSubscription::generation);
         let mut params = serde_json::json!({"name": tool, "arguments": arguments});
@@ -573,11 +625,15 @@ impl McpManager {
         let result = catalog::operation_with_owner(
             &owner,
             progress::observe(
-                transport.request_with_dispatch(
-                    "tools/call",
+                task_execution.run(
+                    self,
+                    &owner,
+                    entry,
+                    transport,
                     params,
                     timeout,
                     Arc::clone(&guard.dispatch),
+                    on_update,
                 ),
                 progress,
                 on_update,
@@ -597,7 +653,9 @@ impl McpManager {
         .and_then(std::convert::identity);
         // Retire cancellation and timeout before any asynchronous revocation
         // cleanup. An uncooperative close must not delay owner cancellation.
-        if !is_current(entry, transport) {
+        if !is_current(entry, transport)
+            || transport.progress_generation() != expected_generation
+        {
             return Err(superseded_call());
         }
         if let Err(error) = catalog::check_request_owner(&owner) {
@@ -691,7 +749,7 @@ impl McpManager {
         // This generation-checked operation is the success linearization
         // point. Ignoring its bool would let an old response escape during a
         // concurrent reconnect and reset the replacement's failure budget.
-        if !Self::record_operational_success(entry, transport) {
+        if !Self::record_operational_success_in_generation(entry, transport, expected_generation) {
             return Err(superseded_call());
         }
         guard.armed = false;
@@ -704,7 +762,7 @@ impl McpManager {
 mod tests {
     use std::future::{Future, poll_fn};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
     use asupersync::{Budget, Cx};
@@ -723,6 +781,7 @@ mod tests {
         requests: Mutex<Vec<(String, Value)>>,
         pending: AtomicBool,
         closed: AtomicBool,
+        generation: AtomicU64,
         hook: Mutex<Option<Arc<DispatchHook>>>,
     }
 
@@ -733,6 +792,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 pending: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
                 hook: Mutex::new(None),
             }
         }
@@ -740,6 +800,10 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for CallTransport {
+        fn progress_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+
         async fn request(&self, method: &str, params: Value, _timeout: Duration) -> Result<Value> {
             assert_eq!(
                 method, "tools/call",
@@ -883,6 +947,64 @@ mod tests {
             .expect("runtime")
     }
 
+    #[test]
+    fn captured_tool_contract_cannot_dispatch_after_logical_session_renewal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, Ok(json!({"content":[]})));
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let contract = contract_for_call(&entry, &erased, "execute").unwrap();
+        assert_eq!(contract.transport_generation, 0);
+        transport.generation.store(1, Ordering::Release);
+
+        let error = contract_for_call(&entry, &erased, "execute")
+            .expect_err("old catalog must not supply a new call contract");
+        assert!(error.to_string().contains("MCP_CATALOG_UNAVAILABLE"));
+        runtime()
+            .block_on(manager.execute_tool_call(
+                &entry,
+                &erased,
+                "execute",
+                &json!({}),
+                DEFAULT_MCP_TIMEOUT,
+                contract.output_schema,
+                contract.task_support,
+                contract.transport_generation,
+                None,
+            ))
+            .expect_err("a previously captured contract cannot cross sessions");
+        assert!(McpManager::lock(&transport.requests).is_empty());
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+    }
+
+    #[test]
+    fn an_old_call_result_and_recovery_preserve_a_newer_logical_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(&temp, Ok(json!({"content":[]})));
+        McpManager::lock(&entry.restarts).count = 2;
+        let weak_entry = Arc::downgrade(&entry);
+        let weak_transport = Arc::downgrade(&transport);
+        *McpManager::lock(&transport.hook) = Some(Arc::new(move || {
+            let entry = weak_entry.upgrade().expect("live entry");
+            let transport = weak_transport.upgrade().expect("live transport");
+            let _current = McpManager::lock(&entry.transport);
+            let mut cache = McpManager::lock(&entry.tools_cache);
+            transport.generation.store(1, Ordering::Release);
+            entry.tools_cache_generation.store(1, Ordering::Release);
+            cache.as_mut().unwrap().1[0].description = "new session catalog".to_string();
+        }));
+        let error = runtime()
+            .block_on(manager.call_tool("exec", "execute", json!({})))
+            .expect_err("a late old-session result is not an admitted success");
+        assert!(error.to_string().contains("MCP_DELIVERY_INDETERMINATE"));
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
+        assert!(!transport.closed.load(Ordering::Acquire));
+        assert_eq!(McpManager::lock(&entry.restarts).count, 2);
+        let mounted = manager.mounted_tool_metas();
+        assert_eq!(mounted.len(), 1);
+        assert_eq!(mounted[0].1[0].description, "new session catalog");
+    }
+
     fn install(entry: &Arc<ServerEntry>, transport: &Arc<CallTransport>, name: &str) {
         let erased: Arc<dyn McpTransport> = transport.clone();
         *McpManager::lock(&entry.transport) = Some(erased);
@@ -893,6 +1015,7 @@ mod tests {
                 description: String::new(),
                 input_schema: json!({"type": "object"}),
                 output_schema: None,
+                task_support: TaskSupport::Forbidden,
             }],
         ));
         *McpManager::lock(&entry.health) = ServerHealth::Ready { tools: 1 };
