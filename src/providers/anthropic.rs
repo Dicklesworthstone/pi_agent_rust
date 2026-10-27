@@ -1285,7 +1285,7 @@ enum AnthropicToolResultContent<'a> {
 struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
-    input_schema: &'a serde_json::Value,
+    input_schema: Cow<'a, serde_json::Value>,
     /// Prompt-cache breakpoint. Set on the LAST tool only: Anthropic caches
     /// everything up to and including a marked block, so one marker covers
     /// the whole tools array.
@@ -1575,7 +1575,7 @@ fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
     AnthropicTool {
         name: &tool.name,
         description: &tool.description,
-        input_schema: &tool.parameters,
+        input_schema: super::tool_schema::anthropic_tool_schema(&tool.parameters),
         cache_control: None,
     }
 }
@@ -1807,6 +1807,59 @@ mod tests {
                 "required": ["text"]
             })
         );
+    }
+
+    #[test]
+    fn build_request_projects_root_tool_variants_without_changing_the_tool_contract() {
+        let parameters = json!({
+            "oneOf": [
+                {
+                    "type":"object",
+                    "properties":{"action":{"const":"read"},"path":{"type":"string"}},
+                    "required":["action","path"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties":{"action":{"const":"list"},"recursive":{"type":"boolean"}},
+                    "required":["action"],
+                    "additionalProperties":false
+                }
+            ]
+        });
+        let context = Context::owned(
+            None,
+            vec![],
+            vec![ToolDef {
+                name: "workspace".to_string(),
+                description: "Read or list the workspace.".to_string(),
+                parameters: parameters.clone(),
+            }],
+        );
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+        let provider = AnthropicProvider::new("claude-test");
+        let request = provider.build_request(&context, &options);
+        let body = serde_json::to_value(&request).expect("serialize request");
+        let schema = &body["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(schema["properties"]["recursive"]["type"], "boolean");
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(context.tools[0].parameters, parameters);
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&context.tools[0].parameters)
+            .expect("original tool contract");
+        assert!(validator.is_valid(&json!({"action":"read","path":"src/lib.rs"})));
+        assert!(!validator.is_valid(&json!({"action":"read","recursive":true})));
     }
 
     #[test]

@@ -32,6 +32,34 @@ This rule is guarded by `tests/traceability_staleness.rs::native_provider_module
 
 Extension-provided providers route through the extension provider bridge in `src/providers/mod.rs`; they are intentionally excluded from the native module count because they are discovered at runtime.
 
+## Tool Schema Handling
+
+Anthropic Messages requests project root `anyOf`, `oneOf`, and `allOf`
+object variants into an object schema. Union variants share only their common
+required fields; intersections combine their required fields. The request
+preserves the original combination as a description hint, and the tool's
+original schema remains unchanged for local argument validation. Schemas with
+references into the root combination, named local anchors, or URI-encoded local
+references are passed through unchanged because projection would require full
+reference resolution. This is a focused adaptation, not a complete JSON Schema
+converter.
+
+OpenAI Codex Responses requests make omitted array `items` explicit as `true`,
+including nested arrays, nullable arrays, and prefix-only tuples, and send
+`strict: false` for repaired tools. This keeps those arrays open. If
+`unevaluatedItems` occurs in any schema position, Pi leaves the entire tool
+schema unchanged so the repair cannot weaken evaluation constraints across
+references. Literal values under `const`, `enum`, `default`, and `examples`
+are untouched. Other Responses routes retain their original schemas because
+some local grammar backends reject boolean item schemas.
+
+These adaptations address the [Anthropic root-schema](https://github.com/can1357/oh-my-pi/pull/16633)
+and [Codex array-schema](https://github.com/can1357/oh-my-pi/pull/16886)
+issues fixed in OMP v18.13.0. The request paths and regression cases live in
+[`src/providers/tool_schema.rs`](../src/providers/tool_schema.rs),
+[`anthropic.rs`](../src/providers/anthropic.rs), and
+[`openai_responses.rs`](../src/providers/openai_responses.rs).
+
 ## Implementation Modes
 
 | Mode | Meaning |

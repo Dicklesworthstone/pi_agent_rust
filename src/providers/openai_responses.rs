@@ -138,7 +138,7 @@ impl OpenAIResponsesProvider {
                 context
                     .tools
                     .iter()
-                    .map(convert_tool_to_openai_responses)
+                    .map(|tool| convert_tool_to_openai_responses(tool, self.codex_mode))
                     .collect(),
             )
         };
@@ -2112,9 +2112,19 @@ struct OpenAIResponsesTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
-fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
+fn convert_tool_to_openai_responses(tool: &ToolDef, codex_mode: bool) -> OpenAIResponsesTool {
+    let parameters = if codex_mode {
+        super::tool_schema::codex_tool_schema(&tool.parameters)
+    } else {
+        std::borrow::Cow::Borrowed(&tool.parameters)
+    };
+    // An open item schema is intentional. Do not let Responses' implicit
+    // strict adaptation close it or make optional arguments mandatory.
+    let strict = matches!(parameters, std::borrow::Cow::Owned(_)).then_some(false);
     OpenAIResponsesTool {
         r#type: "function",
         name: tool.name.clone(),
@@ -2123,7 +2133,8 @@ fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
         } else {
             Some(tool.description.clone())
         },
-        parameters: tool.parameters.clone(),
+        parameters: parameters.into_owned(),
+        strict,
     }
 }
 
@@ -2826,6 +2837,74 @@ mod tests {
             "non-reasoning model must not send a reasoning field"
         );
         assert!(value.get("include").is_none());
+    }
+
+    #[test]
+    fn build_request_repairs_itemless_arrays_only_for_codex() {
+        let parameters = json!({
+            "type":"object",
+            "properties":{
+                "listeners":{"type":"array"},
+                "row":{"type":"array","prefixItems":[{"type":"string"}]},
+                "example":{"const":{"type":"array"}}
+            },
+            "required":["listeners"]
+        });
+        let context = Context::owned(
+            None,
+            vec![],
+            vec![ToolDef {
+                name: "yield_result".to_string(),
+                description: "Return structured results.".to_string(),
+                parameters: parameters.clone(),
+            }],
+        );
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-test").with_codex_mode(codex_mode);
+            let body =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .expect("serialize request");
+            let tool = &body["tools"][0];
+            if codex_mode {
+                assert_eq!(tool["parameters"]["properties"]["listeners"]["items"], true);
+                assert_eq!(tool["parameters"]["properties"]["row"]["items"], true);
+                assert_eq!(tool["strict"], false);
+            } else {
+                assert_eq!(tool["parameters"], parameters);
+                assert!(tool.get("strict").is_none());
+            }
+            assert_eq!(
+                tool["parameters"]["properties"]["example"],
+                parameters["properties"]["example"]
+            );
+            assert_eq!(context.tools[0].parameters, parameters);
+        }
+    }
+
+    #[test]
+    fn codex_request_keeps_unevaluated_item_constraints_unchanged() {
+        let parameters = json!({
+            "type":"object",
+            "properties":{
+                "row":{"type":"array","prefixItems":[{"type":"string"}],"unevaluatedItems":false},
+                "other":{"type":"array"}
+            }
+        });
+        let context = Context::owned(
+            None,
+            vec![],
+            vec![ToolDef {
+                name: "tuple".to_string(),
+                description: "Return a tuple.".to_string(),
+                parameters: parameters.clone(),
+            }],
+        );
+        let provider = OpenAIResponsesProvider::new("gpt-test").with_codex_mode(true);
+        let body =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+        assert_eq!(body["tools"][0]["parameters"], parameters);
+        assert!(body["tools"][0].get("strict").is_none());
     }
 
     fn reasoning_test_context() -> Context<'static> {

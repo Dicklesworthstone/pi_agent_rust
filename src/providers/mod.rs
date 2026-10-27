@@ -40,6 +40,7 @@ pub mod gitlab;
 pub mod model_fetch;
 pub mod openai;
 pub mod openai_responses;
+mod tool_schema;
 pub mod vertex;
 
 pub use model_fetch::{
