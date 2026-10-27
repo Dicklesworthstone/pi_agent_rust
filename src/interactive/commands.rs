@@ -3620,31 +3620,90 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// written to the session JSONL: the call builds a throwaway message
     /// list that shares nothing with the session writer.
     pub(super) fn handle_slash_btw(&mut self, args: &str) -> Option<Cmd> {
+        if self.start_side_question(args, None) {
+            self.history.push(format!("/btw {}", args.trim()));
+            self.clear_side_question_input();
+        }
+        None
+    }
+
+    /// A file command with `side: true` never enters the main input queues,
+    /// even when its side client is unavailable or its expansion is empty.
+    pub(super) fn submit_side_template(&mut self, input: &str) -> bool {
+        let invocation = match SlashCommand::parse(input) {
+            Some((SlashCommand::Template, args)) => {
+                let args = args.trim();
+                let (name, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                let name = name.trim_start_matches('/');
+                if name.is_empty() {
+                    return false;
+                }
+                Some(format!("/{name} {rest}"))
+            }
+            Some(_) => return false,
+            None => None,
+        };
+        let command = invocation.as_deref().unwrap_or(input);
+        let name = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('/');
+        if self
+            .extensions
+            .as_ref()
+            .is_some_and(|manager| manager.has_command(name))
+        {
+            return false;
+        }
+        let Some(question) = self.resources.expand_side_prompt(command) else {
+            return false;
+        };
+        if self.start_side_question(&question, Some(input)) {
+            self.history.push(input.to_string());
+            self.clear_side_question_input();
+        }
+        true
+    }
+
+    fn clear_side_question_input(&mut self) {
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.set_input_height(3);
+        self.input.focus();
+    }
+
+    /// Returns whether a side request was admitted, so refusals retain the
+    /// editor draft. Its title is display-only; the provider sees the expanded
+    /// question and screened context, never another authored main-agent turn.
+    fn start_side_question(&mut self, args: &str, title: Option<&str>) -> bool {
+        let label = title.unwrap_or("/btw").to_string();
         let Some(client) = self.btw_client.clone() else {
-            self.status_message = Some(
-                "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)"
-                    .to_string(),
-            );
+            self.status_message = Some(format!(
+                "{label} unavailable: no smol role model configured (set --smol or model_roles.smol)"
+            ));
             self.scroll_to_bottom();
-            return None;
+            return false;
         };
         let question = args.trim().to_string();
         if question.is_empty() {
-            self.status_message = Some("Usage: /btw <question>".to_string());
+            self.status_message = Some(title.map_or_else(
+                || "Usage: /btw <question>".to_string(),
+                |title| format!("{title}: template expansion produced empty output"),
+            ));
             self.scroll_to_bottom();
-            return None;
+            return false;
         }
         if question
             .len()
             .saturating_add(pi::btw::BTW_SYSTEM_PROMPT.len())
             > pi::text_completion::MAX_INPUT_BYTES
         {
-            self.status_message = Some(
-                "/btw refused: PI_AUXILIARY_INPUT_LIMIT: side question exceeds the privacy scan budget"
-                    .to_string(),
-            );
+            self.status_message = Some(format!(
+                "{label} refused: PI_AUXILIARY_INPUT_LIMIT: side question exceeds the privacy scan budget"
+            ));
             self.scroll_to_bottom();
-            return None;
+            return false;
         }
         // Screen complete source fields and the question before clipping;
         // a busy agent defers preparation until its remembered credentials
@@ -3658,9 +3717,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let request = match prepared {
             Some(Ok(request)) => Some(request),
             Some(Err(err)) => {
-                self.status_message = Some(format!("/btw refused: {err}"));
+                self.status_message = Some(format!("{label} refused: {err}"));
                 self.scroll_to_bottom();
-                return None;
+                return false;
             }
             None => None,
         };
@@ -3672,24 +3731,24 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             |session| (session.header.id.clone(), false),
         );
         if session_busy {
-            self.status_message = Some("/btw unavailable: session is busy".to_string());
+            self.status_message = Some(format!("{label} unavailable: session is busy"));
             self.scroll_to_bottom();
-            return None;
+            return false;
         }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
             content: if agent_busy {
-                format!("(/btw) {question} — queued until the current turn finishes")
+                format!("({label}) {question} — queued until the current turn finishes")
             } else {
-                format!("(/btw) {question}")
+                format!("({label}) {question}")
             },
             thinking: None,
             collapsed: false,
         });
         self.status_message = Some(if agent_busy {
-            "(/btw) waiting for the current turn...".to_string()
+            format!("({label}) waiting for the current turn...")
         } else {
-            "(/btw) thinking...".to_string()
+            format!("({label}) thinking...")
         });
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
@@ -3720,8 +3779,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             // reset live agent state (Idle + dropped abort handle), while an
             // answer landing after a session switch must be discarded.
             let message = match result {
-                Ok(answer) => format!("(/btw) {answer}"),
-                Err(err) => format!("(/btw) failed: {err}"),
+                Ok(answer) => format!("({label}) {answer}"),
+                Err(err) => format!("({label}) failed: {err}"),
             };
             let msg = PiMsg::SessionSystemNote {
                 owner_session_id,
@@ -3730,7 +3789,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             let _ = crate::interactive::enqueue_pi_event(&event_tx, &Cx::for_request(), msg).await;
         });
         self.scroll_to_bottom();
-        None
+        true
     }
 
     fn completed_tan_event(

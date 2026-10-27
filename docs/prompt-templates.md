@@ -40,6 +40,40 @@ Arguments are split on spaces; single or double quotes keep arguments together:
 /review "src/main.rs src/lib.rs" --strict
 ```
 
+## Side Commands
+
+Set the top-level Boolean `side: true` to answer a template through the same
+ephemeral side-question workflow as `/btw` in either terminal interface. For
+example, save `.pi/prompts/sitrep.md`:
+
+```markdown
+---
+description: Summarize current progress
+side: true
+---
+Summarize the current work and the next decision. $ARGUMENTS
+```
+
+Invoke `/sitrep`, `/sitrep "focus on retry behavior"`, or
+`/template sitrep "focus on retry behavior"`. The template expands arguments
+normally, and its answer is labelled with the command you typed. The command
+is available in editor recall, but the question and answer are display-only:
+they do not enter the main model's conversation, steering queue, or saved
+session transcript. The side request uses the configured smol model
+(`--smol` or `model_roles.smol`), shares `/btw`'s privacy screening, and has no
+tools. Requests made during a turn wait for its live context and privacy state
+to become available.
+
+If the side model is unavailable, or the expanded question is empty or too
+large, Pi retains the editor draft and shows an error. It never sends a
+rejected side command as an ordinary prompt. Native and extension commands
+retain ownership of their names; use a distinct template name to avoid a
+collision. `/reload` refreshes both the template body and its side setting.
+
+Only a Boolean `true` enables this behavior; quoted `"true"`, `false`, and
+omitted `side` fields do not. Outside interactive mode, the same file remains
+an ordinary prompt template and expands through the normal prompt path.
+
 ## Expansion Syntax
 
 Templates support bash-like variable expansion:

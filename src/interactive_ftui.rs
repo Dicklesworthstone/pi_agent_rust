@@ -1649,6 +1649,8 @@ pub enum UiCommand {
     /// questions to the session that was visible when they were submitted.
     Btw {
         question: String,
+        /// Authored command label for a `side: true` prompt template.
+        title: Option<String>,
         owner_session_id: String,
     },
     /// `/fresh`: reset provider stream state (new stream session id and
@@ -2150,6 +2152,7 @@ async fn reload_driver_resources(
     catalog: &mut AutocompleteCatalog,
     agent_tx: &Sender<PiMsg>,
 ) {
+    let mut reloaded = None;
     match crate::resources::ResourceLoader::load(
         &source.package_manager,
         cwd,
@@ -2160,6 +2163,7 @@ async fn reload_driver_resources(
     {
         Ok(loader) => {
             *catalog = AutocompleteCatalog::from_resources(&loader);
+            reloaded = Some(Box::new(loader.clone()));
             *resources = Some(loader);
         }
         Err(err) => {
@@ -2171,7 +2175,14 @@ async fn reload_driver_resources(
     // The extension session has already been replaced even if loading a
     // skill or prompt fails. Never keep its old command registrations.
     catalog.extension_commands = extension_commands;
-    let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog.clone()));
+    let update = reloaded.map_or_else(
+        || PiMsg::AutocompleteCatalog(catalog.clone()),
+        |resources| PiMsg::ResourcesReloaded {
+            resources,
+            catalog: catalog.clone(),
+        },
+    );
+    let _ = agent_tx.send(update);
 }
 
 /// Publish registrations from the live session, including an empty set when
@@ -3056,6 +3067,7 @@ impl PiFtuiModel {
                 msg,
                 PiMsg::AutocompleteRefresh
                     | PiMsg::AutocompleteCatalog(_)
+                    | PiMsg::ResourcesReloaded { .. }
                     | PiMsg::SystemNote(_)
                     | PiMsg::ToolStart { .. }
                     | PiMsg::ToolInvocation { .. }
@@ -3353,6 +3365,13 @@ impl PiFtuiModel {
                 self.autocomplete.provider.set_catalog(catalog);
                 self.autocomplete.close();
             }
+            PiMsg::ResourcesReloaded { resources, catalog } => {
+                self.steer_resources = Some(*resources);
+                self.extension_commands
+                    .clone_from(&catalog.extension_commands);
+                self.autocomplete.provider.set_catalog(catalog);
+                self.autocomplete.close();
+            }
             PiMsg::TerminalTitle(title) => {
                 // Issue #200: the cell-grid renderer can't carry OSC escapes
                 // in frame content, so write the title directly. This runs on
@@ -3588,10 +3607,16 @@ impl PiFtuiModel {
             );
             return;
         }
-        // /btw is the one command meant for mid-turn use.
+        // Side questions and side templates can be requested mid-turn.
         if let Some(question) = strip_command(&clean, "/btw") {
             let question = question.trim().to_string();
             self.queue_btw(&question);
+            return;
+        }
+        if let Some(question) = self.side_template_question(&clean) {
+            if self.queue_side_question(&question, Some(&clean)) {
+                self.record_history(&clean);
+            }
             return;
         }
         // OMP /queue <message>: a follow-up for after the agent yields, the
@@ -3673,13 +3698,78 @@ impl PiFtuiModel {
     /// vault. Sending directly while a turn owns the Agent would miss bare
     /// credentials learned earlier in the conversation.
     fn queue_btw(&mut self, question: &str) {
+        self.queue_side_question(question, None);
+    }
+
+    /// Resolve side templates only after every native/extension command has
+    /// retained ownership of its spelling. The classic parser supplies its
+    /// aliases; the remaining tokens are specific to this stack.
+    fn side_template_question(&self, clean: &str) -> Option<String> {
+        let (token, args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        if self.registered_extension_command(token).is_some() {
+            return None;
+        }
+        if token.eq_ignore_ascii_case("/template") {
+            let args = args.trim();
+            let (name, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let name = name.trim_start_matches('/');
+            if name.is_empty()
+                || self
+                    .registered_extension_command(&format!("/{name}"))
+                    .is_some()
+            {
+                return None;
+            }
+            return self
+                .steer_resources
+                .as_ref()?
+                .expand_side_prompt(&format!("/{name} {rest}"));
+        }
+        if crate::interactive::SlashCommand::parse(clean).is_some()
+            || info_commands::InfoCommand::parse(token).is_some()
+            || workspace_commands::WorkspaceCommand::parse(token).is_some()
+            || matches!(
+                token.to_ascii_lowercase().as_str(),
+                "/switch"
+                    | "/restart"
+                    | "/plan-review"
+                    | "/shake"
+                    | "/reload-plugins"
+                    | "/open"
+                    | "/branch"
+                    | "/dump"
+                    | "/delete"
+                    | "/queue"
+                    | "/pin"
+                    | "/fast"
+                    | "/skillful"
+                    | "/rename"
+            )
+        {
+            return None;
+        }
+        self.steer_resources.as_ref()?.expand_side_prompt(clean)
+    }
+
+    fn queue_side_question(&mut self, question: &str, title: Option<&str>) -> bool {
+        let question = question.trim();
+        let label = title.unwrap_or("/btw");
         if question.is_empty() {
-            self.push_entry(EntryRole::Error, String::from(BTW_USAGE));
-            return;
+            self.push_entry(
+                EntryRole::Error,
+                title.map_or_else(
+                    || String::from(BTW_USAGE),
+                    |title| format!("{title}: template expansion produced empty output"),
+                ),
+            );
+            return false;
         }
         if self.btw_client.is_none() {
-            self.push_entry(EntryRole::Error, String::from(BTW_UNAVAILABLE));
-            return;
+            self.push_entry(
+                EntryRole::Error,
+                format!("{label} unavailable: no smol role model configured (set --smol or model_roles.smol)"),
+            );
+            return false;
         }
         if question.len()
             > crate::text_completion::MAX_INPUT_BYTES
@@ -3687,28 +3777,32 @@ impl PiFtuiModel {
         {
             self.push_entry(
                 EntryRole::Error,
-                String::from("/btw refused: question exceeds the auxiliary privacy scan budget"),
+                format!("{label} refused: question exceeds the auxiliary privacy scan budget"),
             );
-            return;
+            return false;
         }
         let Some(owner_session_id) = self.displayed_session_id.clone() else {
             self.push_entry(
                 EntryRole::Error,
-                String::from("/btw: session is still loading; try again when it is ready"),
+                format!("{label}: session is still loading; try again when it is ready"),
             );
-            return;
+            return false;
         };
         self.input.set_text("");
+        self.autocomplete.close();
+        self.scroll_from_tail = 0;
         let note = if self.state == AgentUiState::Working {
-            format!("(/btw) {question} — queued until the current turn finishes")
+            format!("({label}) {question} — queued until the current turn finishes")
         } else {
-            format!("(/btw) {question}")
+            format!("({label}) {question}")
         };
         self.push_entry(EntryRole::System, note);
         self.send_command(UiCommand::Btw {
             question: question.to_string(),
+            title: title.map(str::to_string),
             owner_session_id,
         });
+        true
     }
 
     /// alt+up: pull steering and follow-up messages the running turn has not
@@ -3822,6 +3916,13 @@ impl PiFtuiModel {
         }
         if self.state == AgentUiState::Working {
             self.submit_mid_turn(false);
+            return;
+        }
+        if let Some(question) = self.side_template_question(&clean) {
+            if self.queue_side_question(&question, Some(&clean)) {
+                self.error_banner = None;
+                self.record_history(&clean);
+            }
             return;
         }
         // Sending anything dismisses the pinned error banner
@@ -7136,6 +7237,7 @@ async fn run_handoff_command(
 const BTW_USAGE: &str = "Usage: /btw <question>";
 /// OMP's double-tap window: a second ctrl+c this soon after the first quits.
 const CTRL_C_EXIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(test)]
 const BTW_UNAVAILABLE: &str =
     "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)";
 
@@ -7147,19 +7249,27 @@ async fn run_btw_command(
     handle: &crate::sdk::AgentSessionHandle,
     client: Option<&Arc<crate::btw::BtwClient>>,
     question: String,
+    title: Option<String>,
     owner_session_id: String,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) {
+    let label = title.unwrap_or_else(|| String::from("/btw"));
     let Some(client) = client.cloned() else {
-        let _ = agent_tx.send(PiMsg::AgentError(String::from(BTW_UNAVAILABLE)));
+        let _ = agent_tx.send(PiMsg::SessionSystemNote {
+            owner_session_id,
+            message: format!("{label} unavailable: no smol role model configured (set --smol or model_roles.smol)"),
+        });
         return;
     };
     let Ok(current_session_id) = handle
         .with_session(|session| session.header.id.clone())
         .await
     else {
-        let _ = agent_tx.send(PiMsg::AgentError(String::from("/btw: session busy")));
+        let _ = agent_tx.send(PiMsg::SessionSystemNote {
+            owner_session_id,
+            message: format!("{label}: session busy"),
+        });
         return;
     };
     if current_session_id != owner_session_id {
@@ -7168,7 +7278,10 @@ async fn run_btw_command(
     let prepared = match client.prepare_with_agent(&handle.session().agent, &question) {
         Ok(prepared) => prepared,
         Err(err) => {
-            let _ = agent_tx.send(PiMsg::AgentError(format!("/btw refused: {err}")));
+            let _ = agent_tx.send(PiMsg::SessionSystemNote {
+                owner_session_id,
+                message: format!("{label} refused: {err}"),
+            });
             return;
         }
     };
@@ -7176,8 +7289,8 @@ async fn run_btw_command(
     let tx = agent_tx.clone();
     runtime_handle.spawn(async move {
         let message = match client.ask_prepared(prepared).await {
-            Ok(answer) => format!("(/btw) {answer}"),
-            Err(err) => format!("(/btw) failed: {err}"),
+            Ok(answer) => format!("({label}) {answer}"),
+            Err(err) => format!("({label}) failed: {err}"),
         };
         let _ = tx.send(PiMsg::SessionSystemNote {
             owner_session_id,
@@ -10689,12 +10802,14 @@ pub fn run(
                         }
                         Ok(UiCommand::Btw {
                             question,
+                            title,
                             owner_session_id,
                         }) => {
                             run_btw_command(
                                 &handle,
                                 driver_btw_client.as_ref(),
                                 question,
+                                title,
                                 owner_session_id,
                                 &agent_tx,
                                 &runtime_handle,
@@ -17364,6 +17479,7 @@ mod tests {
             submit_rx.try_recv().expect("routed"),
             UiCommand::Btw {
                 question: String::from("what is a monad"),
+                title: None,
                 owner_session_id: String::from("btw-session"),
             }
         );
@@ -17411,6 +17527,7 @@ mod tests {
                 .expect("question queued for the driver"),
             UiCommand::Btw {
                 question: String::from("quick check"),
+                title: None,
                 owner_session_id: String::from("busy-session"),
             }
         );
@@ -17444,6 +17561,159 @@ mod tests {
                 .last()
                 .is_some_and(|entry| entry.text.contains("privacy scan budget"))
         );
+    }
+
+    fn side_template_resources(content: &str) -> crate::resources::ResourceLoader {
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "sitrep".into(),
+            description: "Summarize the current work".into(),
+            content: content.into(),
+            side: true,
+            source: "project".into(),
+            file_path: std::path::PathBuf::from("sitrep.md"),
+        });
+        resources
+    }
+
+    #[test]
+    fn side_templates_route_idle_and_busy_input_outside_the_main_turn() {
+        for (busy, follow_up, input, question) in [
+            (false, false, "/sitrep", "Summarize"),
+            (
+                true,
+                false,
+                "/sitrep \"the retry path\"",
+                "Summarize the retry path",
+            ),
+            (true, true, "/sitrep '$1'", "Summarize $1"),
+            (false, false, "/template sitrep", "Summarize"),
+            (true, true, "/template /sitrep '$1'", "Summarize $1"),
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let mut model = PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_btw_client(Some(unroutable_btw_client()));
+            model.steer_resources = Some(side_template_resources("Summarize $ARGUMENTS"));
+            model.displayed_session_id = Some("side-owner".into());
+            if busy {
+                model.state = AgentUiState::Working;
+            }
+            let state = model.state;
+            model.input.set_text(input);
+            if busy {
+                model.submit_mid_turn(follow_up);
+            } else {
+                model.submit_input();
+            }
+            assert_eq!(
+                submit_rx.try_recv().expect("side request"),
+                UiCommand::Btw {
+                    question: question.into(),
+                    title: Some(input.into()),
+                    owner_session_id: "side-owner".into(),
+                }
+            );
+            assert!(submit_rx.try_recv().is_err(), "no main prompt is submitted");
+            assert_eq!(model.state, state);
+            assert!(model.pending_task.is_none());
+            assert!(model.input.text().is_empty());
+            assert_eq!(model.input_history.last().map(String::as_str), Some(input));
+            assert!(
+                model
+                    .transcript
+                    .iter()
+                    .all(|entry| entry.role == EntryRole::System)
+            );
+            assert!(
+                model
+                    .transcript
+                    .last()
+                    .unwrap()
+                    .text
+                    .starts_with(&format!("({input})"))
+            );
+        }
+    }
+
+    #[test]
+    fn refused_side_templates_keep_the_draft_and_never_fall_back_to_a_prompt() {
+        for (content, client, expected) in [
+            ("Summarize".into(), false, "unavailable"),
+            (" \n ".into(), true, "empty output"),
+            (
+                "x".repeat(crate::text_completion::MAX_INPUT_BYTES),
+                true,
+                "privacy scan budget",
+            ),
+        ] {
+            for busy in [false, true] {
+                let (_agent_tx, rx) = mpsc::channel();
+                let (submit_tx, submit_rx) = mpsc::channel();
+                let mut model = PiFtuiModel::new(rx)
+                    .with_submit_channel(submit_tx)
+                    .with_btw_client(client.then(unroutable_btw_client));
+                model.steer_resources = Some(side_template_resources(&content));
+                model.displayed_session_id = Some("side-owner".into());
+                if busy {
+                    model.state = AgentUiState::Working;
+                }
+                model.input.set_text("/sitrep");
+                model.submit_input();
+                assert!(submit_rx.try_recv().is_err());
+                assert_eq!(model.input.text(), "/sitrep");
+                assert!(model.input_history.is_empty());
+                assert!(model.transcript.last().unwrap().text.contains(expected));
+                assert!(
+                    !model
+                        .transcript
+                        .iter()
+                        .any(|entry| entry.role == EntryRole::User)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn side_template_metadata_cannot_take_a_native_or_extension_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_btw_client(Some(unroutable_btw_client()));
+        let mut resources = side_template_resources("Summarize");
+        for name in ["help", "stats", "goal", "queue", "switch"] {
+            resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+                name: name.into(),
+                description: String::new(),
+                content: "Do not run this".into(),
+                side: true,
+                source: "project".into(),
+                file_path: std::path::PathBuf::from(format!("{name}.md")),
+            });
+        }
+        model.steer_resources = Some(resources);
+        model.displayed_session_id = Some("side-owner".into());
+        for command in ["/help", "/stats", "/goal", "/queue", "/switch"] {
+            assert!(model.side_template_question(command).is_none());
+        }
+        model.extension_commands = vec![crate::autocomplete::NamedEntry {
+            name: "sitrep".into(),
+            description: None,
+        }];
+        model.input.set_text("/sitrep raw arguments");
+        model.submit_input();
+        assert!(matches!(
+            submit_rx.try_recv(),
+            Ok(UiCommand::RegisteredExtensionCommand { name, args })
+                if name == "sitrep" && args == "raw arguments"
+        ));
+        model.state = AgentUiState::Working;
+        model.input.set_text("/sitrep another argument");
+        model.submit_mid_turn(false);
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(model.input.text(), "/sitrep another argument");
     }
 
     #[derive(Default)]
@@ -17543,6 +17813,7 @@ mod tests {
                 &handle,
                 Some(&blocked_client),
                 String::from("a clean but stale question"),
+                None,
                 String::from("replaced-session"),
                 &agent_tx,
                 &runtime_handle,
@@ -17553,6 +17824,7 @@ mod tests {
                 &handle,
                 Some(&blocked_client),
                 format!("Does {known} still work?"),
+                None,
                 owner_session_id.clone(),
                 &agent_tx,
                 &runtime_handle,
@@ -17560,7 +17832,7 @@ mod tests {
             .await;
             assert!(matches!(
                 agent_rx.try_recv().expect("privacy refusal"),
-                PiMsg::AgentError(message)
+                PiMsg::SessionSystemNote { message, .. }
                     if message.starts_with("/btw refused:") && !message.contains(known)
             ));
             assert!(provider.prompts.lock().unwrap().is_empty());
@@ -17573,6 +17845,7 @@ mod tests {
                 &handle,
                 Some(&redacting_client),
                 format!("Does {known} still work?"),
+                Some(String::from("/sitrep credential status")),
                 owner_session_id.clone(),
                 &agent_tx,
                 &runtime_handle,
@@ -17599,10 +17872,12 @@ mod tests {
             assert!(matches!(
                 answer,
                 PiMsg::SessionSystemNote { owner_session_id: owner, message }
-                    if owner == owner_session_id && message == "(/btw) screened side answer"
+                    if owner == owner_session_id
+                        && message == "(/sitrep credential status) screened side answer"
             ));
             let prompts = provider.prompts.lock().unwrap();
             assert_eq!(prompts.len(), 1);
+            assert!(!prompts[0].contains("/sitrep credential status"));
             assert!(!prompts[0].contains(known));
             assert!(prompts[0].contains("<pi-secret:redacted>"));
             assert!(handle.session().agent.messages().is_empty());
@@ -19785,6 +20060,7 @@ mod tests {
             name: "triage".into(),
             description: String::new(),
             content: "expanded template ultrathink".into(),
+            side: false,
             source: "user".into(),
             file_path: dir.path().join("triage.md"),
         });
@@ -19896,6 +20172,7 @@ mod tests {
             name: "triage".into(),
             description: String::new(),
             content: expanded.into(),
+            side: false,
             source: "user".into(),
             file_path: dir.path().join("triage.md"),
         });
@@ -20125,6 +20402,7 @@ mod tests {
             name: "triage".to_string(),
             description: String::new(),
             content: "Triage the attached report.".to_string(),
+            side: false,
             source: "user".to_string(),
             file_path: std::path::PathBuf::from("/tmp/triage.md"),
         });
@@ -20421,6 +20699,7 @@ mod tests {
             name: "fix".to_string(),
             description: "Fix a bug".to_string(),
             content: "Find and fix the bug in $1".to_string(),
+            side: false,
             source: "user".to_string(),
             file_path: std::path::PathBuf::from("/tmp/fix.md"),
         });
@@ -20457,7 +20736,7 @@ mod tests {
         std::fs::create_dir_all(&prompts).expect("prompts dir");
         std::fs::write(
             prompts.join("triage.md"),
-            "---\ndescription: Triage an issue\n---\nTriage issue $1",
+            "---\ndescription: Triage an issue\nside: true\n---\nTriage issue $1",
         )
         .expect("write template");
 
@@ -20485,11 +20764,32 @@ mod tests {
             Some("Triage issue #12")
         );
         assert!(catalog.prompt_templates.iter().any(|t| t.name == "triage"));
-        let Ok(PiMsg::AutocompleteCatalog(sent)) = rx.try_recv() else {
-            panic!("the refreshed catalog goes to the UI");
+        let Ok(update @ PiMsg::ResourcesReloaded { .. }) = rx.try_recv() else {
+            panic!("the refreshed bodies and catalog go to the UI together");
         };
-        assert!(sent.prompt_templates.iter().any(|t| t.name == "triage"));
-        assert!(sent.extension_commands.iter().any(|c| c.name == "ext-cmd"));
+        let (_agent_tx, ui_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut ui = PiFtuiModel::new(ui_rx)
+            .with_submit_channel(submit_tx)
+            .with_btw_client(Some(unroutable_btw_client()));
+        ui.displayed_session_id = Some("reloaded-session".into());
+        let _ = ui.handle_agent(update);
+        assert!(ui.extension_commands.iter().any(|c| c.name == "ext-cmd"));
+        ui.input.set_text("/triage #12");
+        ui.submit_input();
+        assert_eq!(
+            submit_rx.try_recv().expect("reloaded side route"),
+            UiCommand::Btw {
+                question: "Triage issue #12".into(),
+                title: Some("/triage #12".into()),
+                owner_session_id: "reloaded-session".into(),
+            }
+        );
+        assert!(
+            !ui.transcript
+                .iter()
+                .any(|entry| entry.role == EntryRole::User)
+        );
 
         // A resource failure must not resurrect the replaced runtime's old
         // commands. Retain the last good prompts while publishing removals.

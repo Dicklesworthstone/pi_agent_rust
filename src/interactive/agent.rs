@@ -949,6 +949,7 @@ impl PiApp {
             PiMsg::UiShutdown
             | PiMsg::TerminalTitle(_)
             | PiMsg::AutocompleteCatalog(_)
+            | PiMsg::ResourcesReloaded { .. }
             | PiMsg::LoginPending { .. }
             | PiMsg::StatusSnapshot(_)
             | PiMsg::UserInputSubmitted { .. }
@@ -3048,6 +3049,14 @@ After approving access in the browser, press Enter in Pi to complete login."
             return;
         }
 
+        if self.submit_side_template(trimmed) {
+            return;
+        }
+        if let Some((SlashCommand::Btw, args)) = SlashCommand::parse(trimmed) {
+            let _ = self.handle_slash_btw(args);
+            return;
+        }
+
         let expanded = self.resources.expand_input(trimmed);
 
         // Track input history
@@ -3380,6 +3389,10 @@ After approving access in the browser, press Enter in Pi to complete login."
 
         if let Some((command, exclude_from_context)) = parse_bash_command(message) {
             return self.submit_bash_command(message, command, exclude_from_context);
+        }
+
+        if self.submit_side_template(message) {
+            return None;
         }
 
         // Check for slash commands
@@ -4939,6 +4952,7 @@ mod stream_delta_batcher_tests {
                 name: "tc-plan".to_string(),
                 description: "Planning template".to_string(),
                 content: "Plan the following: $ARGUMENTS".to_string(),
+                side: false,
                 source: "test".to_string(),
                 file_path: std::path::PathBuf::from("tc-plan.md"),
             });
@@ -4968,6 +4982,7 @@ mod stream_delta_batcher_tests {
                 name: "queued".to_string(),
                 description: "Queued provenance fixture".to_string(),
                 content: "generated ultrathink workflowz payload; argument=$ARGUMENTS".to_string(),
+                side: false,
                 source: "test".to_string(),
                 file_path: std::path::PathBuf::from("queued.md"),
             });
@@ -4989,6 +5004,130 @@ mod stream_delta_batcher_tests {
                 ..
             }) if text == "generated ultrathink workflowz payload; argument=orchestrate"
         ));
+    }
+
+    #[test]
+    fn side_templates_never_enter_classic_steering_or_session_history() {
+        for (busy, follow_up, input) in [
+            (false, false, "/sitrep"),
+            (true, false, "/sitrep the retry path"),
+            (true, true, "/sitrep another concern"),
+            (false, false, "/template sitrep"),
+            (true, true, "/template /sitrep another concern"),
+        ] {
+            let main_state = Arc::new(ContinueProbeState::default());
+            let side_state = Arc::new(ContinueProbeState::default());
+            let (mut app, mut receiver) =
+                build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&main_state),
+                }));
+            app.resources
+                .push_prompt_for_tests(crate::resources::PromptTemplate {
+                    name: "sitrep".into(),
+                    description: String::new(),
+                    content: "Summarize $ARGUMENTS".into(),
+                    side: true,
+                    source: "project".into(),
+                    file_path: std::path::PathBuf::from("sitrep.md"),
+                });
+            app.set_btw_client(Arc::new(crate::btw::BtwClient::new(
+                Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&side_state),
+                }),
+                None,
+            )));
+            let agent = Arc::clone(&app.agent);
+            let held = busy.then(|| agent.try_lock().expect("active main turn"));
+            if busy {
+                app.agent_state = AgentState::Processing;
+            }
+            app.input.set_value(input);
+            if busy {
+                app.queue_input(if follow_up {
+                    QueuedMessageKind::FollowUp
+                } else {
+                    QueuedMessageKind::Steering
+                });
+            } else {
+                let _ = app.submit_message(input);
+            }
+            assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+            assert!(app.input.value().is_empty());
+            assert_eq!(app.history.entries().last().unwrap().value, input);
+            assert_eq!(main_state.calls.load(Ordering::SeqCst), 0);
+            drop(held);
+            let note = runtime().block_on(async {
+                let cx = Cx::for_request();
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(10),
+                    receiver.recv(&cx),
+                )
+                .await
+                .expect("side request settles")
+                .expect("side event")
+            });
+            assert!(matches!(
+                &note,
+                PiMsg::SessionSystemNote { message, .. }
+                    if message == &format!("({input}) continued")
+            ));
+            let _ = app.handle_pi_message(note);
+            assert_eq!(main_state.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(side_state.calls.load(Ordering::SeqCst), 1);
+            assert!(app.session.try_lock().unwrap().entries.is_empty());
+            assert!(app.agent.try_lock().unwrap().messages().is_empty());
+            assert!(
+                app.messages
+                    .iter()
+                    .all(|message| message.role != MessageRole::User)
+            );
+            assert_eq!(
+                app.agent_state,
+                if busy {
+                    AgentState::Processing
+                } else {
+                    AgentState::Idle
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_classic_side_template_keeps_input_without_starting_a_turn() {
+        for busy in [false, true] {
+            let state = Arc::new(ContinueProbeState::default());
+            let (mut app, _receiver) =
+                build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&state),
+                }));
+            app.resources
+                .push_prompt_for_tests(crate::resources::PromptTemplate {
+                    name: "sitrep".into(),
+                    description: String::new(),
+                    content: "Summarize current progress".into(),
+                    side: true,
+                    source: "project".into(),
+                    file_path: std::path::PathBuf::from("sitrep.md"),
+                });
+            app.input.set_value("/sitrep");
+            if busy {
+                app.agent_state = AgentState::Processing;
+                app.queue_input(QueuedMessageKind::FollowUp);
+            } else {
+                let _ = app.submit_message("/sitrep");
+            }
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("/sitrep unavailable")
+            );
+            assert_eq!(app.input.value(), "/sitrep");
+            assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+            assert!(app.session.try_lock().unwrap().entries.is_empty());
+            assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
