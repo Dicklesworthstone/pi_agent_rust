@@ -419,6 +419,13 @@ pub struct SessionOptions {
     /// the first provider call. Mirrors the CLI's `--max-time` option.
     pub max_time: Option<Duration>,
 
+    /// Positive finite USD warning/cap overrides for the shared session tree.
+    pub warn_cost: Option<f64>,
+    pub max_cost: Option<f64>,
+    /// Share a parent account with an embedded child, or preserve a live account
+    /// across a same-session rebuild. Native child processes inherit theirs.
+    pub cost_budget: Option<crate::cost::CostBudget>,
+
     /// Provider retry for turns driven through this session.
     ///
     /// `None` — the default — returns a transient provider failure to the
@@ -611,6 +618,9 @@ impl Default for SessionOptions {
             no_context_files: false,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             max_time: None,
+            warn_cost: None,
+            max_cost: None,
+            cost_budget: None,
             retry: None,
             failover: None,
             mcp: None,
@@ -2383,6 +2393,14 @@ impl AgentSessionHandle {
             }
         };
         let owner_session_id = session.header.id.clone();
+        if self.session.save_enabled()
+            && let Some(budget) = self.session.agent.cost_budget()
+            && let Err(error) = budget.checkpoint(&mut session)
+        {
+            let mut report = SessionResourceShutdown::default();
+            report.fail(format!("failed to checkpoint model spend: {error}"));
+            return Err(report);
+        }
         // Replacing the only live handle must preserve every pending mutation,
         // even when final process shutdown is configured as best-effort or
         // skips its flush. A failed preflight leaves this handle available.
@@ -2517,6 +2535,12 @@ impl AgentSessionHandle {
         {
             Ok(mut session) => {
                 let owner_session_id = session.header.id.clone();
+                if self.session.save_enabled()
+                    && let Some(budget) = self.session.agent.cost_budget()
+                    && let Err(error) = budget.checkpoint(&mut session)
+                {
+                    report.fail(format!("failed to checkpoint model spend: {error}"));
+                }
                 if self.session.save_enabled()
                     && let Err(err) = session.flush_autosave_on_shutdown().await
                 {
@@ -3942,6 +3966,13 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         tool_approval: options.tool_approval.clone(),
         keyword_settings: config.keywords.clone(),
         max_time: options.max_time,
+        cost_budget: crate::cost::resolve_budget(
+            &session,
+            config.session.as_ref(),
+            options.warn_cost,
+            options.max_cost,
+            options.cost_budget.clone(),
+        )?,
         turn_recovery: config.turn_recovery_mode(),
         approval_state: options.approval_state.clone(),
         bash_settings: config.bash.clone(),
@@ -7283,6 +7314,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
@@ -7537,6 +7569,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,

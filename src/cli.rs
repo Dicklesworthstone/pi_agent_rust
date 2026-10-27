@@ -118,6 +118,8 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "slow"
         | "plan"
         | "advisor"
+        | "warn-cost"
+        | "max-cost"
         | "prewalk-into"
         | "subagent-fallback-policy"
         | "approval-mode"
@@ -685,6 +687,15 @@ pub struct Cli {
     /// --max-tool-iterations (per-turn count).
     #[arg(long, value_name = "SECONDS")]
     pub max_time: Option<u64>,
+
+    /// Warn once when recorded session-tree model spend reaches this USD amount.
+    #[arg(long, value_name = "USD", value_parser = crate::cost::parse_threshold)]
+    pub warn_cost: Option<f64>,
+
+    /// Refuse further model requests after recorded session-tree spend reaches
+    /// this USD amount. In-flight requests may exceed the cap.
+    #[arg(long, value_name = "USD", value_parser = crate::cost::parse_threshold)]
+    pub max_cost: Option<f64>,
 
     /// Additional workspace roots (bd-cv653.3.12): grant the agent access to
     /// extra directories beyond the primary cwd. Repeatable. Tools and the
@@ -1777,6 +1788,28 @@ mod tests {
         assert_eq!(parsed.cli.session_durability.as_deref(), Some("throughput"));
         assert!(parsed.extension_flags.is_empty());
         assert!(parsed.cli.print);
+    }
+
+    #[test]
+    fn cost_limits_are_validated_builtin_flags_and_preserve_the_prompt() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--warn-cost".to_string(),
+            "0.25".to_string(),
+            "--max-cost=2.50".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cost flags");
+        assert_eq!(parsed.cli.warn_cost, Some(0.25));
+        assert_eq!(parsed.cli.max_cost, Some(2.5));
+        assert_eq!(parsed.cli.message_args(), vec!["hello"]);
+        assert!(parsed.extension_flags.is_empty());
+        for flag in ["--warn-cost", "--max-cost"] {
+            for amount in ["0", "-1", "NaN", "inf", "1e999", "money"] {
+                assert!(Cli::try_parse_from(["pi", &format!("{flag}={amount}")]).is_err());
+            }
+        }
     }
 
     #[test]

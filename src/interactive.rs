@@ -693,9 +693,10 @@ impl PiApp {
         session: &Arc<Mutex<Session>>,
         agent: &Arc<Mutex<InteractiveAgent>>,
         admission: &SessionActionAdmissionGate,
-        new_session: Session,
+        mut new_session: Session,
         messages_for_agent: Vec<ModelMessage>,
         thinking_level: Option<ThinkingLevel>,
+        preserve_cost: bool,
     ) -> std::result::Result<(), &'static str> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let _permit = admission
@@ -709,7 +710,29 @@ impl PiApp {
             return Err("Session busy; session change was not applied");
         };
 
+        let preserve_cost = preserve_cost || session_guard.header.id == new_session.header.id;
+        let cost_budget = agent_guard
+            .replacement_cost_budget(&new_session, preserve_cost)
+            .map_err(|_| "Invalid model spend; session change was not applied")?;
+        if let Some(budget) = agent_guard.cost_budget() {
+            budget
+                .checkpoint(&mut session_guard)
+                .map_err(|_| "Failed to read model spend; session change was not applied")?;
+            session_guard
+                .save()
+                .await
+                .map_err(|_| "Failed to save model spend; session change was not applied")?;
+        }
+        if preserve_cost && let Some(budget) = &cost_budget {
+            budget
+                .checkpoint(&mut new_session)
+                .map_err(|_| "Failed to retain model spend; session change was not applied")?;
+            new_session.save().await.map_err(
+                |_| "Failed to save retained model spend; session change was not applied",
+            )?;
+        }
         *session_guard = new_session;
+        agent_guard.set_cost_budget(cost_budget);
         agent_guard.replace_messages(messages_for_agent);
         if let Some(level) = thinking_level {
             agent_guard.stream_options_mut().thinking_level = Some(level);
@@ -1623,6 +1646,7 @@ impl PiApp {
                 loaded_session,
                 messages_for_agent,
                 None,
+                false,
             )
             .await
             {
@@ -2775,6 +2799,9 @@ impl InteractiveAgent {
             .session_mut()
             .agent
             .reset_session_scoped_state(plan_mode);
+        self.handle
+            .session()
+            .refresh_extension_completion_host_state();
         self.handle.session().provider_admission_gate().clear();
     }
 }

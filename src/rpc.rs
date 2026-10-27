@@ -5188,6 +5188,7 @@ pub async fn run(
                         .clone_from(&thinking_level);
 
                     let session_id = new_session.header.id.clone();
+                    let cost_budget = guard.agent.replacement_cost_budget(&new_session, false)?;
                     guard.invalidate_background_compaction();
                     state.provider_admission.ensure_allowed()?;
                     {
@@ -5197,10 +5198,22 @@ pub async fn run(
                             .map_err(|err| {
                                 Error::session(format!("inner session lock failed: {err}"))
                             })?;
+                        if let Some(budget) = guard.agent.cost_budget() {
+                            budget.checkpoint(&mut inner_session)?;
+                            if guard.save_enabled() {
+                                crate::agent::persist_session_mutations(
+                                    &mut inner_session,
+                                    &guard.provider_admission_gate(),
+                                    crate::session::AutosaveFlushTrigger::Manual,
+                                )
+                                .await?;
+                            }
+                        }
                         *inner_session = new_session;
                         session_transition_permit.commit_session_change();
                         state.output.clear_session();
                     }
+                    guard.agent.set_cost_budget(cost_budget);
                     guard.agent.clear_messages();
                     crate::app::rebind_stream_options_session(
                         guard.agent.stream_options_mut(),
@@ -5423,9 +5436,29 @@ pub async fn run(
                                 })?;
                             let previous_session_file =
                                 inner_session.path.as_ref().map(|p| p.display().to_string());
+                            let preserve_cost = inner_session.header.id == new_session.header.id;
+                            let cost_budget = guard
+                                .agent
+                                .replacement_cost_budget(&new_session, preserve_cost)?;
+                            if let Some(budget) = guard.agent.cost_budget() {
+                                if preserve_cost {
+                                    budget.checkpoint(&mut new_session)?;
+                                } else {
+                                    budget.checkpoint(&mut inner_session)?;
+                                    if guard.save_enabled() {
+                                        crate::agent::persist_session_mutations(
+                                            &mut inner_session,
+                                            &guard.provider_admission_gate(),
+                                            crate::session::AutosaveFlushTrigger::Manual,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
                             guard.invalidate_background_compaction();
                             state.provider_admission.ensure_allowed()?;
-                            if guard.save_enabled() && normalization_changed
+                            if guard.save_enabled()
+                                && (normalization_changed || (preserve_cost && cost_budget.is_some()))
                                 && let Err(first_err) = new_session.save().await
                                     && let Err(retry_err) = new_session.save().await
                                 {
@@ -5447,6 +5480,7 @@ pub async fn run(
                             session_transition_permit.commit_session_change();
                             state.output.clear_session();
                             drop(inner_session);
+                            guard.agent.set_cost_budget(cost_budget);
                             guard.agent.replace_messages(messages);
                             crate::app::rebind_stream_options_session(
                                 guard.agent.stream_options_mut(),
@@ -5692,6 +5726,18 @@ pub async fn run(
                         }
                         guard.invalidate_background_compaction();
                         state.provider_admission.ensure_allowed()?;
+                        if let Some(budget) = guard.agent.cost_budget() {
+                            budget.checkpoint(&mut inner)?;
+                            if save_enabled {
+                                crate::agent::persist_session_mutations(
+                                    &mut inner,
+                                    &guard.provider_admission_gate(),
+                                    crate::session::AutosaveFlushTrigger::Manual,
+                                )
+                                .await?;
+                            }
+                            budget.checkpoint(&mut new_session)?;
+                        }
                         if save_enabled
                             && let Err(first_err) = new_session.save().await
                                 && let Err(retry_err) = new_session.save().await
@@ -6688,6 +6734,7 @@ async fn run_prompt_with_retry_owned(
     let mut stopped_at_time_cap = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
+    let mut final_cost_cap: Option<Value> = None;
 
     loop {
         if retry_abort.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
@@ -7012,6 +7059,7 @@ async fn run_prompt_with_retry_owned(
             }
             Err(err) => {
                 let err_str = err.to_string();
+                final_cost_cap = cost_cap_value(&err);
                 // Keep typed provider errors and terminal refusals in the
                 // same policy as SDK/print. Account exhaustion may permit a
                 // different model even when retrying this one cannot help.
@@ -7311,6 +7359,11 @@ async fn run_prompt_with_retry_owned(
         );
         if let Some(hints) = final_error_hints {
             payload["errorHints"] = hints;
+        }
+        if let Some(cap) = final_cost_cap {
+            payload["errorCode"] = json!("cost_cap");
+            payload["retryable"] = json!(false);
+            payload["costCap"] = cap;
         }
         terminal_guard.disarm();
         let _ = out_tx.send(event(&payload));
@@ -7830,6 +7883,11 @@ async fn run_extension_command_owned(
     if let Err(err) = result {
         payload["error"] = Value::String(err.to_string());
         payload["errorHints"] = error_hints_value(&err);
+        if let Some(cap) = cost_cap_value(&err) {
+            payload["errorCode"] = json!("cost_cap");
+            payload["retryable"] = json!(false);
+            payload["costCap"] = cap;
+        }
     }
     terminal_guard.disarm();
     let _ = out_tx.send(event(&payload));
@@ -7879,7 +7937,19 @@ fn response_error_with_hints(id: Option<String>, command: &str, error: &Error) -
     if let Some(id) = id {
         resp["id"] = Value::String(id);
     }
+    if let Some(cap) = cost_cap_value(error) {
+        resp["errorCode"] = json!("cost_cap");
+        resp["retryable"] = json!(false);
+        resp["costCap"] = cap;
+    }
     resp.to_string()
+}
+
+fn cost_cap_value(error: &Error) -> Option<Value> {
+    let Error::CostCap { spent, cap } = error else {
+        return None;
+    };
+    Some(json!({ "spent": spent, "cap": cap }))
 }
 
 fn event(value: &Value) -> String {
@@ -17072,6 +17142,39 @@ mod tests {
 
     const RPC_OUTPUT_PRESSURE_SCHEMA_V1: &str = "pi.rpc_output_pressure.v1";
     const RPC_OUTPUT_PRESSURE_DEBUG_BUDGET_US: u64 = 50_000;
+
+    #[test]
+    fn cost_cap_response_is_nonretryable_and_preserves_numeric_budget_details() {
+        let response = response_error_with_hints(
+            Some("budget-request".to_string()),
+            "prompt",
+            &Error::CostCap {
+                spent: 2.75,
+                cap: 2.5,
+            },
+        );
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "budget-request");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["errorCode"], "cost_cap");
+        assert_eq!(response["retryable"], false);
+        assert_eq!(response["costCap"], json!({"spent": 2.75, "cap": 2.5}));
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("next model request was not sent")
+        );
+        let warning: Value = serde_json::from_str(&agent_event(AgentEvent::CostWarning {
+            spent: 2.25,
+            threshold: 2.0,
+            message: "Session spend warning".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(warning["type"], "cost_warning");
+        assert_eq!(warning["spent"], 2.25);
+        assert!(cost_cap_value(&Error::api("unrelated failure")).is_none());
+    }
 
     // -----------------------------------------------------------------------
     // Helper builders

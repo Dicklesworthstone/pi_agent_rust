@@ -541,6 +541,52 @@ pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
   "Use the scout agent to inspect the provider implementation."
 ```
 
+### Model Spend Limits
+
+Use `--warn-cost` to show a one-time notice and `--max-cost` to stop admitting
+model requests once recorded spend reaches a USD threshold:
+
+```bash
+pi --warn-cost 2 --max-cost 5 "Implement and test the change."
+pi -p --wait-async --max-cost 10 "Delegate the investigation and report the findings."
+```
+
+The corresponding settings are `session.warnCost` and `session.maxCost`;
+CLI values override them. Values must be positive finite numbers. The limits
+cover the active session tree: foreground turns, retries, native subagents,
+advisor reviews, compaction, titles, memory extraction and side questions
+share the same account. Child requests consult the parent's live balance;
+missing or ambiguous accounting acknowledgements block further child requests.
+
+```json
+{
+  "session": { "warnCost": 2, "maxCost": 5 }
+}
+```
+
+Resuming includes recorded assistant usage from all retained branches and
+saved auxiliary-spend checkpoints. Forking, rewinding, retrying, changing
+models and reloading resources preserve the live balance. A new session gets
+a fresh balance; switching to another saved session restores that session's
+recorded spend. A resumed session already above its warning threshold does
+not repeat the warning. Change launch flags or settings before reopening to
+use different thresholds.
+
+The Rust SDK exposes `SessionOptions.warn_cost`, `max_cost` and an optional
+shared `cost_budget`; `CostBudget` clones share one account. Warnings arrive
+as `AgentEvent::CostWarning` (`type: "cost_warning"` in JSON). A refused request
+returns `Error::CostCap`; print mode exits with status **3**. Native RPC marks
+the terminal failure with `errorCode: "cost_cap"`, `retryable: false`, and
+`costCap: { "spent": ..., "cap": ... }`.
+
+These are request-boundary limits based on known provider costs or catalog
+token pricing. Requests already in flight may finish above the cap, and
+unreported/unpriced usage cannot be estimated. Spend is checkpointed with
+session saves, including normal turn completion, replacement and SDK shutdown.
+A crash before a checkpoint, or background work that finishes after its
+owning session has been replaced, can leave auxiliary spend absent from the
+saved session; that work still charges its original in-memory account.
+
 ### Native Subagents and Orchestration
 
 Rust Pi includes a native `subagent` tool; it does not depend on a QuickJS

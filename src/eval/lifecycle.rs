@@ -169,6 +169,7 @@ impl EvalTool {
         // A misspelled language or a string-valued reset cannot silently reset
         // Python. Unknown extension fields remain ignored as before.
         let mut judgments = super::judgment::Invocation::new(self.judge.clone(), &input, protect)?
+            .with_cost_budget(self.cost_scope.current())
             .with_host(host)
             .with_snapshot_privacy(snapshot_privacy);
         let archive_path = super::output::Archive::requested_path(&input)?;

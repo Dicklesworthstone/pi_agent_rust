@@ -540,9 +540,13 @@ impl AcpOutput {
         };
         timeout(wall_now(), Duration::from_secs(30), Box::pin(drain))
             .await
-            .map_err(|_| Error::session("ACP prompt cleanup timed out; persistence is incomplete"))?;
+            .map_err(|_| {
+                Error::session("ACP prompt cleanup timed out; persistence is incomplete")
+            })?;
         if self.shared.terminals.has_pending() {
-            return Err(Error::session("Editor terminal cleanup could not be confirmed before ACP shutdown"));
+            return Err(Error::session(
+                "Editor terminal cleanup could not be confirmed before ACP shutdown",
+            ));
         }
         Ok(())
     }
@@ -650,6 +654,8 @@ pub struct AcpLaunchOptions {
     pub hide_cwd_in_prompt: bool,
     pub max_tool_iterations: Option<usize>,
     pub max_time: Option<u64>,
+    pub warn_cost: Option<f64>,
+    pub max_cost: Option<f64>,
     /// Explicit launch intent; settings never implicitly arm editor sessions.
     pub prewalk: bool,
     pub prewalk_into: Option<String>,
@@ -678,6 +684,8 @@ impl AcpLaunchOptions {
             hide_cwd_in_prompt: cli.hide_cwd_in_prompt,
             max_tool_iterations: cli.max_tool_iterations,
             max_time: cli.max_time,
+            warn_cost: cli.warn_cost,
+            max_cost: cli.max_cost,
             prewalk: cli.prewalk,
             prewalk_into: cli.prewalk_into.clone(),
             no_prewalk: cli.no_prewalk,
@@ -719,6 +727,8 @@ impl AcpLaunchOptions {
         cli.prewalk = self.prewalk;
         cli.prewalk_into.clone_from(&self.prewalk_into);
         cli.no_prewalk = self.no_prewalk;
+        cli.warn_cost = self.warn_cost;
+        cli.max_cost = self.max_cost;
         cli.smol.clone_from(&self.smol);
         cli.slow.clone_from(&self.slow);
         cli.plan.clone_from(&self.plan);
@@ -975,7 +985,10 @@ async fn run(
 
                 if raw_message.get("method").is_none() {
                     if !route_permission_response(&raw_message, &pending_permissions, &cx)
-                        && !out_tx.shared.terminals.route_response(&out_tx, &raw_message, &cx)
+                        && !out_tx
+                            .shared
+                            .terminals
+                            .route_response(&out_tx, &raw_message, &cx)
                     {
                         out_tx.shared.files.route_response(&raw_message, &cx);
                     }
@@ -2300,6 +2313,13 @@ fn build_acp_session(
             .map(|client| client.handler_for_session(session_id.clone())),
         keyword_settings: options.config.keywords.clone(),
         max_time: cli.max_time.map(Duration::from_secs),
+        cost_budget: crate::cost::resolve_budget(
+            &session,
+            options.config.session.as_ref(),
+            cli.warn_cost,
+            cli.max_cost,
+            None,
+        )?,
         turn_recovery: options.config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: options.config.bash.clone(),
@@ -2514,6 +2534,7 @@ impl AcpRecoveryUpdates {
 
     fn observe(&self, event: &AgentEvent) {
         match event {
+            AgentEvent::CostWarning { message, .. } => self.notice(message),
             AgentEvent::AutoRetryStart {
                 attempt,
                 max_attempts,
@@ -2949,6 +2970,8 @@ async fn report_prompt_error(out_tx: &AcpOutput, session_id: &str, error: &Error
     } else if let Error::Provider { provider, message } = error {
         let summary = crate::error::ProviderErrorSummary::from_error_text(Some(provider), message);
         format!("{}\n{}", summary.headline(), summary.retry_note(None))
+    } else if matches!(error, Error::CostCap { .. }) {
+        error.to_string()
     } else {
         // Hint context and raw provider payloads can contain credentials,
         // private prompts or paths. Only the public category summary is sent.
@@ -3113,7 +3136,8 @@ fn build_acp_event_handler(
                 result,
                 is_error,
             } => {
-                let tool_content = client_terminals::tool_content(&result.content, result.details.as_ref());
+                let tool_content =
+                    client_terminals::tool_content(&result.content, result.details.as_ref());
 
                 Some(json!({
                     "sessionUpdate": "tool_call_update",
@@ -5435,6 +5459,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,

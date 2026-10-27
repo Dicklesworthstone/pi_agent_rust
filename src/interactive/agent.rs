@@ -343,6 +343,9 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AdvisorNote { level, rationale } => {
             batcher.send_immediate(PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}")));
         }
+        AgentEvent::CostWarning { message, .. } => {
+            batcher.send_immediate(PiMsg::SystemNote(message.clone()));
+        }
         AgentEvent::MessageUpdate {
             assistant_message_event,
             ..
@@ -5644,6 +5647,37 @@ mod stream_delta_batcher_tests {
             rx.try_recv().is_err(),
             "one emitted note has one display event"
         );
+    }
+
+    #[test]
+    fn cost_warning_preserves_live_turn_state_and_flushes_earlier_text() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+        batcher.push_delta(StreamDeltaKind::Text, "Still working.");
+        dispatch_agent_event_to_ui(
+            &AgentEvent::CostWarning {
+                spent: 2.5,
+                threshold: 2.0,
+                message: "Model spend reached $2.50 (warning at $2.00).".into(),
+            },
+            &mut batcher,
+        );
+        let text = rx.try_recv().expect("text before warning");
+        assert!(matches!(&text, PiMsg::TextDelta(text) if text == "Still working."));
+        let mut app = build_test_app();
+        app.agent_state = AgentState::Processing;
+        let _ = app.handle_pi_message(text);
+        let _ = app.handle_pi_message(rx.try_recv().expect("visible cost warning"));
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationMessage { role: MessageRole::System, content, .. })
+                if content == "Model spend reached $2.50 (warning at $2.00)."
+        ));
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -10441,6 +10441,69 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // Integer-dollar fixture totals must remain exact.
+    fn cost_budget_includes_hidden_branches_after_lazy_v2_resume() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("lazy-cost-branches.jsonl");
+        let priced = |cost| SessionMessage::Assistant {
+            message: AssistantMessage {
+                usage: Usage {
+                    cost: crate::model::Cost {
+                        total: cost,
+                        ..crate::model::Cost::default()
+                    },
+                    ..Usage::default()
+                },
+                ..AssistantMessage::default()
+            },
+        };
+        let mut seed = Session::create();
+        seed.path = Some(path.clone());
+        let root = seed.append_message(priced(2.0));
+        let hidden = seed.append_message(priced(4.0));
+        let old = crate::cost::CostBudget::new(None, Some(20.0), 6.0).expect("account");
+        old.record(3.0).expect("auxiliary cost");
+        old.checkpoint(&mut seed).expect("hidden branch checkpoint");
+        assert!(seed.create_branch_from(&root));
+        seed.append_message(priced(1.0));
+        run_async(seed.save()).expect("save tree");
+        create_v2_sidecar_from_jsonl(&path).expect("sidecar");
+        let v2_root = session_store_v2::v2_sidecar_path(&path);
+        let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024).expect("store");
+        let (mut loaded, _) =
+            Session::open_from_v2(&store, seed.header.clone(), V2OpenMode::ActivePath)
+                .expect("lazy resume");
+        loaded.path = Some(path);
+        loaded.v2_sidecar_root = Some(v2_root);
+        assert!(loaded.has_partial_v2_hydration());
+        assert!(
+            !loaded
+                .entries
+                .iter()
+                .any(|entry| entry.base().id.as_deref() == Some(hidden.as_str()))
+        );
+        let spent = crate::cost::recorded_spend(&loaded).expect("all retained spend");
+        assert_eq!(spent, 10.0);
+        let resumed =
+            crate::cost::CostBudget::new(None, Some(10.0), spent).expect("resumed account");
+        assert!(matches!(resumed.admit(), Err(Error::CostCap { .. })));
+        resumed
+            .checkpoint(&mut loaded)
+            .expect("full-tree checkpoint");
+        assert!(!loaded.has_partial_v2_hydration());
+        assert!(
+            loaded
+                .entries
+                .iter()
+                .any(|entry| entry.base().id.as_deref() == Some(hidden.as_str()))
+        );
+        assert_eq!(
+            crate::cost::recorded_spend(&loaded).expect("checkpoint total"),
+            10.0
+        );
+    }
+
+    #[test]
     fn v2_partial_hydration_without_sidecar_root_rejects_full_rewrite() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let path = temp_dir.path().join("partial-without-sidecar-root.jsonl");

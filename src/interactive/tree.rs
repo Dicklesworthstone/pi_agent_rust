@@ -540,6 +540,31 @@ impl PiApp {
             }
             let new_session_id = new_session.header.id.clone();
 
+            // A fork retains all prior spend, including sibling and side
+            // requests absent from the selected transcript branch.
+            let (fork_budget, agent_busy) = agent
+                .try_lock()
+                .map_or((None, true), |agent| (agent.cost_budget().cloned(), false));
+            if agent_busy {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError("Agent busy; fork was not saved".to_string()),
+                )
+                .await;
+                return;
+            }
+            if let Some(budget) = &fork_budget
+                && let Err(error) = budget.checkpoint(&mut new_session)
+            {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError(format!("Failed to retain fork model spend: {error}")),
+                )
+                .await;
+                return;
+            }
             if let Err(err) = new_session.save().await {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
@@ -559,6 +584,7 @@ impl PiApp {
                 new_session,
                 messages_for_agent,
                 None,
+                true,
             )
             .await
             {

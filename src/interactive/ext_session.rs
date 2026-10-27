@@ -2417,6 +2417,7 @@ mod tests {
                     replacement,
                     Vec::new(),
                     None,
+                    false,
                 )
                 .await
                 .expect("install replacement session");

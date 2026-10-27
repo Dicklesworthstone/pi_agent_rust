@@ -230,6 +230,7 @@ async fn start(
     let owner_id = background::resolve_session(&tool.job_session_scope, &owner, deadline).await?;
     let admission = crate::jobs::admit_owned_task(&owner_id)?;
     let parent_model = tool.capture_parent_model();
+    let cost_budget = tool.cost_scope.current();
     let mut agent = tool
         .discover(scope)?
         .remove(&name)
@@ -295,6 +296,7 @@ async fn start(
                     deadline,
                 )
                 .with_parent_model(parent_model.clone())
+                .with_cost_budget(cost_budget.clone())
                 .with_worker_model_selection(model_selection.clone())
                 .with_worker_fallback_policy(fallback_policy.clone()),
                 agent.clone(),

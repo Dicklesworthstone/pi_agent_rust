@@ -180,17 +180,24 @@ impl Actor {
                 "PI_SUBAGENT_WORKER_CWD: launch directory is unavailable",
             ));
         }
+        if let Some(budget) = &self.runner.cost_budget {
+            budget.admit()?;
+        }
         let entry = self
             .hub
             .register_worker(&self.agent.name, self.runner.hub_kind)?;
         self.lifecycle.hub_id = Some(entry.id.clone());
         self.check()?;
-        let channel = if self.lifecycle.tools.iter().any(|tool| tool == "hub") {
-            Some(crate::agent_hub::ipc::ChildChannel::bind(
-                &entry.id,
-                &self.owner,
-                self.runner.deadline.remaining(),
-            )?)
+        let messaging = self.lifecycle.tools.iter().any(|tool| tool == "hub");
+        let channel = if messaging || self.runner.cost_budget.is_some() {
+            Some(
+                crate::agent_hub::ipc::ChildChannel::bind(
+                    &entry.id,
+                    &self.owner,
+                    self.runner.deadline.remaining(),
+                )?
+                .with_cost_budget(self.runner.cost_budget.clone(), messaging),
+            )
         } else {
             None
         };

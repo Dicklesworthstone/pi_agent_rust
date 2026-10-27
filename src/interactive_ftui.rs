@@ -6910,6 +6910,7 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         E::AdvisorNote { level, rationale } => {
             vec![PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}"))]
         }
+        E::CostWarning { message, .. } => vec![PiMsg::SystemNote(message.clone())],
         E::PrewalkSwitched {
             provider,
             model,
@@ -7464,17 +7465,14 @@ async fn run_tan_command(
 
     // Capture before spawning: a later /model command must not retarget work
     // the user has already delegated to this background child.
-    let parent_model = handle
-        .session()
-        .agent
-        .shared_tools()
-        .snapshot()
-        .model_scope()
-        .current();
+    let tools = handle.session().agent.shared_tools().snapshot();
+    let parent_model = tools.model_scope().current();
+    let cost_budget = tools.cost_scope().current();
     let tool = crate::subagents::SubagentTool::new(cwd)
         .with_role_model_selection(role_selection)
         .with_model_config(Some(config))
-        .with_parent_model(parent_model);
+        .with_parent_model(parent_model)
+        .with_cost_budget(cost_budget);
     // ubs:ignore Sender clone per background job — the task must own its sender
     let tx = agent_tx.clone();
     runtime_handle.spawn(async move {
@@ -7655,6 +7653,14 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
     // Launch flags are one-shot intent, not a standing rule for restored
     // sessions or branches. `/prewalk` can explicitly arm the new owner.
     template.prewalk = None;
+    // New sessions and switches get their own balance. Keep an explicitly
+    // supplied SDK account's limits, while reload/fork attach the live account
+    // at the replacement call site.
+    if let Some(budget) = template.cost_budget.take() {
+        let limits = budget.snapshot();
+        template.warn_cost = limits.warn_cost;
+        template.max_cost = limits.max_cost;
+    }
     template
 }
 
@@ -9587,6 +9593,16 @@ async fn fork_session_command(
             }
         };
     let new_session_id = forked.header.id.clone();
+    let mut fork_template = template.clone();
+    fork_template.cost_budget = handle.session().agent.cost_budget().cloned();
+    if let Some(budget) = &fork_template.cost_budget
+        && let Err(error) = budget.checkpoint(&mut forked)
+    {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "Failed to checkpoint fork cost: {error}"
+        )));
+        return Ok(());
+    }
     if let Err(err) = forked.save().await {
         let _ = agent_tx.send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
         return Ok(());
@@ -9599,7 +9615,7 @@ async fn fork_session_command(
     };
     Box::pin(resume_session_command(
         &path.to_string_lossy(),
-        template,
+        &fork_template,
         handle,
         current_ask,
         ext_handler,
@@ -9679,8 +9695,10 @@ async fn reload_session_command(
             .await?
         }
         None if empty => {
+            let mut reload_template = template.clone();
+            reload_template.cost_budget = handle.session().agent.cost_budget().cloned();
             Box::pin(new_session_command(
-                template,
+                &reload_template,
                 handle,
                 current_ask,
                 ext_handler,
@@ -9722,6 +9740,23 @@ async fn resume_session_command(
 ) -> std::result::Result<bool, String> {
     let mut options = replacement_options(template, ext_handler, runtime_handle);
     options.session_path = Some(std::path::PathBuf::from(path));
+    let requested_path = std::path::Path::new(path);
+    let same_file = handle
+        .with_session(|session| {
+            session.path.as_deref().is_some_and(|current| {
+                current == requested_path
+                    || current
+                        .canonicalize()
+                        .ok()
+                        .zip(requested_path.canonicalize().ok())
+                        .is_some_and(|(current, requested)| current == requested)
+            })
+        })
+        .await
+        .map_err(|error| format!("resume: {error}"))?;
+    if same_file {
+        options.cost_budget = handle.session().agent.cost_budget().cloned();
+    }
     // `/reload` resumes this same file. Flush the outgoing session before
     // constructing its replacement so the new context includes pending rows.
     // No runtime resources are stopped until the candidate is installed.
@@ -11357,13 +11392,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replacement_template_retains_cost_limits_without_sharing_old_balance() {
+        let budget = crate::cost::CostBudget::new(Some(2.0), Some(5.0), 4.0).expect("budget");
+        let options = crate::sdk::SessionOptions {
+            cost_budget: Some(budget),
+            ..crate::sdk::SessionOptions::default()
+        };
+        let template = resume_template_from(&options);
+        assert!(template.cost_budget.is_none());
+        assert_eq!(template.warn_cost, Some(2.0));
+        assert_eq!(template.max_cost, Some(5.0));
+    }
+
     /// A `/new` or `/resume` replacement keeps extensions observing (bd-82331).
-    ///
-    /// The launch path installs a runtime handle on the session it builds, but
-    /// both replacement paths clone the launch *template*, which cannot carry
-    /// one. Without this the session still works and extensions simply stop
-    /// receiving `message_*` and `tool_execution_*` the moment the user runs
-    /// `/new` or `/resume` — no error, no warning, on the default stack.
+    /// Both replacement paths need the live driver runtime for the coalescer.
     #[test]
     fn replacement_options_install_the_driver_runtime_and_ui_handler() {
         let runtime = asupersync::runtime::RuntimeBuilder::new()
@@ -15776,6 +15819,28 @@ mod tests {
             1,
             "an emitted advisor note must reach the visible transcript once"
         );
+    }
+
+    #[test]
+    fn cost_warning_is_visible_without_ending_the_active_turn() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("Still working.".into())));
+        for message in agent_event_to_pi_msgs(&crate::agent::AgentEvent::CostWarning {
+            spent: 2.5,
+            threshold: 2.0,
+            message: "Model spend reached $2.50 (warning at $2.00).".into(),
+        }) {
+            sim.send(PiFtuiMsg::Agent(message));
+        }
+        assert_eq!(sim.model().state, AgentUiState::Working);
+        assert!(sim.model().transcript.iter().any(|entry| {
+            entry.role == EntryRole::System
+                && entry.text == "Model spend reached $2.50 (warning at $2.00)."
+        }));
+        assert_eq!(sim.model().streaming.as_str(), "Still working.");
     }
 
     #[test]

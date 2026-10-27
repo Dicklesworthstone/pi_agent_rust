@@ -74,6 +74,9 @@ impl Invocation<'_> {
 
 #[allow(clippy::needless_pass_by_value)] // `map_err` adapter at every call site
 pub(super) fn public_error(error: Error) -> String {
+    if matches!(&error, Error::CostCap { .. }) {
+        return format!("cost_cap: {error}");
+    }
     let text = error.to_string();
     for code in [
         "PI_SECRET_BLOCK",

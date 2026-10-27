@@ -57,6 +57,7 @@ pub(super) struct ChildRunner {
     child_binary: PathBuf,
     role_model_spec: Option<String>,
     parent_model: Option<crate::tools::ToolModelSelection>,
+    cost_budget: Option<crate::cost::CostBudget>,
     worker_model_selection: Option<super::model_selection::Selection>,
     worker_fallback_policy: Option<String>,
     hub_kind: ChildKind,
@@ -82,6 +83,7 @@ impl ChildRunner {
             child_binary,
             role_model_spec,
             parent_model: None,
+            cost_budget: None,
             worker_model_selection: None,
             worker_fallback_policy: None,
             hub_kind,
@@ -131,6 +133,11 @@ impl ChildRunner {
         model: Option<crate::tools::ToolModelSelection>,
     ) -> Self {
         self.parent_model = model;
+        self
+    }
+
+    pub(super) fn with_cost_budget(mut self, budget: Option<crate::cost::CostBudget>) -> Self {
+        self.cost_budget = budget;
         self
     }
 
@@ -329,6 +336,7 @@ impl ChildRunner {
                 depth: child_depth(),
                 public_task: self.public_task.clone(),
                 launch_admission: self.launch_admission.clone(),
+                cost_budget: self.cost_budget.clone(),
             },
             |(_, launch)| launch.clone(),
         );
@@ -475,6 +483,12 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
+        if let Some(budget) = &launch.cost_budget
+            && let Err(error) = budget.admit()
+        {
+            attempt.result.fail(error.to_string());
+            return attempt;
+        }
         let capabilities = owner.capabilities();
         if !capabilities.io || !capabilities.spawn || !capabilities.time {
             attempt.result.fail(
@@ -573,13 +587,16 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        let hub_channel = if attempt.result.tools.iter().any(|tool| tool == "hub") {
+        let messaging = attempt.result.tools.iter().any(|tool| tool == "hub");
+        let hub_channel = if messaging || launch.cost_budget.is_some() {
             match crate::agent_hub::ipc::ChildChannel::bind(
                 &hub_entry.id,
                 owner,
                 self.deadline.remaining(),
             ) {
-                Ok(channel) => Some(channel),
+                Ok(channel) => {
+                    Some(channel.with_cost_budget(launch.cost_budget.clone(), messaging))
+                }
                 Err(error) => {
                     attempt.result.fail(error.to_string());
                     return attempt;

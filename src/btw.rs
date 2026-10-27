@@ -50,6 +50,7 @@ pub struct PreparedBtwRequest {
     context_summary: String,
     question: String,
     privacy: Arc<AuxiliaryPrivacy>,
+    cost_budget: Option<crate::cost::CostBudget>,
 }
 
 impl BtwClient {
@@ -114,6 +115,7 @@ impl BtwClient {
             context_summary,
             question,
             privacy: Arc::clone(&self.privacy),
+            cost_budget: self.provider.cost_budget().cloned(),
         })
         .await
     }
@@ -145,9 +147,11 @@ impl BtwClient {
         agent: &crate::agent::Agent,
         question: &str,
     ) -> Result<PreparedBtwRequest> {
-        self.prepare_projected(agent.messages(), question, |inputs| {
+        let mut request = self.prepare_projected(agent.messages(), question, |inputs| {
             agent.project_auxiliary_inputs(inputs, &self.privacy)
-        })
+        })?;
+        request.cost_budget = agent.cost_budget().cloned();
+        Ok(request)
     }
 
     fn prepare_projected(
@@ -188,6 +192,7 @@ impl BtwClient {
             context_summary: render_context_summary(pieces, protected),
             question,
             privacy: Arc::clone(&self.privacy),
+            cost_budget: self.provider.cost_budget().cloned(),
         })
     }
 
@@ -203,8 +208,17 @@ impl BtwClient {
             system_prompt,
             context_summary,
             question,
+            cost_budget,
             ..
         } = request;
+        let provider = cost_budget.map_or_else(
+            || {
+                self.provider
+                    .unguarded_provider()
+                    .unwrap_or_else(|| Arc::clone(&self.provider))
+            },
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&self.provider), budget),
+        );
         let user_text = if context_summary.is_empty() {
             question
         } else {
@@ -225,7 +239,7 @@ impl BtwClient {
             ..Default::default()
         };
         with_timeout(ANSWER_TIMEOUT, async {
-            let stream = self.provider.stream(&context, &options).await?;
+            let stream = provider.stream(&context, &options).await?;
             collect_text(stream, MAX_TEXT_BYTES).await
         })
         .await
@@ -919,6 +933,35 @@ mod tests {
                 0
             );
             assert_eq!(agent.mask_secrets_text(known), "<pi-secret:000001>");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Exact fixture amounts are copied, not calculated.
+    fn prepared_side_request_keeps_its_original_session_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let (client, provider) = privacy_client("obfuscate");
+            let original = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let mut agent = crate::agent::Agent::new(
+                provider.clone(),
+                crate::tools::ToolRegistry::from_tools(Vec::new()),
+                crate::agent::AgentConfig::default(),
+            );
+            agent.set_cost_budget(Some(original.clone()));
+            let prepared = client.prepare_with_agent(&agent, "old question").unwrap();
+            original.record(1.0).unwrap();
+            let replacement = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            agent.set_cost_budget(Some(replacement.clone()));
+            assert!(matches!(
+                client.ask_prepared(prepared).await,
+                Err(Error::CostCap { spent, cap }) if spent == 1.0 && cap == 1.0
+            ));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let prepared = client.prepare_with_agent(&agent, "new question").unwrap();
+            assert_eq!(client.ask_prepared(prepared).await.unwrap(), "safe answer");
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(original.spent(), 1.0);
+            assert_eq!(replacement.spent(), 0.0);
         });
     }
 

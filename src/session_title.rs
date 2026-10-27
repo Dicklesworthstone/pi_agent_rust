@@ -39,6 +39,7 @@ pub(crate) struct PreparedTitle {
     system_prompt: String,
     prompt: String,
     privacy: Arc<AuxiliaryPrivacy>,
+    cost_budget: Option<crate::cost::CostBudget>,
 }
 
 impl TitleClient {
@@ -80,9 +81,13 @@ impl TitleClient {
         &self,
         agent: &crate::agent::Agent,
     ) -> Result<Option<PreparedTitle>> {
-        self.prepare_projected(agent.messages(), |parts| {
+        let mut request = self.prepare_projected(agent.messages(), |parts| {
             agent.project_auxiliary_inputs(parts, &self.privacy)
-        })
+        })?;
+        if let Some(request) = &mut request {
+            request.cost_budget = agent.cost_budget().cloned();
+        }
+        Ok(request)
     }
 
     fn prepare_projected(
@@ -143,6 +148,7 @@ impl TitleClient {
                 excerpt(&assistant, 800)
             ),
             privacy: Arc::clone(&self.privacy),
+            cost_budget: self.provider.cost_budget().cloned(),
         }))
     }
 
@@ -158,6 +164,14 @@ impl TitleClient {
         if !Arc::ptr_eq(&request.privacy, &self.privacy) {
             return None;
         }
+        let provider = request.cost_budget.map_or_else(
+            || {
+                self.provider
+                    .unguarded_provider()
+                    .unwrap_or_else(|| Arc::clone(&self.provider))
+            },
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&self.provider), budget),
+        );
         let context = Context {
             system_prompt: Some(request.system_prompt.into()),
             messages: vec![Message::User(UserMessage {
@@ -168,7 +182,7 @@ impl TitleClient {
             tools: Vec::new().into(),
         };
         let raw = with_timeout(timeout, async {
-            let stream = self.provider.stream(&context, &self.options).await?;
+            let stream = provider.stream(&context, &self.options).await?;
             collect_text(stream, MAX_REPLY_BYTES).await
         })
         .await
@@ -305,6 +319,9 @@ pub(crate) async fn save_if_unnamed(
     }
     let mut candidate = session.clone();
     candidate.set_name(title);
+    if let Some(budget) = agent_session.agent.cost_budget() {
+        budget.checkpoint(&mut candidate)?;
+    }
     // Mark uncertainty immediately before persistence. If the owner is
     // dropped during the save, the shared gate remains closed. The identical
     // candidate reconciles an append that reached disk before a failed ack.

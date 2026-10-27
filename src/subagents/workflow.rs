@@ -465,7 +465,8 @@ impl Plan {
             crate::agent_hub::ChildKind::Subagent,
             deadline,
         )
-        .with_parent_model(parent_model);
+        .with_parent_model(parent_model)
+        .with_cost_budget(tool.cost_scope.current());
         check_authority(&owner)?;
         deadline
             .check()

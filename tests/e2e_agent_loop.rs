@@ -498,6 +498,7 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::PrewalkSwitched { .. } => "prewalk_switched",
         AgentEvent::ExtensionError { .. } => "extension_error",
         AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::CostWarning { .. } => "cost_warning",
         AgentEvent::ProviderError { .. } => "provider_error",
     }
 }
@@ -718,6 +719,7 @@ fn run_scenario(
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1012,6 +1014,7 @@ fn context_intelligence_no_mock_harness() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1491,6 +1494,7 @@ fn rpc_partial_tool_call_arguments_grow_during_stream() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,

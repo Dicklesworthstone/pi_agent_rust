@@ -140,6 +140,8 @@ pub struct SubagentTool {
     model_config: Option<Config>,
     /// Live host identity for tools mounted in an agent's registry.
     model_scope: Option<ToolModelScope>,
+    /// Live session budget; each admitted run retains its original gate.
+    cost_scope: crate::cost::CostScope,
     /// An explicit launch-time snapshot for background host commands.
     parent_model: Option<ToolModelSelection>,
     /// Host ceiling for the entire request, not a fresh allowance per child.
@@ -168,6 +170,7 @@ pub(crate) struct RevivalSpec {
     depth: usize,
     public_task: Option<String>,
     launch_admission: Option<LaunchAdmission>,
+    cost_budget: Option<crate::cost::CostBudget>,
 }
 
 impl RevivalSpec {
@@ -233,6 +236,7 @@ pub(crate) async fn revive_child(
         deadline,
     )
     .with_parent_model(launch.parent_model.clone())
+    .with_cost_budget(launch.cost_budget.clone())
     .with_revival(id.to_string(), launch.clone());
     let mut result = owner
         .with_current(runner.run_one(&agents, task, launch.step, on_update.map(Arc::from)))
@@ -271,6 +275,7 @@ impl SubagentTool {
             role_model_role: None,
             model_config: None,
             model_scope: None,
+            cost_scope: crate::cost::CostScope::default(),
             parent_model: None,
             timeout: None,
             privacy: None,
@@ -336,6 +341,22 @@ impl SubagentTool {
     pub fn with_model_scope(mut self, scope: ToolModelScope) -> Self {
         self.bind_model_scope(scope);
         self
+    }
+
+    /// Bind the owning session's live cost gate. Background runs capture it
+    /// before launch, so switching the parent's session cannot reset them.
+    #[must_use]
+    pub fn with_cost_scope(mut self, scope: crate::cost::CostScope) -> Self {
+        self.cost_scope = scope;
+        self
+    }
+
+    /// Explicit shared budget for standalone SDK delegation.
+    #[must_use]
+    pub fn with_cost_budget(self, budget: Option<crate::cost::CostBudget>) -> Self {
+        let scope = crate::cost::CostScope::default();
+        scope.set(budget);
+        self.with_cost_scope(scope)
     }
 
     /// Freeze the parent's identity before dispatching background work such
@@ -421,6 +442,7 @@ impl SubagentTool {
         )
         .into_background()
         .with_parent_model(self.capture_parent_model())
+        .with_cost_budget(self.cost_scope.current())
         .run_one(&agents, request, None, None)
         .await;
         Ok(TanCompletion::from_result(result))
@@ -444,6 +466,7 @@ impl SubagentTool {
             role_model_role: None,
             model_config: None,
             model_scope: None,
+            cost_scope: crate::cost::CostScope::default(),
             parent_model: None,
             timeout: None,
             privacy: None,
@@ -501,7 +524,8 @@ impl SubagentTool {
                 crate::agent_hub::ChildKind::Subagent,
                 deadline,
             )
-            .with_parent_model(parent_model),
+            .with_parent_model(parent_model)
+            .with_cost_budget(self.cost_scope.current()),
             agents,
             mode,
             concurrency,
@@ -740,6 +764,10 @@ impl Tool for SubagentTool {
     fn bind_model_scope(&mut self, scope: ToolModelScope) {
         self.model_scope = Some(scope);
         self.parent_model = None;
+    }
+
+    fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.cost_scope = scope;
     }
 
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {

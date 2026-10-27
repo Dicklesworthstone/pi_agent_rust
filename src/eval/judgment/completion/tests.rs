@@ -271,6 +271,41 @@ fn incomplete_failed_empty_and_oversized_responses_never_become_answers() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)] // Exact fixture amounts are copied, not calculated.
+fn delayed_eval_binding_keeps_the_invocation_budget_after_scope_replacement() {
+    let provider = fixture([]);
+    let scope = crate::cost::CostScope::default();
+    let original = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+    scope.set(Some(original.clone()));
+    let mut invocation = Invocation::new(Some(binding(&provider)), &json!({}), None)
+        .unwrap()
+        .with_cost_budget(scope.current());
+    original.record(1.0).unwrap();
+    let replacement = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+    scope.set(Some(replacement.clone()));
+    runtime().block_on(async {
+        let judge = invocation.bound_judge(Path::new("."), None).await.unwrap();
+        assert!(matches!(
+            judge.complete(CompletionRequest::parse(json!({"prompt":"old cell"})).unwrap()).await,
+            Err(Error::CostCap { spent, cap }) if spent == 1.0 && cap == 1.0
+        ));
+        assert!(provider.requests.lock().unwrap().is_empty());
+        let mut next = Invocation::new(Some(binding(&provider)), &json!({}), None)
+            .unwrap()
+            .with_cost_budget(scope.current());
+        let judge = next.bound_judge(Path::new("."), None).await.unwrap();
+        let answer = judge
+            .complete(CompletionRequest::parse(json!({"prompt":"new cell"})).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(answer["text"], "answer");
+    });
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    assert_eq!(original.spent(), 1.0);
+    assert_eq!(replacement.spent(), 0.0);
+}
+
+#[test]
 fn completions_judgments_and_batches_share_one_attempt_budget() {
     let provider = fixture([
         Reply::Text("text".into()),

@@ -43,6 +43,11 @@ pub fn hints_for_error(error: &Error) -> ErrorHint {
         Error::Json(err) => json_hints(err),
         Error::Sqlite(err) => sqlite_hints(err),
         Error::Aborted => aborted_hints(),
+        Error::CostCap { .. } => ErrorHint {
+            summary: "Session model-spend cap reached",
+            hints: &["Raise --max-cost / session.maxCost explicitly to continue this session"],
+            context_fields: &["spent", "cap"],
+        },
         Error::Api(msg) => api_hints(msg),
     }
 }
@@ -603,6 +608,7 @@ pub fn error_code(error: &Error) -> &'static str {
         Error::Json(_) => "json",
         Error::Sqlite(_) => "state_store",
         Error::Aborted => "aborted",
+        Error::CostCap { .. } => "cost_cap",
         Error::Api(_) => "api",
     }
 }

@@ -58,6 +58,12 @@ pub enum Error {
     #[error("Operation aborted")]
     Aborted,
 
+    /// A model request was refused before transmission by the session budget.
+    #[error(
+        "Cost cap reached: this session spent ${spent:.4} of its ${cap:.4} cap (--max-cost / session.maxCost); the next model request was not sent"
+    )]
+    CostCap { spent: f64, cap: f64 },
+
     /// API errors (generic)
     #[error("API error: {0}")]
     Api(String),
@@ -298,7 +304,7 @@ impl Error {
         match self {
             Self::Validation(_) => "invalid_request",
             Self::Io(_) | Self::Session(_) | Self::SessionNotFound { .. } | Self::Sqlite(_) => "io",
-            Self::Auth(_) => "denied",
+            Self::Auth(_) | Self::CostCap { .. } => "denied",
             Self::Aborted => "timeout",
             Self::Json(_)
             | Self::Extension(_)
@@ -324,6 +330,7 @@ impl Error {
             Self::Json(_) => "json",
             Self::Sqlite(_) => "sqlite",
             Self::Aborted => "runtime",
+            Self::CostCap { .. } => "cost_cap",
             Self::Api(_) => "api",
         }
     }
@@ -391,6 +398,14 @@ impl Error {
                     "details",
                     "Operation cancelled by user or runtime.".to_string(),
                 )],
+            ),
+            Self::CostCap { spent, cap } => build_hints(
+                "Session model-spend cap reached; the next request was not sent.",
+                vec![
+                    "Raise --max-cost / session.maxCost explicitly to continue this session."
+                        .to_string(),
+                ],
+                vec![("spent", spent.to_string()), ("cap", cap.to_string())],
             ),
             Self::Api(message) => build_hints(
                 "API request failed.",

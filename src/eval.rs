@@ -219,6 +219,7 @@ pub struct EvalTool {
     // Registry snapshots share this resolver. The active slots above belong
     // only to the selected session; other retained namespaces are bounded.
     session_scope: crate::jobs::JobSessionScope,
+    cost_scope: crate::cost::CostScope,
     retained_sessions: Mutex<session::RetainedSessions>,
     // Slot mutexes protect storage, not execution: each runner takes its
     // kernel out across awaits. Keep this lease until it returns or drops.
@@ -239,6 +240,7 @@ impl EvalTool {
             kernel: Mutex::new(None),
             js: Mutex::new(None),
             session_scope: crate::jobs::JobSessionScope::default(),
+            cost_scope: crate::cost::CostScope::default(),
             retained_sessions: Mutex::new(session::RetainedSessions::default()),
             execution: Arc::new(futures::lock::Mutex::new(())),
             judge: None,
@@ -679,6 +681,10 @@ fn format_cell_response(line: &str, restarted: bool, cells_run: u64) -> Result<T
 #[async_trait::async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EvalTool {
+    fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.cost_scope = scope;
+    }
+
     fn name(&self) -> &str {
         "eval"
     }

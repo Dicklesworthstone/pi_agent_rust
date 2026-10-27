@@ -438,6 +438,7 @@ pub(super) async fn execute(
             deadline,
         )
         .with_parent_model(saved_model)
+        .with_cost_budget(tool.cost_scope.current())
         .with_public_task(Some(question.clone()))
         .with_launch_admission(Some(launch_admission))
         .run_one(&agents, task, None, on_update)

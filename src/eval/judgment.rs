@@ -220,6 +220,7 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
 pub(super) struct Invocation<'p> {
     /// An SDK-provided Judge is a fixed authority ceiling, never a cache slot.
     judge: Option<Judge>,
+    cost_budget: Option<crate::cost::CostBudget>,
     selection: Option<Selection>,
     /// Per-cell bindings only. Retained jobs clone their selected native Judge;
     /// interpreter handles never carry provider or credential objects.
@@ -247,6 +248,7 @@ impl<'p> Invocation<'p> {
         }
         Ok(Self {
             judge,
+            cost_budget: None,
             selection,
             resolved: Vec::new(),
             protect,
@@ -260,6 +262,11 @@ impl<'p> Invocation<'p> {
 
     pub(super) fn with_host(mut self, host: Option<&'p dyn ToolInvocationHost>) -> Self {
         self.host = host;
+        self
+    }
+
+    pub(super) fn with_cost_budget(mut self, budget: Option<crate::cost::CostBudget>) -> Self {
+        self.cost_budget = budget;
         self
     }
 
@@ -486,7 +493,7 @@ impl<'p> Invocation<'p> {
             return Err(Error::tool("judge", "PI_JUDGE_PERMISSION"));
         }
         if let Some(judge) = &self.judge {
-            return Ok(judge.clone());
+            return Ok(judge.clone().with_cost_budget(self.cost_budget.clone()));
         }
         let selection = selection.ok_or_else(binding_error)?;
         if let Some((_, judge)) = self.resolved.iter().find(|(key, _)| key == selection) {
@@ -506,7 +513,8 @@ impl<'p> Invocation<'p> {
             resolver_owner.checkpoint().map_err(|_| binding_error())?;
             resolve(&cwd, &selected)
         })
-        .await?;
+        .await?
+        .with_cost_budget(self.cost_budget.clone());
         owner
             .checkpoint()
             .map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
@@ -558,6 +566,9 @@ impl<'p> Invocation<'p> {
 // request state, prompt fragments, authentication headers or command output.
 #[allow(clippy::needless_pass_by_value)] // `map_err` adapter at every call site
 fn public_error(error: Error) -> String {
+    if matches!(&error, Error::CostCap { .. }) {
+        return format!("cost_cap: {error}");
+    }
     let text = error.to_string();
     for code in [
         "PI_SECRET_BLOCK",

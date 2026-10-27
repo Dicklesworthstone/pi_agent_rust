@@ -39,6 +39,7 @@ pub struct ReflectTool {
     store: Arc<MemoryStore>,
     binding: Option<(Arc<dyn Provider>, StreamOptions)>,
     privacy: Option<AuxiliaryPrivacy>,
+    cost_scope: crate::cost::CostScope,
 }
 
 impl ReflectTool {
@@ -48,6 +49,7 @@ impl ReflectTool {
             store,
             binding: None,
             privacy: None,
+            cost_scope: crate::cost::CostScope::default(),
         }
     }
 
@@ -69,6 +71,7 @@ impl ReflectTool {
             store,
             binding: Some((provider, options)),
             privacy: None,
+            cost_scope: crate::cost::CostScope::default(),
         }
     }
 
@@ -190,6 +193,9 @@ impl ReflectTool {
         }
         let owner = AgentCx::for_current_or_request();
         checkpoint(&owner)?;
+        // Capture the admitted invocation's account. Registry snapshots share
+        // the resolver, while a later session switch cannot move this bill.
+        let cost_budget = self.cost_scope.current();
         let corpus = self.gather(&input.question)?;
         if corpus.is_empty() {
             return Ok(text_output(
@@ -199,6 +205,10 @@ impl ReflectTool {
             ));
         }
         let (provider, options, privacy) = self.resolve_binding()?;
+        let provider = cost_budget.map_or_else(
+            || Arc::clone(&provider),
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&provider), budget),
+        );
         let direct_protection = |parts: &[&str]| redact_inputs(parts, &privacy);
         let (question, corpus) = screen_sources(
             &input.question,
@@ -350,6 +360,13 @@ fn safe_error(message: &str, options: &StreamOptions) -> Error {
     Error::tool("reflect", redacted)
 }
 
+fn safe_provider_error(error: Error, options: &StreamOptions) -> Error {
+    match error {
+        cap @ Error::CostCap { .. } => cap,
+        other => safe_error(&other.to_string(), options),
+    }
+}
+
 /// Project all user-controlled source fields together, before JSON quoting.
 /// A credential assignment in a later memory or tag can protect an earlier
 /// bare echo. Only owned copies change: stored facts and the live Agent vault
@@ -464,7 +481,7 @@ async fn collect_answer(
     checkpoint(owner)?;
     let answer = collect_text(stream, MAX_ANSWER_BYTES)
         .await
-        .map_err(|error| safe_error(&error.to_string(), options))?;
+        .map_err(|error| safe_provider_error(error, options))?;
     checkpoint(owner)?;
     Ok(answer)
 }
@@ -485,7 +502,7 @@ async fn synthesize(
     let request = async {
         let stream = Box::pin(provider.stream(context, options))
             .await
-            .map_err(|error| safe_error(&error.to_string(), options))?;
+            .map_err(|error| safe_provider_error(error, options))?;
         collect_answer(stream, options, owner).await
     };
     owner
@@ -516,6 +533,10 @@ struct ReflectInput {
 #[async_trait::async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ReflectTool {
+    fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.cost_scope = scope;
+    }
+
     fn name(&self) -> &str {
         "reflect"
     }
@@ -607,6 +628,91 @@ mod tests {
             )
             .await
         })
+    }
+
+    #[test]
+    fn reflection_uses_the_live_registry_budget_across_snapshots() {
+        struct CostProbe(std::sync::atomic::AtomicUsize);
+
+        #[async_trait::async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
+        impl Provider for CostProbe {
+            fn name(&self) -> &str {
+                "reflection-cost"
+            }
+            fn api(&self) -> &str {
+                "test"
+            }
+            fn model_id(&self) -> &str {
+                "reflection-cost"
+            }
+
+            async fn stream(
+                &self,
+                context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> Result<ReflectionStream> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(context.tools.is_empty());
+                let mut message = AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(
+                        "The parser is incremental.",
+                    ))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                };
+                message.usage.cost.total = 0.5;
+                Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                })])))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).unwrap());
+        store
+            .retain(
+                super::super::MemoryKind::Fact,
+                "The parser is incremental.",
+                &[],
+                None,
+            )
+            .unwrap();
+        let provider = Arc::new(CostProbe(std::sync::atomic::AtomicUsize::new(0)));
+        let registry = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+            ReflectTool::with_provider(store, provider.clone()),
+        )]);
+        let snapshot = registry.clone_shallow();
+        let original = crate::cost::CostBudget::new(None, Some(1.0), 1.0).unwrap();
+        registry.cost_scope().set(Some(original.clone()));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tool = snapshot.get("reflect").unwrap();
+            assert!(matches!(
+                tool.execute("blocked", json!({"question":"parser"}), None).await,
+                Err(Error::CostCap { spent, cap }) if spent == 1.0 && cap == 1.0
+            ));
+            assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let replacement = crate::cost::CostBudget::new(None, Some(0.5), 0.0).unwrap();
+            registry.cost_scope().set(Some(replacement.clone()));
+            let output = tool
+                .execute("admitted", json!({"question":"parser"}), None)
+                .await
+                .unwrap();
+            assert!(!output.is_error);
+            assert_eq!(replacement.spent(), 0.5);
+            assert_eq!(original.spent(), 1.0);
+            assert!(matches!(
+                registry.get("reflect").unwrap()
+                    .execute("next", json!({"question":"parser"}), None).await,
+                Err(Error::CostCap { spent, cap }) if spent == 0.5 && cap == 0.5
+            ));
+            assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 
     #[test]

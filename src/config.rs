@@ -144,6 +144,8 @@ pub struct Config {
     /// Background completion behavior for unattended print runs.
     #[serde(rename = "async", alias = "async_settings")]
     pub async_settings: Option<AsyncSettings>,
+    /// Shared model-spend warning/cap for a session and its native children.
+    pub session: Option<SessionSettings>,
 
     // Version check
     #[serde(alias = "checkForUpdates")]
@@ -415,6 +417,29 @@ pub struct AsyncSettings {
     pub print_wake: Option<bool>,
 }
 
+/// Model costs are denominated in USD. CLI thresholds override these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SessionSettings {
+    #[serde(alias = "warn_cost", deserialize_with = "deserialize_cost_threshold")]
+    pub warn_cost: Option<f64>,
+    #[serde(alias = "max_cost", deserialize_with = "deserialize_cost_threshold")]
+    pub max_cost: Option<f64>,
+}
+
+fn deserialize_cost_threshold<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|amount| !amount.is_finite() || amount <= 0.0) {
+        return Err(serde::de::Error::custom(
+            "expected a positive finite USD amount",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrySettings {
@@ -682,7 +707,10 @@ pub struct MemorySettings {
 impl MemorySettings {
     #[must_use]
     pub fn enabled(&self) -> bool {
-        matches!(self.backend.as_deref().map(str::trim), Some("local" | "cass"))
+        matches!(
+            self.backend.as_deref().map(str::trim),
+            Some("local" | "cass")
+        )
     }
 
     #[must_use]
@@ -998,7 +1026,9 @@ impl Config {
             memory: merge_memory(base.memory, other.memory),
             mcp: match (base.mcp, other.mcp) {
                 (Some(base), Some(other)) => Some(McpSettings {
-                    enable_project_config: other.enable_project_config.or(base.enable_project_config),
+                    enable_project_config: other
+                        .enable_project_config
+                        .or(base.enable_project_config),
                 }),
                 (base, other) => other.or(base),
             },
@@ -1019,6 +1049,13 @@ impl Config {
             async_settings: match (base.async_settings, other.async_settings) {
                 (Some(base), Some(other)) => Some(AsyncSettings {
                     print_wake: other.print_wake.or(base.print_wake),
+                }),
+                (base, other) => other.or(base),
+            },
+            session: match (base.session, other.session) {
+                (Some(base), Some(other)) => Some(SessionSettings {
+                    warn_cost: other.warn_cost.or(base.warn_cost),
+                    max_cost: other.max_cost.or(base.max_cost),
                 }),
                 (base, other) => other.or(base),
             },
@@ -2621,6 +2658,32 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn session_cost_thresholds_validate_and_merge_individually() {
+        for content in [
+            r#"{"session":{"warnCost":1.5,"maxCost":5}}"#,
+            r#"{"session":{"warn_cost":1.5,"max_cost":5}}"#,
+        ] {
+            let base: Config = serde_json::from_str(content).expect("cost settings");
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let other = serde_json::from_str(r#"{"session":{"maxCost":8}}"#).expect("override");
+            let merged = Config::merge(base, other)
+                .session
+                .expect("session settings");
+            assert_eq!(merged.warn_cost, Some(1.5));
+            assert_eq!(merged.max_cost, Some(8.0));
+        }
+        for value in ["0", "-1", "1e999", "\"NaN\"", "true"] {
+            for key in ["warnCost", "maxCost"] {
+                let content = format!(r#"{{"session":{{"{key}":{value}}}}}"#);
+                assert!(
+                    serde_json::from_str::<Config>(&content).is_err(),
+                    "accepted {content}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn async_print_wake_is_opt_in_and_preserves_partial_settings_merges() {

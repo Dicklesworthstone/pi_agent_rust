@@ -748,6 +748,9 @@ pub struct AgentConfig {
     /// instead of starting another turn.
     pub max_time: Option<std::time::Duration>,
 
+    /// Shared parent/child model-spend admission; never reset by retries.
+    pub cost_budget: Option<crate::cost::CostBudget>,
+
     /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15).
     pub turn_recovery: crate::turn_recovery::TurnRecoveryMode,
 
@@ -773,6 +776,7 @@ impl fmt::Debug for AgentConfig {
             .field("tool_approval", &self.tool_approval.is_some())
             .field("keyword_settings", &self.keyword_settings)
             .field("max_time", &self.max_time)
+            .field("cost_budget", &self.cost_budget)
             .field("turn_recovery", &self.turn_recovery)
             .field("approval_state", &self.approval_state)
             .field("bash_settings", &self.bash_settings)
@@ -820,6 +824,7 @@ impl Default for AgentConfig {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1548,6 +1553,12 @@ pub enum AgentEvent {
     },
     /// Advisor verdict recorded for the session, before queued delivery (bd-cv653.3.3).
     AdvisorNote { level: String, rationale: String },
+    /// A shared model-spend warning crossed its configured USD threshold.
+    CostWarning {
+        spent: f64,
+        threshold: f64,
+        message: String,
+    },
     /// A planned one-shot handoff committed after a complete tool batch.
     PrewalkSwitched {
         provider: String,
@@ -2062,11 +2073,16 @@ impl Agent {
         tools: crate::tools::SharedToolRegistry,
         config: AgentConfig,
     ) -> Self {
+        let provider = config.cost_budget.as_ref().map_or_else(
+            || Arc::clone(&provider),
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&provider), budget.clone()),
+        );
         let keyword_max_thinking_level = config
             .stream_options
             .thinking_level
             .unwrap_or(crate::model::ThinkingLevel::Off);
         let registry = tools.snapshot();
+        registry.cost_scope().set(config.cost_budget.clone());
         let job_session_scope = registry.job_session_scope();
         registry
             .model_scope()
@@ -2517,7 +2533,10 @@ impl Agent {
     /// thinking to disabled and the tool-call dialect to native; catalog-aware
     /// callers must install the selected model's capabilities afterwards.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
-        self.provider = provider;
+        self.provider = self.config.cost_budget.as_ref().map_or_else(
+            || Arc::clone(&provider),
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&provider), budget.clone()),
+        );
         self.tools
             .snapshot()
             .model_scope()
@@ -2529,6 +2548,49 @@ impl Agent {
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
         self.tool_call_dialect = crate::dialects::Dialect::Native;
         self.config.model_accepts_images = false;
+    }
+
+    #[must_use]
+    pub fn cost_budget(&self) -> Option<&crate::cost::CostBudget> {
+        self.config.cost_budget.as_ref()
+    }
+
+    pub fn replacement_cost_budget(
+        &self,
+        session: &Session,
+        preserve: bool,
+    ) -> Result<Option<crate::cost::CostBudget>> {
+        self.cost_budget()
+            .map(|budget| budget.for_replacement(session, preserve))
+            .transpose()
+    }
+
+    /// Rebind only for an explicitly selected new/different session. Model
+    /// switches, retries, forks and history navigation keep the same handle.
+    pub fn set_cost_budget(&mut self, budget: Option<crate::cost::CostBudget>) {
+        self.config.cost_budget = budget.clone();
+        self.tools.snapshot().cost_scope().set(budget);
+        let provider = self
+            .provider
+            .unguarded_provider()
+            .unwrap_or_else(|| Arc::clone(&self.provider));
+        self.provider = self.config.cost_budget.as_ref().map_or_else(
+            || Arc::clone(&provider),
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&provider), budget.clone()),
+        );
+    }
+
+    fn emit_cost_warning(&self, on_event: &AgentEventHandler) {
+        if let Some(warning) = self
+            .cost_budget()
+            .and_then(crate::cost::CostBudget::take_warning)
+        {
+            on_event(AgentEvent::CostWarning {
+                spent: warning.spent,
+                threshold: warning.threshold,
+                message: warning.message,
+            });
+        }
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
@@ -4797,6 +4859,7 @@ impl Agent {
         checkpoint_cx: &crate::agent_cx::AgentCx,
         empty_response_limit_reached: bool,
     ) -> Result<AssistantStreamAttempt> {
+        self.emit_cost_warning(&on_event);
         // Refresh admitted MCP catalogs before capturing the provider's tool
         // schema, under the same owner and cancellation as this request.
         crate::mcp::refresh_agent_tools(&self.tools, abort.as_ref(), checkpoint_cx).await;
@@ -5683,6 +5746,7 @@ impl Agent {
         if let Some(rates) = self.provider.model_cost() {
             rates.price_usage(&mut message.usage);
         }
+        self.emit_cost_warning(on_event);
         let arc = Arc::new(message);
         if added_partial {
             if let Some(target) = self
@@ -7833,6 +7897,11 @@ impl ExtensionCompactionModelState {
         stream_options.api_key = target_key;
         stream_options.headers.clone_from(&entry.headers);
         stream_options.max_tokens = Some(entry.model.max_tokens);
+        let provider = if let Some(budget) = current_provider.cost_budget() {
+            crate::provider::guard_with_cost_budget(provider, budget.clone())
+        } else {
+            provider
+        };
         Ok((provider, stream_options))
     }
 
@@ -10627,6 +10696,44 @@ mod extensions_integration_tests {
         );
         assert_eq!(original.api_key.as_deref(), Some("source-provider-key"));
         assert_eq!(current.name(), "capturing-provider");
+    }
+
+    #[test]
+    fn extension_compaction_override_inherits_live_cost_cap_before_dispatch() {
+        let budget = crate::cost::CostBudget::new(None, Some(2.0), 1.0).expect("account");
+        let current = crate::provider::guard_with_cost_budget(
+            Arc::new(PiAiCaptureProvider {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            budget.clone(),
+        );
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![compaction_override_entry(
+            "cost-summary",
+            "summary-model",
+            false,
+        )]);
+        let state = ExtensionCompactionModelState {
+            registry: Some(Arc::new(registry)),
+            ..ExtensionCompactionModelState::default()
+        };
+        let (provider, options) = state
+            .resolve(
+                current,
+                StreamOptions::default(),
+                &compaction_override("cost-summary", "summary-model"),
+            )
+            .expect("alternate model");
+        assert!(
+            provider
+                .cost_budget()
+                .is_some_and(|shared| shared.same_tree(&budget))
+        );
+        // The request is prepared before another branch spends the remainder.
+        // Admission must consult that same live account immediately at send.
+        budget.record(1.0).expect("sibling completion");
+        let result = futures::executor::block_on(provider.stream(&Context::default(), &options));
+        assert!(matches!(result, Err(Error::CostCap { .. })));
     }
 
     #[test]
@@ -13989,6 +14096,7 @@ mod abort_tests {
             AgentEvent::FailoverStart { .. } => "failover_start",
             AgentEvent::FailoverEnd { .. } => "failover_end",
             AgentEvent::AdvisorNote { .. } => "advisor_note",
+            AgentEvent::CostWarning { .. } => "cost_warning",
             AgentEvent::PrewalkSwitched { .. } => "prewalk_switched",
             AgentEvent::ProviderError { .. } => "provider_error",
             AgentEvent::ExtensionError { .. } => "extension_error",
@@ -16804,9 +16912,7 @@ impl AgentSession {
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
-        if runtime_model_changed
-            && let Some(policy) = &mut self.child_fallback_policy
-        {
+        if runtime_model_changed && let Some(policy) = &mut self.child_fallback_policy {
             policy.use_default_role();
         }
         if runtime_model_changed || current_thinking != effective {
@@ -17735,6 +17841,9 @@ impl AgentSession {
     ) -> Result<()> {
         admission.ensure_allowed()?;
         let save_enabled = self.save_enabled();
+        if let Some(budget) = self.agent.cost_budget() {
+            budget.checkpoint(&mut candidate)?;
+        }
         if save_enabled {
             admission.block(format!(
                 "Session {operation} persistence was interrupted before live installation completed"
@@ -18452,6 +18561,9 @@ impl AgentSession {
             ));
         }
 
+        if let Some(budget) = self.agent.cost_budget() {
+            budget.checkpoint(&mut candidate)?;
+        }
         if self.save_enabled {
             self.provider_admission.block(
                 "compaction persistence was interrupted before live installation completed"
@@ -18557,6 +18669,7 @@ impl AgentSession {
             details,
         ));
 
+        self.agent.emit_cost_warning(&on_event);
         on_event(AgentEvent::AutoCompactionEnd {
             result: result_value,
             aborted: false,
@@ -19217,6 +19330,9 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            if let Some(budget) = self.agent.cost_budget() {
+                budget.checkpoint(&mut session)?;
+            }
             let persist_result = flush_turn_autosave(
                 &mut session,
                 &self.provider_admission,
@@ -19236,6 +19352,9 @@ impl AgentSession {
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
+        if let Some(budget) = self.agent.cost_budget() {
+            budget.checkpoint(&mut session)?;
+        }
         let persist_result = flush_turn_autosave(
             &mut session,
             &self.provider_admission,
@@ -19270,6 +19389,7 @@ impl AgentSession {
         let Some(runtime) = self.advisor.as_mut() else {
             return Ok(false);
         };
+        runtime.set_cost_budget(self.agent.cost_budget().cloned());
         let Ok(digest) = runtime.build_digest_with_agent(&self.agent) else {
             tracing::info!(
                 event = "pi.advisor.privacy_projection_refused",
@@ -19460,6 +19580,14 @@ impl AgentSession {
                 "Optional memory extraction did not complete; the completed turn is unchanged"
             );
         }
+        self.agent.emit_cost_warning(&turn.event_handler());
+        // Advisor/automatic memory requests finish after the primary turn's
+        // checkpoint. Save their shared account before returning to the host.
+        let result = if self.agent.cost_budget().is_some() {
+            self.save_and_index().await.and(result)
+        } else {
+            result
+        };
         turn.finish(result)
     }
 
@@ -20656,12 +20784,14 @@ impl AgentSession {
         }
         let session = Arc::clone(&self.session);
         let admission = self.provider_admission.clone();
+        let cost_budget = self.agent.cost_budget().cloned();
         let reset_advisor = self.advisor.is_some();
         let track_memory_inputs = self.memory_settings.is_some();
         let checkpoint: TurnCheckpoint = Arc::new(
             move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, bool> {
                 let session = Arc::clone(&session);
                 let admission = admission.clone();
+                let cost_budget = cost_budget.clone();
                 Box::pin(async move {
                     let cx = crate::agent_cx::AgentCx::for_request();
                     let Ok(mut session) = OwnedMutexGuard::lock(session, cx.cx()).await else {
@@ -20687,6 +20817,14 @@ impl AgentSession {
                         {
                             tracing::warn!("mid-run memory input provenance could not be recorded");
                         }
+                    }
+                    if let Some(budget) = &cost_budget
+                        && let Err(error) = budget.checkpoint(&mut session)
+                    {
+                        // Transcript rows are already queued. Return success
+                        // to advance the cursor; the final save retries the
+                        // checkpoint and reports any persistent error.
+                        tracing::warn!(%error, "mid-run cost checkpoint failed");
                     }
                     if session.autosave_durability_mode()
                         != crate::session::AutosaveDurabilityMode::Throughput
@@ -20767,6 +20905,9 @@ impl AgentSession {
                 && !(run_failed && is_synthetic_empty_error_assistant(&message))
             {
                 session.append_model_message(message);
+            }
+            if let Some(budget) = self.agent.cost_budget() {
+                budget.checkpoint(&mut session)?;
             }
             if self.save_enabled {
                 flush_turn_autosave(

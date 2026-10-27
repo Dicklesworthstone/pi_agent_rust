@@ -87,6 +87,7 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CODE_FAILURE: i32 = 1;
 const EXIT_CODE_USAGE: i32 = 2;
+const EXIT_CODE_COST_CAP: i32 = 3;
 
 /// A print-mode run whose stdout reader closed the pipe first, e.g.
 /// `pi --print --mode json ... | head -5`.
@@ -1206,6 +1207,13 @@ fn format_error_with_hints(err: &anyhow::Error) -> String {
 }
 
 fn exit_code_for_error(err: &anyhow::Error) -> i32 {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<pi::error::Error>()
+            .is_some_and(|error| matches!(error, pi::error::Error::CostCap { .. }))
+    }) {
+        return EXIT_CODE_COST_CAP;
+    }
     if err
         .chain()
         .any(|cause| cause.downcast_ref::<ApprovalSurfaceUnavailable>().is_some())
@@ -2332,6 +2340,23 @@ async fn run(
             Some(&workspace),
         )
     });
+    let startup_cost_budget = startup_session
+        .as_ref()
+        .map(|session| {
+            pi::cost::resolve_budget(
+                session,
+                config.session.as_ref(),
+                cli.warn_cost,
+                cli.max_cost,
+                None,
+            )
+        })
+        .transpose()?
+        .flatten();
+    shared_tools
+        .snapshot()
+        .cost_scope()
+        .set(startup_cost_budget.clone());
 
     // Pre-warm extension runtime in a background task so startup work can overlap
     // with auth refresh, model selection, and session creation.
@@ -2738,6 +2763,9 @@ async fn run(
                 .then(|| resources.format_skills_for_prompt()),
             max_tool_iterations,
             max_time: cli.max_time.map(std::time::Duration::from_secs),
+            warn_cost: cli.warn_cost,
+            max_cost: cli.max_cost,
+            cost_budget: startup_cost_budget.clone(),
             package_dir: Some(package_dir.clone()),
             mcp: (!cli.no_mcp).then(|| pi::sdk::McpSessionOptions {
                 config_paths: cli.mcp_config.clone(),
@@ -2965,6 +2993,7 @@ async fn run(
         tool_approval: None,
         keyword_settings: config.keywords.clone(),
         max_time: cli.max_time.map(std::time::Duration::from_secs),
+        cost_budget: startup_cost_budget,
         turn_recovery: config.turn_recovery_mode(),
         approval_state: Some(approval_state.clone()),
         bash_settings: config.bash.clone(),
@@ -6586,6 +6615,16 @@ async fn review_model_client(
     }
     let provider =
         pi::providers::create_provider_with_auth(&selection.model_entry, None, Some(&auth))?;
+    let provider = match pi::cost::resolve_budget(
+        &session,
+        config.session.as_ref(),
+        cli.warn_cost,
+        cli.max_cost,
+        None,
+    )? {
+        Some(budget) => pi::provider::guard_with_cost_budget(provider, budget),
+        None => provider,
+    };
     let stream_options = pi::app::build_stream_options(&config, key, &selection, &session);
     Ok(pi::review::ModelReviewer::new(
         provider,
@@ -10082,6 +10121,9 @@ async fn run_print_mode_inner(
             .as_ref()
             .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
         move |event: AgentEvent| {
+            if !emit_json_events && let AgentEvent::CostWarning { message, .. } = &event {
+                eprintln!("{message}");
+            }
             if emit_json_events {
                 emit_json_event(&event);
             } else if stream_text_events
@@ -12669,6 +12711,17 @@ mod tests {
             !append_file_fingerprint(&mut hasher, &path),
             "non-regular or symlinked cache inputs must disable the fast-path cache"
         );
+    }
+
+    #[test]
+    fn cost_cap_exit_status_survives_error_context() {
+        let error = anyhow::Error::new(pi::error::Error::CostCap {
+            spent: 2.5,
+            cap: 2.0,
+        })
+        .context("print request failed");
+        assert_eq!(exit_code_for_error(&error), 3);
+        assert_eq!(exit_code_for_error(&anyhow::anyhow!("ordinary failure")), 1);
     }
 
     #[test]

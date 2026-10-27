@@ -7,6 +7,7 @@
 //! live peers. Result reads share this transport and the parent's accepted
 //! output resolver. Process control and transcript access stay with the parent.
 
+pub mod cost;
 pub(crate) mod results;
 
 use super::{AgentHubRegistry, BusMessage, ChildEntry, ChildStatus, registry};
@@ -122,6 +123,7 @@ enum Incoming {
     Message(WireRequest),
     Result(results::WireRequest),
     Wait(WireWaitRequest),
+    Cost(cost::WireRequest),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -430,6 +432,8 @@ pub(crate) struct ChildChannel {
     owner: AgentCx,
     deadline: Instant,
     connections: Vec<Connection>,
+    messaging: bool,
+    cost_budget: Option<crate::cost::CostBudget>,
 }
 
 impl ChildChannel {
@@ -470,18 +474,33 @@ impl ChildChannel {
             owner: owner.clone(),
             deadline,
             connections: Vec::new(),
+            messaging: true,
+            cost_budget: None,
         })
+    }
+
+    /// Cost admission is available even when the child has no hub tool.
+    /// Such a channel must not grant messaging, result reads or reply waits.
+    pub(crate) fn with_cost_budget(
+        mut self,
+        budget: Option<crate::cost::CostBudget>,
+        messaging: bool,
+    ) -> Self {
+        self.cost_budget = budget;
+        self.messaging = messaging;
+        self
     }
 
     pub(crate) fn configure_child(command: &mut std::process::Command, channel: Option<&Self>) {
         // An explicit tool allowlist without hub needs no new channel and
         // must never borrow this process's identity in its own parent hub.
         command.env_remove(ADDRESS_ENV).env_remove(TOKEN_ENV);
-        if let Some(channel) = channel {
+        if let Some(channel) = channel.filter(|channel| channel.messaging) {
             command
                 .env(ADDRESS_ENV, channel.address.to_string())
                 .env(TOKEN_ENV, &channel.token);
         }
+        cost::configure_child(command, channel);
     }
 
     pub(crate) fn deactivate(&mut self) {
@@ -514,7 +533,14 @@ impl ChildChannel {
             }
         }
         self.connections.retain_mut(|connection| {
-            connection.poll(&self.sender, &self.token, &self.owner, self.deadline)
+            connection.poll(
+                &self.sender,
+                &self.token,
+                &self.owner,
+                self.deadline,
+                self.messaging,
+                self.cost_budget.as_ref(),
+            )
         });
     }
 }
@@ -578,7 +604,15 @@ impl Connection {
 
     #[allow(clippy::option_if_let_else)]
     #[allow(clippy::too_many_lines)] // One bounded read/dispatch/write pass per poll.
-    fn poll(&mut self, sender: &str, token: &str, owner: &AgentCx, deadline: Instant) -> bool {
+    fn poll(
+        &mut self,
+        sender: &str,
+        token: &str,
+        owner: &AgentCx,
+        deadline: Instant,
+        messaging: bool,
+        cost_budget: Option<&crate::cost::CostBudget>,
+    ) -> bool {
         if Instant::now() >= self.deadline.min(deadline) || owner.checkpoint().is_err() {
             return false;
         }
@@ -625,7 +659,7 @@ impl Connection {
                                 return false;
                             }
                             match serde_json::from_slice::<Incoming>(&self.input[..end]) {
-                                Ok(Incoming::Result(request)) => {
+                                Ok(Incoming::Result(request)) if messaging => {
                                     let response = results::dispatch_authenticated(
                                         sender, token, &request, owner,
                                     );
@@ -641,7 +675,7 @@ impl Connection {
                                         ),
                                     }
                                 }
-                                Ok(Incoming::Message(request)) => {
+                                Ok(Incoming::Message(request)) if messaging => {
                                     let response =
                                         dispatch_authenticated(sender, token, request, owner);
                                     self.set_response(&match response {
@@ -649,7 +683,7 @@ impl Connection {
                                         Err(error) => WireResponse::Error(error.to_string()),
                                     });
                                 }
-                                Ok(Incoming::Wait(request)) => {
+                                Ok(Incoming::Wait(request)) if messaging => {
                                     match acquire_wait_hold(
                                         sender,
                                         token,
@@ -668,6 +702,19 @@ impl Connection {
                                             .set_response(&WireResponse::Error(error.to_string())),
                                     }
                                 }
+                                Ok(Incoming::Cost(request)) => {
+                                    self.set_response(&cost::dispatch_authenticated(
+                                        sender,
+                                        token,
+                                        request,
+                                        owner,
+                                        cost_budget,
+                                    ));
+                                }
+                                Ok(_) => self.refuse(
+                                    "PERMISSION",
+                                    "this child channel only admits cost accounting",
+                                ),
                                 Err(_) => self.refuse("PROTOCOL", "invalid request frame"),
                             }
                             break;

@@ -157,6 +157,7 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::PrewalkSwitched { .. } => "prewalk_switched",
         AgentEvent::ExtensionError { .. } => "extension_error",
         AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::CostWarning { .. } => "cost_warning",
         AgentEvent::ProviderError { .. } => "provider_error",
     }
 }
@@ -222,6 +223,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         tool_approval: None,
         keyword_settings: None,
         max_time: None,
+        cost_budget: None,
         turn_recovery: TurnRecoveryMode::default(),
         approval_state: None,
         bash_settings: None,
@@ -1201,6 +1203,7 @@ fn agent_tool_execution_error_wraps_in_output() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1279,6 +1282,7 @@ fn agent_queue_follow_up_only_at_idle() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,

@@ -2237,7 +2237,12 @@ impl PiApp {
                     return None;
                 }
 
-                let Some(extensions) = self.extensions.clone() else {
+                let extensions = self.extensions.clone();
+                let requires_cost_save = self
+                    .agent
+                    .try_lock()
+                    .map_or(true, |agent| agent.cost_budget().is_some());
+                if extensions.is_none() && !requires_cost_save {
                     let Ok(mut agent_guard) = self.agent.try_lock() else {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
@@ -2290,7 +2295,7 @@ impl PiApp {
                     self.scroll_to_bottom();
                     self.input.focus();
                     return None;
-                };
+                }
 
                 let model_provider = self.model_entry.model.provider.clone();
                 let runtime_cwd = self.cwd.clone();
@@ -2319,14 +2324,18 @@ impl PiApp {
 
                 let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
                 runtime_handle.spawn(async move {
-                    let cancelled = extensions
-                        .dispatch_cancellable_event(
-                            ExtensionEventName::SessionBeforeSwitch,
-                            Some(json!({ "reason": "new" })),
-                            EXTENSION_EVENT_TIMEOUT_MS,
-                        )
-                        .await
-                        .unwrap_or(false);
+                    let cancelled = if let Some(extensions) = &extensions {
+                        extensions
+                            .dispatch_cancellable_event(
+                                ExtensionEventName::SessionBeforeSwitch,
+                                Some(json!({ "reason": "new" })),
+                                EXTENSION_EVENT_TIMEOUT_MS,
+                            )
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
                     if cancelled {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
@@ -2350,6 +2359,7 @@ impl PiApp {
                         new_session,
                         Vec::new(),
                         Some(reset_thinking),
+                        false,
                     )
                     .await
                     {
@@ -2376,16 +2386,18 @@ impl PiApp {
                     )
                     .await;
 
-                    let _ = extensions
-                        .dispatch_event(
-                            ExtensionEventName::SessionSwitch,
-                            Some(json!({
-                                "reason": "new",
-                                "previousSessionFile": previous_session_file,
-                                "sessionId": new_session_id,
-                            })),
-                        )
-                        .await;
+                    if let Some(extensions) = extensions {
+                        let _ = extensions
+                            .dispatch_event(
+                                ExtensionEventName::SessionSwitch,
+                                Some(json!({
+                                    "reason": "new",
+                                    "previousSessionFile": previous_session_file,
+                                    "sessionId": new_session_id,
+                                })),
+                            )
+                            .await;
+                    }
                 });
 
                 None
@@ -3814,7 +3826,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// parent agent's next idle turn boundary.
     pub(super) fn handle_slash_tan(&mut self, args: &str) -> Option<Cmd> {
         enum TanGate {
-            Enabled(Option<pi::tools::ToolModelSelection>),
+            Enabled(
+                Option<pi::tools::ToolModelSelection>,
+                Option<pi::cost::CostBudget>,
+            ),
             Disabled,
             Busy,
         }
@@ -3828,12 +3843,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
             if agent.has_tool("subagent") {
-                TanGate::Enabled(agent.shared_tools().snapshot().model_scope().current())
+                let tools = agent.shared_tools().snapshot();
+                TanGate::Enabled(tools.model_scope().current(), tools.cost_scope().current())
             } else {
                 TanGate::Disabled
             }
         });
-        let parent_model = match gate {
+        let (parent_model, cost_budget) = match gate {
             TanGate::Busy => {
                 self.status_message = Some("/tan unavailable: agent session is busy".to_string());
                 self.scroll_to_bottom();
@@ -3847,7 +3863,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
                 return None;
             }
-            TanGate::Enabled(model) => model,
+            TanGate::Enabled(model, cost) => (model, cost),
         };
 
         // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
@@ -3864,7 +3880,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
             .with_role_model_selection(pi::app::subagent_role_selection(&self.config))
             .with_model_config(Some(self.config.clone()))
-            .with_parent_model(parent_model);
+            .with_parent_model(parent_model)
+            .with_cost_budget(cost_budget);
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
@@ -5643,6 +5660,170 @@ mod tests {
     }
 
     #[test]
+    fn session_install_preserves_fork_spend_and_rebinds_new_or_resumed_accounts() {
+        let temp = TempDir::new().unwrap();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let original = crate::cost::CostBudget::new(None, Some(2.0), 1.25).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(original.clone()));
+
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                Session::in_memory(),
+                Vec::new(),
+                None,
+                true,
+            ))
+            .unwrap();
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .cost_budget()
+                .unwrap()
+                .same_tree(&original)
+        );
+        assert!(
+            (crate::cost::recorded_spend(&session.try_lock().unwrap()).unwrap() - 1.25).abs()
+                < f64::EPSILON
+        );
+
+        let same_session = session.try_lock().unwrap().clone();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                same_session,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .cost_budget()
+                .unwrap()
+                .same_tree(&original)
+        );
+
+        let mut resumed = Session::in_memory();
+        crate::cost::CostBudget::new(None, Some(2.0), 0.5)
+            .unwrap()
+            .checkpoint(&mut resumed)
+            .unwrap();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                resumed,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        let resumed_budget = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!resumed_budget.same_tree(&original));
+        assert!((resumed_budget.spent() - 0.5).abs() < f64::EPSILON);
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .shared_tools()
+                .snapshot()
+                .cost_scope()
+                .current()
+                .unwrap()
+                .same_tree(&resumed_budget)
+        );
+
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                Session::in_memory(),
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        let fresh = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!fresh.same_tree(&resumed_budget));
+        assert!(fresh.spent().abs() < f64::EPSILON);
+        assert!((original.spent() - 1.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn new_without_extensions_saves_departing_shared_spend_before_reset() {
+        let temp = TempDir::new().unwrap();
+        let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+        initial.header.cwd = temp.path().display().to_string();
+        runtime().block_on(initial.save()).unwrap();
+        let source_path = initial.path.clone().unwrap();
+        let session = Arc::new(Mutex::new(initial));
+        let (mut app, mut events) = build_bash_test_app(session, temp.path());
+        let original_id = current_session_id(&app);
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.75).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(budget.clone()));
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                events.recv(&cx),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert!(
+            matches!(terminal, PiMsg::ConversationReset { .. }),
+            "{terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert_ne!(current_session_id(&app), original_id);
+        let active = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!active.same_tree(&budget));
+        assert!(active.spent().abs() < f64::EPSILON);
+        let saved = runtime()
+            .block_on(Session::open(source_path.to_str().unwrap()))
+            .unwrap();
+        assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn atomic_session_install_does_not_mutate_agent_when_session_is_busy() {
         let temp = TempDir::new().expect("tempdir");
         let session = Arc::new(Mutex::new(Session::in_memory()));
@@ -5668,6 +5849,7 @@ mod tests {
             Session::in_memory(),
             vec![replacement_message],
             None,
+            false,
         ));
 
         assert!(result.is_err());

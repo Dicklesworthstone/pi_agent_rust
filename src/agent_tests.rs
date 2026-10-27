@@ -1447,11 +1447,8 @@ mod tests {
                     ..ResolvedCompactionSettings::default()
                 },
             );
-            let run = Box::pin(session.run_text_with_abort(
-                "Write the file".to_string(),
-                None,
-                |_| {},
-            ));
+            let run =
+                Box::pin(session.run_text_with_abort("Write the file".to_string(), None, |_| {}));
             let second_request = Box::pin(async {
                 while calls.load(Ordering::SeqCst) < 2 {
                     asupersync::runtime::yield_now().await;
@@ -1462,14 +1459,26 @@ mod tests {
 
             let path = {
                 let cx = crate::agent_cx::AgentCx::for_request();
-                saved.lock(cx.cx()).await.expect("saved session").path.clone().expect("path")
+                saved
+                    .lock(cx.cx())
+                    .await
+                    .expect("saved session")
+                    .path
+                    .clone()
+                    .expect("path")
             };
-            let reopened = Session::open(path.to_string_lossy().as_ref()).await.expect("reopen");
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen");
             let history = reopened.to_messages_for_current_path();
             assert!(
                 matches!(
                     history.as_slice(),
-                    [Message::User(_), Message::Assistant(_), Message::ToolResult(_)]
+                    [
+                        Message::User(_),
+                        Message::Assistant(_),
+                        Message::ToolResult(_)
+                    ]
                 ),
                 "{history:?}"
             ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
@@ -1578,17 +1587,38 @@ mod tests {
             let global = temp.path().join("global");
             std::fs::create_dir_all(&global).expect("global directory");
             let provider = Arc::new(RuleScriptProvider::new(vec![
-                rule_done("FORBIDDEN"), rule_done("FORBIDDEN"), rule_done("Completed."),
+                rule_done("FORBIDDEN"),
+                rule_done("FORBIDDEN"),
+                rule_done("Completed."),
             ]));
-            let mut agent = Agent::new(provider.clone(), ToolRegistry::from_tools(Vec::new()), AgentConfig::default());
-            agent.set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
-                temp.path().to_path_buf(), global.clone(), false,
-            )).expect("source");
-            agent.run("before configuration", |_| {}).await.expect("unconfigured turn");
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent
+                .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
+                    temp.path().to_path_buf(),
+                    global.clone(),
+                    false,
+                ))
+                .expect("source");
+            agent
+                .run("before configuration", |_| {})
+                .await
+                .expect("unconfigured turn");
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
             let file = global.join("stream-rules.json");
-            std::fs::write(&file, serde_json::to_vec(&json!({"version":1,"rules":[rule_fixture()]})).expect("serialize rules")).expect("write rules");
-            agent.run("after configuration", |_| {}).await.expect("reloaded turn");
+            std::fs::write(
+                &file,
+                serde_json::to_vec(&json!({"version":1,"rules":[rule_fixture()]}))
+                    .expect("serialize rules"),
+            )
+            .expect("write rules");
+            agent
+                .run("after configuration", |_| {})
+                .await
+                .expect("reloaded turn");
             assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
             std::fs::write(&file, "{ broken").expect("invalid replacement");
             assert!(agent.run("after invalid edit", |_| {}).await.is_err());
@@ -4097,6 +4127,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
@@ -4137,6 +4168,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
@@ -4590,6 +4622,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
@@ -4764,12 +4797,7 @@ mod tests {
                         .to_string();
                         for _ in 0..2 {
                             agent_session
-                                .execute_extension_command(
-                                    "select-route",
-                                    &request,
-                                    5_000,
-                                    |_| {},
-                                )
+                                .execute_extension_command("select-route", &request, 5_000, |_| {})
                                 .await
                                 .expect("select registered destination through JS hostcall");
                             agent_session
@@ -4789,11 +4817,8 @@ mod tests {
                         assert_eq!(agent_session.agent.stream_options().headers, entry.headers);
 
                         let cx = crate::agent_cx::AgentCx::for_request();
-                        let mut session = agent_session
-                            .session
-                            .lock(cx.cx())
-                            .await
-                            .expect("session");
+                        let mut session =
+                            agent_session.session.lock(cx.cx()).await.expect("session");
                         let model_changes = session
                             .entries
                             .iter()
@@ -4879,8 +4904,7 @@ mod tests {
             assert!(error.to_string().contains("open-router/shared"));
             assert!(error.to_string().contains("ctx.modelRegistry.find"));
             assert_eq!(bridge.get_branch().await, before);
-            for (provider, model) in
-                [("missing", "shared"), (" ", "shared"), ("openrouter", "\t")]
+            for (provider, model) in [("missing", "shared"), (" ", "shared"), ("openrouter", "\t")]
             {
                 bridge
                     .set_model(
@@ -5047,8 +5071,7 @@ mod tests {
                         ("initial-route", "shared"),
                         dir.path(),
                     );
-                    let mut auth =
-                        AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                    let mut auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
                     for provider in ["openrouter", "open-router", "rescue-route"] {
                         auth.set(
                             provider,
@@ -5096,11 +5119,7 @@ mod tests {
                         format!("https://{expected}.example.test/v1")
                     );
                     let cx = crate::agent_cx::AgentCx::for_request();
-                    let session = agent_session
-                        .session
-                        .lock(cx.cx())
-                        .await
-                        .expect("session");
+                    let session = agent_session.session.lock(cx.cx()).await.expect("session");
                     assert_eq!(session.header.provider.as_deref(), Some(expected));
                     assert_eq!(
                         session.effective_model_for_current_path(),
@@ -5121,10 +5140,9 @@ mod tests {
     fn failover_walk_keeps_distinct_declared_aliases_and_resumed_entries() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
-            for (previous, requested) in [
-                ("openrouter", "open-router"),
-                ("open-router", "openrouter"),
-            ] {
+            for (previous, requested) in
+                [("openrouter", "open-router"), ("open-router", "openrouter")]
+            {
                 for reversed in [false, true] {
                     for resumed in [false, true] {
                         let dir = tempfile::tempdir().expect("tempdir");
@@ -5186,11 +5204,7 @@ mod tests {
                             Some(&requested.to_string())
                         );
                         let cx = crate::agent_cx::AgentCx::for_request();
-                        let session = agent_session
-                            .session
-                            .lock(cx.cx())
-                            .await
-                            .expect("session");
+                        let session = agent_session.session.lock(cx.cx()).await.expect("session");
                         assert_eq!(session.header.provider.as_deref(), Some(requested));
                         assert_eq!(
                             session
@@ -5239,12 +5253,12 @@ mod tests {
                 assert_eq!(agent_session.agent.provider().name(), "openrouter");
                 {
                     let cx = crate::agent_cx::AgentCx::for_request();
-                    let session = agent_session
-                        .session
-                        .lock(cx.cx())
-                        .await
-                        .expect("session");
-                    assert!(session.active_failover_provenance_for_current_path().is_none());
+                    let session = agent_session.session.lock(cx.cx()).await.expect("session");
+                    assert!(
+                        session
+                            .active_failover_provenance_for_current_path()
+                            .is_none()
+                    );
                     assert_eq!(session.entries.len(), 2);
                 }
                 let outcome = try_catalog_failover(
@@ -5308,8 +5322,7 @@ mod tests {
                         ("fallback-route", "shared"),
                         dir.path(),
                     );
-                    let mut auth =
-                        AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                    let mut auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
                     auth.set(
                         "open-router",
                         AuthCredential::BearerToken {
@@ -5362,11 +5375,7 @@ mod tests {
                     } else {
                         assert_eq!(agent_session.agent.provider().name(), "fallback-route");
                     }
-                    let session = agent_session
-                        .session
-                        .lock(cx.cx())
-                        .await
-                        .expect("session");
+                    let session = agent_session.session.lock(cx.cx()).await.expect("session");
                     let expected_provider = if should_restore {
                         "open-router"
                     } else {
@@ -5402,11 +5411,7 @@ mod tests {
                 // One case has drifted runtime identity, the other has a
                 // branch-local Session change despite the runtime still matching.
                 {
-                    let mut session = agent_session
-                        .session
-                        .lock(cx.cx())
-                        .await
-                        .expect("session");
+                    let mut session = agent_session.session.lock(cx.cx()).await.expect("session");
                     session.select_model("open-router".to_string(), "shared".to_string());
                 }
                 let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
@@ -5434,11 +5439,7 @@ mod tests {
                         .is_none()
                 );
                 assert_eq!(agent_session.agent.provider().name(), runtime_provider);
-                let session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session");
+                let session = agent_session.session.lock(cx.cx()).await.expect("session");
                 assert_eq!(session.header.provider.as_deref(), Some("open-router"));
             }
         });
@@ -7353,7 +7354,10 @@ mod tests {
             _input: Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<ToolOutput> {
-            Err(Error::tool(self.name, "invocation context was not supplied"))
+            Err(Error::tool(
+                self.name,
+                "invocation context was not supplied",
+            ))
         }
 
         async fn execute_with_invocation(
@@ -7364,12 +7368,18 @@ mod tests {
             context: crate::tools::ToolInvocationContext<'_>,
         ) -> Result<ToolOutput> {
             let has_host = context.host.is_some();
-            self.captures.lock().unwrap().push(CapturedInvocationPrivacy { // ubs:ignore serialized test capture must record the invocation snapshot
-                has_host,
-                snapshot: (context.snapshot_privacy)(),
-            });
+            self.captures
+                .lock()
+                .unwrap()
+                .push(CapturedInvocationPrivacy {
+                    // ubs:ignore serialized test capture must record the invocation snapshot
+                    has_host,
+                    snapshot: (context.snapshot_privacy)(),
+                });
             Ok(ToolOutput {
-                content: vec![ContentBlock::Text(TextContent::new("owned privacy captured"))],
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "owned privacy captured",
+                ))],
                 details: Some(json!({"hasHost": has_host})),
                 is_error: false,
             })
@@ -7379,7 +7389,8 @@ mod tests {
     fn remember_invocation_secret(agent: &mut Agent, secret: &str) {
         // The fixture must depend on remembered session state, not merely
         // trigger the generic credential detector again in its bare form.
-        assert_eq!( // ubs:ignore fixture proves this opaque value is not rediscovered by generic credential matching
+        assert_eq!(
+            // ubs:ignore fixture proves this opaque value is not rediscovered by generic credential matching
             crate::text_completion::redact_inputs(
                 &[secret],
                 &crate::text_completion::AuxiliaryPrivacy::default(),
@@ -7400,10 +7411,13 @@ mod tests {
         let projected = snapshot // ubs:ignore retained snapshot must remain usable after Agent destruction
             .project_json(&json!({"echo": secret, "nested": [secret, "ordinary text"]}))
             .expect("project after the owning Agent was dropped"); // ubs:ignore successful post-drop projection is the lifecycle behavior under test
-        assert_eq!(projected, json!({ // ubs:ignore assert exact privacy projection of content and nested details
-            "echo": "<pi-secret:redacted>",
-            "nested": ["<pi-secret:redacted>", "ordinary text"],
-        }));
+        assert_eq!(
+            projected,
+            json!({ // ubs:ignore assert exact privacy projection of content and nested details
+                "echo": "<pi-secret:redacted>",
+                "nested": ["<pi-secret:redacted>", "ordinary text"],
+            })
+        );
     }
 
     #[test]
@@ -7443,7 +7457,8 @@ mod tests {
             assert_invocation_snapshot_masks(&first_capture.snapshot, first);
             assert_invocation_snapshot_masks(&later_capture.snapshot, first);
             assert_invocation_snapshot_masks(&later_capture.snapshot, later);
-            assert_eq!( // ubs:ignore assert the first snapshot never shares subsequently learned secrets
+            assert_eq!(
+                // ubs:ignore assert the first snapshot never shares subsequently learned secrets
                 first_capture.snapshot.project_json(&json!(later)).unwrap(), // ubs:ignore clean later value must project through the earlier immutable snapshot
                 json!(later),
                 "an admitted task must not share the Agent's subsequently mutated vault",
@@ -7477,7 +7492,11 @@ mod tests {
             assert!(!failed && !output.is_error, "{output:?}"); // ubs:ignore assert the discoverable invocation completes successfully
             assert_eq!(output.details.as_ref().unwrap()["dispatchedVia"], "xdev"); // ubs:ignore fixture requires the xdev routing field in the returned details
             drop(agent);
-            let capture = captures.lock().unwrap().pop().expect("dispatched invocation"); // ubs:ignore the completed xdev invocation must retain exactly its privacy capture
+            let capture = captures
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("dispatched invocation"); // ubs:ignore the completed xdev invocation must retain exactly its privacy capture
             assert!(capture.has_host); // ubs:ignore assert xdev forwards invocation-scoped host authority
             assert_invocation_snapshot_masks(&capture.snapshot, secret);
         });
@@ -7499,13 +7518,16 @@ mod tests {
             remember_invocation_secret(&mut agent, secret);
             let (output, failed) = agent
                 .execute_tool(
-                    eval_host_call("js", r#"
+                    eval_host_call(
+                        "js",
+                        r#"
                         const result = await tool.result("privacy_probe", {});
                         if (result.isError || result.details.hasHost !== false) {
                           throw new Error("nested invocation renewed tool-call authority");
                         }
                         "nested-owned-privacy"
-                    "#),
+                    "#,
+                    ),
                     Arc::new(|_| {}),
                     Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
                 )
@@ -7531,10 +7553,15 @@ mod tests {
     }
 
     fn eval_host_text(output: &ToolOutput) -> String {
-        output.content.iter().filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        }).collect::<Vec<_>>().join("\n")
+        output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -7770,7 +7797,9 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
         runtime.block_on(async {
             let root = tempfile::tempdir().unwrap();
             let extension = root.path().join("observe-nested-hook.mjs");
-            std::fs::write(&extension, r#"
+            std::fs::write(
+                &extension,
+                r#"
                 import { complete } from "@mariozechner/pi-ai";
                 export default function init(pi) {
                   pi.on("tool_call", async event => {
@@ -7781,34 +7810,54 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     }
                   });
                 }
-            "#).unwrap();
+            "#,
+            )
+            .unwrap();
             let provider_calls = Arc::new(StdMutex::new(Vec::new()));
             let agent = Agent::new(
-                Arc::new(PiAiCaptureProvider { calls: Arc::clone(&provider_calls) }),
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&provider_calls),
+                }),
                 ToolRegistry::new(&["eval", "write"], root.path(), None),
                 AgentConfig::default(),
             );
             let mut session = AgentSession::new(
-                agent, Arc::new(Mutex::new(Session::in_memory())), false,
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
                 ResolvedCompactionSettings::default(),
             );
-            session.enable_extensions(&[], root.path(), None, &[extension]).await.unwrap();
+            session
+                .enable_extensions(&[], root.path(), None, &[extension])
+                .await
+                .unwrap();
             let scope = session.agent.job_session_scope.clone();
             session.agent.config.tool_approval = Some(Arc::new(move |request| {
                 if request.tool_name == "write" {
-                    scope.bind(Arc::new(|| Box::pin(async { Some("replacement-session".to_string()) })));
+                    scope.bind(Arc::new(|| {
+                        Box::pin(async { Some("replacement-session".to_string()) })
+                    }));
                 }
                 Box::pin(async { ToolApprovalDecision::Allow })
             }));
-            let (output, failed) = session.agent.execute_tool(
-                eval_host_call("js", "await tool.call('write',{path:'blocked.txt',content:'forbidden'})"),
-                Arc::new(|_| {}),
-                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
-            ).await;
+            let (output, failed) = session
+                .agent
+                .execute_tool(
+                    eval_host_call(
+                        "js",
+                        "await tool.call('write',{path:'blocked.txt',content:'forbidden'})",
+                    ),
+                    Arc::new(|_| {}),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                )
+                .await;
             assert!(failed && output.is_error, "{output:?}");
             assert!(eval_host_text(&output).contains("EVAL_SESSION_CHANGED"));
             assert!(!root.path().join("blocked.txt").exists());
-            assert!(provider_calls.lock().unwrap().is_empty(), "a replacement session must not run the nested tool hook");
+            assert!(
+                provider_calls.lock().unwrap().is_empty(),
+                "a replacement session must not run the nested tool hook"
+            );
         });
     }
 
@@ -7875,16 +7924,20 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     Some("replacement-session".to_string())
                 })
             }));
-            let host = AgentToolInvocationHost::new(&agent, Arc::new(|_| {
-                panic!("a replaced session must not admit a nested tool")
-            }));
+            let host = AgentToolInvocationHost::new(
+                &agent,
+                Arc::new(|_| panic!("a replaced session must not admit a nested tool")),
+            );
             let call = ToolCall {
                 id: "first-host-call".to_string(),
                 name: "write".to_string(),
                 arguments: json!({"path":"blocked.txt","content":"forbidden"}),
                 thought_signature: None,
             };
-            let error = host.call_tool(call.clone(), &original_owner).await.unwrap_err();
+            let error = host
+                .call_tool(call.clone(), &original_owner)
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("EVAL_SESSION_CHANGED"));
             assert_eq!(lookups.load(Ordering::SeqCst), 1);
             assert!(!root.path().join("blocked.txt").exists());
@@ -7892,7 +7945,10 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 let owner = original_owner.clone();
                 Box::pin(async move { Some(owner) })
             }));
-            let error = host.call_tool(call, "replacement-session").await.unwrap_err();
+            let error = host
+                .call_tool(call, "replacement-session")
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("revoked"), "{error}");
             assert_eq!(lookups.load(Ordering::SeqCst), 1, "revocation is sticky");
         });
@@ -9752,7 +9808,9 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     continue;
                 }
                 assert_eq!(
-                    result.expect("held note keeps completed answer").stop_reason,
+                    result
+                        .expect("held note keeps completed answer")
+                        .stop_reason,
                     StopReason::Stop
                 );
                 {
@@ -10021,15 +10079,18 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             );
             advisor.pending_on_call.store(true, Ordering::SeqCst);
             session.agent.config.max_time = Some(Duration::from_secs(600));
-            session.agent.set_system_prompt(Some("base-system".to_string()));
+            session
+                .agent
+                .set_system_prompt(Some("base-system".to_string()));
             let active = Arc::clone(&session.extensions_turn_active);
             let streaming = Arc::clone(&session.extensions_is_streaming);
             let events = Arc::new(StdMutex::new(Vec::new()));
             let captured = Arc::clone(&events);
-            let mut turn = Box::pin(session.run_text(
-                "check the fixture".to_string(),
-                move |event| captured.lock().expect("events").push(event),
-            ));
+            let mut turn = Box::pin(
+                session.run_text("check the fixture".to_string(), move |event| {
+                    captured.lock().expect("events").push(event)
+                }),
+            );
             let reached_review = futures::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
                 if advisor.observed_durable_completion.load(Ordering::SeqCst) {
@@ -10048,16 +10109,23 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             assert_eq!(doer.calls.load(Ordering::SeqCst), 2);
             assert_eq!(advisor.calls.load(Ordering::SeqCst), 1);
             assert!(active.load(Ordering::SeqCst));
-            assert!(events.lock().expect("events").iter().all(|event| {
-                !matches!(event, AgentEvent::AgentEnd { .. })
-            }));
+            assert!(
+                events
+                    .lock()
+                    .expect("events")
+                    .iter()
+                    .all(|event| { !matches!(event, AgentEvent::AgentEnd { .. }) })
+            );
 
             drop(turn);
 
             assert!(!active.load(Ordering::SeqCst));
             assert!(!streaming.load(Ordering::SeqCst));
             assert_eq!(session.agent.system_prompt(), Some("base-system"));
-            assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(600)));
+            assert_eq!(
+                session.agent.config.max_time,
+                Some(Duration::from_secs(600))
+            );
             assert!(session.agent.message_queue.steering.is_empty());
             let events = events.lock().expect("events after drop");
             assert_eq!(
@@ -10109,19 +10177,34 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
 
             let path = {
                 let cx = crate::agent_cx::AgentCx::for_request();
-                session.session.lock(cx.cx()).await.expect("session").path.clone().expect("path")
+                session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session")
+                    .path
+                    .clone()
+                    .expect("path")
             };
-            let reopened = Session::open(path.to_string_lossy().as_ref()).await.expect("reopen");
-            let reservations = reopened.entries_for_current_path().into_iter().filter_map(|entry| {
-                match entry {
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen");
+            let reservations = reopened
+                .entries_for_current_path()
+                .into_iter()
+                .filter_map(|entry| match entry {
                     crate::session::SessionEntry::Custom(custom)
                         if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
                     {
-                        custom.data.as_ref().and_then(|data| data.get("count")).and_then(Value::as_u64)
+                        custom
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("count"))
+                            .and_then(Value::as_u64)
                     }
                     _ => None,
-                }
-            }).collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
             assert_eq!(reservations, vec![0, 1, 2]);
 
             // Install the independently reopened journal in a completely fresh
@@ -10130,7 +10213,10 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             let shared_session = Arc::clone(&session.session);
             {
                 let cx = crate::agent_cx::AgentCx::for_request();
-                *shared_session.lock(cx.cx()).await.expect("replace with reopened") = reopened;
+                *shared_session
+                    .lock(cx.cx())
+                    .await
+                    .expect("replace with reopened") = reopened;
             }
             let mut resumed = AgentSession::new(
                 Agent::new(
@@ -10149,26 +10235,42 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 advisor.clone(),
                 "advisor/advisor-model".to_string(),
             ));
-            resumed.run_continue_with_abort(None, |_| {}).await.expect("explicit resume");
+            resumed
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("explicit resume");
             assert_eq!(doer.calls.load(Ordering::SeqCst), 5);
             assert_eq!(advisor.calls.load(Ordering::SeqCst), 4);
             assert_eq!(resumed.agent.message_queue.steering.len(), 1);
 
-            resumed.run_text("a new task".to_string(), |_| {}).await.expect("new authored input");
+            resumed
+                .run_text("a new task".to_string(), |_| {})
+                .await
+                .expect("new authored input");
             assert_eq!(doer.calls.load(Ordering::SeqCst), 6);
             let cx = crate::agent_cx::AgentCx::for_request();
             let inner = resumed.session.lock(cx.cx()).await.expect("new turn state");
-            let count = inner.entries_for_current_path().into_iter().rev().find_map(|entry| {
-                match entry {
+            let count = inner
+                .entries_for_current_path()
+                .into_iter()
+                .rev()
+                .find_map(|entry| match entry {
                     crate::session::SessionEntry::Custom(custom)
                         if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
                     {
-                        custom.data.as_ref().and_then(|data| data.get("count")).and_then(Value::as_u64)
+                        custom
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("count"))
+                            .and_then(Value::as_u64)
                     }
                     _ => None,
-                }
-            });
-            assert_eq!(count, Some(0), "new authored input renews the bounded budget");
+                });
+            assert_eq!(
+                count,
+                Some(0),
+                "new authored input renews the bounded budget"
+            );
         });
     }
 
@@ -10196,7 +10298,9 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
     fn queued_authored_inputs_renew_advisor_budget_and_generated_inputs_do_not() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
-            for (authored, follow_up) in [(true, false), (true, true), (false, false), (false, true)] {
+            for (authored, follow_up) in
+                [(true, false), (true, true), (false, false), (false, true)]
+            {
                 let temp = tempfile::tempdir().expect("tempdir");
                 let mut reviewed = advisor_lifecycle_reply(StopReason::Stop);
                 reviewed.content = vec![ContentBlock::Text(TextContent::new(
@@ -10221,7 +10325,10 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                         ADVISOR_CONTINUATION_ENTRY.to_string(),
                         Some(json!({"count": MAX_ADVISOR_CONTINUATIONS})),
                     );
-                    inner.save().await.expect("persist exhausted previous budget");
+                    inner
+                        .save()
+                        .await
+                        .expect("persist exhausted previous budget");
                     inner.path.clone().expect("saved path")
                 };
                 *advisor.verdict.lock().expect("blocker script") =
@@ -10245,7 +10352,10 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     .expect("queued turn");
                 let expected_calls = if authored { 4 } else { 2 };
                 assert_eq!(doer.calls.load(Ordering::SeqCst), expected_calls);
-                assert_eq!(advisor.calls.load(Ordering::SeqCst), if authored { 3 } else { 1 });
+                assert_eq!(
+                    advisor.calls.load(Ordering::SeqCst),
+                    if authored { 3 } else { 1 }
+                );
                 let reopened = Session::open(path.to_string_lossy().as_ref())
                     .await
                     .expect("reopen queued turn");
@@ -10494,7 +10604,12 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
     fn extension_input_does_not_renew_advisor_continuation_budget() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
-            for entrypoint in ["extension_text", "extension_custom", "extension_content", "custom"] {
+            for entrypoint in [
+                "extension_text",
+                "extension_custom",
+                "extension_content",
+                "custom",
+            ] {
                 let temp = tempfile::tempdir().expect("tempdir");
                 let (mut session, doer, advisor) = advisor_lifecycle_session(
                     temp.path(),
@@ -10562,7 +10677,11 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 assert_eq!(session.input_source, previous_source, "{entrypoint}");
                 assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{entrypoint}");
                 assert_eq!(advisor.calls.load(Ordering::SeqCst), 1, "{entrypoint}");
-                assert_eq!(session.agent.message_queue.steering.len(), 1, "{entrypoint}");
+                assert_eq!(
+                    session.agent.message_queue.steering.len(),
+                    1,
+                    "{entrypoint}"
+                );
 
                 let path = {
                     let cx = crate::agent_cx::AgentCx::for_request();
@@ -10594,7 +10713,11 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(reservations, vec![MAX_ADVISOR_CONTINUATIONS], "{entrypoint}");
+                assert_eq!(
+                    reservations,
+                    vec![MAX_ADVISOR_CONTINUATIONS],
+                    "{entrypoint}"
+                );
             }
         });
     }
@@ -10618,7 +10741,10 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     "advisor/advisor-model".to_string(),
                 ));
                 session.agent.set_automatic_queue_dispatch(lanes.0, lanes.1);
-                session.run_text("check the fixture".to_string(), |_| {}).await.expect("paused lanes");
+                session
+                    .run_text("check the fixture".to_string(), |_| {})
+                    .await
+                    .expect("paused lanes");
                 assert_eq!(doer.calls.load(Ordering::SeqCst), 2);
                 assert_eq!(advisor.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(session.agent.message_queue.steering.len(), 1);

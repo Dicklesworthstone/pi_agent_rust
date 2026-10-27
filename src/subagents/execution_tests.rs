@@ -328,6 +328,82 @@ fn prepared_model_identity_survives_catalog_and_parent_changes() {
 }
 
 #[test]
+fn queued_children_schema_retries_and_revival_keep_their_original_cost_account() {
+    for mode in ["tasks", "chain"] {
+        let body = format!(
+            "test -n \"$PI_SUBAGENT_COST_ADDRESS\" || exit 70\n\
+             test -n \"$PI_SUBAGENT_COST_TOKEN\" || exit 71\n\
+             test -z \"$PI_SUBAGENT_HUB_ADDRESS\" || exit 72\n\
+             if [ -f \"$PI_CODING_AGENT_DIR/retried\" ]; then\n{}\
+             else\n: > \"$PI_CODING_AGENT_DIR/retried\"\n{}\
+             fi\n",
+            emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+            emit(&[ended("not JSON", "stop")]),
+        );
+        let (_dir, tool) = fixture(&record_model_script(&body));
+        std::fs::write(
+            tool.global_dir.join("agents/worker.md"),
+            "---\nname: worker\ndescription: cost-only fixture\ntools: read\n---\nFinish.",
+        )
+        .unwrap();
+        let original = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        let replacement = crate::cost::CostBudget::new(None, Some(1.0), 1.0).unwrap();
+        let scope = crate::cost::CostScope::default();
+        scope.set(Some(original.clone()));
+        let tool = tool.with_cost_scope(scope.clone());
+        let mut input = json!({"concurrency":1});
+        input[mode] = json!([
+            {"agent":"worker", "task":"cost captured before queue",
+             "outputSchema":{"type":"object","required":["accepted"]}, "schemaMode":"strict"},
+            {"agent":"worker", "task":"follow up on {previous}"}
+        ]);
+        let parsed: SubagentRequest = serde_json::from_value(input).unwrap();
+        let prepared = tool.prepare_request(&parsed).unwrap();
+        scope.set(Some(replacement));
+        let results = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(prepared.run(None));
+        assert!(
+            results.iter().all(|result| !result.is_error),
+            "{mode}: {results:?}"
+        );
+        assert_eq!(results[0].schema_retries, Some(1));
+        assert_eq!(recorded_models(&tool).len(), 3);
+        let source_id = results[0].hub_id.as_deref().unwrap();
+        let source = crate::agent_hub::registry()
+            .lock()
+            .unwrap()
+            .native_revival_source(source_id)
+            .unwrap();
+        assert!(
+            source
+                .launch
+                .cost_budget
+                .as_ref()
+                .unwrap()
+                .same_tree(&original)
+        );
+
+        // New work uses the current session, while revival keeps its source.
+        let refused = run(&tool, request());
+        assert!(refused.is_error);
+        assert!(result(&refused)["pid"].is_null());
+        assert_eq!(recorded_models(&tool).len(), 3);
+        let revived = revive_through_hub(&tool.cwd, source_id);
+        assert!(!revived.is_error, "{revived:?}");
+        assert_eq!(recorded_models(&tool).len(), 4);
+
+        // Spending the original allowance prevents another revival before
+        // registration or spawn, even though the live scope was replaced.
+        original.record(1.0).unwrap();
+        let refused = revive_through_hub(&tool.cwd, source_id);
+        assert!(refused.is_error);
+        assert_eq!(recorded_models(&tool).len(), 4);
+    }
+}
+
+#[test]
 fn subagent_launch_model_precedence_keeps_resolved_parent_ids_exact() {
     let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
     let scope = ToolModelScope::default();

@@ -137,6 +137,7 @@ pub mod conformance_shapes;
 #[doc(hidden)]
 pub mod connectors;
 pub mod context_files;
+pub mod cost;
 pub mod crash;
 #[doc(hidden)]
 pub mod crypto_shim;

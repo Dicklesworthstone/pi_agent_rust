@@ -163,6 +163,7 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::PrewalkSwitched { .. } => "prewalk_switched",
         AgentEvent::ExtensionError { .. } => "extension_error",
         AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::CostWarning { .. } => "cost_warning",
         AgentEvent::ProviderError { .. } => "provider_error",
     }
 }

@@ -367,6 +367,9 @@ pub trait Tool: Send + Sync {
     /// Tools that do not delegate model work intentionally ignore it.
     fn bind_model_scope(&mut self, _scope: ToolModelScope) {}
 
+    /// Attach the session-tree spend budget to tools that make model calls.
+    fn bind_cost_scope(&mut self, _scope: crate::cost::CostScope) {}
+
     /// Attach the owning host's editor filesystem without changing tool policy.
     fn bind_text_file_client_scope(&mut self, _scope: TextFileClientScope) {}
 
@@ -5655,6 +5658,7 @@ pub struct ToolRegistry {
     job_session_scope: crate::jobs::JobSessionScope,
     /// Shared by delegating tools and updated on every host provider switch.
     model_scope: ToolModelScope,
+    cost_scope: crate::cost::CostScope,
     text_file_client_scope: TextFileClientScope,
     terminal_client_scope: TerminalClientScope,
     /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
@@ -5847,6 +5851,7 @@ impl ToolRegistry {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
+        let cost_scope = crate::cost::CostScope::default();
         let text_file_client_scope = TextFileClientScope::default();
         let terminal_client_scope = TerminalClientScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
@@ -6149,6 +6154,7 @@ impl ToolRegistry {
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
+            tool.bind_cost_scope(cost_scope.clone());
             tool.bind_text_file_client_scope(text_file_client_scope.clone());
             tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
@@ -6158,6 +6164,7 @@ impl ToolRegistry {
             inactive: Vec::new(),
             job_session_scope,
             model_scope,
+            cost_scope,
             text_file_client_scope,
             terminal_client_scope,
             discoverable: discoverable_names,
@@ -6182,12 +6189,14 @@ impl ToolRegistry {
     pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
+        let cost_scope = crate::cost::CostScope::default();
         let text_file_client_scope = TextFileClientScope::default();
         let terminal_client_scope = TerminalClientScope::default();
         let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
+            tool.bind_cost_scope(cost_scope.clone());
             tool.bind_text_file_client_scope(text_file_client_scope.clone());
             tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
@@ -6196,6 +6205,7 @@ impl ToolRegistry {
             inactive: Vec::new(),
             job_session_scope,
             model_scope,
+            cost_scope,
             text_file_client_scope,
             terminal_client_scope,
             discoverable: std::collections::HashSet::new(),
@@ -6216,6 +6226,7 @@ impl ToolRegistry {
             inactive: self.inactive.clone(),
             job_session_scope: self.job_session_scope.clone(),
             model_scope: self.model_scope.clone(),
+            cost_scope: self.cost_scope.clone(),
             text_file_client_scope: self.text_file_client_scope.clone(),
             terminal_client_scope: self.terminal_client_scope.clone(),
             discoverable: self.discoverable.clone(),
@@ -6300,6 +6311,7 @@ impl ToolRegistry {
     pub fn push(&mut self, mut tool: Box<dyn Tool>) {
         tool.bind_job_session_scope(self.job_session_scope.clone());
         tool.bind_model_scope(self.model_scope.clone());
+        tool.bind_cost_scope(self.cost_scope.clone());
         tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
         tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
         let name = tool.name();
@@ -6318,6 +6330,7 @@ impl ToolRegistry {
         for mut tool in tools {
             tool.bind_job_session_scope(self.job_session_scope.clone());
             tool.bind_model_scope(self.model_scope.clone());
+            tool.bind_cost_scope(self.cost_scope.clone());
             tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
             tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
             let name = tool.name();
@@ -6357,6 +6370,7 @@ impl ToolRegistry {
             if next.description() != tool.description() || next.parameters() != tool.parameters() {
                 next.bind_job_session_scope(self.job_session_scope.clone());
                 next.bind_model_scope(self.model_scope.clone());
+                next.bind_cost_scope(self.cost_scope.clone());
                 next.bind_text_file_client_scope(self.text_file_client_scope.clone());
                 next.bind_terminal_client_scope(self.terminal_client_scope.clone());
                 *tool = Arc::from(next);
@@ -6375,6 +6389,7 @@ impl ToolRegistry {
             }
             next.bind_job_session_scope(self.job_session_scope.clone());
             next.bind_model_scope(self.model_scope.clone());
+            next.bind_cost_scope(self.cost_scope.clone());
             next.bind_text_file_client_scope(self.text_file_client_scope.clone());
             next.bind_terminal_client_scope(self.terminal_client_scope.clone());
             self.tools.push(Arc::from(next));
@@ -6398,6 +6413,13 @@ impl ToolRegistry {
     #[must_use]
     pub fn model_scope(&self) -> ToolModelScope {
         self.model_scope.clone()
+    }
+
+    /// The live budget shared by snapshots and tools; a running invocation
+    /// captures its current handle so switching sessions cannot move its bill.
+    #[must_use]
+    pub fn cost_scope(&self) -> crate::cost::CostScope {
+        self.cost_scope.clone()
     }
 
     /// Get all tools.

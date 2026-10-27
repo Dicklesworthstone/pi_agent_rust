@@ -139,6 +139,12 @@ impl From<Error> for JudgmentFailure {
 
 impl JudgmentFailure {
     fn provider(error: Error, diagnostic: &str) -> Self {
+        if matches!(&error, Error::CostCap { .. }) {
+            return Self {
+                error,
+                retryable: false,
+            };
+        }
         // Classify the actual error body, never a provider's display name or
         // the sanitized public message. Explicit stops outrank retry wording.
         let error = match error {
@@ -180,6 +186,16 @@ impl Judge {
             privacy: AuxiliaryPrivacy::default(),
             supports_images: false,
         }
+    }
+
+    /// Retained jobs and batch items clone the admitted cell's budget along
+    /// with its provider; selecting another model never grants another cap.
+    #[must_use]
+    pub(crate) fn with_cost_budget(mut self, budget: Option<crate::cost::CostBudget>) -> Self {
+        if let Some(budget) = budget {
+            self.provider = crate::provider::guard_with_cost_budget(self.provider, budget);
+        }
+        self
     }
 
     #[must_use]

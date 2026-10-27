@@ -572,6 +572,19 @@ impl AdvisorRuntime {
         self
     }
 
+    /// Bind reviews to the doer's live session-tree budget. Session switches
+    /// replace the guard rather than stacking old and new accounting scopes.
+    pub fn set_cost_budget(&mut self, budget: Option<crate::cost::CostBudget>) {
+        self.provider = budget.map_or_else(
+            || {
+                self.provider
+                    .unguarded_provider()
+                    .unwrap_or_else(|| Arc::clone(&self.provider))
+            },
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&self.provider), budget),
+        );
+    }
+
     #[must_use]
     pub fn with_secrets_settings(
         mut self,
@@ -662,6 +675,7 @@ impl AdvisorRuntime {
         let reply = match crate::text_completion::with_timeout_and_abort(timeout, abort, call).await
         {
             Ok(Ok(reply)) => reply,
+            Ok(Err(crate::error::Error::CostCap { .. })) => return AdvisorOutcome::Quiet,
             Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
             Err(RequestStop::TimedOut)
                 if remaining_time.is_some_and(|time| time < self.timeout) =>

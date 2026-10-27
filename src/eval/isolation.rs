@@ -44,6 +44,7 @@ impl EvalTool {
             kernel: Mutex::new(None),
             js: Mutex::new(None),
             session_scope: self.session_scope.clone(),
+            cost_scope: self.cost_scope.clone(),
             retained_sessions: Mutex::new(super::session::RetainedSessions::default()),
             execution: Arc::clone(&self.execution),
             judge: self.judge.clone(),
