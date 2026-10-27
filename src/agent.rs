@@ -7263,6 +7263,7 @@ struct SessionTurnPromptGuard<'a> {
     session: &'a mut AgentSession,
     base_system_prompt: Option<String>,
     base_max_time: Option<Duration>,
+    base_prewalk_max_time: Option<(Instant, Option<Duration>)>,
 }
 
 impl<'a> SessionTurnPromptGuard<'a> {
@@ -7274,6 +7275,22 @@ impl<'a> SessionTurnPromptGuard<'a> {
             session,
             base_system_prompt,
             base_max_time,
+            base_prewalk_max_time: None,
+        }
+    }
+
+    fn limit_max_time(&mut self, started: Instant, max_time: Option<Duration>) {
+        self.session.agent.config.max_time =
+            max_time.map(|cap| cap.saturating_sub(started.elapsed()));
+        if let (Some(cap), Some(budget)) = (max_time, self.session.agent.prewalk_budget.as_mut()) {
+            self.base_prewalk_max_time = Some((budget.started, budget.max_time));
+            // Prewalk keeps its original clock through retries and handoffs.
+            // Convert this wake's deadline to that clock before clamping it;
+            // assigning the relative cap would count earlier work twice.
+            let deadline = started
+                .saturating_duration_since(budget.started)
+                .saturating_add(cap);
+            budget.max_time = Some(budget.max_time.map_or(deadline, |base| base.min(deadline)));
         }
     }
 }
@@ -7284,6 +7301,15 @@ impl Drop for SessionTurnPromptGuard<'_> {
             .agent
             .set_system_prompt(self.base_system_prompt.take());
         self.session.agent.config.max_time = self.base_max_time;
+        if let (Some((started, max_time)), Some(budget)) = (
+            self.base_prewalk_max_time,
+            self.session.agent.prewalk_budget.as_mut(),
+        ) && budget.started == started
+        {
+            // Restore the limit, retaining completed tool/turn accounting.
+            // Do not resurrect a disarmed or replaced logical request.
+            budget.max_time = max_time;
+        }
         // The agent normally consumes this at loop entry. Early returns and
         // cancellation must not hand this turn's provenance to another input.
         let _ = self.session.agent.magic_keyword_scan_override.take();
@@ -20384,6 +20410,72 @@ impl AgentSession {
 
         let result = finish_turn_persistence(&self.provider_admission, result, persist_result);
         self.finish_turn_with_advice(result, abort.as_ref(), turn)
+            .await
+    }
+
+    /// Stage completed background jobs owned by this session without starting
+    /// a provider request. Unlike an ordinary follow-up poll, this does not
+    /// invoke extension or surface fetchers merely to decide whether an idle
+    /// print run has work to do. Staged notices keep their session ownership
+    /// until the existing durable follow-up boundary accepts them.
+    pub async fn stage_pending_job_follow_up(&mut self) -> bool {
+        if !self.agent.automatic_follow_up_dispatch {
+            return false;
+        }
+        self.agent.fetch_job_follow_up_messages().await;
+        self.agent.message_queue.has_job_follow_up()
+    }
+
+    /// Continue from a pending owned job result, with no synthetic authored
+    /// prompt. The normal continuation path persists the generated notice and
+    /// all resulting messages, and retains retry, advisor and extension hooks.
+    ///
+    /// `remaining_time` limits this wake to the caller's remaining run budget;
+    /// it never extends the configured cap. The owning surface must also bound
+    /// its idle waits and retry delays. A zero budget or cancellation leaves
+    /// the notice unconsumed and does not admit a provider request.
+    pub async fn run_pending_job_follow_up_with_abort(
+        &mut self,
+        remaining_time: Option<Duration>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
+        let started = Instant::now();
+        let prewalk_remaining = self.agent.prewalk_budget.and_then(|budget| {
+            budget
+                .max_time
+                .map(|cap| cap.saturating_sub(started.saturating_duration_since(budget.started)))
+        });
+        let max_time = [
+            self.agent.config.max_time,
+            remaining_time,
+            prewalk_remaining,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            || max_time.is_some_and(|remaining| remaining.is_zero())
+        {
+            return Err(Error::Aborted);
+        }
+        if !self.stage_pending_job_follow_up().await {
+            return Err(Error::session(
+                "no owned background completion is pending for this session",
+            ));
+        }
+        let system_prompt = self.agent.system_prompt().map(str::to_string);
+        let mut prompt_scope = SessionTurnPromptGuard::new(self, system_prompt);
+        prompt_scope.limit_max_time(started, max_time);
+        prompt_scope
+            .session
+            .run_continue_with_follow_up_with_abort(
+                true,
+                abort,
+                move || max_time.is_none_or(|cap| started.elapsed() < cap),
+                on_event,
+            )
             .await
     }
 

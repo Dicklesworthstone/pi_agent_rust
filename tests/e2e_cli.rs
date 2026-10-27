@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -279,8 +279,17 @@ impl CliTestHarness {
             )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&[u8]>) -> CliResult {
+        self.run_with_stdout_observer(args, stdin, |_| {})
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_with_stdout_observer(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        mut on_line: impl FnMut(&[u8]) + Send + 'static,
+    ) -> CliResult {
         self.harness
             .log()
             .info("action", format!("Running CLI: {}", args.join(" ")));
@@ -317,11 +326,23 @@ impl CliTestHarness {
         let mut child = command.spawn().expect("run pi");
         let child_pid = child.id();
 
-        let mut child_stdout = child.stdout.take().expect("child stdout piped");
+        let child_stdout = child.stdout.take().expect("child stdout piped");
         let mut child_stderr = child.stderr.take().expect("child stderr piped");
         let stdout_handle = std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = child_stdout.read_to_end(&mut buf);
+            let mut reader = std::io::BufReader::new(child_stdout);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let result = reader.read_until(b'\n', &mut line);
+                buf.extend_from_slice(&line);
+                if !line.is_empty() {
+                    on_line(&line);
+                }
+                if !matches!(result, Ok(length) if length > 0) {
+                    break;
+                }
+            }
             buf
         });
         let stderr_handle = std::thread::spawn(move || {
@@ -5769,6 +5790,14 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
 /// SSE frames for an Anthropic response that calls one tool and stops with
 /// `stop_reason: "tool_use"`.
 fn build_anthropic_tool_use_chunks(tool_name: &str, tool_input: &serde_json::Value) -> Vec<String> {
+    build_anthropic_tool_use_chunks_with_id("toolu_mock_approval_001", tool_name, tool_input)
+}
+
+fn build_anthropic_tool_use_chunks_with_id(
+    tool_id: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Vec<String> {
     let message_start = json!({
         "type": "message_start",
         "message": {
@@ -5793,7 +5822,7 @@ fn build_anthropic_tool_use_chunks(tool_name: &str, tool_input: &serde_json::Val
         "index": 0,
         "content_block": {
             "type": "tool_use",
-            "id": "toolu_mock_approval_001",
+            "id": tool_id,
             "name": tool_name,
             "input": {}
         }
@@ -6038,6 +6067,341 @@ fn e2e_print_mode_yolo_approves_tools_and_exits_zero() {
         "an auto-approved run must still exit 0.\nstderr:\n{}\nstdout:\n{}",
         result.stderr, result.stdout
     );
+}
+
+#[cfg(unix)]
+fn print_background_args() -> Vec<&'static str> {
+    vec![
+        "-p",
+        "--mode",
+        "json",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--yolo",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--tools",
+        "bash,jobs",
+        "--system-prompt",
+        "You are a test harness model.",
+    ]
+}
+
+/// The real shell job cannot settle until the original AgentEnd has reached
+/// the caller. A successful third provider request therefore proves that
+/// print mode woke an idle session, not that its ordinary tool loop happened
+/// to notice a fast job before returning.
+#[test]
+#[cfg(unix)]
+fn e2e_cli_print_background_results_wake_only_when_enabled() {
+    for (name, flag, setting, wake_fails) in [
+        ("default", false, false, false),
+        ("flag", true, false, false),
+        ("setting", false, true, false),
+        ("failure", true, false, true),
+    ] {
+        let mut harness = CliTestHarness::new(&format!("print_background_{name}"));
+        fs::write(
+            harness.global_settings_path(),
+            serde_json::to_vec(&json!({
+                "retry": {"enabled": false},
+                "async": {"printWake": setting}
+            }))
+            .expect("settings"),
+        )
+        .expect("write settings");
+        setup_vcr_anthropic_sequence(
+            &mut harness,
+            &format!("print_background_{name}"),
+            &[
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_tool_use_chunks(
+                        "bash",
+                        &json!({
+                            "command": "while [ ! -e release-job ]; do sleep 0.02; done; printf 'JOB_DONE_42\\n'",
+                            "background": true
+                        }),
+                    ),
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_response_chunks("JOB_STARTED"),
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    if wake_fails {
+                        vec![
+                            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"background wake rejected\"}}\n\n".to_string(),
+                        ]
+                    } else {
+                        build_anthropic_response_chunks("FINAL_BACKGROUND_RESULT")
+                    },
+                ),
+            ],
+        );
+        let mut args = print_background_args();
+        if flag {
+            args.push("--wait-async");
+        }
+        args.extend([
+            "--max-time",
+            "30",
+            "Start a background job and report its result.",
+        ]);
+        let gate = harness.harness.temp_path("release-job");
+        let enabled = flag || setting;
+        let result = harness.run_with_stdout_observer(&args, None, move |line| {
+            if enabled
+                && serde_json::from_slice::<serde_json::Value>(line)
+                    .is_ok_and(|event| event["type"] == "agent_end")
+            {
+                fs::write(&gate, "continue").expect("release job after agent idle");
+            }
+        });
+        assert_exit_code(&harness.harness, &result, i32::from(wake_fails));
+        if wake_fails {
+            assert_contains(&harness.harness, &result.stderr, "background wake rejected");
+        }
+        let events = parse_json_mode_stdout_lines(&result.stdout);
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "agent_start")
+            .collect();
+        let ends = events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count();
+        assert_eq!(starts.len(), if enabled { 2 } else { 1 }, "{name}");
+        assert_eq!(ends, starts.len(), "balanced wake lifecycle: {name}");
+        assert!(
+            starts
+                .iter()
+                .all(|event| event["sessionId"] == events[0]["id"])
+        );
+        assert_eq!(
+            result.stdout.contains("FINAL_BACKGROUND_RESULT"),
+            enabled && !wake_fails
+        );
+        let notices = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "message_end"
+                    && event["message"]["role"] == "user"
+                    && event["message"]["content"].as_str().is_some_and(|text| {
+                        text.starts_with("[background job ") && text.contains("JOB_DONE_42")
+                    })
+            })
+            .count();
+        assert_eq!(
+            notices,
+            usize::from(enabled),
+            "notice delivered once: {name}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn e2e_cli_wait_async_waits_for_jobs_started_by_a_wake_turn() {
+    let mut harness = CliTestHarness::new("print_background_nested_wake");
+    fs::write(
+        harness.global_settings_path(),
+        r#"{"retry":{"enabled":false}}"#,
+    )
+    .expect("disable retries");
+    setup_vcr_anthropic_sequence(
+        &mut harness,
+        "print_background_nested_wake",
+        &[
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_tool_use_chunks(
+                    "bash",
+                    &json!({
+                        "command": "while [ ! -e release-first ]; do sleep 0.02; done; printf 'FIRST_DONE\\n'",
+                        "background": true
+                    }),
+                ),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("FIRST_STARTED"),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_tool_use_chunks_with_id(
+                    "toolu_background_second",
+                    "bash",
+                    &json!({
+                        "command": "while [ ! -e release-second ]; do sleep 0.02; done; printf 'SECOND_DONE\\n'",
+                        "background": true
+                    }),
+                ),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("SECOND_STARTED"),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("BOTH_JOBS_FINISHED"),
+            ),
+        ],
+    );
+    let mut args = print_background_args();
+    args.extend([
+        "--wait-async",
+        "--max-time",
+        "30",
+        "Run two dependent background jobs.",
+    ]);
+    let root = harness.harness.temp_dir().to_path_buf();
+    let mut completed_turns = 0;
+    let result = harness.run_with_stdout_observer(&args, None, move |line| {
+        if serde_json::from_slice::<serde_json::Value>(line)
+            .is_ok_and(|event| event["type"] == "agent_end")
+        {
+            completed_turns += 1;
+            let gate = match completed_turns {
+                1 => Some("release-first"),
+                2 => Some("release-second"),
+                _ => None,
+            };
+            if let Some(gate) = gate {
+                fs::write(root.join(gate), "continue").expect("release owned job");
+            }
+        }
+    });
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "BOTH_JOBS_FINISHED");
+    let events = parse_json_mode_stdout_lines(&result.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_start")
+            .count(),
+        3
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count(),
+        3
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn e2e_cli_wait_async_deadline_fails_and_reaps_the_owned_job() {
+    for retry_backoff in [false, true] {
+        let name = if retry_backoff {
+            "print_background_deadline_initial_retry"
+        } else {
+            "print_background_deadline_idle"
+        };
+        let mut harness = CliTestHarness::new(name);
+        fs::write(
+            harness.global_settings_path(),
+            r#"{"retry":{"enabled":true,"maxRetries":1,"baseDelayMs":60000,"maxDelayMs":60000,"modelFallback":false}}"#,
+        )
+        .expect("configure long retry backoff");
+        let original_reply = if retry_backoff {
+            vec![
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"server error\"}}\n\n".to_string(),
+            ]
+        } else {
+            build_anthropic_response_chunks("JOB_STILL_RUNNING")
+        };
+        setup_vcr_anthropic_sequence(
+            &mut harness,
+            name,
+            &[
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_tool_use_chunks(
+                        "bash",
+                        &json!({
+                            "command": "printf '%s' $$ > job.pid; while :; do sleep 1; done",
+                            "background": true
+                        }),
+                    ),
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    original_reply,
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_response_chunks("RETRY_MUST_NOT_START_AFTER_DEADLINE"),
+                ),
+            ],
+        );
+        let mut args = print_background_args();
+        args.extend(["--wait-async", "--max-time", "2", "Start a background job."]);
+        let result = harness.run(&args);
+        assert_exit_code(&harness.harness, &result, 1);
+        assert_contains(
+            &harness.harness,
+            &result.stderr,
+            "--max-time reached before background work settled",
+        );
+        assert!(
+            !result
+                .stdout
+                .contains("RETRY_MUST_NOT_START_AFTER_DEADLINE")
+        );
+        if retry_backoff {
+            let events = parse_json_mode_stdout_lines(&result.stdout);
+            let retry_start = events
+                .iter()
+                .find(|event| event["type"] == "auto_retry_start");
+            assert!(
+                retry_start.is_some(),
+                "original turn must reach retry backoff"
+            );
+            let retry_end = events
+                .iter()
+                .find(|event| event["type"] == "auto_retry_end");
+            assert!(retry_end.is_some_and(|event| event["success"] == false));
+        }
+        let pid = fs::read_to_string(harness.harness.temp_path("job.pid"))
+            .expect("background shell started")
+            .trim()
+            .parse::<u32>()
+            .expect("shell pid");
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "deadline left owned background shell {pid} running");
+    }
+}
+
+#[test]
+fn e2e_cli_wait_async_rejects_non_print_modes_before_provider_startup() {
+    for (mode, args) in [
+        ("rpc", vec!["--mode", "rpc", "--wait-async"]),
+        ("interactive", vec!["--wait-async"]),
+    ] {
+        let harness = CliTestHarness::new(&format!("wait_async_rejects_{mode}"));
+        let result = harness.run(&args);
+        assert_exit_code(&harness.harness, &result, 2);
+        assert_contains(
+            &harness.harness,
+            &result.stderr,
+            "--wait-async requires print mode",
+        );
+    }
 }
 
 // ============================================================================

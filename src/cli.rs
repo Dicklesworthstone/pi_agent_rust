@@ -541,6 +541,11 @@ pub struct Cli {
     #[arg(short = 'p', long)]
     pub print: bool,
 
+    /// In print mode, wait for background jobs and let the agent handle their results.
+    /// --max-time also bounds idle waiting and subsequent completion turns.
+    #[arg(long, conflicts_with_all = ["rpc", "acp"])]
+    pub wait_async: bool,
+
     /// Start in RPC mode (alias for --mode rpc)
     #[arg(long, conflicts_with_all = ["mode", "print"])]
     pub rpc: bool,
@@ -1445,6 +1450,25 @@ mod tests {
         };
         assert_eq!(pat, "claude*");
         Ok(())
+    }
+
+    #[test]
+    fn wait_async_survives_extension_flag_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            ["pi", "-p", "--wait-async", "--max-time", "37", "run tests"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("parse background completion mode");
+        assert!(parsed.cli.print);
+        assert!(parsed.cli.wait_async);
+        assert_eq!(parsed.cli.max_time, Some(37));
+        assert_eq!(parsed.cli.message_args(), vec!["run tests"]);
+        assert!(parsed.extension_flags.is_empty());
+        assert!(!Cli::parse_from(["pi", "-p", "hello"]).wait_async);
+        assert!(Cli::try_parse_from(["pi", "--rpc", "--wait-async"]).is_err());
+        assert!(Cli::try_parse_from(["pi", "--acp", "--wait-async"]).is_err());
     }
 
     #[test]

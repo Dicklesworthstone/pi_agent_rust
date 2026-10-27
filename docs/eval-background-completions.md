@@ -91,6 +91,34 @@ or cancel the completion. Keep the existing ID rather than launching a duplicate
 The usual background completion notice and retained artifact use the same jobs
 registry as shell and subagent work; there is no second completion scheduler.
 
+### Wait for results in print mode
+
+`pi -p --wait-async` keeps the current session alive after its original prompt
+finishes while it still owns background jobs or undelivered completion notices.
+Each completed job uses the same generated follow-up path as an ordinary agent
+turn, so the model can read the retained result, act on it, and start more jobs.
+The process exits once that work and its notices are exhausted. This includes
+Eval completion jobs, shell jobs and native tasks in the session-owned registry.
+
+```bash
+pi -p --tools read,write,edit,bash,eval,jobs --wait-async --max-time 3600 \
+  "Start the independent reviews as background jobs, then combine their findings."
+```
+
+The setting `"async": {"printWake": true}` enables the same behavior for text
+and JSON print mode. The default remains single-shot. Text streams the original
+and follow-up answers; JSON emits normal agent and message events with the same
+session identity. Completion notices remain generated context, not new authored
+user prompts.
+
+Use `--max-time` to bound unattended runs. The original run clock covers idle
+waiting, follow-up turns and retry backoff; every completed job does not receive
+a fresh time allowance. Deadline expiry or cancellation stops the wake loop and
+cancels the session's unfinished jobs. A failed follow-up exits unsuccessfully
+instead of silently reporting an earlier answer as the final result.
+Cancellation waits for the active turn's lifecycle and persistence work to close
+before job cleanup, so safe shutdown can extend beyond the configured deadline.
+
 ## Ownership, limits and outcomes
 
 The start arguments are exactly the ordinary completion contract: `prompt`,

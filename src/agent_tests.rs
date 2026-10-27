@@ -269,6 +269,268 @@ mod tests {
     }
 
     #[test]
+    fn idle_job_wake_persists_only_owned_notices_and_restores_the_time_cap() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let saved = Session::in_memory();
+            let owner = saved.header.id.clone();
+            let foreign_owner = format!("foreign-wake-{}", uuid::Uuid::new_v4().simple());
+            let saved = Arc::new(Mutex::new(saved));
+            let provider = CapturingProvider::new("test-api");
+            let calls = provider.calls();
+            let agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    max_time: Some(Duration::from_secs(60)),
+                    ..AgentConfig::default()
+                },
+            );
+            let mut session = AgentSession::new(
+                agent,
+                Arc::clone(&saved),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            crate::jobs::push_completion_notice(&owner, "owned background result")
+                .expect("owned notice");
+            crate::jobs::push_completion_notice(&foreign_owner, "foreign background result")
+                .expect("foreign notice");
+
+            assert!(session.stage_pending_job_follow_up().await);
+            session
+                .run_pending_job_follow_up_with_abort(Some(Duration::from_secs(10)), None, |_| {})
+                .await
+                .expect("wake completes");
+            assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(60)));
+            assert!(!session.stage_pending_job_follow_up().await);
+
+            let captured = calls.lock().expect("captured provider context");
+            assert_eq!(captured.len(), 1, "exactly one wake request");
+            assert_eq!(captured[0].messages.len(), 1);
+            assert_user_text(&captured[0].messages[0], "owned background result");
+            drop(captured);
+            let cx = AgentCx::for_current_or_request();
+            let saved = saved.lock(cx.cx()).await.expect("saved transcript");
+            let messages = saved.to_messages_for_current_path();
+            assert_eq!(messages.len(), 2, "notice and response persist once");
+            assert_user_text(&messages[0], "owned background result");
+            assert!(matches!(&messages[1], Message::Assistant(_)));
+            drop(saved);
+            let foreign = crate::jobs::take_completion_notices(&foreign_owner);
+            assert_eq!(foreign.len(), 1, "another owner's notice remains queued");
+            assert_user_text(&foreign[0], "foreign background result");
+        });
+    }
+
+    #[test]
+    fn idle_job_wake_refuses_empty_cancelled_and_expired_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let saved = Session::in_memory();
+            let owner = saved.header.id.clone();
+            let stream_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent::new(
+                Arc::new(CountingStopProvider {
+                    stream_calls: StdArc::clone(&stream_calls),
+                }),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(saved)),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            assert!(
+                session
+                    .run_pending_job_follow_up_with_abort(None, None, |_| {})
+                    .await
+                    .is_err(),
+                "an idle check must not fabricate a provider request"
+            );
+            crate::jobs::push_completion_notice(&owner, "result survives refused wake")
+                .expect("owned notice");
+            assert!(matches!(
+                session
+                    .run_pending_job_follow_up_with_abort(Some(Duration::ZERO), None, |_| {})
+                    .await,
+                Err(Error::Aborted)
+            ));
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            abort_handle.abort();
+            assert!(matches!(
+                session
+                    .run_pending_job_follow_up_with_abort(None, Some(abort_signal), |_| {})
+                    .await,
+                Err(Error::Aborted)
+            ));
+            let expired = PrewalkRunBudget {
+                started: Instant::now() - Duration::from_secs(2),
+                max_time: Some(Duration::from_secs(1)),
+                iterations: 3,
+                pause_continuations: 0,
+                turn_index: 4,
+                warned: false,
+            };
+            session.agent.prewalk_budget = Some(expired);
+            assert!(
+                matches!(
+                    session
+                        .run_pending_job_follow_up_with_abort(
+                            Some(Duration::from_secs(10)),
+                            None,
+                            |_| {}
+                        )
+                        .await,
+                    Err(Error::Aborted)
+                ),
+                "an expired prewalk cannot admit a new wake request"
+            );
+            assert_eq!(stream_calls.load(Ordering::SeqCst), 0);
+            assert!(!session.agent.message_queue.has_job_follow_up());
+            let retained = crate::jobs::take_completion_notices(&owner);
+            assert_eq!(
+                retained.len(),
+                1,
+                "refused admission leaves the notice intact"
+            );
+            assert_user_text(&retained[0], "result survives refused wake");
+        });
+    }
+
+    fn idle_wake_session_with_prewalk(
+        provider: Arc<dyn Provider>,
+        started: Instant,
+        max_time: Option<Duration>,
+    ) -> AgentSession {
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::from_tools(Vec::new()),
+            AgentConfig {
+                max_time: Some(Duration::from_secs(90)),
+                ..AgentConfig::default()
+            },
+        );
+        agent.prewalk_budget = Some(PrewalkRunBudget {
+            started,
+            max_time,
+            iterations: 3,
+            pause_continuations: 2,
+            turn_index: 4,
+            warned: true,
+        });
+        AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(Session::in_memory())),
+            false,
+            ResolvedCompactionSettings::default(),
+        )
+    }
+
+    #[test]
+    fn idle_job_wake_deadline_clamps_the_original_prewalk_clock() {
+        let wake_started = Instant::now();
+        let prewalk_started = wake_started - Duration::from_secs(20);
+        for (original_cap, expected_cap) in [(Some(60), 30), (Some(25), 25), (None, 30)] {
+            let original_cap = original_cap.map(Duration::from_secs);
+            let mut session = idle_wake_session_with_prewalk(
+                Arc::new(SilentProvider),
+                prewalk_started,
+                original_cap,
+            );
+            let mut scope = SessionTurnPromptGuard::new(&mut session, None);
+            scope.limit_max_time(wake_started, Some(Duration::from_secs(10)));
+            let budget = scope.session.agent.prewalk_budget.expect("active prewalk");
+            assert_eq!(budget.started, prewalk_started);
+            assert_eq!(budget.max_time, Some(Duration::from_secs(expected_cap)));
+            let advisor = AdvisorTurn::new(scope.session, Arc::new(|_| {}));
+            let remaining = advisor.remaining_time().expect("bounded advisor");
+            assert!(remaining <= Duration::from_secs(10));
+            drop(advisor);
+            scope
+                .session
+                .agent
+                .prewalk_budget
+                .as_mut()
+                .unwrap()
+                .iterations += 1;
+            drop(scope);
+            let restored = session.agent.prewalk_budget.expect("surviving prewalk");
+            assert_eq!(restored.started, prewalk_started);
+            assert_eq!(restored.max_time, original_cap);
+            assert_eq!(
+                restored.iterations, 4,
+                "completed work survives guard restoration"
+            );
+            assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(90)));
+        }
+    }
+
+    #[test]
+    fn dropping_an_idle_job_wake_restores_prewalk_limits_and_preserves_progress() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let started = Instant::now() - Duration::from_secs(20);
+            let mut session = idle_wake_session_with_prewalk(
+                Arc::new(StallAfterToolTurnProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                started,
+                Some(Duration::from_secs(600)),
+            );
+            let owner = {
+                let cx = AgentCx::for_current_or_request();
+                session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .unwrap()
+                    .header
+                    .id
+                    .clone()
+            };
+            crate::jobs::push_completion_notice(&owner, "owned completion starts a wake")
+                .expect("queue notice");
+            let mut wake = Box::pin(session.run_pending_job_follow_up_with_abort(
+                Some(Duration::from_secs(60)),
+                None,
+                |_| {},
+            ));
+            let reached_second_request = futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(wake.as_mut(), cx).is_pending());
+                if calls.load(Ordering::SeqCst) == 2 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(30),
+                reached_second_request,
+            )
+            .await
+            .expect("wake must retain time for its second provider request");
+            drop(wake);
+            let restored = session.agent.prewalk_budget.expect("surviving prewalk");
+            assert_eq!(restored.started, started);
+            assert_eq!(restored.max_time, Some(Duration::from_secs(600)));
+            assert_eq!(
+                restored.iterations, 4,
+                "finished tool accounting is retained"
+            );
+            assert_eq!(
+                restored.turn_index, 5,
+                "finished turn accounting is retained"
+            );
+            assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(90)));
+        });
+    }
+
+    #[test]
     fn background_job_follow_ups_track_the_live_agent_session() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

@@ -1125,6 +1125,12 @@ fn main_impl() -> Result<()> {
             "text".to_string()
         }
     });
+    if cli.wait_async && !matches!(early_mode.as_str(), "text" | "json") {
+        return Err(pi::error::Error::validation(
+            "--wait-async requires print mode (-p, --mode text, or --mode json)",
+        )
+        .into());
+    }
     if cli.command.is_none()
         && cli.fetch_models.is_none()
         && early_mode.eq("text")
@@ -3559,6 +3565,8 @@ async fn run(
                 auth: &auth,
                 cli_api_key: cli.api_key.as_deref(),
             }),
+            cli.wait_async || config.async_print_wake(),
+            cli.max_time.map(Duration::from_secs),
         )
         .await;
         // Explicitly shut down extension runtimes before the session drops.
@@ -9943,6 +9951,96 @@ async fn run_print_mode(
     config: &Config,
     approval_state: &pi::approval::ApprovalState,
     failover_ctx: Option<FailoverResolution<'_>>,
+    wait_async: bool,
+    max_time: Option<Duration>,
+) -> Result<()> {
+    let run_started = std::time::Instant::now();
+    let owner_session_id = if wait_async {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        Some(
+            session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?
+                .header
+                .id
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let abort_listener = abort_handle.clone();
+    if let Err(err) = ctrlc::set_handler(move || {
+        abort_listener.abort();
+    }) {
+        eprintln!("Warning: Failed to install Ctrl+C handler: {err}");
+    }
+
+    let result = {
+        let run = run_print_mode_inner(
+            session,
+            mode,
+            initial,
+            messages,
+            first_message_is_piped,
+            resources,
+            runtime_handle,
+            config,
+            approval_state,
+            failover_ctx,
+            owner_session_id.as_deref(),
+            max_time,
+            run_started,
+            &abort_signal,
+        );
+        let deadline = wait_for_print_background_deadline(
+            run_started,
+            if wait_async { max_time } else { None },
+        );
+        futures::pin_mut!(run, deadline);
+        match futures::future::select(run, deadline).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(((), remaining_run)) => {
+                // The deadline also covers the original prompt and retry
+                // backoff. Let cancellation close and save any active turn
+                // before tearing down this session's supervised jobs.
+                abort_handle.abort();
+                let _ = remaining_run.await;
+                Err(print_background_deadline_error())
+            }
+        }
+    };
+    match (owner_session_id.as_deref(), result) {
+        (Some(owner_session_id), Err(error)) => {
+            Err(match pi::jobs::kill_session(owner_session_id).await {
+                Ok(()) => error,
+                Err(cleanup_error) => error.context(format!(
+                    "background job cleanup was incomplete: {cleanup_error}"
+                )),
+            })
+        }
+        (_, result) => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_print_mode_inner(
+    session: &mut AgentSession,
+    mode: &str,
+    initial: Option<InitialMessage>,
+    messages: Vec<String>,
+    first_message_is_piped: bool,
+    resources: &ResourceLoader,
+    runtime_handle: RuntimeHandle,
+    config: &Config,
+    approval_state: &pi::approval::ApprovalState,
+    failover_ctx: Option<FailoverResolution<'_>>,
+    owner_session_id: Option<&str>,
+    max_time: Option<Duration>,
+    run_started: std::time::Instant,
+    abort_signal: &pi::agent::AbortSignal,
 ) -> Result<()> {
     if mode.ne("text") && mode.ne("json") {
         bail!("Unknown mode: {mode}");
@@ -10002,14 +10100,6 @@ async fn run_print_mode(
             }
         }
     };
-    let (abort_handle, abort_signal) = AbortHandle::new();
-    let abort_listener = abort_handle.clone();
-    if let Err(err) = ctrlc::set_handler(move || {
-        abort_listener.abort();
-    }) {
-        eprintln!("Warning: Failed to install Ctrl+C handler: {err}");
-    }
-
     let mut initial = initial;
     if let Some(ref mut initial) = initial {
         let generated_prefix = initial
@@ -10033,6 +10123,7 @@ async fn run_print_mode(
     let max_retries = config.retry_max_retries();
     let is_json = mode.eq("json");
     let mut sent_prompts = 0usize;
+    let mut completed_agent_turn = false;
     // Lives across every prompt in this process (bd-gm481.1): what the chain
     // started from, what is installed now, when the cooldown began, and where
     // the walk left off. Previously all of this was per-prompt, so a sequence
@@ -10060,7 +10151,7 @@ async fn run_print_mode(
         let message = run_print_prompt_with_retry(
             session,
             config,
-            &abort_signal,
+            abort_signal,
             &make_event_handler,
             retry_enabled,
             max_retries,
@@ -10075,12 +10166,16 @@ async fn run_print_mode(
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
+        completed_agent_turn = true;
         if mode.eq("text") {
             finish_print_text_response(
                 &message,
                 snapshot_print_text_stream_state(&text_stream_state),
                 config,
             )?;
+        }
+        if owner_session_id.is_some() {
+            ensure_print_command_response(&message)?;
         }
     }
 
@@ -10111,7 +10206,7 @@ async fn run_print_mode(
                 args
             };
             let outcome =
-                execute_print_command(session, command, focus, &abort_signal, make_event_handler())
+                execute_print_command(session, command, focus, abort_signal, make_event_handler())
                     .await?;
             match outcome {
                 PrintCommandOutcome::Compacted(result) => {
@@ -10159,7 +10254,7 @@ async fn run_print_mode(
         let response = run_print_prompt_with_retry(
             session,
             config,
-            &abort_signal,
+            abort_signal,
             &make_event_handler,
             retry_enabled,
             max_retries,
@@ -10171,12 +10266,16 @@ async fn run_print_mode(
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
+        completed_agent_turn = true;
         if mode.eq("text") {
             finish_print_text_response(
                 &response,
                 snapshot_print_text_stream_state(&text_stream_state),
                 config,
             )?;
+        }
+        if owner_session_id.is_some() {
+            ensure_print_command_response(&response)?;
         }
         if retry_command {
             // JSON prompts historically report a provider error in-band.
@@ -10196,6 +10295,80 @@ async fn run_print_mode(
             return Ok(());
         }
         bail!("No messages were sent");
+    }
+
+    if let Some(owner_session_id) = owner_session_id
+        && completed_agent_turn
+        && !approval_state.surface_was_unavailable()
+    {
+        // Keep the same session and completion delivery path as an ordinary
+        // tool-loop follow-up. A wake turn may start more jobs, so an empty
+        // queue only ends the run once the owner's registry is also idle.
+        let drain_result = async {
+            loop {
+                if abort_signal.is_aborted() {
+                    return Err(pi::error::Error::Aborted.into());
+                }
+                ensure_print_background_owner(session, owner_session_id).await?;
+                let staged = session.stage_pending_job_follow_up().await;
+                if !staged && !pi::jobs::has_pending_work(owner_session_id)? {
+                    return Ok(());
+                }
+                let remaining_time =
+                    max_time.map(|budget| budget.saturating_sub(run_started.elapsed()));
+                if remaining_time.is_some_and(|remaining| remaining.is_zero()) {
+                    return Err(print_background_deadline_error());
+                }
+                if !staged {
+                    sleep_with_current_timer(Duration::from_millis(50)).await;
+                    continue;
+                }
+                let _ = maybe_restore_print_primary(
+                    session,
+                    &mut failover_state,
+                    failover_ctx,
+                    is_json,
+                )
+                .await;
+                ensure_print_background_owner(session, owner_session_id).await?;
+                reset_print_text_stream_state(&text_stream_state);
+                let response = run_print_prompt_with_retry(
+                    session,
+                    config,
+                    abort_signal,
+                    &make_event_handler,
+                    retry_enabled,
+                    max_retries,
+                    is_json,
+                    &text_stream_state,
+                    PromptInput::JobFollowUp {
+                        remaining_time: max_time
+                            .map(|budget| budget.saturating_sub(run_started.elapsed())),
+                    },
+                    failover_ctx,
+                    &mut failover_state,
+                )
+                .await?;
+                if mode.eq("text") {
+                    finish_print_text_response(
+                        &response,
+                        snapshot_print_text_stream_state(&text_stream_state),
+                        config,
+                    )?;
+                }
+                ensure_print_command_response(&response)?;
+                if approval_state.surface_was_unavailable() {
+                    return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
+                }
+            }
+        }
+        .await;
+        if let Err(error) = drain_result {
+            if mode.eq("text") {
+                emit_trailing_print_newline(snapshot_print_text_stream_state(&text_stream_state))?;
+            }
+            return Err(error);
+        }
     }
 
     flush_stdout()?;
@@ -10350,6 +10523,48 @@ enum PromptInput {
         content: Vec<ContentBlock>,
         keyword_scan_source: Option<String>,
     },
+    JobFollowUp {
+        remaining_time: Option<Duration>,
+    },
+}
+
+fn print_background_deadline_error() -> anyhow::Error {
+    anyhow::anyhow!("--max-time reached before background work settled")
+}
+
+async fn ensure_print_background_owner(session: &AgentSession, owner: &str) -> Result<()> {
+    let cx = pi::agent_cx::AgentCx::for_request();
+    let same_owner = session
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .header
+        .id
+        == owner;
+    if !same_owner {
+        bail!("agent session changed while waiting for its background work");
+    }
+    Ok(())
+}
+
+/// Use bounded timer slices so a duration larger than the timer's nanosecond
+/// range cannot wrap into an immediate timeout. The monotonic original clock
+/// also means each completion and provider retry shares one wait budget.
+async fn wait_for_print_background_deadline(
+    started: std::time::Instant,
+    max_time: Option<Duration>,
+) {
+    let Some(max_time) = max_time else {
+        return futures::future::pending().await;
+    };
+    loop {
+        let remaining = max_time.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return;
+        }
+        sleep_with_current_timer(remaining.min(Duration::from_secs(1))).await;
+    }
 }
 
 /// Print mode's retry limits, read out of config in exactly one place so the
@@ -10371,6 +10586,16 @@ async fn sleep_with_current_timer(duration: Duration) {
         .and_then(|cx| cx.timer_driver())
         .map_or_else(asupersync::time::wall_now, |timer| timer.now());
     asupersync::time::sleep(now, duration).await;
+}
+
+async fn sleep_print_retry(duration: Duration, abort_signal: &pi::agent::AbortSignal) -> bool {
+    let cancelled = abort_signal.wait();
+    let timer = sleep_with_current_timer(duration);
+    futures::pin_mut!(cancelled, timer);
+    matches!(
+        futures::future::select(cancelled, timer).await,
+        futures::future::Either::Right(((), _))
+    )
 }
 
 /// Emit a JSON-serialized [`AgentEvent`] to stdout (for JSON print mode).
@@ -10809,6 +11034,15 @@ where
                 )
                 .await
         }
+        PromptInput::JobFollowUp { remaining_time } => {
+            session
+                .run_pending_job_follow_up_with_abort(
+                    *remaining_time,
+                    Some(abort_signal.clone()),
+                    make_event_handler(),
+                )
+                .await
+        }
     };
 
     let mut retry_count: u32 = 0;
@@ -10931,7 +11165,19 @@ where
                     });
                 }
 
-                sleep_with_current_timer(Duration::from_millis(u64::from(delay_ms))).await;
+                if !sleep_print_retry(Duration::from_millis(u64::from(delay_ms)), abort_signal)
+                    .await
+                {
+                    if is_json {
+                        emit_json_event(&AgentEvent::AutoRetryEnd {
+                            success: false,
+                            attempt: retry_count,
+                            final_error: Some("Aborted".to_string()),
+                        });
+                    }
+                    emit_print_failover_end(is_json, failed_over, session, false);
+                    return Err(pi::error::Error::Aborted.into());
+                }
 
                 // Resume the turn instead of replaying it: strip only the failed
                 // request's incomplete output (a transient drop leaves a partial
@@ -11068,7 +11314,19 @@ where
                         });
                     }
 
-                    sleep_with_current_timer(Duration::from_millis(u64::from(delay_ms))).await;
+                    if !sleep_print_retry(Duration::from_millis(u64::from(delay_ms)), abort_signal)
+                        .await
+                    {
+                        if is_json {
+                            emit_json_event(&AgentEvent::AutoRetryEnd {
+                                success: false,
+                                attempt: retry_count,
+                                final_error: Some("Aborted".to_string()),
+                            });
+                        }
+                        emit_print_failover_end(is_json, failed_over, session, false);
+                        return Err(pi::error::Error::Aborted.into());
+                    }
 
                     // Resume the turn instead of replaying it (pi_agent_rust#125):
                     // strip only the failed request's incomplete output and
@@ -13787,6 +14045,42 @@ mod tests {
     // ================================================================
 
     #[test]
+    fn print_retry_sleep_cancels_before_and_during_the_backoff() {
+        run_cli_workdir_test(async {
+            let (abort, signal) = AbortHandle::new();
+            let waiting = sleep_print_retry(Duration::from_secs(60), &signal);
+            futures::pin_mut!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            abort.abort();
+            assert!(!waiting.await, "abort must interrupt an armed retry timer");
+            assert!(
+                !sleep_print_retry(Duration::from_secs(60), &signal).await,
+                "an already-aborted retry must not wait or re-enter the provider"
+            );
+        });
+    }
+
+    #[test]
+    fn print_background_deadline_handles_expired_and_very_large_budgets() {
+        run_cli_workdir_test(async {
+            let started = std::time::Instant::now();
+            let expired = wait_for_print_background_deadline(started, Some(Duration::ZERO));
+            futures::pin_mut!(expired);
+            assert!(futures::poll!(&mut expired).is_ready());
+            let distant =
+                wait_for_print_background_deadline(started, Some(Duration::from_secs(u64::MAX)));
+            futures::pin_mut!(distant);
+            assert!(
+                futures::poll!(&mut distant).is_pending(),
+                "oversized timer durations must not wrap into immediate expiry"
+            );
+            let unlimited = wait_for_print_background_deadline(started, None);
+            futures::pin_mut!(unlimited);
+            assert!(futures::poll!(&mut unlimited).is_pending());
+        });
+    }
+
+    #[test]
     fn print_mode_retry_delay_first_attempt_is_base() {
         let config = Config {
             retry: Some(pi::config::RetrySettings {
@@ -15032,6 +15326,59 @@ mod tests {
             &mut PrintFailoverState::default(),
         )
         .await
+    }
+
+    #[test]
+    fn print_background_wake_retries_without_duplicating_the_completion_notice() {
+        run_cli_workdir_test(async {
+            let provider = Arc::new(PrintRecoveryProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prompts: StdMutex::new(Vec::new()),
+                input_tokens: 0,
+                transport_error: true,
+            });
+            let mut session = print_recovery_session(&provider);
+            let owner = {
+                let cx = pi::agent_cx::AgentCx::for_request();
+                session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .unwrap()
+                    .header
+                    .id
+                    .clone()
+            };
+            let notice = "background completion survives a provider retry";
+            pi::jobs::push_completion_notice(&owner, notice).unwrap();
+            assert!(session.stage_pending_job_follow_up().await);
+            assert!(!pi::jobs::has_pending_work(&owner).unwrap());
+            let result = run_print_recovery_fixture(
+                &mut session,
+                PromptInput::JobFollowUp {
+                    remaining_time: None,
+                },
+            )
+            .await
+            .expect("recover the failed completion turn");
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(!session.stage_pending_job_follow_up().await);
+            let cx = pi::agent_cx::AgentCx::for_request();
+            let stored = session.session.lock(cx.cx()).await.unwrap();
+            assert_eq!(
+                stored
+                    .to_messages_for_current_path()
+                    .iter()
+                    .filter(|message| matches!(message,
+                        pi::model::Message::User(pi::model::UserMessage {
+                            content: pi::model::UserContent::Text(text), ..
+                        }) if text == notice))
+                    .count(),
+                1,
+                "retry must reuse the durable generated input"
+            );
+        });
     }
 
     #[test]

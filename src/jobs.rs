@@ -2858,6 +2858,43 @@ pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
         .collect())
 }
 
+/// Whether one session still owns background work or an undelivered result.
+///
+/// Print mode uses this non-consuming observation before exiting. Inspecting
+/// notices and running jobs under the same lock closes the settlement race:
+/// publication cannot make a job disappear between two separate checks while
+/// its completion notice has yet to be observed. Admissions captured before a
+/// job is registered count too. Published foreground commands and other
+/// sessions do not count.
+///
+/// # Errors
+/// Tool error when the registry is poisoned or the owner is unavailable.
+pub fn has_pending_work(owner_session_id: &str) -> Result<bool> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
+                .to_string(),
+        ));
+    }
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    Ok(reg
+        .owner_spawns_in_flight
+        .get(owner_session_id)
+        .is_some_and(|count| *count > 0)
+        || reg.jobs.values().any(|job| {
+            job.owner_session_id == owner_session_id
+                && job.delivery == JobDelivery::Background
+                && !job.status.settled()
+        })
+        || reg
+            .notices
+            .iter()
+            .any(|notice| notice.owner_session_id == owner_session_id))
+}
+
 fn unknown_job_error(id: &str) -> Error {
     Error::tool(
         "jobs",
@@ -5440,6 +5477,26 @@ mod tests {
                 ..
             }) if text == "notice-b"
         ));
+    }
+
+    #[test]
+    fn pending_work_tracks_owner_admission_and_undelivered_notices() {
+        let owner = format!("pending-work-{}", uuid::Uuid::new_v4().simple());
+        let other = format!("pending-work-other-{}", uuid::Uuid::new_v4().simple());
+        assert!(!has_pending_work(&owner).expect("idle owner"));
+        let admission = capture_session_spawn_generation(&owner).expect("capture admission");
+        assert!(has_pending_work(&owner).expect("admitted owner"));
+        assert!(!has_pending_work(&other).expect("foreign admission is hidden"));
+        drop(admission);
+        assert!(!has_pending_work(&owner).expect("admission finished"));
+
+        push_completion_notice(&owner, "retained result").expect("queue completion");
+        assert!(has_pending_work(&owner).expect("pending notice"));
+        assert!(has_pending_work(&owner).expect("observation does not consume"));
+        assert!(!has_pending_work(&other).expect("foreign notice is hidden"));
+        assert_eq!(take_completion_notices(&owner).len(), 1);
+        assert!(!has_pending_work(&owner).expect("notice delivered"));
+        assert!(has_pending_work(" ").is_err());
     }
 
     #[test]

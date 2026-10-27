@@ -141,6 +141,9 @@ pub struct Config {
     pub steering_mode: Option<String>,
     #[serde(alias = "followUpMode")]
     pub follow_up_mode: Option<String>,
+    /// Background completion behavior for unattended print runs.
+    #[serde(rename = "async", alias = "async_settings")]
+    pub async_settings: Option<AsyncSettings>,
 
     // Version check
     #[serde(alias = "checkForUpdates")]
@@ -401,6 +404,15 @@ pub struct CompactionSettings {
 pub struct BranchSummarySettings {
     #[serde(alias = "reserveTokens")]
     pub reserve_tokens: Option<u32>,
+}
+
+/// Opt-in background completion handling. Ordinary print runs still exit
+/// when their authored prompts finish.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AsyncSettings {
+    #[serde(alias = "printWake")]
+    pub print_wake: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1004,6 +1016,12 @@ impl Config {
             // Message Handling
             steering_mode: other.steering_mode.or(base.steering_mode),
             follow_up_mode: other.follow_up_mode.or(base.follow_up_mode),
+            async_settings: match (base.async_settings, other.async_settings) {
+                (Some(base), Some(other)) => Some(AsyncSettings {
+                    print_wake: other.print_wake.or(base.print_wake),
+                }),
+                (base, other) => other.or(base),
+            },
 
             // Version check
             check_for_updates: other.check_for_updates.or(base.check_for_updates),
@@ -1081,6 +1099,15 @@ impl Config {
     }
 
     // === Accessor methods with defaults ===
+
+    /// Keep print mode alive for owned background work only when opted in.
+    #[must_use]
+    pub fn async_print_wake(&self) -> bool {
+        self.async_settings
+            .as_ref()
+            .and_then(|settings| settings.print_wake)
+            .unwrap_or(false)
+    }
 
     /// Discover project-local MCP definitions when the workspace is also trusted.
     /// Explicit CLI files, global definitions, and ACP client declarations are
@@ -2594,6 +2621,27 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn async_print_wake_is_opt_in_and_preserves_partial_settings_merges() {
+        assert!(!Config::default().async_print_wake());
+        for content in [
+            r#"{"async":{"printWake":true}}"#,
+            r#"{"async":{"print_wake":true}}"#,
+            r#"{"async_settings":{"print_wake":true}}"#,
+        ] {
+            let enabled: Config = serde_json::from_str(content).expect("async settings");
+            assert!(enabled.async_print_wake());
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let partial = serde_json::from_str(r#"{"async":{}}"#).expect("empty override");
+            let inherited = Config::merge(enabled, partial);
+            assert!(inherited.async_print_wake());
+            let disabled = serde_json::from_str(r#"{"async":{"printWake":false}}"#)
+                .expect("explicit project override");
+            assert!(!Config::merge(inherited, disabled).async_print_wake());
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"async":{"printWake":"true"}}"#).is_err());
+    }
 
     #[test]
     fn mcp_project_discovery_setting_aliases_defaults_and_layering() {
