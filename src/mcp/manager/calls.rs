@@ -621,14 +621,26 @@ impl McpManager {
                 registry.subscribe(Arc::clone(&guard.dispatch), expected_generation)
             });
         let generation = progress.as_ref().map(ProgressSubscription::generation);
-        let elicitation = transport.elicitation_registry().and_then(|registry| {
-            registry.subscribe(
-                Arc::clone(&guard.dispatch),
-                expected_generation,
-                task_execution.is_augmented(),
-            )
-        });
-        let task_binding = elicitation.as_ref().map(elicitation::Subscription::task_binding);
+        let elicitation = match transport.elicitation_registry() {
+            Some(registry) => Some(
+                registry
+                    .subscribe(
+                        Arc::clone(&guard.dispatch),
+                        expected_generation,
+                        task_execution.is_augmented(),
+                    )
+                    .ok_or_else(|| {
+                        tool_err(
+                            "MCP_REQUEST_LIMIT",
+                            "too many active MCP requests to safely associate a tool form; the call was not sent",
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let task_binding = elicitation
+            .as_ref()
+            .map(elicitation::Subscription::task_binding);
         let ask = Self::lock(&self.inner.ask).clone();
         let mut params = serde_json::json!({"name": tool, "arguments": arguments});
         if let Some(progress) = &progress {
@@ -681,9 +693,7 @@ impl McpManager {
         .and_then(std::convert::identity);
         // Retire cancellation and timeout before any asynchronous revocation
         // cleanup. An uncooperative close must not delay owner cancellation.
-        if !is_current(entry, transport)
-            || transport.progress_generation() != expected_generation
-        {
+        if !is_current(entry, transport) || transport.progress_generation() != expected_generation {
             return Err(superseded_call());
         }
         if let Err(error) = catalog::check_request_owner(&owner) {

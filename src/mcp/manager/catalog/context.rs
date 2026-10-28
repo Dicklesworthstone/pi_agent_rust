@@ -14,6 +14,8 @@ use super::super::{Arc, McpManager, McpTransport, ServerEntry, tool_err};
 use super::DEFAULT_MCP_TIMEOUT;
 use super::{CatalogByteBudget, Instant, MAX_CURSOR_BYTES};
 use crate::error::{Error, Result};
+use crate::mcp::elicitation;
+use crate::mcp::transport::RequestDispatch;
 
 const MAX_CONTEXT_ITEMS: usize = 1024;
 const MAX_CONTEXT_NAME_BYTES: usize = 1024;
@@ -288,21 +290,45 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
 struct ContextRequestGuard {
     entry: Arc<ServerEntry>,
     transport: Arc<dyn McpTransport>,
+    dispatch: Arc<RequestDispatch>,
+    generation: u64,
     armed: bool,
+}
+
+impl ContextRequestGuard {
+    fn retire(&mut self, error: &Error) {
+        if !self.armed {
+            return;
+        }
+        // Revoking the same lease used by the writer proves queued work can
+        // no longer be sent. Such a request must not retire another caller's
+        // healthy shared connection.
+        if self.dispatch.revoke_unsent()
+            && self.transport.is_alive()
+            && self.transport.progress_generation() == self.generation
+            && McpManager::lock(&self.entry.transport)
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.transport))
+        {
+            self.armed = false;
+            return;
+        }
+        // Native HTTP can renew a session inside the same transport Arc.
+        // Seal only the admitted generation before ordinary failure cleanup;
+        // an abandoned form must not close a replacement protocol session.
+        if self.transport.abort_in_generation(self.generation) {
+            McpManager::fail_transport_generation(&self.entry, &self.transport, error);
+        }
+        self.armed = false;
+    }
 }
 
 impl Drop for ContextRequestGuard {
     fn drop(&mut self) {
-        if self.armed {
-            McpManager::fail_transport_generation(
-                &self.entry,
-                &self.transport,
-                &tool_err(
-                    "MCP_CANCELLED",
-                    "MCP context request was cancelled; it was not replayed",
-                ),
-            );
-        }
+        self.retire(&tool_err(
+            "MCP_CANCELLED",
+            "MCP context request was cancelled; it was not replayed",
+        ));
     }
 }
 
@@ -472,6 +498,7 @@ impl McpManager {
         &self,
         entry: &Arc<ServerEntry>,
         transport: &Arc<dyn McpTransport>,
+        generation: u64,
     ) -> Result<()> {
         self.check_running()?;
         if let Err(error) = self.check_trust(entry) {
@@ -481,8 +508,8 @@ impl McpManager {
         let current = Self::lock(&entry.transport)
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, transport));
-        if !current {
-            transport.abort();
+        if !current || transport.progress_generation() != generation {
+            transport.abort_in_generation(generation);
             return Err(tool_err(
                 "MCP_TRANSPORT_SUPERSEDED",
                 "connection changed during MCP context access",
@@ -506,6 +533,7 @@ impl McpManager {
             .await
     }
 
+    #[allow(clippy::too_many_lines)] // One guard spans dispatch, user interaction and validated publication.
     async fn request_context_with_timeout(
         &self,
         server: &str,
@@ -525,23 +553,79 @@ impl McpManager {
                 "connection disappeared before MCP context access",
             )
         })?;
-        self.check_context_transport(&entry, &transport).await?;
+        let generation = transport.progress_generation();
+        self.check_context_transport(&entry, &transport, generation)
+            .await?;
         let mut guard = ContextRequestGuard {
             entry: Arc::clone(&entry),
             transport: Arc::clone(&transport),
+            dispatch: Arc::new(RequestDispatch::new()),
+            generation,
             armed: true,
         };
+        // All context requests occupy a routing slot: an unexpected form
+        // during discovery must not be attributed to a concurrent tool call.
+        // Only the two user-selected retrieval operations may open the picker.
+        let subscription = match transport.elicitation_registry() {
+            Some(registry) => Some(
+                registry
+                    .subscribe(Arc::clone(&guard.dispatch), generation, false)
+                    .ok_or_else(|| {
+                        tool_err(
+                            "MCP_REQUEST_LIMIT",
+                            "too many active MCP requests to safely associate a context form; the request was not sent",
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let ask = if matches!(method, "resources/read" | "prompts/get") {
+            Self::lock(&self.inner.ask).clone()
+        } else {
+            None
+        };
         let started = Instant::now();
-        let result = super::request_with_owner(&owner, &transport, method, params, timeout).await;
+        let result = super::operation_with_owner(
+            &owner,
+            elicitation::observe(
+                // The generation-bound path never renews or replays this
+                // operation, including after the user has submitted a form.
+                transport.request_in_task_generation(
+                    method,
+                    params,
+                    timeout,
+                    Arc::clone(&guard.dispatch),
+                    generation,
+                ),
+                subscription,
+                ask,
+                &entry.config.name,
+                &transport,
+                || {
+                    super::check_request_owner(&owner).is_ok()
+                        && self.check_running().is_ok()
+                        && self.check_trust(&entry).is_ok()
+                        && transport.is_alive()
+                        && transport.progress_generation() == generation
+                        && Self::lock(&entry.transport)
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &transport))
+                },
+            ),
+            timeout,
+        )
+        .await
+        .and_then(std::convert::identity);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
                 if server_error(&error) {
-                    self.check_context_transport(&entry, &transport).await?;
+                    self.check_context_transport(&entry, &transport, generation)
+                        .await?;
                 } else {
                     // Preserve the original cancellation/timeout taxonomy,
                     // even if dropping the request already closed its socket.
-                    Self::fail_transport_generation(&entry, &transport, &error);
+                    guard.retire(&error);
                 }
                 guard.armed = false;
                 return Err(error);
@@ -549,10 +633,10 @@ impl McpManager {
         };
         // Cleanup ownership lasts through validation and final publication,
         // not just until the transport has produced a value.
-        self.check_context_transport(&entry, &transport).await?;
+        self.check_context_transport(&entry, &transport, generation)
+            .await?;
         if let Err(error) = validate_response(&result, shape) {
-            Self::fail_transport_generation(&entry, &transport, &error);
-            guard.armed = false;
+            guard.retire(&error);
             return Err(error);
         }
         if started.elapsed() >= timeout {
@@ -560,14 +644,13 @@ impl McpManager {
                 "MCP_TIMEOUT",
                 "MCP context response arrived after its deadline",
             );
-            Self::fail_transport_generation(&entry, &transport, &error);
-            guard.armed = false;
+            guard.retire(&error);
             return Err(error);
         }
-        self.check_context_transport(&entry, &transport).await?;
+        self.check_context_transport(&entry, &transport, generation)
+            .await?;
         if let Err(error) = super::check_request_owner(&owner) {
-            Self::fail_transport_generation(&entry, &transport, &error);
-            guard.armed = false;
+            guard.retire(&error);
             return Err(error);
         }
         if !Self::record_operational_success(&entry, &transport) {
@@ -763,6 +846,7 @@ mod tests {
         replies: Mutex<VecDeque<Result<Value>>>,
         requests: Mutex<Vec<(String, Value, std::time::Duration)>>,
         closed: AtomicBool,
+        generation: std::sync::atomic::AtomicU64,
         after_response: Mutex<Option<Arc<ResponseHook>>>,
     }
 
@@ -790,6 +874,9 @@ mod tests {
         }
         fn is_alive(&self) -> bool {
             !self.closed.load(Ordering::Acquire)
+        }
+        fn progress_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
         }
         fn abort(&self) {
             self.closed.store(true, Ordering::Release);
@@ -841,6 +928,7 @@ mod tests {
             replies: Mutex::new(replies.into()),
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            generation: std::sync::atomic::AtomicU64::new(0),
             after_response: Mutex::new(None),
         });
         let erased: Arc<dyn McpTransport> = transport.clone();
@@ -1396,6 +1484,7 @@ mod tests {
             replies: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            generation: std::sync::atomic::AtomicU64::new(0),
             after_response: Mutex::new(None),
         });
         let erased: Arc<dyn McpTransport> = replacement.clone();
@@ -1419,15 +1508,74 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, transport) = fixture(&temp, Vec::new(), true);
         let erased: Arc<dyn McpTransport> = transport.clone();
+        let dispatch = Arc::new(RequestDispatch::new());
+        assert!(dispatch.claim());
         drop(ContextRequestGuard {
             entry: entry.clone(),
             transport: erased,
+            dispatch,
+            generation: 0,
             armed: true,
         });
         assert!(transport.closed.load(Ordering::Acquire));
         assert!(McpManager::lock(&entry.transport).is_none());
         assert_eq!(McpManager::lock(&entry.restarts).count, 1);
         assert_eq!(manager.context_server_names(None), vec!["docs"]);
+    }
+
+    #[test]
+    fn dropped_undispatched_context_request_preserves_its_shared_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, entry, transport) = fixture(&temp, Vec::new(), true);
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let dispatch = Arc::new(RequestDispatch::new());
+        drop(ContextRequestGuard {
+            entry: entry.clone(),
+            transport: Arc::clone(&erased),
+            dispatch: Arc::clone(&dispatch),
+            generation: 0,
+            armed: true,
+        });
+        assert!(
+            !dispatch.claim(),
+            "late writer must not dispatch abandoned work"
+        );
+        assert!(transport.is_alive());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        assert!(
+            McpManager::lock(&entry.transport)
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &erased))
+        );
+    }
+
+    #[test]
+    fn context_reply_from_an_in_place_replaced_session_is_not_published_or_retired() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (manager, entry, transport) = fixture(
+            &temp,
+            vec![Ok(
+                json!({"contents":[{"uri":"db://private","text":"obsolete"}]}),
+            )],
+            true,
+        );
+        let weak_transport = Arc::downgrade(&transport);
+        *McpManager::lock(&transport.after_response) = Some(Arc::new(move || {
+            weak_transport
+                .upgrade()
+                .unwrap()
+                .generation
+                .store(1, Ordering::Release);
+        }));
+        let error = runtime()
+            .block_on(manager.read_resource("docs", "db://private"))
+            .expect_err("obsolete session result");
+        assert!(error.to_string().contains("MCP_TRANSPORT_SUPERSEDED"));
+        assert!(!error.to_string().contains("obsolete"));
+        assert!(transport.is_alive(), "the replacement session must survive");
+        assert!(McpManager::lock(&entry.transport).is_some());
+        assert_eq!(McpManager::lock(&entry.restarts).count, 0);
+        assert_eq!(McpManager::lock(&transport.requests).len(), 1);
     }
 
     #[test]
@@ -1900,15 +2048,20 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (manager, entry, old) = fixture(&temp, Vec::new(), true);
         let old_erased: Arc<dyn McpTransport> = old.clone();
+        let dispatch = Arc::new(RequestDispatch::new());
+        assert!(dispatch.claim());
         let guard = ContextRequestGuard {
             entry: entry.clone(),
             transport: old_erased,
+            dispatch,
+            generation: 0,
             armed: true,
         };
         let replacement = Arc::new(ContextTransport {
             replies: Mutex::new(vec![Ok(json!({"prompts":[]}))].into()),
             requests: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
+            generation: std::sync::atomic::AtomicU64::new(0),
             after_response: Mutex::new(None),
         });
         let erased: Arc<dyn McpTransport> = replacement.clone();

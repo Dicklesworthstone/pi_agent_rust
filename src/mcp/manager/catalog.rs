@@ -15,6 +15,8 @@ use super::{
     Arc, Duration, Instant, MAX_SERVER_TOOLS, McpManager, McpToolMeta, McpTransport, Result,
     ServerEntry, Value, parse_tool_list, tool_err,
 };
+use crate::mcp::elicitation;
+use crate::mcp::transport::RequestDispatch;
 
 mod context;
 
@@ -150,13 +152,35 @@ fn remaining_budget(deadline: Instant, now: Instant) -> Result<Duration> {
 struct CatalogRequestGuard {
     entry: Arc<ServerEntry>,
     transport: Arc<dyn McpTransport>,
+    dispatch: Arc<RequestDispatch>,
     generation: u64,
     armed: bool,
 }
 
+impl CatalogRequestGuard {
+    fn preserve_unsent(&mut self) -> bool {
+        if self.armed
+            && self.dispatch.revoke_unsent()
+            && self.transport.is_alive()
+            && self.transport.progress_generation() == self.generation
+            && McpManager::lock(&self.entry.transport)
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.transport))
+        {
+            self.armed = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Drop for CatalogRequestGuard {
     fn drop(&mut self) {
-        if self.armed && self.transport.abort_in_generation(self.generation) {
+        if self.armed
+            && !self.preserve_unsent()
+            && self.transport.abort_in_generation(self.generation)
+        {
             McpManager::fail_transport_generation(
                 &self.entry,
                 &self.transport,
@@ -376,6 +400,7 @@ impl McpManager {
             .await
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the page's admission, owner and publication boundary together.
     async fn collect_tool_catalog_with_timeout(
         &self,
         entry: &Arc<ServerEntry>,
@@ -404,30 +429,68 @@ impl McpManager {
                     return Err(error);
                 }
             };
+            let dispatch = Arc::new(RequestDispatch::new());
+            // Discovery cannot ask for user data, but still owns a routing
+            // slot so its server requests cannot borrow a concurrent tool's
+            // or resource retrieval's picker. Refuse dispatch if the bounded
+            // registry cannot account for this page.
+            let subscription = match transport.elicitation_registry() {
+                Some(registry) => Some(
+                    registry
+                        .subscribe(Arc::clone(&dispatch), generation, false)
+                        .ok_or_else(|| {
+                            tool_err(
+                                "MCP_REQUEST_LIMIT",
+                                "too many active MCP requests to safely associate catalog discovery; the request was not sent",
+                            )
+                        })?,
+                ),
+                None => None,
+            };
             let mut request_guard = CatalogRequestGuard {
                 entry: Arc::clone(entry),
                 transport: Arc::clone(transport),
+                dispatch: Arc::clone(&dispatch),
                 generation,
                 armed: true,
             };
             let result = operation_with_owner(
                 &owner,
-                transport.request_in_task_generation(
-                    "tools/list",
-                    params,
-                    remaining,
-                    Arc::new(super::super::transport::RequestDispatch::new()),
-                    generation,
+                elicitation::observe(
+                    transport.request_in_task_generation(
+                        "tools/list",
+                        params,
+                        remaining,
+                        dispatch,
+                        generation,
+                    ),
+                    subscription,
+                    None,
+                    &entry.config.name,
+                    transport,
+                    || {
+                        check_request_owner(&owner).is_ok()
+                            && self.check_running().is_ok()
+                            && self.check_trust(entry).is_ok()
+                            && transport.is_alive()
+                            && transport.progress_generation() == generation
+                            && Self::lock(&entry.transport)
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, transport))
+                    },
                 ),
                 remaining,
             )
             .await
             .and_then(std::convert::identity);
-            // A returned error is handled by the existing failure taxonomy;
-            // only abandonment of the pending future belongs to the guard.
+            // A queued catalog request may be cancelled behind an active
+            // HTTP form. Revoke its exact lease without killing the caller
+            // that currently owns the shared request lane.
+            let unsent = result.is_err() && request_guard.preserve_unsent();
             request_guard.armed = false;
             let result = match result {
                 Ok(result) => result,
+                Err(error) if unsent => return Err(error),
                 // Tools are optional in MCP. A resource-only server may
                 // explicitly reject the initial tools/list method. Do not
                 // mistake that for a crashed connection, or accept a failure

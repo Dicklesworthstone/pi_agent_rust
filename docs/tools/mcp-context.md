@@ -51,6 +51,23 @@ preserved, including intervening native media. No instructions are automatically
 executed. Other role values are rejected. Client-only `_meta` and unknown catalog
 metadata stay in tool details and do not become model-visible instructions.
 
+## Forms during retrieval
+
+A resource read or prompt retrieval can ask for additional non-sensitive values
+through the session's installed ask picker. Pi identifies the requesting server,
+validates each field, and shows the complete values for explicit review before
+sharing them. The picker works even when the model-facing `ask` tool is disabled.
+Headless sessions cancel the form; automatic recommended answers are not sent.
+See [interactive server forms](mcp-configuration.md#interactive-server-forms)
+for supported fields and the submission, edit, decline, and cancel choices.
+
+Listings, template discovery, and argument completion cannot open a server form.
+If concurrent requests make a form's initiating request ambiguous, Pi cancels it.
+The original request's timeout includes the time spent answering. Cancellation,
+timeout, trust revocation, or a changed protocol session removes the pending form
+and prevents late answers from publishing context. A request and its form reply
+remain in their original session and are never replayed after HTTP session expiry.
+
 ## Limits and lifecycle
 
 Resource, template, and prompt listings accept up to 1,024 entries and 2 MiB of

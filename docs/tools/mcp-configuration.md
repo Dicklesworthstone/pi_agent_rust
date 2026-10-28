@@ -178,7 +178,7 @@ negotiate the required protocol revision and capabilities.
 
 ## Interactive server forms
 
-During an admitted tool call, a server can request non-sensitive information
+During an admitted tool call, resource read, or prompt retrieval, a server can request non-sensitive information
 using [MCP form elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation).
 Pi shows the requesting server and its reason, collects each field through the
 existing ask picker, and presents the complete values for review. Choose
@@ -199,20 +199,31 @@ are escaped to prevent terminal controls, misleading markup, and clickable
 server-provided links. Form mode must not request passwords, API keys, tokens,
 or payment credentials; URL mode for those interactions is not supported.
 
-The server's configured `timeout` still bounds the entire tool call, including
+Resource reads (`resources/read`) and prompt retrieval (`prompts/get`) use this
+same picker and explicit review. Tool, resource, template, and prompt listings and
+argument completion always cancel form requests without opening a picker.
+Concurrent uncorrelated context and tool requests cannot borrow each other's
+permission to ask questions.
+
+The server's configured `timeout` still bounds the entire request, including
 user interaction. Configure sufficient time for a person to answer. Cancelling
-the tool or a server form removes that form's pending reply; a late answer
-cannot resume an abandoned call. Form results retain the original transport
+the request or a server form removes that form's pending reply; a late answer
+cannot resume an abandoned request. Form results retain the original transport
 session, and related-task requests retain the validated remote task identity.
+Context retrieval is not renewed or replayed in a new HTTP session, including
+when delivery of an accepted form response is uncertain.
 Unsolicited requests, ambiguous concurrent calls without task correlation, and
 requests from an obsolete session receive no user data.
 
-Admission is bounded to 64 observed calls per connection, eight form requests
-per call, 16 fields per form, 32 KiB of request data, 4 KiB per answer, and 16 KiB
+Admission is bounded to 64 observed requests per connection, eight form requests
+per request, 16 fields per form, 32 KiB of request data, 4 KiB per answer, and 16 KiB
 of submitted content. One replacement form can queue after its predecessor is
 cancelled or its response begins dispatch. Unsupported or oversized schemas
 return an invalid-params response. Requests to make the elicitation itself a
 remote task are not supported; a form can still belong to an existing tool task.
+When all request ownership slots are occupied, a new request is rejected before
+dispatch so its forms cannot be attributed to an existing caller. Cancelling a
+catalog refresh before dispatch leaves another caller's active form intact.
 
 ## Legacy HTTP+SSE servers
 

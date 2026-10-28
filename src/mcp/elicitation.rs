@@ -189,7 +189,11 @@ impl ElicitationRegistry {
         if !matches!(id, Value::Number(_) | Value::String(_))
             || id.as_str().is_some_and(|id| id.len() > 1024)
         {
-            return Some(rpc_error(&Value::Null, -32600, "invalid elicitation request id"));
+            return Some(rpc_error(
+                &Value::Null,
+                -32600,
+                "invalid elicitation request id",
+            ));
         }
         let slots = lock(&self.slots);
         for slot in slots.values() {
@@ -203,20 +207,32 @@ impl ElicitationRegistry {
             }
         }
         let Some(params) = params.filter(|params| params.is_object()) else {
-            return Some(rpc_error(id, -32602, "elicitation params must be an object"));
+            return Some(rpc_error(
+                id,
+                -32602,
+                "elicitation params must be an object",
+            ));
         };
         if !bounded(params, MAX_FORM_BYTES)
             || params.get("task").is_some()
-            || params.get("mode").is_some_and(|mode| mode.as_str() != Some("form"))
+            || params
+                .get("mode")
+                .is_some_and(|mode| mode.as_str() != Some("form"))
         {
-            return Some(rpc_error(id, -32602, "only bounded, non-task-augmented form elicitation is supported"));
+            return Some(rpc_error(
+                id,
+                -32602,
+                "only bounded, non-task-augmented form elicitation is supported",
+            ));
         }
         let related_task = match params.get("_meta") {
             None => None,
             Some(Value::Object(meta)) => match meta.get(RELATED_TASK) {
                 None => None,
                 Some(related) => {
-                    let Some(task) = related.get("taskId").and_then(Value::as_str)
+                    let Some(task) = related
+                        .get("taskId")
+                        .and_then(Value::as_str)
                         .filter(|task| !task.is_empty() && task.len() <= 4096)
                     else {
                         return Some(rpc_error(id, -32602, "invalid related-task metadata"));
@@ -224,7 +240,13 @@ impl ElicitationRegistry {
                     Some(task)
                 }
             },
-            Some(_) => return Some(rpc_error(id, -32602, "elicitation metadata must be an object")),
+            Some(_) => {
+                return Some(rpc_error(
+                    id,
+                    -32602,
+                    "elicitation metadata must be an object",
+                ));
+            }
         };
         let mut exact = Vec::new();
         let mut awaiting = Vec::new();
@@ -257,12 +279,19 @@ impl ElicitationRegistry {
             return Some(action(id, "cancel", related_task));
         };
         let mut state = lock(&slot.state);
-        if state.closed || state.seen.len() >= MAX_REQUESTS_PER_CALL
+        if state.closed
+            || state.seen.len() >= MAX_REQUESTS_PER_CALL
             || state.pending.len() >= 2
-            || state.pending.iter().any(|request| !request.cancelled.load(Ordering::Acquire))
-            || state.active.as_ref().is_some_and(|(_, cancelled, responding)| {
-                !cancelled.load(Ordering::Acquire) && !responding.load(Ordering::Acquire)
-            })
+            || state
+                .pending
+                .iter()
+                .any(|request| !request.cancelled.load(Ordering::Acquire))
+            || state
+                .active
+                .as_ref()
+                .is_some_and(|(_, cancelled, responding)| {
+                    !cancelled.load(Ordering::Acquire) && !responding.load(Ordering::Acquire)
+                })
         {
             return Some(action(id, "cancel", related_task));
         }
@@ -355,7 +384,8 @@ impl Subscription {
         let mut state = lock(&self.slot.state);
         state.waiter = Some(task.waker().clone());
         let ready = state.pending.front().is_some_and(|request| {
-            finished || request.cancelled.load(Ordering::Acquire)
+            finished
+                || request.cancelled.load(Ordering::Acquire)
                 || request.related_task.is_none()
                 || !matches!(state.task, TaskOwner::AwaitingReceipt)
         });
@@ -363,12 +393,17 @@ impl Subscription {
             return Poll::Pending;
         }
         let mut request = state.pending.pop_front().expect("pending request checked");
-        request.authorized = !finished && match (&request.related_task, &state.task) {
-            (None, _) => true,
-            (Some(task), TaskOwner::Known(owned)) => task == owned,
-            _ => false,
-        };
-        state.active = Some((request.id.clone(), Arc::clone(&request.cancelled), Arc::clone(&request.responding)));
+        request.authorized = !finished
+            && match (&request.related_task, &state.task) {
+                (None, _) => true,
+                (Some(task), TaskOwner::Known(owned)) => task == owned,
+                _ => false,
+            };
+        state.active = Some((
+            request.id.clone(),
+            Arc::clone(&request.cancelled),
+            Arc::clone(&request.responding),
+        ));
         Poll::Ready(request)
     }
 
@@ -406,7 +441,10 @@ fn display(value: &str) -> String {
     use std::fmt::Write as _;
     let mut text = String::new();
     for character in value.chars() {
-        if matches!(character, '<' | '>' | '[' | ']' | '(' | ')' | '`' | '*' | '_' | '~' | '#' | '|' | '!' | ':' | '@') {
+        if matches!(
+            character,
+            '<' | '>' | '[' | ']' | '(' | ')' | '`' | '*' | '_' | '~' | '#' | '|' | '!' | ':' | '@'
+        ) {
             let _ = write!(text, "\\u{{{:x}}}", u32::from(character));
         } else {
             text.extend(character.escape_default());
@@ -448,25 +486,40 @@ fn choices(schema: &Map<String, Value>, alternatives: &str) -> Option<Vec<(Strin
         if names.is_some_and(|names| names.len() != values.len()) {
             return None;
         }
-        return values.iter().enumerate().map(|(index, value)| {
-            let value = value.as_str().filter(|value| value.len() <= MAX_VALUE_BYTES)?;
-            let title = names.map_or(Some(value), |names| names[index].as_str())?;
-            (title.len() <= 2048).then(|| (title.to_string(), Value::String(value.to_string())))
-        }).collect();
+        return values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let value = value
+                    .as_str()
+                    .filter(|value| value.len() <= MAX_VALUE_BYTES)?;
+                let title = names.map_or(Some(value), |names| names[index].as_str())?;
+                (title.len() <= 2048).then(|| (title.to_string(), Value::String(value.to_string())))
+            })
+            .collect();
     }
     let values = schema.get(alternatives)?.as_array()?;
     if values.is_empty() || values.len() > MAX_CHOICES {
         return None;
     }
-    values.iter().map(|value| {
-        let object = value.as_object()?;
-        if !only_keys(object, &["const", "title"]) {
-            return None;
-        }
-        let value = object.get("const")?.as_str().filter(|value| value.len() <= MAX_VALUE_BYTES)?;
-        let title = object.get("title")?.as_str().filter(|title| title.len() <= 2048)?;
-        Some((title.to_string(), Value::String(value.to_string())))
-    }).collect()
+    values
+        .iter()
+        .map(|value| {
+            let object = value.as_object()?;
+            if !only_keys(object, &["const", "title"]) {
+                return None;
+            }
+            let value = object
+                .get("const")?
+                .as_str()
+                .filter(|value| value.len() <= MAX_VALUE_BYTES)?;
+            let title = object
+                .get("title")?
+                .as_str()
+                .filter(|title| title.len() <= 2048)?;
+            Some((title.to_string(), Value::String(value.to_string())))
+        })
+        .collect()
 }
 
 impl Field {
@@ -477,14 +530,31 @@ impl Field {
         let kind = object.get("type")?.as_str()?;
         let choices = match kind {
             "string" => {
-                if !only_keys(object, &["type", "title", "description", "default", "minLength", "maxLength", "pattern", "format", "enum", "enumNames", "oneOf"])
-                    || (object.contains_key("enum") && object.contains_key("oneOf"))
+                if !only_keys(
+                    object,
+                    &[
+                        "type",
+                        "title",
+                        "description",
+                        "default",
+                        "minLength",
+                        "maxLength",
+                        "pattern",
+                        "format",
+                        "enum",
+                        "enumNames",
+                        "oneOf",
+                    ],
+                ) || (object.contains_key("enum") && object.contains_key("oneOf"))
                     || (object.contains_key("enumNames") && !object.contains_key("enum"))
                 {
                     return None;
                 }
                 if let Some(format) = object.get("format")
-                    && !matches!(format.as_str(), Some("email" | "uri" | "date" | "date-time"))
+                    && !matches!(
+                        format.as_str(),
+                        Some("email" | "uri" | "date" | "date-time")
+                    )
                 {
                     return None;
                 }
@@ -495,7 +565,17 @@ impl Field {
                 }
             }
             "number" | "integer" => {
-                if !only_keys(object, &["type", "title", "description", "default", "minimum", "maximum"]) {
+                if !only_keys(
+                    object,
+                    &[
+                        "type",
+                        "title",
+                        "description",
+                        "default",
+                        "minimum",
+                        "maximum",
+                    ],
+                ) {
                     return None;
                 }
                 Vec::new()
@@ -504,16 +584,31 @@ impl Field {
                 if !only_keys(object, &["type", "title", "description", "default"]) {
                     return None;
                 }
-                vec![("true".to_string(), json!(true)), ("false".to_string(), json!(false))]
+                vec![
+                    ("true".to_string(), json!(true)),
+                    ("false".to_string(), json!(false)),
+                ]
             }
             "array" => {
-                if !only_keys(object, &["type", "title", "description", "default", "minItems", "maxItems", "items"]) {
+                if !only_keys(
+                    object,
+                    &[
+                        "type",
+                        "title",
+                        "description",
+                        "default",
+                        "minItems",
+                        "maxItems",
+                        "items",
+                    ],
+                ) {
                     return None;
                 }
                 let items = object.get("items")?.as_object()?;
                 if !only_keys(items, &["type", "enum", "anyOf"])
                     || (items.contains_key("enum") && items.contains_key("anyOf"))
-                    || (items.contains_key("enum") && items.get("type").and_then(Value::as_str) != Some("string"))
+                    || (items.contains_key("enum")
+                        && items.get("type").and_then(Value::as_str) != Some("string"))
                 {
                     return None;
                 }
@@ -545,7 +640,9 @@ impl Field {
             // Quotes let users enter an empty string or literal newlines;
             // ordinary free text remains ordinary string content.
             if input.starts_with('"') {
-                serde_json::from_str::<String>(input).ok().map(Value::String)?
+                serde_json::from_str::<String>(input)
+                    .ok()
+                    .map(Value::String)?
             } else {
                 Value::String(input.to_string())
             }
@@ -567,7 +664,10 @@ impl Form {
         if !bounded(params, MAX_FORM_BYTES) {
             return None;
         }
-        let message = params.get("message")?.as_str().filter(|message| message.len() <= 4096)?;
+        let message = params
+            .get("message")?
+            .as_str()
+            .filter(|message| message.len() <= 4096)?;
         let schema = params.get("requestedSchema")?;
         let object = schema.as_object()?;
         if object.get("type").and_then(Value::as_str) != Some("object")
@@ -588,12 +688,15 @@ impl Form {
                 }
             }
         }
-        let fields = properties.iter().map(|(name, schema)| {
-            if name.is_empty() || name.len() > 256 {
-                return None;
-            }
-            Field::parse(name, schema, required.contains(name.as_str()))
-        }).collect::<Option<Vec<_>>>()?;
+        let fields = properties
+            .iter()
+            .map(|(name, schema)| {
+                if name.is_empty() || name.len() > 256 {
+                    return None;
+                }
+                Field::parse(name, schema, required.contains(name.as_str()))
+            })
+            .collect::<Option<Vec<_>>>()?;
         Some(Self {
             message: message.to_string(),
             fields,
@@ -614,7 +717,13 @@ async fn prompt(ask: &AskTool, id: &str, question: String, options: Vec<String>)
             id: Some(id.to_string()),
             question,
             header: Some("MCP form".to_string()),
-            options: options.into_iter().map(|label| AskOption { label, description: None }).collect(),
+            options: options
+                .into_iter()
+                .map(|label| AskOption {
+                    label,
+                    description: None,
+                })
+                .collect(),
             recommended: None,
             multi: false,
         }],
@@ -637,7 +746,11 @@ async fn prompt(ask: &AskTool, id: &str, question: String, options: Vec<String>)
 }
 
 async fn fill_form(ask: &AskTool, server: &str, form: &Form, request: &ServerRequest) -> Value {
-    let origin = format!("MCP server \"{}\" requests non-sensitive information.\nReason: \"{}\"", display(server), display(&form.message));
+    let origin = format!(
+        "MCP server \"{}\" requests non-sensitive information.\nReason: \"{}\"",
+        display(server),
+        display(&form.message)
+    );
     let mut content = Map::new();
     for _ in 0..4 {
         for field in &form.fields {
@@ -660,33 +773,63 @@ async fn fill_form(ask: &AskTool, server: &str, form: &Form, request: &ServerReq
                 options.push(OMIT.to_string());
             }
             options.extend([DECLINE.to_string(), CANCEL.to_string()]);
-            let previous = default.map(|value| format!("\nDisplayed value: {}", display(&value.to_string()))).unwrap_or_default();
-            let title = schema.get("title").and_then(Value::as_str).unwrap_or(&field.name);
-            let description = schema.get("description").and_then(Value::as_str)
-                .map(|value| format!("\n{}", display(value))).unwrap_or_default();
+            let previous = default
+                .map(|value| format!("\nDisplayed value: {}", display(&value.to_string())))
+                .unwrap_or_default();
+            let title = schema
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(&field.name);
+            let description = schema
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|value| format!("\n{}", display(value)))
+                .unwrap_or_default();
             let guidance = if field.string {
                 "Use Other to enter text (JSON quotes can express an empty string or escapes)."
             } else {
                 "Use Other to enter a JSON value: a number, true/false, or an array of enum strings."
             };
-            let question = format!("{origin}\n\nField: \"{}\" ({}){description}\n{guidance}{previous}\nConstraints: {}\nValues are sent only after you review and submit the complete form.", display(title), if field.required { "required" } else { "optional" }, display(&schema.to_string()));
+            let question = format!(
+                "{origin}\n\nField: \"{}\" ({}){description}\n{guidance}{previous}\nConstraints: {}\nValues are sent only after you review and submit the complete form.",
+                display(title),
+                if field.required {
+                    "required"
+                } else {
+                    "optional"
+                },
+                display(&schema.to_string())
+            );
             let default = default.cloned();
             let mut answered = false;
             for attempt in 0..3 {
-                let question = if attempt == 0 { question.clone() } else {
-                    format!("{question}\nThe previous value did not match this field's constraints. Please correct it or decline/cancel.")
+                let question = if attempt == 0 {
+                    question.clone()
+                } else {
+                    format!(
+                        "{question}\nThe previous value did not match this field's constraints. Please correct it or decline/cancel."
+                    )
                 };
                 let value = match prompt(ask, "mcp_field", question, options.clone()).await {
-                    Answer::Cancel => return action(&request.id, "cancel", request.related_task.as_deref()),
-                    Answer::Choice(choice) if choice == CANCEL => return action(&request.id, "cancel", request.related_task.as_deref()),
-                    Answer::Choice(choice) if choice == DECLINE => return action(&request.id, "decline", request.related_task.as_deref()),
+                    Answer::Cancel => {
+                        return action(&request.id, "cancel", request.related_task.as_deref());
+                    }
+                    Answer::Choice(choice) if choice == CANCEL => {
+                        return action(&request.id, "cancel", request.related_task.as_deref());
+                    }
+                    Answer::Choice(choice) if choice == DECLINE => {
+                        return action(&request.id, "decline", request.related_task.as_deref());
+                    }
                     Answer::Choice(choice) if choice == OMIT && !field.required => {
                         content.remove(&field.name);
                         answered = true;
                         break;
                     }
                     Answer::Choice(choice) if choice == KEEP => default.clone(),
-                    Answer::Choice(choice) => selected_values.iter().find(|(label, _)| *label == choice).map(|(_, value)| value.clone()),
+                    Answer::Choice(choice) => selected_values
+                        .iter()
+                        .find(|(label, _)| *label == choice)
+                        .map(|(_, value)| value.clone()),
                     Answer::Text(text) => field.input_value(&text),
                 };
                 if let Some(value) = value
@@ -706,15 +849,32 @@ async fn fill_form(ask: &AskTool, server: &str, form: &Form, request: &ServerReq
         if !bounded(&value, MAX_CONTENT_BYTES) || !form.schema.accepts(&value) {
             return action(&request.id, "cancel", request.related_task.as_deref());
         }
-        let review = format!("{origin}\n\nReview the complete values below. Controls, markup, and URL punctuation are escaped for display. Submit sends these values to this server. Edit lets you change them first.\n\n{}", display(&value.to_string()));
-        match prompt(ask, "mcp_review", review, vec![SUBMIT.to_string(), EDIT.to_string(), DECLINE.to_string(), CANCEL.to_string()]).await {
+        let review = format!(
+            "{origin}\n\nReview the complete values below. Controls, markup, and URL punctuation are escaped for display. Submit sends these values to this server. Edit lets you change them first.\n\n{}",
+            display(&value.to_string())
+        );
+        match prompt(
+            ask,
+            "mcp_review",
+            review,
+            vec![
+                SUBMIT.to_string(),
+                EDIT.to_string(),
+                DECLINE.to_string(),
+                CANCEL.to_string(),
+            ],
+        )
+        .await
+        {
             Answer::Choice(choice) if choice == SUBMIT => {
                 let mut response = action(&request.id, "accept", request.related_task.as_deref());
                 response["result"]["content"] = value;
                 return response;
             }
             Answer::Choice(choice) if choice == EDIT => {}
-            Answer::Choice(choice) if choice == DECLINE => return action(&request.id, "decline", request.related_task.as_deref()),
+            Answer::Choice(choice) if choice == DECLINE => {
+                return action(&request.id, "decline", request.related_task.as_deref());
+            }
             _ => return action(&request.id, "cancel", request.related_task.as_deref()),
         }
     }
@@ -760,7 +920,15 @@ pub(crate) async fn observe<'a>(
             completed = Some(result);
         }
         if !current() {
-            return Poll::Ready(Err(failure("elicitation caller changed during protocol work")));
+            // A returned transport error may itself retire the connection.
+            // Preserve that cause (authentication, expiry, uncertain delivery)
+            // instead of misclassifying it as caller cancellation. Successful
+            // results still cannot escape an obsolete owner or session, and
+            // returning here drops any pending picker future.
+            return Poll::Ready(match completed.take() {
+                Some(Err(error)) => Err(error),
+                _ => Err(failure("elicitation caller changed during protocol work")),
+            });
         }
         if let Some(pending) = active.as_mut()
             && !pending.cancelling
@@ -769,9 +937,8 @@ pub(crate) async fn observe<'a>(
         {
             // Replacing this future drops AskTool's pending-reply lease.
             let response = action(&pending.id, "cancel", pending.related_task.as_deref());
-            pending.future = Box::pin(async move {
-                send_response(transport, response, generation).await
-            });
+            pending.future =
+                Box::pin(async move { send_response(transport, response, generation).await });
             pending.cancelling = true;
         }
         if active.is_none()
@@ -801,7 +968,11 @@ pub(crate) async fn observe<'a>(
                             action(&request.id, "cancel", request.related_task.as_deref())
                         }
                     } else {
-                        rpc_error(&request.id, -32602, "invalid, oversized, or unsupported form schema")
+                        rpc_error(
+                            &request.id,
+                            -32602,
+                            "invalid, oversized, or unsupported form schema",
+                        )
                     };
                     if !current() {
                         return Err(failure("elicitation caller changed before its response"));
@@ -825,13 +996,15 @@ pub(crate) async fn observe<'a>(
                 Poll::Pending => {}
             }
         }
-        if active.is_none() && !subscription.has_pending()
+        if active.is_none()
+            && !subscription.has_pending()
             && let Some(result) = completed.take()
         {
             return Poll::Ready(result);
         }
         Poll::Pending
-    }).await
+    })
+    .await
 }
 
 async fn send_response(
