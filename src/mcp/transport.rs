@@ -241,7 +241,10 @@ pub trait McpTransport: Send + Sync {
     /// that lane may be held by the tool awaiting this very response.
     /// Implementations must never renew or change the admitted generation.
     async fn respond_to_server_request(&self, _response: Value, _generation: u64) -> Result<()> {
-        Err(tool_err("MCP_PROTOCOL", "server request responses are unsupported"))
+        Err(tool_err(
+            "MCP_PROTOCOL",
+            "server request responses are unsupported",
+        ))
     }
     /// Optional, connection-owned progress router. Existing custom transports
     /// remain valid without an observer and receive no progress token.
@@ -1572,13 +1575,22 @@ impl McpTransport for StdioTransport {
 
     async fn respond_to_server_request(&self, response: Value, generation: u64) -> Result<()> {
         if generation != 0 || !self.is_alive() {
-            return Err(tool_err("MCP_TRANSPORT_CLOSED", "elicitation connection is closed"));
+            return Err(tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                "elicitation connection is closed",
+            ));
         }
         let encoded = encode_stdio_message(&response)
             .map_err(|error| tool_err(error.code(), error.message()))?;
-        self.rpc.writer_tx.try_send(WriterCommand::Message(encoded)).map_err(|_| {
-            tool_err("MCP_TRANSPORT_IO", "elicitation response writer is unavailable")
-        })
+        self.rpc
+            .writer_tx
+            .try_send(WriterCommand::Message(encoded))
+            .map_err(|_| {
+                tool_err(
+                    "MCP_TRANSPORT_IO",
+                    "elicitation response writer is unavailable",
+                )
+            })
     }
 
     fn take_tools_list_changed(&self) -> bool {
@@ -1796,18 +1808,22 @@ impl HttpCancellationDispatch {
     async fn send_inner(self) -> Result<()> {
         let is_task = self.task_id.is_some();
         let frame = self.task_id.as_ref().map_or_else(
-            || serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/cancelled",
-                "params": {
-                    "requestId": self.request_id,
-                    "reason": "request timed out or was cancelled",
-                },
-            }),
-            |task_id| serde_json::json!({
-                "jsonrpc": "2.0", "id": self.request_id, "method": "tasks/cancel",
-                "params": {"taskId": task_id},
-            }),
+            || {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {
+                        "requestId": self.request_id,
+                        "reason": "request timed out or was cancelled",
+                    },
+                })
+            },
+            |task_id| {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": self.request_id, "method": "tasks/cancel",
+                    "params": {"taskId": task_id},
+                })
+            },
         );
         let mut request = self
             .client
@@ -2947,7 +2963,9 @@ impl HttpTransport {
                 if method == "notifications/progress" {
                     self.progress.publish(&value, wire_state.generation);
                 } else if method == "notifications/cancelled" {
-                    self.roots.elicitation.cancel(object.get("params"), wire_state.generation);
+                    self.roots
+                        .elicitation
+                        .cancel(object.get("params"), wire_state.generation);
                 } else if method == "notifications/tools/list_changed" {
                     self.tools_list_changed_generation
                         .store(wire_state.generation.wrapping_add(1), Ordering::Release);
@@ -2960,7 +2978,10 @@ impl HttpTransport {
                     "SSE JSON-RPC request id must be a string or number",
                 ));
             }
-            if let Some(response) = self.roots.route(method, id, object.get("params"), wire_state.generation) {
+            if let Some(response) =
+                self.roots
+                    .route(method, id, object.get("params"), wire_state.generation)
+            {
                 self.send_server_response(&response, wire_state).await?;
             }
             return Ok(None);
@@ -3497,23 +3518,24 @@ fn validate_jsonrpc_response(value: &Value, expected_id: u64) -> Result<Value> {
             let error = error
                 .as_object()
                 .ok_or_else(|| tool_err("MCP_PROTOCOL", "JSON-RPC error must be an object"))?;
-            if !matches!(
-                error.get("code"),
-                Some(Value::Number(code)) if code.is_i64() || code.is_u64()
-            ) || error.get("message").and_then(Value::as_str).is_none()
-            {
-                return Err(tool_err(
-                    "MCP_PROTOCOL",
-                    "JSON-RPC error requires integer code and string message",
-                ));
-            }
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown server error");
+            let (code, message) = match (error.get("code"), error.get("message")) {
+                (Some(Value::Number(code)), Some(Value::String(message)))
+                    if code.is_i64() || code.is_u64() =>
+                {
+                    (code, message)
+                }
+                _ => {
+                    return Err(tool_err(
+                        "MCP_PROTOCOL",
+                        "JSON-RPC error requires integer code and string message",
+                    ));
+                }
+            };
+            // Discovery uses this transport-owned code to distinguish an
+            // optional missing method from server-controlled error prose.
             Err(tool_err(
                 "MCP_SERVER_ERROR",
-                format!("server error: {message}"),
+                format!("server error {code}: {message}"),
             ))
         }
         _ => Err(tool_err(
@@ -3621,7 +3643,10 @@ impl McpTransport for HttpTransport {
     async fn respond_to_server_request(&self, response: Value, generation: u64) -> Result<()> {
         let wire_state = self.wire_state();
         if wire_state.generation != generation || !self.is_alive() {
-            return Err(tool_err("MCP_TRANSPORT_SUPERSEDED", "elicitation protocol session changed"));
+            return Err(tool_err(
+                "MCP_TRANSPORT_SUPERSEDED",
+                "elicitation protocol session changed",
+            ));
         }
         // This snapshot, not the latest mutable session, supplies every wire
         // header. The tool's owner/deadline also bounds the nested response.
@@ -3648,8 +3673,7 @@ impl McpTransport for HttpTransport {
         }
         let result = match self.request_once(method, &params, timeout).await {
             Err(error)
-                if request_requires_same_session(method, &params)
-                    && is_session_expired(&error) =>
+                if request_requires_same_session(method, &params) && is_session_expired(&error) =>
             {
                 // A task ID and its admitted execution metadata belong to the
                 // original logical session. Even a definite 404 cannot grant
@@ -5367,6 +5391,319 @@ pub(crate) mod tests {
         })
     }
 
+    fn http_error_response(error: &Value, sse: bool) -> String {
+        let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":__ECHO_ID__,\"error\":{error}}}");
+        if sse {
+            http_event_stream(&format!("data: {body}\n\n"))
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        }
+    }
+
+    fn native_http_context_manager(
+        root: &Path,
+        server: &ScriptedHttpServer,
+    ) -> std::sync::Arc<crate::mcp::McpManager> {
+        use crate::mcp::{ConfiguredServer, McpDiscovery, McpManager, Provenance};
+
+        std::sync::Arc::new(McpManager::new(
+            root,
+            root,
+            McpDiscovery {
+                servers: vec![ConfiguredServer {
+                    name: "context-only".to_string(),
+                    command: None,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    url: Some(server.url()),
+                    headers: Vec::new(),
+                    oauth: None,
+                    transport_hint: Some("http".to_string()),
+                    enabled: true,
+                    cwd: None,
+                    timeout_ms: Some(5000),
+                    provenance: Provenance::ProjectPi,
+                    source_file: root.join("mcp.json"),
+                }],
+                warnings: Vec::new(),
+            },
+        ))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn streamable_http_resource_and_prompt_only_servers_reach_mounted_context_tools() {
+        for sse in [false, true] {
+            for capability in ["resources", "prompts", "both"] {
+                let mut initialize = initialize_success_body();
+                let mut operations = Vec::new();
+                if capability != "prompts" {
+                    initialize["capabilities"]["resources"] = serde_json::json!({});
+                    operations.push((
+                        "resources/list",
+                        serde_json::json!({"action":"list_resources"}),
+                        serde_json::json!({"resources":[{
+                            "name":"Database schema", "uri":"db://schema?revision=2"
+                        }]}),
+                        "Database schema",
+                    ));
+                    operations.push((
+                        "resources/read",
+                        serde_json::json!({"action":"read_resource", "uri":"db://schema?revision=2"}),
+                        serde_json::json!({"contents":[{
+                            "uri":"db://schema?revision=2", "text":"schema-v2"
+                        }]}),
+                        "schema-v2",
+                    ));
+                }
+                if capability != "resources" {
+                    initialize["capabilities"]["prompts"] = serde_json::json!({});
+                    operations.push((
+                        "prompts/list",
+                        serde_json::json!({"action":"list_prompts"}),
+                        serde_json::json!({"prompts":[{
+                            "name":"review", "description":"Review a schema",
+                            "arguments":[{"name":"schema", "required":true}]
+                        }]}),
+                        "Review a schema",
+                    ));
+                    operations.push((
+                        "prompts/get",
+                        serde_json::json!({"action":"get_prompt", "name":"review", "arguments":{"schema":"v2"}}),
+                        serde_json::json!({"messages":[{
+                            "role":"user", "content":{"type":"text", "text":"Review schema-v2"}
+                        }]}),
+                        "Review schema-v2",
+                    ));
+                }
+                let mut responses = vec![
+                    http_ok_with_session("__ECHO_ID__", initialize, "context-session"),
+                    http_empty(202, "Accepted"),
+                    http_empty(405, "Method Not Allowed"),
+                    http_error_response(
+                        &serde_json::json!({"code":-32601, "message":"This server has no tools"}),
+                        sse,
+                    ),
+                ];
+                for (_, _, result, _) in &operations {
+                    // ubs:ignore[rust.collections.clone-in-loop] At most four fixture responses; retain operations for the wire assertions below.
+                    responses.push(http_ok_plain("__ECHO_ID__", result.clone()));
+                }
+                responses.push(http_empty(204, "No Content"));
+                let server = ScriptedHttpServer::start(responses);
+                let root = tempfile::tempdir().expect("workspace");
+                let manager = native_http_context_manager(root.path(), &server);
+                runtime_for_tests().block_on(async {
+                    assert!(
+                        manager
+                            .trust("context-only")
+                            .await
+                            .expect("context-only server admitted")
+                            .is_empty(),
+                        "a missing tools method must publish an empty tool catalog"
+                    );
+                    assert_eq!(manager.list()[0].health, "ready (0 tools)");
+                    let tools = crate::mcp::mount_tools(&manager);
+                    assert_eq!(tools.len(), 1, "the native context tool must be mounted");
+                    for (method, input, _, expected_text) in &operations {
+                        let output = tools[0]
+                            .execute(method, input.clone(), None)
+                            .await
+                            .expect("context workflow");
+                        assert!(!output.is_error, "{capability}, SSE={sse}, {method}");
+                        assert!(
+                            output.content.iter().any(|block| {
+                                matches!(block, crate::model::ContentBlock::Text(text)
+                                if text.text.contains(*expected_text))
+                            }),
+                            "{capability}, SSE={sse}, {method}: missing result"
+                        );
+                    }
+                    assert_eq!(manager.list()[0].health, "ready (0 tools)");
+                    assert_eq!(manager.shutdown_all().await, vec!["context-only"]);
+                });
+                let captured = server.captured();
+                let frames: Vec<Value> = captured
+                    .iter()
+                    .filter(|(_, body)| !body.is_empty())
+                    .map(|(_, body)| serde_json::from_str(body).expect("wire frame"))
+                    .collect();
+                let mut expected_methods =
+                    vec!["initialize", "notifications/initialized", "tools/list"];
+                expected_methods.extend(operations.iter().map(|(method, _, _, _)| *method));
+                let methods: Vec<_> = frames
+                    .iter()
+                    .map(|frame| frame["method"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    methods, expected_methods,
+                    "no retry, reinitialize, or tool execution"
+                );
+                assert_eq!(
+                    captured.len(),
+                    expected_methods.len() + 2,
+                    "one GET and one DELETE"
+                );
+                assert!(server.request_lines()[2].starts_with("GET "));
+                assert!(
+                    server
+                        .request_lines()
+                        .last()
+                        .unwrap()
+                        .starts_with("DELETE ")
+                );
+                for (headers, _) in &captured[1..] {
+                    assert!(
+                        headers
+                            .iter()
+                            .any(|(name, value)| name.eq_ignore_ascii_case("Mcp-Session-Id")
+                                && value == "context-session")
+                    );
+                    assert!(headers.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("MCP-Protocol-Version")
+                            && value == MCP_PROTOCOL_VERSION
+                    }));
+                }
+                for frame in &frames {
+                    match frame["method"].as_str().unwrap() {
+                        "resources/read" => assert_eq!(
+                            frame["params"],
+                            serde_json::json!({"uri":"db://schema?revision=2"})
+                        ),
+                        "prompts/get" => assert_eq!(
+                            frame["params"],
+                            serde_json::json!({"name":"review", "arguments":{"schema":"v2"}})
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_native_http_catalog_refused(
+        error: &Value,
+        sse: bool,
+        later_page: bool,
+        expected: &str,
+    ) {
+        let mut initialize = initialize_success_body();
+        initialize["capabilities"] = serde_json::json!({"resources":{}, "prompts":{}});
+        let mut responses = vec![
+            http_ok_with_session("__ECHO_ID__", initialize, "context-session"),
+            http_empty(202, "Accepted"),
+            http_empty(405, "Method Not Allowed"),
+        ];
+        if later_page {
+            responses.push(http_ok_plain(
+                "__ECHO_ID__",
+                serde_json::json!({
+                    "tools":[{"name":"unpublished", "inputSchema":{"type":"object"}}],
+                    "nextCursor":"next"
+                }),
+            ));
+        }
+        responses.push(http_error_response(error, sse));
+        let server = ScriptedHttpServer::start(responses);
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = native_http_context_manager(root.path(), &server);
+        runtime_for_tests().block_on(async {
+            let failure = manager
+                .trust("context-only")
+                .await
+                .expect_err("catalog must fail");
+            assert!(
+                failure.to_string().contains(expected),
+                "SSE={sse}, error={error}: {failure}"
+            );
+            assert!(
+                manager.mounted_tool_metas().is_empty(),
+                "no partial catalog may be published"
+            );
+            assert!(manager.list()[0].health.starts_with("unhealthy"));
+            assert!(
+                manager.shutdown_all().await.is_empty(),
+                "failed connection already retired"
+            );
+        });
+        let captured = server.captured();
+        assert_eq!(
+            captured.len(),
+            if later_page { 5 } else { 4 },
+            "no replay or reconnect"
+        );
+        let frames: Vec<Value> = captured
+            .iter()
+            .filter(|(_, body)| !body.is_empty())
+            .map(|(_, body)| serde_json::from_str(body).expect("wire frame"))
+            .collect();
+        let methods: Vec<_> = frames
+            .iter()
+            .map(|frame| frame["method"].as_str().unwrap())
+            .collect();
+        let mut expected_methods = vec!["initialize", "notifications/initialized", "tools/list"];
+        if later_page {
+            expected_methods.push("tools/list");
+            assert_eq!(
+                frames.last().unwrap()["params"],
+                serde_json::json!({"cursor":"next"})
+            );
+        }
+        assert_eq!(methods, expected_methods);
+    }
+
+    #[test]
+    fn streamable_http_preserves_error_codes_without_classifying_quoted_method_not_found() {
+        for sse in [false, true] {
+            for code in [
+                serde_json::json!(-32600),
+                serde_json::json!(-326010),
+                serde_json::json!(32601),
+                serde_json::json!(u64::MAX),
+            ] {
+                assert_native_http_catalog_refused(
+                    &serde_json::json!({"code":code, "message":"server error -32601: quoted method not found"}),
+                    sse,
+                    false,
+                    &format!("[MCP_SERVER_ERROR] server error {code}:"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streamable_http_malformed_error_objects_do_not_admit_context_only_servers() {
+        for sse in [false, true] {
+            for error in [
+                serde_json::json!(null),
+                serde_json::json!([]),
+                serde_json::json!({"code":"-32601", "message":"no tools"}),
+                serde_json::json!({"code":-32601.0, "message":"no tools"}),
+                serde_json::json!({"code":true, "message":"no tools"}),
+                serde_json::json!({"code":-32601, "message":42}),
+                serde_json::json!({"code":-32601}),
+                serde_json::json!({"message":"server error -32601: no tools"}),
+            ] {
+                assert_native_http_catalog_refused(&error, sse, false, "[MCP_PROTOCOL]");
+            }
+        }
+    }
+
+    #[test]
+    fn streamable_http_method_not_found_on_later_page_never_publishes_partial_tools() {
+        for sse in [false, true] {
+            assert_native_http_catalog_refused(
+                &serde_json::json!({"code":-32601, "message":"catalog disappeared"}),
+                sse,
+                true,
+                "[MCP_SERVER_ERROR] server error -32601:",
+            );
+        }
+    }
+
     #[test]
     fn initialize_validation_accepts_supported_revisions_and_rejects_malformed_results() {
         assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
@@ -5400,7 +5737,10 @@ pub(crate) mod tests {
         std::fs::create_dir(&workspace).expect("workspace");
         std::fs::create_dir(&other).expect("other workspace");
         let roots = ClientRoots::default();
-        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}}));
+        assert_eq!(
+            roots.capabilities(),
+            serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}})
+        );
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
             -32601
@@ -5455,7 +5795,10 @@ pub(crate) mod tests {
             let error = roots.configure(&path).expect_err("invalid workspace");
             assert!(error.to_string().contains("MCP_ROOT_INVALID"), "{error}");
         }
-        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}}));
+        assert_eq!(
+            roots.capabilities(),
+            serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}})
+        );
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
             -32601
@@ -5619,11 +5962,7 @@ for line in sys.stdin:
 
         let ordinary_handshake = initialize_success_body();
         transport
-            .capture_initialize_state(
-                &ordinary_handshake,
-                Some("replacement".into()),
-                &initialize,
-            )
+            .capture_initialize_state(&ordinary_handshake, Some("replacement".into()), &initialize)
             .expect("replacement handshake");
         transport
             .record_initialize_result(&ordinary_handshake)
@@ -5637,7 +5976,10 @@ for line in sys.stdin:
         assert_eq!(transport.task_capabilities(), TaskCapabilities::default());
         let replacement_generation = transport.progress_generation();
         assert!(!transport.abort_in_generation(generation));
-        assert!(transport.is_alive(), "an obsolete owner cannot retire replacement");
+        assert!(
+            transport.is_alive(),
+            "an obsolete owner cannot retire replacement"
+        );
         assert!(transport.abort_in_generation(replacement_generation));
         assert!(
             transport.abort_in_generation(replacement_generation),
@@ -5744,7 +6086,11 @@ for line in sys.stdin:
             ("tasks/cancel", serde_json::json!({"taskId":"owned"})),
         ] {
             let server = ScriptedHttpServer::start(vec![
-                http_ok_with_session("__ECHO_ID__", task_initialize_success_body(), "task-session"),
+                http_ok_with_session(
+                    "__ECHO_ID__",
+                    task_initialize_success_body(),
+                    "task-session",
+                ),
                 http_empty(404, "Not Found"),
                 // A mutated renewal path would complete and dispatch the
                 // operation again, making the request-count assertion fail.
@@ -5822,12 +6168,14 @@ for line in sys.stdin:
     #[test]
     fn task_cancellation_uses_the_captured_http_session_after_replacement_and_abort() {
         let server = ScriptedHttpServer::start(vec![http_ok_plain(
-            "__ECHO_ID__", serde_json::json!({"taskId":"owned", "status":"cancelled"}),
+            "__ECHO_ID__",
+            serde_json::json!({"taskId":"owned", "status":"cancelled"}),
         )]);
         let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
         let handshake = task_initialize_success_body();
         let initialize = serde_json::json!({"params": {}});
-        transport.capture_initialize_state(&handshake, Some("original".into()), &initialize)
+        transport
+            .capture_initialize_state(&handshake, Some("original".into()), &initialize)
             .expect("original session");
         let generation = transport.progress_generation();
         let runtime = runtime_for_tests();
@@ -5838,7 +6186,9 @@ for line in sys.stdin:
             // An attenuated caller cannot enqueue cleanup using the runtime's
             // more powerful ambient context.
             {
-                let _restricted = owner.cx().restrict::<asupersync::cx::cap::None>()
+                let _restricted = owner
+                    .cx()
+                    .restrict::<asupersync::cx::cap::None>()
                     .set_current_restricted();
                 transport.cancel_task("forbidden", generation);
             }
@@ -5847,7 +6197,8 @@ for line in sys.stdin:
             // No await separates dispatch capture from replacement. The
             // scheduled cleanup must retain original wire state, not fetch it
             // from the transport when it first runs.
-            transport.capture_initialize_state(&handshake, Some("replacement".into()), &initialize)
+            transport
+                .capture_initialize_state(&handshake, Some("replacement".into()), &initialize)
                 .expect("replacement session");
             transport.cancel_task("stale", generation);
             transport.abort();
@@ -5857,10 +6208,16 @@ for line in sys.stdin:
         assert_eq!(requests.len(), 1);
         let cancellation: Value = serde_json::from_str(&requests[0].1).expect("task cancel frame");
         assert_eq!(cancellation["method"], "tasks/cancel");
-        assert_eq!(cancellation["params"], serde_json::json!({"taskId":"owned"}));
-        assert!(cancellation["id"].is_number(), "cancellation is a request, not a notification");
-        assert!(requests[0].0.iter().any(|(name, value)|
-            name.eq_ignore_ascii_case("Mcp-Session-Id") && value == "original"
+        assert_eq!(
+            cancellation["params"],
+            serde_json::json!({"taskId":"owned"})
+        );
+        assert!(
+            cancellation["id"].is_number(),
+            "cancellation is a request, not a notification"
+        );
+        assert!(requests[0].0.iter().any(
+            |(name, value)| name.eq_ignore_ascii_case("Mcp-Session-Id") && value == "original"
         ));
     }
 
@@ -5869,17 +6226,26 @@ for line in sys.stdin:
         let server = CancellationHttpServer::start();
         let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
         runtime_for_tests().block_on(async {
-            transport.request("initialize", serde_json::json!({}), Duration::from_secs(2))
-                .await.expect("initialize");
-            let error = transport.request(
-                "tools/call",
-                serde_json::json!({"name":"slow", "arguments":{}, "task":{}}),
-                Duration::from_millis(50),
-            ).await.expect_err("unacknowledged task creation times out");
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(2))
+                .await
+                .expect("initialize");
+            let error = transport
+                .request(
+                    "tools/call",
+                    serde_json::json!({"name":"slow", "arguments":{}, "task":{}}),
+                    Duration::from_millis(50),
+                )
+                .await
+                .expect_err("unacknowledged task creation times out");
             assert!(error.to_string().contains("MCP_TRANSPORT_IO"), "{error}");
         });
         assert!(!transport.is_alive());
-        assert_eq!(server.captured().len(), 2, "only initialize and original call are sent");
+        assert_eq!(
+            server.captured().len(),
+            2,
+            "only initialize and original call are sent"
+        );
         assert!(!server.cancellation_received.load(Ordering::Acquire));
     }
 
