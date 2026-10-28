@@ -34,6 +34,7 @@ const MAX_PROMPT_MESSAGES: usize = 256;
 
 #[derive(Clone, Copy)]
 enum ContextResult {
+    Empty,
     Resources,
     ResourceTemplates,
     ResourceContents,
@@ -190,6 +191,7 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
         return Err(invalid_response("MCP context result must be an object"));
     }
     let (field, limit) = match shape {
+        ContextResult::Empty => ("", MAX_CONTEXT_PAGE_BYTES),
         ContextResult::Resources => ("resources", MAX_CONTEXT_PAGE_BYTES),
         ContextResult::ResourceTemplates => ("resourceTemplates", MAX_CONTEXT_PAGE_BYTES),
         ContextResult::ResourceContents => ("contents", MAX_CONTEXT_CONTENT_BYTES),
@@ -200,6 +202,9 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
     let mut budget = CatalogByteBudget { remaining: limit };
     serde_json::to_writer(&mut budget, result)
         .map_err(|_| invalid_response("MCP context response exceeds the byte limit"))?;
+    if matches!(shape, ContextResult::Empty) {
+        return Ok(());
+    }
     if matches!(shape, ContextResult::Completion) {
         return validate_completion(result);
     }
@@ -274,7 +279,7 @@ fn validate_response(result: &Value, shape: ContextResult) -> Result<()> {
                     })?;
                 response_string(content, "type", MAX_CONTEXT_NAME_BYTES)?;
             }
-            ContextResult::Completion => {
+            ContextResult::Completion | ContextResult::Empty => {
                 return Err(invalid_response(
                     "MCP completion was not validated as an object",
                 ));
@@ -379,6 +384,75 @@ impl McpManager {
             ContextResult::ResourceContents,
         )
         .await
+    }
+
+    /// Watch one exact resource URI in this connection. Acknowledged watches
+    /// expire on reconnect and are never replayed or silently re-established.
+    ///
+    /// # Errors
+    /// Returns capability, capacity, trust, connection, or server errors.
+    pub async fn subscribe_resource(&self, server: &str, uri: &str) -> Result<Value> {
+        checked_identifier(uri, MAX_RESOURCE_URI_BYTES, "resource URI")?;
+        self.request_context(
+            server,
+            "resources/subscribe",
+            json!({"uri": uri}),
+            ContextResult::Empty,
+        )
+        .await?;
+        Ok(json!({"uri": uri, "subscribed": true}))
+    }
+
+    /// Stop an acknowledged watch. An absent watch is an idempotent local
+    /// success; an uncertain remote mutation is never automatically replayed.
+    ///
+    /// # Errors
+    /// Returns capability, trust, connection, or server errors.
+    pub async fn unsubscribe_resource(&self, server: &str, uri: &str) -> Result<Value> {
+        checked_identifier(uri, MAX_RESOURCE_URI_BYTES, "resource URI")?;
+        self.request_context(
+            server,
+            "resources/unsubscribe",
+            json!({"uri": uri}),
+            ContextResult::Empty,
+        )
+        .await?;
+        Ok(json!({"uri": uri, "subscribed": false}))
+    }
+
+    /// Drain coalesced resource and catalog change notices without network
+    /// work. This never reconnects, rereads content, or starts a provider turn.
+    ///
+    /// # Errors
+    /// Returns owner, trust, shutdown, or superseded-connection errors.
+    pub async fn poll_updates(&self, server: &str) -> Result<Value> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        super::check_request_owner(&owner)?;
+        self.check_running()?;
+        let entry = self.entry(server)?;
+        let transport = Self::lock(&entry.transport).clone();
+        if let Err(error) = self.check_trust(&entry) {
+            if let Some(transport) = transport {
+                Self::close_revoked_transport(&entry, &transport).await;
+            } else {
+                entry.context_updates.clear();
+            }
+            return Err(error);
+        }
+        super::check_request_owner(&owner)?;
+        let Some(transport) = transport else {
+            return Ok(entry.context_updates.poll_disconnected());
+        };
+        let generation = transport.progress_generation();
+        self.check_context_transport(&entry, &transport, generation)
+            .await?;
+        let updates = transport.context_update_connection().ok_or_else(|| {
+            tool_err(
+                "MCP_SUBSCRIPTION_UNSUPPORTED",
+                "this transport does not support context change notifications",
+            )
+        })?;
+        updates.poll(generation, transport.is_alive())
     }
 
     /// List a single page of server-provided prompt templates and their
@@ -556,6 +630,38 @@ impl McpManager {
         let generation = transport.progress_generation();
         self.check_context_transport(&entry, &transport, generation)
             .await?;
+        // Reserve before dispatch to retain notifications racing the server's
+        // acknowledgement. This guard is declared before the request guard:
+        // uncertain delivery retires the session before local rollback.
+        let mutation = if matches!(method, "resources/subscribe" | "resources/unsubscribe") {
+            let updates = transport.context_update_connection().ok_or_else(|| {
+                tool_err(
+                    "MCP_SUBSCRIPTION_UNSUPPORTED",
+                    "this transport does not support resource subscriptions",
+                )
+            })?;
+            let uri = params
+                .get("uri")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_request("resource URI is required"))?;
+            let mutation = updates.begin(generation, uri, method == "resources/subscribe")?;
+            if mutation.is_none() {
+                super::check_request_owner(&owner)?;
+                self.check_context_transport(&entry, &transport, generation)
+                    .await?;
+                if !Self::record_operational_success(&entry, &transport) {
+                    updates.retire(generation);
+                    return Err(tool_err(
+                        "MCP_TRANSPORT_CLOSED",
+                        "resource subscription connection closed before publication",
+                    ));
+                }
+                return Ok(json!({}));
+            }
+            mutation
+        } else {
+            None
+        };
         let mut guard = ContextRequestGuard {
             entry: Arc::clone(&entry),
             transport: Arc::clone(&transport),
@@ -659,6 +765,9 @@ impl McpManager {
                 "MCP_TRANSPORT_SUPERSEDED",
                 "connection changed before MCP context publication",
             ));
+        }
+        if let Some(mutation) = mutation {
+            mutation.commit()?;
         }
         guard.armed = false;
         Ok(result)

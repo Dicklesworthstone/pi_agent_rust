@@ -119,9 +119,34 @@ pub(super) fn validate_initialize_result(result: &Value) -> Result<&str> {
 struct ClientRoots {
     roots: OnceLock<Value>,
     elicitation: std::sync::Arc<super::elicitation::ElicitationRegistry>,
+    updates: OnceLock<super::updates::ContextUpdateConnection>,
+    updates_binding: Mutex<()>,
 }
 
 impl ClientRoots {
+    fn configure_context_updates(
+        &self,
+        inbox: std::sync::Arc<super::updates::ContextUpdates>,
+    ) -> Result<()> {
+        let _binding = lock(&self.updates_binding);
+        if let Some(connection) = self.updates.get() {
+            return if connection.belongs_to(&inbox) {
+                Ok(())
+            } else {
+                Err(tool_err(
+                    "MCP_PROTOCOL",
+                    "a context inbox cannot change within a connection",
+                ))
+            };
+        }
+        self.updates.set(inbox.connect()?).map_err(|_| {
+            tool_err(
+                "MCP_PROTOCOL",
+                "a context inbox was already bound to this connection",
+            )
+        })
+    }
+
     fn configure(&self, workspace: &Path) -> Result<()> {
         let path = workspace.canonicalize().map_err(|error| {
             tool_err(
@@ -206,6 +231,21 @@ pub trait McpTransport: Send + Sync {
     /// Built-in transports reject inaccessible roots and changes of scope.
     fn configure_workspace_root(&self, _workspace: &Path) -> Result<()> {
         Ok(())
+    }
+    /// Bind the manager's bounded, server-specific context update inbox before
+    /// initialization. Custom transports may leave subscriptions unsupported.
+    ///
+    /// # Errors
+    /// Native transports reject changing an already bound inbox.
+    fn configure_context_updates(
+        &self,
+        _inbox: std::sync::Arc<super::updates::ContextUpdates>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Connection-specific access to resource subscriptions and change notices.
+    fn context_update_connection(&self) -> Option<&super::updates::ContextUpdateConnection> {
+        None
     }
     /// Preferred revision for this transport's initialization handshake.
     fn preferred_protocol_version(&self) -> &'static str {
@@ -971,6 +1011,9 @@ fn reader_loop(
                     return;
                 }
                 progress.publish(&message, 0);
+                if let Some(updates) = roots.updates.get() {
+                    updates.publish(&message, 0);
+                }
                 if message.get("method").and_then(Value::as_str)
                     == Some("notifications/tools/list_changed")
                     && message.get("id").is_none()
@@ -1387,6 +1430,9 @@ impl McpStdioClient {
     fn abort(&self) {
         self.closing.store(true, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(0);
+        }
         fail_pending(
             &self.pending,
             McpStdioError::Closed("client aborted the transport".to_string()),
@@ -1519,6 +1565,17 @@ impl McpTransport for StdioTransport {
         self.rpc.roots.configure(workspace)
     }
 
+    fn configure_context_updates(
+        &self,
+        inbox: std::sync::Arc<super::updates::ContextUpdates>,
+    ) -> Result<()> {
+        self.rpc.roots.configure_context_updates(inbox)
+    }
+
+    fn context_update_connection(&self) -> Option<&super::updates::ContextUpdateConnection> {
+        self.rpc.roots.updates.get()
+    }
+
     fn client_capabilities(&self) -> Value {
         self.rpc.roots.capabilities()
     }
@@ -1529,7 +1586,11 @@ impl McpTransport for StdioTransport {
 
     fn record_initialize_result(&self, result: &Value) -> Result<()> {
         validate_initialize_result(result)?;
+        let capabilities = super::updates::UpdateCapabilities::from_initialize(result)?;
         *lock(&self.task_capabilities) = TaskCapabilities::from_initialize(result)?;
+        if let Some(updates) = self.rpc.roots.updates.get() {
+            updates.initialize(0, capabilities)?;
+        }
         Ok(())
     }
 
@@ -2228,6 +2289,9 @@ impl HttpTransport {
     fn seal_and_take_session(&self) -> HttpWireState {
         let mut session = Self::lock(&self.session);
         self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(session.generation);
+        }
         let wire_state = HttpWireState {
             generation: session.generation,
             session_id: session.session_id.clone(),
@@ -2255,6 +2319,9 @@ impl HttpTransport {
             return false;
         }
         self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(generation);
+        }
         drop(session);
         self.abort_notify.notify_waiters();
         true
@@ -2281,6 +2348,9 @@ impl HttpTransport {
         if session.generation != generation {
             return;
         }
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(generation);
+        }
         session.generation = session.generation.wrapping_add(1);
         session.session_id = None;
         session.protocol_version = None;
@@ -2291,6 +2361,9 @@ impl HttpTransport {
 
     fn reset_session_state(&self) {
         let mut session = Self::lock(&self.session);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(session.generation);
+        }
         let generation = session.generation.wrapping_add(1);
         *session = HttpSessionState {
             generation,
@@ -2311,6 +2384,9 @@ impl HttpTransport {
                 "MCP_TRANSPORT_CLOSED",
                 "HTTP transport closed before initialize session publication",
             ));
+        }
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(session.generation);
         }
         session.generation = session.generation.wrapping_add(1);
         session.session_id = Some(session_id.to_string());
@@ -2659,6 +2735,7 @@ impl HttpTransport {
     ) -> Result<()> {
         let protocol_version = validate_initialize_result(result)?;
         let task_capabilities = TaskCapabilities::from_initialize(result)?;
+        let context_capabilities = super::updates::UpdateCapabilities::from_initialize(result)?;
         if let Some(session_id) = candidate_session_id.as_deref() {
             validate_http_session_id(session_id)?;
         }
@@ -2670,6 +2747,9 @@ impl HttpTransport {
             ));
         }
         let generation = session.generation.wrapping_add(1);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.initialize(generation, context_capabilities)?;
+        }
         *session = HttpSessionState {
             generation,
             session_id: candidate_session_id,
@@ -2960,6 +3040,9 @@ impl HttpTransport {
                 // Both POST SSE and the optional GET stream reach this path.
                 // Match the receiving stream's generation, not the latest
                 // session: an old stream must not address a new subscription.
+                if let Some(updates) = self.roots.updates.get() {
+                    updates.publish(&value, wire_state.generation);
+                }
                 if method == "notifications/progress" {
                     self.progress.publish(&value, wire_state.generation);
                 } else if method == "notifications/cancelled" {
@@ -3575,6 +3658,17 @@ impl McpTransport for HttpTransport {
         self.roots.configure(workspace)
     }
 
+    fn configure_context_updates(
+        &self,
+        inbox: std::sync::Arc<super::updates::ContextUpdates>,
+    ) -> Result<()> {
+        self.roots.configure_context_updates(inbox)
+    }
+
+    fn context_update_connection(&self) -> Option<&super::updates::ContextUpdateConnection> {
+        self.roots.updates.get()
+    }
+
     fn client_capabilities(&self) -> Value {
         self.roots.capabilities()
     }
@@ -3586,6 +3680,7 @@ impl McpTransport for HttpTransport {
     fn record_initialize_result(&self, result: &Value) -> Result<()> {
         let version = validate_initialize_result(result)?;
         let capabilities = TaskCapabilities::from_initialize(result)?;
+        let context_capabilities = super::updates::UpdateCapabilities::from_initialize(result)?;
         let session = Self::lock(&self.session);
         if session.protocol_version.as_deref() != Some(version)
             || session.task_capabilities != capabilities
@@ -3594,6 +3689,9 @@ impl McpTransport for HttpTransport {
                 "MCP_PROTOCOL",
                 "HTTP initialize metadata does not match its negotiated session",
             ));
+        }
+        if let Some(updates) = self.roots.updates.get() {
+            updates.initialize(session.generation, context_capabilities)?;
         }
         Ok(())
     }
@@ -3793,6 +3891,9 @@ impl McpTransport for HttpTransport {
         // Serialize terminal admission with initialize-state publication.
         let session = Self::lock(&self.session);
         self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(session.generation);
+        }
         drop(session);
         self.abort_notify.notify_waiters();
     }
@@ -3806,6 +3907,9 @@ impl McpTransport for HttpTransport {
         // must still detach it, while an obsolete owner must leave any newly
         // negotiated generation untouched.
         self.alive.store(false, Ordering::SeqCst);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(generation);
+        }
         drop(session);
         self.abort_notify.notify_waiters();
         true

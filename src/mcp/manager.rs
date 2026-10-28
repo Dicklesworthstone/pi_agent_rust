@@ -258,6 +258,7 @@ struct ServerEntry {
     config: ConfiguredServer,
     connect_lane: Arc<asupersync::sync::Mutex<()>>,
     transport: Mutex<Option<Arc<dyn McpTransport>>>,
+    context_updates: Arc<super::updates::ContextUpdates>,
     tools_cache: Mutex<Option<(Instant, Vec<McpToolMeta>)>>,
     /// Logical HTTP session owning the catalog. Read and publish this stamp
     /// while holding tools_cache; Arc identity alone does not bind renewal.
@@ -405,6 +406,7 @@ impl McpManager {
                     cwd_override: None,
                     connect_lane: Arc::new(asupersync::sync::Mutex::new(())),
                     transport: Mutex::new(None),
+                    context_updates: Arc::default(),
                     tools_cache: Mutex::new(None),
                     tools_cache_generation: AtomicU64::new(0),
                     health: Mutex::new(ServerHealth::NotStarted),
@@ -632,6 +634,7 @@ impl McpManager {
         }
         *Self::lock(&entry.health) = ServerHealth::NotStarted;
         Self::lock(&entry.tools_cache).take();
+        entry.context_updates.clear();
         Ok(())
     }
 
@@ -921,6 +924,7 @@ impl McpManager {
             }
             *Self::lock(&entry.health) = ServerHealth::NotStarted;
             Self::lock(&entry.tools_cache).take();
+            entry.context_updates.clear();
         }
 
         // A connection under construction stays private until its handshake
@@ -946,6 +950,7 @@ impl McpManager {
             }
             *Self::lock(&entry.health) = ServerHealth::NotStarted;
             Self::lock(&entry.tools_cache).take();
+            entry.context_updates.clear();
         }
         drop(lane_guards);
 
@@ -1327,6 +1332,7 @@ impl McpManager {
         self.check_running()?;
         if let Err(err) = self.check_trust(entry) {
             let transport = { Self::lock(&entry.transport).take() };
+            entry.context_updates.clear();
             if let Some(transport) = transport {
                 transport.close().await;
             }
@@ -1381,6 +1387,7 @@ impl McpManager {
         }
         if let Err(err) = self.check_trust(entry) {
             transport.close().await;
+            entry.context_updates.clear();
             *Self::lock(&entry.health) = ServerHealth::NotStarted;
             Self::lock(&entry.tools_cache).take();
             return Err(err);
@@ -1424,6 +1431,7 @@ impl McpManager {
         }
         if let Err(err) = self.check_trust(entry) {
             transport.close().await;
+            entry.context_updates.clear();
             *Self::lock(&entry.health) = ServerHealth::NotStarted;
             Self::lock(&entry.tools_cache).take();
             return Err(err);
@@ -1529,6 +1537,7 @@ impl McpManager {
         connection::check_transport_owner(&owner, &config)?;
         let cwd = entry.effective_cwd(&self.inner.cwd);
         let workspace = self.inner.cwd.clone();
+        let context_updates = Arc::clone(&entry.context_updates);
         let trust_path = self.inner.trust_path.clone();
         let global_dir = self.inner.global_dir.clone();
         #[cfg(test)]
@@ -1569,6 +1578,7 @@ impl McpManager {
             if let Some(factory) = factory {
                 let transport = factory();
                 transport.configure_workspace_root(&workspace)?;
+                transport.configure_context_updates(Arc::clone(&context_updates))?;
                 if let Err(error) = ensure_active() {
                     transport.abort();
                     return Err(error);
@@ -1614,6 +1624,7 @@ impl McpManager {
                         Box::new(transport)
                     };
                 transport.configure_workspace_root(&workspace)?;
+                transport.configure_context_updates(Arc::clone(&context_updates))?;
                 if let Err(error) = ensure_active() {
                     transport.abort();
                     return Err(error);
@@ -1637,6 +1648,7 @@ impl McpManager {
             let transport =
                 super::transport::StdioTransport::spawn(&command, &config.args, &env, &cwd)?;
             transport.configure_workspace_root(&workspace)?;
+            transport.configure_context_updates(context_updates)?;
             if let Err(error) = ensure_active() {
                 transport.abort();
                 return Err(error);
@@ -1748,6 +1760,7 @@ impl McpManager {
                 // so a concurrently published replacement cannot be erased.
                 *Self::lock(&entry.health) = ServerHealth::NotStarted;
                 Self::lock(&entry.tools_cache).take();
+                entry.context_updates.clear();
                 removed
             } else {
                 None
@@ -2226,6 +2239,7 @@ impl McpManager {
             cwd_override,
             connect_lane: Arc::new(asupersync::sync::Mutex::new(())),
             transport: Mutex::new(None),
+            context_updates: Arc::default(),
             tools_cache: Mutex::new(None),
             tools_cache_generation: AtomicU64::new(0),
             health: Mutex::new(ServerHealth::NotStarted),

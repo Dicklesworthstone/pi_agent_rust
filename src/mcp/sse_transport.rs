@@ -250,6 +250,9 @@ impl SseState {
 
     fn abort(&self) {
         self.alive.store(false, Ordering::SeqCst);
+        if let Some(updates) = self.roots.updates.get() {
+            updates.retire(0);
+        }
         lock(&self.pending).take();
         self.aborted.notify_waiters();
         self.endpoint_ready.notify_waiters();
@@ -572,6 +575,9 @@ impl SseState {
                 ));
             }
             let Some(id) = object.get("id") else {
+                if let Some(updates) = self.roots.updates.get() {
+                    updates.publish(message, 0);
+                }
                 if method == "notifications/progress" {
                     self.progress.publish(message, 0);
                 } else if method == "notifications/cancelled" {
@@ -810,6 +816,17 @@ impl McpTransport for SseTransport {
         self.state.roots.configure(workspace)
     }
 
+    fn configure_context_updates(
+        &self,
+        inbox: Arc<crate::mcp::updates::ContextUpdates>,
+    ) -> Result<()> {
+        self.state.roots.configure_context_updates(inbox)
+    }
+
+    fn context_update_connection(&self) -> Option<&crate::mcp::updates::ContextUpdateConnection> {
+        self.state.roots.updates.get()
+    }
+
     fn client_capabilities(&self) -> Value {
         self.state.roots.capabilities()
     }
@@ -820,7 +837,11 @@ impl McpTransport for SseTransport {
 
     fn record_initialize_result(&self, result: &Value) -> Result<()> {
         validate_initialize_result(result)?;
+        let capabilities = crate::mcp::updates::UpdateCapabilities::from_initialize(result)?;
         *lock(&self.state.task_capabilities) = TaskCapabilities::from_initialize(result)?;
+        if let Some(updates) = self.state.roots.updates.get() {
+            updates.initialize(0, capabilities)?;
+        }
         Ok(())
     }
 

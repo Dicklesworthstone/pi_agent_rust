@@ -7,16 +7,20 @@ startup, runtime trust, and extension-registration paths as other MCP tools.
 Pending, denied, or configuration-disabled servers do not expose context tools. Existing wrappers recheck
 trust on every call, including after a server has returned its response.
 
-These are the six supported actions. They run against the server attached to the
+These actions run against the server attached to the
 tool; there is no argument for selecting another server or an arbitrary RPC method.
 
 ```json
 {"action":"list_resources"}
 {"action":"list_resource_templates"}
 {"action":"read_resource","uri":"repo://src/main.rs"}
+{"action":"read_resource_template","uri_template":"repo://{path}","variables":{"path":"main.rs"}}
 {"action":"list_prompts"}
 {"action":"get_prompt","name":"code_review","arguments":{"code":"fn main() {}"}}
 {"action":"complete_argument","reference":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"code","value":""}}
+{"action":"subscribe_resource","uri":"repo://src/main.rs"}
+{"action":"poll_updates"}
+{"action":"unsubscribe_resource","uri":"repo://src/main.rs"}
 ```
 
 ## Resource discovery and reads
@@ -25,8 +29,8 @@ Each listing returns one page, not an automatically accumulated catalog. When th
 result contains `nextCursor`, pass that exact string as `cursor` in another call
 of the same listing action on the same server. An empty `nextCursor` is still a
 cursor; only absence indicates the end. Resource-template discovery returns the
-server's `uriTemplate` unchanged. Supply a concrete URI to `read_resource`; this
-implementation does not perform URI-template expansion.
+server's `uriTemplate` unchanged. Supply a concrete URI to `read_resource`, or use
+`read_resource_template` with that exact template and its variables.
 
 Resource URIs are opaque server identifiers. Even a `file://` or `https://` URI is
 sent to the trusted server through `resources/read`; Pi does not open the named
@@ -35,6 +39,66 @@ Text stays text; supported image, audio, and video blobs use Pi's native content
 blocks. Unknown binary formats produce an explicit placeholder with the original
 payload in tool details, not a base64 dump into model text. Malformed native media
 is reported as a content error.
+
+## Watching resources and catalog changes
+
+When the server advertises `resources.subscribe`, `subscribe_resource` watches
+one exact resource URI and returns `{"uri":"…","subscribed":true}` after the
+server acknowledges it. Repeating an already acknowledged subscription is a
+local success. `unsubscribe_resource` returns `subscribed:false`; unsubscribing
+an unwatched URI is also a local success. A second mutation for the same URI
+while its first operation is pending returns `MCP_SUBSCRIPTION_BUSY`.
+
+`poll_updates` consumes the connection's pending change notices without making a
+server request. It reports active subscriptions, changed resource URIs, and
+resource/prompt catalog invalidations:
+
+```json
+{
+  "connected": true,
+  "capabilities": {
+    "subscribe": true,
+    "resources_list_changed": true,
+    "prompts_list_changed": true
+  },
+  "subscriptions": ["repo://src/main.rs"],
+  "updated_resources": ["repo://src/main.rs"],
+  "resources_list_changed": false,
+  "prompts_list_changed": true,
+  "expired_subscriptions": [],
+  "expired_overflow": false
+}
+```
+
+Repeated notifications for a URI coalesce into one entry between polls. Only
+requested URIs are accepted, with their exact bytes preserved; notification
+metadata and unsolicited resource identifiers never enter model context.
+Changes arriving before the subscribe acknowledgement are retained, then become
+visible after that acknowledgement succeeds. An explicit server rejection rolls
+back the local mutation; a rejected unsubscribe leaves the existing watch active.
+
+Resource and prompt list-change flags are admitted independently according to
+the server's `resources.listChanged` and `prompts.listChanged` capabilities.
+They indicate that another explicit listing may be useful. Notifications never
+automatically read a resource, refresh a catalog, retrieve a prompt, or start an
+agent turn. Use `read_resource`, `list_resources`, or `list_prompts` when fresh
+content is needed. Native stdio, Streamable HTTP POST/GET SSE, and legacy SSE
+receive paths all feed the same bounded inbox.
+
+Watches belong to one connection and protocol session. A disconnect or HTTP
+session replacement expires them; Pi never silently resubscribes or replays an
+uncertain subscription mutation. Polling reports expired URIs once and returns
+`connected:false` while disconnected. It does not reconnect. A later explicit
+context operation may reconnect, after which desired watches must be requested
+again. Old readers and late acknowledgements cannot affect the new session.
+Trust revocation and session shutdown discard all retained watch state.
+
+Each server accepts at most 64 active or pending subscriptions, with at most
+64 KiB of combined URI bytes and 16 KiB per URI. Expiry notices have the same
+count and total-byte bounds; `expired_overflow:true` means some expired names
+could not be retained across repeated unpolled reconnects. No subscription is
+restored automatically, including when this flag is set. Polling drains change
+and expiry notices but leaves acknowledged subscriptions active.
 
 ## Selecting a prompt
 
@@ -61,7 +125,8 @@ Headless sessions cancel the form; automatic recommended answers are not sent.
 See [interactive server forms](mcp-configuration.md#interactive-server-forms)
 for supported fields and the submission, edit, decline, and cancel choices.
 
-Listings, template discovery, and argument completion cannot open a server form.
+Listings, template discovery, argument completion, and subscription mutations
+cannot open a server form.
 If concurrent requests make a form's initiating request ambiguous, Pi cancels it.
 The original request's timeout includes the time spent answering. Cancellation,
 timeout, trust revocation, or a changed protocol session removes the pending form
@@ -91,15 +156,17 @@ A resource-only or prompt-only server may explicitly reject the initial
 errors, including failures on later tool-catalog pages, are not swallowed.
 Unsupported resource or prompt methods return their server error explicitly.
 
-This surface is on-demand; it does not add resource subscriptions, prompt
-execution, or automatic change-notification refresh.
+Prompt execution and automatic change-notification refresh are not performed.
 
 ## Rust API
 
 `McpManager` exposes `list_resources`, `list_resource_templates`, `read_resource`,
-`list_prompts`, `get_prompt`, and `complete_argument`. Listings take an optional borrowed cursor;
+`read_resource_template`, `list_prompts`, `get_prompt`, `complete_argument`,
+`subscribe_resource`, `unsubscribe_resource`, and `poll_updates`.
+Listings take an optional borrowed cursor;
 `get_prompt` takes an optional borrowed `BTreeMap<String, String>`. Methods return
-validated raw JSON. Native content conversion happens in the mounted context tool.
+validated raw JSON for server reads and locally generated JSON for subscription
+state and update polling. Native content conversion happens in the mounted context tool.
 
 ## Server-guided argument completion
 
