@@ -7184,6 +7184,9 @@ pub struct AgentSession {
     /// A CLI/API override belongs to the provider selected when it was set.
     /// Role switches must not forward that secret to a different provider.
     api_key_override_provider: Option<String>,
+    /// Recovery configuration on a pre-built handle may carry an unbound CLI
+    /// key. Keep it visible to ordinary turn admission as well as chain swaps.
+    recovery_cli_api_key: Option<String>,
     /// Frozen role ownership and exclusions for admitted native child work.
     child_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
     semantic_context_bundle: Option<SemanticContextBundleInjection>,
@@ -7844,9 +7847,72 @@ struct ExtensionCompactionModelState {
     registry: Option<Arc<ModelRegistry>>,
     auth: Option<Arc<AuthStorage>>,
     js_provider_ids: Vec<String>,
+    api_key_override: Option<String>,
+    api_key_override_provider: Option<String>,
+    recovery_cli_api_key: Option<String>,
 }
 
 impl ExtensionCompactionModelState {
+    fn explicit_key(&self, provider: &str) -> Option<&str> {
+        if let Some(bound) = &self.api_key_override_provider {
+            return bound
+                .eq_ignore_ascii_case(provider)
+                .then_some(self.api_key_override.as_deref())
+                .flatten();
+        }
+        self.recovery_cli_api_key.as_deref()
+    }
+
+    /// Completion and native compaction hosts retain a snapshot between turns.
+    /// Revalidate managed credentials at actual admission, preserving explicit
+    /// session keys and configured authorization headers.
+    fn refresh_current_key(
+        &self,
+        provider: &dyn Provider,
+        options: &mut StreamOptions,
+    ) -> Result<()> {
+        let entry = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider.name(), provider.model_id()));
+        Self::refresh_key_from_sources(
+            provider,
+            options,
+            entry.as_ref(),
+            self.auth.as_deref(),
+            self.explicit_key(provider.name()),
+        )
+    }
+
+    fn refresh_key_from_sources(
+        provider: &dyn Provider,
+        options: &mut StreamOptions,
+        entry: Option<&ModelEntry>,
+        auth: Option<&AuthStorage>,
+        explicit: Option<&str>,
+    ) -> Result<()> {
+        if Self::has_header_auth(provider.name(), provider.api(), &options.headers)
+            || entry.is_some_and(|entry| Self::has_registered_header_auth(entry, provider))
+        {
+            return Ok(());
+        }
+        if let Some(auth) = auth {
+            let resolved = entry.map_or_else(
+                || {
+                    auth.resolve_api_key_status(provider.name(), explicit)
+                        .into_result(provider.name())
+                },
+                |entry| crate::models::resolve_model_key(explicit, auth, entry),
+            )?;
+            if resolved.is_some() {
+                options.api_key = resolved;
+            }
+        } else if let Some(key) = explicit {
+            options.api_key = Some(key.to_string());
+        }
+        Ok(())
+    }
+
     fn resolve(
         &self,
         current_provider: Arc<dyn Provider>,
@@ -7893,6 +7959,7 @@ impl ExtensionCompactionModelState {
         // request. The summary engine also clears it for ordinary callers.
         stream_options.before_provider_request = None;
         if same_model {
+            self.refresh_current_key(current_provider.as_ref(), &mut stream_options)?;
             return Ok((current_provider, stream_options));
         }
 
@@ -7901,15 +7968,29 @@ impl ExtensionCompactionModelState {
                 "compact: model {provider_id}/{model_id} is not registered"
             ))
         })?;
-        let target_key = same_provider
-            .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
-            .flatten()
-            .or_else(|| {
-                self.auth.as_ref().and_then(|auth| {
-                    normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
-                })
+        let explicit = self.explicit_key(&entry.model.provider);
+        let header_auth = Self::has_registered_header_auth_for_api(
+            &entry,
+            &entry.model.provider,
+            &entry.model.api,
+        );
+        let target_key = if header_auth {
+            None
+        } else if let Some(auth) = &self.auth {
+            crate::models::resolve_model_key(explicit, auth, &entry)?.or_else(|| {
+                same_provider
+                    .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
+                    .flatten()
             })
-            .or_else(|| normalize_api_key_opt(entry.api_key.clone()));
+        } else {
+            normalize_api_key_opt(explicit.map(str::to_string))
+                .or_else(|| {
+                    same_provider
+                        .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
+                        .flatten()
+                })
+                .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+        };
         // Some providers bind credentials during construction (Copilot's
         // token exchange). They must see the same resolved target credential
         // as providers that read it from StreamOptions for each request.
@@ -7940,14 +8021,29 @@ impl ExtensionCompactionModelState {
     }
 
     fn has_registered_header_auth(entry: &ModelEntry, provider: &dyn Provider) -> bool {
-        if crate::provider_metadata::canonical_provider_id(provider.name())
-            == Some("github-copilot")
-        {
+        Self::has_registered_header_auth_for_api(entry, provider.name(), provider.api())
+    }
+
+    fn has_registered_header_auth_for_api(entry: &ModelEntry, provider: &str, api: &str) -> bool {
+        Self::has_header_auth(provider, api, &entry.headers)
+            || entry
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .is_some_and(|headers| Self::has_header_auth(provider, api, headers))
+    }
+
+    fn has_header_auth(
+        provider: &str,
+        api: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        if crate::provider_metadata::canonical_provider_id(provider) == Some("github-copilot") {
             // Copilot reports openai-completions but requires its own GitHub
             // token exchange before it can send a completion request.
             return false;
         }
-        let names: &[&str] = match provider.api() {
+        let names: &[&str] = match api {
             "openai-completions"
             | "openai-responses"
             | "openai-codex-responses"
@@ -7959,16 +8055,7 @@ impl ExtensionCompactionModelState {
             // credential payloads; unrelated headers do not make them ready.
             _ => return false,
         };
-        let has_auth = |headers| {
-            crate::providers::first_non_empty_header_value_case_insensitive(headers, names)
-                .is_some()
-        };
-        has_auth(&entry.headers)
-            || entry
-                .compat
-                .as_ref()
-                .and_then(|compat| compat.custom_headers.as_ref())
-                .is_some_and(has_auth)
+        crate::providers::first_non_empty_header_value_case_insensitive(headers, names).is_some()
     }
 }
 
@@ -8090,15 +8177,20 @@ impl ExtensionHostActions for AgentSessionHostActions {
 
     async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
         let _provider_admission = self.acquire_provider_admission().await?;
-        let (provider, mut stream_options) = {
+        let (provider, mut stream_options, credentials) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
-            (Arc::clone(&state.provider), state.stream_options.clone())
+            (
+                Arc::clone(&state.provider),
+                state.stream_options.clone(),
+                state.compaction_models.clone(),
+            )
         };
 
         apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
         let context = build_pi_ai_completion_context(&request)?;
+        credentials.refresh_current_key(provider.as_ref(), &mut stream_options)?;
         let provider_name = provider.name().to_string();
         let mut events = provider.stream(&context, &stream_options).await?;
         let mut streamed_text = String::new();
@@ -8225,13 +8317,14 @@ impl ExtensionHostActions for AgentSessionHostActions {
         // pi's default compaction (never a fabricated result).
         let mut preparation = crate::compaction::compaction_preparation_from_value(&preparation)?;
 
-        let (provider, stream_options, privacy) = {
+        let (provider, mut stream_options, credentials, privacy) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
             (
                 Arc::clone(&state.provider),
                 state.stream_options.clone(),
+                state.compaction_models.clone(),
                 Arc::clone(&state.compaction_privacy),
             )
         };
@@ -8251,6 +8344,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
             })?
             .clone();
         let sanitized = privacy.screen_native_request(&mut preparation, &sanitized)?;
+        credentials.refresh_current_key(provider.as_ref(), &mut stream_options)?;
         let response = provider.compact_native(&sanitized, &stream_options).await?;
 
         let (read_files, modified_files) =
@@ -10697,6 +10791,7 @@ mod extensions_integration_tests {
             registry: Some(Arc::new(registry)),
             auth: Some(Arc::new(auth)),
             js_provider_ids: Vec::new(),
+            ..ExtensionCompactionModelState::default()
         };
         let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -10768,6 +10863,116 @@ mod extensions_integration_tests {
         budget.record(1.0).expect("sibling completion");
         let result = futures::executor::block_on(provider.stream(&Context::default(), &options));
         assert!(matches!(result, Err(Error::CostCap { .. })));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_completion_and_compaction_revalidate_exhausted_pools() {
+        const CHILD: &str = "PI_COMPACTION_POOL_EXHAUSTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "agent::extensions_integration_tests::extension_completion_and_compaction_revalidate_exhausted_pools", "--nocapture"])
+                .env(CHILD, "1")
+                .env("OPENAI_API_KEYS", "summary-pool-a,summary-pool-b")
+                .env("OPENAI_API_KEY", "must-not-use-singular")
+                .env_remove("PI_DEBUG_ROTATION")
+                .output().expect("isolated compaction pool fixture");
+            assert!(
+                output.status.success(),
+                "compaction pool fixture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::auth::reset_credential_rings_for_tests();
+        let directory = tempfile::tempdir().unwrap();
+        let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        let first = auth.resolve_api_key("openai", None).unwrap();
+        crate::auth::report_provider_rate_limit("openai", &first);
+        let second = auth.resolve_api_key("openai", None).unwrap();
+        crate::auth::report_provider_rate_limit("openai", &second);
+        let mut current_entry = compaction_override_entry("openai", "current", true);
+        current_entry.api_key = Some("must-not-use-catalog".to_string());
+        let mut alternate = current_entry.clone();
+        alternate.model.id = "alternate".to_string();
+        let current = crate::providers::create_provider(&current_entry, None).unwrap();
+        let mut state = ExtensionCompactionModelState {
+            registry: Some(Arc::new(ModelRegistry::from_entries_for_tests(vec![
+                current_entry,
+                alternate,
+            ]))),
+            auth: Some(Arc::new(auth)),
+            ..ExtensionCompactionModelState::default()
+        };
+        let cached = StreamOptions {
+            api_key: Some(first.clone()),
+            ..StreamOptions::default()
+        };
+        for options in [
+            ExtensionCompactionOptions::default(),
+            compaction_override("openai", "alternate"),
+        ] {
+            let error = state
+                .resolve(Arc::clone(&current), cached.clone(), &options)
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+            );
+        }
+        // complete_ai and native compaction share this admission helper.
+        let error = state
+            .refresh_current_key(current.as_ref(), &mut cached.clone())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+        );
+
+        state.api_key_override = Some(first.clone());
+        state.api_key_override_provider = Some("openai".to_string());
+        for options in [
+            ExtensionCompactionOptions::default(),
+            compaction_override("openai", "alternate"),
+        ] {
+            let (_, options) = state
+                .resolve(Arc::clone(&current), cached.clone(), &options)
+                .unwrap();
+            assert_eq!(options.api_key.as_deref(), Some(first.as_str()));
+        }
+        state.api_key_override_provider = Some("unrelated-provider".to_string());
+        state.recovery_cli_api_key = Some("must-not-override-bound-provider".to_string());
+        assert!(
+            state
+                .refresh_current_key(current.as_ref(), &mut cached.clone())
+                .is_err()
+        );
+        state.api_key_override_provider = None;
+        state.api_key_override = None;
+        state.recovery_cli_api_key = Some(first.clone());
+        state
+            .refresh_current_key(current.as_ref(), &mut cached.clone())
+            .unwrap();
+
+        state.recovery_cli_api_key = None;
+        let mut header_pinned = cached.clone();
+        header_pinned.headers.insert(
+            "Authorization".to_string(),
+            "Bearer explicit-header".to_string(),
+        );
+        state
+            .refresh_current_key(current.as_ref(), &mut header_pinned)
+            .unwrap();
+        let mut explicitly_injected = cached;
+        ExtensionCompactionModelState::default()
+            .refresh_current_key(current.as_ref(), &mut explicitly_injected)
+            .unwrap();
+        assert_eq!(explicitly_injected.api_key.as_deref(), Some(first.as_str()));
     }
 
     #[test]
@@ -10876,6 +11081,7 @@ mod extensions_integration_tests {
             registry: Some(Arc::new(registry)),
             auth: Some(Arc::new(auth)),
             js_provider_ids: Vec::new(),
+            ..ExtensionCompactionModelState::default()
         };
         let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -10906,6 +11112,7 @@ mod extensions_integration_tests {
             registry: Some(Arc::new(registry)),
             auth: None,
             js_provider_ids: vec!["compaction-js".to_string()],
+            ..ExtensionCompactionModelState::default()
         };
         let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -16063,6 +16270,7 @@ impl AgentSession {
             auth_storage: None,
             api_key_override: None,
             api_key_override_provider: None,
+            recovery_cli_api_key: None,
             child_fallback_policy: None,
             semantic_context_bundle: None,
             provider_admission: ProviderAdmissionGate::default(),
@@ -16181,6 +16389,17 @@ impl AgentSession {
         self.refresh_extension_compaction_models();
     }
 
+    /// Keep a driver-supplied recovery key in normal credential admission.
+    /// An explicitly provider-bound session override still takes precedence.
+    pub fn set_recovery_cli_api_key(&mut self, key: Option<String>) {
+        let key = normalize_api_key_opt(key);
+        // ubs:ignore[rust.security.constant-time-compare] Local configuration change detection, not authentication.
+        if self.recovery_cli_api_key != key {
+            self.recovery_cli_api_key = key;
+            self.refresh_extension_completion_host_state();
+        }
+    }
+
     pub(crate) fn scope_auth_storage(&self, auth: &mut AuthStorage) {
         if let Some(previous) = &self.auth_storage {
             auth.inherit_command_working_directory(previous);
@@ -16197,7 +16416,7 @@ impl AgentSession {
         let key = entry.as_ref().map_or_else(
             || {
                 let provider = self.agent.provider();
-                self.api_key_override_for_provider(provider.name())
+                self.recovery_api_key_override(provider.name(), None)
                     .map(str::to_string)
                     .or_else(|| {
                         self.auth_storage.as_ref().and_then(|auth| {
@@ -16205,7 +16424,7 @@ impl AgentSession {
                         })
                     })
             },
-            |entry| self.resolve_stream_api_key_for_model(entry),
+            |entry| self.resolve_stream_api_key_for_model(entry).ok().flatten(),
         );
         self.agent.stream_options_mut().api_key = key;
         self.refresh_extension_completion_host_state();
@@ -16218,7 +16437,7 @@ impl AgentSession {
         provider: &str,
         key: &str,
         legacy_cli_api_key: Option<&str>,
-    ) {
+    ) -> Result<()> {
         if self.agent.provider().name() != provider
             // ubs:ignore-next-line Local request identity, not an authentication verifier.
             || self.agent.stream_options().api_key.as_deref() != Some(key)
@@ -16226,17 +16445,30 @@ impl AgentSession {
                 .recovery_api_key_override(provider, legacy_cli_api_key)
                 .is_some_and(|key| !key.trim().is_empty())
         {
-            return;
+            return Ok(());
         }
         let Some(auth) = self.auth_storage.as_ref() else {
-            return;
+            return Ok(());
         };
         crate::auth::report_provider_rate_limit(provider, key);
         let entry = self.current_model_entry();
         let fresh = entry.as_ref().map_or_else(
-            || normalize_api_key_opt(auth.resolve_api_key(provider, None)),
+            || {
+                auth.resolve_api_key_status(provider, None)
+                    .into_result(provider)
+            },
             |entry| self.resolve_stream_api_key_for_model(entry),
         );
+        let fresh = match fresh {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                // Do not leave a known-cooled key available to completion
+                // hosts while the next turn waits for fresh admission.
+                self.agent.stream_options_mut().api_key = None;
+                self.refresh_extension_completion_host_state();
+                return Err(error);
+            }
+        };
         if let Some(fresh) = fresh
             // ubs:ignore-next-line Compare local configuration to avoid an unnecessary key replacement.
             && fresh != key
@@ -16244,6 +16476,69 @@ impl AgentSession {
             self.agent.stream_options_mut().api_key = Some(fresh);
             self.refresh_extension_completion_host_state();
         }
+        Ok(())
+    }
+
+    /// Print-mode recovery uses the same serialized credential transition as
+    /// SDK/RPC. A completed durable rewind is required before calling this.
+    pub async fn rotate_rate_limited_credential_after_retry(
+        &mut self,
+        provider: &str,
+        key: &str,
+        legacy_cli_api_key: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<()> {
+        if abort.is_aborted() {
+            return Err(Error::Aborted);
+        }
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission_gate();
+        let _authority = admission.acquire_transition_authority(cx.cx()).await?;
+        if abort.is_aborted() {
+            return Err(Error::Aborted);
+        }
+        self.rotate_rate_limited_credential(provider, key, legacy_cli_api_key)
+    }
+
+    /// Record a terminal provider failure only after its transcript save has
+    /// completed. Even when retry/fallback is disabled or exhausted, a later
+    /// prompt must not reuse the failed key while healthy siblings are present.
+    pub fn record_terminal_credential_failure(
+        &self,
+        outcome: crate::failover::TurnOutcome<'_>,
+    ) -> Option<Error> {
+        if !crate::failover::is_credential_rate_limit(outcome) {
+            return None;
+        }
+        let provider = self.agent.provider();
+        let key = self.agent.stream_options().api_key.as_deref()?;
+        self.record_terminal_rate_limited_credential(provider.name(), key)
+            .err()
+    }
+
+    pub(crate) fn record_terminal_rate_limited_credential(
+        &self,
+        provider: &str,
+        key: &str,
+    ) -> Result<()> {
+        if self.agent.provider().name() != provider
+            // ubs:ignore[rust.security.constant-time-compare] Captured request identity, not authentication.
+            || self.agent.stream_options().api_key.as_deref() != Some(key)
+            || self
+                .recovery_api_key_override(provider, None)
+                .is_some_and(|key| !key.trim().is_empty())
+        {
+            return Ok(());
+        }
+        self.ensure_provider_reentry_allowed()?;
+        let Some(auth) = &self.auth_storage else {
+            return Ok(());
+        };
+        crate::auth::report_provider_rate_limit(provider, key);
+        let _ = auth
+            .resolve_api_key_status(provider, None)
+            .into_result(provider)?;
+        Ok(())
     }
 
     /// The complete configured catalog, including models whose credentials are
@@ -16272,6 +16567,7 @@ impl AgentSession {
             .api_key_override
             .as_ref()
             .map(|_| self.agent.provider().name().to_string());
+        self.refresh_extension_completion_host_state();
     }
 
     pub(crate) fn api_key_override_for_provider(&self, provider: &str) -> Option<&str> {
@@ -16319,6 +16615,18 @@ impl AgentSession {
         };
         state.provider = self.agent.provider();
         state.stream_options = self.agent.stream_options().clone();
+        state
+            .compaction_models
+            .api_key_override
+            .clone_from(&self.api_key_override);
+        state
+            .compaction_models
+            .api_key_override_provider
+            .clone_from(&self.api_key_override_provider);
+        state
+            .compaction_models
+            .recovery_cli_api_key
+            .clone_from(&self.recovery_cli_api_key);
     }
 
     fn refresh_extension_compaction_models(&self) {
@@ -16333,6 +16641,9 @@ impl AgentSession {
         let models = ExtensionCompactionModelState {
             registry: self.model_registry.clone().map(Arc::new),
             auth: self.auth_storage.clone().map(Arc::new),
+            api_key_override: self.api_key_override.clone(),
+            api_key_override_provider: self.api_key_override_provider.clone(),
+            recovery_cli_api_key: self.recovery_cli_api_key.clone(),
             js_provider_ids: self.extensions.as_ref().map_or_else(Vec::new, |region| {
                 region
                     .manager()
@@ -16453,10 +16764,22 @@ impl AgentSession {
                     "Unable to switch provider/model to {provider_id}/{model_id}"
                 )));
             }
+            let resolved_key = if let Some(auth) = &self.auth_storage {
+                auth.resolve_api_key_status(
+                    provider_id,
+                    self.recovery_api_key_override(provider_id, None),
+                )
+                .into_result(provider_id)?
+                .or_else(|| self.agent.stream_options().api_key.clone())
+            } else {
+                self.recovery_api_key_override(provider_id, None)
+                    .map(str::to_string)
+                    .or_else(|| self.agent.stream_options().api_key.clone())
+            };
             return Ok(PreparedModelSelection {
                 entry: None,
                 provider: None,
-                resolved_key: self.agent.stream_options().api_key.clone(),
+                resolved_key,
                 provider_id: active_provider.name().to_string(),
                 model_id: active_provider.model_id().to_string(),
                 thinking_level: requested_thinking,
@@ -16468,7 +16791,7 @@ impl AgentSession {
         let already_active = active_provider.name().eq(&canonical_provider_id)
             && active_provider.model_id().eq(&canonical_model_id);
         let requires_credential = model_requires_configured_credential(&entry);
-        let resolved_key = self.resolve_stream_api_key_for_model(&entry).or_else(|| {
+        let resolved_key = self.resolve_stream_api_key_for_model(&entry)?.or_else(|| {
             (already_active && requires_credential)
                 .then(|| self.agent.stream_options().api_key.clone())
                 .flatten()
@@ -16550,7 +16873,9 @@ impl AgentSession {
                 entry.model.context_window
             });
         } else {
-            self.agent.stream_options_mut().thinking_level = Some(thinking_level);
+            let options = self.agent.stream_options_mut();
+            options.api_key = resolved_key;
+            options.thinking_level = Some(thinking_level);
         }
 
         if let Some(region) = &self.extensions {
@@ -16942,22 +17267,25 @@ impl AgentSession {
             .map_or(level, |entry| entry.clamp_thinking_level(level))
     }
 
-    fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
-        let normalize = |key_opt: Option<String>| {
-            key_opt.and_then(|key| {
-                let trimmed = key.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            })
-        };
+    fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Result<Option<String>> {
+        let override_key = self.recovery_api_key_override(&entry.model.provider, None);
+        if let Some(auth) = &self.auth_storage {
+            return crate::models::resolve_model_key(override_key, auth, entry);
+        }
+        Ok(normalize_api_key_opt(override_key.map(str::to_string))
+            .or_else(|| normalize_api_key_opt(entry.api_key.clone())))
+    }
 
-        self.api_key_override_for_provider(&entry.model.provider)
-            .map(str::to_string)
-            .or_else(|| {
-                self.auth_storage
-                    .as_ref()
-                    .and_then(|auth| normalize(auth.resolve_api_key(&entry.model.provider, None)))
-            })
-            .or_else(|| normalize(entry.api_key.clone()))
+    fn refresh_compaction_credential(&self, options: &mut StreamOptions) -> Result<()> {
+        let provider = self.agent.provider();
+        let entry = self.current_model_entry();
+        ExtensionCompactionModelState::refresh_key_from_sources(
+            provider.as_ref(),
+            options,
+            entry.as_ref(),
+            self.auth_storage.as_ref(),
+            self.recovery_api_key_override(provider.name(), None),
+        )
     }
 
     pub(crate) async fn sync_runtime_selection_from_session_header(&mut self) -> Result<()> {
@@ -16989,8 +17317,18 @@ impl AgentSession {
             let provider = self.agent.provider();
             (provider.name().to_string(), provider.model_id().to_string())
         });
-        let prepared =
-            self.prepare_model_selection(&requested_provider_id, &requested_model_id, requested)?;
+        let prepared = self
+            .prepare_model_selection(&requested_provider_id, &requested_model_id, requested)
+            .map_err(|error| {
+                if crate::failover::marks_credential_pool_exhausted(&error.to_string()) {
+                    // This boundary precedes acceptance of a new user message.
+                    // An automatic continuation here would lose that input;
+                    // return a local admission refusal without dispatching.
+                    Error::validation(format!("Provider admission unavailable: {error}"))
+                } else {
+                    error
+                }
+            })?;
         let canonical_provider_id = prepared.provider_id.clone();
         let canonical_model_id = prepared.model_id.clone();
         let effective = prepared.thinking_level;
@@ -17430,7 +17768,7 @@ impl AgentSession {
     /// Native CLI/API overrides retain their original provider binding across
     /// automatic role changes and recovery. Standalone RPC/embedding recovery
     /// requests without a session binding keep their explicit override contract.
-    fn recovery_api_key_override<'a>(
+    pub(crate) fn recovery_api_key_override<'a>(
         &'a self,
         provider: &str,
         external_override: Option<&'a str>,
@@ -17438,7 +17776,7 @@ impl AgentSession {
         if self.api_key_override_provider.is_some() {
             self.api_key_override_for_provider(provider)
         } else {
-            external_override
+            external_override.or(self.recovery_cli_api_key.as_deref())
         }
     }
 
@@ -17505,7 +17843,16 @@ impl AgentSession {
             return Ok(None);
         }
 
-        let key = crate::models::resolve_model_key(cli_api_key, request.auth, &entry);
+        let key = match crate::models::resolve_model_key(cli_api_key, request.auth, &entry) {
+            Ok(key) => key,
+            Err(error)
+                if !request.strict_invariants
+                    && crate::failover::marks_credential_pool_exhausted(&error.to_string()) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if crate::models::model_requires_configured_credential(&entry) && key.is_none() {
             // Restoring into an auth error would be strictly worse than staying
             // on a working fallback.
@@ -17639,6 +17986,12 @@ impl AgentSession {
             let provider = self.agent.provider();
             (provider.name().to_string(), provider.model_id().to_string())
         };
+        let failed_key = (attempt.class == crate::failover::FailoverClass::Quota
+            && self
+                .recovery_api_key_override(&from_provider, attempt.cli_api_key)
+                .is_none_or(|key| key.trim().is_empty()))
+        .then(|| self.agent.stream_options().api_key.clone())
+        .flatten();
         let mut walk = crate::failover::FailoverWalk::new(
             attempt.chain,
             attempt.start_position,
@@ -17683,7 +18036,23 @@ impl AgentSession {
                 // to make an otherwise unready configured route usable.
                 continue;
             }
-            let api_key = crate::models::resolve_model_key(cli_api_key, attempt.auth, &entry);
+            let key_result = failed_key.as_deref().map_or_else(
+                || crate::models::resolve_model_key(cli_api_key, attempt.auth, &entry),
+                |key| {
+                    crate::models::resolve_model_key_after_rate_limit(
+                        cli_api_key,
+                        attempt.auth,
+                        &entry,
+                        &from_provider,
+                        key,
+                    )
+                },
+            );
+            let Ok(api_key) = key_result else {
+                // A second model on the same exhausted credential pool cannot
+                // recover the turn. Keep walking to a usable provider.
+                continue;
+            };
             if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
                 continue;
             }
@@ -17714,6 +18083,9 @@ impl AgentSession {
             let (_, source) = self
                 .commit_failover_swap_admitted(cx, &request, admission)
                 .await?;
+            if let Some(key) = failed_key.as_deref() {
+                crate::auth::report_provider_rate_limit(&from_provider, key);
+            }
             return Ok(FailoverSwapOutcome {
                 next_position,
                 committed: Some(CommittedFailover {
@@ -18445,7 +18817,7 @@ impl AgentSession {
             }
 
             let provider = self.agent.provider();
-            let stream_options = self.agent.stream_options().clone();
+            let mut stream_options = self.agent.stream_options().clone();
 
             let runtime_handle = match self.compaction_runtime_handle() {
                 Ok(runtime_handle) => runtime_handle,
@@ -18474,6 +18846,15 @@ impl AgentSession {
                 }
             };
             if let Err(err) = self.provider_admission.ensure_allowed() {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
+            if let Err(err) = self.refresh_compaction_credential(&mut stream_options) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: false,
@@ -18986,7 +19367,7 @@ impl AgentSession {
             }
 
             let provider = self.agent.provider();
-            let stream_options = self.agent.stream_options().clone();
+            let mut stream_options = self.agent.stream_options().clone();
 
             self.invalidate_background_compaction();
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
@@ -19014,6 +19395,10 @@ impl AgentSession {
             let privacy = self.agent.compaction_privacy();
             let compaction_result = if abort.is_some_and(AbortSignal::is_aborted) {
                 Err(Error::Aborted)
+            } else if !shake
+                && let Err(error) = self.refresh_compaction_credential(&mut stream_options)
+            {
+                Err(error)
             } else if let Some((focus, abort)) = handoff {
                 compaction::compact_handoff(prep, provider, &stream_options, focus, abort, &privacy)
                     .await

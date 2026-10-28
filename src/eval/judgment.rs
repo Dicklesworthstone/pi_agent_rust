@@ -191,8 +191,7 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
     let registry = ModelRegistry::load(&auth, None);
     let (entry, thinking_level) = resolve_entry(cwd, selection, &config, &registry)?;
     let api_key =
-        crate::models::normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
-            .or_else(|| crate::models::normalize_api_key_opt(entry.api_key.clone()));
+        crate::models::resolve_model_key(None, &auth, &entry).map_err(|_| binding_error())?;
     if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
         return Err(binding_error());
     }

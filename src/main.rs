@@ -1525,7 +1525,7 @@ fn advisor_options(
     let entry =
         pi::app::resolve_role_model(pi::models::ModelRole::Advisor, cli, config, model_registry)?
             .model_entry;
-    let key = pi::models::resolve_model_key(cli.api_key.as_deref(), auth, &entry);
+    let key = pi::models::resolve_model_key(cli.api_key.as_deref(), auth, &entry).ok()?;
     if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
         tracing::info!(
             event = "pi.advisor.no_credentials",
@@ -1540,6 +1540,11 @@ fn advisor_options(
             timeout: Duration::from_secs(config.advisor_timeout_secs()),
             continue_severity: config.advisor_continue_severity(),
             api_key: key,
+            credential_binding: Some(pi::advisor::AdvisorCredentialBinding::new(
+                &entry,
+                auth,
+                cli.api_key.as_deref(),
+            )),
         }),
         Err(err) => {
             tracing::warn!(
@@ -11019,7 +11024,7 @@ where
             emit_json_event(&event);
         }
     });
-    let result = run_print_prompt_attempts(
+    let mut result = run_print_prompt_attempts(
         session,
         config,
         abort_signal,
@@ -11035,6 +11040,24 @@ where
         &recovery_events,
     )
     .await;
+    let exhaustion = match &result {
+        Ok(message) => session
+            .record_terminal_credential_failure(pi::failover::TurnOutcome::Completed(message)),
+        Err(error) => error.downcast_ref::<pi::error::Error>().and_then(|source| {
+            // A contextual wrapper describes failed local restoration or
+            // persistence, not another quota response from the provider.
+            (error.to_string() == source.to_string())
+                .then(|| {
+                    session.record_terminal_credential_failure(pi::failover::TurnOutcome::Failed(
+                        source,
+                    ))
+                })
+                .flatten()
+        }),
+    };
+    if let Some(error) = exhaustion {
+        result = Err(error.into());
+    }
     let interrupted = result.as_ref().map_or(true, |message| {
         matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
     });
@@ -11080,6 +11103,11 @@ where
     // Hooks belong to the logical prompt, not its provider attempts. Capture
     // their effective base once so a retry or provider swap retains the same
     // instructions after each attempt restores the session's ordinary prompt.
+    session.set_recovery_cli_api_key(
+        failover_ctx
+            .and_then(|ctx| ctx.cli_api_key)
+            .map(str::to_string),
+    );
     let mut turn_system_prompt = session.agent.system_prompt().map(str::to_string);
     // First attempt.
     let first_result = match &input {
@@ -11210,6 +11238,34 @@ where
             }
         };
 
+        let quota_credential = match &current_result {
+            Ok(message) if message.stop_reason == StopReason::Error => {
+                message.error_message.clone()
+            }
+            Err(error)
+                if matches!(
+                    decision,
+                    pi::failover::TurnDecision::Retry { .. } | pi::failover::TurnDecision::FailOver
+                ) =>
+            {
+                Some(error.to_string())
+            }
+            _ => None,
+        }
+        .filter(|error| {
+            !pi::failover::marks_credential_pool_exhausted(error)
+                && pi::failover::classify_failover(error)
+                    == Some(pi::failover::FailoverClass::Quota)
+        })
+        .and_then(|_| {
+            session
+                .agent
+                .stream_options()
+                .api_key
+                .clone()
+                .map(|key| (session.agent.provider().name().to_string(), key))
+        });
+
         match current_result {
             Ok(msg)
                 if decision
@@ -11271,6 +11327,19 @@ where
                     emit_print_restore_failure(recovery_events, retry_count, &restore_err);
                     emit_print_failover_end(recovery_events, failed_over, session, false);
                     return Err(restore_err);
+                }
+                if let Some((provider, key)) = quota_credential.as_ref()
+                    && let Err(error) = session
+                        .rotate_rate_limited_credential_after_retry(
+                            provider,
+                            key,
+                            failover_ctx.and_then(|ctx| ctx.cli_api_key),
+                            abort_signal,
+                        )
+                        .await
+                {
+                    current_result = Err(error);
+                    continue;
                 }
                 current_result = session
                     .run_continue_with_abort_and_system_prompt(
@@ -11376,14 +11445,6 @@ where
                     return Err(anyhow::Error::new(err));
                 }
                 let err_str = err.to_string();
-                let quota_credential = (pi::failover::classify_failover(&err_str)
-                    == Some(pi::failover::FailoverClass::Quota))
-                .then(|| {
-                    (
-                        session.agent.provider().name().to_string(),
-                        session.agent.stream_options().api_key.clone(),
-                    )
-                });
                 if let pi::failover::TurnDecision::Retry { attempt, delay_ms } = decision {
                     retry_count = attempt;
                     if is_json {
@@ -11424,26 +11485,18 @@ where
                         emit_print_failover_end(recovery_events, failed_over, session, false);
                         return Err(terminal_err);
                     }
-                    // Rotation bookkeeping (bd-cv653.3.2): restoration is the
-                    // precondition for mutating credential cooldown state.
-                    if let Some((provider_name, Some(key))) = quota_credential.as_ref() {
-                        pi::auth::report_provider_rate_limit(provider_name, key);
-                    }
-                    // Credential rotation (bd-cv653.3.2): re-resolve the key so
-                    // a backed-off credential rotates to its healthy sibling on
-                    // the retry. Explicit --api-key stays pinned by design.
-                    if failover_ctx.is_none_or(|ctx| ctx.cli_api_key.is_none()) {
-                        let provider_name = session.agent.provider().name().to_string();
-                        if let Some(auth) = failover_ctx.map(|ctx| ctx.auth)
-                            && let Some(fresh) = auth.resolve_api_key(&provider_name, None)
-                        {
-                            let changed = session.agent.stream_options().api_key.as_deref()
-                                != Some(fresh.as_str());
-                            if changed {
-                                session.agent.stream_options_mut().api_key = Some(fresh);
-                                session.refresh_extension_completion_host_state();
-                            }
-                        }
+                    if let Some((provider, key)) = quota_credential.as_ref()
+                        && let Err(error) = session
+                            .rotate_rate_limited_credential_after_retry(
+                                provider,
+                                key,
+                                failover_ctx.and_then(|ctx| ctx.cli_api_key),
+                                abort_signal,
+                            )
+                            .await
+                    {
+                        current_result = Err(error);
+                        continue;
                     }
                     current_result = session
                         .run_continue_with_abort_and_system_prompt(
@@ -11484,9 +11537,6 @@ where
                         }
                     };
                     if swapped.is_some() {
-                        if let Some((provider_name, Some(key))) = quota_credential.as_ref() {
-                            pi::auth::report_provider_rate_limit(provider_name, key);
-                        }
                         failed_over = true;
                         failovers_this_turn += 1;
                         retry_count = 0;
@@ -11498,9 +11548,6 @@ where
                             )
                             .await;
                         continue;
-                    }
-                    if let Some((provider_name, Some(key))) = quota_credential.as_ref() {
-                        pi::auth::report_provider_rate_limit(provider_name, key);
                     }
                     if retry_count > 0 && is_json {
                         recovery_events.emit(AgentEvent::AutoRetryEnd {

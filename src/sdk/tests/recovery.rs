@@ -775,6 +775,7 @@ fn every_entrypoint_resumes_instead_of_replaying_user_input() {
 struct CredentialRetryProvider {
     keys: Arc<Mutex<Vec<Option<String>>>>,
     streamed_failure: bool,
+    failures: usize,
 }
 
 #[async_trait::async_trait]
@@ -799,34 +800,34 @@ impl crate::provider::Provider for CredentialRetryProvider {
     ) -> Result<
         std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
     > {
-        let first = {
+        let failed = {
             let mut keys = self.keys.lock().unwrap();
             keys.push(options.api_key.clone());
-            keys.len() == 1
+            keys.len() <= self.failures
         };
-        if first && !self.streamed_failure {
+        if failed && !self.streamed_failure {
             return Err(Error::provider("openai", "HTTP 429: rate limit exceeded"));
         }
         let message = AssistantMessage {
             api: self.api().to_string(),
             provider: self.name().to_string(),
             model: self.model_id().to_string(),
-            content: if first {
+            content: if failed {
                 Vec::new()
             } else {
                 vec![ContentBlock::Text(TextContent::new(
                     "credential retry completed",
                 ))]
             },
-            stop_reason: if first {
+            stop_reason: if failed {
                 StopReason::Error
             } else {
                 StopReason::Stop
             },
-            error_message: first.then(|| "HTTP 429: rate limit exceeded".to_string()),
+            error_message: failed.then(|| "HTTP 429: rate limit exceeded".to_string()),
             ..Default::default()
         };
-        let event = if first {
+        let event = if failed {
             crate::model::StreamEvent::Error {
                 reason: StopReason::Error,
                 error: message,
@@ -894,6 +895,7 @@ fn rate_limit_retries_rotate_credentials_and_preserve_explicit_pins() {
                     .set_provider(Arc::new(CredentialRetryProvider {
                         keys: Arc::clone(&keys),
                         streamed_failure,
+                        failures: 1,
                     }));
                 handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
                 handle.session.set_auth_storage(auth.clone());
@@ -950,6 +952,7 @@ fn rate_limit_retries_rotate_credentials_and_preserve_explicit_pins() {
         .set_provider(Arc::new(CredentialRetryProvider {
             keys: Arc::clone(&keys),
             streamed_failure: false,
+            failures: 1,
         }));
     handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
     handle.session.set_auth_storage(auth.clone());
@@ -964,6 +967,225 @@ fn rate_limit_retries_rotate_credentials_and_preserve_explicit_pins() {
     assert!(matches!(result, Err(Error::Aborted)));
     assert_eq!(keys.lock().unwrap().len(), 1);
     assert_eq!(auth.resolve_api_key("openai", None), Some(initial));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exhausted_credential_pools_fence_later_prompts_and_preserve_pins() {
+    const CHILD: &str = "PI_SDK_CREDENTIAL_EXHAUSTION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sdk::tests::recovery::exhausted_credential_pools_fence_later_prompts_and_preserve_pins",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("OPENAI_API_KEYS", "exhaustion-pool-a,exhaustion-pool-b")
+            .env("OPENAI_API_KEY", "must-not-use-singular")
+            .env_remove("PI_DEBUG_ROTATION")
+            .output()
+            .expect("isolated credential exhaustion fixture");
+        assert!(
+            output.status.success(),
+            "credential exhaustion fixture failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    for entrypoint in ENTRYPOINTS {
+        for streamed_failure in [false, true] {
+            for max_retries in [1, 5] {
+                for with_registry in [false, true] {
+                    crate::auth::reset_credential_rings_for_tests();
+                    let directory = tempdir().unwrap();
+                    let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+                    auth.set(
+                        "openai",
+                        crate::auth::AuthCredential::ApiKey {
+                            key: "must-not-use-stored".to_string(),
+                        },
+                    );
+                    let initial = auth.resolve_api_key("openai", None).unwrap();
+                    let keys = Arc::new(Mutex::new(Vec::new()));
+                    let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+                    let mut handle = handle.with_retry(Some(fast_retry_policy(max_retries)));
+                    handle
+                        .session
+                        .agent
+                        .set_provider(Arc::new(CredentialRetryProvider {
+                            keys: Arc::clone(&keys),
+                            streamed_failure,
+                            failures: 2,
+                        }));
+                    handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
+                    handle.session.set_auth_storage(auth.clone());
+                    if with_registry {
+                        let mut entry = recovery_route_entry("openai", "credential-retry");
+                        entry.api_key = Some("must-not-use-catalog".to_string());
+                        handle
+                            .session
+                            .set_model_registry(ModelRegistry::from_entries_for_tests(vec![entry]));
+                    }
+                    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+                    let observed = Arc::clone(&events);
+                    let error = run_async(invoke(
+                        &mut handle,
+                        entrypoint,
+                        Arc::new(move |event| {
+                            observed
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::to_value(event).unwrap());
+                        }),
+                    ))
+                    .expect_err("the third request must not use a cooled or lower-priority key");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+                    );
+                    let requests = keys.lock().unwrap().clone();
+                    assert_eq!(
+                        requests.len(),
+                        2,
+                        "{entrypoint:?}/{max_retries}/{with_registry}"
+                    );
+                    assert_eq!(requests[0].as_deref(), Some(initial.as_str()));
+                    assert_ne!(requests[0], requests[1]);
+                    for key in requests.iter().flatten() {
+                        assert!(["exhaustion-pool-a", "exhaustion-pool-b"].contains(&key.as_str()));
+                    }
+                    assert!(matches!(
+                        auth.resolve_api_key_status("openai", None),
+                        crate::auth::CredentialResolution::Exhausted { .. }
+                    ));
+                    // A terminal quota error is recorded once, including when
+                    // the retry budget ended before another retry preparation.
+                    let ring = crate::auth::credential_ring_for_tests("openai").unwrap();
+                    assert_eq!(
+                        ring.cooling_count(
+                            std::time::Instant::now() + std::time::Duration::from_secs(16)
+                        ),
+                        0
+                    );
+                    let events = events.lock().unwrap();
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event["type"] == "auto_retry_start")
+                            .count(),
+                        events
+                            .iter()
+                            .filter(|event| event["type"] == "auto_retry_end")
+                            .count()
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event["type"] == "agent_end")
+                            .count(),
+                        1
+                    );
+                    assert!(
+                        events.last().unwrap()["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+                    );
+                    drop(events);
+
+                    let messages_before =
+                        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+                    let entries_before =
+                        serde_json::to_value(&handle.session_store().try_lock().unwrap().entries)
+                            .unwrap();
+                    for later in ENTRYPOINTS {
+                        let error = run_async(invoke(&mut handle, later, Arc::new(|_| {})))
+                            .expect_err("already exhausted admission must be refused");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+                        );
+                        assert_eq!(keys.lock().unwrap().len(), 2);
+                        assert_eq!(
+                            serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+                            messages_before
+                        );
+                        assert_eq!(
+                            serde_json::to_value(
+                                &handle.session_store().try_lock().unwrap().entries
+                            )
+                            .unwrap(),
+                            entries_before
+                        );
+                    }
+
+                    // Both explicit pin sources outrank a managed pool even
+                    // when the chosen key is one of its cooling members.
+                    if with_registry {
+                        handle.session.set_api_key_override(Some(initial.clone()));
+                    } else {
+                        handle = handle.with_failover(Some(FailoverOptions {
+                            chains: HashMap::new(),
+                            available_models: Vec::new(),
+                            auth,
+                            cli_api_key: Some(initial.clone()),
+                            cooldown_secs: 300,
+                        }));
+                    }
+                    let result =
+                        run_async(handle.prompt("explicit pinned request", |_| {})).unwrap();
+                    assert_eq!(result.stop_reason, StopReason::Stop);
+                    let requests = keys.lock().unwrap();
+                    assert_eq!(requests.len(), 3);
+                    assert_eq!(requests[2].as_deref(), Some(initial.as_str()));
+                }
+            }
+        }
+    }
+
+    // A zero retry budget records each final failure too. With no catalog,
+    // the following prompt must install the healthy sibling resolved during
+    // admission, rather than retaining the previously installed credential.
+    for streamed_failure in [false, true] {
+        crate::auth::reset_credential_rings_for_tests();
+        let directory = tempdir().unwrap();
+        let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        let initial = auth.resolve_api_key("openai", None).unwrap();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+        let mut handle = handle.with_retry(Some(fast_retry_policy(0)));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(CredentialRetryProvider {
+                keys: Arc::clone(&keys),
+                streamed_failure,
+                failures: 2,
+            }));
+        handle.session.agent.stream_options_mut().api_key = Some(initial);
+        handle.session.set_auth_storage(auth);
+        let _ = run_async(handle.prompt("first failed request", |_| {}));
+        let error = run_async(handle.prompt("second failed request", |_| {})).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+        );
+        let requests = keys.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            requests[0], requests[1],
+            "no-registry admission installs its newly resolved key"
+        );
+        assert!(run_async(handle.prompt("blocked request", |_| {})).is_err());
+        assert_eq!(keys.lock().unwrap().len(), 2);
+    }
 }
 
 #[test]

@@ -2497,6 +2497,8 @@ pub async fn run(
         .map_or_else(std::env::current_dir, Ok)?;
     let runtime_cwd = crate::workspace::validate_new_root(&requested_cwd)?;
     options.auth.set_command_working_directory(&runtime_cwd)?;
+    session.set_auth_storage(options.auth.clone());
+    session.set_recovery_cli_api_key(options.cli_api_key.clone());
     let session_handle = Arc::clone(&session.session);
     let provider_admission = session.provider_admission_gate();
     let session = Arc::new(Mutex::new(session));
@@ -3794,7 +3796,7 @@ pub async fn run(
                         ))
                     })?;
                     let key =
-                        resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
+                        resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry)?;
                     if model_requires_configured_credential(&entry) && key.is_none() {
                         return Err(Error::auth(format!(
                             "Missing credentials for {}/{}",
@@ -5480,7 +5482,7 @@ pub async fn run(
                                 options.cli_api_key.as_deref(),
                                 &options.auth,
                                 &entry,
-                            );
+                            )?;
                             if model_requires_configured_credential(&entry) && key.is_none() {
                                 return Err(Error::auth(format!(
                                     "Missing credentials for resumed Session model {}/{}",
@@ -5775,7 +5777,7 @@ pub async fn run(
                             options.cli_api_key.as_deref(),
                             &options.auth,
                             &entry,
-                        );
+                        )?;
                         if model_requires_configured_credential(&entry) && key.is_none() {
                             return Err(Error::auth(format!(
                                 "Missing credentials for forked Session model {}/{}",
@@ -6835,6 +6837,8 @@ async fn run_prompt_with_retry_owned(
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
     let mut final_cost_cap: Option<Value> = None;
+    let mut pending_recovery_error: Option<Error> = None;
+    let mut terminal_quota_credential: Option<(String, String, String)> = None;
 
     loop {
         if retry_abort.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
@@ -6864,7 +6868,12 @@ async fn run_prompt_with_retry_owned(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
-        let (result, prewalk_pending) = {
+        let (result, prewalk_pending) = if let Some(error) = pending_recovery_error.take() {
+            // Credential exhaustion follows a durable rewind but admits no
+            // new provider request. Classify it through the same bounded
+            // fallback path as an ordinary attempt failure.
+            (Err(error), false)
+        } else {
             let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                 Ok(guard) => guard,
                 Err(err) => {
@@ -6873,6 +6882,7 @@ async fn run_prompt_with_retry_owned(
                     break;
                 }
             };
+            guard.set_recovery_cli_api_key(options.cli_api_key.clone());
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
             // Servers an extension registered after startup (`registerMcpServer`
             // from a later callback) reach the session-owned MCP manager at the
@@ -7051,6 +7061,10 @@ async fn run_prompt_with_retry_owned(
             stream_can_retry: true,
         };
         let recovery_decision;
+        let rate_limited = crate::failover::is_credential_rate_limit(match &result {
+            Ok(message) => crate::failover::TurnOutcome::Completed(message),
+            Err(error) => crate::failover::TurnOutcome::Failed(error),
+        });
 
         match result {
             Ok(message) => {
@@ -7156,30 +7170,37 @@ async fn run_prompt_with_retry_owned(
                 );
                 final_error = Some(err_str.clone());
                 final_error_hints = Some(error_hints_value(&err));
-                if (crate::failover::call_error_is_retryable(&err)
-                    || recovery_decision == crate::failover::TurnDecision::FailOver)
-                    && crate::failover::classify_failover(&err_str)
-                        == Some(crate::failover::FailoverClass::Quota)
-                {
-                    let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                        Ok(guard) => guard,
-                        Err(lock_err) => {
-                            let restore_err = Error::session(format!(
-                                "retry credential snapshot session lock failed: {lock_err}"
-                            ));
-                            final_error = Some(restore_err.to_string());
-                            final_error_hints = Some(error_hints_value(&restore_err));
-                            break;
-                        }
-                    };
-                    let provider = guard.agent.provider();
-                    let provider_name = provider.name().to_string();
-                    if let Some(key) = guard.agent.stream_options().api_key.clone() {
-                        quota_credential = Some((provider_name, key));
-                    }
-                }
             }
         }
+
+        // SSE error messages and setup errors describe the same failed
+        // credential. Capture it before the backoff callback can run.
+        if rate_limited {
+            let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                Ok(guard) => guard,
+                Err(lock_err) => {
+                    let error = Error::session(format!(
+                        "retry credential snapshot session lock failed: {lock_err}"
+                    ));
+                    final_error = Some(error.to_string());
+                    final_error_hints = Some(error_hints_value(&error));
+                    break;
+                }
+            };
+            let provider = guard.agent.provider().name().to_string();
+            if !guard
+                .recovery_api_key_override(&provider, options.cli_api_key.as_deref())
+                .is_some_and(|key| !key.trim().is_empty())
+                && let Some(key) = guard.agent.stream_options().api_key.clone()
+            {
+                quota_credential = Some((provider, key));
+            }
+        }
+        terminal_quota_credential = quota_credential.as_ref().and_then(|(provider, key)| {
+            final_error
+                .as_ref()
+                .map(|error| (provider.clone(), key.clone(), error.clone()))
+        });
 
         let retry_enabled = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
             .await
@@ -7191,9 +7212,6 @@ async fn run_prompt_with_retry_owned(
                     | crate::failover::TurnDecision::Terminal(_)
             )
         {
-            if let Some((provider_name, key)) = quota_credential.as_ref() {
-                crate::auth::report_provider_rate_limit(provider_name, key);
-            }
             break;
         }
         if recovery_decision == crate::failover::TurnDecision::FailOver {
@@ -7218,20 +7236,13 @@ async fn run_prompt_with_retry_owned(
             };
             match failover_result {
                 Ok(true) => {
-                    if let Some((provider_name, key)) = quota_credential.as_ref() {
-                        crate::auth::report_provider_rate_limit(provider_name, key);
-                    }
                     retry_count = 0;
                     failovers_this_turn += 1;
                     final_error = None;
                     final_error_hints = None;
                     continue;
                 }
-                Ok(false) => {
-                    if let Some((provider_name, key)) = quota_credential.as_ref() {
-                        crate::auth::report_provider_rate_limit(provider_name, key);
-                    }
-                }
+                Ok(false) => {}
                 Err(restore_err) => {
                     let transition_error = restore_err.to_string();
                     final_error = Some(final_error.take().map_or_else(
@@ -7324,25 +7335,16 @@ async fn run_prompt_with_retry_owned(
             final_error_hints = Some(error_hints_value(&admission_err));
             break;
         }
-        // Rotation bookkeeping and key replacement are one admission-bound
-        // mutation. Tail restoration must succeed before either can occur,
-        // and no provider call may observe the backed-off key in between.
-        if let Some((provider_name, key)) = quota_credential.as_ref() {
-            crate::auth::report_provider_rate_limit(provider_name, key);
+        if retry_abort.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
+            final_error = Some("Retry aborted".to_string());
+            final_error_hints = None;
+            break;
         }
-        // Credential rotation (bd-cv653.3.2): re-resolve the key so a
-        // backed-off credential rotates on the retry. CLI-pinned keys
-        // never rotate.
-        if options.cli_api_key.is_none() {
-            let provider_name = guard.agent.provider().name().to_string();
-            if let Some(fresh) = options.auth.resolve_api_key(&provider_name, None) {
-                let changed =
-                    guard.agent.stream_options().api_key.as_deref() != Some(fresh.as_str());
-                if changed {
-                    guard.agent.stream_options_mut().api_key = Some(fresh);
-                    guard.refresh_extension_completion_host_state();
-                }
-            }
+        if let Some((provider, key)) = quota_credential.as_ref()
+            && let Err(error) =
+                guard.rotate_rate_limited_credential(provider, key, options.cli_api_key.as_deref())
+        {
+            pending_recovery_error = Some(error);
         }
     }
 
@@ -7355,11 +7357,6 @@ async fn run_prompt_with_retry_owned(
     {
         *guard = None;
     }
-
-    // Every recovery attempt closes before the terminal RPC frame, including
-    // cancellation and a failed transition. The stream retains the identities
-    // announced by Start; closing never needs a cancellable session lock.
-    recovery_events.finish(success, if success { None } else { final_error.clone() });
 
     if !success {
         // Close the admission window before preserving any acknowledged input
@@ -7399,6 +7396,18 @@ async fn run_prompt_with_retry_owned(
                 |terminal| format!("{terminal}; {preservation_error}"),
             ));
         }
+        if !preservation_quarantined
+            && let Some((provider, key, original_error)) = terminal_quota_credential.as_ref()
+            && final_error.as_ref() == Some(original_error)
+            && let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &preservation_cx).await
+            && let Err(error) = guard.record_terminal_rate_limited_credential(provider, key)
+        {
+            final_error = Some(error.to_string());
+            final_error_hints = Some(error_hints_value(&error));
+        }
+        // Close every announced attempt with the final durable outcome,
+        // including terminal exhaustion when no fallback could be installed.
+        recovery_events.finish(false, final_error.clone());
         // Emit the terminal event BEFORE clearing is_streaming: the stdin-EOF
         // drain only guarantees flush-before-shutdown for events queued while
         // a flag is still set (gh #137).
@@ -7430,6 +7439,7 @@ async fn run_prompt_with_retry_owned(
         return;
     }
 
+    recovery_events.finish(true, None);
     let terminal_messages = deferred_agent_end
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -16791,7 +16801,7 @@ pub(crate) fn resolve_model_key(
     cli_api_key: Option<&str>,
     auth: &AuthStorage,
     entry: &ModelEntry,
-) -> Option<String> {
+) -> Result<Option<String>> {
     crate::models::resolve_model_key(cli_api_key, auth, entry)
 }
 
@@ -17131,7 +17141,7 @@ async fn cycle_model_for_rpc(
             candidate.model.provider, candidate.model.id
         ))
     })?;
-    let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &next_entry);
+    let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &next_entry)?;
     if model_requires_configured_credential(&next_entry) && key.is_none() {
         return Err(Error::auth(format!(
             "Missing credentials for {}/{}",
@@ -19560,7 +19570,7 @@ export default function init(pi) {
         );
 
         assert_eq!(
-            resolve_model_key(None, &auth, &entry).as_deref(),
+            resolve_model_key(None, &auth, &entry).unwrap().as_deref(),
             Some("stored-auth-key")
         );
     }
@@ -19585,7 +19595,7 @@ export default function init(pi) {
         );
 
         assert_eq!(
-            resolve_model_key(None, &auth, &entry).as_deref(),
+            resolve_model_key(None, &auth, &entry).unwrap().as_deref(),
             Some("stored-auth-key")
         );
     }
@@ -19608,7 +19618,9 @@ export default function init(pi) {
         );
 
         assert_eq!(
-            resolve_model_key(Some("cli-override-key"), &auth, &entry).as_deref(),
+            resolve_model_key(Some("cli-override-key"), &auth, &entry)
+                .unwrap()
+                .as_deref(),
             Some("cli-override-key")
         );
     }

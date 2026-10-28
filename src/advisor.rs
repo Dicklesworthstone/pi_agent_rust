@@ -481,6 +481,30 @@ pub fn format_injection(verdict: &AdvisorVerdict) -> String {
 pub static ADVISOR_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Credential provenance for a configured model. A retained advisor resolves
+/// the pool again for each review instead of pinning its startup snapshot.
+#[derive(Clone)]
+pub struct AdvisorCredentialBinding {
+    entry: crate::models::ModelEntry,
+    auth: crate::auth::AuthStorage,
+    override_key: Option<String>,
+}
+
+impl AdvisorCredentialBinding {
+    #[must_use]
+    pub fn new(
+        entry: &crate::models::ModelEntry,
+        auth: &crate::auth::AuthStorage,
+        override_key: Option<&str>,
+    ) -> Self {
+        Self {
+            entry: entry.clone(),
+            auth: auth.clone(),
+            override_key: override_key.map(str::to_string),
+        }
+    }
+}
+
 /// What a session needs to build its own [`AdvisorRuntime`]: hosts that
 /// replace sessions (`/new`, `/resume`, `/fork`) keep this and build a fresh
 /// runtime per session.
@@ -491,6 +515,7 @@ pub struct AdvisorOptions {
     pub timeout: Duration,
     pub continue_severity: ContinueSeverity,
     pub api_key: Option<String>,
+    pub credential_binding: Option<AdvisorCredentialBinding>,
 }
 
 impl AdvisorOptions {
@@ -500,6 +525,7 @@ impl AdvisorOptions {
             .with_timeout(self.timeout)
             .with_continue_severity(self.continue_severity)
             .with_api_key(self.api_key.clone())
+            .with_credential_binding(self.credential_binding.clone())
     }
 }
 
@@ -515,6 +541,7 @@ pub struct AdvisorRuntime {
     /// Resolved credential for the advisor's provider; forwarded on every
     /// review call so keyed providers authenticate exactly like the doer.
     api_key: Option<String>,
+    credential_binding: Option<AdvisorCredentialBinding>,
     privacy: AuxiliaryPrivacy,
     /// One-shot user notice. Consuming it does not clear the disabled state.
     pub disabled_notice: Option<String>,
@@ -544,6 +571,7 @@ impl AdvisorRuntime {
             guard: EmissionGuard::new(3, 10),
             consecutive_failures: 0,
             api_key: None,
+            credential_binding: None,
             privacy: AuxiliaryPrivacy::default(),
             disabled_notice: None,
         }
@@ -569,6 +597,16 @@ impl AdvisorRuntime {
     #[must_use]
     pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
         self.api_key = api_key;
+        self.credential_binding = None;
+        self
+    }
+
+    #[must_use]
+    pub fn with_credential_binding(
+        mut self,
+        credential_binding: Option<AdvisorCredentialBinding>,
+    ) -> Self {
+        self.credential_binding = credential_binding;
         self
     }
 
@@ -676,6 +714,13 @@ impl AdvisorRuntime {
         {
             Ok(Ok(reply)) => reply,
             Ok(Err(crate::error::Error::CostCap { .. })) => return AdvisorOutcome::Quiet,
+            Ok(Err(error))
+                if crate::failover::marks_credential_pool_exhausted(&error.to_string()) =>
+            {
+                // Local admission refused the request; the provider was never
+                // called, so do not disable it through the failure watchdog.
+                return AdvisorOutcome::Quiet;
+            }
             Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
             Err(RequestStop::TimedOut)
                 if remaining_time.is_some_and(|time| time < self.timeout) =>
@@ -716,9 +761,17 @@ impl AdvisorRuntime {
             .into(),
             tools: Vec::new().into(),
         };
+        let api_key = match &self.credential_binding {
+            Some(binding) => crate::models::resolve_model_key(
+                binding.override_key.as_deref(),
+                &binding.auth,
+                &binding.entry,
+            )?,
+            None => self.api_key.clone(),
+        };
         let options = crate::provider::StreamOptions {
             max_tokens: Some(512),
-            api_key: self.api_key.clone(),
+            api_key,
             ..Default::default()
         };
         let stream = self.provider.stream(&context, &options).await?;
@@ -869,6 +922,7 @@ mod tests {
         responses: std::sync::Mutex<std::collections::VecDeque<Vec<crate::model::StreamEvent>>>,
         calls: std::sync::atomic::AtomicUsize,
         prompts: std::sync::Mutex<Vec<String>>,
+        expected_api_key: std::sync::Mutex<Option<String>>,
         cancel_on_call: Option<asupersync::Cx>,
     }
 
@@ -901,7 +955,10 @@ mod tests {
         > {
             assert!(context.tools.is_empty());
             assert_eq!(context.system_prompt.as_deref(), Some(REVIEW_SYSTEM_PROMPT));
-            assert_eq!(options.api_key.as_deref(), Some("test-key"));
+            assert_eq!(
+                options.api_key.as_deref(),
+                self.expected_api_key.lock().unwrap().as_deref()
+            );
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let Some(Message::User(user)) = context.messages.first() else {
                 panic!("expected an advisor user prompt");
@@ -933,6 +990,7 @@ mod tests {
             responses: std::sync::Mutex::new(responses.into()),
             calls: std::sync::atomic::AtomicUsize::new(0),
             prompts: std::sync::Mutex::new(Vec::new()),
+            expected_api_key: std::sync::Mutex::new(Some("test-key".to_string())),
             cancel_on_call: None,
         });
         let runtime = AdvisorRuntime::new(provider.clone(), "test".to_string())
@@ -959,6 +1017,93 @@ mod tests {
                 ..Default::default()
             },
         }]
+    }
+
+    #[test]
+    fn retained_advisor_rechecks_pools_without_disabling_or_overriding_explicit_keys() {
+        const CHILD: &str = "PI_ADVISOR_CREDENTIAL_ADMISSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "advisor::tests::retained_advisor_rechecks_pools_without_disabling_or_overriding_explicit_keys",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("OPENAI_API_KEYS", "pool-key-one,pool-key-two")
+                .env("OPENAI_API_KEY", "singular-bypass")
+                .output()
+                .expect("run isolated advisor credential fixture");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        crate::auth::reset_credential_rings_for_tests();
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut auth = crate::auth::AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set(
+                "openai",
+                crate::auth::AuthCredential::ApiKey {
+                    key: "stored-bypass".to_string(),
+                },
+            );
+            let mut entry = crate::models::ad_hoc_model_entry("openai", "gpt-4o-mini")
+                .expect("known OpenAI model");
+            entry.api_key = Some("catalog-bypass".to_string());
+            let initial_key = crate::models::resolve_model_key(None, &auth, &entry)
+                .unwrap()
+                .unwrap();
+            let (_, provider) = scripted_runtime(vec![
+                completed_reply("CONCERN\nThe first review needs a migration check."),
+                completed_reply("CONCERN\nThe explicit review needs a regression check."),
+            ]);
+            let options = AdvisorOptions {
+                provider: provider.clone(),
+                label: "credential fixture".to_string(),
+                timeout: Duration::from_secs(15),
+                continue_severity: ContinueSeverity::Concern,
+                api_key: Some(initial_key.clone()),
+                credential_binding: Some(AdvisorCredentialBinding::new(&entry, &auth, None)),
+            };
+            let mut runtime = options.runtime();
+            crate::auth::report_provider_rate_limit("openai", &initial_key);
+            let sibling = auth.resolve_api_key("openai", None).unwrap();
+            assert_ne!(initial_key, sibling);
+            *provider.expected_api_key.lock().unwrap() = Some(sibling.clone());
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 0).await,
+                AdvisorOutcome::Inject(_)
+            ));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            crate::auth::report_provider_rate_limit("openai", &sibling);
+            runtime.consecutive_failures = 2;
+            for turn in 1..5 {
+                assert!(matches!(
+                    runtime.review_turn(&review_digest(), turn).await,
+                    AdvisorOutcome::Quiet
+                ));
+            }
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(runtime.consecutive_failures, 2);
+            assert!(!runtime.is_disabled());
+            assert!(runtime.disabled_notice.is_none());
+
+            runtime = runtime.with_api_key(Some("test-key".to_string()));
+            *provider.expected_api_key.lock().unwrap() = Some("test-key".to_string());
+            assert!(matches!(
+                runtime.review_turn(&review_digest(), 5).await,
+                AdvisorOutcome::Inject(_)
+            ));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        });
     }
 
     fn disconnected_reply() -> Vec<crate::model::StreamEvent> {
@@ -1504,6 +1649,7 @@ mod tests {
             ),
             calls: std::sync::atomic::AtomicUsize::new(0),
             prompts: std::sync::Mutex::new(Vec::new()),
+            expected_api_key: std::sync::Mutex::new(Some("test-key".to_string())),
             cancel_on_call: Some(owner.cx().clone()),
         });
         let mut runtime = AdvisorRuntime::new(provider.clone(), "test".to_string())

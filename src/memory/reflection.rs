@@ -328,9 +328,8 @@ fn select_model(config: &Config, registry: &ModelRegistry) -> Result<ModelEntry>
 }
 
 fn options_for_entry(auth: &AuthStorage, entry: &ModelEntry) -> Result<StreamOptions> {
-    let api_key =
-        crate::models::normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
-            .or_else(|| crate::models::normalize_api_key_opt(entry.api_key.clone()));
+    let api_key = crate::models::resolve_model_key(None, auth, entry)
+        .map_err(|error| Error::tool("reflect", error.to_string()))?;
     if crate::models::model_requires_configured_credential(entry) && api_key.is_none() {
         return Err(Error::tool(
             "reflect",

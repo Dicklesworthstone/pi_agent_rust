@@ -389,7 +389,9 @@ fn provider_text_is_retryable(
     usage_input_tokens: Option<u64>,
     context_window: Option<u32>,
 ) -> bool {
-    if crate::error::is_context_overflow(error_text, usage_input_tokens, context_window) {
+    if marks_credential_pool_exhausted(error_text)
+        || crate::error::is_context_overflow(error_text, usage_input_tokens, context_window)
+    {
         return false;
     }
     if let Some(class) = provider_code::connect_recovery(error_text) {
@@ -891,6 +893,23 @@ impl CredentialRing {
         (0..self.keys.len())
             .find(|&idx| usable(idx))
             .map(|idx| self.keys[idx].as_str())
+    }
+
+    /// Time until at least one configured key becomes usable. The production
+    /// ring caps each cooldown at five minutes; this never introduces a wait.
+    #[must_use]
+    pub(crate) fn next_usable_after(&self, now: Instant) -> Duration {
+        self.backoff
+            .iter()
+            .map(|backoff| {
+                backoff.last_rate_limit.map_or(Duration::ZERO, |failed_at| {
+                    backoff
+                        .delay
+                        .saturating_sub(now.saturating_duration_since(failed_at))
+                })
+            })
+            .min()
+            .unwrap_or(Duration::ZERO)
     }
 
     /// Report a 429 for `key`: repeated failures double the previous delay,
@@ -1505,6 +1524,13 @@ pub fn marks_session_persistence(error_text: &str) -> bool {
     error_text.contains(crate::error::Error::SESSION_PERSISTENCE_PREFIX)
 }
 
+/// No credential is available until a local cooldown expires. Repeating the
+/// current provider request cannot help; an eligible different provider may.
+#[must_use]
+pub fn marks_credential_pool_exhausted(error_text: &str) -> bool {
+    error_text.contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+}
+
 /// Whether a completed turn that ended in [`StopReason::Error`] should be
 /// retried against the same provider.
 ///
@@ -1559,6 +1585,7 @@ pub fn call_error_is_retryable(error: &crate::error::Error) -> bool {
     let error_text = error.to_string();
     let lower = error_text.to_ascii_lowercase();
     if marks_session_persistence(&error_text)
+        || marks_credential_pool_exhausted(&error_text)
         || is_auth_failure(&lower)
         || crate::error::is_context_overflow(&error_text, None, None)
         || response_refuses_retry(&lower)
@@ -1575,6 +1602,26 @@ pub enum TurnOutcome<'a> {
     Completed(&'a crate::model::AssistantMessage),
     /// The call failed before a message could be produced.
     Failed(&'a crate::error::Error),
+}
+
+/// Actual provider quota failures may update credential cooldowns after their
+/// transcript is durable. Local refusals, synthetic pool exhaustion, aborts,
+/// and persistence errors are not new evidence against a credential.
+#[must_use]
+pub fn is_credential_rate_limit(outcome: TurnOutcome<'_>) -> bool {
+    let text = match outcome {
+        TurnOutcome::Completed(message)
+            if message.stop_reason == crate::model::StopReason::Error =>
+        {
+            std::borrow::Cow::Borrowed(message.error_message.as_deref().unwrap_or(""))
+        }
+        TurnOutcome::Failed(error) if is_provider_call_error(error) => {
+            std::borrow::Cow::Owned(error.to_string())
+        }
+        _ => return false,
+    };
+    !marks_credential_pool_exhausted(&text)
+        && classify_failover(&text) == Some(FailoverClass::Quota)
 }
 
 /// Overflow can justify changing the context, never resending it unchanged.
@@ -2582,6 +2629,38 @@ mod tests {
             // 429 must continue the same failure streak.
             now = until;
         }
+    }
+
+    #[test]
+    fn credential_pool_retry_after_uses_the_first_expiring_key() {
+        let now = Instant::now();
+        let mut ring = CredentialRing::new(vec!["first".into(), "second".into()], 0).unwrap();
+        assert_eq!(ring.next_usable_after(now), Duration::ZERO);
+        ring.report_rate_limited(
+            "first",
+            now,
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        );
+        assert_eq!(ring.next_usable_after(now), Duration::ZERO);
+        ring.report_rate_limited(
+            "second",
+            now,
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+        );
+        assert_eq!(
+            ring.next_usable_after(now + Duration::from_secs(5)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            ring.next_usable_after(now + Duration::from_secs(15)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ring.current_key(now + Duration::from_secs(15)),
+            Some("second")
+        );
     }
 
     #[test]
@@ -4251,6 +4330,148 @@ mod tests {
         }
         assert_eq!(classify_failover("HTTP 401: insufficient_quota"), None);
         assert_eq!(classify_failover("HTTP 400: invalid billing field"), None);
+    }
+
+    #[test]
+    fn exhausted_credential_pools_skip_retries_and_obey_fallback_filters_and_budgets() {
+        let error = crate::auth::CredentialResolution::Exhausted {
+            retry_after: Duration::from_secs(15),
+        }
+        .into_result("openai")
+        .expect_err("configured pool is cooling");
+        let text = error.to_string();
+        let message = errored_message(Some(&text), 0);
+        assert!(!call_error_is_retryable(&error));
+        assert!(!error_result_is_retryable(&message, None));
+        assert_eq!(classify_failover(&text), Some(FailoverClass::Quota));
+
+        for outcome in [
+            TurnOutcome::Completed(&message),
+            TurnOutcome::Failed(&error),
+        ] {
+            assert!(
+                !is_credential_rate_limit(outcome),
+                "local exhaustion is not another provider failure"
+            );
+            for filter in [
+                FallbackOn::Any,
+                FallbackOn::UsageLimit,
+                FallbackOn::ExceptUsageLimit,
+            ] {
+                let allowed = !matches!(filter, FallbackOn::UsageLimit);
+                let policy = RetryPolicy {
+                    fallback_on: filter,
+                    ..policy()
+                };
+                for retries in [0, policy.max_retries] {
+                    // A temporarily cooling pool is a throttle, not account
+                    // exhaustion. No spare same-provider retry can bypass it.
+                    assert_eq!(
+                        decide(outcome, &progress(retries, 0), &policy, None),
+                        if allowed {
+                            TurnDecision::FailOver
+                        } else {
+                            TurnDecision::Finish { success: false }
+                        },
+                        "{filter:?}, retries={retries}",
+                    );
+                    assert_eq!(
+                        decide(
+                            outcome,
+                            &progress(retries, policy.max_failovers_per_turn),
+                            &policy,
+                            None
+                        ),
+                        TurnDecision::Finish { success: false },
+                    );
+                    assert_eq!(
+                        decide(
+                            outcome,
+                            &progress(retries, 0),
+                            &RetryPolicy {
+                                model_fallback: false,
+                                ..policy
+                            },
+                            None
+                        ),
+                        TurnDecision::Finish { success: false },
+                    );
+                    assert_eq!(
+                        decide(
+                            outcome,
+                            &TurnProgress {
+                                stream_can_retry: false,
+                                ..progress(retries, 0)
+                            },
+                            &policy,
+                            None
+                        ),
+                        TurnDecision::Finish { success: false },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_admission_persistence_and_abort_outrank_credential_pool_exhaustion() {
+        let exhausted = crate::auth::CredentialResolution::Exhausted {
+            retry_after: Duration::from_secs(15),
+        }
+        .into_result("openai")
+        .expect_err("configured pool is cooling")
+        .to_string();
+        let admission =
+            crate::error::Error::validation(format!("Provider admission unavailable: {exhausted}"));
+        assert_eq!(
+            decide(
+                TurnOutcome::Failed(&admission),
+                &progress(0, 0),
+                &policy(),
+                None
+            ),
+            TurnDecision::Finish { success: false },
+            "refusal before accepting a prompt cannot become an automatic continuation",
+        );
+        assert!(!is_credential_rate_limit(TurnOutcome::Failed(&admission)));
+
+        let persistence_text = format!(
+            "{} {exhausted}",
+            crate::error::Error::SESSION_PERSISTENCE_PREFIX
+        );
+        let persistence_error = crate::error::Error::api(&persistence_text);
+        let persistence_message = errored_message(Some(&persistence_text), 0);
+        let abort_error = crate::error::Error::Aborted;
+        let mut abort_message = errored_message(Some(&exhausted), 0);
+        abort_message.stop_reason = crate::model::StopReason::Aborted;
+        for (outcome, expected) in [
+            (
+                TurnOutcome::Failed(&persistence_error),
+                TerminalReason::SessionPersistence,
+            ),
+            (
+                TurnOutcome::Completed(&persistence_message),
+                TerminalReason::SessionPersistence,
+            ),
+            (TurnOutcome::Failed(&abort_error), TerminalReason::Aborted),
+            (
+                TurnOutcome::Completed(&abort_message),
+                TerminalReason::Aborted,
+            ),
+        ] {
+            assert_eq!(
+                decide(outcome, &progress(0, 0), &policy(), None),
+                TurnDecision::Terminal(expected)
+            );
+            assert!(!is_credential_rate_limit(outcome));
+        }
+
+        let real_quota = crate::error::Error::provider("openai", "HTTP 429: rate limit exceeded");
+        let real_message = errored_message(Some("HTTP 429: rate limit exceeded"), 0);
+        assert!(is_credential_rate_limit(TurnOutcome::Failed(&real_quota)));
+        assert!(is_credential_rate_limit(TurnOutcome::Completed(
+            &real_message
+        )));
     }
 
     #[test]

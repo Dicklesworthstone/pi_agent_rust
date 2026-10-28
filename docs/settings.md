@@ -346,6 +346,22 @@ request started before a newer rate limit cannot clear that newer cooldown.
 Changing the configured list removes revoked keys and adds new keys while
 retaining cooldowns for keys that remain. Provider aliases share this state.
 
+When every key is cooling, Pi stops using that provider immediately. It can
+continue on an eligible configured fallback without spending the remaining
+same-provider retries. Another model using the same exhausted pool is skipped;
+it does not consume a fallback slot. If no eligible fallback is available, the
+request ends with `[CREDENTIAL_POOL_EXHAUSTED]` and the time until the first key
+becomes usable. Pi does not wait indefinitely or fall back to a singular
+environment key, stored API key, or cached catalog credential to bypass the pool.
+
+The last failed credential is recorded even when retries are disabled or the
+retry budget has ended. A new prompt submitted while the pool is exhausted is
+refused before its input is appended, so it can be submitted again after the
+cooldown or after selecting another provider. Explicit key overrides and stored
+OAuth/Bearer credentials retain their normal precedence. Background summaries,
+extension completions, and other model-backed helpers also check their managed
+credentials when dispatching a request.
+
 ### Search
 
 - `search_backend` (string): Backend for the `grep`/`find` tools. `inproc`

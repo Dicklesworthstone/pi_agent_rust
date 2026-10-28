@@ -40,7 +40,16 @@ pub type BtwClientFactory = std::sync::Arc<
 pub struct BtwClient {
     provider: Arc<dyn Provider>,
     api_key: Option<String>,
+    credential_binding: Option<ModelCredentialBinding>,
     privacy: Arc<AuxiliaryPrivacy>,
+}
+
+/// Retain credential provenance separately from the last resolved key. A
+/// startup-created client can outlive a foreground request's pool cooldown.
+struct ModelCredentialBinding {
+    entry: crate::models::ModelEntry,
+    auth: crate::auth::AuthStorage,
+    override_key: Option<String>,
 }
 
 /// A bounded, screened side request ready for background execution. Fields
@@ -58,6 +67,7 @@ impl BtwClient {
         Self {
             provider,
             api_key,
+            credential_binding: None,
             privacy: Arc::new(AuxiliaryPrivacy::default()),
         }
     }
@@ -81,7 +91,7 @@ impl BtwClient {
         auth: &crate::auth::AuthStorage,
         secrets: Option<&crate::secrets::SecretsSettings>,
     ) -> Option<std::sync::Arc<Self>> {
-        let key = crate::models::resolve_model_key(cli_api_key, auth, entry);
+        let key = crate::models::resolve_model_key(cli_api_key, auth, entry).ok()?;
         let credentialed =
             !crate::models::model_requires_configured_credential(entry) || key.is_some();
         if !credentialed {
@@ -90,7 +100,13 @@ impl BtwClient {
         crate::providers::create_provider_with_auth(entry, None, Some(auth))
             .ok()
             .map(|provider| {
-                std::sync::Arc::new(Self::new(provider, key).with_secrets_settings(secrets))
+                let mut client = Self::new(provider, key).with_secrets_settings(secrets);
+                client.credential_binding = Some(ModelCredentialBinding {
+                    entry: entry.clone(),
+                    auth: auth.clone(),
+                    override_key: cli_api_key.map(str::to_string),
+                });
+                std::sync::Arc::new(client)
             })
     }
 
@@ -233,12 +249,20 @@ impl BtwClient {
             .into(),
             tools: Vec::new().into(),
         };
-        let options = crate::provider::StreamOptions {
-            max_tokens: Some(ANSWER_MAX_TOKENS),
-            api_key: self.api_key.clone(),
-            ..Default::default()
-        };
         with_timeout(ANSWER_TIMEOUT, async {
+            let api_key = match &self.credential_binding {
+                Some(binding) => crate::models::resolve_model_key(
+                    binding.override_key.as_deref(),
+                    &binding.auth,
+                    &binding.entry,
+                )?,
+                None => self.api_key.clone(),
+            };
+            let options = crate::provider::StreamOptions {
+                max_tokens: Some(ANSWER_MAX_TOKENS),
+                api_key,
+                ..Default::default()
+            };
             let stream = provider.stream(&context, &options).await?;
             collect_text(stream, MAX_TEXT_BYTES).await
         })
@@ -707,6 +731,70 @@ mod tests {
         )))
         .expect("empty auth storage loads");
         assert!(BtwClient::for_model_entry(&entry, None, &auth, None).is_none());
+    }
+
+    #[test]
+    fn retained_model_client_rechecks_exhaustion_without_overriding_explicit_keys() {
+        const CHILD: &str = "PI_BTW_CREDENTIAL_ADMISSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "btw::tests::retained_model_client_rechecks_exhaustion_without_overriding_explicit_keys",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("OPENAI_API_KEYS", "pool-key-one,pool-key-two")
+                .env("OPENAI_API_KEY", "singular-bypass")
+                .output()
+                .expect("run isolated side-question credential fixture");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        crate::auth::reset_credential_rings_for_tests();
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut auth = crate::auth::AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set(
+                "openai",
+                crate::auth::AuthCredential::ApiKey {
+                    key: "stored-bypass".to_string(),
+                },
+            );
+            let mut entry = crate::models::ad_hoc_model_entry("openai", "gpt-4o-mini")
+                .expect("known OpenAI model");
+            entry.api_key = Some("catalog-bypass".to_string());
+            let provider = Arc::new(RecordingProvider::default());
+            let mut client = BtwClient::for_model_entry(&entry, None, &auth, None)
+                .expect("pool is initially available");
+            Arc::get_mut(&mut client).unwrap().provider = provider.clone();
+            let request = client.prepare_with_messages(&[], "why?").unwrap();
+
+            // A foreground request can exhaust the pool after the client and
+            // even its screened request were prepared.
+            crate::auth::report_provider_rate_limit("openai", "pool-key-one");
+            crate::auth::report_provider_rate_limit("openai", "pool-key-two");
+            let error = client.ask_prepared(request).await.unwrap_err();
+            assert!(crate::failover::marks_credential_pool_exhausted(
+                &error.to_string()
+            ));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let direct = BtwClient::new(provider.clone(), Some("test-key".to_string()));
+            assert_eq!(direct.ask("", "why?").await.unwrap(), "safe answer");
+            let mut pinned = BtwClient::for_model_entry(&entry, Some("test-key"), &auth, None)
+                .expect("explicit override remains available");
+            Arc::get_mut(&mut pinned).unwrap().provider = provider.clone();
+            assert_eq!(pinned.ask("", "why?").await.unwrap(), "safe answer");
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        });
     }
 
     fn user(text: impl Into<String>) -> Message {

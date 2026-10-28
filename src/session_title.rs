@@ -28,11 +28,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REPLY_BYTES: usize = 4096;
 const MAX_INPUT_FIELDS: usize = 256;
 
-/// An optional tiny/smol client bound to its launch-time destination and key.
+/// An optional tiny/smol client bound to its launch-time destination.
 pub struct TitleClient {
     provider: Arc<dyn Provider>,
     options: StreamOptions,
+    credential_binding: Option<ModelCredentialBinding>,
     privacy: Arc<AuxiliaryPrivacy>,
+}
+
+struct ModelCredentialBinding {
+    entry: crate::models::ModelEntry,
+    auth: crate::auth::AuthStorage,
+    override_key: Option<String>,
 }
 
 pub(crate) struct PreparedTitle {
@@ -59,8 +66,8 @@ impl TitleClient {
             &entry.model.provider,
             &primary_entry.model.provider,
         ) && entry.model.base_url == primary_entry.model.base_url;
-        let api_key =
-            crate::models::resolve_model_key(cli_api_key.filter(|_| same_destination), auth, entry);
+        let override_key = cli_api_key.filter(|_| same_destination);
+        let api_key = crate::models::resolve_model_key(override_key, auth, entry).ok()?;
         if crate::models::model_requires_configured_credential(entry) && api_key.is_none() {
             return None;
         }
@@ -73,6 +80,11 @@ impl TitleClient {
                 thinking_level: Some(entry.clamp_thinking_level(ThinkingLevel::Minimal)),
                 ..Default::default()
             },
+            credential_binding: Some(ModelCredentialBinding {
+                entry: entry.clone(),
+                auth: auth.clone(),
+                override_key: override_key.map(str::to_string),
+            }),
             privacy: Arc::new(AuxiliaryPrivacy::from_settings(secrets)),
         }))
     }
@@ -182,7 +194,17 @@ impl TitleClient {
             tools: Vec::new().into(),
         };
         let raw = with_timeout(timeout, async {
-            let stream = provider.stream(&context, &self.options).await?;
+            let mut options = self.options.clone();
+            if let Some(binding) = &self.credential_binding {
+                // The foreground turn may have cooled this pool since the
+                // optional client was created. Re-admit its current key here.
+                options.api_key = crate::models::resolve_model_key(
+                    binding.override_key.as_deref(),
+                    &binding.auth,
+                    &binding.entry,
+                )?;
+            }
+            let stream = provider.stream(&context, &options).await?;
             collect_text(stream, MAX_REPLY_BYTES).await
         })
         .await

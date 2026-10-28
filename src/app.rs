@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::model::{self, AssistantMessage, ContentBlock, TextContent};
 use crate::models::{
     ModelEntry, ModelRegistry, ModelRole, default_models_path, model_entry_is_ready,
-    model_requires_configured_credential, normalize_api_key_opt,
+    model_requires_configured_credential,
 };
 use crate::provider::{CacheRetention, StreamOptions, ThinkingBudgets};
 use crate::provider_metadata::{
@@ -1748,9 +1748,7 @@ pub fn resolve_api_key(
     cli: &cli::Cli,
     entry: &ModelEntry,
 ) -> Result<Option<String>> {
-    let key = normalize_api_key_opt(cli.api_key.clone())
-        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
-        .or_else(|| normalize_api_key_opt(entry.api_key.clone()));
+    let key = crate::models::resolve_model_key(cli.api_key.as_deref(), auth, entry)?;
 
     if model_requires_configured_credential(entry) && key.is_none() {
         return Err(StartupError::MissingApiKey {

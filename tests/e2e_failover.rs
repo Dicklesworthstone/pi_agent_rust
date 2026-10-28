@@ -1703,17 +1703,13 @@ fn e2e_credential_rotation_swaps_key_on_429() {
         .log()
         .info("setup", "openai override → mock, OPENAI_API_KEYS=k1,k2");
     let server = harness.start_mock_http_server();
-    // Every chat call 429s once then succeeds: the FIRST key sees 429s, the
-    // rotated key sees success. Use a queue: two 429s, then text. (The
+    // The first key sees a 429, and its healthy sibling succeeds. Two 429s
+    // would exhaust this two-key pool and must not authorize a third call. (The
     // built-in openai provider uses the Responses API for gpt-4o here.)
     server.add_route_queue(
         "POST",
         "/v1/responses",
         vec![
-            error_response(
-                429,
-                r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
-            ),
             error_response(
                 429,
                 r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
@@ -1737,7 +1733,7 @@ fn e2e_credential_rotation_swaps_key_on_429() {
     .expect("write models.json");
     std::fs::write(
         root.join("settings.json"),
-        r#"{"retry": {"enabled": true, "maxRetries": 2}, "checkForUpdates": false}"#,
+        r#"{"retry": {"enabled": true, "maxRetries": 2, "baseDelayMs": 1, "maxDelayMs": 1}, "checkForUpdates": false}"#,
     )
     .expect("write settings.json");
 
@@ -1795,23 +1791,16 @@ fn e2e_credential_rotation_swaps_key_on_429() {
         stdout.contains("rotated ok"),
         "rotation should complete; stdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(
-        auth_headers.len() >= 2,
-        "expected at least two attempts, got {auth_headers:?}"
+    assert_eq!(auth_headers.len(), 2, "{auth_headers:?}");
+    assert_ne!(
+        auth_headers[0], auth_headers[1],
+        "the retry must use a different credential, regardless of session affinity"
     );
+    let distinct: std::collections::HashSet<_> = auth_headers.iter().map(String::as_str).collect();
     assert_eq!(
-        auth_headers[0],
-        format!("Bearer {}", auth_headers[0].trim_start_matches("Bearer ")),
-        "first request carries a bearer header"
-    );
-    let distinct: std::collections::HashSet<_> = auth_headers.iter().collect();
-    assert!(
-        distinct.len() >= 2 || stdout.contains("rotated ok"),
-        "a 429 on the first key must rotate to the sibling key (headers: {auth_headers:?})"
-    );
-    assert!(
-        auth_headers.iter().any(|h| h == "Bearer k-bbb"),
-        "after the 429 on k-aaa, a retry must carry k-bbb: {auth_headers:?}"
+        distinct,
+        std::collections::HashSet::from(["Bearer k-aaa", "Bearer k-bbb"]),
+        "both admitted credentials must come from the configured pool"
     );
 
     let path = harness.temp_path("e2e_rotation_429.jsonl");
@@ -1819,6 +1808,247 @@ fn e2e_credential_rotation_swaps_key_on_429() {
     let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
     assert!(errors.is_empty(), "JSONL violations: {errors:?}");
     harness.record_artifact("e2e_rotation_429.jsonl", &path);
+}
+
+/// Exercise the real CLI drivers with both kinds of quota failure: an HTTP
+/// setup error and a successfully established stream that ends with an error
+/// message. Neither a successful sibling nor a lower-priority secret may hide
+/// an extra request using a credential whose pool is already exhausted.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_print_and_rpc_respect_credential_pool_exhaustion_and_explicit_pins() {
+    use serde_json::json;
+
+    for mode in ["print", "rpc"] {
+        for streamed in [false, true] {
+            for outcome in [
+                "rotate",
+                "exhaust-stop",
+                "exhaust-stop-budget",
+                "exhaust-fallback",
+                "exhaust-fallback-budget",
+                "pinned",
+            ] {
+                let harness = TestHarness::new(format!("e2e_pool_{mode}_{streamed}_{outcome}"));
+                let server = harness.start_mock_http_server();
+                let failure = || {
+                    if streamed {
+                        sse_response(
+                            concat!(
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}],",
+                                "\"error\":{\"type\":\"rate_limit_error\",\"message\":\"HTTP 429: rate limit exceeded\"}}\n\n",
+                                "data: [DONE]\n\n"
+                            )
+                            .to_string(),
+                        )
+                    } else {
+                        error_response(
+                            429,
+                            r#"{"error":{"type":"rate_limit_error","message":"rate limit exceeded"}}"#,
+                        )
+                    }
+                };
+                if matches!(outcome, "rotate" | "pinned") {
+                    server.add_route_queue(
+                        "POST",
+                        "/primary/v1/chat/completions",
+                        vec![
+                            failure(),
+                            sse_response(text_sse_body("pool retry completed")),
+                        ],
+                    );
+                } else {
+                    server.add_route("POST", "/primary/v1/chat/completions", failure());
+                }
+                server.add_route(
+                    "POST",
+                    "/backup/v1/chat/completions",
+                    sse_response(text_sse_body("healthy fallback completed")),
+                );
+
+                let env = PiEnv::new(&harness);
+                let models = json!({"providers": {
+                    "openai": {
+                        "api": "openai-completions",
+                        "baseUrl": format!("{}/primary/v1", server.base_url()),
+                        "apiKey": "catalog-bypass-must-not-send",
+                        "models": [
+                            {"id": "pool-primary", "api": "openai-completions", "contextWindow": 128000},
+                            {"id": "pool-alternate", "api": "openai-completions", "contextWindow": 128000}
+                        ]
+                    },
+                    "e2ebackup": {
+                        "api": "openai-completions",
+                        "baseUrl": format!("{}/backup/v1", server.base_url()),
+                        "apiKey": "healthy-backup-key",
+                        "models": [{"id": "backup-model", "contextWindow": 128000}]
+                    }
+                }});
+                std::fs::write(
+                    env.root.join("agent/models.json"),
+                    serde_json::to_vec(&models).expect("encode model registry"),
+                )
+                .expect("write model registry");
+                std::fs::write(
+                    env.root.join("agent/auth.json"),
+                    r#"{"openai":{"type":"api_key","key":"stored-bypass-must-not-send"}}"#,
+                )
+                .expect("write lower-priority stored credential");
+                let fallback = matches!(outcome, "exhaust-fallback" | "exhaust-fallback-budget");
+                let settings = json!({
+                    "retry": {
+                        "enabled": true,
+                        // At one retry the second 429 goes directly to the
+                        // chain or terminal result. The failed key must cool
+                        // even when no candidate can complete a swap.
+                        "maxRetries": if outcome.ends_with("-budget") { 1 } else { 5 },
+                        "baseDelayMs": 1,
+                        "maxDelayMs": 1,
+                        "maxFailoversPerTurn": 1,
+                        "fallbackChains": {"default": if fallback {
+                            vec!["openai/pool-alternate", "e2ebackup/backup-model"]
+                        } else {
+                            Vec::<&str>::new()
+                        }}
+                    },
+                    "checkForUpdates": false
+                });
+                std::fs::write(
+                    env.root.join("settings.json"),
+                    serde_json::to_vec(&settings).expect("encode retry settings"),
+                )
+                .expect("write retry settings");
+                let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+                let mut command = env.command(&binary);
+                command
+                    .env("OPENAI_API_KEYS", "pool-key-one,pool-key-two")
+                    .env("OPENAI_API_KEY", "singular-bypass-must-not-send")
+                    .args([
+                        "--provider",
+                        "openai",
+                        "--model",
+                        "pool-primary",
+                        "--no-extensions",
+                    ]);
+                if outcome == "pinned" {
+                    command.args(["--api-key", "explicitly-pinned-key"]);
+                }
+                if mode == "print" {
+                    command.args(["--print", "--mode", "json", "--no-session", "ping"]);
+                } else {
+                    command.arg("--rpc").stdin(Stdio::piped());
+                }
+                let mut child = command.spawn().expect("spawn credential recovery process");
+                if mode == "rpc" {
+                    use std::io::Write as _;
+                    let mut stdin = child.stdin.take().expect("RPC stdin");
+                    writeln!(stdin, r#"{{"type":"prompt","id":"pool","message":"ping"}}"#)
+                        .expect("send credential recovery prompt");
+                }
+                let (stdout, stderr) = run_and_collect(child, 60);
+                harness
+                    .log()
+                    .info_ctx("verify", "credential recovery finished", |ctx| {
+                        ctx.push(("stdout".to_string(), stdout.clone()));
+                        ctx.push(("stderr".to_string(), stderr.clone()));
+                    });
+                assert!(
+                    !stderr.contains("TIMEOUT:"),
+                    "{mode}/{streamed}/{outcome}: {stderr}"
+                );
+                let requests = server.requests();
+                let primary: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request.path == "/primary/v1/chat/completions")
+                    .collect();
+                assert_eq!(
+                    primary.len(),
+                    2,
+                    "{mode}/{streamed}/{outcome}: a two-key pool cannot send a third cooled-key request\n{stdout}\n{stderr}"
+                );
+                let auth: Vec<_> = primary
+                    .iter()
+                    .map(|request| {
+                        request
+                            .headers
+                            .iter()
+                            .rev()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                            .map(|(_, value)| value.as_str())
+                            .expect("provider authorization header")
+                    })
+                    .collect();
+                if outcome == "pinned" {
+                    assert_eq!(auth, vec!["Bearer explicitly-pinned-key"; 2]);
+                } else {
+                    assert_ne!(auth[0], auth[1], "{mode}/{streamed}: retry must rotate");
+                    assert_eq!(
+                        auth.into_iter().collect::<std::collections::HashSet<_>>(),
+                        std::collections::HashSet::from([
+                            "Bearer pool-key-one",
+                            "Bearer pool-key-two"
+                        ]),
+                        "exhaustion must not fall through to a singular, stored, or catalog key"
+                    );
+                }
+                for request in &primary {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&request.body).expect("provider request JSON");
+                    assert_eq!(
+                        body["model"], "pool-primary",
+                        "a same-provider fallback shares the exhausted pool"
+                    );
+                }
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.path == "/backup/v1/chat/completions")
+                        .count(),
+                    usize::from(fallback),
+                    "{mode}/{streamed}/{outcome}: fallback admission must remain explicit"
+                );
+                if fallback {
+                    assert!(
+                        stdout.contains("healthy fallback completed"),
+                        "{stdout}\n{stderr}"
+                    );
+                } else if matches!(outcome, "exhaust-stop" | "exhaust-stop-budget") {
+                    assert!(
+                        stdout.contains("[CREDENTIAL_POOL_EXHAUSTED]")
+                            || stderr.contains("[CREDENTIAL_POOL_EXHAUSTED]"),
+                        "exhaustion must be actionable, not an authentication failure\n{stdout}\n{stderr}"
+                    );
+                } else {
+                    assert!(
+                        stdout.contains("pool retry completed"),
+                        "{stdout}\n{stderr}"
+                    );
+                }
+                let events: Vec<serde_json::Value> = stdout
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                let starts = events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_retry_start")
+                    .count();
+                let ends = events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_retry_end")
+                    .count();
+                assert!(starts > 0, "the real retry path must be exercised");
+                assert_eq!(
+                    starts, ends,
+                    "credential exhaustion must close every started retry"
+                );
+                let path = harness.temp_path("credential-pool-recovery.jsonl");
+                harness
+                    .write_jsonl_logs(&path)
+                    .expect("write recovery evidence");
+                harness.record_artifact("credential-pool-recovery.jsonl", &path);
+            }
+        }
+    }
 }
 
 #[test]

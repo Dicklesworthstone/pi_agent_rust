@@ -381,18 +381,90 @@ static CREDENTIAL_RINGS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, crate::failover::CredentialRing>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Resolve the current usable key from a provider's rotation ring, if the
-/// plural list env var is set. `None` = rotation not configured for this
-/// provider (caller falls back to the single-key paths).
-fn resolve_rotated_key<F>(provider: &str, auth_path: &Path, mut env_lookup: F) -> Option<String>
+/// A temporary local refusal, distinct from absent or invalid credentials.
+// ubs:ignore[rust.security.hardcoded-secrets] Public diagnostic marker, not credential material.
+pub const CREDENTIAL_POOL_EXHAUSTED: &str = "[CREDENTIAL_POOL_EXHAUSTED]";
+
+/// Credential precedence distinguishes an absent source from a configured
+/// pool whose keys are all cooling. Exhaustion never authorizes a lower-priority
+/// secret or a cached key to bypass the pool's backoff.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CredentialResolution {
+    NotConfigured,
+    Available(String),
+    Exhausted { retry_after: Duration },
+}
+
+impl std::fmt::Debug for CredentialResolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConfigured => formatter.write_str("NotConfigured"),
+            Self::Available(_) => formatter.write_str("Available([redacted])"),
+            Self::Exhausted { retry_after } => formatter
+                .debug_struct("Exhausted")
+                .field("retry_after", retry_after)
+                .finish(),
+        }
+    }
+}
+
+impl CredentialResolution {
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::Available(key) => Some(key),
+            Self::NotConfigured | Self::Exhausted { .. } => None,
+        }
+    }
+
+    /// Provider admission retains exhaustion as an actionable temporary
+    /// failure instead of treating it as a missing credential.
+    pub fn into_result(self, provider: &str) -> Result<Option<String>> {
+        match self {
+            Self::NotConfigured => Ok(None),
+            Self::Available(key) => Ok(Some(key)),
+            Self::Exhausted { retry_after } => {
+                let seconds = retry_after
+                    .as_secs()
+                    .saturating_add(u64::from(retry_after.subsec_nanos() > 0));
+                Err(Error::provider(
+                    provider,
+                    format!(
+                        "{CREDENTIAL_POOL_EXHAUSTED} All configured API keys are temporarily rate limited; retry after {}s or select another provider",
+                        seconds.max(1)
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+/// Resolve the current usable key from a provider's configured rotation ring.
+fn resolve_rotated_key<F>(provider: &str, auth_path: &Path, env_lookup: F) -> CredentialResolution
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    resolve_rotated_key_after_failure(provider, auth_path, env_lookup, None)
+}
+
+fn resolve_rotated_key_after_failure<F>(
+    provider: &str,
+    auth_path: &Path,
+    mut env_lookup: F,
+    failed_key: Option<&str>,
+) -> CredentialResolution
 where
     F: FnMut(&str) -> Option<String>,
 {
     let provider = canonical_provider_id(provider).unwrap_or(provider);
-    let plural_var = env_keys_for_provider(provider)
+    let Some(plural_var) = env_keys_for_provider(provider)
         .first()
-        .map(|key| format!("{key}S"))?;
-    let list_value = env_lookup(&plural_var)?;
+        .map(|key| format!("{key}S"))
+    else {
+        return CredentialResolution::NotConfigured;
+    };
+    let Some(list_value) = env_lookup(&plural_var) else {
+        return CredentialResolution::NotConfigured;
+    };
     let mut seen = std::collections::HashSet::new();
     let keys: Vec<String> = list_value
         .split(',')
@@ -404,34 +476,53 @@ where
     // rotation value, and requiring the comma keeps permissive env closures
     // (anything-set probes) from hijacking the single-key precedence path.
     if keys.len() < 2 {
-        return None;
+        return CredentialResolution::NotConfigured;
     }
     let seed =
         crate::failover::session_affinity_hash(&format!("{}:{provider}", auth_path.display()));
     {
-        let mut map = CREDENTIAL_RINGS.lock().ok()?;
+        let mut map = CREDENTIAL_RINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let value = {
             let ring = match map.entry(provider.to_string()) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let ring = entry.into_mut();
-                    if !ring.reconfigure(keys, seed) {
-                        return None;
-                    }
+                    ring.reconfigure(keys, seed);
                     ring
                 }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(crate::failover::CredentialRing::new(keys, seed)?)
-                }
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    crate::failover::CredentialRing::new(keys, seed)
+                        .expect("rotation requires at least two distinct keys"),
+                ),
             };
-            ring.current_key(std::time::Instant::now())
-                .map(str::to_string)
+            let now = Instant::now();
+            // Candidate preparation must not mutate shared cooldowns before
+            // its durable transition commits. Still exclude the credential
+            // whose just-finished attempt is the reason for this failover.
+            let projected = failed_key.map(|key| {
+                let mut projected = ring.clone();
+                projected.report_rate_limited(
+                    key,
+                    now,
+                    Duration::from_secs(15),
+                    Duration::from_secs(300),
+                );
+                projected
+            });
+            let ring = projected.as_ref().unwrap_or(ring);
+            ring.current_key(now).map_or_else(
+                || CredentialResolution::Exhausted {
+                    retry_after: ring.next_usable_after(now),
+                },
+                |key| CredentialResolution::Available(key.to_string()),
+            )
         };
         drop(map);
         if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
             eprintln!(
-                "[rotation] resolve provider={provider} key_present={} key_len={}",
-                value.is_some(),
-                value.as_ref().map_or(0, String::len)
+                "[rotation] resolve provider={provider} key_present={} state={value:?}",
+                matches!(&value, CredentialResolution::Available(_))
             );
         }
         value
@@ -1838,24 +1929,72 @@ impl AuthStorage {
         external_setup_source(provider)
     }
 
-    /// Resolve API key with precedence.
+    /// Resolve an available key for catalog/availability queries. Provider
+    /// dispatch must use [`Self::resolve_api_key_status`] so a cooling pool
+    /// cannot fall through to a lower-priority or previously installed key.
     pub fn resolve_api_key(&self, provider: &str, override_key: Option<&str>) -> Option<String> {
-        self.resolve_api_key_with_env_lookup(provider, override_key, |var| std::env::var(var).ok())
+        self.resolve_api_key_status(provider, override_key)
+            .into_option()
     }
 
+    /// Resolve credentials with precedence while preserving pool exhaustion.
+    pub fn resolve_api_key_status(
+        &self,
+        provider: &str,
+        override_key: Option<&str>,
+    ) -> CredentialResolution {
+        self.resolve_api_key_status_with_env_lookup(
+            provider,
+            override_key,
+            |var| std::env::var(var).ok(),
+            None,
+        )
+    }
+
+    /// Prepare a same-provider fallback without admitting the credential that
+    /// just failed. Only the eventual durable commit records the real cooldown.
+    pub(crate) fn resolve_api_key_after_rate_limit(
+        &self,
+        provider: &str,
+        override_key: Option<&str>,
+        failed_key: &str,
+    ) -> CredentialResolution {
+        self.resolve_api_key_status_with_env_lookup(
+            provider,
+            override_key,
+            |var| std::env::var(var).ok(),
+            Some(failed_key),
+        )
+    }
+
+    #[cfg(test)]
     fn resolve_api_key_with_env_lookup<F>(
         &self,
         provider: &str,
         override_key: Option<&str>,
-        mut env_lookup: F,
+        env_lookup: F,
     ) -> Option<String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        self.resolve_api_key_status_with_env_lookup(provider, override_key, env_lookup, None)
+            .into_option()
+    }
+
+    fn resolve_api_key_status_with_env_lookup<F>(
+        &self,
+        provider: &str,
+        override_key: Option<&str>,
+        mut env_lookup: F,
+        failed_key: Option<&str>,
+    ) -> CredentialResolution
     where
         F: FnMut(&str) -> Option<String>,
     {
         if let Some(key) = override_key {
             let trimmed = key.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                return CredentialResolution::Available(trimmed.to_string());
             }
         }
 
@@ -1882,7 +2021,7 @@ impl AuthStorage {
                 _ => None,
             }
         {
-            return Some(key);
+            return CredentialResolution::Available(key);
         }
 
         let generic_env_keys: &[&str] = match canonical_provider {
@@ -1897,10 +2036,16 @@ impl AuthStorage {
 
         // Credential rotation (bd-cv653.3.2): a plural list env var stacks
         // multiple keys for this provider; the ring picks the healthy one.
-        if !matches!(canonical_provider, "amazon-bedrock" | "sap-ai-core")
-            && let Some(key) = resolve_rotated_key(provider, &self.path, &mut env_lookup)
-        {
-            return Some(key);
+        if !matches!(canonical_provider, "amazon-bedrock" | "sap-ai-core") {
+            let rotated = if failed_key.is_some() {
+                resolve_rotated_key_after_failure(provider, &self.path, &mut env_lookup, failed_key)
+            } else {
+                resolve_rotated_key(provider, &self.path, &mut env_lookup)
+            };
+            match rotated {
+                CredentialResolution::NotConfigured => {}
+                resolution => return resolution,
+            }
         }
 
         if let Some(key) = generic_env_keys.iter().find_map(|var| {
@@ -1913,17 +2058,17 @@ impl AuthStorage {
                 }
             })
         }) {
-            return Some(key);
+            return CredentialResolution::Available(key);
         }
 
         if let Some(key) = self.generic_api_key(provider) {
-            return Some(key);
+            return CredentialResolution::Available(key);
         }
 
         if self.allow_external_provider_lookup()
             && let Some(key) = resolve_external_provider_api_key(provider)
         {
-            return Some(key);
+            return CredentialResolution::Available(key);
         }
 
         canonical_provider_id(provider)
@@ -1935,6 +2080,10 @@ impl AuthStorage {
                         .flatten()
                 })
             })
+            .map_or(
+                CredentialResolution::NotConfigured,
+                CredentialResolution::Available,
+            )
     }
 
     /// Refresh any expired OAuth tokens that this binary knows how to refresh.
@@ -6866,10 +7015,12 @@ mod tests {
         reset_credential_rings_for_tests();
         let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "k-aaa, k-bbb ,k-ccc".to_string());
         let first = resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env)
+            .into_option()
             .expect("plural list resolves a key");
         assert!(["k-aaa", "k-bbb", "k-ccc"].contains(&first.as_str()));
         // Same auth path + provider → same affinity pick (stability).
         let again = resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env)
+            .into_option()
             .expect("stable affinity");
         assert_eq!(first, again);
     }
@@ -6879,10 +7030,12 @@ mod tests {
         let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
         reset_credential_rings_for_tests();
         let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "k-aaa,k-bbb".to_string());
-        let first =
-            resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env).expect("first key");
+        let first = resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env)
+            .into_option()
+            .expect("first key");
         report_provider_rate_limit("openai", &first);
         let next = resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env)
+            .into_option()
             .expect("rotation provides sibling");
         assert_ne!(first, next, "backed-off key must rotate to its sibling");
     }
@@ -6893,7 +7046,9 @@ mod tests {
         reset_credential_rings_for_tests();
         let path = Path::new("/tmp/auth-refresh.json");
         let original = |var: &str| (var == "OPENAI_API_KEYS").then(|| "old-a,old-b".to_string());
-        let limited = resolve_rotated_key("openai", path, original).expect("initial key");
+        let limited = resolve_rotated_key("openai", path, original)
+            .into_option()
+            .expect("initial key");
         let revoked = if limited == "old-a" { "old-b" } else { "old-a" };
         report_provider_rate_limit("openai", &limited);
 
@@ -6901,7 +7056,10 @@ mod tests {
         let selected = resolve_rotated_key("openai", path, |var| {
             (var == "OPENAI_API_KEYS").then(|| updated.clone())
         });
-        assert_eq!(selected.as_deref(), Some("replacement"));
+        assert_eq!(
+            selected,
+            CredentialResolution::Available("replacement".to_string())
+        );
         let mut ring = credential_ring_for_tests("openai").expect("updated ring");
         let now = Instant::now();
         let base = Duration::from_secs(15);
@@ -6919,13 +7077,15 @@ mod tests {
         reset_credential_rings_for_tests();
         let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "key-a,key-b".to_string());
         let first = resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env)
+            .into_option()
             .expect("first auth scope");
         let second = resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env)
+            .into_option()
             .expect("second auth scope");
         assert_ne!(first, second);
         assert_eq!(
             resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env),
-            Some(first)
+            CredentialResolution::Available(first)
         );
     }
 
@@ -6935,23 +7095,33 @@ mod tests {
         reset_credential_rings_for_tests();
         let env = |var: &str| (var == "GOOGLE_API_KEYS").then(|| "google-a,google-b".to_string());
         let path = Path::new("/tmp/auth-alias.json");
-        let first = resolve_rotated_key("gemini", path, env).expect("alias key");
+        let first = resolve_rotated_key("gemini", path, env)
+            .into_option()
+            .expect("alias key");
         assert_eq!(
             resolve_rotated_key("google", path, env),
-            Some(first.clone())
+            CredentialResolution::Available(first.clone())
         );
         report_provider_rate_limit("gemini", &first);
-        let sibling = resolve_rotated_key("google", path, env).expect("canonical sibling");
+        let sibling = resolve_rotated_key("google", path, env)
+            .into_option()
+            .expect("canonical sibling");
         assert_ne!(sibling, first);
-        assert_eq!(resolve_rotated_key("gemini", path, env), Some(sibling));
+        assert_eq!(
+            resolve_rotated_key("gemini", path, env),
+            CredentialResolution::Available(sibling)
+        );
         report_provider_success("google", &first, Instant::now() + Duration::from_nanos(1));
         assert_eq!(
             resolve_rotated_key("gemini", path, env),
-            Some(first.clone())
+            CredentialResolution::Available(first.clone())
         );
         report_provider_rate_limit("google", &first);
         report_provider_success("gemini", &first, Instant::now() + Duration::from_nanos(1));
-        assert_eq!(resolve_rotated_key("google", path, env), Some(first));
+        assert_eq!(
+            resolve_rotated_key("google", path, env),
+            CredentialResolution::Available(first)
+        );
     }
 
     #[test]
@@ -6959,38 +7129,205 @@ mod tests {
         let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
         reset_credential_rings_for_tests();
         let path = Path::new("/tmp/auth-duplicates.json");
-        assert!(
+        assert_eq!(
             resolve_rotated_key("openai", path, |var| {
                 (var == "OPENAI_API_KEYS").then(|| "same, same ,same".to_string())
-            })
-            .is_none()
+            }),
+            CredentialResolution::NotConfigured
         );
         assert!(credential_ring_for_tests("openai").is_none());
 
         let env = |var: &str| {
             (var == "OPENAI_API_KEYS").then(|| "repeated,repeated,sibling,repeated".to_string())
         };
-        let first = resolve_rotated_key("openai", path, env).expect("first distinct key");
+        let first = resolve_rotated_key("openai", path, env)
+            .into_option()
+            .expect("first distinct key");
         report_provider_rate_limit("openai", &first);
-        let second = resolve_rotated_key("openai", path, env).expect("healthy sibling");
+        let second = resolve_rotated_key("openai", path, env)
+            .into_option()
+            .expect("healthy sibling");
         assert_ne!(first, second);
         report_provider_rate_limit("openai", &second);
-        assert!(resolve_rotated_key("openai", path, env).is_none());
+        assert!(matches!(
+            resolve_rotated_key("openai", path, env),
+            CredentialResolution::Exhausted { .. }
+        ));
     }
 
     #[test]
-    fn rotated_key_all_cooling_falls_through_to_none() {
+    fn rotated_key_all_cooling_reports_a_bounded_retry_after() {
         let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
         reset_credential_rings_for_tests();
         let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "k-one,k-two".to_string());
         let first = resolve_rotated_key("openai", Path::new("/tmp/auth-c.json"), env)
+            .into_option()
             .expect("first key resolves");
         report_provider_rate_limit("openai", &first);
         let second = resolve_rotated_key("openai", Path::new("/tmp/auth-c.json"), env)
+            .into_option()
             .expect("sibling rotates in");
         report_provider_rate_limit("openai", &second);
         // Both keys now inside the 300s max backoff window: nothing usable.
-        assert!(resolve_rotated_key("openai", Path::new("/tmp/auth-c.json"), env).is_none());
+        let CredentialResolution::Exhausted { retry_after } =
+            resolve_rotated_key("openai", Path::new("/tmp/auth-c.json"), env)
+        else {
+            panic!("a configured cooling pool must not look absent");
+        };
+        assert!(retry_after > Duration::ZERO);
+        assert!(retry_after <= Duration::from_secs(15));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn prospective_rate_limit_excludes_the_failed_key_without_committing_cooldowns() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let auth = AuthStorage::empty_at(PathBuf::from("/tmp/auth-projection.json"));
+        let env =
+            |var: &str| (var == "OPENAI_API_KEYS").then(|| "projection-a,projection-b".to_string());
+        let first = auth
+            .resolve_api_key_with_env_lookup("openai", None, env)
+            .unwrap();
+        let sibling = auth
+            .resolve_api_key_status_with_env_lookup("openai", None, env, Some(&first))
+            .into_option()
+            .expect("prospective healthy sibling");
+        assert_ne!(sibling, first);
+
+        // Walking multiple same-provider models must neither authorize the
+        // failed key nor count candidate preparation as a real failure.
+        for _ in 0..3 {
+            assert_eq!(
+                auth.resolve_api_key_status_with_env_lookup("openai", None, env, Some(&first)),
+                CredentialResolution::Available(sibling.clone()),
+            );
+            assert_eq!(
+                auth.resolve_api_key_with_env_lookup("openai", None, env),
+                Some(first.clone())
+            );
+            assert_eq!(
+                credential_ring_for_tests("openai")
+                    .unwrap()
+                    .cooling_count(Instant::now()),
+                0
+            );
+        }
+        assert_eq!(
+            auth.resolve_api_key_status_with_env_lookup("openai", Some(&first), env, Some(&first)),
+            CredentialResolution::Available(first.clone()),
+            "an explicit pin retains precedence over a prospective managed-pool exclusion",
+        );
+
+        // Once the first real failure commits, projecting the remaining key
+        // must refuse this provider without actually cooling that second key.
+        report_provider_rate_limit("openai", &first);
+        for _ in 0..3 {
+            let projected =
+                auth.resolve_api_key_status_with_env_lookup("openai", None, env, Some(&sibling));
+            let CredentialResolution::Exhausted { retry_after } = projected else {
+                panic!("both the committed and prospective failed keys must be excluded");
+            };
+            assert!(retry_after > Duration::ZERO && retry_after <= Duration::from_secs(15));
+            assert_eq!(
+                auth.resolve_api_key_with_env_lookup("openai", None, env),
+                Some(sibling.clone())
+            );
+            assert_eq!(
+                credential_ring_for_tests("openai")
+                    .unwrap()
+                    .cooling_count(Instant::now()),
+                1
+            );
+        }
+
+        // Probe a private snapshot to verify the exact failure histories: the
+        // first key has one real failure and the second still has none.
+        let mut snapshot = credential_ring_for_tests("openai").unwrap();
+        let now = Instant::now();
+        let base = Duration::from_secs(15);
+        let maximum = Duration::from_secs(300);
+        assert_eq!(
+            snapshot.report_rate_limited(&first, now, base, maximum),
+            Some(now + Duration::from_secs(30))
+        );
+        assert_eq!(
+            snapshot.report_rate_limited(&sibling, now, base, maximum),
+            Some(now + base)
+        );
+        report_provider_rate_limit("openai", &sibling);
+        assert!(matches!(
+            auth.resolve_api_key_status_with_env_lookup("openai", None, env, None),
+            CredentialResolution::Exhausted { .. },
+        ));
+    }
+
+    #[test]
+    fn exhausted_pool_blocks_lower_priority_keys_but_preserves_explicit_auth() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let directory = tempfile::tempdir().expect("auth directory");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "stored-fallback".to_string(),
+            },
+        );
+        let env = |var: &str| match var {
+            "OPENAI_API_KEYS" => Some("pool-one,pool-two".to_string()),
+            "OPENAI_API_KEY" => Some("singular-fallback".to_string()),
+            _ => None,
+        };
+        let first = auth
+            .resolve_api_key_with_env_lookup("openai", None, env)
+            .unwrap();
+        report_provider_rate_limit("openai", &first);
+        let second = auth
+            .resolve_api_key_with_env_lookup("openai", None, env)
+            .unwrap();
+        assert_ne!(first, second);
+        report_provider_rate_limit("openai", &second);
+        let exhausted = auth.resolve_api_key_status_with_env_lookup("openai", None, env, None);
+        assert!(matches!(&exhausted, CredentialResolution::Exhausted { .. }));
+        let error = exhausted.into_result("openai").unwrap_err();
+        assert!(error.to_string().contains(CREDENTIAL_POOL_EXHAUSTED));
+        assert!(error.to_string().contains("retry after"));
+        assert_eq!(
+            auth.resolve_api_key_with_env_lookup("openai", None, env),
+            None
+        );
+        assert_eq!(
+            auth.resolve_api_key_with_env_lookup("openai", Some("  pinned  "), env),
+            Some("pinned".to_string())
+        );
+        assert!(matches!(
+            auth.resolve_api_key_status_with_env_lookup("openai", Some(" "), env, None),
+            CredentialResolution::Exhausted { .. }
+        ));
+        for credential in [
+            AuthCredential::BearerToken {
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated precedence fixture.
+                token: "stored-bearer".to_string(),
+            },
+            AuthCredential::OAuth {
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated precedence fixture.
+                access_token: "stored-oauth".to_string(),
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated precedence fixture.
+                refresh_token: "refresh-fixture".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 60_000,
+                token_url: None,
+                client_id: None,
+                extra: HashMap::new(),
+            },
+        ] {
+            let expected = api_key_from_credential(&credential, None).unwrap();
+            auth.set("openai", credential);
+            assert_eq!(
+                auth.resolve_api_key_with_env_lookup("openai", None, env),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -6998,7 +7335,10 @@ mod tests {
         let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
         reset_credential_rings_for_tests();
         let env = |var: &str| (var == "OPENAI_API_KEY").then(|| "k-single".to_string());
-        assert!(resolve_rotated_key("openai", Path::new("/tmp/auth-d.json"), env).is_none());
+        assert_eq!(
+            resolve_rotated_key("openai", Path::new("/tmp/auth-d.json"), env),
+            CredentialResolution::NotConfigured
+        );
     }
 
     #[test]

@@ -187,6 +187,7 @@ fn client(
             max_tokens: Some(96),
             ..Default::default()
         },
+        credential_binding: None,
         privacy: Arc::new(AuxiliaryPrivacy::from_settings(settings)),
     })
 }
@@ -493,6 +494,90 @@ fn entry(provider: &str, url: &str, key: Option<&str>) -> ModelEntry {
         compat: None,
         oauth_config: None,
     }
+}
+
+#[test]
+fn retained_title_client_rechecks_rotation_and_exhaustion_at_dispatch() {
+    const CHILD: &str = "PI_TITLE_CREDENTIAL_ADMISSION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_title::tests::retained_title_client_rechecks_rotation_and_exhaustion_at_dispatch",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("OPENAI_API_KEYS", "pool-key-one,pool-key-two")
+            .env("OPENAI_API_KEY", "singular-bypass")
+            .output()
+            .expect("run isolated title credential fixture");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    crate::auth::reset_credential_rings_for_tests();
+    run_async(async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "stored-bypass".to_string(),
+            },
+        );
+        let role = entry("openai", "https://title.invalid/v1", Some("catalog-bypass"));
+        let mut client = TitleClient::for_model_entry(&role, &role, None, &auth, None)
+            .expect("pool is initially available");
+        let initial_key = client.options.api_key.clone().unwrap();
+        let provider = RecordingProvider::new(vec![
+            Reply::Events(vec![done("Fix editor startup")]),
+            Reply::Events(vec![done("Fix editor startup")]),
+        ]);
+        Arc::get_mut(&mut client).unwrap().provider = provider.clone();
+        let first = prepare(&client, exchange());
+        let after_exhaustion = prepare(&client, exchange());
+
+        crate::auth::report_provider_rate_limit("openai", &initial_key);
+        let sibling = auth.resolve_api_key("openai", None).unwrap();
+        assert_ne!(initial_key, sibling);
+        assert!(client.generate(first).await.is_some());
+        assert_eq!(
+            provider.requests.lock().unwrap()[0]
+                .options
+                .api_key
+                .as_deref(),
+            Some(sibling.as_str())
+        );
+
+        crate::auth::report_provider_rate_limit("openai", &sibling);
+        assert!(client.generate(after_exhaustion).await.is_none());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        let mut pinned =
+            TitleClient::for_model_entry(&role, &role, Some("explicit-title-key"), &auth, None)
+                .expect("same-destination explicit override remains available");
+        Arc::get_mut(&mut pinned).unwrap().provider = provider.clone();
+        assert!(
+            pinned
+                .generate(prepare(&pinned, exchange()))
+                .await
+                .is_some()
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider.requests.lock().unwrap()[1]
+                .options
+                .api_key
+                .as_deref(),
+            Some("explicit-title-key")
+        );
+    });
 }
 
 #[test]

@@ -407,6 +407,11 @@ impl AgentSessionHandle {
 
         // Construct this once for the entire call. Recovery events must reach
         // subscribers too, and a resumed attempt must not fan out a second time.
+        self.session.set_recovery_cli_api_key(
+            self.failover
+                .as_ref()
+                .and_then(|options| options.cli_api_key.clone()),
+        );
         let shared: EventCallback = Arc::new(self.make_combined_callback(on_event));
         let shared = complete_stream_callback(shared, self.listeners.on_stream_event.clone());
         self.maybe_restore_primary(&shared).await?;
@@ -465,7 +470,14 @@ impl AgentSessionHandle {
             .await;
         // Also cover failures while preparing a retry/failover. Install the
         // fence before observers receive the logical turn's terminal event.
-        let result = fence_session_persistence(&admission, result);
+        let mut result = fence_session_persistence(&admission, result);
+        let outcome = match &result {
+            Ok(message) => TurnOutcome::Completed(message),
+            Err(error) => TurnOutcome::Failed(error),
+        };
+        if let Some(error) = self.session.record_terminal_credential_failure(outcome) {
+            result = Err(error);
+        }
         let interrupted = result.as_ref().map_or(true, |message| {
             matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
         });
@@ -477,6 +489,11 @@ impl AgentSessionHandle {
     /// Install (or clear) fallback-chain configuration on a pre-built handle.
     #[must_use]
     pub fn with_failover(mut self, options: Option<FailoverOptions>) -> Self {
+        self.session.set_recovery_cli_api_key(
+            options
+                .as_ref()
+                .and_then(|options| options.cli_api_key.clone()),
+        );
         self.failover_state = options
             .as_ref()
             .map_or_else(crate::failover::FailoverState::new_empty, |options| {
@@ -947,6 +964,14 @@ impl AgentSessionHandle {
                 .await
             {
                 // Preparation has already closed the retry it announced.
+                if crate::failover::marks_credential_pool_exhausted(&error.to_string()) {
+                    // No provider call was made after the durable rewind. Feed
+                    // the temporary exhaustion through the normal bounded
+                    // fallback policy instead of retrying a cooled key.
+                    progress.retry_count = attempt;
+                    current = Err(error);
+                    continue;
+                }
                 self.close_failover_lifecycle(failed_over, false, shared);
                 return Err(error);
             }
@@ -1049,7 +1074,7 @@ impl AgentSessionHandle {
                     .as_ref()
                     .and_then(|options| options.cli_api_key.as_deref());
                 self.session
-                    .rotate_rate_limited_credential(provider, key, legacy_pin);
+                    .rotate_rate_limited_credential(provider, key, legacy_pin)?;
                 drop(authority);
             }
             ensure_not_aborted(abort_signal)

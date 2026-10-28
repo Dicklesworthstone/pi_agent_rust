@@ -1565,14 +1565,30 @@ pub fn resolve_model_key(
     cli_api_key: Option<&str>,
     auth: &crate::auth::AuthStorage,
     entry: &ModelEntry,
-) -> Option<String> {
-    cli_api_key
-        .and_then(|key| {
-            let trimmed = key.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
-        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+) -> crate::error::Result<Option<String>> {
+    let resolved = auth
+        .resolve_api_key_status(&entry.model.provider, cli_api_key)
+        .into_result(&entry.model.provider)?;
+    Ok(normalize_api_key_opt(resolved).or_else(|| normalize_api_key_opt(entry.api_key.clone())))
+}
+
+/// Resolve a prospective fallback without reusing the failed request's key.
+/// The projection applies only to its provider's managed pool; explicit pins
+/// and unrelated providers retain the ordinary precedence.
+pub(crate) fn resolve_model_key_after_rate_limit(
+    cli_api_key: Option<&str>,
+    auth: &crate::auth::AuthStorage,
+    entry: &ModelEntry,
+    failed_provider: &str,
+    failed_key: &str,
+) -> crate::error::Result<Option<String>> {
+    if !crate::provider_metadata::provider_ids_match(&entry.model.provider, failed_provider) {
+        return resolve_model_key(cli_api_key, auth, entry);
+    }
+    let resolved = auth
+        .resolve_api_key_after_rate_limit(&entry.model.provider, cli_api_key, failed_key)
+        .into_result(&entry.model.provider)?;
+    Ok(normalize_api_key_opt(resolved).or_else(|| normalize_api_key_opt(entry.api_key.clone())))
 }
 
 pub fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
