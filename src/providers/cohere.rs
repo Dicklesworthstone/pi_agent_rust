@@ -238,6 +238,7 @@ impl Provider for CohereProvider {
             self.model.clone(),
             self.api().to_string(),
             self.name().to_string(),
+            options.usage_observer.clone(),
         ))
     }
 }
@@ -824,6 +825,189 @@ mod tests {
             }
             out
         })
+    }
+
+    fn billed_test_provider(
+        url: String,
+        budget: crate::cost::CostBudget,
+    ) -> std::sync::Arc<dyn Provider> {
+        let entry = crate::models::ModelEntry {
+            model: crate::provider::Model {
+                id: "command-r-test".to_string(),
+                name: "Cohere billing fixture".to_string(),
+                api: "cohere-chat".to_string(),
+                provider: "cohere".to_string(),
+                base_url: url,
+                reasoning: false,
+                input: vec![crate::provider::InputType::Text],
+                cost: crate::provider::ModelCost {
+                    input: 2.0,
+                    output: 4.0,
+                    ..Default::default()
+                },
+                context_window: 128_000,
+                max_tokens: 4096,
+                headers: HashMap::new(),
+            },
+            api_key: None,
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        };
+        crate::provider::guard_with_cost_budget(
+            crate::providers::create_provider(&entry, None).unwrap(),
+            budget,
+        )
+    }
+
+    #[test]
+    fn native_billed_units_drive_cost_caps_without_shrinking_context_usage() {
+        for (name, billed, limit, expected, exhausted) in [
+            (
+                "discounted",
+                Some(json!({"input_tokens":100,"output_tokens":10})),
+                0.001,
+                Some(0.000_24),
+                false,
+            ),
+            (
+                "free",
+                Some(json!({"input_tokens":0.0,"output_tokens":0.0})),
+                0.001,
+                Some(0.0),
+                false,
+            ),
+            (
+                "billed-cap",
+                Some(json!({"input_tokens":100,"output_tokens":10})),
+                0.000_2,
+                Some(0.000_24),
+                true,
+            ),
+            ("legacy", None, 0.001, Some(0.002_4), true),
+            (
+                "incomplete",
+                Some(json!({"input_tokens":100})),
+                0.001,
+                None,
+                true,
+            ),
+        ] {
+            let mut usage = json!({"tokens":{"input_tokens":1000,"output_tokens":100}});
+            if let Some(billed) = billed {
+                usage["billed_units"] = billed;
+            }
+            let terminal =
+                json!({"type":"message-end","delta":{"finish_reason":"COMPLETE","usage":usage}});
+            let response = format!("data: {{\"type\":\"message-start\"}}\n\ndata: {terminal}\n\n");
+            let (url, captured) = spawn_test_server(200, "text/event-stream", &response);
+            let budget = crate::cost::CostBudget::new(None, Some(limit), 0.0).unwrap();
+            let provider = billed_test_provider(url, budget.clone());
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let context = Context::default();
+                let options = StreamOptions {
+                    api_key: Some("fixture-key".to_string()),
+                    ..Default::default()
+                };
+                let mut events = provider.stream(&context, &options).await.unwrap();
+                let mut completed = false;
+                let mut failed = false;
+                while let Some(event) = events.next().await {
+                    match event {
+                        Ok(StreamEvent::Done { message, .. }) => {
+                            assert_eq!(
+                                (
+                                    message.usage.input,
+                                    message.usage.output,
+                                    message.usage.total_tokens
+                                ),
+                                (1000, 100, 1100),
+                                "{name}"
+                            );
+                            assert!(
+                                (message.usage.cost.total - expected.unwrap()).abs() < 1e-12,
+                                "{name}"
+                            );
+                            assert_eq!(message.usage.billing.is_some(), name != "legacy");
+                            completed = true;
+                        }
+                        Err(_) => failed = true,
+                        _ => {}
+                    }
+                }
+                assert_eq!(completed, expected.is_some(), "{name}");
+                assert_eq!(failed, expected.is_none(), "{name}");
+                if exhausted {
+                    match (expected, provider.stream(&context, &options).await) {
+                        (Some(_), Err(Error::CostCap { .. })) | (None, Err(Error::Session(_))) => {}
+                        _ => panic!("{name}: follow-up was not stopped by the accounting boundary"),
+                    }
+                }
+            });
+            assert!(
+                (budget.spent() - expected.unwrap_or(0.0)).abs() < 1e-12,
+                "{name}"
+            );
+            assert_eq!(budget.admit().is_err(), exhausted, "{name}");
+            assert!(captured.recv_timeout(Duration::from_secs(2)).is_ok());
+        }
+    }
+
+    #[test]
+    fn native_billing_is_kept_before_queued_done_or_a_terminal_protocol_error() {
+        for (finish, billed) in [("COMPLETE", 100), ("COMPLETE", 0), ("INVALID_FINISH", 100)] {
+            let terminal = json!({"type":"message-end","delta":{"finish_reason":finish,"usage":{
+                "tokens":{"input_tokens":1000,"output_tokens":100},
+                "billed_units":{"input_tokens":billed,"output_tokens":0}
+            }}});
+            let response = format!(
+                "data: {{\"type\":\"message-start\"}}\n\ndata: {{\"type\":\"tool-plan-delta\",\"delta\":{{\"message\":{{\"tool_plan\":\"acknowledged plan\"}}}}}}\n\ndata: {terminal}\n\n"
+            );
+            let (url, captured) = spawn_test_server(200, "text/event-stream", &response);
+            let budget = crate::cost::CostBudget::new(None, Some(0.001), 0.0).unwrap();
+            let provider = billed_test_provider(url, budget.clone());
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let mut events = provider
+                    .stream(
+                        &Context::default(),
+                        &StreamOptions {
+                            api_key: Some("fixture-key".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let mut stopped = false;
+                while let Some(event) = events.next().await {
+                    match event {
+                        Ok(StreamEvent::TextEnd { .. }) => {
+                            assert_eq!(finish, "COMPLETE");
+                            stopped = true;
+                            break;
+                        }
+                        Err(_) => {
+                            assert_eq!(finish, "INVALID_FINISH");
+                            stopped = true;
+                            break;
+                        }
+                        Ok(StreamEvent::Done { .. }) => {
+                            panic!("the queued plan end must precede Done")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(stopped);
+                drop(events);
+            });
+            let expected = f64::from(billed) * 2.0 / 1_000_000.0;
+            assert!((budget.spent() - expected).abs() < 1e-12);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            budget.admit().unwrap();
+            assert!(captured.recv_timeout(Duration::from_secs(2)).is_ok());
+        }
     }
 
     #[derive(Debug)]

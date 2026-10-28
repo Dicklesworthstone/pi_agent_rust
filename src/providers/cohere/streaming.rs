@@ -7,8 +7,8 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ThinkingContent,
-    ToolCall, Usage,
+    AssistantMessage, BillingTokenCounts, BillingUsage, ContentBlock, StopReason, StreamEvent,
+    TextContent, ThinkingContent, ToolCall, Usage,
 };
 use crate::sse::SseStream;
 use futures::{Stream, StreamExt, stream};
@@ -82,6 +82,7 @@ where
     seen_tool_ids: BTreeSet<String>,
     plan: Option<ContentSlot>,
     received_bytes: usize,
+    usage_observer: Option<crate::provider::UsageObserver>,
 }
 
 impl<S> StreamState<S>
@@ -116,6 +117,7 @@ where
             seen_tool_ids: BTreeSet::new(),
             plan: None,
             received_bytes: 0,
+            usage_observer: None,
         }
     }
 
@@ -370,6 +372,10 @@ where
     }
 
     fn message_end(&mut self, value: &Value) -> Result<()> {
+        // A received bill remains real even when another terminal field is
+        // malformed. Publish it before lifecycle validation or queued events
+        // can return control to a caller that cancels the stream.
+        self.apply_usage(value)?;
         let finish = required_str(value, "/delta/finish_reason")?;
         let has_tools = !self.seen_tool_indices.is_empty();
         // A normal completion that emitted tool calls is a ToolUse stop, and a
@@ -395,6 +401,21 @@ where
             self.partial.error_message =
                 Some("Cohere reported an unsuccessful generation".to_string());
         }
+        self.pending_events.push_back(StreamEvent::Done {
+            reason,
+            message: std::mem::take(&mut self.partial),
+        });
+        self.finished = true;
+        Ok(())
+    }
+
+    fn apply_usage(&mut self, value: &Value) -> Result<()> {
+        self.partial.usage.billing = billed_usage(value.pointer("/delta/usage/billed_units"));
+        if self.partial.usage.billing.is_some()
+            && let Some(observer) = &self.usage_observer
+        {
+            observer.observe_authoritative(&mut self.partial.usage)?;
+        }
         if let Some(tokens) = value.pointer("/delta/usage/tokens")
             && !tokens.is_null()
         {
@@ -409,11 +430,11 @@ where
                 .input
                 .saturating_add(self.partial.usage.output);
         }
-        self.pending_events.push_back(StreamEvent::Done {
-            reason,
-            message: std::mem::take(&mut self.partial),
-        });
-        self.finished = true;
+        if self.partial.usage.billing.is_none()
+            && let Some(observer) = &self.usage_observer
+        {
+            observer.observe_authoritative(&mut self.partial.usage)?;
+        }
         Ok(())
     }
 
@@ -591,10 +612,61 @@ where
 fn token_count(value: Option<&Value>) -> Result<u64> {
     match value {
         None | Some(Value::Null) => Ok(0),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| protocol("invalid usage token count")),
+        Some(value) => {
+            exact_token_count(value).ok_or_else(|| protocol("invalid usage token count"))
+        }
     }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn exact_token_count(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        // Cohere's official schema uses numbers, including whole-valued
+        // floats. Never round a fractional bill or saturate an overflow.
+        let count = value.as_f64()?;
+        (count.is_finite()
+            && (0.0..18_446_744_073_709_551_616.0).contains(&count)
+            && count.fract() == 0.0)
+            .then_some(count as u64)
+    })
+}
+
+fn billed_usage(value: Option<&Value>) -> Option<BillingUsage> {
+    let value = value.filter(|value| !value.is_null())?;
+    let unavailable = || {
+        Some(BillingUsage::Unavailable {
+        reason: "Cohere billed_units requires complete nonnegative integer token counts without unsupported billing units".to_string(),
+    })
+    };
+    let Some(units) = value.as_object() else {
+        return unavailable();
+    };
+    let (Some(input), Some(output)) = (
+        units.get("input_tokens").and_then(exact_token_count),
+        units.get("output_tokens").and_then(exact_token_count),
+    ) else {
+        return unavailable();
+    };
+    if units.iter().any(|(field, value)| {
+        !matches!(field.as_str(), "input_tokens" | "output_tokens")
+            && !value.is_null()
+            && value.as_f64() != Some(0.0)
+    }) {
+        return unavailable();
+    }
+    // Cohere excludes model-added tokens from billed_units; usage.tokens
+    // remains the actual context count. No dollar total or discounted cache
+    // partition is documented here, so do not manufacture either one.
+    // https://docs.cohere.com/docs/how-does-cohere-pricing-work
+    Some(BillingUsage::Tokens {
+        text: BillingTokenCounts {
+            input,
+            output,
+            ..Default::default()
+        },
+        audio: BillingTokenCounts::default(),
+        reported_total: None,
+    })
 }
 
 pub(super) fn response_stream<S>(
@@ -602,11 +674,13 @@ pub(super) fn response_stream<S>(
     model: String,
     api: String,
     provider: String,
+    usage_observer: Option<crate::provider::UsageObserver>,
 ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>
 where
     S: Stream<Item = std::io::Result<Vec<u8>>> + Send + Unpin + 'static,
 {
-    let state = StreamState::new(SseStream::new(source), model, api, provider);
+    let mut state = StreamState::new(SseStream::new(source), model, api, provider);
+    state.usage_observer = usage_observer;
     Box::pin(
         stream::unfold(state, |mut state| async move {
             state.next_event().await.map(|event| (event, state))
@@ -851,6 +925,95 @@ mod tests {
     }
 
     #[test]
+    fn billed_units_are_independent_of_context_tokens_and_preserve_explicit_zero() {
+        for (input, output) in [(json!(5), json!(2)), (json!(0.0), json!(0.0))] {
+            let mut state = started();
+            let mut terminal = end("COMPLETE");
+            terminal["delta"]["usage"]["tokens"] =
+                json!({"input_tokens":71.0,"output_tokens":26.0});
+            terminal["delta"]["usage"]["billed_units"] =
+                json!({"input_tokens":input,"output_tokens":output});
+            feed(&mut state, &terminal).unwrap();
+            let Some(StreamEvent::Done { message, .. }) = state.pending_events.back() else {
+                panic!("Done");
+            };
+            assert_eq!(
+                (
+                    message.usage.input,
+                    message.usage.output,
+                    message.usage.total_tokens
+                ),
+                (71, 26, 97)
+            );
+            assert!(matches!(
+                message.usage.billing,
+                Some(BillingUsage::Tokens { .. })
+            ));
+            let Some(BillingUsage::Tokens {
+                text,
+                audio,
+                reported_total,
+            }) = message.usage.billing.as_ref()
+            else {
+                unreachable!();
+            };
+            assert_eq!(text.input, exact_token_count(&input).unwrap());
+            assert_eq!(text.output, exact_token_count(&output).unwrap());
+            assert_eq!(*audio, BillingTokenCounts::default());
+            assert_eq!(*reported_total, None);
+        }
+        let mut state = started();
+        feed(&mut state, &end("COMPLETE")).unwrap();
+        let Some(StreamEvent::Done { message, .. }) = state.pending_events.back() else {
+            panic!("Done");
+        };
+        assert!(
+            message.usage.billing.is_none(),
+            "absent billed_units retains legacy text-only pricing"
+        );
+    }
+
+    #[test]
+    fn incomplete_or_unsupported_billed_units_are_explicitly_unavailable() {
+        for units in [
+            json!({}),
+            json!({"input_tokens":5}),
+            json!({"input_tokens":null,"output_tokens":2}),
+            json!({"input_tokens":-1,"output_tokens":2}),
+            json!({"input_tokens":1.5,"output_tokens":2}),
+            json!({"input_tokens":1e30,"output_tokens":2}),
+            json!({"input_tokens":"private-invalid-value","output_tokens":2}),
+            json!({"input_tokens":5,"output_tokens":2,"search_units":1}),
+            json!({"input_tokens":5,"output_tokens":2,"images":1}),
+            json!({"input_tokens":5,"output_tokens":2,"future_units":1}),
+            json!({"input_tokens":5,"output_tokens":2,"future_units":"private-invalid-value"}),
+            json!([]),
+        ] {
+            let billing = billed_usage(Some(&units)).unwrap();
+            assert!(
+                matches!(billing, BillingUsage::Unavailable { .. }),
+                "{units}"
+            );
+            let encoded = serde_json::to_string(&billing).unwrap();
+            assert!(!encoded.contains("private-invalid-value"));
+            assert!(!encoded.contains("NaN"));
+        }
+        assert_eq!(billed_usage(None), None);
+        assert_eq!(billed_usage(Some(&Value::Null)), None);
+        assert_eq!(exact_token_count(&json!(u64::MAX)), Some(u64::MAX));
+        assert_eq!(
+            exact_token_count(&json!(18_446_744_073_709_551_616.0)),
+            None
+        );
+        assert!(matches!(
+            billed_usage(Some(
+                &json!({"input_tokens":0,"output_tokens":0,"search_units":0.0})
+            )),
+            Some(BillingUsage::Tokens { .. })
+        ));
+    }
+
+    #[test]
     fn oversized_arguments_and_sparse_indices_have_bounded_state() {
         let mut state = started();
         feed(&mut state, &start(u32::MAX, "a", "{}")).unwrap();
@@ -914,14 +1077,20 @@ mod tests {
                     "m".into(),
                     "cohere-chat".into(),
                     "cohere".into(),
+                    None,
                 );
                 assert!(events.next().await.unwrap().is_err());
                 assert!(events.next().await.is_none());
                 assert!(events.next().await.is_none());
             }
             let source = stream::iter(vec![Err(std::io::Error::other("secret transport detail"))]);
-            let mut events =
-                response_stream(source, "m".into(), "cohere-chat".into(), "cohere".into());
+            let mut events = response_stream(
+                source,
+                "m".into(),
+                "cohere-chat".into(),
+                "cohere".into(),
+                None,
+            );
             assert!(
                 !events
                     .next()
@@ -944,8 +1113,13 @@ mod tests {
             );
             let source = stream::iter(wire.into_bytes().into_iter().map(|byte| Ok(vec![byte])))
                 .chain(stream::pending());
-            let mut events =
-                response_stream(source, "m".into(), "cohere-chat".into(), "cohere".into());
+            let mut events = response_stream(
+                source,
+                "m".into(),
+                "cohere-chat".into(),
+                "cohere".into(),
+                None,
+            );
             assert!(matches!(
                 events.next().await.unwrap().unwrap(),
                 StreamEvent::Start { .. }
