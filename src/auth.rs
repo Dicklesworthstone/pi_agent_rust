@@ -388,17 +388,19 @@ fn resolve_rotated_key<F>(provider: &str, auth_path: &Path, mut env_lookup: F) -
 where
     F: FnMut(&str) -> Option<String>,
 {
+    let provider = canonical_provider_id(provider).unwrap_or(provider);
     let plural_var = env_keys_for_provider(provider)
         .first()
         .map(|key| format!("{key}S"))?;
     let list_value = env_lookup(&plural_var)?;
+    let mut seen = std::collections::HashSet::new();
     let keys: Vec<String> = list_value
         .split(',')
         .map(str::trim)
-        .filter(|k| !k.is_empty())
+        .filter(|key| !key.is_empty() && seen.insert(*key))
         .map(str::to_string)
         .collect();
-    // Rotation engages only with 2+ keys: a single "stacked" key offers no
+    // Rotation engages only with 2+ distinct keys: one repeated key offers no
     // rotation value, and requiring the comma keeps permissive env closures
     // (anything-set probes) from hijacking the single-key precedence path.
     if keys.len() < 2 {
@@ -409,18 +411,27 @@ where
     {
         let mut map = CREDENTIAL_RINGS.lock().ok()?;
         let value = {
-            let ring = map.entry(provider.to_string()).or_insert_with(|| {
-                crate::failover::CredentialRing::new(keys, seed)
-                    .expect("non-empty key list checked above")
-            });
+            let ring = match map.entry(provider.to_string()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let ring = entry.into_mut();
+                    if !ring.reconfigure(keys, seed) {
+                        return None;
+                    }
+                    ring
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(crate::failover::CredentialRing::new(keys, seed)?)
+                }
+            };
             ring.current_key(std::time::Instant::now())
                 .map(str::to_string)
         };
         drop(map);
         if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
             eprintln!(
-                "[rotation] resolve provider={provider} -> {:?}",
-                value.as_deref()
+                "[rotation] resolve provider={provider} key_present={} key_len={}",
+                value.is_some(),
+                value.as_ref().map_or(0, String::len)
             );
         }
         value
@@ -430,6 +441,7 @@ where
 /// Report a 429/rate-limit against a credential (bd-cv653.3.2). The key backs
 /// off exponentially; the next `resolve_api_key` rotates to a healthy sibling.
 pub fn report_provider_rate_limit(provider: &str, key: &str) {
+    let provider = canonical_provider_id(provider).unwrap_or(provider);
     if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
         eprintln!(
             "[rotation] report provider={provider} key_len={}",
@@ -462,6 +474,50 @@ pub fn report_provider_rate_limit(provider: &str, key: &str) {
     } else if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
         eprintln!("[rotation] report but NO RING found for {provider}");
     }
+}
+
+/// Reset a credential's failure history after a successful provider request.
+/// The request's start time protects a newer 429 from an older in-flight
+/// response. Call this for the provider/key actually used by the request,
+/// rather than the model or credential installed when a whole turn ends.
+pub fn report_provider_success(provider: &str, key: &str, started_at: Instant) {
+    if key.trim().is_empty() {
+        return;
+    }
+    let provider = canonical_provider_id(provider).unwrap_or(provider);
+    if let Ok(mut map) = CREDENTIAL_RINGS.lock()
+        && let Some(ring) = map.get_mut(provider)
+    {
+        ring.report_success(key, started_at);
+    }
+}
+
+// Auth and Agent regression tests share this lock because the live rings are
+// process-global. Fixtures use direct injection instead of mutating env vars.
+#[cfg(test)]
+pub(crate) static ROTATION_TEST_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
+#[cfg(test)]
+pub(crate) fn seed_credential_ring_for_tests(
+    provider: &str,
+    ring: crate::failover::CredentialRing,
+) {
+    let provider = canonical_provider_id(provider).unwrap_or(provider);
+    CREDENTIAL_RINGS
+        .lock()
+        .expect("credential rings")
+        .insert(provider.to_string(), ring);
+}
+
+#[cfg(test)]
+pub(crate) fn credential_ring_for_tests(provider: &str) -> Option<crate::failover::CredentialRing> {
+    let provider = canonical_provider_id(provider).unwrap_or(provider);
+    CREDENTIAL_RINGS
+        .lock()
+        .expect("credential rings")
+        .get(provider)
+        .cloned()
 }
 
 #[cfg(test)]
@@ -6804,11 +6860,6 @@ mod tests {
 
     // === Credential rotation wiring (bd-cv653.3.2) ===
 
-    // The credential ring is process-global; these tests reset it, so they
-    // must not interleave (cargo runs tests on parallel threads).
-    static ROTATION_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
     #[test]
     fn rotated_key_reads_plural_env_list_and_uses_affinity() {
         let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
@@ -6834,6 +6885,97 @@ mod tests {
         let next = resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env)
             .expect("rotation provides sibling");
         assert_ne!(first, next, "backed-off key must rotate to its sibling");
+    }
+
+    #[test]
+    fn rotated_key_refreshes_changed_credentials_without_erasing_backoff() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let path = Path::new("/tmp/auth-refresh.json");
+        let original = |var: &str| (var == "OPENAI_API_KEYS").then(|| "old-a,old-b".to_string());
+        let limited = resolve_rotated_key("openai", path, original).expect("initial key");
+        let revoked = if limited == "old-a" { "old-b" } else { "old-a" };
+        report_provider_rate_limit("openai", &limited);
+
+        let updated = format!("replacement,{limited}");
+        let selected = resolve_rotated_key("openai", path, |var| {
+            (var == "OPENAI_API_KEYS").then(|| updated.clone())
+        });
+        assert_eq!(selected.as_deref(), Some("replacement"));
+        let mut ring = credential_ring_for_tests("openai").expect("updated ring");
+        let now = Instant::now();
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(300);
+        assert_eq!(ring.report_rate_limited(revoked, now, base, max), None);
+        assert_eq!(
+            ring.report_rate_limited(&limited, now, base, max),
+            Some(now + Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn rotated_key_uses_each_auth_paths_affinity() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "key-a,key-b".to_string());
+        let first = resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env)
+            .expect("first auth scope");
+        let second = resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env)
+            .expect("second auth scope");
+        assert_ne!(first, second);
+        assert_eq!(
+            resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn provider_aliases_share_rotation_failures_and_successes() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let env = |var: &str| (var == "GOOGLE_API_KEYS").then(|| "google-a,google-b".to_string());
+        let path = Path::new("/tmp/auth-alias.json");
+        let first = resolve_rotated_key("gemini", path, env).expect("alias key");
+        assert_eq!(
+            resolve_rotated_key("google", path, env),
+            Some(first.clone())
+        );
+        report_provider_rate_limit("gemini", &first);
+        let sibling = resolve_rotated_key("google", path, env).expect("canonical sibling");
+        assert_ne!(sibling, first);
+        assert_eq!(resolve_rotated_key("gemini", path, env), Some(sibling));
+        report_provider_success("google", &first, Instant::now() + Duration::from_nanos(1));
+        assert_eq!(
+            resolve_rotated_key("gemini", path, env),
+            Some(first.clone())
+        );
+        report_provider_rate_limit("google", &first);
+        report_provider_success("gemini", &first, Instant::now() + Duration::from_nanos(1));
+        assert_eq!(resolve_rotated_key("google", path, env), Some(first));
+    }
+
+    #[test]
+    fn rotated_key_requires_distinct_keys_and_deduplicates_rotation() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let path = Path::new("/tmp/auth-duplicates.json");
+        assert!(
+            resolve_rotated_key("openai", path, |var| {
+                (var == "OPENAI_API_KEYS").then(|| "same, same ,same".to_string())
+            })
+            .is_none()
+        );
+        assert!(credential_ring_for_tests("openai").is_none());
+
+        let env = |var: &str| {
+            (var == "OPENAI_API_KEYS").then(|| "repeated,repeated,sibling,repeated".to_string())
+        };
+        let first = resolve_rotated_key("openai", path, env).expect("first distinct key");
+        report_provider_rate_limit("openai", &first);
+        let second = resolve_rotated_key("openai", path, env).expect("healthy sibling");
+        assert_ne!(first, second);
+        report_provider_rate_limit("openai", &second);
+        assert!(resolve_rotated_key("openai", path, env).is_none());
     }
 
     #[test]

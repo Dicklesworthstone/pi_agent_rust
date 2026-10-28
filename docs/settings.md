@@ -330,6 +330,22 @@ Camel-case aliases `modelFallback` and `fallbackOn` are accepted. The default
 interactive `/settings` panel can change both preferences live and persist them.
 Editing them while automatic recovery is off keeps recovery off.
 
+#### Credential pools
+
+A comma-separated plural API-key variable, such as `OPENAI_API_KEYS`, enables
+rotation when it contains at least two distinct keys. The auth-file path supplies
+a stable initial preference. On an admitted rate-limit retry, print, RPC, SDK,
+and both terminal interfaces can select a healthy sibling credential after the
+failed response has been removed durably. An explicit `--api-key`, SDK key
+override, or applicable `FailoverOptions.cli_api_key` remains pinned.
+
+Each credential has its own cooldown: repeated rate limits increase it from
+15 seconds through 30, 60, 120, and 240 seconds, capped at 300 seconds. Expiry
+permits another attempt; a successful request resets the failure history. A
+request started before a newer rate limit cannot clear that newer cooldown.
+Changing the configured list removes revoked keys and adds new keys while
+retaining cooldowns for keys that remain. Provider aliases share this state.
+
 ### Search
 
 - `search_backend` (string): Backend for the `grep`/`find` tools. `inproc`

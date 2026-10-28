@@ -11,7 +11,7 @@
 //! (401/403/invalid key) NEVER trigger failover — they are loud user errors,
 //! not provider capacity problems.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -808,34 +808,83 @@ impl CooldownTracker {
 #[derive(Debug, Clone)]
 pub struct CredentialRing {
     keys: Vec<String>,
-    backoff_until: Vec<Option<Instant>>,
+    backoff: Vec<CredentialBackoff>,
     /// Stable affinity index derived from the session hash at construction.
     affinity: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CredentialBackoff {
+    last_rate_limit: Option<Instant>,
+    delay: Duration,
+}
+
+impl CredentialBackoff {
+    fn is_cooling(self, now: Instant) -> bool {
+        self.last_rate_limit
+            .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < self.delay)
+    }
+}
+
 impl CredentialRing {
+    fn deduplicate_keys(keys: &mut Vec<String>) {
+        let mut seen = HashSet::with_capacity(keys.len());
+        keys.retain(|key| seen.insert(key.clone()));
+    }
+
     /// Build a ring from a non-empty key list with session-affinity index.
+    /// Repeated credentials share one slot, retaining their configured order.
     #[must_use]
-    pub fn new(keys: Vec<String>, session_hash: u64) -> Option<Self> {
+    pub fn new(mut keys: Vec<String>, session_hash: u64) -> Option<Self> {
+        Self::deduplicate_keys(&mut keys);
         if keys.is_empty() {
             return None;
         }
         // Hash-first modulo keeps the affinity index within pointer width on
         // every target (no u64→usize truncation).
         let affinity = usize::try_from(session_hash % keys.len() as u64).unwrap_or(0);
-        let backoff_until = vec![None; keys.len()];
+        let backoff = vec![CredentialBackoff::default(); keys.len()];
         Some(Self {
             keys,
-            backoff_until,
+            backoff,
             affinity,
         })
+    }
+
+    /// Replace a non-empty configured key list without forgetting the failure
+    /// history of credentials that remain. New keys start healthy, and the
+    /// caller's affinity is recalculated even when only its auth path changed.
+    /// An empty list leaves the ring unchanged and returns false.
+    pub(crate) fn reconfigure(&mut self, mut keys: Vec<String>, session_hash: u64) -> bool {
+        Self::deduplicate_keys(&mut keys);
+        if keys.is_empty() {
+            return false;
+        }
+        let affinity = usize::try_from(session_hash % keys.len() as u64).unwrap_or(0);
+        if self.keys != keys {
+            let previous: HashMap<&str, CredentialBackoff> = self
+                .keys
+                .iter()
+                .zip(&self.backoff)
+                .map(|(key, backoff)| (key.as_str(), *backoff))
+                .collect();
+            let backoff = keys
+                .iter()
+                .map(|key| previous.get(key.as_str()).copied().unwrap_or_default())
+                .collect();
+            drop(previous);
+            self.keys = keys;
+            self.backoff = backoff;
+        }
+        self.affinity = affinity;
+        true
     }
 
     /// The current usable key at `now`: the affinity key when healthy, else
     /// the next key without an active backoff; `None` when all are cooling.
     #[must_use]
     pub fn current_key(&self, now: Instant) -> Option<&str> {
-        let usable = |idx: usize| self.backoff_until[idx].is_none_or(|until| now >= until);
+        let usable = |idx: usize| !self.backoff[idx].is_cooling(now);
         if usable(self.affinity) {
             return Some(self.keys[self.affinity].as_str());
         }
@@ -844,8 +893,13 @@ impl CredentialRing {
             .map(|idx| self.keys[idx].as_str())
     }
 
-    /// Report a 429 for `key`: exponential backoff `base * 2^strikes` clamped
-    /// to `max`. Returns the new backoff expiry for observability.
+    /// Report a 429 for `key`: repeated failures double the previous delay,
+    /// clamped to `max`, even if its previous cooldown already expired.
+    /// Success, rather than elapsed time, resets the failure history.
+    ///
+    /// Returns the new expiry when the key exists and the deadline fits in an
+    /// `Instant`. An unrepresentable deadline still leaves the key cooling;
+    /// elapsed-time checks do not overflow or accidentally release it.
     pub fn report_rate_limited(
         &mut self,
         key: &str,
@@ -854,20 +908,42 @@ impl CredentialRing {
         max: Duration,
     ) -> Option<Instant> {
         let idx = self.keys.iter().position(|k| k == key)?;
-        let previous = self.backoff_until[idx];
-        let strikes = previous.filter(|until| now < *until).map_or(0, |_| 1);
-        let delay = (base * 2_u32.pow(strikes)).min(max);
-        let expiry = now + delay;
-        self.backoff_until[idx] = Some(expiry);
-        Some(expiry)
+        let backoff = &mut self.backoff[idx];
+        let delay = if backoff.last_rate_limit.is_some() {
+            backoff.delay.saturating_mul(2).max(base)
+        } else {
+            base
+        }
+        .min(max);
+        backoff.last_rate_limit = Some(now);
+        backoff.delay = delay;
+        now.checked_add(delay)
+    }
+
+    /// A successful provider request resets only the credential it used.
+    /// A request that started before the latest 429 cannot erase a newer
+    /// cooldown when its older stream finally completes.
+    pub fn report_success(&mut self, key: &str, started_at: Instant) -> bool {
+        let Some(idx) = self.keys.iter().position(|candidate| candidate == key) else {
+            return false;
+        };
+        let backoff = &mut self.backoff[idx];
+        if backoff
+            .last_rate_limit
+            .is_some_and(|failed_at| started_at <= failed_at)
+        {
+            return false;
+        }
+        *backoff = CredentialBackoff::default();
+        true
     }
 
     /// All keys currently cooling (observability/testing).
     #[must_use]
     pub(crate) fn cooling_count(&self, now: Instant) -> usize {
-        self.backoff_until
+        self.backoff
             .iter()
-            .filter(|until| until.is_some_and(|u| now < u))
+            .filter(|backoff| backoff.is_cooling(now))
             .count()
     }
 
@@ -2479,6 +2555,166 @@ mod tests {
             Duration::from_secs(60),
         );
         assert!(ring.current_key(later).is_none());
+    }
+
+    #[test]
+    fn credential_backoff_grows_after_expiry_and_stays_capped() {
+        let mut ring = CredentialRing::new(vec!["primary".into(), "sibling".into()], 0)
+            .expect("credential ring");
+        let mut now = Instant::now();
+        for seconds in [15, 30, 60, 120, 240, 300, 300] {
+            let until = ring
+                .report_rate_limited(
+                    "primary",
+                    now,
+                    Duration::from_secs(15),
+                    Duration::from_secs(300),
+                )
+                .expect("representable cooldown");
+            assert_eq!(until.duration_since(now), Duration::from_secs(seconds));
+            assert_eq!(ring.current_key(now), Some("sibling"));
+            assert_eq!(
+                ring.current_key(until - Duration::from_nanos(1)),
+                Some("sibling")
+            );
+            assert_eq!(ring.current_key(until), Some("primary"));
+            // Retrying an expired key is not proof it recovered. Its next
+            // 429 must continue the same failure streak.
+            now = until;
+        }
+    }
+
+    #[test]
+    fn credential_success_resets_only_its_key_and_rejects_stale_requests() {
+        let start = Instant::now();
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(vec!["primary".into(), "sibling".into()], 0)
+            .expect("credential ring");
+        let _ = ring.report_rate_limited("primary", start, base, max);
+        let _ = ring.report_rate_limited("sibling", start, base, max);
+        let newer_failure = start + Duration::from_secs(2);
+        let _ = ring.report_rate_limited("primary", newer_failure, base, max);
+        assert!(!ring.report_success("primary", start + Duration::from_secs(1)));
+        assert!(!ring.report_success("primary", newer_failure));
+        assert_eq!(ring.cooling_count(newer_failure), 2);
+
+        let successful_request = newer_failure + Duration::from_secs(1);
+        assert!(ring.report_success("primary", successful_request));
+        assert_eq!(ring.current_key(successful_request), Some("primary"));
+        assert_eq!(ring.cooling_count(successful_request), 1);
+        assert!(!ring.report_success("unknown", successful_request));
+        assert_eq!(
+            ring.report_rate_limited("primary", successful_request, base, max),
+            Some(successful_request + base)
+        );
+        assert_eq!(
+            ring.report_rate_limited("sibling", successful_request, base, max),
+            Some(successful_request + Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn credential_backoff_saturates_without_releasing_extreme_deadlines() {
+        let start = Instant::now();
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(vec!["primary".into(), "sibling".into()], 0)
+            .expect("credential ring");
+        for _ in 0..3 {
+            assert_eq!(
+                ring.report_rate_limited("primary", start, Duration::MAX, max),
+                Some(start + max)
+            );
+        }
+        // An elapsed-time cooldown remains effective even when an absolute
+        // deadline cannot be represented by the platform's Instant type.
+        let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
+        let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
+        assert_eq!(
+            ring.current_key(start + Duration::from_secs(86_400)),
+            Some("sibling")
+        );
+        assert!(ring.report_success("primary", start + Duration::from_secs(1)));
+        assert_eq!(
+            ring.current_key(start + Duration::from_secs(1)),
+            Some("primary")
+        );
+    }
+
+    #[test]
+    fn credential_reconfiguration_preserves_surviving_failures_and_updates_affinity() {
+        let start = Instant::now();
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(vec!["limited".into(), "revoked".into()], 0)
+            .expect("credential ring");
+        let _ = ring.report_rate_limited("limited", start, base, max);
+        assert!(ring.reconfigure(vec!["new".into(), "limited".into()], 1));
+        assert_eq!(ring.current_key(start), Some("new"));
+        assert_eq!(ring.cooling_count(start), 1);
+        assert_eq!(ring.report_rate_limited("revoked", start, base, max), None);
+        let retry = start + base;
+        assert_eq!(
+            ring.report_rate_limited("limited", retry, base, max),
+            Some(retry + Duration::from_secs(30))
+        );
+        assert_eq!(
+            ring.report_rate_limited("new", retry, base, max),
+            Some(retry + base)
+        );
+
+        let recovered = retry + Duration::from_secs(31);
+        assert_eq!(ring.current_key(recovered), Some("limited"));
+        assert!(ring.reconfigure(vec!["new".into(), "limited".into()], 0));
+        assert_eq!(ring.current_key(recovered), Some("new"));
+        assert!(!ring.reconfigure(Vec::new(), 0));
+        assert_eq!(ring.current_key(recovered), Some("new"));
+    }
+
+    #[test]
+    fn duplicate_credentials_cannot_escape_cooldown_or_erase_failure_history() {
+        let start = Instant::now();
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(
+            vec!["limited".into(), "limited".into(), "sibling".into()],
+            0,
+        )
+        .expect("credential ring");
+        assert_eq!(ring.current_key(start), Some("limited"));
+        let _ = ring.report_rate_limited("limited", start, base, max);
+        assert_eq!(ring.current_key(start), Some("sibling"));
+        let _ = ring.report_rate_limited("sibling", start, base, max);
+        assert!(ring.current_key(start).is_none());
+
+        assert!(ring.reconfigure(
+            vec![
+                "limited".into(),
+                "new".into(),
+                "limited".into(),
+                "new".into()
+            ],
+            0,
+        ));
+        assert_eq!(ring.current_key(start), Some("new"));
+        assert_eq!(
+            ring.report_rate_limited("limited", start, base, max),
+            Some(start + Duration::from_secs(30))
+        );
+        let _ = ring.report_rate_limited("new", start, base, max);
+        assert!(ring.current_key(start).is_none());
+
+        let ring = CredentialRing::new(
+            vec![
+                "first".into(),
+                "first".into(),
+                "second".into(),
+                "third".into(),
+            ],
+            2,
+        )
+        .expect("stable distinct order");
+        assert_eq!(ring.current_key(start), Some("third"));
     }
 
     #[test]

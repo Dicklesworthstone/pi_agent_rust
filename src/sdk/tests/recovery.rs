@@ -772,6 +772,200 @@ fn every_entrypoint_resumes_instead_of_replaying_user_input() {
     }
 }
 
+struct CredentialRetryProvider {
+    keys: Arc<Mutex<Vec<Option<String>>>>,
+    streamed_failure: bool,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl crate::provider::Provider for CredentialRetryProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn api(&self) -> &str {
+        "test-api"
+    }
+
+    fn model_id(&self) -> &str {
+        "credential-retry"
+    }
+
+    async fn stream(
+        &self,
+        _context: &crate::provider::Context<'_>,
+        options: &crate::provider::StreamOptions,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+    > {
+        let first = {
+            let mut keys = self.keys.lock().unwrap();
+            keys.push(options.api_key.clone());
+            keys.len() == 1
+        };
+        if first && !self.streamed_failure {
+            return Err(Error::provider("openai", "HTTP 429: rate limit exceeded"));
+        }
+        let message = AssistantMessage {
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            content: if first {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text(TextContent::new(
+                    "credential retry completed",
+                ))]
+            },
+            stop_reason: if first {
+                StopReason::Error
+            } else {
+                StopReason::Stop
+            },
+            error_message: first.then(|| "HTTP 429: rate limit exceeded".to_string()),
+            ..Default::default()
+        };
+        let event = if first {
+            crate::model::StreamEvent::Error {
+                reason: StopReason::Error,
+                error: message,
+            }
+        } else {
+            crate::model::StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            }
+        };
+        Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn rate_limit_retries_rotate_credentials_and_preserve_explicit_pins() {
+    const CHILD: &str = "PI_SDK_CREDENTIAL_RETRY_CHILD";
+    // Keep process-global environment and credential rings out of the other
+    // tests. The child runs this exact test, with synthetic keys and no network.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sdk::tests::recovery::rate_limit_retries_rotate_credentials_and_preserve_explicit_pins",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("OPENAI_API_KEYS", "rotation-fixture-a,rotation-fixture-b")
+            .env_remove("OPENAI_API_KEY")
+            .env("PI_DEBUG_ROTATION", "1")
+            .output()
+            .expect("run isolated credential retry fixture");
+        assert!(
+            output.status.success(),
+            "credential retry fixture failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostics.contains("key_present=true"));
+        for key in ["rotation-fixture-a", "rotation-fixture-b"] {
+            assert!(
+                !diagnostics.contains(key),
+                "rotation diagnostics exposed a key"
+            );
+        }
+        return;
+    }
+
+    for entrypoint in ENTRYPOINTS {
+        for streamed_failure in [false, true] {
+            for pin in [None, Some("session"), Some("failover")] {
+                crate::auth::reset_credential_rings_for_tests();
+                let directory = tempdir().unwrap();
+                let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+                let initial = auth.resolve_api_key("openai", None).unwrap();
+                let keys = Arc::new(Mutex::new(Vec::new()));
+                let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+                let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+                handle
+                    .session
+                    .agent
+                    .set_provider(Arc::new(CredentialRetryProvider {
+                        keys: Arc::clone(&keys),
+                        streamed_failure,
+                    }));
+                handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
+                handle.session.set_auth_storage(auth.clone());
+                if pin == Some("session") {
+                    handle.session.set_api_key_override(Some(initial.clone()));
+                } else if pin == Some("failover") {
+                    handle = handle.with_failover(Some(FailoverOptions {
+                        chains: std::collections::HashMap::new(),
+                        available_models: Vec::new(),
+                        auth: auth.clone(),
+                        cli_api_key: Some(initial.clone()),
+                        cooldown_secs: 300,
+                    }));
+                }
+                let result = run_async(invoke(&mut handle, entrypoint, Arc::new(|_| {})))
+                    .expect("retry with credential rotation");
+                assert_eq!(result.stop_reason, StopReason::Stop);
+                let keys = keys.lock().unwrap();
+                assert_eq!(keys.len(), 2, "one admitted retry: {entrypoint:?}");
+                assert_eq!(keys[0].as_deref(), Some(initial.as_str()));
+                if pin.is_some() {
+                    assert_eq!(keys[1], keys[0], "explicit key stays pinned");
+                } else {
+                    assert_ne!(keys[1], keys[0], "rate-limited key must rotate");
+                    assert_eq!(keys[1], auth.resolve_api_key("openai", None));
+                }
+                let messages = run_async(handle.messages()).unwrap();
+                let expected_users = usize::from(matches!(
+                    entrypoint,
+                    Entrypoint::Prompt | Entrypoint::PromptWithAbort
+                ));
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count(),
+                    expected_users,
+                    "rotation must not replay authored input",
+                );
+            }
+        }
+    }
+
+    crate::auth::reset_credential_rings_for_tests();
+    let directory = tempdir().unwrap();
+    let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+    let initial = auth.resolve_api_key("openai", None).unwrap();
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+    let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+    handle
+        .session
+        .agent
+        .set_provider(Arc::new(CredentialRetryProvider {
+            keys: Arc::clone(&keys),
+            streamed_failure: false,
+        }));
+    handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
+    handle.session.set_auth_storage(auth.clone());
+    let (abort, signal) = AbortHandle::new();
+    let result = run_async(
+        handle.prompt_with_abort("cancel retry", signal, move |event| {
+            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                abort.abort();
+            }
+        }),
+    );
+    assert!(matches!(result, Err(Error::Aborted)));
+    assert_eq!(keys.lock().unwrap().len(), 1);
+    assert_eq!(auth.resolve_api_key("openai", None), Some(initial));
+}
+
 #[test]
 fn no_policy_preserves_the_first_error_on_every_entrypoint() {
     for entrypoint in ENTRYPOINTS {

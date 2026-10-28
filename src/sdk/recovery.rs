@@ -997,12 +997,31 @@ impl AgentSessionHandle {
         abort_signal: &AbortSignal,
         turn: &LogicalTurn,
     ) -> Result<()> {
+        let error_message = Self::turn_error_text_for(current);
+        let quota_credential = error_message
+            .as_deref()
+            .filter(|error| {
+                crate::failover::classify_failover(error)
+                    == Some(crate::failover::FailoverClass::Quota)
+            })
+            .and_then(|_| {
+                self.session
+                    .agent
+                    .stream_options()
+                    .api_key
+                    .as_ref()
+                    .map(|key| {
+                        (
+                            self.session.agent.provider().name().to_string(),
+                            key.clone(),
+                        )
+                    })
+            });
         turn.emit(AgentEvent::AutoRetryStart {
             attempt,
             max_attempts: policy.max_retries,
             delay_ms: u64::from(delay_ms),
-            error_message: Self::turn_error_text_for(current)
-                .unwrap_or_else(|| "Request error".to_string()),
+            error_message: error_message.unwrap_or_else(|| "Request error".to_string()),
         });
         let result = async {
             if !Self::await_retry_backoff(delay_ms, abort_signal).await {
@@ -1018,6 +1037,21 @@ impl AgentSessionHandle {
             turn.restored_tail();
             // Do not race cancellation against a durability operation: let it
             // settle, then refuse provider re-entry when the signal was raised.
+            ensure_not_aborted(abort_signal)?;
+            if let Some((provider, key)) = quota_credential.as_ref() {
+                // A successful rewind is the prerequisite for credential
+                // rotation, just as it is for another provider request. Keep
+                // a delayed retry from changing a newer provider selection.
+                let authority = admission.acquire_transition_authority(cx.cx()).await?;
+                ensure_not_aborted(abort_signal)?;
+                let legacy_pin = self
+                    .failover
+                    .as_ref()
+                    .and_then(|options| options.cli_api_key.as_deref());
+                self.session
+                    .rotate_rate_limited_credential(provider, key, legacy_pin);
+                drop(authority);
+            }
             ensure_not_aborted(abort_signal)
         }
         .await;

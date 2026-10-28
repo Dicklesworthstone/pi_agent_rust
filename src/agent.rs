@@ -4920,6 +4920,7 @@ impl Agent {
             ));
         }
 
+        let request_started_at = Instant::now();
         let stream_fut = provider.stream(&context, &stream_options);
         let mut stream = if let Some(signal) = abort.as_ref() {
             let abort_fut = signal.wait().fuse();
@@ -5625,7 +5626,22 @@ impl Agent {
                         &mut message,
                         empty_response_limit_reached,
                     );
-                    return Ok(self.finalize_assistant_message(message, &on_event, added_partial));
+                    let completed =
+                        self.finalize_assistant_message(message, &on_event, added_partial);
+                    if let AssistantStreamAttempt::Complete(message) = &completed
+                        && !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                        && let Some(key) = stream_options.api_key.as_deref()
+                    {
+                        // Use the request's captured provider and credential.
+                        // Later callbacks or concurrent requests may have
+                        // changed the session key or reported a newer limit.
+                        crate::auth::report_provider_success(
+                            provider.name(),
+                            key,
+                            request_started_at,
+                        );
+                    }
+                    return Ok(completed);
                 }
                 StreamEvent::Error { reason, mut error } => {
                     // Custom providers can leave the partial snapshot stamped
@@ -14978,6 +14994,80 @@ mod turn_event_tests {
         }
     }
 
+    #[test]
+    fn provider_completion_resets_only_its_credential_and_preserves_newer_limits() {
+        let _rotation = crate::auth::ROTATION_TEST_LOCK
+            .lock()
+            .expect("rotation test lock");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let request_key = "completed-request-key";
+        let other_key = "unrelated-request-key";
+
+        for (newer_limit, setup_failure) in [(false, false), (true, false), (false, true)] {
+            let mut ring = crate::failover::CredentialRing::new(
+                vec![request_key.to_string(), other_key.to_string()],
+                0,
+            )
+            .expect("nonempty ring");
+            let limited_at = Instant::now() - Duration::from_secs(1);
+            for key in [request_key, other_key] {
+                ring.report_rate_limited(
+                    key,
+                    limited_at,
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                )
+                .expect("known credential");
+            }
+            crate::auth::seed_credential_ring_for_tests("test-provider", ring);
+            let provider: Arc<dyn Provider> = if setup_failure {
+                Arc::new(StreamSetupErrorProvider)
+            } else {
+                Arc::new(SingleShotProvider)
+            };
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        api_key: Some(request_key.to_string()),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            let on_event: AgentEventHandler = Arc::new(move |event| {
+                if newer_limit && matches!(event, AgentEvent::MessageStart { .. }) {
+                    // Simulate a concurrent request reporting a limit after
+                    // this successful request was already dispatched.
+                    crate::auth::report_provider_rate_limit("test-provider", request_key);
+                }
+            });
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let result =
+                runtime.block_on(agent.stream_assistant_attempt(on_event, None, &cx, false));
+            if setup_failure {
+                assert!(result.is_err(), "setup failure must remain an error");
+            } else {
+                assert!(matches!(result, Ok(AssistantStreamAttempt::Complete(_))));
+            }
+
+            let ring =
+                crate::auth::credential_ring_for_tests("test-provider").expect("installed ring");
+            let now = Instant::now();
+            if newer_limit || setup_failure {
+                assert_eq!(ring.cooling_count(now), 2);
+                assert!(ring.current_key(now).is_none());
+            } else {
+                assert_eq!(ring.cooling_count(now), 1);
+                assert_eq!(ring.current_key(now), Some(request_key));
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct EchoTool;
 
@@ -16101,6 +16191,41 @@ impl AgentSession {
         );
         self.agent.stream_options_mut().api_key = key;
         self.refresh_extension_completion_host_state();
+    }
+
+    /// Rotate a failed request's credential after its retry tail is durable.
+    /// The caller holds provider transition authority through this mutation.
+    pub(crate) fn rotate_rate_limited_credential(
+        &mut self,
+        provider: &str,
+        key: &str,
+        legacy_cli_api_key: Option<&str>,
+    ) {
+        if self.agent.provider().name() != provider
+            // ubs:ignore-next-line Local request identity, not an authentication verifier.
+            || self.agent.stream_options().api_key.as_deref() != Some(key)
+            || self
+                .recovery_api_key_override(provider, legacy_cli_api_key)
+                .is_some_and(|key| !key.trim().is_empty())
+        {
+            return;
+        }
+        let Some(auth) = self.auth_storage.as_ref() else {
+            return;
+        };
+        crate::auth::report_provider_rate_limit(provider, key);
+        let entry = self.current_model_entry();
+        let fresh = entry.as_ref().map_or_else(
+            || normalize_api_key_opt(auth.resolve_api_key(provider, None)),
+            |entry| self.resolve_stream_api_key_for_model(entry),
+        );
+        if let Some(fresh) = fresh
+            // ubs:ignore-next-line Compare local configuration to avoid an unnecessary key replacement.
+            && fresh != key
+        {
+            self.agent.stream_options_mut().api_key = Some(fresh);
+            self.refresh_extension_completion_host_state();
+        }
     }
 
     /// The complete configured catalog, including models whose credentials are
