@@ -117,31 +117,11 @@ struct LogicalTurn {
 struct LogicalTurnState {
     session_id: Option<Arc<str>>,
     messages: Vec<Message>,
-    retry: Option<u32>,
-    fallback: Option<(String, String)>,
+    recovery: crate::failover::RecoveryEventLifecycle,
     finished: bool,
 }
 
 impl LogicalTurnState {
-    fn end_retry(&mut self, success: bool, error: Option<String>) -> Option<AgentEvent> {
-        self.retry.take().map(|attempt| AgentEvent::AutoRetryEnd {
-            success,
-            attempt,
-            final_error: error,
-        })
-    }
-
-    fn end_fallback(&mut self, success: bool) -> Option<AgentEvent> {
-        self.fallback
-            .take()
-            .map(|(provider, model)| AgentEvent::FailoverEnd {
-                success,
-                provider,
-                model,
-                restored_primary: false,
-            })
-    }
-
     fn forget_incomplete_tail(&mut self) {
         while self.messages.last().is_some_and(|message| {
             matches!(
@@ -156,7 +136,7 @@ impl LogicalTurnState {
 
     /// At most two pending lifecycles close before an incoming event. A fixed
     /// array avoids allocating a Vec for every streamed text delta.
-    fn observe(&mut self, mut event: AgentEvent) -> [Option<AgentEvent>; 3] {
+    fn observe(&mut self, event: AgentEvent) -> [Option<AgentEvent>; 3] {
         if self.finished {
             return [None, None, None];
         }
@@ -164,9 +144,7 @@ impl LogicalTurnState {
             self.messages.extend(messages);
             return [None, None, None];
         }
-        let mut retry_end = None;
-        let mut fallback_end = None;
-        let forward = match &mut event {
+        let forward = match &event {
             AgentEvent::AgentStart { session_id } => {
                 if self.session_id.is_some() {
                     false
@@ -174,45 +152,6 @@ impl LogicalTurnState {
                     self.session_id = Some(Arc::clone(session_id));
                     true
                 }
-            }
-            AgentEvent::AutoRetryStart {
-                attempt,
-                error_message,
-                ..
-            } => {
-                retry_end = self.end_retry(false, Some(error_message.clone()));
-                self.retry = Some(*attempt);
-                true
-            }
-            AgentEvent::AutoRetryEnd { attempt, .. } => {
-                let matches = self.retry == Some(*attempt);
-                if matches {
-                    self.retry = None;
-                }
-                matches
-            }
-            AgentEvent::FailoverStart {
-                to_provider,
-                to_model,
-                ..
-            } => {
-                retry_end = self.end_retry(false, Some("Retry budget exhausted".to_string()));
-                fallback_end = self.end_fallback(false);
-                self.fallback = Some((to_provider.clone(), to_model.clone()));
-                true
-            }
-            AgentEvent::FailoverEnd {
-                provider,
-                model,
-                restored_primary: false,
-                ..
-            } => {
-                // Pair the end with the target that its Start announced,
-                // even if another runtime mutation changed the live model.
-                self.fallback.take().is_some_and(|target| {
-                    (*provider, *model) = target;
-                    true
-                })
             }
             AgentEvent::AutoCompactionEnd {
                 aborted: false,
@@ -225,7 +164,11 @@ impl LogicalTurnState {
             }
             _ => true,
         };
-        [retry_end, fallback_end, forward.then_some(event)]
+        if forward {
+            self.recovery.observe(event)
+        } else {
+            [None, None, None]
+        }
     }
 }
 
@@ -292,8 +235,7 @@ impl LogicalTurn {
             }
             state.finished = true;
             let success = error.is_none();
-            let retry_end = state.end_retry(success, error.clone());
-            let fallback_end = state.end_fallback(success);
+            let [retry_end, fallback_end] = state.recovery.finish(success, error.clone());
             let terminal = state
                 .session_id
                 .take()

@@ -12,9 +12,150 @@
 //! not provider capacity problems.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub(crate) mod provider_code;
+
+/// Pair recovery events independently of the counters used to admit attempts.
+/// A new retry or fallback closes the preceding unsuccessful attempt before
+/// announcing its successor. Resetting a provider's retry budget cannot lose
+/// an open lifecycle, and duplicate terminal events cannot close it twice.
+#[derive(Default)]
+pub(crate) struct RecoveryEventLifecycle {
+    retry: Option<u32>,
+    fallback: Option<(String, String)>,
+}
+
+impl RecoveryEventLifecycle {
+    fn end_retry(
+        &mut self,
+        success: bool,
+        error: Option<String>,
+    ) -> Option<crate::agent::AgentEvent> {
+        self.retry
+            .take()
+            .map(|attempt| crate::agent::AgentEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error: error,
+            })
+    }
+
+    fn end_fallback(&mut self, success: bool) -> Option<crate::agent::AgentEvent> {
+        self.fallback
+            .take()
+            .map(|(provider, model)| crate::agent::AgentEvent::FailoverEnd {
+                success,
+                provider,
+                model,
+                restored_primary: false,
+            })
+    }
+
+    /// At most two closers precede the input event. Non-recovery events pass
+    /// through unchanged; the execution surface still owns AgentStart/End.
+    pub(crate) fn observe(
+        &mut self,
+        mut event: crate::agent::AgentEvent,
+    ) -> [Option<crate::agent::AgentEvent>; 3] {
+        use crate::agent::AgentEvent;
+
+        let mut retry_end = None;
+        let mut fallback_end = None;
+        let forward = match &mut event {
+            AgentEvent::AutoRetryStart {
+                attempt,
+                error_message,
+                ..
+            } => {
+                retry_end = self.end_retry(false, Some(error_message.clone()));
+                self.retry = Some(*attempt);
+                true
+            }
+            AgentEvent::AutoRetryEnd { attempt, .. } => {
+                let matches = self.retry == Some(*attempt);
+                if matches {
+                    self.retry = None;
+                }
+                matches
+            }
+            AgentEvent::FailoverStart {
+                to_provider,
+                to_model,
+                ..
+            } => {
+                retry_end = self.end_retry(false, Some("Retry budget exhausted".to_string()));
+                fallback_end = self.end_fallback(false);
+                self.fallback = Some((to_provider.clone(), to_model.clone()));
+                true
+            }
+            AgentEvent::FailoverEnd {
+                provider,
+                model,
+                restored_primary: false,
+                ..
+            } => self.fallback.take().is_some_and(|target| {
+                // The matching Start owns this identity even if a later
+                // runtime transition changed the currently installed model.
+                (*provider, *model) = target;
+                true
+            }),
+            _ => true,
+        };
+        [retry_end, fallback_end, forward.then_some(event)]
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        success: bool,
+        error: Option<String>,
+    ) -> [Option<crate::agent::AgentEvent>; 2] {
+        [self.end_retry(success, error), self.end_fallback(success)]
+    }
+}
+
+/// A shared recovery-event sink for drivers with separate provider-attempt
+/// callbacks. Keep one sink for the whole logical request, including every
+/// provider hop, and finish it with the request's actual terminal outcome.
+pub struct RecoveryEventStream {
+    lifecycle: Mutex<RecoveryEventLifecycle>,
+    output: Arc<dyn Fn(crate::agent::AgentEvent) + Send + Sync>,
+}
+
+impl RecoveryEventStream {
+    #[must_use]
+    pub fn new(output: impl Fn(crate::agent::AgentEvent) + Send + Sync + 'static) -> Self {
+        Self {
+            lifecycle: Mutex::new(RecoveryEventLifecycle::default()),
+            output: Arc::new(output),
+        }
+    }
+
+    pub fn emit(&self, event: crate::agent::AgentEvent) {
+        let events = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(event);
+        // The callback may inspect the driver or emit another event. It must
+        // never run while the lifecycle mutex is held.
+        for event in events.into_iter().flatten() {
+            (self.output)(event);
+        }
+    }
+
+    pub fn finish(&self, success: bool, error: Option<String>) {
+        let events = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish(success, error);
+        for event in events.into_iter().flatten() {
+            (self.output)(event);
+        }
+    }
+}
 
 /// Failure classes relevant to failover decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1598,6 +1739,189 @@ pub fn decide(
         return TurnDecision::FailOver;
     }
     TurnDecision::Finish { success: false }
+}
+
+#[cfg(test)]
+mod recovery_event_tests {
+    use super::*;
+    use crate::agent::AgentEvent;
+
+    fn retry(attempt: u32, error: &str) -> AgentEvent {
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts: 3,
+            delay_ms: 1,
+            error_message: error.to_string(),
+        }
+    }
+
+    fn fallback(attempt: u32, model: &str) -> AgentEvent {
+        AgentEvent::FailoverStart {
+            from_provider: "primary".to_string(),
+            from_model: "original".to_string(),
+            to_provider: "backup".to_string(),
+            to_model: model.to_string(),
+            class: "overload".to_string(),
+            attempt,
+            chain_index: attempt - 1,
+        }
+    }
+
+    #[test]
+    fn each_retry_attempt_finishes_before_its_successor_starts() {
+        let mut lifecycle = RecoveryEventLifecycle::default();
+        let [
+            None,
+            None,
+            Some(AgentEvent::AutoRetryStart { attempt: 1, .. }),
+        ] = lifecycle.observe(retry(1, "first failure"))
+        else {
+            panic!("first retry must open exactly one lifecycle");
+        };
+        let [
+            Some(AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt: 1,
+                final_error: Some(error),
+            }),
+            None,
+            Some(AgentEvent::AutoRetryStart { attempt: 2, .. }),
+        ] = lifecycle.observe(retry(2, "retry one failed"))
+        else {
+            panic!("retry two must close retry one before opening");
+        };
+        assert_eq!(error, "retry one failed");
+        assert!(matches!(
+            lifecycle.finish(true, None),
+            [
+                Some(AgentEvent::AutoRetryEnd {
+                    success: true,
+                    attempt: 2,
+                    final_error: None,
+                }),
+                None
+            ]
+        ));
+        assert!(lifecycle.finish(true, None).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_new_fallback_closes_the_failed_retry_and_previous_target_in_order() {
+        let mut lifecycle = RecoveryEventLifecycle::default();
+        let _ = lifecycle.observe(fallback(1, "first"));
+        let _ = lifecycle.observe(retry(1, "first fallback overloaded"));
+        let [
+            Some(AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt: 1,
+                ..
+            }),
+            Some(AgentEvent::FailoverEnd {
+                success: false,
+                provider,
+                model,
+                restored_primary: false,
+            }),
+            Some(AgentEvent::FailoverStart {
+                attempt: 2,
+                to_model,
+                ..
+            }),
+        ] = lifecycle.observe(fallback(2, "second"))
+        else {
+            panic!("old retry and fallback must close before the next hop");
+        };
+        assert_eq!((provider.as_str(), model.as_str()), ("backup", "first"));
+        assert_eq!(to_model, "second");
+
+        // The start owns the target identity even if a model transition
+        // changes what the terminal emitter observes in the live runtime.
+        let [
+            None,
+            None,
+            Some(AgentEvent::FailoverEnd {
+                success: true,
+                provider,
+                model,
+                restored_primary: false,
+            }),
+        ] = lifecycle.observe(AgentEvent::FailoverEnd {
+            success: true,
+            provider: "later-provider".to_string(),
+            model: "later-model".to_string(),
+            restored_primary: false,
+        })
+        else {
+            panic!("last fallback must close exactly once");
+        };
+        assert_eq!((provider.as_str(), model.as_str()), ("backup", "second"));
+        assert!(lifecycle.finish(true, None).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn terminal_failures_close_both_pending_lifecycles_once() {
+        for error in [
+            "Aborted",
+            "session persistence failed",
+            "failover setup failed",
+        ] {
+            let mut lifecycle = RecoveryEventLifecycle::default();
+            let _ = lifecycle.observe(fallback(1, "first"));
+            let _ = lifecycle.observe(retry(1, "overloaded"));
+            let [
+                Some(AgentEvent::AutoRetryEnd {
+                    success: false,
+                    attempt: 1,
+                    final_error: Some(actual),
+                }),
+                Some(AgentEvent::FailoverEnd {
+                    success: false,
+                    model,
+                    restored_primary: false,
+                    ..
+                }),
+            ] = lifecycle.finish(false, Some(error.to_string()))
+            else {
+                panic!("terminal failure must close the retry before the fallback");
+            };
+            assert_eq!(actual, error);
+            assert_eq!(model, "first");
+            assert!(
+                lifecycle
+                    .observe(AgentEvent::AutoRetryEnd {
+                        success: true,
+                        attempt: 1,
+                        final_error: None,
+                    })
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert!(lifecycle.finish(true, None).iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn cooldown_restoration_is_independent_of_the_finished_turn() {
+        let mut lifecycle = RecoveryEventLifecycle::default();
+        let _ = lifecycle.observe(fallback(1, "first"));
+        let _ = lifecycle.finish(true, None);
+        assert!(matches!(
+            lifecycle.observe(AgentEvent::FailoverEnd {
+                success: true,
+                provider: "primary".to_string(),
+                model: "original".to_string(),
+                restored_primary: true,
+            }),
+            [
+                None,
+                None,
+                Some(AgentEvent::FailoverEnd {
+                    restored_primary: true,
+                    ..
+                })
+            ]
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -673,6 +673,188 @@ fn event_kinds(events: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+/// Two retries on each failed provider and two committed fallback hops expose
+/// counters that accidentally replace event-lifecycle state. Exercise both
+/// successful and terminal-error outcomes through the real print/RPC drivers.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_recovery_pairs_every_attempt_across_multiple_provider_hops() {
+    use serde_json::json;
+
+    for mode in ["print", "rpc"] {
+        for final_success in [true, false] {
+            let harness = TestHarness::new(format!("e2e_{mode}_multi_hop_{final_success}"));
+            let server = harness.start_mock_http_server();
+            for provider in ["primary", "backup"] {
+                server.add_route(
+                    "POST",
+                    &format!("/{provider}/v1/chat/completions"),
+                    error_response(
+                        503,
+                        r#"{"error":{"type":"service_unavailable","message":"provider overloaded"}}"#,
+                    ),
+                );
+            }
+            server.add_route(
+                "POST",
+                "/final/v1/chat/completions",
+                if final_success {
+                    sse_response(text_sse_body("last fallback completed"))
+                } else {
+                    error_response(
+                        401,
+                        r#"{"error":{"type":"authentication_error","message":"invalid API key"}}"#,
+                    )
+                },
+            );
+            let env = PiEnv::new(&harness);
+            env.write_models(&server.base_url());
+            let models_path = env.root.join("agent/models.json");
+            let mut models: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&models_path).expect("read models"))
+                    .expect("parse models");
+            models["providers"]["e2efinal"] = json!({
+                "api": "openai-completions",
+                "baseUrl": format!("{}/final/v1", server.base_url()),
+                "apiKey": "final-key",
+                "models": [{"id": "final-model", "contextWindow": 128000}]
+            });
+            std::fs::write(
+                &models_path,
+                serde_json::to_vec(&models).expect("encode models"),
+            )
+            .expect("write three-provider registry");
+            std::fs::write(
+                env.root.join("settings.json"),
+                serde_json::to_vec(&json!({
+                    "retry": {
+                        "enabled": true, "maxRetries": 2,
+                        "baseDelayMs": 1, "maxDelayMs": 1,
+                        "maxFailoversPerTurn": 2,
+                        "fallbackChains": {
+                            "default": ["e2ebackup/backup-model", "e2efinal/final-model"]
+                        }
+                    },
+                    "checkForUpdates": false
+                }))
+                .expect("encode recovery settings"),
+            )
+            .expect("write recovery settings");
+            let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+            let mut command = env.command(&binary);
+            command.args([
+                "--provider",
+                "e2eprimary",
+                "--model",
+                "primary-model",
+                "--no-extensions",
+            ]);
+            if mode == "print" {
+                command.args(["--print", "--mode", "json", "--no-session", "ping"]);
+            } else {
+                command.arg("--rpc").stdin(Stdio::piped());
+            }
+            let mut child = command.spawn().expect("spawn recovery process");
+            if mode == "rpc" {
+                use std::io::Write as _;
+                let mut stdin = child.stdin.take().expect("RPC stdin");
+                writeln!(stdin, r#"{{"type":"prompt","id":"p1","message":"ping"}}"#)
+                    .expect("send prompt");
+            }
+            let (stdout, stderr) = run_and_collect(child, 60);
+            let events = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>();
+            harness
+                .log()
+                .info_ctx("verify", "multi-hop recovery finished", |ctx| {
+                    ctx.push(("mode".to_string(), mode.to_string()));
+                    ctx.push(("final_success".to_string(), final_success.to_string()));
+                    ctx.push(("stdout".to_string(), stdout.clone()));
+                    ctx.push(("stderr".to_string(), stderr.clone()));
+                });
+            let recovery = events
+                .iter()
+                .filter_map(|event| match event["type"].as_str()? {
+                    "auto_retry_start" => Some(json!(["retry_start", event["attempt"]])),
+                    "auto_retry_end" => {
+                        Some(json!(["retry_end", event["attempt"], event["success"]]))
+                    }
+                    "failover_start" => Some(json!([
+                        "failover_start",
+                        event["attempt"],
+                        event["fromModel"],
+                        event["toModel"]
+                    ])),
+                    "failover_end" => Some(json!([
+                        "failover_end",
+                        event["provider"],
+                        event["model"],
+                        event["success"],
+                        event["restoredPrimary"]
+                    ])),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                recovery,
+                vec![
+                    json!(["retry_start", 1]),
+                    json!(["retry_end", 1, false]),
+                    json!(["retry_start", 2]),
+                    json!(["retry_end", 2, false]),
+                    json!(["failover_start", 1, "primary-model", "backup-model"]),
+                    json!(["retry_start", 1]),
+                    json!(["retry_end", 1, false]),
+                    json!(["retry_start", 2]),
+                    json!(["retry_end", 2, false]),
+                    json!(["failover_end", "e2ebackup", "backup-model", false, false]),
+                    json!(["failover_start", 2, "backup-model", "final-model"]),
+                    json!([
+                        "failover_end",
+                        "e2efinal",
+                        "final-model",
+                        final_success,
+                        false
+                    ]),
+                ],
+                "{mode}, success={final_success}: each announced attempt needs one truthful end\n{stdout}\n{stderr}"
+            );
+            let requests = server.requests();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "/primary/v1/chat/completions",
+                    "/primary/v1/chat/completions",
+                    "/primary/v1/chat/completions",
+                    "/backup/v1/chat/completions",
+                    "/backup/v1/chat/completions",
+                    "/backup/v1/chat/completions",
+                    "/final/v1/chat/completions",
+                ],
+                "{mode}: recovery must execute the original budgets"
+            );
+            let terminal = events
+                .iter()
+                .rfind(|event| event["type"] == "agent_end")
+                .expect("terminal agent_end");
+            assert_eq!(terminal["error"].is_null(), final_success, "{stdout}");
+            if mode == "rpc" {
+                assert_eq!(events.last().expect("last event")["type"], "agent_end");
+            }
+            let log_path = harness.temp_path("multi-hop-recovery.jsonl");
+            harness
+                .write_jsonl_logs(&log_path)
+                .expect("write event evidence");
+            harness.record_artifact("multi-hop-recovery.jsonl", &log_path);
+        }
+    }
+}
+
 /// bd-2vmu6.1: in JSON mode a turn that walks the fallback chain closes its
 /// `failover_start` with exactly one `failover_end { restoredPrimary: false }`
 /// naming the fallback, emitted with the other lifecycle closers after the

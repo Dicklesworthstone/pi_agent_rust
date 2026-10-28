@@ -6817,7 +6817,7 @@ async fn run_prompt_with_retry_owned(
     };
     let mut retry_count: u32 = 0;
     let mut failovers_this_turn: u32 = 0;
-    let mut failover_open = false;
+    let recovery_events = rpc_recovery_events(out_tx.clone());
     let mut prewalk_turn = None;
     // Distinct from retry_count: a failover resets the retry BUDGET but must
     // never replay the first attempt (which would re-add the user message and
@@ -6989,23 +6989,8 @@ async fn run_prompt_with_retry_owned(
                     .map_err(|error| {
                         Error::session(format!("prewalk session lock failed: {error}"))
                     })?;
-                if retry_count > 0 {
-                    let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
-                        success: true,
-                        attempt: retry_count,
-                        final_error: None,
-                    }));
-                    retry_count = 0;
-                }
-                if failover_open {
-                    let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
-                        success: true,
-                        provider: guard.agent.provider().name().to_string(),
-                        model: guard.agent.provider().model_id().to_string(),
-                        restored_primary: false,
-                    }));
-                    failover_open = false;
-                }
+                recovery_events.finish(true, None);
+                retry_count = 0;
                 if let Some(target) = guard
                     .complete_prewalk_handoff(owner, Some(&handoff_abort))
                     .await?
@@ -7219,7 +7204,7 @@ async fn run_prompt_with_retry_owned(
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &recovery_events,
                     &options,
                     final_error.as_deref(),
                     require_incomplete_tail,
@@ -7238,7 +7223,6 @@ async fn run_prompt_with_retry_owned(
                     }
                     retry_count = 0;
                     failovers_this_turn += 1;
-                    failover_open = true;
                     final_error = None;
                     final_error_hints = None;
                     continue;
@@ -7267,12 +7251,12 @@ async fn run_prompt_with_retry_owned(
         let error_message = final_error
             .clone()
             .unwrap_or_else(|| "Request error".to_string());
-        let _ = out_tx.send(agent_event(AgentEvent::AutoRetryStart {
+        recovery_events.emit(AgentEvent::AutoRetryStart {
             attempt: retry_count,
             max_attempts: max_retries,
             delay_ms: u64::from(delay_ms),
             error_message,
-        }));
+        });
 
         let delay = Duration::from_millis(delay_ms as u64);
         let start = std::time::Instant::now();
@@ -7372,35 +7356,10 @@ async fn run_prompt_with_retry_owned(
         *guard = None;
     }
 
-    if retry_count > 0 {
-        let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
-            success,
-            attempt: retry_count,
-            final_error: if success { None } else { final_error.clone() },
-        }));
-    }
-
-    // Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
-    // entry closes its `FailoverStart` here, before the terminal `agent_end`,
-    // whether the fallback succeeded, failed, or was aborted. Restoring the
-    // primary after cooldown is a separate lifecycle (`restoredPrimary: true`
-    // from `maybe_restore_primary`). The turn context may already be
-    // cancelled, so the shared state is read with a fresh request context.
-    if failover_open {
-        let lifecycle_cx = AgentCx::for_request();
-        let (provider, model) = OwnedMutexGuard::lock(Arc::clone(&shared_state), &lifecycle_cx)
-            .await
-            .map_or_else(
-                |_| (String::new(), String::new()),
-                |state| state.active_failover_model.clone().unwrap_or_default(),
-            );
-        let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
-            success,
-            provider,
-            model,
-            restored_primary: false,
-        }));
-    }
+    // Every recovery attempt closes before the terminal RPC frame, including
+    // cancellation and a failed transition. The stream retains the identities
+    // announced by Start; closing never needs a cancellable session lock.
+    recovery_events.finish(success, if success { None } else { final_error.clone() });
 
     if !success {
         // Close the admission window before preserving any acknowledged input
@@ -7655,6 +7614,14 @@ async fn maybe_restore_primary(
     Ok(())
 }
 
+fn rpc_recovery_events(
+    out_tx: std::sync::mpsc::SyncSender<String>,
+) -> crate::failover::RecoveryEventStream {
+    crate::failover::RecoveryEventStream::new(move |event| {
+        let _ = out_tx.send(agent_event(event));
+    })
+}
+
 /// Failover walk (bd-cv653.3.2): classify the terminal error; if it is
 /// failover-eligible, resolve the next chain entry, swap the provider in the
 /// session's agent, emit FailoverStart, and record the cooldown + audit entry.
@@ -7662,7 +7629,7 @@ async fn maybe_restore_primary(
 async fn try_failover_to_next_chain_entry(
     session: Arc<Mutex<AgentSession>>,
     shared_state: Arc<Mutex<RpcSharedState>>,
-    out_tx: std::sync::mpsc::SyncSender<String>,
+    recovery_events: &crate::failover::RecoveryEventStream,
     options: &RpcOptions,
     error_text: Option<&str>,
     require_incomplete_tail: bool,
@@ -7823,7 +7790,7 @@ async fn try_failover_to_next_chain_entry(
     state.failover_cooldown = Some(cooldown);
     state.provider_admission.clear();
 
-    let event = agent_event(AgentEvent::FailoverStart {
+    let event = AgentEvent::FailoverStart {
         from_provider: committed.from_provider.clone(),
         from_model: committed.from_model.clone(),
         to_provider: committed.to_provider.clone(),
@@ -7833,19 +7800,19 @@ async fn try_failover_to_next_chain_entry(
         // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
         attempt: swaps_so_far.saturating_add(1),
         chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
-    });
+    };
     drop(state);
     drop(session_action_permit);
     drop(provider_authority);
     drop(guard);
     if let Some(attempt) = retry_attempt_to_end {
-        let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
+        recovery_events.emit(AgentEvent::AutoRetryEnd {
             success: false,
             attempt,
             final_error: Some(error_text.to_string()),
-        }));
+        });
     }
-    let _ = out_tx.send(event);
+    recovery_events.emit(event);
     Ok(true)
 }
 
@@ -10304,7 +10271,7 @@ mod retry_tests {
                         let swapped = try_failover_to_next_chain_entry(
                             Arc::clone(&session),
                             Arc::clone(&state),
-                            out_tx,
+                            &rpc_recovery_events(out_tx),
                             &options,
                             Some("503 service unavailable"),
                             false,
@@ -10441,7 +10408,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx,
+                    &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
                     false,
@@ -10493,7 +10460,7 @@ mod retry_tests {
                 !try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    exhausted_tx,
+                    &rpc_recovery_events(exhausted_tx),
                     &options,
                     Some("server error"),
                     false,
@@ -10611,7 +10578,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
                     false,
@@ -10629,7 +10596,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx,
+                    &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
                     false,
@@ -10747,7 +10714,7 @@ mod retry_tests {
             let err = try_failover_to_next_chain_entry(
                 Arc::clone(&session),
                 Arc::clone(&shared_state),
-                out_tx.clone(),
+                &rpc_recovery_events(out_tx.clone()),
                 &options,
                 Some("server error"),
                 true,
@@ -10828,11 +10795,23 @@ mod retry_tests {
             drop(inner);
             drop(guard);
 
+            let recovery_events = rpc_recovery_events(out_tx);
+            recovery_events.emit(AgentEvent::AutoRetryStart {
+                attempt: 2,
+                max_attempts: 2,
+                delay_ms: 0,
+                error_message: "server error".to_string(),
+            });
+            let retry_start: Value =
+                serde_json::from_str(&out_rx.try_recv().expect("auto_retry_start event"))
+                    .expect("retry-start event JSON");
+            assert_eq!(retry_start["type"], "auto_retry_start");
+
             assert!(
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx,
+                    &recovery_events,
                     &options,
                     Some("server error"),
                     true,
@@ -11378,7 +11357,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&fixture.session),
                     Arc::clone(&fixture.state),
-                    out_tx,
+                    &rpc_recovery_events(out_tx),
                     &fixture.options,
                     Some("503 service unavailable"),
                     false,
@@ -11466,7 +11445,7 @@ mod retry_tests {
                 !try_failover_to_next_chain_entry(
                     Arc::clone(&fixture.session),
                     Arc::clone(&fixture.state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &fixture.options,
                     Some("503 service unavailable"),
                     false,
@@ -11725,7 +11704,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
                     true,
@@ -11792,7 +11771,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
                     true,
@@ -12116,7 +12095,7 @@ mod retry_tests {
                     try_failover_to_next_chain_entry(
                         Arc::clone(&session),
                         Arc::clone(&shared_state),
-                        out_tx,
+                        &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
                         true,
@@ -12436,7 +12415,7 @@ mod retry_tests {
                     try_failover_to_next_chain_entry(
                         Arc::clone(&session),
                         Arc::clone(&shared_state),
-                        out_tx,
+                        &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
                         true,

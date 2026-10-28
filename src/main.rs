@@ -45,6 +45,7 @@ use pi::extensions::{
     resolve_extension_load_spec,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::failover::RecoveryEventStream;
 use pi::file_identity::FileIdentity;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
 use pi::models::{
@@ -10725,16 +10726,16 @@ type PrintFailoverPrimary = pi::failover::FailoverPrimary;
 /// whether the fallback succeeded, failed, or was aborted. Restoring the
 /// primary after cooldown is a separate lifecycle (`restoredPrimary: true`).
 fn emit_print_failover_end(
-    is_json: bool,
+    recovery_events: &RecoveryEventStream,
     failed_over: bool,
     session: &AgentSession,
     success: bool,
 ) {
-    if !is_json || !failed_over {
+    if !failed_over {
         return;
     }
     let provider = session.agent.provider();
-    emit_json_event(&AgentEvent::FailoverEnd {
+    recovery_events.emit(AgentEvent::FailoverEnd {
         success,
         provider: provider.name().to_string(),
         model: provider.model_id().to_string(),
@@ -10756,9 +10757,13 @@ async fn restore_print_retry_tail(
         .map_err(anyhow::Error::new)
 }
 
-fn emit_print_restore_failure(is_json: bool, retry_count: u32, error: &anyhow::Error) {
-    if is_json && retry_count > 0 {
-        emit_json_event(&AgentEvent::AutoRetryEnd {
+fn emit_print_restore_failure(
+    recovery_events: &RecoveryEventStream,
+    retry_count: u32,
+    error: &anyhow::Error,
+) {
+    if retry_count > 0 {
+        recovery_events.emit(AgentEvent::AutoRetryEnd {
             success: false,
             attempt: retry_count,
             final_error: Some(error.to_string()),
@@ -10850,7 +10855,7 @@ async fn try_print_failover(
     failover_ctx: Option<FailoverResolution<'_>>,
     failover_state: &mut PrintFailoverState,
     error_text: Option<&str>,
-    is_json: bool,
+    recovery_events: &RecoveryEventStream,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
     swaps_so_far: u32,
@@ -10966,26 +10971,24 @@ async fn try_print_failover(
         std::time::Instant::now(),
     );
 
-    if is_json {
-        if let Some(attempt) = retry_attempt_to_end {
-            emit_json_event(&AgentEvent::AutoRetryEnd {
-                success: false,
-                attempt,
-                final_error: Some(error_text.to_string()),
-            });
-        }
-        emit_json_event(&AgentEvent::FailoverStart {
-            from_provider: committed.from_provider.clone(),
-            from_model: committed.from_model.clone(),
-            to_provider: committed.to_provider.clone(),
-            to_model: committed.to_model.clone(),
-            class: format!("{class:?}").to_ascii_lowercase(),
-            // Budget position, not chain position: this swap is the
-            // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
-            attempt: swaps_so_far.saturating_add(1),
-            chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
+    if let Some(attempt) = retry_attempt_to_end {
+        recovery_events.emit(AgentEvent::AutoRetryEnd {
+            success: false,
+            attempt,
+            final_error: Some(error_text.to_string()),
         });
     }
+    recovery_events.emit(AgentEvent::FailoverStart {
+        from_provider: committed.from_provider.clone(),
+        from_model: committed.from_model.clone(),
+        to_provider: committed.to_provider.clone(),
+        to_model: committed.to_model.clone(),
+        class: format!("{class:?}").to_ascii_lowercase(),
+        // Budget position, not chain position: this swap is the
+        // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
+        attempt: swaps_so_far.saturating_add(1),
+        chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
+    });
 
     Ok(Some((committed.to_provider, committed.to_model)))
 }
@@ -11011,6 +11014,11 @@ where
     EH: Fn(AgentEvent) + Send + Sync + 'static,
 {
     let prewalk_turn = session.begin_prewalk_turn();
+    let recovery_events = RecoveryEventStream::new(move |event| {
+        if is_json {
+            emit_json_event(&event);
+        }
+    });
     let result = run_print_prompt_attempts(
         session,
         config,
@@ -11024,12 +11032,28 @@ where
         failover_ctx,
         failover_state,
         &prewalk_turn,
+        &recovery_events,
     )
     .await;
     let interrupted = result.as_ref().map_or(true, |message| {
         matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
     });
     session.finish_prewalk_turn(interrupted);
+    let final_error = result.as_ref().map_or_else(
+        |error| Some(error.to_string()),
+        |message| {
+            interrupted.then(|| {
+                message.error_message.clone().unwrap_or_else(|| {
+                    if message.stop_reason == StopReason::Aborted {
+                        "Aborted".to_string()
+                    } else {
+                        "Request error".to_string()
+                    }
+                })
+            })
+        },
+    );
+    recovery_events.finish(!interrupted, final_error);
     result
 }
 
@@ -11047,6 +11071,7 @@ async fn run_print_prompt_attempts<H, EH>(
     failover_ctx: Option<FailoverResolution<'_>>,
     failover_state: &mut PrintFailoverState,
     prewalk_turn: &pi::prewalk::PrewalkTurn,
+    recovery_events: &RecoveryEventStream,
 ) -> Result<AssistantMessage>
 where
     H: Fn() -> EH + Sync,
@@ -11113,13 +11138,13 @@ where
     loop {
         if current_result.is_ok() && session.prewalk_handoff_pending() {
             if retry_count > 0 && is_json {
-                emit_json_event(&AgentEvent::AutoRetryEnd {
+                recovery_events.emit(AgentEvent::AutoRetryEnd {
                     success: true,
                     attempt: retry_count,
                     final_error: None,
                 });
             }
-            emit_print_failover_end(is_json, failed_over, session, true);
+            emit_print_failover_end(recovery_events, failed_over, session, true);
             retry_count = 0;
             failed_over = false;
             if let Some(target) = session
@@ -11193,13 +11218,13 @@ where
                     ) =>
             {
                 if retry_count > 0 && is_json {
-                    emit_json_event(&AgentEvent::AutoRetryEnd {
+                    recovery_events.emit(AgentEvent::AutoRetryEnd {
                         success: false,
                         attempt: retry_count,
                         final_error: Some("Aborted".to_string()),
                     });
                 }
-                emit_print_failover_end(is_json, failed_over, session, false);
+                emit_print_failover_end(recovery_events, failed_over, session, false);
                 return Ok(msg);
             }
             Ok(msg) if matches!(decision, pi::failover::TurnDecision::Retry { .. }) => {
@@ -11213,7 +11238,7 @@ where
                 };
                 retry_count = attempt;
                 if is_json {
-                    emit_json_event(&AgentEvent::AutoRetryStart {
+                    recovery_events.emit(AgentEvent::AutoRetryStart {
                         attempt: retry_count,
                         max_attempts: max_retries,
                         delay_ms: u64::from(delay_ms),
@@ -11225,13 +11250,13 @@ where
                     .await
                 {
                     if is_json {
-                        emit_json_event(&AgentEvent::AutoRetryEnd {
+                        recovery_events.emit(AgentEvent::AutoRetryEnd {
                             success: false,
                             attempt: retry_count,
                             final_error: Some("Aborted".to_string()),
                         });
                     }
-                    emit_print_failover_end(is_json, failed_over, session, false);
+                    emit_print_failover_end(recovery_events, failed_over, session, false);
                     return Err(pi::error::Error::Aborted.into());
                 }
 
@@ -11243,8 +11268,8 @@ where
                 // are not re-run and prior work is not re-billed
                 // (pi_agent_rust#125). Matches RPC retry behaviour.
                 if let Err(restore_err) = restore_print_retry_tail(session, true).await {
-                    emit_print_restore_failure(is_json, retry_count, &restore_err);
-                    emit_print_failover_end(is_json, failed_over, session, false);
+                    emit_print_restore_failure(recovery_events, retry_count, &restore_err);
+                    emit_print_failover_end(recovery_events, failed_over, session, false);
                     return Err(restore_err);
                 }
                 current_result = session
@@ -11267,13 +11292,13 @@ where
                         )
                     {
                         if retry_count > 0 && is_json {
-                            emit_json_event(&AgentEvent::AutoRetryEnd {
+                            recovery_events.emit(AgentEvent::AutoRetryEnd {
                                 success: false,
                                 attempt: retry_count,
                                 final_error: msg.error_message.clone(),
                             });
                         }
-                        emit_print_failover_end(is_json, failed_over, session, false);
+                        emit_print_failover_end(recovery_events, failed_over, session, false);
                         return Ok(msg);
                     }
                     // Failover (bd-cv653.3.2): a classified transient failure
@@ -11285,7 +11310,7 @@ where
                             failover_ctx,
                             failover_state,
                             msg.error_message.as_deref(),
-                            is_json,
+                            recovery_events,
                             true,
                             (retry_count > 0).then_some(retry_count),
                             failovers_this_turn,
@@ -11297,8 +11322,8 @@ where
                     let swapped = match failover_result {
                         Ok(swapped) => swapped,
                         Err(restore_err) => {
-                            emit_print_restore_failure(is_json, retry_count, &restore_err);
-                            emit_print_failover_end(is_json, failed_over, session, false);
+                            emit_print_restore_failure(recovery_events, retry_count, &restore_err);
+                            emit_print_failover_end(recovery_events, failed_over, session, false);
                             return Err(restore_err);
                         }
                     };
@@ -11317,7 +11342,7 @@ where
                     }
                 }
                 if retry_count > 0 && is_json {
-                    emit_json_event(&AgentEvent::AutoRetryEnd {
+                    recovery_events.emit(AgentEvent::AutoRetryEnd {
                         success,
                         attempt: retry_count,
                         final_error: if success {
@@ -11327,7 +11352,7 @@ where
                         },
                     });
                 }
-                emit_print_failover_end(is_json, failed_over, session, success);
+                emit_print_failover_end(recovery_events, failed_over, session, success);
                 return Ok(msg);
             }
             Err(err) => {
@@ -11341,13 +11366,13 @@ where
                     )
                 {
                     if retry_count > 0 && is_json {
-                        emit_json_event(&AgentEvent::AutoRetryEnd {
+                        recovery_events.emit(AgentEvent::AutoRetryEnd {
                             success: false,
                             attempt: retry_count,
                             final_error: Some(err.to_string()),
                         });
                     }
-                    emit_print_failover_end(is_json, failed_over, session, false);
+                    emit_print_failover_end(recovery_events, failed_over, session, false);
                     return Err(anyhow::Error::new(err));
                 }
                 let err_str = err.to_string();
@@ -11362,7 +11387,7 @@ where
                 if let pi::failover::TurnDecision::Retry { attempt, delay_ms } = decision {
                     retry_count = attempt;
                     if is_json {
-                        emit_json_event(&AgentEvent::AutoRetryStart {
+                        recovery_events.emit(AgentEvent::AutoRetryStart {
                             attempt: retry_count,
                             max_attempts: max_retries,
                             delay_ms: u64::from(delay_ms),
@@ -11374,13 +11399,13 @@ where
                         .await
                     {
                         if is_json {
-                            emit_json_event(&AgentEvent::AutoRetryEnd {
+                            recovery_events.emit(AgentEvent::AutoRetryEnd {
                                 success: false,
                                 attempt: retry_count,
                                 final_error: Some("Aborted".to_string()),
                             });
                         }
-                        emit_print_failover_end(is_json, failed_over, session, false);
+                        emit_print_failover_end(recovery_events, failed_over, session, false);
                         return Err(pi::error::Error::Aborted.into());
                     }
 
@@ -11395,8 +11420,8 @@ where
                         let terminal_err = anyhow::Error::new(err).context(format!(
                             "retry restoration failed before provider re-entry: {restore_err}"
                         ));
-                        emit_print_restore_failure(is_json, retry_count, &terminal_err);
-                        emit_print_failover_end(is_json, failed_over, session, false);
+                        emit_print_restore_failure(recovery_events, retry_count, &terminal_err);
+                        emit_print_failover_end(recovery_events, failed_over, session, false);
                         return Err(terminal_err);
                     }
                     // Rotation bookkeeping (bd-cv653.3.2): restoration is the
@@ -11438,7 +11463,7 @@ where
                             failover_ctx,
                             failover_state,
                             Some(err_str.as_str()),
-                            is_json,
+                            recovery_events,
                             false,
                             (retry_count > 0).then_some(retry_count),
                             failovers_this_turn,
@@ -11453,8 +11478,8 @@ where
                             let terminal_err = anyhow::Error::new(err).context(format!(
                                 "failover transition failed before provider re-entry: {restore_err}"
                             ));
-                            emit_print_restore_failure(is_json, retry_count, &terminal_err);
-                            emit_print_failover_end(is_json, failed_over, session, false);
+                            emit_print_restore_failure(recovery_events, retry_count, &terminal_err);
+                            emit_print_failover_end(recovery_events, failed_over, session, false);
                             return Err(terminal_err);
                         }
                     };
@@ -11478,13 +11503,13 @@ where
                         pi::auth::report_provider_rate_limit(provider_name, key);
                     }
                     if retry_count > 0 && is_json {
-                        emit_json_event(&AgentEvent::AutoRetryEnd {
+                        recovery_events.emit(AgentEvent::AutoRetryEnd {
                             success: false,
                             attempt: retry_count,
                             final_error: Some(err_str),
                         });
                     }
-                    emit_print_failover_end(is_json, failed_over, session, false);
+                    emit_print_failover_end(recovery_events, failed_over, session, false);
                     return Err(anyhow::Error::new(err));
                 }
             }
@@ -16127,7 +16152,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 true,
                 None,
                 0,
@@ -16168,7 +16193,7 @@ mod tests {
                     failover_ctx,
                     &mut failover_state,
                     Some("server error"),
-                    false,
+                    &RecoveryEventStream::new(|_| {}),
                     true,
                     None,
                     0,
@@ -16334,7 +16359,7 @@ mod tests {
                             }),
                             &mut state,
                             Some("503 service unavailable"),
-                            false,
+                            &RecoveryEventStream::new(|_| {}),
                             false,
                             None,
                             0,
@@ -16466,7 +16491,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
                 0,
@@ -16512,7 +16537,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
                 0,
@@ -16530,7 +16555,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
                 0,
@@ -16578,7 +16603,7 @@ mod tests {
                     failover_ctx,
                     &mut holding,
                     Some("server error"),
-                    false,
+                    &RecoveryEventStream::new(|_| {}),
                     false,
                     None,
                     0,
@@ -16622,7 +16647,7 @@ mod tests {
                     failover_ctx,
                     &mut elapsed,
                     Some("server error"),
-                    false,
+                    &RecoveryEventStream::new(|_| {}),
                     false,
                     None,
                     0,
@@ -16657,7 +16682,7 @@ mod tests {
                     failover_ctx,
                     &mut ready,
                     Some("server error"),
-                    false,
+                    &RecoveryEventStream::new(|_| {}),
                     false,
                     None,
                     0,
@@ -16802,7 +16827,7 @@ mod tests {
                 }),
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
                 0,
@@ -16828,7 +16853,7 @@ mod tests {
                 }),
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
                 0,
@@ -16952,7 +16977,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
                 0,
@@ -16976,7 +17001,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
                 1,
@@ -17143,7 +17168,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
-                false,
+                &RecoveryEventStream::new(|_| {}),
                 true,
                 None,
                 0,
