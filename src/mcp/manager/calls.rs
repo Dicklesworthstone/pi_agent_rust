@@ -9,6 +9,7 @@ use super::{
     is_indeterminate_call_delivery, tool_err,
 };
 use crate::agent_cx::AgentCx;
+use crate::mcp::elicitation;
 use crate::mcp::progress::{self, ProgressSubscription};
 use crate::mcp::tasks::TaskSupport;
 use crate::mcp::transport::RequestDispatch;
@@ -26,6 +27,9 @@ mod progress_tests;
 
 #[cfg(all(test, unix))]
 mod task_tests;
+
+#[cfg(all(test, unix))]
+mod elicitation_tests;
 
 mod tasks;
 
@@ -617,6 +621,15 @@ impl McpManager {
                 registry.subscribe(Arc::clone(&guard.dispatch), expected_generation)
             });
         let generation = progress.as_ref().map(ProgressSubscription::generation);
+        let elicitation = transport.elicitation_registry().and_then(|registry| {
+            registry.subscribe(
+                Arc::clone(&guard.dispatch),
+                expected_generation,
+                task_execution.is_augmented(),
+            )
+        });
+        let task_binding = elicitation.as_ref().map(elicitation::Subscription::task_binding);
+        let ask = Self::lock(&self.inner.ask).clone();
         let mut params = serde_json::json!({"name": tool, "arguments": arguments});
         if let Some(progress) = &progress {
             // This is request metadata, never a model-supplied tool argument.
@@ -625,15 +638,30 @@ impl McpManager {
         let result = catalog::operation_with_owner(
             &owner,
             progress::observe(
-                task_execution.run(
-                    self,
-                    &owner,
-                    entry,
+                elicitation::observe(
+                    task_execution.run(
+                        self,
+                        &owner,
+                        entry,
+                        transport,
+                        params,
+                        timeout,
+                        Arc::clone(&guard.dispatch),
+                        on_update,
+                        task_binding,
+                    ),
+                    elicitation,
+                    ask,
+                    &entry.config.name,
                     transport,
-                    params,
-                    timeout,
-                    Arc::clone(&guard.dispatch),
-                    on_update,
+                    || {
+                        catalog::check_request_owner(&owner).is_ok()
+                            && self.check_running().is_ok()
+                            && is_current(entry, transport)
+                            && transport.is_alive()
+                            && self.check_trust(entry).is_ok()
+                            && transport.progress_generation() == expected_generation
+                    },
                 ),
                 progress,
                 on_update,

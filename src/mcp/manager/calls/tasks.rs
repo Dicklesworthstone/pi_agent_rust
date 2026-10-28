@@ -21,6 +21,10 @@ pub(super) struct Execution {
 }
 
 impl Execution {
+    pub(super) const fn is_augmented(&self) -> bool {
+        self.augmented
+    }
+
     pub(super) fn capture(
         transport: &Arc<dyn McpTransport>,
         support: TaskSupport,
@@ -80,6 +84,7 @@ impl Execution {
         timeout: Duration,
         dispatch: Arc<RequestDispatch>,
         on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+        elicitation: Option<crate::mcp::elicitation::TaskBinding>,
     ) -> Result<Value> {
         if !self.augmented {
             return transport
@@ -116,6 +121,9 @@ impl Execution {
         };
         self.check(manager, owner, entry, transport)?;
         let mut task = Task::from_create_result(&receipt)?;
+        if let Some(elicitation) = elicitation {
+            elicitation.bind(&active.id);
+        }
         let mut updates = StatusUpdates::default();
         loop {
             self.check(manager, owner, entry, transport)?;

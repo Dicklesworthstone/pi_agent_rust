@@ -116,7 +116,10 @@ pub(super) fn validate_initialize_result(result: &Value) -> Result<&str> {
 /// One immutable, client-selected workspace. Server requests never select or
 /// expand this scope, and changing a server's process cwd cannot change it.
 #[derive(Default)]
-struct ClientRoots(OnceLock<Value>);
+struct ClientRoots {
+    roots: OnceLock<Value>,
+    elicitation: std::sync::Arc<super::elicitation::ElicitationRegistry>,
+}
 
 impl ClientRoots {
     fn configure(&self, workspace: &Path) -> Result<()> {
@@ -141,9 +144,9 @@ impl ClientRoots {
             root["name"] = Value::String(name.to_string());
         }
         let roots = serde_json::json!({"roots": [root]});
-        match self.0.set(roots) {
+        match self.roots.set(roots) {
             Ok(()) => Ok(()),
-            Err(roots) if self.0.get() == Some(&roots) => Ok(()),
+            Err(roots) if self.roots.get() == Some(&roots) => Ok(()),
             Err(_) => Err(tool_err(
                 "MCP_ROOT_INVALID",
                 "an MCP connection's workspace root cannot change",
@@ -152,17 +155,17 @@ impl ClientRoots {
     }
 
     fn capabilities(&self) -> Value {
-        if self.0.get().is_some() {
-            serde_json::json!({"roots": {"listChanged": false}, "tasks": {}})
+        if self.roots.get().is_some() {
+            serde_json::json!({"roots": {"listChanged": false}, "tasks": {}, "elicitation": {"form": {}}})
         } else {
-            serde_json::json!({"tasks": {}})
+            serde_json::json!({"tasks": {}, "elicitation": {"form": {}}})
         }
     }
 
     fn response(&self, method: &str, id: &Value) -> Value {
         let result = match method {
             "ping" => Some(serde_json::json!({})),
-            "roots/list" => self.0.get().cloned(),
+            "roots/list" => self.roots.get().cloned(),
             _ => None,
         };
         result.map_or_else(
@@ -174,6 +177,20 @@ impl ClientRoots {
             },
             |result| serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
         )
+    }
+
+    fn route(
+        &self,
+        method: &str,
+        id: &Value,
+        params: Option<&Value>,
+        generation: u64,
+    ) -> Option<Value> {
+        if method == "elicitation/create" {
+            self.elicitation.route(id, params, generation)
+        } else {
+            Some(self.response(method, id))
+        }
     }
 }
 
@@ -211,6 +228,19 @@ pub trait McpTransport: Send + Sync {
     /// Implementations may only enqueue bounded cleanup; acknowledgement and
     /// rollback of remote effects are not implied by this call.
     fn cancel_task(&self, _task_id: &str, _generation: u64) {}
+    /// Connection-owned form mailbox. User interaction runs only on a
+    /// registered tool caller; custom transports opt in explicitly.
+    fn elicitation_registry(
+        &self,
+    ) -> Option<&std::sync::Arc<super::elicitation::ElicitationRegistry>> {
+        None
+    }
+    /// Reply to a server request without taking the outbound request lane:
+    /// that lane may be held by the tool awaiting this very response.
+    /// Implementations must never renew or change the admitted generation.
+    async fn respond_to_server_request(&self, _response: Value, _generation: u64) -> Result<()> {
+        Err(tool_err("MCP_PROTOCOL", "server request responses are unsupported"))
+    }
     /// Optional, connection-owned progress router. Existing custom transports
     /// remain valid without an observer and receive no progress token.
     fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
@@ -647,6 +677,9 @@ fn route_stdio_message(
             ));
         }
         let Some(id) = id else {
+            if method.as_str() == Some("notifications/cancelled") {
+                roots.elicitation.cancel(object.get("params"), 0);
+            }
             return Ok(()); // Valid notification; the reader routes progress.
         };
         if !valid_server_request_id(id) {
@@ -654,7 +687,14 @@ fn route_stdio_message(
                 "server request id must be a string, number, or null".to_string(),
             ));
         }
-        let response = roots.response(method.as_str().unwrap_or_default(), id);
+        let Some(response) = roots.route(
+            method.as_str().unwrap_or_default(),
+            id,
+            object.get("params"),
+            0,
+        ) else {
+            return Ok(());
+        };
         let encoded = encode_stdio_message(&response)?;
         return writer_tx
             .try_send(WriterCommand::Message(encoded))
@@ -1520,6 +1560,23 @@ impl McpTransport for StdioTransport {
 
     fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
         Some(&self.rpc.progress)
+    }
+
+    fn elicitation_registry(
+        &self,
+    ) -> Option<&std::sync::Arc<super::elicitation::ElicitationRegistry>> {
+        Some(&self.rpc.roots.elicitation)
+    }
+
+    async fn respond_to_server_request(&self, response: Value, generation: u64) -> Result<()> {
+        if generation != 0 || !self.is_alive() {
+            return Err(tool_err("MCP_TRANSPORT_CLOSED", "elicitation connection is closed"));
+        }
+        let encoded = encode_stdio_message(&response)
+            .map_err(|error| tool_err(error.code(), error.message()))?;
+        self.rpc.writer_tx.try_send(WriterCommand::Message(encoded)).map_err(|_| {
+            tool_err("MCP_TRANSPORT_IO", "elicitation response writer is unavailable")
+        })
     }
 
     fn take_tools_list_changed(&self) -> bool {
@@ -2887,6 +2944,8 @@ impl HttpTransport {
                 // session: an old stream must not address a new subscription.
                 if method == "notifications/progress" {
                     self.progress.publish(&value, wire_state.generation);
+                } else if method == "notifications/cancelled" {
+                    self.roots.elicitation.cancel(object.get("params"), wire_state.generation);
                 } else if method == "notifications/tools/list_changed" {
                     self.tools_list_changed_generation
                         .store(wire_state.generation.wrapping_add(1), Ordering::Release);
@@ -2899,8 +2958,9 @@ impl HttpTransport {
                     "SSE JSON-RPC request id must be a string or number",
                 ));
             }
-            let response = self.roots.response(method, id);
-            self.send_server_response(&response, wire_state).await?;
+            if let Some(response) = self.roots.route(method, id, object.get("params"), wire_state.generation) {
+                self.send_server_response(&response, wire_state).await?;
+            }
             return Ok(None);
         }
         validate_jsonrpc_response(&value, expected_id).map(Some)
@@ -3548,6 +3608,22 @@ impl McpTransport for HttpTransport {
 
     fn progress_registry(&self) -> Option<&std::sync::Arc<ProgressRegistry>> {
         Some(&self.progress)
+    }
+
+    fn elicitation_registry(
+        &self,
+    ) -> Option<&std::sync::Arc<super::elicitation::ElicitationRegistry>> {
+        Some(&self.roots.elicitation)
+    }
+
+    async fn respond_to_server_request(&self, response: Value, generation: u64) -> Result<()> {
+        let wire_state = self.wire_state();
+        if wire_state.generation != generation || !self.is_alive() {
+            return Err(tool_err("MCP_TRANSPORT_SUPERSEDED", "elicitation protocol session changed"));
+        }
+        // This snapshot, not the latest mutable session, supplies every wire
+        // header. The tool's owner/deadline also bounds the nested response.
+        self.send_server_response(&response, &wire_state).await
     }
 
     fn progress_generation(&self) -> u64 {
@@ -5322,7 +5398,7 @@ pub(crate) mod tests {
         std::fs::create_dir(&workspace).expect("workspace");
         std::fs::create_dir(&other).expect("other workspace");
         let roots = ClientRoots::default();
-        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{}}));
+        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}}}));
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
             -32601
@@ -5337,7 +5413,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             roots.capabilities(),
-            serde_json::json!({"roots":{"listChanged":false},"tasks":{}})
+            serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}}})
         );
 
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
@@ -5377,7 +5453,7 @@ pub(crate) mod tests {
             let error = roots.configure(&path).expect_err("invalid workspace");
             assert!(error.to_string().contains("MCP_ROOT_INVALID"), "{error}");
         }
-        assert_eq!(roots.capabilities(), serde_json::json!({}));
+        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}}}));
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
             -32601
@@ -5483,7 +5559,7 @@ for line in sys.stdin:
                 assert_eq!(observed["initialize"]["protocolVersion"], "2025-11-25");
                 assert_eq!(
                     observed["initialize"]["capabilities"],
-                    serde_json::json!({"roots":{"listChanged":false},"tasks":{}})
+                    serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}}})
                 );
                 let uri = observed["rootsReply"]["result"]["roots"][0]["uri"]
                     .as_str()
@@ -6007,7 +6083,7 @@ for line in sys.stdin:
             assert_eq!(frame["params"]["protocolVersion"], "2025-11-25");
             assert_eq!(
                 frame["params"]["capabilities"],
-                serde_json::json!({"roots":{"listChanged":false},"tasks":{}})
+                serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}}})
             );
             assert!(
                 !captured[index]

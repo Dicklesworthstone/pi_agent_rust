@@ -574,6 +574,8 @@ impl SseState {
             let Some(id) = object.get("id") else {
                 if method == "notifications/progress" {
                     self.progress.publish(message, 0);
+                } else if method == "notifications/cancelled" {
+                    self.roots.elicitation.cancel(object.get("params"), 0);
                 } else if method == "notifications/tools/list_changed" {
                     self.tools_list_changed.store(true, Ordering::Release);
                 }
@@ -591,7 +593,9 @@ impl SseState {
                     "legacy SSE server exceeded the pending client-response limit",
                 ));
             }
-            let frame = self.roots.response(method, id);
+            let Some(frame) = self.roots.route(method, id, object.get("params"), 0) else {
+                return Ok(());
+            };
             let state = Arc::clone(self);
             replies.push(Box::pin(async move {
                 HttpTransport::run_with_deadline(
@@ -848,6 +852,24 @@ impl McpTransport for SseTransport {
 
     fn progress_registry(&self) -> Option<&Arc<ProgressRegistry>> {
         Some(&self.state.progress)
+    }
+
+    fn elicitation_registry(
+        &self,
+    ) -> Option<&Arc<crate::mcp::elicitation::ElicitationRegistry>> {
+        Some(&self.state.roots.elicitation)
+    }
+
+    async fn respond_to_server_request(&self, response: Value, generation: u64) -> Result<()> {
+        if generation != 0 || !self.is_alive() {
+            return Err(tool_err("MCP_TRANSPORT_CLOSED", "elicitation connection is closed"));
+        }
+        HttpTransport::run_with_deadline(
+            self.state.post(&response, DEFAULT_MCP_TIMEOUT, None, true),
+            DEFAULT_MCP_TIMEOUT,
+            "legacy SSE elicitation response",
+        )
+        .await
     }
 
     fn take_tools_list_changed(&self) -> bool {

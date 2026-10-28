@@ -10,6 +10,7 @@
 mod auth;
 pub mod config;
 mod content;
+pub mod elicitation;
 pub mod manager;
 pub mod progress;
 pub mod tasks;
@@ -625,6 +626,7 @@ pub fn reconcile_tools(
     manager: &std::sync::Arc<McpManager>,
     registry: &crate::tools::SharedToolRegistry,
 ) -> usize {
+    manager.set_ask_tool(registry.snapshot().host_ask_tool());
     registry.bind_mcp_manager(manager);
     registry.reconcile_mcp_tools(manager, mount_tools(manager))
 }

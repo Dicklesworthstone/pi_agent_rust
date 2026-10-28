@@ -133,7 +133,9 @@ from another project cannot authorize a new root even when server `cwd` is fixed
 Connections advertise task-aware result handling with `tasks: {}`. When the
 server negotiates MCP 2025-11-25 and task-augmented tool calls, mounted tools can
 wait for their remote task to finish within the original call deadline.
-Sampling and elicitation are not advertised.
+Connections also advertise form elicitation with `elicitation: {"form": {}}`.
+Server prompts use the session's installed host picker. Sampling and URL-mode
+elicitation are not advertised.
 HTTP OAuth is available through the native authentication flow below.
 Configured authentication headers and credential references remain supported.
 
@@ -155,8 +157,8 @@ execution. An older protocol revision cannot enable tasks.
 No extra user command or model tool is required. Pi keeps the original
 `tools/call` pending after receiving a task receipt, polls `tasks/get`, and
 retrieves the actual tool output with `tasks/result`. An `input_required`
-status opens `tasks/result` immediately; it does not enable unsupported
-sampling or elicitation. Successful output still has to satisfy the tool's
+status opens `tasks/result` immediately, allowing the server to request a form
+through the originating tool's host picker. Successful output still has to satisfy the tool's
 captured `outputSchema`. Task status and live progress use the existing
 tool-update callback; see [MCP progress](../mcp-progress.md).
 
@@ -173,6 +175,44 @@ Tasks are scoped to a running tool invocation. Pi does not persist remote tasks
 for detached execution, list unrelated tasks, or resume them after restart.
 Native stdio, Streamable HTTP, and legacy SSE share this behavior when they
 negotiate the required protocol revision and capabilities.
+
+## Interactive server forms
+
+During an admitted tool call, a server can request non-sensitive information
+using [MCP form elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation).
+Pi shows the requesting server and its reason, collects each field through the
+existing ask picker, and presents the complete values for review. Choose
+**Submit these values** to share them, **Edit answers** to change them, or
+**Decline request** / **Cancel request** to end the form without sharing content.
+The picker is available to the host even when the model-facing `ask` tool is
+disabled. Classic TUI, ftui, RPC, and SDK-installed ask handlers share this path.
+Headless sessions cancel the form; `askPolicy: "recommended"` never supplies
+answers to a server automatically.
+
+Flat string, number, integer, boolean, and string-enum fields are supported,
+including titled enums and arrays of enum strings. Use the picker's **Other**
+entry for free text or typed JSON values. Strings can use JSON quotes to express
+an empty string or escapes. Numeric limits, string patterns/formats, enum
+membership, required fields, and array limits are validated before submission.
+Defaults are offered for explicit selection. Server text and the full review
+are escaped to prevent terminal controls, misleading markup, and clickable
+server-provided links. Form mode must not request passwords, API keys, tokens,
+or payment credentials; URL mode for those interactions is not supported.
+
+The server's configured `timeout` still bounds the entire tool call, including
+user interaction. Configure sufficient time for a person to answer. Cancelling
+the tool or a server form removes that form's pending reply; a late answer
+cannot resume an abandoned call. Form results retain the original transport
+session, and related-task requests retain the validated remote task identity.
+Unsolicited requests, ambiguous concurrent calls without task correlation, and
+requests from an obsolete session receive no user data.
+
+Admission is bounded to 64 observed calls per connection, eight form requests
+per call, 16 fields per form, 32 KiB of request data, 4 KiB per answer, and 16 KiB
+of submitted content. One replacement form can queue after its predecessor is
+cancelled or its response begins dispatch. Unsupported or oversized schemas
+return an invalid-params response. Requests to make the elicitation itself a
+remote task are not supported; a form can still belong to an existing tool task.
 
 ## Legacy HTTP+SSE servers
 

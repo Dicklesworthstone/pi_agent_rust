@@ -350,6 +350,11 @@ already admitted handoff through its terminal response before shutdown.
   Carries `id`, `questions` (each `{id?, question, header?, options:
   [{label, description?}], recommended?, multi}`), and `timeoutMs`.
   Answer with the `ask_response` command.
+- `ask_request_cancelled`: The wait for a published question ended before a
+  client answer, including when an MCP server cancels its form. Carries the
+  original `ask_request` `id`. Dismiss that card and any buffered copy with
+  the same ID; other cards remain active. A late `ask_response` returns
+  `resolved: false`. Normally answered cards do not emit this event.
 - `agent_end`: Turn complete.
 - `auto_retry_start` / `auto_retry_end`: Transient error retries.
 - `auto_compaction_start` / `auto_compaction_end`: Auto-compaction status.

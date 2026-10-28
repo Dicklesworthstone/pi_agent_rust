@@ -384,6 +384,7 @@ struct McpManagerInner {
     trust_path: PathBuf,
     trust_lock: Mutex<()>,
     shutting_down: AtomicBool,
+    ask: Mutex<Option<crate::ask::AskTool>>,
     warnings: Vec<super::config::ConfigWarning>,
     #[cfg(test)]
     transport_factory: Mutex<Option<Arc<TestTransportFactory>>>,
@@ -420,6 +421,7 @@ impl McpManager {
                 trust_path: global_dir.join("mcp-trust.json"),
                 trust_lock: Mutex::new(()),
                 shutting_down: AtomicBool::new(false),
+                ask: Mutex::new(None),
                 warnings: discovery.warnings,
                 #[cfg(test)]
                 transport_factory: Mutex::new(None),
@@ -427,6 +429,14 @@ impl McpManager {
                 startup_after_generation_hook: Mutex::new(None),
             }),
         }
+    }
+
+    /// Bind the session's host picker for server-originated form requests.
+    /// This shares the installed classic, ftui, RPC, or SDK ask surface even
+    /// when the model-facing ask tool is disabled. Headless calls never use
+    /// AskPolicy to manufacture an answer on the user's behalf.
+    pub fn set_ask_tool(&self, ask: crate::ask::AskTool) {
+        *Self::lock(&self.inner.ask) = Some(ask);
     }
 
     /// Discover + build in one step, enforcing the established workspace-trust

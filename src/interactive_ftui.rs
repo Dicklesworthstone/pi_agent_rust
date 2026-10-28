@@ -1942,6 +1942,9 @@ pub struct PiFtuiModel {
     ext_reply_tx: Option<Sender<ExtensionUiResponse>>,
     /// Where completed ask interactions go (launch path calls respond_ui).
     ask_reply_tx: Option<Sender<AskUiReply>>,
+    /// The live picker owner also lets buffered or cancelled cards relinquish
+    /// the editor without waiting for an unrelated turn to finish.
+    current_ask: Option<CurrentAsk>,
     /// Abort handle for the driver's in-flight prompt turn (issue #205).
     /// `run_prompt_turn` installs a fresh handle per turn; Ctrl-C fires it so
     /// exit doesn't block on the provider stream and remaining tool calls.
@@ -2324,6 +2327,7 @@ impl PiFtuiModel {
             card_draft_snapshot: None,
             ext_reply_tx: None,
             ask_reply_tx: None,
+            current_ask: None,
             turn_abort: None,
             turn_control: None,
             btw_client: None,
@@ -2475,6 +2479,12 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_ask_reply_channel(mut self, tx: Sender<AskUiReply>) -> Self {
         self.ask_reply_tx = Some(tx);
+        self
+    }
+
+    #[must_use]
+    fn with_current_ask(mut self, current: CurrentAsk) -> Self {
+        self.current_ask = Some(current);
         self
     }
 
@@ -3308,6 +3318,9 @@ impl PiFtuiModel {
                 self.scroll_from_tail = 0;
             }
             PiMsg::AskUiRequest(request) => {
+                if !self.ask_request_is_pending(&request.id) {
+                    return Cmd::none();
+                }
                 if request.request.questions.is_empty() {
                     // Defensive: an empty card resolves immediately as
                     // dismissed rather than deadlocking the pending tool.
@@ -3514,6 +3527,30 @@ impl PiFtuiModel {
                 response: AskResponse { answers, dismissed },
             });
         }
+    }
+
+    fn ask_request_is_pending(&self, id: &str) -> bool {
+        self.current_ask.as_ref().is_none_or(|current| {
+            current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|ask| ask.channel_ui_request_is_pending(id))
+        })
+    }
+
+    fn prune_expired_ask_card(&mut self) -> bool {
+        let released = self
+            .active_ask
+            .as_ref()
+            .is_some_and(|active| !self.ask_request_is_pending(&active.request.id));
+        if released {
+            self.active_ask = None;
+            self.input.set_text("");
+            self.maybe_activate_queued_ext();
+            self.restore_card_draft_after_cards_settle();
+        }
+        released
     }
 
     /// Consume the editor content as the reply to the active ask question.
@@ -6387,6 +6424,14 @@ impl Model for PiFtuiModel {
 
     fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
         let probe = self.watchdog.start();
+        if self.prune_expired_ask_card()
+            && matches!(&msg, PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_)))
+        {
+            // The event was intended for the expired card, not the restored
+            // pre-card draft or a newly promoted extension question.
+            self.watchdog.finish(LoopPhase::Input, probe);
+            return Cmd::none();
+        }
         let phase = match &msg {
             PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage(_) => {
                 LoopPhase::Input
@@ -7178,8 +7223,11 @@ fn install_ask_bridges(
     agent_tx: &Sender<PiMsg>,
     ask_reply_rx: Receiver<AskUiReply>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
+    current_ask: CurrentAsk,
 ) -> CurrentAsk {
-    let current_ask: CurrentAsk = Arc::new(Mutex::new(handle.ask_tool()));
+    *current_ask
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.ask_tool();
     if let Some(ask) = handle.ask_tool() {
         drop(install_ask_forwarder(&ask, agent_tx, runtime_handle));
     }
@@ -10404,6 +10452,8 @@ pub fn run(
     let driver_turn_control = Arc::clone(&turn_control);
     let command_registry: ExtensionCommandRegistry = Arc::default();
     let driver_command_registry = Arc::clone(&command_registry);
+    let current_ask: CurrentAsk = Arc::default();
+    let driver_current_ask = Arc::clone(&current_ask);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -10441,8 +10491,13 @@ pub fn run(
                 // Replacements must retain the exact live root set, including
                 // saved roots the SDK restored and later /remove-dir changes.
                 resume_template.workspace = handle.workspace();
-                let current_ask =
-                    install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
+                let current_ask = install_ask_bridges(
+                    &handle,
+                    &agent_tx,
+                    ask_reply_rx,
+                    &runtime_handle,
+                    driver_current_ask,
+                );
                 // Publish extension ownership before the initial ready/reset
                 // event, so completion and routing use the live session.
                 let mut info_catalog = driver_catalog;
@@ -11157,6 +11212,7 @@ pub fn run(
         .with_turn_control(turn_control)
         .with_btw_client(btw_client)
         .with_ask_reply_channel(ask_reply_tx)
+        .with_current_ask(current_ask)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
         .with_model_names(model_names)
@@ -14590,6 +14646,68 @@ mod tests {
         for ch in s.chars() {
             sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
         }
+    }
+
+    #[test]
+    fn cancelled_ask_does_not_block_successor_or_reappear_from_buffer() {
+        let (_agent_tx, agent_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+        tool.register_channel_ui_request_for_tests("cancelled");
+        tool.register_channel_ui_request_for_tests("successor");
+        let current = Arc::new(Mutex::new(Some(tool.clone())));
+        let mut model = PiFtuiModel::new(agent_rx)
+            .with_current_ask(current)
+            .with_submit_channel(submit_tx);
+        model.input.set_text("original draft");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        let questions = vec![question("Choose?", &["A", "B"], false)];
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "cancelled",
+            questions.clone(),
+        ))));
+        type_str(&mut sim, "unfinished answer");
+        tool.respond_ui(
+            "cancelled",
+            AskResponse {
+                answers: Vec::new(),
+                dismissed: true,
+            },
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "successor",
+            questions.clone(),
+        ))));
+        assert_eq!(
+            sim.model().active_ask.as_ref().unwrap().request.id,
+            "successor"
+        );
+        assert!(sim.model().input.text().is_empty());
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "cancelled",
+            questions,
+        ))));
+        assert_eq!(
+            sim.model().active_ask.as_ref().unwrap().request.id,
+            "successor"
+        );
+        assert!(tool.channel_ui_request_is_pending("successor"));
+        tool.respond_ui(
+            "successor",
+            AskResponse {
+                answers: Vec::new(),
+                dismissed: true,
+            },
+        );
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().active_ask.is_none());
+        assert_eq!(sim.model().input.text(), "original draft");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "cancelled card Enter must not submit a draft"
+        );
     }
 
     #[test]

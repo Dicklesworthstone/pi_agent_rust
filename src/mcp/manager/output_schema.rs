@@ -148,6 +148,16 @@ impl McpOutputSchema {
     /// Rejects malformed, oversized, excessively nested, or unresolved schemas.
     /// Error messages deliberately omit server-provided schema values and URIs.
     pub fn compile(schema: &Value) -> Result<Self> {
+        Self::compile_with_formats(schema, false)
+    }
+
+    /// Elicitation forms must enforce their advertised string formats as well
+    /// as ordinary JSON Schema constraints, without fetching external schemas.
+    pub(crate) fn compile_form(schema: &Value) -> Result<Self> {
+        Self::compile_with_formats(schema, true)
+    }
+
+    fn compile_with_formats(schema: &Value, validate_formats: bool) -> Result<Self> {
         if !schema.is_object() {
             return Err(tool_err(
                 "MCP_PROTOCOL",
@@ -167,16 +177,27 @@ impl McpOutputSchema {
                 "tools/list outputSchema exceeds the schema byte limit",
             )
         })?;
-        let validator = jsonschema::options()
-            .with_retriever(NoExternalSchemas)
-            .with_pattern_options(
-                PatternOptions::fancy_regex()
-                    .backtrack_limit(MAX_REGEX_BACKTRACKS)
-                    .size_limit(MAX_REGEX_BYTES)
-                    .dfa_size_limit(MAX_REGEX_DFA_BYTES),
-            )
-            .build(schema)
-            .map_err(|_| {
+        let patterns = || {
+            PatternOptions::fancy_regex()
+                .backtrack_limit(MAX_REGEX_BACKTRACKS)
+                .size_limit(MAX_REGEX_BYTES)
+                .dfa_size_limit(MAX_REGEX_DFA_BYTES)
+        };
+        let compiled = if validate_formats {
+            jsonschema::options()
+                .with_retriever(NoExternalSchemas)
+                .with_pattern_options(patterns())
+                .should_validate_formats(true)
+                .build(schema)
+        } else {
+            // Preserve the established dialect-specific default for tool
+            // input/output schemas. Explicit false would weaken older drafts.
+            jsonschema::options()
+                .with_retriever(NoExternalSchemas)
+                .with_pattern_options(patterns())
+                .build(schema)
+        };
+        let validator = compiled.map_err(|_| {
                 tool_err(
                     "MCP_PROTOCOL",
                     "tools/list outputSchema is invalid, unsupported, or references an unavailable schema",
@@ -192,6 +213,10 @@ impl McpOutputSchema {
     #[must_use]
     pub fn schema(&self) -> &Value {
         &self.0.schema
+    }
+
+    pub(crate) fn accepts(&self, value: &Value) -> bool {
+        self.0.validator.is_valid(value)
     }
 
     /// Check a completed tool response. An explicit tool execution error is
@@ -247,6 +272,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn form_format_assertions_preserve_existing_tool_dialect_defaults() {
+        for draft in [
+            "http://json-schema.org/draft-07/schema#",
+            "https://json-schema.org/draft/2020-12/schema",
+        ] {
+            let schema = json!({
+                "$schema":draft, "type":"object", "required":["email"],
+                "properties":{"email":{"type":"string","format":"email"}}
+            });
+            let invalid = json!({"email":"missing-at-sign"});
+            let previous_default = jsonschema::options().build(&schema).unwrap();
+            let tool = McpOutputSchema::compile(&schema).unwrap();
+            assert_eq!(tool.accepts(&invalid), previous_default.is_valid(&invalid));
+            assert!(!McpOutputSchema::compile_form(&schema).unwrap().accepts(&invalid));
+        }
+    }
 
     fn contract() -> McpOutputSchema {
         McpOutputSchema::compile(&json!({

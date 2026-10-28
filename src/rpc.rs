@@ -90,6 +90,32 @@ impl Drop for AskUiCloseGuard {
     }
 }
 
+/// Track only published cards. The same lock linearizes normal answers with
+/// cancellation observation, so an answered card gets no spurious cancel.
+#[derive(Default)]
+struct RpcAskBridgeState {
+    forwarded: HashSet<String>,
+    closed: bool,
+}
+
+impl RpcAskBridgeState {
+    fn prune(&mut self, ask: &crate::ask::AskTool, mut emit: impl FnMut(&str) -> bool) {
+        self.forwarded
+            .retain(|id| ask.channel_ui_request_is_pending(id) || !emit(id));
+    }
+}
+
+struct RpcAskBridgeCloseGuard(Arc<std::sync::Mutex<RpcAskBridgeState>>);
+
+impl Drop for RpcAskBridgeCloseGuard {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+}
+
 /// Closes the extension UI channel and releases every waiting request on all
 /// RPC exit paths. The forwarder owns a manager clone while the manager owns
 /// the matching channel sender, so relying on normal EOF cleanup alone would
@@ -2600,19 +2626,66 @@ pub async fn run(
     // an `ask_response` command. Response routing is id-keyed through the
     // AskTool's own pending map (with its built-in wait budget), so no
     // active/queue ordering state is needed here.
+    let ask_bridge_state = Arc::new(std::sync::Mutex::new(RpcAskBridgeState::default()));
+    let _ask_bridge_close = RpcAskBridgeCloseGuard(Arc::clone(&ask_bridge_state));
     if let Some(ref ask) = options.ask_tool {
         let (ask_ui_tx, mut ask_ui_rx) =
             asupersync::channel::mpsc::channel::<crate::ask::AskUiRequest>(4);
         ask.install_channel_ui(ask_ui_tx);
         let ask_forwarder = ask.clone();
         let out_tx_ask = out_tx.clone();
+        let bridge = Arc::clone(&ask_bridge_state);
         options.runtime_handle.spawn(async move {
             let cx = AgentCx::for_request();
-            while let Ok(request) = ask_ui_rx.recv(&cx).await {
+            loop {
+                {
+                    let mut state = bridge
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.closed {
+                        break;
+                    }
+                    state.prune(&ask_forwarder, |id| {
+                        out_tx_ask
+                            .try_send(event(&json!({"type":"ask_request_cancelled", "id":id})))
+                            .is_ok()
+                    });
+                }
+                let request = match asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_millis(50),
+                    ask_ui_rx.recv(&cx),
+                )
+                .await
+                {
+                    Ok(Ok(request)) => request,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                };
+                let mut state = bridge
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.closed {
+                    break;
+                }
+                // Refuse an unreachable card instead of retaining unbounded
+                // IDs when a client cannot drain cancellation notifications.
+                if state.forwarded.len() >= 256 {
+                    ask_forwarder.respond_ui(
+                        &request.id,
+                        crate::ask::AskResponse {
+                            answers: Vec::new(),
+                            dismissed: true,
+                        },
+                    );
+                    continue;
+                }
                 let frame = event(&ask_request_rpc_event(&request));
-                ask_forwarder.try_forward_channel_ui_request(&request.id, || {
+                if ask_forwarder.try_forward_channel_ui_request(&request.id, || {
                     out_tx_ask.try_send(frame).is_ok()
-                });
+                }) {
+                    state.forwarded.insert(request.id);
+                }
             }
         });
     }
@@ -5889,7 +5962,13 @@ pub async fn run(
                 };
                 match rpc_parse_ask_response(&parsed) {
                     Ok((request_id, response)) => {
-                        let resolved = ask.respond_ui(&request_id, response);
+                        let resolved = {
+                            let mut state = ask_bridge_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.forwarded.remove(&request_id);
+                            ask.respond_ui(&request_id, response)
+                        };
                         let _ = out_tx.send(response_ok(
                             id,
                             "ask_response",
@@ -28063,6 +28142,43 @@ export default function init(pi) {
         let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
         let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
         assert_eq!(resp.value, Some(json!("Beta")));
+    }
+
+    #[test]
+    fn ask_cancellation_tracking_preserves_other_cards_and_retries_backpressure() {
+        let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+        for id in ["cancelled", "answered", "live"] {
+            ask.register_channel_ui_request_for_tests(id);
+        }
+        let mut state = RpcAskBridgeState::default();
+        state
+            .forwarded
+            .extend(["cancelled", "answered", "live"].map(str::to_string));
+        for id in ["cancelled", "answered"] {
+            ask.respond_ui(
+                id,
+                crate::ask::AskResponse {
+                    answers: Vec::new(),
+                    dismissed: true,
+                },
+            );
+        }
+        // The normal ask_response path removes its ID while holding this
+        // same state lock; only an abandoned wait emits cancellation.
+        state.forwarded.remove("answered");
+        state.prune(&ask, |_| false);
+        assert!(state.forwarded.contains("cancelled"));
+        let mut cancelled = Vec::new();
+        state.prune(&ask, |id| {
+            cancelled.push(id.to_string());
+            true
+        });
+        assert_eq!(cancelled, vec!["cancelled"]);
+        assert_eq!(state.forwarded, HashSet::from(["live".to_string()]));
+        let shared = Arc::new(std::sync::Mutex::new(state));
+        drop(RpcAskBridgeCloseGuard(Arc::clone(&shared)));
+        assert!(shared.lock().unwrap().closed);
+        assert!(ask.channel_ui_request_is_pending("live"));
     }
 
     /// bd-cv653.3.8: the ask_request frame carries the request id, the

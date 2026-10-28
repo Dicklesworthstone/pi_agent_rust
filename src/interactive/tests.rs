@@ -825,7 +825,66 @@ fn new_session_thinking_level_resolves_configured_default() {
     );
 }
 
-/// route to AskTool::respond_ui (an expired request surfaces a status).
+#[test]
+fn cancelled_ask_cards_release_the_editor_for_a_successor() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+    app.ask_tool = Some(tool.clone());
+    app.input.set_value("original draft");
+    let request: crate::ask::AskRequest = serde_json::from_value(serde_json::json!({
+        "questions": [{"question":"Choose?", "options":[{"label":"A"},{"label":"B"}]}]
+    }))
+    .unwrap();
+    for id in ["cancelled-active", "cancelled-buffered", "successor"] {
+        tool.register_channel_ui_request_for_tests(id);
+    }
+    for id in ["cancelled-active", "cancelled-buffered"] {
+        let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+            id: id.to_string(),
+            request: request.clone(),
+        }));
+    }
+    app.input.set_value("unfinished answer");
+    for id in ["cancelled-active", "cancelled-buffered"] {
+        tool.respond_ui(
+            id,
+            crate::ask::AskResponse {
+                answers: Vec::new(),
+                dismissed: true,
+            },
+        );
+    }
+    let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "successor".to_string(),
+        request: request.clone(),
+    }));
+    assert_eq!(app.active_ask_ui.as_ref().unwrap().request.id, "successor");
+    assert!(app.ask_ui_queue.is_empty());
+    assert_eq!(app.input_card_order.len(), 1);
+    assert!(app.input.value().is_empty());
+    assert_eq!(app.card_draft_snapshot.as_deref(), Some("original draft"));
+    let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "cancelled-active".to_string(),
+        request,
+    }));
+    assert!(app.ask_ui_queue.is_empty());
+    assert!(tool.channel_ui_request_is_pending("successor"));
+    app.agent_state = AgentState::ToolRunning;
+    tool.respond_ui(
+        "successor",
+        crate::ask::AskResponse {
+            answers: Vec::new(),
+            dismissed: true,
+        },
+    );
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_ask_ui.is_none());
+    assert_eq!(app.input.value(), "original draft");
+    assert!(app.message_queue.lock().unwrap().pop_steering().is_empty());
+}
+
+/// Route to AskTool::respond_ui (an expired request surfaces a status).
 #[test]
 fn ask_card_consumes_input_and_advances_questions() {
     let dir = tempdir();

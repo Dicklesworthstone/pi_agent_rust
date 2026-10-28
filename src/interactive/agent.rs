@@ -815,6 +815,7 @@ impl PiApp {
 
     /// Handle custom Pi messages from the agent.
     pub(super) fn handle_pi_message(&mut self, msg: PiMsg) -> Option<Cmd> {
+        self.prune_expired_ask_cards();
         self.handle_pi_message_with_session_retry(msg, SESSION_EVENT_LOCK_RETRY_ATTEMPTS)
     }
 
@@ -2440,6 +2441,41 @@ After approving access in the browser, press Enter in Pi to complete login."
         } else {
             self.status_message = Some("Extensions are disabled".to_string());
         }
+    }
+
+    /// A cancelled provider/server wait releases only its own cards. Keep the
+    /// mixed Ask/extension order aligned when removing buffered requests.
+    pub(super) fn prune_expired_ask_cards(&mut self) -> bool {
+        let Some(tool) = self.ask_tool.clone() else {
+            return false;
+        };
+        let mut queued = VecDeque::new();
+        self.ask_ui_queue.retain(|request| {
+            let pending = tool.channel_ui_request_is_pending(&request.id);
+            queued.push_back(pending);
+            pending
+        });
+        let mut active = self.active_ask_ui.is_some();
+        self.input_card_order.retain(|kind| {
+            if *kind != InputCardKind::Ask {
+                true
+            } else if active {
+                active = false;
+                true
+            } else {
+                queued.pop_front().unwrap_or(false)
+            }
+        });
+        let released = self
+            .active_ask_ui
+            .as_ref()
+            .is_some_and(|card| !tool.channel_ui_request_is_pending(&card.request.id));
+        if released {
+            self.active_ask_ui = None;
+            self.complete_input_card_transition(InputCardKind::Ask);
+        }
+        self.restore_card_draft_after_cards_settle();
+        released
     }
 
     /// Ask cards (bd-cv653.3.8): show the next queued request's current

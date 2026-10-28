@@ -3699,6 +3699,11 @@ impl PiApp {
     /// Inner update handler (extracted for frame timing instrumentation).
     #[allow(clippy::too_many_lines)]
     fn update_inner(&mut self, msg: Message) -> Option<Cmd> {
+        if self.prune_expired_ask_cards() && msg.is::<KeyMsg>() {
+            // This key belonged to the cancelled card. In particular, Enter
+            // must not submit the pre-card draft restored by pruning.
+            return None;
+        }
         // Memory pressure sampling + progressive collapse (PERF-6)
         self.memory_monitor.maybe_sample();
         self.run_memory_pressure_actions();
