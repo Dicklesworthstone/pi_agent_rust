@@ -42,8 +42,11 @@ mod deepseek;
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_READY_EVENTS_PER_YIELD: usize = 64;
 const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
 const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
+
+type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
 /// Map a role string (which may come from compat config at runtime) to a `Cow<'_, str>`.
 ///
@@ -821,89 +824,113 @@ impl Provider for OpenAIProvider {
             return Err(Error::api(message));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
+        Ok(wire_stream(
+            response.bytes_stream(),
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
+        ))
+    }
+}
 
-        // Create stream state
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
+/// Silent metadata and heartbeat frames must not monopolize one executor poll.
+/// Wake the existing consumer without creating a timer or detached task.
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
 
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                loop {
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
+fn wire_stream<S>(source: S, model: String, api: String, provider: String) -> EventStream
+where
+    S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
+{
+    let state = StreamState::new(SseStream::new(source), model, api, provider);
+    let output = stream::unfold(Some(state), |active| async move {
+        let mut state = active?;
+        let mut ready_events = 0;
+        loop {
+            if let Some(event) = state.pending_events.pop_front() {
+                let terminal =
+                    matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                // Drop the socket, captured owner and buffered tail before
+                // exposing the terminal event. The caller may retain this
+                // stream without polling it again.
+                let active = (!terminal).then_some(state);
+                return Some((Ok(event), active));
+            }
+            // A terminal frame can enqueue block-end events before Done.
+            // Drain that queue even after the transport is finished.
+            if state.done {
+                return None;
+            }
+            if ready_events == MAX_READY_EVENTS_PER_YIELD {
+                yield_stream_turn().await;
+                ready_events = 0;
+            }
+            ready_events += 1;
+
+            match state.event_source.next().await {
+                Some(Ok(msg)) => {
+                    state.transient_error_count = 0;
+                    // Final usage may follow finish_reason, so only [DONE]
+                    // seals the response and releases its source.
+                    if msg.data.trim() == "[DONE]" {
+                        state.finish_response();
+                        continue;
                     }
-                    // A terminal frame can enqueue block-end events before Done.
-                    // Drain that queue even after the transport is finished.
-                    if state.done {
-                        return None;
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            // A successful chunk resets the consecutive error counter.
-                            state.transient_error_count = 0;
-                            // OpenAI sends "[DONE]" as final message
-                            if msg.data.trim() == "[DONE]" {
-                                state.finish_response();
-                                continue;
-                            }
-
-                            if let Err(e) = state.process_event(&msg.data) {
-                                state.done = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                            // Skip them and keep reading the stream, but cap
-                            // consecutive occurrences to avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.done = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        // A clean transport EOF is not a successful OpenAI
-                        // completion unless the [DONE] sentinel was observed.
-                        // The agent loop retains partial content on this error.
-                        None => {
-                            state.done = true;
-                            return Some((
-                                Err(Error::api(
-                                    "OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
-                                )),
-                                state,
-                            ));
-                        }
+                    if let Err(error) = state.process_event(&msg.data) {
+                        return Some((Err(error), None));
                     }
                 }
-            },
-        );
-
-        Ok(Box::pin(stream))
-    }
+                Some(Err(error)) => {
+                    // Retain the existing bounded transient-error policy.
+                    const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WriteZero
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) {
+                        state.transient_error_count += 1;
+                        if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+                            tracing::warn!(
+                                kind = ?error.kind(),
+                                count = state.transient_error_count,
+                                "Transient error in SSE stream, continuing"
+                            );
+                            continue;
+                        }
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
+                             consecutive attempts, treating as fatal"
+                        );
+                    }
+                    return Some((Err(Error::sse(&error)), None));
+                }
+                // A clean EOF is not a completion without [DONE]. The agent
+                // retains the partial content delivered before this error.
+                None => {
+                    return Some((
+                        Err(Error::api(
+                            "OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
+                        )),
+                        None,
+                    ));
+                }
+            }
+        }
+    });
+    Box::pin(output.fuse())
 }
 
 // ============================================================================

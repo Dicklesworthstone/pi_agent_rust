@@ -31,6 +31,7 @@ const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta"
 const GOOGLE_GEMINI_CLI_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_ANTIGRAVITY_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const MAX_GENERATION_ERROR_BYTES: usize = 64 * 1024;
+const MAX_READY_EVENTS_PER_YIELD: usize = 64;
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 fn authorization_override(
@@ -532,6 +533,23 @@ impl Provider for GeminiProvider {
 // Stream State
 // ============================================================================
 
+/// Heartbeats and usage-only frames do not produce public events. A ready
+/// transport must still let the consumer's abort branch and sibling sessions
+/// run; this yield remains owned by the response rather than a detached task.
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
 /// Shared by Developer API, Cloud Code Assist and Google-native Vertex.
 /// Keeping one parser also keeps signature boundaries and usage accounting
 /// identical across the three transports.
@@ -592,14 +610,24 @@ where
         self,
         cloud_cli_mode: bool,
     ) -> impl Stream<Item = Result<StreamEvent>> {
-        stream::unfold(self, move |mut state| async move {
+        stream::unfold(Some(self), move |active| async move {
+            let mut state = active?;
+            let mut ready_events = 0;
             loop {
                 if let Some(event) = state.pending_events.pop_front() {
-                    return Some((Ok(event), state));
+                    let active =
+                        (!matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. }))
+                            .then_some(state);
+                    return Some((Ok(event), active));
                 }
                 if state.finished {
                     return None;
                 }
+                if ready_events == MAX_READY_EVENTS_PER_YIELD {
+                    yield_stream_turn().await;
+                    ready_events = 0;
+                }
+                ready_events += 1;
                 match state.event_source.next().await {
                     Some(Ok(msg)) => {
                         if msg.event == "ping" {
@@ -611,20 +639,21 @@ where
                             state.process_event(&msg.data)
                         };
                         if let Err(error) = result {
-                            state.finished = true;
-                            return Some((Err(error), state));
+                            return Some((Err(error), None));
                         }
                     }
                     Some(Err(error)) => {
                         // SseStream errors are terminal. Swallowing a timeout
                         // here would turn its next EOF into a clean success
                         // when a finish marker had already been observed.
-                        state.finished = true;
-                        return Some((Err(Error::sse(&error)), state));
+                        return Some((Err(Error::sse(&error)), None));
                     }
                     None => {
                         let outcome = state.finish_at_eof();
-                        return Some((outcome, state));
+                        // Keep reading through EOF for trailing usage and late
+                        // signatures, then release the source and its owner
+                        // before the consumer can observe the terminal result.
+                        return Some((outcome, None));
                     }
                 }
             }
@@ -1391,6 +1420,347 @@ pub(crate) fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaratio
 #[cfg(test)]
 mod tests {
     mod integration_reasoning;
+
+    mod stream_lifecycle {
+        use super::super::*;
+        use asupersync::runtime::RuntimeBuilder;
+        use futures::FutureExt as _;
+        use serde_json::{Value, json};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context as TaskContext, Poll, Wake, Waker};
+
+        type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+
+        #[derive(Clone, Copy)]
+        struct Mode {
+            api: &'static str,
+            provider: &'static str,
+            cloud_cli: bool,
+        }
+
+        const MODES: [Mode; 3] = [
+            Mode {
+                api: "google-generative-ai",
+                provider: "google",
+                cloud_cli: false,
+            },
+            Mode {
+                api: "google-vertex",
+                provider: "google-vertex",
+                cloud_cli: false,
+            },
+            Mode {
+                api: "google-gemini-cli",
+                provider: "google-gemini-cli",
+                cloud_cli: true,
+            },
+        ];
+
+        enum Tail {
+            Eof,
+            Pending,
+            Repeat(Vec<u8>),
+        }
+
+        struct ObservedSource {
+            chunks: VecDeque<std::io::Result<Vec<u8>>>,
+            tail: Tail,
+            repeated_polls: usize,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Stream for ObservedSource {
+            type Item = std::io::Result<Vec<u8>>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _: &mut TaskContext<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                let this = self.get_mut();
+                if let Some(chunk) = this.chunks.pop_front() {
+                    return Poll::Ready(Some(chunk));
+                }
+                match &this.tail {
+                    Tail::Eof => Poll::Ready(None),
+                    Tail::Pending => Poll::Pending,
+                    Tail::Repeat(frame) => {
+                        this.repeated_polls += 1;
+                        // A regression must fail rather than hang this test on
+                        // an endlessly ready source that never yields a result.
+                        assert!(
+                            this.repeated_polls <= MAX_READY_EVENTS_PER_YIELD * 4,
+                            "silent frames monopolized the consumer's poll"
+                        );
+                        Poll::Ready(Some(Ok(frame.clone())))
+                    }
+                }
+            }
+        }
+
+        impl Drop for ObservedSource {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn observed(
+            mode: Mode,
+            chunks: impl IntoIterator<Item = std::io::Result<Vec<u8>>>,
+            tail: Tail,
+        ) -> (EventStream, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let source = ObservedSource {
+                chunks: chunks.into_iter().collect(),
+                tail,
+                repeated_polls: 0,
+                dropped: Arc::clone(&dropped),
+            };
+            let state = StreamState::new(
+                SseStream::new(source),
+                "gemini-test".into(),
+                mode.api.into(),
+                mode.provider.into(),
+            );
+            (Box::pin(state.into_stream(mode.cloud_cli)), dropped)
+        }
+
+        fn wire(mode: Mode, value: Value) -> Vec<u8> {
+            let value = if mode.cloud_cli {
+                json!({"response": value})
+            } else {
+                value
+            };
+            format!("data: {value}\n\n").into_bytes()
+        }
+
+        fn usage() -> Value {
+            json!({"usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 3,
+                "thoughtsTokenCount": 2,
+                "cachedContentTokenCount": 4,
+                "totalTokenCount": 16
+            }})
+        }
+
+        fn assert_usage(message: &AssistantMessage) {
+            assert_eq!(message.usage.input, 7);
+            assert_eq!(message.usage.cache_read, 4);
+            assert_eq!(message.usage.output, 5);
+            assert_eq!(message.usage.total_tokens, 16);
+        }
+
+        fn assert_retired(output: &mut EventStream, dropped: &AtomicBool) {
+            // Check before another poll: the consumer can retain a stream
+            // indefinitely after receiving its terminal outcome.
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "terminal delivery retained the response source"
+            );
+            for _ in 0..3 {
+                assert!(
+                    output
+                        .next()
+                        .now_or_never()
+                        .expect("terminal stream must stay ready")
+                        .is_none()
+                );
+            }
+        }
+
+        #[test]
+        fn terminal_releases_source_after_collecting_late_usage_and_signatures() {
+            for mode in MODES {
+                let chunks = [
+                    json!({"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}),
+                    json!({"candidates": [{"finishReason": "STOP"}]}),
+                    json!({"candidates": [{"content": {"parts": [{
+                        "text": "", "thoughtSignature": "bGF0ZQ=="
+                    }]}}]}),
+                    usage(),
+                ]
+                .map(|value| Ok(wire(mode, value)));
+                let (mut output, dropped) = observed(mode, chunks, Tail::Eof);
+                let mut terminal = None;
+                for _ in 0..12 {
+                    let event = output.next().now_or_never().unwrap().unwrap().unwrap();
+                    if let StreamEvent::Done { reason, message } = event {
+                        assert_eq!(reason, StopReason::Stop);
+                        terminal = Some(message);
+                        break;
+                    }
+                    assert!(!dropped.load(Ordering::SeqCst));
+                }
+                let message = terminal.expect("missing terminal outcome");
+                assert_eq!(message.api, mode.api);
+                assert_eq!(message.provider, mode.provider);
+                assert_usage(&message);
+                assert_eq!(message.content.len(), 2);
+                let ContentBlock::Text(text) = &message.content[1] else {
+                    panic!("missing late signed text");
+                };
+                // ubs:ignore[rust.security.constant-time-compare] Public fixture equality, not authentication.
+                assert_eq!(text.text_signature.as_deref(), Some("bGF0ZQ=="));
+                assert_retired(&mut output, &dropped);
+            }
+        }
+
+        #[test]
+        fn refused_prompt_retains_late_usage_and_retires_its_source() {
+            for mode in MODES {
+                let chunks = [
+                    json!({"promptFeedback": {"blockReason": "SAFETY"}}),
+                    usage(),
+                ]
+                .map(|value| Ok(wire(mode, value)));
+                let (mut output, dropped) = observed(mode, chunks, Tail::Eof);
+                let Some(Ok(StreamEvent::Done { reason, message })) =
+                    output.next().now_or_never().unwrap()
+                else {
+                    panic!("missing refused terminal outcome");
+                };
+                assert_eq!(reason, StopReason::Error);
+                assert!(message.error_message.as_deref().unwrap().contains("SAFETY"));
+                assert!(message.content.is_empty());
+                assert_usage(&message);
+                assert_retired(&mut output, &dropped);
+            }
+        }
+
+        #[test]
+        fn parser_transport_and_incomplete_errors_retire_before_delivery() {
+            for mode in MODES {
+                let cases = [
+                    (vec![Ok(b"data: {broken json}\n\n".to_vec())], Tail::Pending),
+                    (
+                        vec![Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "fixture",
+                        ))],
+                        Tail::Pending,
+                    ),
+                    (Vec::new(), Tail::Eof),
+                    (
+                        vec![
+                            Ok(wire(
+                                mode,
+                                json!({"candidates": [{"finishReason": "STOP"}]}),
+                            )),
+                            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture")),
+                        ],
+                        Tail::Pending,
+                    ),
+                ];
+                for (chunks, tail) in cases {
+                    let (mut output, dropped) = observed(mode, chunks, tail);
+                    let event = output.next().now_or_never().unwrap().unwrap();
+                    assert!(event.is_err(), "failure became a success: {event:?}");
+                    assert_retired(&mut output, &dropped);
+                }
+            }
+        }
+
+        #[test]
+        fn dropping_a_pending_stream_releases_the_source() {
+            for mode in MODES {
+                let (mut output, dropped) = observed(mode, [], Tail::Pending);
+                assert!(output.next().now_or_never().is_none());
+                assert!(!dropped.load(Ordering::SeqCst));
+                drop(output);
+                assert!(dropped.load(Ordering::SeqCst));
+            }
+        }
+
+        struct WakeFlag(AtomicBool);
+
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn silent_frame(mode: Mode, metadata: bool) -> Vec<u8> {
+            if metadata {
+                wire(mode, usage())
+            } else {
+                b"event: ping\ndata: {}\n\n".to_vec()
+            }
+        }
+
+        #[test]
+        fn buffered_heartbeat_and_usage_bursts_yield_and_resume() {
+            for mode in MODES {
+                for metadata in [false, true] {
+                    let mut bytes =
+                        silent_frame(mode, metadata).repeat(MAX_READY_EVENTS_PER_YIELD * 2);
+                    bytes.extend(wire(mode, usage()));
+                    bytes.extend(wire(
+                        mode,
+                        json!({"candidates": [{"finishReason": "STOP"}]}),
+                    ));
+                    let (mut output, dropped) = observed(mode, [Ok(bytes)], Tail::Eof);
+                    let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+                    let waker = Waker::from(Arc::clone(&flag));
+                    let mut task = TaskContext::from_waker(&waker);
+                    assert!(
+                        output.as_mut().poll_next(&mut task).is_pending(),
+                        "ready silent frames must yield before completing the burst"
+                    );
+                    assert!(
+                        flag.0.load(Ordering::SeqCst),
+                        "yield did not arrange another poll"
+                    );
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    let mut terminal = None;
+                    for _ in 0..4 {
+                        if let Poll::Ready(Some(Ok(StreamEvent::Done { message, .. }))) =
+                            output.as_mut().poll_next(&mut task)
+                        {
+                            terminal = Some(message);
+                            break;
+                        }
+                    }
+                    assert_usage(&terminal.expect("yielded stream did not finish"));
+                    assert_retired(&mut output, &dropped);
+                }
+            }
+        }
+
+        #[test]
+        fn continuously_ready_frames_allow_abort_and_release_on_drop() {
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            for mode in MODES {
+                for metadata in [false, true] {
+                    let (mut output, dropped) =
+                        observed(mode, [], Tail::Repeat(silent_frame(mode, metadata)));
+                    runtime.block_on(async {
+                        let (abort, signal) = crate::agent::AbortHandle::new();
+                        // Poll the response first. Its cooperative yield must
+                        // let the other branch run and deliver cancellation.
+                        let next = Box::pin(output.next());
+                        let cancel = Box::pin(async move {
+                            abort.abort();
+                            signal.wait().await;
+                        });
+                        match futures::future::select(next, cancel).await {
+                            futures::future::Either::Right(((), pending)) => drop(pending),
+                            futures::future::Either::Left(_) => {
+                                panic!("ready frame flood starved cancellation");
+                            }
+                        }
+                    });
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    drop(output);
+                    assert!(dropped.load(Ordering::SeqCst));
+                }
+            }
+        }
+    }
 
     use super::*;
     use crate::model::TextContent;
