@@ -332,7 +332,11 @@ impl Provider for VertexProvider {
             self.api().to_string(),
             self.name().to_string(),
         );
-        Ok(Box::pin(state.into_stream(false)))
+        Ok(Box::pin(
+            state
+                .with_usage_observer(options.usage_observer.clone())
+                .into_stream(false),
+        ))
     }
 }
 

@@ -429,8 +429,9 @@ impl Provider for GeminiProvider {
             let provider = self.name().to_string();
             let cloud_cli_mode = self.google_cli_mode;
 
-            let stream =
-                StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
+            let stream = StreamState::new(event_source, model, api, provider)
+                .with_usage_observer(options.usage_observer.clone())
+                .into_stream(cloud_cli_mode);
 
             return Ok(Box::pin(stream));
         }
@@ -522,8 +523,9 @@ impl Provider for GeminiProvider {
         let provider = self.name().to_string();
         let cloud_cli_mode = self.google_cli_mode;
 
-        let stream =
-            StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
+        let stream = StreamState::new(event_source, model, api, provider)
+            .with_usage_observer(options.usage_observer.clone())
+            .into_stream(cloud_cli_mode);
 
         Ok(Box::pin(stream))
     }
@@ -569,6 +571,7 @@ where
     saw_terminal: bool,
     content_state: reasoning::ContentState,
     usage_state: reasoning::UsageState,
+    usage_observer: Option<crate::provider::UsageObserver>,
 }
 
 impl<S> StreamState<S>
@@ -600,7 +603,16 @@ where
             saw_terminal: false,
             content_state: reasoning::ContentState::default(),
             usage_state: reasoning::UsageState::default(),
+            usage_observer: None,
         }
+    }
+
+    pub(super) fn with_usage_observer(
+        mut self,
+        observer: Option<crate::provider::UsageObserver>,
+    ) -> Self {
+        self.usage_observer = observer;
+        self
     }
 
     /// The returned stream is fused: once it yields `None` every later poll
@@ -714,6 +726,9 @@ where
                 metadata.cached_content_token_count,
                 metadata.total_token_count,
             );
+            if let Some(observer) = &self.usage_observer {
+                observer.observe(&self.partial.usage)?;
+            }
         }
 
         // A blocked prompt arrives as `promptFeedback.blockReason` with no
@@ -1567,6 +1582,174 @@ mod tests {
                         .is_none()
                 );
             }
+        }
+
+        struct UsageWireProvider {
+            mode: Mode,
+            response: std::sync::Mutex<Option<(Vec<std::io::Result<Vec<u8>>>, Tail)>>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Provider for UsageWireProvider {
+            fn name(&self) -> &str {
+                self.mode.provider
+            }
+            fn api(&self) -> &str {
+                self.mode.api
+            }
+            fn model_id(&self) -> &str {
+                "gemini-usage-fixture"
+            }
+
+            fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+                Some(crate::provider::ModelCost {
+                    input: 1_000_000.0,
+                    output: 1_000_000.0,
+                    cache_read: 1_000_000.0,
+                    cache_write: 0.0,
+                })
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                options: &StreamOptions,
+            ) -> Result<EventStream> {
+                let (chunks, tail) = self
+                    .response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one wire request");
+                let source = ObservedSource {
+                    chunks: chunks.into(),
+                    tail,
+                    repeated_polls: 0,
+                    dropped: Arc::clone(&self.dropped),
+                };
+                let state = StreamState::new(
+                    SseStream::new(source),
+                    self.model_id().into(),
+                    self.api().into(),
+                    self.name().into(),
+                )
+                .with_usage_observer(options.usage_observer.clone());
+                Ok(Box::pin(state.into_stream(self.mode.cloud_cli)))
+            }
+        }
+
+        fn guarded_usage_wire(
+            mode: Mode,
+            chunks: Vec<std::io::Result<Vec<u8>>>,
+            tail: Tail,
+        ) -> (Arc<dyn Provider>, crate::cost::CostBudget, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let provider = Arc::new(UsageWireProvider {
+                mode,
+                response: std::sync::Mutex::new(Some((chunks, tail))),
+                dropped: Arc::clone(&dropped),
+            });
+            let budget = crate::cost::CostBudget::new(None, Some(15.0), 0.0).unwrap();
+            (
+                crate::provider::guard_with_cost_budget(provider, budget.clone()),
+                budget,
+                dropped,
+            )
+        }
+
+        #[test]
+        fn usage_only_pending_wire_updates_budget_before_any_public_event_and_survives_drop() {
+            futures::executor::block_on(async {
+                for mode in MODES {
+                    let (provider, budget, dropped) =
+                        guarded_usage_wire(mode, vec![Ok(wire(mode, usage()))], Tail::Pending);
+                    let mut output = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    assert!(output.next().now_or_never().is_none());
+                    assert_eq!(budget.snapshot().pending, 16.0);
+                    assert_eq!(budget.spent(), 0.0);
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    assert!(matches!(
+                        provider
+                            .stream(&Context::default(), &StreamOptions::default())
+                            .await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    drop(output);
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert_eq!(budget.spent(), 16.0);
+                    assert_eq!(budget.snapshot().pending, 0.0);
+                }
+            });
+        }
+
+        #[test]
+        fn later_wire_usage_survives_transport_parser_and_incomplete_failures_without_double_billing()
+         {
+            futures::executor::block_on(async {
+                for mode in MODES {
+                    for outcome in ["transport", "parser", "incomplete", "done"] {
+                        let mut chunks = vec![
+                            Ok(wire(
+                                mode,
+                                json!({"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}),
+                            )),
+                            Ok(wire(mode, usage())),
+                            Ok(wire(mode, usage())),
+                        ];
+                        match outcome {
+                            "transport" => chunks.push(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "fixture",
+                            ))),
+                            "parser" => chunks.push(Ok(b"data: {broken json}\n\n".to_vec())),
+                            "done" => chunks.push(Ok(wire(
+                                mode,
+                                json!({"candidates": [{"finishReason": "STOP"}]}),
+                            ))),
+                            _ => {}
+                        }
+                        let (provider, budget, dropped) =
+                            guarded_usage_wire(mode, chunks, Tail::Eof);
+                        let mut output = provider
+                            .stream(&Context::default(), &StreamOptions::default())
+                            .await
+                            .unwrap();
+                        let mut terminal = false;
+                        for _ in 0..12 {
+                            let Some(event) =
+                                output.next().now_or_never().expect("bounded ready wire")
+                            else {
+                                break;
+                            };
+                            match event {
+                                Ok(StreamEvent::Done { message, .. }) => {
+                                    assert_eq!(outcome, "done");
+                                    assert_usage(&message);
+                                    assert_eq!(message.usage.cost.total, 16.0);
+                                    terminal = true;
+                                }
+                                Err(_) => {
+                                    assert_ne!(outcome, "done");
+                                    terminal = true;
+                                }
+                                _ => continue,
+                            }
+                            assert!(dropped.load(Ordering::SeqCst));
+                            assert_eq!(budget.spent(), 16.0);
+                            break;
+                        }
+                        assert!(terminal);
+                        assert_retired(&mut output, &dropped);
+                        drop(output);
+                        assert_eq!(budget.spent(), 16.0);
+                        assert_eq!(budget.snapshot().pending, 0.0);
+                    }
+                }
+            });
         }
 
         #[test]

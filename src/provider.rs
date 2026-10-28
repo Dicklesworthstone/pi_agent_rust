@@ -144,15 +144,20 @@ impl Provider for CostGuardedProvider {
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>>
     {
         let attempt = self.budget.start_attempt()?;
-        let inner = self.inner.stream(context, options).await?;
-        Ok(Box::pin(CostMeteredStream {
-            inner,
-            attempt,
+        let accounting = CostAccountingOwner::new(CostAccounting {
+            attempt: Some(attempt),
             rates: self.inner.model_cost(),
             known_cost: 0.0,
             settled: false,
-            accounting_failed: false,
-        }))
+            failure: None,
+        });
+        let mut observed_options = options.clone();
+        observed_options.usage_observer = Some(accounting.observer());
+        CostMeteredSetup {
+            inner: Some(self.inner.stream(context, &observed_options)),
+            accounting: Some(accounting),
+        }
+        .await
     }
 
     async fn compact_native(
@@ -200,19 +205,39 @@ impl Provider for CostGuardedProvider {
     }
 }
 
-/// Owns the accounting until the response is consumed or dropped. Start
-/// usage is the only partial usage in the native stream contract; never
-/// guess charges from text length when a cancelled provider reports none.
-struct CostMeteredStream {
-    inner: Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-    attempt: crate::cost::CostAttempt,
+/// A provider can publish acknowledged cumulative usage without adding a
+/// public stream event. Only token/cost data crosses this boundary. The
+/// request owner closes the observer before returning or being dropped;
+/// retained clones cannot charge a later request or reopen settled billing.
+#[derive(Clone)]
+pub struct UsageObserver {
+    accounting: Arc<std::sync::Mutex<CostAccounting>>,
+}
+
+impl UsageObserver {
+    pub fn observe(&self, usage: &crate::model::Usage) -> crate::error::Result<()> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(&mut usage.clone(), false)
+    }
+}
+
+impl std::fmt::Debug for UsageObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UsageObserver")
+    }
+}
+
+struct CostAccounting {
+    attempt: Option<crate::cost::CostAttempt>,
     rates: Option<ModelCost>,
     known_cost: f64,
     settled: bool,
-    accounting_failed: bool,
+    failure: Option<String>,
 }
 
-impl CostMeteredStream {
+impl CostAccounting {
     fn observe(
         &mut self,
         usage: &mut crate::model::Usage,
@@ -221,91 +246,287 @@ impl CostMeteredStream {
         if self.settled {
             return Ok(());
         }
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        let result = self.observe_usage(usage, terminal);
+        if let Err(error) = &result {
+            self.failure = Some(error.to_string());
+        }
+        if terminal {
+            // Install the authoritative bill and close under the same lock.
+            // A retained observer cannot race in another provisional amount
+            // between final pricing and settlement.
+            self.settle();
+        }
+        result
+    }
+
+    fn observe_usage(
+        &mut self,
+        usage: &mut crate::model::Usage,
+        terminal: bool,
+    ) -> crate::error::Result<()> {
         // price_usage treats nonpositive/NaN totals as missing billing. The
         // spend guard must distinguish an absent zero from invalid usage
         // before that fallback can erase evidence of an accounting failure.
         if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
             self.known_cost = f64::NAN;
-            return self.attempt.observe(f64::NAN);
+            return self
+                .attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(f64::NAN);
         }
         if let Some(rates) = &self.rates {
             rates.price_usage(usage);
         }
         if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
             self.known_cost = f64::NAN;
-            return self.attempt.observe(f64::NAN);
-        } else if self.known_cost.is_finite()
-            && ((terminal && usage.cost.total > 0.0) || usage.cost.total > self.known_cost)
-        {
-            self.known_cost = usage.cost.total;
+            return self
+                .attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(f64::NAN);
         }
+        self.remember_cost(usage.cost.total, terminal && usage.cost.total > 0.0);
         if terminal {
             Ok(())
         } else {
             // The parent must own known partial usage before this stream can
             // be interrupted or its child process reaped. Terminal billing
             // replaces this estimate rather than charging it a second time.
-            self.attempt.observe(self.known_cost)
+            self.attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(self.known_cost)
         }
+    }
+
+    fn remember_cost(&mut self, cost: f64, authoritative_terminal: bool) {
+        if self.known_cost.is_finite() && (authoritative_terminal || cost > self.known_cost) {
+            self.known_cost = cost;
+        }
+    }
+
+    fn failure(&self) -> Option<crate::error::Error> {
+        self.failure.as_ref().map(|message| {
+            crate::error::Error::session(format!("model cost accounting failed: {message}"))
+        })
     }
 
     fn settle(&mut self) {
         if !self.settled {
             self.settled = true;
-            if let Err(error) = self.attempt.finish(self.known_cost) {
+            // Release remote accounting resources even if an adapter retains
+            // observer clones after the request owner has finished.
+            let mut attempt = self.attempt.take().expect("active cost attempt");
+            if let Err(error) = attempt.finish(self.known_cost) {
                 tracing::warn!(%error, "provider spend accounting failed; budget quarantined");
             }
         }
     }
 }
 
+/// Exactly one owner settles the attempt, even when observer clones outlive it.
+struct CostAccountingOwner {
+    accounting: Arc<std::sync::Mutex<CostAccounting>>,
+}
+
+impl CostAccountingOwner {
+    fn new(accounting: CostAccounting) -> Self {
+        Self {
+            accounting: Arc::new(std::sync::Mutex::new(accounting)),
+        }
+    }
+
+    fn observer(&self) -> UsageObserver {
+        UsageObserver {
+            accounting: Arc::clone(&self.accounting),
+        }
+    }
+
+    fn observe(&self, usage: &mut crate::model::Usage, terminal: bool) -> crate::error::Result<()> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(usage, terminal)
+    }
+
+    fn failure(&self) -> Option<crate::error::Error> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure()
+    }
+
+    fn settle(&self) {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settle();
+    }
+}
+
+impl Drop for CostAccountingOwner {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+type BoxedProviderStream = Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>;
+
+/// Drop the provider's setup future before the accounting owner. Its cleanup
+/// can still report usage, even when setup never produced a public stream.
+struct CostMeteredSetup<'a> {
+    inner: Option<
+        Pin<
+            Box<
+                dyn std::future::Future<Output = crate::error::Result<BoxedProviderStream>>
+                    + Send
+                    + 'a,
+            >,
+        >,
+    >,
+    accounting: Option<CostAccountingOwner>,
+}
+
+impl std::future::Future for CostMeteredSetup<'_> {
+    type Output = crate::error::Result<BoxedProviderStream>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let result = self
+            .inner
+            .as_mut()
+            .expect("active provider setup")
+            .as_mut()
+            .poll(cx);
+        if result.is_pending()
+            && self
+                .accounting
+                .as_ref()
+                .and_then(CostAccountingOwner::failure)
+                .is_none()
+        {
+            return Poll::Pending;
+        }
+        drop(self.inner.take());
+        let accounting = self
+            .accounting
+            .take()
+            .expect("provider setup accounting owner");
+        if let Some(error) = accounting.failure() {
+            // A ready stream may itself publish usage during cleanup.
+            drop(result);
+            drop(accounting);
+            return Poll::Ready(Err(error));
+        }
+        match result {
+            Poll::Ready(Ok(inner)) => Poll::Ready(Ok(Box::pin(CostMeteredStream {
+                inner: Some(inner),
+                accounting,
+            }))),
+            Poll::Ready(Err(error)) => {
+                drop(accounting);
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => {
+                unreachable!("pending setup without an accounting error returned above")
+            }
+        }
+    }
+}
+
+impl Drop for CostMeteredSetup<'_> {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        drop(self.accounting.take());
+    }
+}
+
+/// Owns accounting through source cleanup. Usage snapshots update the shared
+/// budget immediately, including frames that produce no public stream event.
+struct CostMeteredStream {
+    inner: Option<BoxedProviderStream>,
+    accounting: CostAccountingOwner,
+}
+
 impl Stream for CostMeteredStream {
     type Item = crate::error::Result<StreamEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        if self.accounting_failed {
+        if self.inner.is_none() {
             return Poll::Ready(None);
         }
-        let item = self.inner.as_mut().poll_next(cx);
+        if let Some(error) = self.accounting.failure() {
+            drop(self.inner.take());
+            self.accounting.settle();
+            return Poll::Ready(Some(Err(error)));
+        }
+        let item = self
+            .inner
+            .as_mut()
+            .expect("active provider stream")
+            .as_mut()
+            .poll_next(cx);
         match item {
             Poll::Ready(Some(Ok(mut event))) => {
+                let terminal =
+                    matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                if terminal {
+                    drop(self.inner.take());
+                }
                 let observed = match &mut event {
-                    StreamEvent::Start { partial } => self.observe(&mut partial.usage, false),
+                    StreamEvent::Start { partial } => {
+                        self.accounting.observe(&mut partial.usage, false)
+                    }
                     StreamEvent::Done { message, .. } => {
-                        let result = self.observe(&mut message.usage, true);
-                        self.settle();
-                        result
+                        self.accounting.observe(&mut message.usage, true)
                     }
                     StreamEvent::Error { error, .. } => {
-                        let result = self.observe(&mut error.usage, true);
-                        self.settle();
-                        result
+                        self.accounting.observe(&mut error.usage, true)
                     }
-                    _ => Ok(()),
+                    _ => self.accounting.failure().map_or(Ok(()), Err),
                 };
                 if let Err(error) = observed {
-                    self.accounting_failed = true;
-                    self.settle();
+                    drop(self.inner.take());
+                    self.accounting.settle();
                     return Poll::Ready(Some(Err(error)));
+                }
+                if terminal {
+                    self.accounting.settle();
                 }
                 Poll::Ready(Some(Ok(event)))
             }
             Poll::Ready(None) => {
-                self.settle();
-                Poll::Ready(None)
+                drop(self.inner.take());
+                let error = self.accounting.failure();
+                self.accounting.settle();
+                Poll::Ready(error.map(Err))
             }
             Poll::Ready(Some(Err(error))) => {
-                self.settle();
+                drop(self.inner.take());
+                let error = self.accounting.failure().unwrap_or(error);
+                self.accounting.settle();
                 Poll::Ready(Some(Err(error)))
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                if let Some(error) = self.accounting.failure() {
+                    drop(self.inner.take());
+                    self.accounting.settle();
+                    Poll::Ready(Some(Err(error)))
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 }
 
 impl Drop for CostMeteredStream {
     fn drop(&mut self) {
-        self.settle();
+        drop(self.inner.take());
+        self.accounting.settle();
     }
 }
 
@@ -470,6 +691,11 @@ pub struct StreamOptions {
     pub thinking_budgets: Option<ThinkingBudgets>,
     /// Optional `before_provider_request` interceptor (gh #167 / bd-1q31s).
     pub before_provider_request: Option<BeforeProviderRequestHook>,
+    /// Report cumulative provider-acknowledged usage independently of public
+    /// stream events. Installed per attempt by the spending guard; providers
+    /// must not estimate usage from generated text or share it across requests.
+    #[doc(hidden)]
+    pub usage_observer: Option<UsageObserver>,
 }
 
 /// The `service_tier` value an OpenAI-shaped request to `provider` should
@@ -881,6 +1107,237 @@ mod tests {
             rates,
             native_cost: None,
         })
+    }
+
+    mod usage_observation {
+        use super::*;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy)]
+        enum Mode {
+            SetupPending,
+            SetupError,
+            Pending,
+            Error,
+            Eof,
+            Done,
+            Invalid,
+        }
+
+        struct DropUsage {
+            observer: UsageObserver,
+            cost: f64,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DropUsage {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                let _ = self.observer.observe(&cost_message(self.cost, 0).usage);
+            }
+        }
+
+        struct Probe {
+            mode: Mode,
+            observer: Mutex<Option<UsageObserver>>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Provider for Probe {
+            fn name(&self) -> &str {
+                "usage-probe"
+            }
+            fn api(&self) -> &str {
+                "test"
+            }
+            fn model_id(&self) -> &str {
+                "observed"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                options: &StreamOptions,
+            ) -> crate::error::Result<BoxedProviderStream> {
+                let observer = options
+                    .usage_observer
+                    .clone()
+                    .expect("per-attempt observer");
+                *self.observer.lock().unwrap() = Some(observer.clone());
+                observer.observe(&cost_message(0.5, 0).usage)?;
+                let setup = matches!(self.mode, Mode::SetupPending | Mode::SetupError);
+                let cleanup = DropUsage {
+                    observer,
+                    cost: if setup { 0.75 } else { 1.25 },
+                    drops: Arc::clone(&self.drops),
+                };
+                if setup {
+                    let _cleanup = cleanup;
+                    if matches!(self.mode, Mode::SetupPending) {
+                        std::future::pending::<()>().await;
+                    }
+                    return Err(crate::error::Error::api("setup failed"));
+                }
+                Ok(Box::pin(ObservedStream {
+                    mode: self.mode,
+                    cleanup,
+                }))
+            }
+        }
+
+        struct ObservedStream {
+            mode: Mode,
+            cleanup: DropUsage,
+        }
+
+        impl Stream for ObservedStream {
+            type Item = crate::error::Result<StreamEvent>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.cleanup
+                    .observer
+                    .observe(&cost_message(1.0, 0).usage)
+                    .unwrap();
+                match self.mode {
+                    Mode::Pending => Poll::Pending,
+                    Mode::Error => Poll::Ready(Some(Err(crate::error::Error::api("wire failed")))),
+                    Mode::Eof => Poll::Ready(None),
+                    Mode::Done => Poll::Ready(Some(Ok(StreamEvent::Done {
+                        reason: crate::model::StopReason::Stop,
+                        message: cost_message(0.25, 0),
+                    }))),
+                    Mode::Invalid => {
+                        // Even an adapter that ignores observer failure must
+                        // not hide invalid acknowledged billing with Pending.
+                        let _ = self
+                            .cleanup
+                            .observer
+                            .observe(&cost_message(f64::NAN, 0).usage);
+                        Poll::Pending
+                    }
+                    Mode::SetupPending | Mode::SetupError => unreachable!("setup-only fixture"),
+                }
+            }
+        }
+
+        fn probe(mode: Mode) -> Arc<Probe> {
+            Arc::new(Probe {
+                mode,
+                observer: Mutex::new(None),
+                drops: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+
+        fn assert_closed(probe: &Probe, budget: &crate::cost::CostBudget, cost: f64) {
+            assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
+            assert!((budget.spent() - cost).abs() < f64::EPSILON);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            let revision = budget.snapshot().revision;
+            let observer = probe.observer.lock().unwrap().clone().unwrap();
+            assert!(observer.accounting.lock().unwrap().attempt.is_none());
+            observer.observe(&cost_message(99.0, 0).usage).unwrap();
+            observer.observe(&cost_message(f64::NAN, 0).usage).unwrap();
+            assert_eq!(budget.snapshot().revision, revision);
+            assert!((budget.spent() - cost).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn setup_cancellation_and_failure_keep_acknowledged_usage_and_close_observers() {
+            for mode in [Mode::SetupPending, Mode::SetupError] {
+                let budget = crate::cost::CostBudget::new(None, Some(0.4), 0.0).unwrap();
+                let probe = probe(mode);
+                let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                let context = Context::default();
+                let options = StreamOptions::default();
+                let mut setup = Box::pin(provider.stream(&context, &options));
+                let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+                let result = std::future::Future::poll(setup.as_mut(), &mut cx);
+                if matches!(mode, Mode::SetupPending) {
+                    assert!(result.is_pending());
+                    assert_eq!(budget.snapshot().pending, 0.5);
+                    assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+                } else {
+                    assert!(matches!(result, Poll::Ready(Err(_))));
+                }
+                assert!(matches!(
+                    budget.admit(),
+                    Err(crate::error::Error::CostCap { .. })
+                ));
+                drop(setup);
+                assert_closed(&probe, &budget, 0.75);
+                assert!(matches!(
+                    budget.admit(),
+                    Err(crate::error::Error::CostCap { .. })
+                ));
+            }
+        }
+
+        #[test]
+        fn pending_failure_eof_and_terminal_cleanup_settle_once_after_source_drop() {
+            futures::executor::block_on(async {
+                for mode in [
+                    Mode::Pending,
+                    Mode::Error,
+                    Mode::Eof,
+                    Mode::Done,
+                    Mode::Invalid,
+                ] {
+                    let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+                    let probe = probe(mode);
+                    let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                    let mut stream = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(budget.snapshot().pending, 0.5);
+                    let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+                    let result = stream.as_mut().poll_next(&mut cx);
+                    if matches!(mode, Mode::Pending) {
+                        assert!(result.is_pending());
+                        assert_eq!(budget.snapshot().pending, 1.0);
+                        assert!(budget.admit().is_err());
+                        assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+                    } else {
+                        assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
+                        match mode {
+                            Mode::Done => assert!(matches!(
+                                result,
+                                Poll::Ready(Some(Ok(StreamEvent::Done { .. })))
+                            )),
+                            Mode::Eof => assert!(matches!(result, Poll::Ready(None))),
+                            _ => assert!(matches!(result, Poll::Ready(Some(Err(_))))),
+                        }
+                        assert!(matches!(
+                            stream.as_mut().poll_next(&mut cx),
+                            Poll::Ready(None)
+                        ));
+                    }
+                    drop(stream);
+                    let expected = match mode {
+                        Mode::Done => 0.25,
+                        Mode::Invalid => 1.0,
+                        _ => 1.25,
+                    };
+                    assert_closed(&probe, &budget, expected);
+                    match mode {
+                        Mode::Done => budget.admit().unwrap(),
+                        Mode::Invalid => assert!(matches!(
+                            budget.admit(),
+                            Err(crate::error::Error::Session(_))
+                        )),
+                        _ => assert!(matches!(
+                            budget.admit(),
+                            Err(crate::error::Error::CostCap { .. })
+                        )),
+                    }
+                }
+            });
+        }
     }
 
     #[test]
