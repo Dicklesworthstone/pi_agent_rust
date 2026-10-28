@@ -1179,8 +1179,8 @@ async fn run(
                         };
 
                         // Decode the complete ContentBlock[] before starting a turn.
-                        // Images stay native image blocks, and embedded editor context
-                        // retains its provenance without implicitly opening its URI.
+                        // Images/audio/video stay native blocks, and embedded editor
+                        // context retains its provenance without opening its URI.
                         let prompt_blocks = request.params.get("prompt").and_then(Value::as_array);
                         let Some(prompt_blocks) = prompt_blocks else {
                             let _ = out_tx.send(json_rpc_error(
@@ -1198,7 +1198,10 @@ async fn run(
                                 continue;
                             }
                         };
-                        let message_content = match content::extract_prompt_content(prompt_blocks) {
+                        let message_content = match content::extract_prompt_content(
+                            prompt_blocks,
+                            &options.config,
+                        ) {
                             Ok(content) => content,
                             Err(err) => {
                                 let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
@@ -1331,7 +1334,11 @@ async fn run(
                             }
                             continue;
                         }
-                        match steering::Input::parse(&request.params, request.id.clone()) {
+                        match steering::Input::parse(
+                            &request.params,
+                            request.id.clone(),
+                            &options.config,
+                        ) {
                             Ok(input) => out_tx.enqueue_steering(session_id, input),
                             Err(error) => {
                                 if request.id.is_some() {
@@ -3517,6 +3524,7 @@ mod tests {
                         "_meta": { "steering": { "queue": queue } },
                     }),
                     Some(json!(id)),
+                    &Config::default(),
                 )
                 .unwrap();
                 output.enqueue_steering("editor-session", input);
@@ -3589,8 +3597,12 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::sync_channel(16);
             let output = AcpOutput::new(tx);
             let input = |id| {
-                steering::Input::parse(&json!({ "prompt": "retained by editor" }), Some(json!(id)))
-                    .unwrap()
+                steering::Input::parse(
+                    &json!({ "prompt": "retained by editor" }),
+                    Some(json!(id)),
+                    &Config::default(),
+                )
+                .unwrap()
             };
             output.enqueue_steering("editor-session", input(1));
             let idle: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
@@ -3685,6 +3697,7 @@ mod tests {
                     "prompt": "after this", "_meta": { "steering": { "queue": "followUp" } },
                 }),
                 Some(json!(10)),
+                &Config::default(),
             )
             .unwrap();
             output.enqueue_steering("first", follow_up);
@@ -3695,6 +3708,7 @@ mod tests {
                 steering::Input::parse(
                     &json!({ "prompt": "stop that tool and inspect instead" }),
                     Some(json!(11)),
+                    &Config::default(),
                 )
                 .unwrap(),
             );
@@ -4525,10 +4539,10 @@ mod tests {
         assert_eq!(result["agentCapabilities"]["loadSession"], true);
         // GH #245: session/list is implemented, so it is advertised.
         assert!(result["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
-        // Native image and embedded-context prompt decoding is wired to the agent.
+        // Native image/audio and embedded-context decoding is wired to the agent.
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["audio"],
-            false
+            true
         );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["image"],

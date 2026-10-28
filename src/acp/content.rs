@@ -7,19 +7,23 @@
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use crate::model::{ContentBlock, ImageContent, TextContent};
+use crate::config::Config;
+use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent};
 
 const MAX_PROMPT_BLOCKS: usize = 1024;
 const MAX_PROMPT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BINARY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BASE64_BYTES: usize = MAX_BINARY_BYTES.div_ceil(3) * 4;
+const MAX_MEDIA_BLOCKS: usize = 32;
 
 pub(super) fn prompt_capabilities() -> Value {
-    json!({ "audio": false, "embeddedContext": true, "image": true })
+    json!({ "audio": true, "embeddedContext": true, "image": true })
 }
 
 struct PromptBudget {
     remaining: usize,
+    remaining_media: usize,
+    max_media_bytes: u64,
 }
 
 impl PromptBudget {
@@ -33,16 +37,34 @@ impl PromptBudget {
 }
 
 /// Validate the whole prompt before any session mutation or provider request.
-/// Keep native blocks in order, including image-only prompts.
-pub(super) fn extract_prompt_content(blocks: &[Value]) -> Result<Vec<ContentBlock>, String> {
-    extract_with_limit(blocks, MAX_PROMPT_BYTES)
+/// Keep native blocks in order, including image/audio-only prompts. Media
+/// capabilities are transport-specific; the shared provider path retains its
+/// explicit omission notices for providers without audio/video input.
+pub(super) fn extract_prompt_content(
+    blocks: &[Value],
+    config: &Config,
+) -> Result<Vec<ContentBlock>, String> {
+    let max_media_bytes = config
+        .media
+        .as_ref()
+        .and_then(|settings| settings.max_bytes)
+        .unwrap_or(crate::media_tools::DEFAULT_MEDIA_MAX_BYTES);
+    extract_with_limit(blocks, MAX_PROMPT_BYTES, max_media_bytes)
 }
 
-fn extract_with_limit(blocks: &[Value], limit: usize) -> Result<Vec<ContentBlock>, String> {
+fn extract_with_limit(
+    blocks: &[Value],
+    limit: usize,
+    max_media_bytes: u64,
+) -> Result<Vec<ContentBlock>, String> {
     if blocks.len() > MAX_PROMPT_BLOCKS {
         return Err("ACP prompt contains too many content blocks".to_string());
     }
-    let mut budget = PromptBudget { remaining: limit };
+    let mut budget = PromptBudget {
+        remaining: limit,
+        remaining_media: MAX_MEDIA_BLOCKS,
+        max_media_bytes: max_media_bytes.min(MAX_BINARY_BYTES as u64),
+    };
     let mut content = Vec::with_capacity(blocks.len());
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
@@ -66,6 +88,14 @@ fn extract_with_limit(blocks: &[Value], limit: usize) -> Result<Vec<ContentBlock
                 content.push(ContentBlock::Image(parse_image(
                     block,
                     "data",
+                    &mut budget,
+                )?));
+            }
+            Some("audio") => {
+                content.push(ContentBlock::Media(parse_media(
+                    block,
+                    "data",
+                    true,
                     &mut budget,
                 )?));
             }
@@ -141,6 +171,72 @@ fn parse_image(
     })
 }
 
+fn parse_media(
+    object: &Value,
+    data_key: &str,
+    audio_only: bool,
+    budget: &mut PromptBudget,
+) -> Result<MediaContent, String> {
+    budget.remaining_media = budget
+        .remaining_media
+        .checked_sub(1)
+        .ok_or_else(|| "ACP prompt exceeds the 32 audio/video attachment limit".to_string())?;
+    let raw_mime = required_string(object, "mimeType")?;
+    budget.charge(raw_mime.len())?;
+    // Reject metadata the native model would truncate or rewrite on reload.
+    // In particular, parameters, controls, wildcards and extra slashes must
+    // not turn a malformed label into a different, apparently valid format.
+    let mime_type = crate::model::sanitize_image_mime_type(raw_mime);
+    if mime_type != raw_mime.trim() {
+        return Err("ACP media requires a bare audio or video MIME type".to_string());
+    }
+    let mime_type = mime_type.to_ascii_lowercase();
+    if !mime_type.split_once('/').is_some_and(|(kind, subtype)| {
+        (kind == "audio" || (!audio_only && kind == "video"))
+            && !subtype.is_empty()
+            && !subtype.contains('/')
+    }) {
+        return Err(if audio_only {
+            "ACP audio content requires an audio MIME type".to_string()
+        } else {
+            "ACP media requires an audio or video MIME type".to_string()
+        });
+    }
+    let data = required_string(object, data_key)?;
+    // Apply the configured decoded bound before cloning or decoding. The
+    // second check accounts for padding and limits not divisible by three.
+    let max_encoded_bytes = budget.max_media_bytes.div_ceil(3).saturating_mul(4);
+    if u64::try_from(data.len()).unwrap_or(u64::MAX) > max_encoded_bytes {
+        return Err(format!(
+            "ACP media exceeds media.maxBytes or the transport limit ({} bytes)",
+            budget.max_media_bytes,
+        ));
+    }
+    budget.charge(data.len())?;
+    let engine = if data.ends_with('=') {
+        &base64::engine::general_purpose::STANDARD
+    } else {
+        &base64::engine::general_purpose::STANDARD_NO_PAD
+    };
+    let bytes = engine
+        .decode(data)
+        .map_err(|_| "ACP media is not valid standard base64".to_string())?;
+    if bytes.is_empty() {
+        return Err("ACP media content must not be empty".to_string());
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > budget.max_media_bytes {
+        return Err(format!(
+            "ACP media exceeds media.maxBytes or the transport limit ({} bytes)",
+            budget.max_media_bytes,
+        ));
+    }
+    Ok(MediaContent {
+        data: data.to_string(),
+        mime_type,
+        name: None,
+    })
+}
+
 fn is_text_mime_type(mime: Option<&str>) -> bool {
     let Some(mime) = mime else {
         // A resource's MIME type is optional. A blob without it must still
@@ -201,11 +297,18 @@ fn append_resource(
                 let image = parse_image(resource, "blob", budget)?;
                 content.push(resource_text(uri, Some(&image.mime_type), None));
                 content.push(ContentBlock::Image(image));
+            } else if mime.is_some_and(|mime| {
+                let mime = mime.trim().to_ascii_lowercase();
+                mime.starts_with("audio/") || mime.starts_with("video/")
+            }) {
+                let media = parse_media(resource, "blob", false, budget)?;
+                content.push(resource_text(uri, Some(&media.mime_type), None));
+                content.push(ContentBlock::Media(media));
             } else {
                 budget.charge(mime.map_or(0, str::len))?;
                 if !is_text_mime_type(mime) {
                     return Err(
-                        "ACP embedded binary resource is unsupported; supply UTF-8 text or a supported image"
+                        "ACP embedded binary resource is unsupported; supply UTF-8 text, an image, audio, or video"
                             .to_string(),
                     );
                 }
@@ -284,6 +387,10 @@ mod tests {
 
     const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
 
+    fn extract_prompt_content(blocks: &[Value]) -> Result<Vec<ContentBlock>, String> {
+        super::extract_prompt_content(blocks, &Config::default())
+    }
+
     fn text(block: &ContentBlock) -> &str {
         match block {
             ContentBlock::Text(text) => &text.text,
@@ -331,6 +438,216 @@ mod tests {
         assert!(
             matches!(&blocks[..], [ContentBlock::Image(image)] if image.mime_type == "image/png")
         );
+    }
+
+    #[test]
+    fn audio_only_prompt_stays_native_and_does_not_forward_private_metadata() {
+        for data in ["AQID", "YQ==", "YQ"] {
+            let blocks = extract_prompt_content(&[json!({
+                "type": "audio", "mimeType": " AuDiO/WAV ", "data": data,
+                "annotations": { "audience": ["assistant"], "marker": "private-annotation" },
+                "_meta": { "instructions": "private-metadata" },
+                "name": "not-an-acp-audio-field",
+            })])
+            .unwrap();
+            let [ContentBlock::Media(media)] = blocks.as_slice() else {
+                panic!("audio-only prompt was flattened or discarded")
+            };
+            assert_eq!(media.data, data);
+            assert_eq!(media.mime_type, "audio/wav");
+            assert!(media.name.is_none());
+            let stored = serde_json::to_string(&blocks).unwrap();
+            for private in [
+                "private-annotation",
+                "private-metadata",
+                "not-an-acp-audio-field",
+            ] {
+                assert!(!stored.contains(private));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_audio_video_prompt_preserves_order_provenance_and_gemini_payloads() {
+        let blocks = extract_prompt_content(&[
+            json!({ "type": "text", "text": "Compare" }),
+            json!({ "type": "audio", "mimeType": "audio/wav", "data": "AQID" }),
+            json!({ "type": "image", "mimeType": "image/png", "data": PNG }),
+            json!({ "type": "resource", "resource": {
+                "uri": "file:///not-opened/clip.mp4", "mimeType": "video/mp4", "blob": "BAUG",
+                "_meta": { "marker": "private-resource-metadata" },
+            } }),
+            json!({ "type": "text", "text": "Then explain" }),
+        ])
+        .unwrap();
+        assert_eq!(blocks.len(), 6);
+        assert_eq!(text(&blocks[0]), "Compare");
+        assert!(matches!(&blocks[1], ContentBlock::Media(media) if media.data == "AQID"));
+        assert!(matches!(&blocks[2], ContentBlock::Image(image) if image.data == PNG));
+        assert_eq!(reference(&blocks[3])["uri"], "file:///not-opened/clip.mp4");
+        assert_eq!(reference(&blocks[3])["mimeType"], "video/mp4");
+        assert!(reference(&blocks[3]).get("blob").is_none());
+        assert!(matches!(&blocks[4], ContentBlock::Media(media) if media.data == "BAUG"));
+        assert_eq!(text(&blocks[5]), "Then explain");
+        let parts = crate::providers::gemini::convert_user_content_to_parts(
+            &crate::model::UserContent::Blocks(blocks),
+        );
+        let wire = serde_json::to_value(parts).unwrap();
+        assert_eq!(wire[0], json!({ "text": "Compare" }));
+        assert_eq!(
+            wire[1],
+            json!({ "inline_data": { "mimeType": "audio/wav", "data": "AQID" } }),
+        );
+        assert_eq!(wire[2]["inline_data"]["data"], PNG);
+        assert_eq!(
+            wire[4],
+            json!({ "inline_data": { "mimeType": "video/mp4", "data": "BAUG" } }),
+        );
+        assert_eq!(wire[5], json!({ "text": "Then explain" }));
+        assert!(!wire.to_string().contains("private-resource-metadata"));
+    }
+
+    #[test]
+    fn audio_and_embedded_video_tool_content_can_be_attached_to_a_later_prompt() {
+        for mime in ["audio/ogg", "video/webm"] {
+            let original = MediaContent {
+                data: "AQIDBA==".to_string(),
+                mime_type: mime.to_string(),
+                name: None,
+            };
+            let emitted = tool_result_content(&[ContentBlock::Media(original.clone())]);
+            let decoded = extract_prompt_content(&[emitted[0]["content"].clone()]).unwrap();
+            let ContentBlock::Media(restored) = decoded.last().unwrap() else {
+                panic!("attachment was flattened")
+            };
+            assert_eq!(restored.mime_type, original.mime_type);
+            assert_eq!(restored.data, original.data);
+            if mime.starts_with("video/") {
+                assert_eq!(decoded.len(), 2);
+                assert!(
+                    reference(&decoded[0])["uri"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("urn:pi:acp:video:sha256:")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_media_rejects_the_entire_prompt_without_echoing_payloads() {
+        for (mime, data) in [
+            ("audio/wav", ""),
+            ("audio/wav", "private not base64!"),
+            ("audio/wav", "YR=="),
+            ("audio/wav", "__8="),
+            ("audio/wav", "YQ=Q"),
+            ("audio/wav", "YQ==\n"),
+            ("audio/", "AQID"),
+            ("audio/*", "AQID"),
+            ("audio/wav; charset=utf-8", "AQID"),
+            ("audio/wav\nprivate-metadata", "AQID"),
+            ("audio/wav/extra", "AQID"),
+            ("audio/é", "AQID"),
+            ("video/mp4", "AQID"),
+            ("image/png", "AQID"),
+        ] {
+            let error = extract_prompt_content(&[
+                json!({ "type": "text", "text": "must not be partially admitted" }),
+                json!({ "type": "audio", "mimeType": mime, "data": data }),
+            ])
+            .unwrap_err();
+            assert!(!error.contains("private"));
+            assert!(!error.contains("AQID"));
+        }
+        for resource in [
+            json!({ "uri": "memory:video", "mimeType": "video/mp4; private", "blob": "AQID" }),
+            json!({ "uri": "memory:audio", "mimeType": "audio/wav", "blob": "" }),
+            json!({ "uri": "memory:video", "mimeType": "video/mp4", "blob": "bad!" }),
+        ] {
+            assert!(
+                extract_prompt_content(&[json!({ "type": "resource", "resource": resource })])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn configured_media_limit_applies_to_audio_and_embedded_audio_video() {
+        let config = Config {
+            media: Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(2),
+                ..crate::media_tools::MediaSettings::default()
+            }),
+            ..Config::default()
+        };
+        for kind in ["audio", "embedded-audio", "embedded-video"] {
+            let block = |data: &str| match kind {
+                "audio" => json!({ "type": "audio", "mimeType": "audio/wav", "data": data }),
+                _ => json!({ "type": "resource", "resource": {
+                    "uri": "https://example.invalid/not-fetched",
+                    "mimeType": if kind == "embedded-audio" { "audio/ogg" } else { "video/mp4" },
+                    "blob": data,
+                } }),
+            };
+            assert!(super::extract_prompt_content(&[block("AQI=")], &config).is_ok());
+            // Both payloads encode to four bytes. Decoded admission must still
+            // distinguish a two-byte attachment from a three-byte attachment.
+            for rejected in ["AQID", "AQIDBA=="] {
+                let error =
+                    super::extract_prompt_content(&[block(rejected)], &config).unwrap_err();
+                assert!(error.contains("media.maxBytes"));
+            }
+        }
+    }
+
+    #[test]
+    fn media_count_and_aggregate_budget_cover_all_attachment_forms() {
+        let audio = json!({ "type": "audio", "mimeType": "audio/wav", "data": "AQID" });
+        let video = json!({ "type": "resource", "resource": {
+            "uri": "memory:v", "mimeType": "video/mp4", "blob": "BAUG",
+        } });
+        let mut blocks = vec![audio.clone(); MAX_MEDIA_BLOCKS - 1];
+        blocks.push(video.clone());
+        assert!(extract_prompt_content(&blocks).is_ok());
+        blocks.push(video.clone());
+        assert!(
+            extract_prompt_content(&blocks)
+                .unwrap_err()
+                .contains("32 audio/video")
+        );
+
+        let budget = "audio/wav".len() + 4 + "memory:v".len() + "video/mp4".len() + 4;
+        assert!(extract_with_limit(&[audio.clone(), video.clone()], budget, 3).is_ok());
+        assert!(extract_with_limit(&[audio, video], budget - 1, 3).is_err());
+        assert!(
+            extract_with_limit(
+                &[json!({ "type": "audio", "mimeType": "audio/wav", "data": "YQ==" })],
+                1024,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn configured_media_size_cannot_exceed_the_acp_transport_ceiling() {
+        let config = Config {
+            media: Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(u64::MAX),
+                ..crate::media_tools::MediaSettings::default()
+            }),
+            ..Config::default()
+        };
+        let error = super::extract_prompt_content(
+            &[json!({
+                "type": "audio", "mimeType": "audio/wav",
+                "data": "A".repeat(MAX_BASE64_BYTES + 1),
+            })],
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.contains("transport limit (10485760 bytes)"));
     }
 
     #[test]
@@ -401,7 +718,7 @@ mod tests {
             json!({ "type": "resource", "resource": { "uri": "memory:x", "text": "a", "mimeType": 12 } }),
             json!({ "type": "resource", "resource": { "text": "missing URI" } }),
             json!({ "type": "resource_link", "uri": " " }),
-            json!({ "type": "audio", "mimeType": "audio/wav", "data": "YQ==" }),
+            json!({ "type": "audio", "mimeType": "video/mp4", "data": "YQ==" }),
             json!({ "type": "unknown" }),
             json!({ "text": "missing type" }),
             json!(null),
@@ -437,11 +754,11 @@ mod tests {
             json!({ "type": "text", "text": "abc" }),
             json!({ "type": "text", "text": "def" }),
         ];
-        assert!(extract_with_limit(&text_blocks, 6).is_ok());
-        assert!(extract_with_limit(&text_blocks, 5).is_err());
+        assert!(extract_with_limit(&text_blocks, 6, 1024).is_ok());
+        assert!(extract_with_limit(&text_blocks, 5, 1024).is_err());
         let image = [json!({ "type": "image", "mimeType": "image/png", "data": PNG })];
-        assert!(extract_with_limit(&image, PNG.len() + "image/png".len()).is_ok());
-        assert!(extract_with_limit(&image, PNG.len()).is_err());
+        assert!(extract_with_limit(&image, PNG.len() + "image/png".len(), 1024).is_ok());
+        assert!(extract_with_limit(&image, PNG.len(), 1024).is_err());
     }
 
     #[test]

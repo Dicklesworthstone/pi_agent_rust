@@ -749,12 +749,22 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
+**ACP attachments.** `session/prompt` accepts ordered text, images, native
+`audio` blocks, and embedded audio/video resource blobs. Audio-only prompts
+work. Gemini-family providers receive native media; other transports show an
+explicit omission label while the complete attachment stays in session history
+and editor replay. Audio/video admission honors `media.maxBytes` (5 MiB by
+default), with a 10 MiB transport ceiling per attachment and at most 32 media
+attachments per prompt. See [ACP audio and video prompts](docs/tools/media_tools.md#acp-audio-and-video-prompts)
+for the editor wire format and aggregate limits.
+
 **ACP live steering.** The initialize response advertises
 `_meta.steering.supported: true`. Editors can send `_session/steering` with
 `sessionId` and the same `prompt` content blocks as `session/prompt` while a
-turn is running. Text, images, and embedded references retain their native
-form. Set `_meta.steering.queue` to `"followUp"` to request delivery after the
-current model turn; the default `"steering"` lane delivers at the next native
+turn is running. Text, images, audio/video, and embedded references retain
+their native form and the same media limits. Set `_meta.steering.queue` to
+`"followUp"` to request delivery after the current model turn; the default
+`"steering"` lane delivers at the next native
 steering boundary. Steering cancels that session's open permission dialog via
 `$/cancel_request`; a follow-up leaves the dialog open.
 

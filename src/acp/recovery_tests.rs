@@ -1348,6 +1348,141 @@ fn launch_key_survives_real_retry_failover_and_explicit_runtime_model_switch() {
 }
 
 #[test]
+fn acp_audio_video_ingress_reaches_provider_persistence_and_history_replay() {
+    use base64::Engine as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut server = ProviderFixture::new(vec![200]);
+    let runtime = runtime();
+    // Larger than the native session's inline threshold, so reopening must
+    // resolve an integrity-checked attachment rather than an inline JSON copy.
+    let audio = base64::engine::general_purpose::STANDARD.encode(vec![42_u8; 65_537]);
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &server.url, runtime.handle(), 0);
+        options.launch.no_tools = true;
+        options.launch.no_context_files = true;
+        options.config.session_store = Some("jsonl".to_string());
+        options.config.media = Some(crate::media_tools::MediaSettings {
+            max_bytes: Some(70_000),
+            ..crate::media_tools::MediaSettings::default()
+        });
+        let (id, state) = new_state(root.path(), &options);
+        let input = content::extract_prompt_content(
+            &[
+                json!({ "type": "text", "text": "Compare the recording and clip" }),
+                json!({ "type": "audio", "mimeType": "AuDiO/WAV", "data": audio,
+                    "_meta": { "secret": "private-attachment-metadata" } }),
+                json!({ "type": "image", "mimeType": "image/png", "data": PNG }),
+                json!({ "type": "resource", "resource": {
+                    "uri": "file:///unopened/editor-clip.mp4", "mimeType": "video/mp4", "blob": "BAUG",
+                } }),
+                json!({ "type": "text", "text": "Keep their order" }),
+            ],
+            &options.config,
+        )
+        .expect("admit ACP native media");
+        let expected = serde_json::to_value(UserContent::Blocks(input.clone())).unwrap();
+        let (_, signal) = AbortHandle::new();
+        let (reason, updates) = prompt(&state, &id, input, signal).await;
+        assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+        assert_eq!(updates.last().unwrap()["result"]["stopReason"], "end_turn");
+
+        let saved = reopen(&state).await;
+        let messages = saved.to_messages_for_current_path();
+        let users = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), 1);
+        assert_eq!(serde_json::to_value(&users[0].content).unwrap(), expected);
+        let durable = std::fs::read_to_string(saved.path.as_ref().unwrap()).unwrap();
+        assert!(durable.contains("$piBlob"));
+        assert!(!durable.contains(&audio));
+        assert!(!durable.contains("private-attachment-metadata"));
+
+        // The restored native input remains usable by Gemini, even though the
+        // current provider's transport emits explicit media-omission notices.
+        let gemini = serde_json::to_value(
+            crate::providers::gemini::convert_user_content_to_parts(&users[0].content),
+        )
+        .unwrap();
+        assert_eq!(gemini[1]["inline_data"]["mimeType"], "audio/wav");
+        assert_eq!(gemini[1]["inline_data"]["data"], audio);
+        assert_eq!(gemini[2]["inline_data"]["data"], PNG);
+        assert_eq!(gemini[4]["inline_data"]["mimeType"], "video/mp4");
+        assert_eq!(gemini[4]["inline_data"]["data"], "BAUG");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        let tx = AcpOutput::new(tx);
+        let cx = AgentCx::for_current_or_request();
+        let permission_client = AcpPermissionClient {
+            out_tx: tx.clone(),
+            pending: Arc::clone(&tx.shared.pending_permissions),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            timeout: Duration::from_secs(1),
+            cx: cx.clone(),
+        };
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        history::load(
+            &json!({ "sessionId": id, "cwd": root.path(), "mcpServers": [] }),
+            &options,
+            &permission_client,
+            &sessions,
+            &cx,
+            &tx,
+            true,
+        )
+        .await
+        .expect("reload and replay durable ACP media");
+        let replay = rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|frame| frame["params"]["update"]["sessionUpdate"] == "user_message_chunk")
+            .map(|frame| frame["params"]["update"]["content"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(replay.len(), 6);
+        assert_eq!(replay[0]["text"], "Compare the recording and clip");
+        assert_eq!(
+            replay[1],
+            json!({ "type": "audio", "mimeType": "audio/wav", "data": audio }),
+        );
+        assert_eq!(replay[2]["type"], "image");
+        assert_eq!(replay[2]["data"], PNG);
+        assert!(
+            replay[3]["text"]
+                .as_str()
+                .unwrap()
+                .contains("file:///unopened/editor-clip.mp4")
+        );
+        assert_eq!(replay[4]["type"], "resource");
+        assert_eq!(replay[4]["resource"]["mimeType"], "video/mp4");
+        assert_eq!(replay[4]["resource"]["blob"], "BAUG");
+        assert_eq!(replay[5]["text"], "Keep their order");
+    }));
+    let requests = server.finish(1);
+    let wire = user_content(&requests[0].1);
+    assert_eq!(wire.as_array().unwrap().len(), 6);
+    assert_eq!(wire[0]["text"], "Compare the recording and clip");
+    assert_eq!(
+        wire[1]["text"],
+        "[media omitted: unnamed, audio/wav, 64.0 KB]",
+    );
+    assert_eq!(
+        wire[2]["image_url"]["url"],
+        format!("data:image/png;base64,{PNG}"),
+    );
+    assert_eq!(wire[4]["text"], "[media omitted: unnamed, video/mp4, 3 B]");
+    assert_eq!(wire[5]["text"], "Keep their order");
+    let wire = wire.to_string();
+    assert!(!wire.contains(&audio));
+    assert!(!wire.contains("private-attachment-metadata"));
+    assert!(!wire.contains("BAUG"));
+}
+
+#[test]
 fn configured_acp_retry_preserves_ordered_native_input_and_one_durable_turn() {
     let root = tempfile::tempdir().unwrap();
     let mut server = ProviderFixture::new(vec![503, 200]);

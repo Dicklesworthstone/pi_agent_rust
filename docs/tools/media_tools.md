@@ -300,6 +300,52 @@ transports retain the existing text-placeholder behavior instead of sending the
 inline media payload. This attachment path is distinct from `inspect_image`,
 which explicitly sends its input to the separately selected vision provider.
 
+## ACP audio and video prompts
+
+ACP editors can attach audio directly in `session/prompt`. Pi advertises the
+ACP v1 `promptCapabilities.audio` capability and accepts audio-only prompts:
+
+```json
+{
+  "sessionId": "<active session>",
+  "prompt": [
+    {"type": "text", "text": "Summarize this recording and compare the clip."},
+    {"type": "audio", "mimeType": "audio/wav", "data": "<base64 audio>"},
+    {"type": "resource", "resource": {
+      "uri": "memory:editor-clip.mp4",
+      "mimeType": "video/mp4",
+      "blob": "<base64 video>"
+    }}
+  ]
+}
+```
+
+ACP v1 carries video as an embedded binary resource. Audio resource blobs work
+too. The supplied bytes retain their order beside text and images; a resource
+also retains a labeled URI reference. The URI is never opened or fetched during
+attachment admission. Metadata in `_meta` and annotations is not forwarded to
+the model. MIME types must be bare audio/video labels such as `audio/ogg` or
+`video/webm`; casing is normalized, while parameters and malformed labels are
+rejected. Standard base64 may include or omit padding. Empty or malformed
+payloads reject the whole prompt before a turn starts. These are MIME/base64
+checks, not audio/video codec validation; the selected provider must support
+the submitted format.
+
+The decoded limit is `media.maxBytes`, defaulting to 5 MiB, with a hard 10 MiB
+ceiling for each attachment. A prompt accepts at most 32 audio/video blocks and
+1024 total ACP blocks. Text, URI/MIME metadata, and encoded binary payloads
+share a 32 MiB prompt budget. `_session/steering` uses the same media admission
+rules plus its existing smaller queue and serialized-request limits.
+
+Gemini-family providers receive the native audio/video. Other transports keep
+the explicit media-omission text; they do not receive the binary payload. The
+shared session store retains the full attachment, including large attachment
+sidecars, so ACP load/replay and a later model switch preserve the media. Live
+audio tool outputs and embedded video outputs use the same ACP wire forms and
+can be attached to a later prompt.
+
+The wire forms follow the [official ACP v1 content schema](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1/schema.json).
+
 ## Operational boundaries and validation
 
 All live media operations declare network effects; generation and synthesis

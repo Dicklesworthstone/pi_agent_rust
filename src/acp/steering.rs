@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use crate::agent::{MessageFetcher, QueuedAgentMessage};
+use crate::config::Config;
 use crate::model::{ContentBlock, Message, UserContent, UserMessage};
 
 use super::{AcpOutput, content, json_rpc_ok};
@@ -41,7 +42,11 @@ pub(super) struct Input {
 }
 
 impl Input {
-    pub(super) fn parse(params: &Value, response_id: Option<Value>) -> Result<Self, String> {
+    pub(super) fn parse(
+        params: &Value,
+        response_id: Option<Value>,
+        config: &Config,
+    ) -> Result<Self, String> {
         if response_id
             .as_ref()
             .is_some_and(|id| !matches!(id, Value::Null | Value::String(_) | Value::Number(_)))
@@ -88,10 +93,11 @@ impl Input {
                 return Err("embedded resource mimeType must be a string when present".into());
             }
         }
-        let native = content::extract_prompt_content(blocks)?;
+        let native = content::extract_prompt_content(blocks, config)?;
         if !native.iter().any(|block| match block {
             ContentBlock::Text(text) => !text.text.trim().is_empty(),
             ContentBlock::Image(image) => !image.data.is_empty(),
+            ContentBlock::Media(media) => !media.data.is_empty(),
             _ => false,
         }) {
             return Err("steering prompt is empty".into());
@@ -308,6 +314,7 @@ mod tests {
                 "_meta": { "steering": { "queue": queue } },
             }),
             Some(json!(1)),
+            &Config::default(),
         )
         .expect("valid queued prompt")
     }
@@ -342,6 +349,49 @@ mod tests {
     }
 
     #[test]
+    fn media_only_steering_preserves_native_content_and_configured_limits() {
+        let mut config = Config {
+            media: Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(2),
+                ..crate::media_tools::MediaSettings::default()
+            }),
+            ..Config::default()
+        };
+        let params = json!({ "prompt": [
+            { "type": "audio", "mimeType": "audio/wav", "data": "AQID" },
+            { "type": "resource", "resource": {
+                "uri": "memory:ultrathink.mp4", "mimeType": "video/mp4", "blob": "BAUG",
+            } },
+        ] });
+        let error = Input::parse(&params, Some(json!(7)), &config)
+            .err()
+            .expect("configured per-media cap applies before queueing");
+        assert!(error.contains("media.maxBytes"));
+        config.media.as_mut().unwrap().max_bytes = Some(3);
+        let admitted = Input::parse(&params, Some(json!(7)), &config).unwrap();
+        assert_eq!(admitted.message.keyword_scan_source(), Some(""));
+        let Message::User(user) = admitted.message.message() else {
+            panic!("user input")
+        };
+        let UserContent::Blocks(blocks) = &user.content else {
+            panic!("native blocks")
+        };
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], ContentBlock::Media(media) if media.data == "AQID"));
+        assert!(
+            matches!(&blocks[1], ContentBlock::Text(text) if text.text.contains("memory:ultrathink.mp4"))
+        );
+        assert!(matches!(&blocks[2], ContentBlock::Media(media) if media.mime_type == "video/mp4"));
+
+        let audio_only = input(
+            json!([{ "type": "audio", "mimeType": "audio/ogg", "data": "AQID" }]),
+            "followUp",
+        );
+        assert_eq!(audio_only.message.keyword_scan_source(), Some(""));
+        assert!(!audio_only.is_steering());
+    }
+
+    #[test]
     fn malformed_or_empty_prompts_are_rejected_before_admission() {
         for prompt in [
             json!([]),
@@ -354,13 +404,28 @@ mod tests {
             json!([{ "type": "resource_link", "uri": "file:///x", "description": 7 }]),
             json!([{ "type": "resource", "resource": { "uri": "file:///x", "text": "x", "mimeType": null } }]),
         ] {
-            assert!(Input::parse(&json!({ "prompt": prompt }), Some(json!(1))).is_err());
+            assert!(
+                Input::parse(
+                    &json!({ "prompt": prompt }),
+                    Some(json!(1)),
+                    &Config::default(),
+                )
+                .is_err()
+            );
         }
-        assert!(Input::parse(&json!({ "prompt": "ok" }), Some(json!({ "bad": "id" }))).is_err());
+        assert!(
+            Input::parse(
+                &json!({ "prompt": "ok" }),
+                Some(json!({ "bad": "id" })),
+                &Config::default(),
+            )
+            .is_err()
+        );
         assert!(
             Input::parse(
                 &json!({ "prompt": "ok" }),
                 Some(json!("x".repeat(MAX_INPUT_BYTES))),
+                &Config::default(),
             )
             .is_err()
         );
@@ -391,6 +456,7 @@ mod tests {
             Input::parse(
                 &json!({ "prompt": "x".repeat(MAX_AUTHORED_BYTES + 1) }),
                 None,
+                &Config::default(),
             )
             .is_err()
         );
