@@ -28,6 +28,9 @@ use std::task::{Context as TaskContext, Poll};
 const OPENAI_RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
 pub(crate) const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+const MAX_READY_EVENTS_PER_YIELD: usize = 64;
+
+type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
 // ============================================================================
 // OpenAI Responses Provider
@@ -582,101 +585,127 @@ impl Provider for OpenAIResponsesProvider {
             }
         }
 
-        let byte_stream = response.bytes_stream();
-        let event_source = if use_ndjson {
-            ResponsesEventStream::Ndjson(NdjsonStream::new(byte_stream))
+        Ok(wire_stream(
+            response.bytes_stream(),
+            use_ndjson,
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
+        ))
+    }
+}
+
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            Poll::Ready(())
         } else {
-            ResponsesEventStream::Sse(SseStream::new(byte_stream))
-        };
+            yielded = true;
+            task.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
 
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
+fn wire_stream<S>(
+    source: S,
+    use_ndjson: bool,
+    model: String,
+    api: String,
+    provider: String,
+) -> EventStream
+where
+    S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
+{
+    let event_source = if use_ndjson {
+        ResponsesEventStream::Ndjson(NdjsonStream::new(source))
+    } else {
+        ResponsesEventStream::Sse(SseStream::new(source))
+    };
+    let state = StreamState::new(event_source, model, api, provider);
+    let output = stream::unfold(Some(state), |active| async move {
+        let mut state = active?;
+        let mut ready_events = 0;
+        loop {
+            if let Some(event) = state.pending_events.pop_front() {
+                let terminal =
+                    matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                // Release the source, buffered wire data, and partial tool state
+                // before the caller observes a terminal event and stops polling.
+                let active = (!terminal).then_some(state);
+                return Some((Ok(event), active));
+            }
 
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                loop {
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
+            // Drain block endings queued at the wire boundary before stopping.
+            if state.finished {
+                return None;
+            }
+
+            // Metadata-only events can always be ready, even when the underlying
+            // SSE/NDJSON parser yields fairly within each individual event.
+            if ready_events == MAX_READY_EVENTS_PER_YIELD {
+                yield_stream_turn().await;
+                ready_events = 0;
+            }
+            ready_events += 1;
+
+            match state.event_source.next().await {
+                Some(Ok(msg)) => {
+                    state.transient_error_count = 0;
+                    if msg.data == "[DONE]" {
+                        // Completion metadata can precede trailing item events
+                        // and usage. Finalize only at the wire boundary.
+                        if !state.finish_terminal_response() {
+                            state.finish(None);
+                        }
+                        continue;
                     }
 
-                    // We may have queued terminal events (ToolCallEnd, Done, etc) after
-                    // consuming the final wire chunk. Only stop once the queue is empty.
-                    if state.finished {
-                        return None;
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            // A successful chunk resets the consecutive error counter.
-                            state.transient_error_count = 0;
-                            if msg.data == "[DONE]" {
-                                // Response terminal metadata can arrive before trailing item
-                                // events, so only emit Done once the wire stream itself ends.
-                                if !state.finish_terminal_response() {
-                                    // Best-effort fallback: if we didn't see a completed or
-                                    // incomplete chunk, emit Done using current state.
-                                    state.finish(None);
-                                }
-                                continue;
-                            }
-
-                            if let Err(e) = state.process_event(&msg.data) {
-                                // A malformed known event is fatal to this response.
-                                // Repolling must not authorize trailing tool calls.
-                                state.finished = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                            // Skip them and keep reading the stream, but cap
-                            // consecutive occurrences to avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        None => {
-                            if state.finish_terminal_response() {
-                                continue;
-                            }
-
-                            // If the stream ends unexpectedly, surface an error. This matches the
-                            // agent loop expectation that providers emit Done/Error explicitly.
-                            return Some((
-                                Err(Error::api("Stream ended without Done event")),
-                                state,
-                            ));
-                        }
+                    if let Err(error) = state.process_event(&msg.data) {
+                        // A fatal frame must not leave a live source that can
+                        // authorize trailing tools when a caller repolls.
+                        return Some((Err(error), None));
                     }
                 }
-            },
-        );
+                Some(Err(error)) => {
+                    // Preserve the bounded retry policy for transient wire errors.
+                    const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
+                    if error.kind() == std::io::ErrorKind::WriteZero
+                        || error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut
+                    {
+                        state.transient_error_count += 1;
+                        if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+                            tracing::warn!(
+                                kind = ?error.kind(),
+                                count = state.transient_error_count,
+                                "Transient error in SSE stream, continuing"
+                            );
+                            continue;
+                        }
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
+                             consecutive attempts, treating as fatal"
+                        );
+                    }
+                    return Some((Err(Error::sse(&error)), None));
+                }
+                None => {
+                    if state.finish_terminal_response() {
+                        continue;
+                    }
 
-        // Fuse so a repoll after the terminal `None` stays at EOF instead of
-        // hitting `Unfold`'s poll-after-completion panic (an abort in release).
-        Ok(Box::pin(stream.fuse()))
-    }
+                    return Some((Err(Error::api("Stream ended without Done event")), None));
+                }
+            }
+        }
+    });
+
+    // A terminal item retires the state; fusion also makes repeated EOF polls safe.
+    Box::pin(output.fuse())
 }
 
 // ============================================================================
@@ -684,11 +713,13 @@ impl Provider for OpenAIResponsesProvider {
 // ============================================================================
 
 const NDJSON_MAX_EVENT_BYTES: usize = 100 * 1024 * 1024;
+const MAX_NDJSON_CHUNKS_PER_POLL: usize = 64;
+const MAX_NDJSON_LINES_PER_POLL: usize = 64;
 
 struct NdjsonStream<S> {
     inner: S,
     buffer: Vec<u8>,
-    pending: VecDeque<String>,
+    buffer_offset: usize,
     finished: bool,
     max_event_bytes: usize,
 }
@@ -698,7 +729,7 @@ impl<S> NdjsonStream<S> {
         Self {
             inner,
             buffer: Vec::new(),
-            pending: VecDeque::new(),
+            buffer_offset: 0,
             finished: false,
             max_event_bytes: NDJSON_MAX_EVENT_BYTES,
         }
@@ -709,7 +740,7 @@ impl<S> NdjsonStream<S> {
         Self {
             inner,
             buffer: Vec::new(),
-            pending: VecDeque::new(),
+            buffer_offset: 0,
             finished: false,
             max_event_bytes,
         }
@@ -729,46 +760,16 @@ impl<S> NdjsonStream<S> {
         )
     }
 
-    fn push_line(&mut self, line_bytes: &[u8]) -> std::io::Result<()> {
+    fn parse_line(&self, line_bytes: &[u8]) -> std::io::Result<Option<SseEvent>> {
         if line_bytes.len() > self.max_event_bytes {
             return Err(self.event_too_large_error());
         }
         let line = std::str::from_utf8(line_bytes).map_err(|_| Self::invalid_utf8_error())?;
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.trim().is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        self.pending.push_back(line.to_string());
-        Ok(())
-    }
-
-    fn drain_buffer(&mut self) -> std::io::Result<()> {
-        if self.buffer.len() > self.max_event_bytes && memchr::memchr(b'\n', &self.buffer).is_none()
-        {
-            return Err(self.event_too_large_error());
-        }
-        while let Some(pos) = memchr::memchr(b'\n', &self.buffer) {
-            if pos > self.max_event_bytes {
-                return Err(self.event_too_large_error());
-            }
-            let mut line = self.buffer.drain(..=pos).collect::<Vec<u8>>();
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            if !line.is_empty() {
-                self.push_line(&line)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn finish_buffer(&mut self) -> std::io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let line = std::mem::take(&mut self.buffer);
-        self.push_line(&line)?;
-        Ok(())
+        Ok(Some(Self::event_from_line(line.to_string())))
     }
 
     fn event_from_line(line: String) -> SseEvent {
@@ -786,35 +787,62 @@ where
     type Item = std::io::Result<SseEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(line) = self.pending.pop_front() {
-            return Poll::Ready(Some(Ok(Self::event_from_line(line))));
-        }
-
         if self.finished {
             return Poll::Ready(None);
         }
 
+        let mut chunks = 0;
+        let mut lines = 0;
         loop {
+            // Empty chunks and coalesced blank lines produce no provider event,
+            // so both require their own cooperative polling budget here.
+            if lines == MAX_NDJSON_LINES_PER_POLL {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let unread = &self.buffer[self.buffer_offset..];
+            if let Some(pos) = memchr::memchr(b'\n', unread) {
+                let event = self.parse_line(&unread[..pos]);
+                self.buffer_offset += pos + 1;
+                lines += 1;
+                match event {
+                    Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        self.finished = true;
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                }
+            }
+            if unread.len() > self.max_event_bytes {
+                self.finished = true;
+                return Poll::Ready(Some(Err(self.event_too_large_error())));
+            }
+            if chunks == MAX_NDJSON_CHUNKS_PER_POLL {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            // Compact only before reading more bytes. Parsing a coalesced batch
+            // does not repeatedly shift its entire unread tail for every line.
+            let consumed = self.buffer_offset;
+            if consumed > 0 {
+                drop(self.buffer.drain(..consumed));
+                self.buffer_offset = 0;
+            }
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
+                    chunks += 1;
                     self.buffer.extend_from_slice(&chunk);
-                    if let Err(err) = self.drain_buffer() {
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                    if let Some(line) = self.pending.pop_front() {
-                        return Poll::Ready(Some(Ok(Self::event_from_line(line))));
-                    }
                 }
                 Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
                 Poll::Ready(None) => {
                     self.finished = true;
-                    if let Err(err) = self.finish_buffer() {
-                        return Poll::Ready(Some(Err(err)));
+                    let line = std::mem::take(&mut self.buffer);
+                    match self.parse_line(&line) {
+                        Ok(event) => return Poll::Ready(event.map(Ok)),
+                        Err(error) => return Poll::Ready(Some(Err(error))),
                     }
-                    if let Some(line) = self.pending.pop_front() {
-                        return Poll::Ready(Some(Ok(Self::event_from_line(line))));
-                    }
-                    return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -6535,6 +6563,636 @@ mod tests {
             let expected = summarize_events(&collect_ndjson_events_from_chunks(&body, &[]));
             let actual = summarize_events(&collect_ndjson_events_from_chunks(&body, &chunk_sizes));
             prop_assert_eq!(actual, expected);
+        }
+    }
+
+    mod stream_lifecycle {
+        use super::*;
+        use futures::FutureExt as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        #[derive(Clone, Copy, Debug)]
+        struct Mode {
+            ndjson: bool,
+            codex: bool,
+        }
+
+        const MODES: [Mode; 4] = [
+            Mode {
+                ndjson: false,
+                codex: false,
+            },
+            Mode {
+                ndjson: false,
+                codex: true,
+            },
+            Mode {
+                ndjson: true,
+                codex: false,
+            },
+            Mode {
+                ndjson: true,
+                codex: true,
+            },
+        ];
+
+        impl Mode {
+            fn frame(self, data: &str) -> Vec<u8> {
+                if self.ndjson {
+                    format!("{data}\n").into_bytes()
+                } else {
+                    format!("data: {data}\n\n").into_bytes()
+                }
+            }
+
+            fn events(self, values: &[Value]) -> Vec<u8> {
+                values
+                    .iter()
+                    .flat_map(|value| self.frame(&value.to_string()))
+                    .collect()
+            }
+
+            const fn identity(self) -> (&'static str, &'static str, &'static str) {
+                if self.codex {
+                    ("gpt-codex-test", "openai-codex-responses", "openai-codex")
+                } else {
+                    ("gpt-responses-test", "openai-responses", "openai")
+                }
+            }
+
+            fn assert_identity(self, message: &AssistantMessage) {
+                let (model, api, provider) = self.identity();
+                assert_eq!(message.model, model);
+                assert_eq!(message.api, api);
+                assert_eq!(message.provider, provider);
+            }
+        }
+
+        #[derive(Default)]
+        struct SourceObservation {
+            dropped: AtomicBool,
+            polls: AtomicUsize,
+        }
+
+        enum Tail {
+            Eof,
+            Pending,
+            Repeat(Vec<u8>),
+        }
+
+        struct ObservedSource {
+            chunks: VecDeque<std::io::Result<Vec<u8>>>,
+            tail: Tail,
+            observation: Arc<SourceObservation>,
+        }
+
+        impl Stream for ObservedSource {
+            type Item = std::io::Result<Vec<u8>>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _: &mut TaskContext<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                let this = self.get_mut();
+                let polls = this.observation.polls.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some(chunk) = this.chunks.pop_front() {
+                    return Poll::Ready(Some(chunk));
+                }
+                match &this.tail {
+                    Tail::Eof => Poll::Ready(None),
+                    Tail::Pending => Poll::Pending,
+                    Tail::Repeat(chunk) => {
+                        // A regressed driver fails the test instead of hanging
+                        // forever while reading an always-ready source.
+                        assert!(
+                            polls <= MAX_READY_EVENTS_PER_YIELD * 4,
+                            "ready source never yielded"
+                        );
+                        Poll::Ready(Some(Ok(chunk.clone())))
+                    }
+                }
+            }
+        }
+
+        impl Drop for ObservedSource {
+            fn drop(&mut self) {
+                self.observation.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn observed_stream(
+            mode: Mode,
+            chunks: Vec<std::io::Result<Vec<u8>>>,
+            tail: Tail,
+        ) -> (EventStream, Arc<SourceObservation>) {
+            let observation = Arc::new(SourceObservation::default());
+            let source = ObservedSource {
+                chunks: chunks.into(),
+                tail,
+                observation: Arc::clone(&observation),
+            };
+            let (model, api, provider) = mode.identity();
+            (
+                wire_stream(
+                    source,
+                    mode.ndjson,
+                    model.into(),
+                    api.into(),
+                    provider.into(),
+                ),
+                observation,
+            )
+        }
+
+        fn assert_retired(output: &mut EventStream, observation: &SourceObservation) {
+            assert!(
+                observation.dropped.load(Ordering::SeqCst),
+                "source survived terminal delivery"
+            );
+            let polls = observation.polls.load(Ordering::SeqCst);
+            for _ in 0..3 {
+                assert!(
+                    matches!(output.next().now_or_never(), Some(None)),
+                    "terminal stream did not stay at EOF"
+                );
+            }
+            assert_eq!(
+                observation.polls.load(Ordering::SeqCst),
+                polls,
+                "retired source was polled again"
+            );
+        }
+
+        #[derive(Default)]
+        struct WakeFlag(AtomicBool);
+
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn completion(input: u64, output: u64) -> Value {
+            json!({
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": input, "output_tokens": output, "total_tokens": input + output}}
+            })
+        }
+
+        fn text_delta(text: &str) -> Value {
+            json!({"type": "response.output_text.delta", "item_id": "msg_1", "content_index": 0, "delta": text})
+        }
+
+        fn tool_done(arguments: &str) -> Value {
+            json!({
+                "type": "response.output_item.done",
+                "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "echo", "arguments": arguments}
+            })
+        }
+
+        async fn terminal_events(output: &mut EventStream) -> Vec<StreamEvent> {
+            let mut events = Vec::new();
+            for _ in 0..32 {
+                let event = output
+                    .next()
+                    .await
+                    .expect("terminal event missing")
+                    .expect("wire event");
+                let terminal =
+                    matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                events.push(event);
+                if terminal {
+                    return events;
+                }
+            }
+            panic!("terminal event missing after 32 events");
+        }
+
+        #[test]
+        fn terminal_releases_source_after_late_items_usage_and_block_endings() {
+            for mode in MODES {
+                for sentinel in [false, true] {
+                    let mut body = mode.events(&[
+                        json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 0, "delta": "Plan"}),
+                        text_delta("Ready"),
+                        json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"text\":\"late\"}"}),
+                        completion(1, 1),
+                        json!({"type": "response.output_item.done", "item": {"type": "reasoning", "id": "rs_1", "summary": [{"text": "Plan"}], "encrypted_content": "opaque-signature"}}),
+                        json!({"type": "response.output_item.done", "item": {"type": "message", "id": "msg_1"}}),
+                        tool_done(""),
+                        completion(17, 9),
+                    ]);
+                    let tail = if sentinel {
+                        body.extend(mode.frame("[DONE]"));
+                        Tail::Pending
+                    } else {
+                        Tail::Eof
+                    };
+                    let (mut output, observation) = observed_stream(mode, vec![Ok(body)], tail);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    let events = runtime.block_on(terminal_events(&mut output));
+                    assert_retired(&mut output, &observation);
+                    let Some(StreamEvent::Done { reason, message }) = events.last() else {
+                        panic!("expected successful terminal for {mode:?}");
+                    };
+                    assert_eq!(*reason, StopReason::ToolUse);
+                    mode.assert_identity(message);
+                    assert_eq!(
+                        (
+                            message.usage.input,
+                            message.usage.output,
+                            message.usage.total_tokens
+                        ),
+                        (17, 9, 26)
+                    );
+                    assert!(events.iter().any(|event| matches!(event, StreamEvent::TextEnd { content, .. } if content == "Ready")));
+                    assert!(events.iter().any(|event| matches!(event, StreamEvent::ThinkingEnd { content, .. } if content == "Plan")));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                            .count(),
+                        1
+                    );
+                    // ubs:ignore[rust.security.constant-time-compare] Public fixture equality, not authentication.
+                    assert!(message.content.iter().any(|block| matches!(block, ContentBlock::Text(text) if text.text == "Ready" && text.text_signature.as_deref() == Some("msg_1"))));
+                    let thinking = message
+                        .content
+                        .iter()
+                        .find_map(|block| match block {
+                            ContentBlock::Thinking(thinking) => Some(thinking),
+                            _ => None,
+                        })
+                        .expect("thinking block");
+                    let signature: Value = serde_json::from_str(
+                        thinking
+                            .thinking_signature
+                            .as_deref()
+                            .expect("late signature"),
+                    )
+                    .expect("signature JSON");
+                    assert_eq!(signature["encrypted_content"], "opaque-signature");
+                    // ubs:ignore[rust.security.constant-time-compare] Public fixture equality, not authentication.
+                    assert!(message.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(call) if call.id == "call_1" && call.arguments == json!({"text": "late"}) && call.thought_signature.as_deref() == Some("fc_1"))));
+                }
+            }
+        }
+
+        #[test]
+        fn protocol_errors_release_source_and_never_replay_trailing_tools() {
+            for mode in MODES {
+                for failure in [
+                    json!({"type": "response.failed", "response": {"error": {"message": "provider failed"}}}),
+                    json!({"type": "error", "message": "provider failed"}),
+                    tool_done("{"),
+                ] {
+                    let mut body = mode.events(&[text_delta("partial"), completion(7, 3), failure]);
+                    body.extend(mode.events(&[tool_done("{}"), completion(99, 99)]));
+                    body.extend(mode.frame("[DONE]"));
+                    let (mut output, observation) =
+                        observed_stream(mode, vec![Ok(body)], Tail::Pending);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    let events = runtime.block_on(terminal_events(&mut output));
+                    assert_retired(&mut output, &observation);
+                    let Some(StreamEvent::Error { reason, error }) = events.last() else {
+                        panic!("expected failed terminal for {mode:?}");
+                    };
+                    assert_eq!(*reason, StopReason::Error);
+                    mode.assert_identity(error);
+                    assert_eq!((error.usage.input, error.usage.output), (7, 3));
+                    assert!(error.error_message.is_some());
+                    assert!(error.content.iter().any(
+                        |block| matches!(block, ContentBlock::Text(text) if text.text == "partial")
+                    ));
+                    assert!(!events.iter().any(|event| matches!(
+                        event,
+                        StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. }
+                    )));
+                }
+            }
+        }
+
+        #[test]
+        fn parser_transport_and_eof_failures_retire_before_one_error() {
+            for mode in MODES {
+                for failure in [
+                    "json",
+                    "json-coalesced",
+                    "known-event",
+                    "utf8",
+                    "utf8-coalesced",
+                    "utf8-at-eof",
+                    "transport",
+                    "eof",
+                    "transport-after-completed",
+                ] {
+                    let mut chunks = vec![Ok(mode.events(&[text_delta("partial")]))];
+                    if failure == "transport-after-completed" {
+                        chunks.push(Ok(mode.events(&[completion(7, 3)])));
+                    }
+                    let expected = match failure {
+                        "json" | "json-coalesced" => {
+                            chunks.push(Ok(mode.frame("{")));
+                            "JSON parse error"
+                        }
+                        "known-event" => {
+                            chunks.push(Ok(mode.frame(r#"{"type":"response.output_text.delta","item_id":"msg_1","content_index":0}"#)));
+                            "JSON parse error"
+                        }
+                        "utf8" | "utf8-coalesced" => {
+                            chunks.push(Ok(vec![0xff, b'\n']));
+                            "UTF-8"
+                        }
+                        "utf8-at-eof" => {
+                            chunks.push(Ok(vec![0xc3]));
+                            "UTF-8"
+                        }
+                        "transport" | "transport-after-completed" => {
+                            chunks.push(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "connection lost",
+                            )));
+                            "connection lost"
+                        }
+                        "eof" => "Stream ended without Done event",
+                        _ => unreachable!(),
+                    };
+                    let tail = if failure == "eof" || failure == "utf8-at-eof" {
+                        Tail::Eof
+                    } else {
+                        chunks.push(Ok(mode.events(&[tool_done("{}"), completion(99, 99)])));
+                        Tail::Pending
+                    };
+                    if failure.ends_with("-coalesced") {
+                        let mut body = Vec::new();
+                        for chunk in chunks {
+                            body.extend(chunk.expect("coalesced wire bytes"));
+                        }
+                        chunks = vec![Ok(body)];
+                    }
+                    let (mut output, observation) = observed_stream(mode, chunks, tail);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut saw_partial = false;
+                        for _ in 0..8 {
+                            match output.next().await.expect("expected exactly one error") {
+                                Ok(StreamEvent::TextDelta { delta, .. }) => {
+                                    saw_partial |= delta == "partial"
+                                }
+                                Ok(StreamEvent::Start { partial }) => {
+                                    mode.assert_identity(&partial)
+                                }
+                                Ok(StreamEvent::TextStart { .. }) => {}
+                                Ok(event) => {
+                                    panic!("unexpected event after failure {failure}: {event:?}")
+                                }
+                                Err(error) => {
+                                    assert!(saw_partial);
+                                    assert!(
+                                        error.to_string().contains(expected),
+                                        "{mode:?} {failure}: {error}"
+                                    );
+                                    assert_retired(&mut output, &observation);
+                                    return;
+                                }
+                            }
+                        }
+                        panic!("wire failure was not reported");
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn ndjson_transient_errors_remain_bounded_and_reset_after_a_valid_frame() {
+            let mode = Mode {
+                ndjson: true,
+                codex: true,
+            };
+            for recover in [false, true] {
+                let mut chunks: Vec<_> = (0..5)
+                    .map(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)))
+                    .collect();
+                if recover {
+                    chunks.push(Ok(mode.events(&[completion(7, 3)])));
+                    chunks.extend(
+                        (0..5).map(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+                    );
+                    chunks.push(Ok(mode.frame("[DONE]")));
+                } else {
+                    chunks.push(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+                    chunks.push(Ok(mode.events(&[tool_done("{}"), completion(99, 99)])));
+                }
+                let (mut output, observation) = observed_stream(mode, chunks, Tail::Pending);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    if recover {
+                        let events = terminal_events(&mut output).await;
+                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                            panic!("valid frame did not reset transient allowance");
+                        };
+                        assert_eq!((message.usage.input, message.usage.output), (7, 3));
+                    } else {
+                        assert!(output.next().await.expect("fatal sixth error").is_err());
+                        assert_eq!(observation.polls.load(Ordering::SeqCst), 6);
+                    }
+                    assert_retired(&mut output, &observation);
+                });
+            }
+        }
+
+        #[test]
+        fn ready_metadata_bursts_yield_wake_and_preserve_late_usage() {
+            for mode in MODES {
+                let mut body = mode.events(&[completion(1, 1)]);
+                for _ in 0..MAX_READY_EVENTS_PER_YIELD * 2 {
+                    body.extend(mode.frame(r#"{"type":"response.in_progress"}"#));
+                }
+                body.extend(mode.events(&[completion(17, 9)]));
+                body.extend(mode.frame("[DONE]"));
+                let (mut output, observation) =
+                    observed_stream(mode, vec![Ok(body)], Tail::Pending);
+                assert!(matches!(
+                    output.next().now_or_never(),
+                    Some(Some(Ok(StreamEvent::Start { .. })))
+                ));
+                let flag = Arc::new(WakeFlag::default());
+                let waker = Waker::from(Arc::clone(&flag));
+                let mut task = TaskContext::from_waker(&waker);
+                assert!(
+                    output.as_mut().poll_next(&mut task).is_pending(),
+                    "{mode:?} consumed an entire metadata burst"
+                );
+                assert!(
+                    flag.0.load(Ordering::SeqCst),
+                    "cooperative yield did not wake its consumer"
+                );
+                assert!(!observation.dropped.load(Ordering::SeqCst));
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                let events = runtime.block_on(terminal_events(&mut output));
+                let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                    panic!("missing metadata terminal");
+                };
+                assert_eq!((message.usage.input, message.usage.output), (17, 9));
+                assert_retired(&mut output, &observation);
+            }
+        }
+
+        #[test]
+        fn cancellation_wins_against_an_always_ready_metadata_source() {
+            for mode in MODES {
+                let mut repeats = vec![mode.frame(r#"{"type":"response.in_progress"}"#)];
+                if mode.ndjson {
+                    repeats.extend([Vec::new(), b" \t".to_vec(), b" \t\r\n".to_vec()]);
+                }
+                for repeat in repeats {
+                    let (mut output, observation) =
+                        observed_stream(mode, Vec::new(), Tail::Repeat(repeat));
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let (abort, signal) = crate::agent::AbortHandle::new();
+                        let next = Box::pin(output.next());
+                        let cancel = Box::pin(async move {
+                            abort.abort();
+                            signal.wait().await;
+                        });
+                        match futures::future::select(next, cancel).await {
+                            futures::future::Either::Right(((), pending)) => drop(pending),
+                            futures::future::Either::Left(_) => {
+                                panic!("ready source starved cancellation")
+                            }
+                        }
+                    });
+                    assert!(observation.polls.load(Ordering::SeqCst) <= MAX_READY_EVENTS_PER_YIELD);
+                    drop(output);
+                    assert!(observation.dropped.load(Ordering::SeqCst));
+                }
+            }
+        }
+
+        #[test]
+        fn ndjson_limits_each_line_and_preserves_valid_prefix_before_a_parse_error() {
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            runtime.block_on(async {
+                let line = r#"{"type":"response.in_progress"}"#;
+                let count = MAX_READY_EVENTS_PER_YIELD * 2;
+                for suffix in [vec![0xff, b'\n'], vec![0xc3], vec![b'x'; line.len() + 1]] {
+                    let mut body = format!("{line}\n").repeat(count).into_bytes();
+                    body.extend(suffix);
+                    let mut parser = NdjsonStream::with_max_event_bytes(
+                        stream::iter(vec![Ok(body)]),
+                        line.len(),
+                    );
+                    for _ in 0..count {
+                        let event = parser
+                            .next()
+                            .await
+                            .expect("valid prefix line")
+                            .expect("per-line limit, not aggregate limit");
+                        assert_eq!(event.data, line);
+                    }
+                    assert!(parser.next().await.expect("invalid suffix").is_err());
+                    for _ in 0..3 {
+                        assert!(parser.next().await.is_none());
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn ndjson_empty_chunks_and_buffered_blank_lines_yield_at_the_wire_boundary() {
+            let mode = Mode {
+                ndjson: true,
+                codex: true,
+            };
+            for chunk in [Vec::new(), b" \t".to_vec(), b" \t\r\n".to_vec()] {
+                let (mut output, observation) =
+                    observed_stream(mode, Vec::new(), Tail::Repeat(chunk));
+                let flag = Arc::new(WakeFlag::default());
+                let waker = Waker::from(Arc::clone(&flag));
+                let mut task = TaskContext::from_waker(&waker);
+                assert!(output.as_mut().poll_next(&mut task).is_pending());
+                assert!(flag.0.load(Ordering::SeqCst));
+                assert!(observation.polls.load(Ordering::SeqCst) <= MAX_NDJSON_CHUNKS_PER_POLL);
+                drop(output);
+                assert!(observation.dropped.load(Ordering::SeqCst));
+            }
+
+            let mut body = b" \t\r\n".repeat(MAX_NDJSON_LINES_PER_POLL * 2);
+            body.extend(mode.events(&[completion(17, 9)]));
+            body.extend(mode.frame("[DONE]"));
+            let (mut output, observation) = observed_stream(mode, vec![Ok(body)], Tail::Pending);
+            let flag = Arc::new(WakeFlag::default());
+            let waker = Waker::from(Arc::clone(&flag));
+            let mut task = TaskContext::from_waker(&waker);
+            assert!(output.as_mut().poll_next(&mut task).is_pending());
+            assert!(flag.0.load(Ordering::SeqCst));
+            assert_eq!(
+                observation.polls.load(Ordering::SeqCst),
+                1,
+                "buffered whitespace budget was not enforced"
+            );
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            let events = runtime.block_on(terminal_events(&mut output));
+            let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                panic!("buffered whitespace discarded the final response");
+            };
+            assert_eq!((message.usage.input, message.usage.output), (17, 9));
+            assert_retired(&mut output, &observation);
+        }
+
+        #[test]
+        fn ndjson_budget_preserves_split_utf8_crlf_and_unterminated_final_line() {
+            let mode = Mode {
+                ndjson: true,
+                codex: false,
+            };
+            let line = format!("{}\r\n", text_delta("café ☕")).into_bytes();
+            let split = line
+                .iter()
+                .position(|byte| *byte == 0xc3)
+                .expect("UTF-8 lead byte")
+                + 1;
+            let mut chunks = vec![Ok(line[..split].to_vec())];
+            chunks.extend((0..MAX_NDJSON_CHUNKS_PER_POLL).map(|_| Ok(Vec::new())));
+            chunks.push(Ok(line[split..].to_vec()));
+            chunks.push(Ok(completion(7, 3).to_string().into_bytes()));
+            let (mut output, observation) = observed_stream(mode, chunks, Tail::Eof);
+            assert!(output.next().now_or_never().is_none());
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            let events = runtime.block_on(terminal_events(&mut output));
+            let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                panic!("split UTF-8 response did not complete");
+            };
+            assert!(
+                message.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text(text) if text.text == "café ☕")
+                )
+            );
+            assert_eq!((message.usage.input, message.usage.output), (7, 3));
+            assert_retired(&mut output, &observation);
+        }
+
+        #[test]
+        fn dropping_unpolled_or_pending_streams_releases_the_source() {
+            for mode in MODES {
+                for poll_once in [false, true] {
+                    let (mut output, observation) =
+                        observed_stream(mode, Vec::new(), Tail::Pending);
+                    if poll_once {
+                        assert!(output.next().now_or_never().is_none());
+                    }
+                    assert!(!observation.dropped.load(Ordering::SeqCst));
+                    drop(output);
+                    assert!(observation.dropped.load(Ordering::SeqCst));
+                }
+            }
         }
     }
 }
