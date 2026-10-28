@@ -8508,6 +8508,19 @@ async fn new_session_command(
             // Commit the candidate before teardown begins. Cancellation during
             // any later await can no longer leave a partially decommissioned
             // old handle installed as the current session.
+            if let Err(error) = prepared.retire_cost_for(&new_handle) {
+                drop(prepared);
+                let _ = agent_tx.send(PiMsg::AgentError(format!(
+                    "new session cancelled because background model spend could not be preserved: {error}"
+                )));
+                let cleanup = new_handle.discard_uncommitted_resources().await;
+                for issue in cleanup.messages() {
+                    let _ = agent_tx.send(PiMsg::System(format!(
+                        "Uncommitted new session cleanup issue: {issue}"
+                    )));
+                }
+                return Ok(false);
+            }
             let old_handle = std::mem::replace(handle, new_handle);
             ext_handler.install_command_registry(handle);
             if let Some(ask) = old_handle.ask_tool() {
@@ -9769,6 +9782,19 @@ async fn resume_session_command(
     };
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
+            if let Err(error) = prepared.retire_cost_for(&new_handle) {
+                drop(prepared);
+                let _ = agent_tx.send(PiMsg::AgentError(format!(
+                    "resume cancelled because background model spend could not be preserved: {error}"
+                )));
+                let cleanup = new_handle.discard_uncommitted_resources().await;
+                for issue in cleanup.messages() {
+                    let _ = agent_tx.send(PiMsg::System(format!(
+                        "Uncommitted resumed session cleanup issue: {issue}"
+                    )));
+                }
+                return Ok(false);
+            }
             let old_handle = std::mem::replace(handle, new_handle);
             ext_handler.install_command_registry(handle);
             if let Some(ask) = old_handle.ask_tool() {

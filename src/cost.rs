@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+mod durability;
+
+use durability::{Coverage, Journal, Origin, Retirement};
+
 const CHECKPOINT_TYPE: &str = "cost_budget";
 const MAX_PENDING_ATTEMPTS: usize = 1024;
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
@@ -123,9 +127,50 @@ struct CostState {
     pending: BTreeMap<u64, f64>,
     warning: Option<CostWarning>,
     failure: Option<String>,
+    account: String,
+    own_finalized: f64,
+    observed: Coverage,
+    retired: BTreeMap<std::path::PathBuf, Retirement>,
 }
 
 impl CostState {
+    fn finalize(&mut self, cost: f64, deadline: Option<Instant>) -> Result<()> {
+        self.snapshot.spent = add_cost(self.snapshot.spent, cost);
+        self.own_finalized = add_cost(self.own_finalized, cost);
+        self.changed()?;
+        let deadline = durability::settlement_deadline(deadline);
+        for retired in self.retired.values() {
+            if let Err(error) = retired.persist(&self.account, self.own_finalized, deadline) {
+                // Keep the valid bill even if its durable acknowledgement fails.
+                // A later request must not silently run with incomplete storage.
+                self.failure = Some(error.to_string());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn import(&mut self, journal: &Journal) -> Result<()> {
+        let mut added = 0.0;
+        for (account, writer) in &journal.writers {
+            if account == &self.account {
+                continue;
+            }
+            let observed = self.observed.entry(account.clone()).or_default();
+            added = add_cost(
+                added,
+                (writer.own_total - observed.max(writer.baseline_own)).max(0.0),
+            );
+            *observed = observed.max(writer.own_total);
+        }
+        durability::validate_coverage(&self.observed)?;
+        if added > 0.0 {
+            self.snapshot.spent = add_cost(self.snapshot.spent, added);
+            self.changed()?;
+        }
+        Ok(())
+    }
+
     fn changed(&mut self) -> Result<()> {
         self.snapshot.pending = self
             .pending
@@ -160,6 +205,7 @@ impl CostState {
 pub struct CostBudget {
     state: Arc<Mutex<CostState>>,
     remote: Option<Arc<dyn CostRemote>>,
+    origin: Option<Arc<Origin>>,
 }
 
 impl std::fmt::Debug for CostBudget {
@@ -189,8 +235,13 @@ impl CostBudget {
                 pending: BTreeMap::new(),
                 warning: None,
                 failure: None,
+                account: uuid::Uuid::new_v4().to_string(),
+                own_finalized: 0.0,
+                observed: Coverage::new(),
+                retired: BTreeMap::new(),
             })),
             remote: None,
+            origin: None,
         })
     }
 
@@ -203,8 +254,13 @@ impl CostBudget {
                 pending: BTreeMap::new(),
                 warning: None,
                 failure: None,
+                account: uuid::Uuid::new_v4().to_string(),
+                own_finalized: 0.0,
+                observed: Coverage::new(),
+                retired: BTreeMap::new(),
             })),
             remote: Some(remote),
+            origin: None,
         })
     }
 
@@ -215,15 +271,52 @@ impl CostBudget {
 
     /// A native child always remains charged to its original parent tree.
     pub fn for_replacement(&self, session: &Session, preserve: bool) -> Result<Self> {
-        if preserve || self.remote.is_some() {
+        if self.remote.is_some() {
             return Ok(self.clone());
         }
+        if preserve {
+            let mut replacement = self.clone();
+            replacement.origin = Origin::for_session(session)?;
+            replacement.refresh_origin()?;
+            return Ok(replacement);
+        }
         let snapshot = self.snapshot();
-        Self::new(
-            snapshot.warn_cost,
-            snapshot.max_cost,
-            recorded_spend(session)?,
-        )
+        Self::from_session(session, snapshot.warn_cost, snapshot.max_cost)
+    }
+
+    fn from_session(session: &Session, warn: Option<f64>, max: Option<f64>) -> Result<Self> {
+        let origin = Origin::for_session(session)?;
+        let journal = origin.as_ref().map(|origin| origin.read()).transpose()?;
+        let (spent, mut covered) = recorded_account(session, journal.as_ref())?;
+        if let Some(journal) = &journal {
+            journal.cover(&mut covered)?;
+        }
+        let mut budget = Self::new(warn, max, spent)?;
+        budget.origin = origin;
+        budget
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observed = covered;
+        Ok(budget)
+    }
+
+    fn refresh_origin(&self) -> Result<()> {
+        let Some(origin) = &self.origin else {
+            return Ok(());
+        };
+        let journal = origin
+            .read()
+            .inspect_err(|error| self.quarantine(&error.to_string()))?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = state.import(&journal) {
+            state.failure = Some(error.to_string());
+            return Err(error);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -240,13 +333,15 @@ impl CostBudget {
         self.snapshot().spent
     }
 
-    /// Refresh remote accounting before every admission. A failed accounting
+    /// Refresh parent accounting and late source charges before admission. A failed accounting
     /// ACK permanently quarantines this handle; retrying cannot hide spend.
     pub fn refresh(&self) -> Result<CostSnapshot> {
         self.check_health()?;
         if let Some(remote) = &self.remote {
             let result = remote.snapshot();
             self.accept_remote(result)?;
+        } else {
+            self.refresh_origin()?;
         }
         // A concurrent record may have lost its acknowledgement while this
         // snapshot was in flight. A successful read cannot clear quarantine.
@@ -384,8 +479,7 @@ impl CostBudget {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.snapshot.spent = add_cost(state.snapshot.spent, cost);
-        state.changed()
+        state.finalize(cost, None)
     }
 
     pub fn take_warning(&self) -> Option<CostWarning> {
@@ -403,8 +497,26 @@ impl CostBudget {
         // Cold resume may load only the active suffix. The persisted watermark
         // must include every retained branch, or resume would count it twice.
         session.ensure_full_v2_hydration_before_save()?;
-        let spent = self.spent();
+        if self.remote.is_none() {
+            self.refresh_origin()?;
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spent = state.snapshot.spent;
         let main_spent = main_spend(session);
+        let mut covered = state.observed.clone();
+        covered.insert(state.account.clone(), state.own_finalized);
+        durability::validate_coverage(&covered)?;
+        let data = serde_json::json!({
+            "spent": spent,
+            "mainSpent": main_spent,
+            "account": state.account,
+            "ownFinalized": state.own_finalized,
+            "lateCovered": covered,
+        });
+        drop(state);
         let unchanged = session
             .entries
             .iter()
@@ -415,18 +527,12 @@ impl CostBudget {
                 }
                 _ => None,
             })
-            .is_some_and(|data| {
-                data.get("spent").and_then(serde_json::Value::as_f64) == Some(spent)
-                    && data.get("mainSpent").and_then(serde_json::Value::as_f64) == Some(main_spent)
-            });
-        if !unchanged && spent > 0.0 {
+            .is_some_and(|existing| existing == &data);
+        if !unchanged {
             let active_leaf = session.leaf_id().map(str::to_owned);
             session.append_custom_entry(
                 CHECKPOINT_TYPE.to_string(),
-                Some(serde_json::json!({
-                    "spent": spent,
-                    "mainSpent": main_spent,
-                })),
+                Some(data),
             );
             // Accounting belongs to the retained session tree, outside the
             // selected conversation. A failed assistant must remain the leaf
@@ -442,6 +548,73 @@ impl CostBudget {
                 session.reset_leaf();
             }
         }
+        Ok(())
+    }
+
+    /// Retain only final-bill persistence for a saved source leaving the
+    /// foreground. Call after all fallible replacement preparation, immediately
+    /// before installing the replacement, or after the final shutdown save.
+    /// No journal is activated by an abandoned checkpoint or an unsaved session.
+    pub fn retire_session(&self, session: &Session, owner: &asupersync::Cx) -> Result<()> {
+        if self.remote.is_some() || session.path.is_none() {
+            return Ok(());
+        }
+        let origin = Origin::for_session(session)?
+            .ok_or_else(|| Error::session("late model cost source is not saved"))?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(retired) = state.retired.get(&origin.key) {
+            let result = retired.persist(
+                &state.account,
+                state.own_finalized,
+                durability::settlement_deadline(None),
+            );
+            if let Err(error) = &result {
+                state.failure = Some(error.to_string());
+            }
+            return result;
+        }
+        if state.retired.len() >= durability::MAX_TARGETS {
+            return Err(Error::session("too many retired model cost sources"));
+        }
+        let baseline = session
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| {
+                let SessionEntry::Custom(entry) = entry else {
+                    return None;
+                };
+                if entry.custom_type != CHECKPOINT_TYPE || !session.entry_is_persisted(index) {
+                    return None;
+                }
+                let data = entry.data.as_ref()?;
+                if data.get("account").and_then(serde_json::Value::as_str)
+                    != Some(state.account.as_str())
+                {
+                    return None;
+                }
+                data.get("ownFinalized").and_then(serde_json::Value::as_f64)
+            })
+            .filter(|baseline| baseline.is_finite() && *baseline >= 0.0)
+            .filter(|baseline| *baseline <= state.own_finalized)
+            .ok_or_else(|| Error::session("late model cost retirement requires a saved checkpoint"))?;
+        let retired = Retirement::prepare(origin, baseline, owner)?;
+        // Hold the account mutex across initial persistence and registration:
+        // settlement during the asynchronous source save is included relative
+        // to the exact saved counter, and no later settlement can miss its sink.
+        if let Err(error) = retired.persist(
+            &state.account,
+            state.own_finalized,
+            durability::settlement_deadline(None),
+        ) {
+            state.failure = Some(error.to_string());
+            return Err(error);
+        }
+        state.retired.insert(retired.origin.key.clone(), retired);
         Ok(())
     }
 }
@@ -524,9 +697,7 @@ impl CostAttempt {
                     .pending
                     .remove(id)
                     .ok_or_else(|| Error::session("model cost attempt is unavailable"))?;
-                state.snapshot.spent =
-                    add_cost(state.snapshot.spent, if valid { cost } else { known });
-                state.changed()
+                state.finalize(if valid { cost } else { known }, deadline)
             }
             AttemptSource::Remote(remote) => {
                 self.budget
@@ -567,33 +738,79 @@ fn main_spend(session: &Session) -> f64 {
 
 /// Account for every retained branch, plus auxiliary/child spend checkpoints.
 pub fn recorded_spend(session: &Session) -> Result<f64> {
+    let origin = Origin::for_session(session)?;
+    let journal = origin.as_ref().map(|origin| origin.read()).transpose()?;
+    recorded_account(session, journal.as_ref()).map(|(spent, _)| spent)
+}
+
+fn recorded_account(session: &Session, journal: Option<&Journal>) -> Result<(f64, Coverage)> {
     if session.has_partial_v2_hydration() {
         let mut complete = session.clone();
         complete.ensure_full_v2_hydration_before_save()?;
-        return recorded_spend(&complete);
+        return recorded_account(&complete, journal);
     }
     let main_spent = main_spend(session);
-    Ok(session.entries.iter().fold(main_spent, |spent, entry| {
+    let mut spent = main_spent;
+    let mut observed = Coverage::new();
+    let mut checkpoint_found = false;
+    for entry in &session.entries {
         let SessionEntry::Custom(entry) = entry else {
-            return spent;
+            continue;
         };
         if entry.custom_type != CHECKPOINT_TYPE {
-            return spent;
+            continue;
         }
         let Some(data) = &entry.data else {
-            return spent;
+            continue;
         };
         let Some(recorded) = data.get("spent").and_then(serde_json::Value::as_f64) else {
-            return spent;
+            continue;
         };
         let Some(covered) = data.get("mainSpent").and_then(serde_json::Value::as_f64) else {
-            return spent;
+            continue;
         };
         if !recorded.is_finite() || recorded < 0.0 || !covered.is_finite() || covered < 0.0 {
-            return spent;
+            continue;
         }
-        spent.max(add_cost(recorded, (main_spent - covered).max(0.0)))
-    }))
+        checkpoint_found = true;
+        let coverage = data
+            .get("lateCovered")
+            .map(|coverage| serde_json::from_value::<Coverage>(coverage.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        durability::validate_coverage(&coverage)?;
+        let late = journal.map_or(0.0, |journal| journal.uncovered(&coverage));
+        let candidate = add_cost(add_cost(recorded, (main_spent - covered).max(0.0)), late);
+        if candidate >= spent {
+            spent = candidate;
+            observed = coverage;
+        }
+    }
+    if !checkpoint_found
+        && let Some(journal) = journal
+    {
+        spent = add_cost(spent, journal.uncovered(&observed));
+    }
+    Ok((spent, observed))
+}
+
+/// A reload of the same saved source can keep its account live. A copied file
+/// with the same header ID is a distinct target and still needs retirement.
+pub(crate) fn same_session_target(source: &Session, target: &Session) -> bool {
+    if source.header.id != target.header.id {
+        return false;
+    }
+    match (&source.path, &target.path) {
+        (None, None) => true,
+        (Some(source), Some(target)) if source == target => true,
+        (Some(source), Some(target)) => {
+            match (std::fs::canonicalize(source), std::fs::canonicalize(target)) {
+                (Ok(source), Ok(target)) => source == target,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Resolve launch overrides without letting a native child replace its parent's
@@ -608,15 +825,15 @@ pub fn resolve_budget(
     if let Some(inherited) = crate::agent_hub::ipc::cost::inherited_budget()? {
         return Ok(Some(inherited));
     }
-    if shared.is_some() {
-        return Ok(shared);
+    if let Some(shared) = shared {
+        return shared.for_replacement(session, true).map(Some);
     }
     let warn_cost = warn_cost.or_else(|| settings.and_then(|settings| settings.warn_cost));
     let max_cost = max_cost.or_else(|| settings.and_then(|settings| settings.max_cost));
     if warn_cost.is_none() && max_cost.is_none() {
         return Ok(None);
     }
-    CostBudget::new(warn_cost, max_cost, recorded_spend(session)?).map(Some)
+    CostBudget::from_session(session, warn_cost, max_cost).map(Some)
 }
 
 /// A live registry binding: tools retain the scope when the owner changes.
@@ -846,6 +1063,121 @@ mod tests {
         assert_eq!(recorded_spend(&forked).expect("fork resume"), 10.0);
         fork.record(2.0).expect("fork work");
         assert_eq!(switched.spent(), 12.0);
+    }
+
+    #[test]
+    fn late_charges_use_the_saved_baseline_and_reopen_without_duplicate_imports() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let budget = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+        budget.record(5.0).unwrap();
+        let mut outstanding = budget.start_attempt().unwrap();
+        outstanding.observe(4.0).unwrap();
+        budget.checkpoint(&mut session).unwrap();
+        runtime.block_on(session.save()).unwrap();
+        let path = session.path.clone().unwrap();
+        let transcript = std::fs::read(&path).unwrap();
+
+        // This charge arrives after the checkpoint snapshot. A newer staged
+        // checkpoint has no receipt and must not replace the saved baseline.
+        budget.record(1.0).unwrap();
+        budget.checkpoint(&mut session).unwrap();
+        budget.retire_session(&session, owner.cx()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), transcript);
+        let mut reopened = runtime
+            .block_on(Session::open(path.to_str().unwrap()))
+            .unwrap();
+        let resumed = budget.for_replacement(&reopened, false).unwrap();
+        assert_eq!(resumed.spent(), 6.0);
+
+        outstanding.finish(2.0).unwrap();
+        assert_eq!(resumed.refresh().unwrap().spent, 8.0);
+        assert_eq!(resumed.refresh().unwrap().spent, 8.0);
+        resumed.record(0.5).unwrap();
+        resumed.checkpoint(&mut reopened).unwrap();
+        runtime.block_on(reopened.save()).unwrap();
+        assert_eq!(recorded_spend(&reopened).unwrap(), 8.5);
+        budget.record(1.0).unwrap();
+        assert_eq!(resumed.refresh().unwrap().spent, 9.5);
+        assert_eq!(recorded_spend(&reopened).unwrap(), 9.5);
+        assert_eq!(budget.spent(), 9.0, "imported or inherited fees are not own charges");
+    }
+
+    #[test]
+    fn zero_cost_retirement_settles_under_its_canceled_owner_without_touching_the_transcript() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let budget = CostBudget::new(None, Some(0.5), 0.0).unwrap();
+        let mut outstanding = budget.start_attempt().unwrap();
+        outstanding.observe(1.0).unwrap();
+        budget.checkpoint(&mut session).unwrap();
+        runtime.block_on(session.save()).unwrap();
+        let path = session.path.clone().unwrap();
+        let transcript = std::fs::read(&path).unwrap();
+        owner.set_cancel_requested(true);
+        budget.retire_session(&session, owner.cx()).unwrap();
+        outstanding.finish(0.5).unwrap();
+        drop(outstanding);
+        assert_eq!(std::fs::read(&path).unwrap(), transcript);
+        let reopened = runtime
+            .block_on(Session::open(path.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(recorded_spend(&reopened).unwrap(), 0.5);
+        let resumed = budget.for_replacement(&reopened, false).unwrap();
+        assert!(matches!(resumed.admit(), Err(Error::CostCap { .. })));
+    }
+
+    #[test]
+    fn fork_journals_do_not_import_the_same_foreign_charge_twice() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let budget = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+        budget.record(1.0).unwrap();
+        let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        budget.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        budget.retire_session(&source, owner.cx()).unwrap();
+        let mut fork = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        budget.checkpoint(&mut fork).unwrap();
+        runtime.block_on(fork.save()).unwrap();
+        budget.retire_session(&fork, owner.cx()).unwrap();
+        budget.record(2.0).unwrap();
+
+        let reopened = budget.for_replacement(&source, false).unwrap();
+        let second_view = reopened.for_replacement(&fork, true).unwrap();
+        assert_eq!(reopened.spent(), 3.0);
+        assert_eq!(second_view.spent(), 3.0);
+        budget.record(1.0).unwrap();
+        assert_eq!(reopened.refresh().unwrap().spent, 4.0);
+        assert_eq!(second_view.refresh().unwrap().spent, 4.0);
+        assert_eq!(recorded_spend(&source).unwrap(), 4.0);
+        assert_eq!(recorded_spend(&fork).unwrap(), 4.0);
+    }
+
+    #[test]
+    fn a_configured_unsaved_path_does_not_create_a_journal_or_grant_retirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("not-yet-saved.jsonl");
+        let mut session = Session::create();
+        session.path = Some(path.clone());
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let budget = CostBudget::from_session(&session, None, Some(1.0)).unwrap();
+        budget.checkpoint(&mut session).unwrap();
+        assert!(budget.retire_session(&session, owner.cx()).is_err());
+        budget.record(0.5).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]

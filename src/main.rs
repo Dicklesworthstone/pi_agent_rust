@@ -3608,15 +3608,29 @@ async fn run(
         result
     };
 
-    // Best-effort autosave flush on shutdown. OwnedMutexGuard: the guard is
-    // held across the flush await, and the borrowed MutexGuard is !Send
-    // (clippy::future_not_send).
+    // Preserve the active account before final teardown. The shared tool
+    // scope follows session switches, while a startup budget clone would
+    // still refer to the original session. OwnedMutexGuard keeps this await
+    // Send for the CLI driver.
     if !cli.no_session {
-        let cx = pi::agent_cx::AgentCx::for_request();
-        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await
-            && let Err(e) = guard.flush_autosave_on_shutdown().await
-        {
-            eprintln!("Warning: Failed to flush session autosave: {e}");
+        let cx = pi::agent_cx::AgentCx::for_current_or_request();
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await {
+            let budget = shared_tools.snapshot().cost_scope().current();
+            let flushed = async {
+                if let Some(budget) = budget {
+                    budget.checkpoint(&mut guard)?;
+                    guard
+                        .flush_autosave(pi::session::AutosaveFlushTrigger::Shutdown)
+                        .await?;
+                    budget.retire_session(&guard, cx.cx())
+                } else {
+                    guard.flush_autosave_on_shutdown().await
+                }
+            }
+            .await;
+            if let Err(e) = flushed {
+                eprintln!("Warning: Failed to preserve session at shutdown: {e}");
+            }
         }
     }
 

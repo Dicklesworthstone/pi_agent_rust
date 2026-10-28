@@ -2236,10 +2236,38 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
 /// `commit_resource_shutdown`.
 pub(crate) struct PreparedSessionShutdown {
     owner_session_id: String,
+    owner: asupersync::Cx,
+    cost_budget: Option<crate::cost::CostBudget>,
     // Drop the store before mutation admission on an uncommitted token too.
     session: asupersync::sync::OwnedMutexGuard<Session>,
     session_actions: crate::agent::SessionActionAdmissionGate,
     session_action_permit: asupersync::sync::OwnedMutexGuard<()>,
+}
+
+impl PreparedSessionShutdown {
+    /// Arm late billing only once the candidate is complete. The caller must
+    /// install it synchronously after this succeeds; dropping a preparation
+    /// before this point leaves the source account live and unretired.
+    pub(crate) fn retire_cost_for(&self, replacement: &AgentSessionHandle) -> Result<()> {
+        let Some(budget) = &self.cost_budget else {
+            return Ok(());
+        };
+        let candidate = replacement.session.session.try_lock().map_err(|_| {
+            Error::session("replacement session is busy; cost handoff was not applied")
+        })?;
+        // Reloading the same session keeps its account live. Treating its
+        // ongoing foreground usage as late billing would count it twice.
+        if crate::cost::same_session_target(&self.session, &candidate)
+            && replacement
+                .session
+                .agent
+                .cost_budget()
+                .is_some_and(|active| active.same_tree(budget))
+        {
+            return Ok(());
+        }
+        budget.retire_session(&self.session, &self.owner)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2360,7 +2388,7 @@ impl AgentSessionHandle {
     pub(crate) async fn preflight_replacement(
         &mut self,
     ) -> std::result::Result<PreparedSessionShutdown, SessionResourceShutdown> {
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
         // Extension mutations take action admission before the store. Keep
         // that order so an in-flight callback can finish before we freeze it.
         let session_actions = self.session.session_action_admission_gate();
@@ -2417,6 +2445,13 @@ impl AgentSessionHandle {
         }
         Ok(PreparedSessionShutdown {
             owner_session_id,
+            owner: cx.cx().clone(),
+            cost_budget: self
+                .session
+                .agent
+                .cost_budget()
+                .filter(|_| self.session.save_enabled())
+                .cloned(),
             session,
             session_actions,
             session_action_permit,
@@ -2482,6 +2517,7 @@ impl AgentSessionHandle {
             session,
             session_actions,
             session_action_permit,
+            ..
         } = prepared;
         // Queued extension work must fail its old-origin check after the
         // commit. Release both guards before awaiting runtime shutdown, whose
@@ -2526,7 +2562,7 @@ impl AgentSessionHandle {
     /// failures are reported, but they never skip later independent cleanup.
     pub async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
         let mut report = SessionResourceShutdown::default();
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
             Arc::clone(&self.session.session),
             cx.cx(),
@@ -2535,18 +2571,45 @@ impl AgentSessionHandle {
         {
             Ok(mut session) => {
                 let owner_session_id = session.header.id.clone();
-                if self.session.save_enabled()
-                    && let Some(budget) = self.session.agent.cost_budget()
-                    && let Err(error) = budget.checkpoint(&mut session)
-                {
-                    report.fail(format!("failed to checkpoint model spend: {error}"));
-                }
-                if self.session.save_enabled()
-                    && let Err(err) = session.flush_autosave_on_shutdown().await
-                {
-                    let warning = format!("failed to flush session autosave: {err}");
-                    tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
-                    report.fail(warning);
+                if self.session.save_enabled() {
+                    let budget = self.session.agent.cost_budget();
+                    let checkpointed = if let Some(budget) = budget {
+                        match budget.checkpoint(&mut session) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                report.fail(format!("failed to checkpoint model spend: {error}"));
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    // A late-cost journal needs an acknowledged baseline,
+                    // even when transcript shutdown is normally best-effort.
+                    let persisted = if budget.is_some() {
+                        session
+                            .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                            .await
+                    } else {
+                        session.flush_autosave_on_shutdown().await
+                    };
+                    match persisted {
+                        Ok(()) => {
+                            if checkpointed
+                                && let Some(budget) = budget
+                                && let Err(error) = budget.retire_session(&session, cx.cx())
+                            {
+                                report.fail(format!(
+                                    "failed to preserve late model spend: {error}"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            let warning = format!("failed to flush session autosave: {err}");
+                            tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+                            report.fail(warning);
+                        }
+                    }
                 }
                 Some(owner_session_id)
             }
@@ -8353,12 +8416,97 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preserves_usage_after_checkpoint_and_after_handoff() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            let tmp = tempdir().expect("tempdir");
+            let mut handle = saving_handle_with_store(tmp.path(), store_kind);
+            let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            handle.session.agent.set_cost_budget(Some(budget.clone()));
+            run_async(async {
+                let prepared = handle.preflight_replacement().await.unwrap();
+                let source_path = prepared.session.path.clone().unwrap();
+                let source_bytes = std::fs::read(&source_path).unwrap();
+
+                // This charge races with candidate construction, after the
+                // exact source checkpoint has already reached storage.
+                budget.record(0.5).unwrap();
+                let next = saving_handle_with_store(tmp.path(), store_kind);
+                prepared.retire_cost_for(&next).unwrap();
+                let old = std::mem::replace(&mut handle, next);
+                assert!(old.commit_resource_shutdown(prepared).await.completed_cleanly());
+
+                // A captured request keeps its original account after the
+                // foreground has installed a different session.
+                budget.record(0.75).unwrap();
+                assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+                let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+                assert!(
+                    (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs()
+                        < f64::EPSILON
+                );
+                let resumed = budget.for_replacement(&reopened, false).unwrap();
+                assert!(!resumed.same_tree(&budget));
+                assert!((resumed.spent() - 1.5).abs() < f64::EPSILON);
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            });
+        }
+    }
+
+    #[test]
+    fn cancelled_preflight_and_same_file_reload_keep_foreground_spend_live() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        budget.record(0.25).unwrap();
+        handle.session.agent.set_cost_budget(Some(budget.clone()));
+        run_async(async {
+            let prepared = handle.preflight_replacement().await.unwrap();
+            let source_path = prepared.session.path.clone().unwrap();
+            drop(prepared);
+            budget.record(0.5).unwrap();
+            let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            assert!(
+                (crate::cost::recorded_spend(&reopened).unwrap() - 0.25).abs() < f64::EPSILON
+            );
+
+            let prepared = handle.preflight_replacement().await.unwrap();
+            let mut next = saving_handle(tmp.path());
+            *next.session.session.try_lock().unwrap() = prepared.session.clone();
+            next.session.agent.set_cost_budget(Some(budget.clone()));
+            prepared.retire_cost_for(&next).unwrap();
+            let old = std::mem::replace(&mut handle, next);
+            assert!(old.commit_resource_shutdown(prepared).await.completed_cleanly());
+            budget.record(0.25).unwrap();
+            let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            assert!(
+                (crate::cost::recorded_spend(&reopened).unwrap() - 0.75).abs() < f64::EPSILON,
+                "same-file foreground usage must wait for its normal checkpoint"
+            );
+
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            budget.record(0.5).unwrap();
+            let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            assert!(
+                (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON
+            );
+        });
+    }
+
+    #[test]
     fn shutdown_skips_autosave_for_ephemeral_session() {
         let tmp = tempdir().expect("tempdir");
         let warnings = run_async(async {
-            let handle = create_agent_session(hermetic_session_options(tmp.path()))
+            let mut handle = create_agent_session(hermetic_session_options(tmp.path()))
                 .await
                 .expect("create session");
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            handle.session.agent.set_cost_budget(Some(budget.clone()));
             let cx = crate::agent_cx::AgentCx::for_request();
             {
                 let mut session = handle
@@ -8371,7 +8519,10 @@ mod tests {
                     .set_autosave_durability_mode(crate::session::AutosaveDurabilityMode::Strict);
                 session.append_session_info(Some("ephemeral mutation".to_string()));
             }
-            handle.shutdown_owned_resources().await
+            let report = handle.shutdown_owned_resources().await;
+            budget.record(0.25).unwrap();
+            assert!((budget.spent() - 0.5).abs() < f64::EPSILON);
+            report
         });
 
         assert!(

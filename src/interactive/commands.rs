@@ -5821,6 +5821,14 @@ mod tests {
             .block_on(Session::open(source_path.to_str().unwrap()))
             .unwrap();
         assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.75).abs() < f64::EPSILON);
+        let original_transcript = std::fs::read(&source_path).unwrap();
+        budget.record(0.125).unwrap();
+        let saved = runtime()
+            .block_on(Session::open(source_path.to_str().unwrap()))
+            .unwrap();
+        assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.875).abs() < f64::EPSILON);
+        assert_eq!(std::fs::read(&source_path).unwrap(), original_transcript);
+        assert!(active.spent().abs() < f64::EPSILON);
     }
 
     #[test]

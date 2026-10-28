@@ -710,6 +710,8 @@ impl PiApp {
             return Err("Session busy; session change was not applied");
         };
 
+        let retiring_session = !crate::cost::same_session_target(&session_guard, &new_session);
+        let save_enabled = agent_guard.handle.session().save_enabled();
         let preserve_cost = preserve_cost || session_guard.header.id == new_session.header.id;
         let cost_budget = agent_guard
             .replacement_cost_budget(&new_session, preserve_cost)
@@ -718,18 +720,29 @@ impl PiApp {
             budget
                 .checkpoint(&mut session_guard)
                 .map_err(|_| "Failed to read model spend; session change was not applied")?;
-            session_guard
-                .save()
-                .await
-                .map_err(|_| "Failed to save model spend; session change was not applied")?;
+            if save_enabled {
+                session_guard
+                    .save()
+                    .await
+                    .map_err(|_| "Failed to save model spend; session change was not applied")?;
+            }
         }
         if preserve_cost && let Some(budget) = &cost_budget {
             budget
                 .checkpoint(&mut new_session)
                 .map_err(|_| "Failed to retain model spend; session change was not applied")?;
-            new_session.save().await.map_err(
-                |_| "Failed to save retained model spend; session change was not applied",
-            )?;
+            if save_enabled {
+                new_session.save().await.map_err(
+                    |_| "Failed to save retained model spend; session change was not applied",
+                )?;
+            }
+        }
+        // The source stays live if any candidate preparation fails. Once
+        // retirement succeeds, install the replacement without another await.
+        if save_enabled && retiring_session && let Some(budget) = agent_guard.cost_budget() {
+            budget.retire_session(&session_guard, cx.cx()).map_err(|_| {
+                "Failed to preserve background model spend; session change was not applied"
+            })?;
         }
         *session_guard = new_session;
         agent_guard.set_cost_budget(cost_budget);

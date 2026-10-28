@@ -661,6 +661,25 @@ fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Resu
     Ok(())
 }
 
+/// Inspect the authoritative header in one read snapshot without materializing
+/// entries or attachments. The existing read-only open preserves backend
+/// integrity checks and its handling of the SQLite sidecar family.
+pub(crate) fn load_session_header(path: &Path) -> Result<SessionHeader> {
+    if !crate::session::session_path_try_exists(path).map_err(|err| Error::Io(Box::new(err)))? {
+        return Err(Error::SessionNotFound {
+            path: path.display().to_string(),
+        });
+    }
+    run_on_sqlite_thread(|| {
+        let conn = open_sqlite_connection_read_only(path)?;
+        let snapshot = entry_io::ReadSnapshot::begin(&conn)?;
+        let header = read_stored_header(&conn)?
+            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
+        snapshot.finish()?;
+        Ok(header)
+    })
+}
+
 #[allow(
     clippy::unused_async,
     reason = "session storage keeps an async backend contract"
@@ -1347,6 +1366,10 @@ mod tests {
                 futures::executor::block_on(load_session_meta(&path)).expect("metadata-only read");
             assert_eq!(meta.name, name);
             assert_eq!(meta.message_count, 1);
+            assert_eq!(
+                load_session_header(&path).expect("header-only read").id,
+                header.id
+            );
             futures::executor::block_on(load_session(&path))
                 .expect_err("full load must still detect corrupt history");
         }

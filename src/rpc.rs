@@ -5207,6 +5207,7 @@ pub async fn run(
                                     crate::session::AutosaveFlushTrigger::Manual,
                                 )
                                 .await?;
+                                budget.retire_session(&inner_session, cx.cx())?;
                             }
                         }
                         *inner_session = new_session;
@@ -5437,13 +5438,16 @@ pub async fn run(
                             let previous_session_file =
                                 inner_session.path.as_ref().map(|p| p.display().to_string());
                             let preserve_cost = inner_session.header.id == new_session.header.id;
+                            let retiring_session =
+                                !crate::cost::same_session_target(&inner_session, &new_session);
                             let cost_budget = guard
                                 .agent
                                 .replacement_cost_budget(&new_session, preserve_cost)?;
                             if let Some(budget) = guard.agent.cost_budget() {
                                 if preserve_cost {
                                     budget.checkpoint(&mut new_session)?;
-                                } else {
+                                }
+                                if retiring_session {
                                     budget.checkpoint(&mut inner_session)?;
                                     if guard.save_enabled() {
                                         crate::agent::persist_session_mutations(
@@ -5471,6 +5475,12 @@ pub async fn run(
                             let messages = new_session.to_messages_for_current_path();
                             let session_id = new_session.header.id.clone();
 
+                            if retiring_session
+                                && guard.save_enabled()
+                                && let Some(budget) = guard.agent.cost_budget()
+                            {
+                                budget.retire_session(&inner_session, cx.cx())?;
+                            }
                             state.reconstruct_failover_from_session(
                                 &new_session,
                                 options.config.failover_cooldown_secs(),
@@ -5750,6 +5760,9 @@ pub async fn run(
                         let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
+                        if save_enabled && let Some(budget) = guard.agent.cost_budget() {
+                            budget.retire_session(&inner, cx.cx())?;
+                        }
                         state.reconstruct_failover_from_session(
                             &new_session,
                             options.config.failover_cooldown_secs(),
@@ -6515,7 +6528,15 @@ async fn flush_rpc_session_on_shutdown(
     let mut inner = OwnedMutexGuard::lock(session_store, cx)
         .await
         .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-    inner.flush_autosave_on_shutdown().await
+    if let Some(budget) = guard.agent.cost_budget() {
+        budget.checkpoint(&mut inner)?;
+        inner
+            .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+            .await?;
+        budget.retire_session(&inner, cx.cx())
+    } else {
+        inner.flush_autosave_on_shutdown().await
+    }
 }
 
 async fn acknowledge_durable_rpc_in_flight(

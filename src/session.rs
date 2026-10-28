@@ -4950,6 +4950,19 @@ impl Session {
         self.v2_partial_hydration
     }
 
+    /// Whether the accepted open/save receipt covers an entry in this full view.
+    /// A queued or cancelled save does not advance the persistence watermark.
+    /// Callers must separately verify the backing session's identity before
+    /// using an entry as authority for a new durable side effect.
+    pub(crate) fn entry_is_persisted(&self, index: usize) -> bool {
+        let persisted = self.persisted_entry_count.load(Ordering::SeqCst);
+        self.path.is_some()
+            && !self.source_integrity_failed
+            && !self.v2_partial_hydration
+            && persisted <= self.entries.len()
+            && index < persisted
+    }
+
     /// Ensure a lazily hydrated V2 session is fully hydrated before persisting.
     ///
     /// Partial V2 hydration intentionally loads only a subset of entries for fast
@@ -8464,9 +8477,39 @@ fn validate_v2_manifest_jsonl_identity(
     validate_v2_manifest_jsonl_identity_fields(&manifest, header)
 }
 
+/// Read only the authoritative source header, without hydrating conversation
+/// entries or consulting an optional V2 cache. The caller supplies an already
+/// resolved regular-file path; the backend retains its normal no-follow and
+/// header-integrity checks.
+pub(crate) fn read_persisted_session_header(path: &Path) -> Result<SessionHeader> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sqlite"))
+    {
+        #[cfg(feature = "sqlite-sessions")]
+        {
+            return crate::session_sqlite::load_session_header(path);
+        }
+        #[cfg(not(feature = "sqlite-sessions"))]
+        {
+            return Err(Error::session(
+                "SQLite session files require building with `--features sqlite-sessions`",
+            ));
+        }
+    }
+    read_jsonl_header_for_v2(path)
+}
+
 fn read_jsonl_header_for_v2(jsonl_path: &Path) -> Result<SessionHeader> {
     let file = open_existing_session_file_for_read(jsonl_path)?;
-    let mut reader = BufReader::new(file);
+    // Oversized JSONL lines are normally drained to recover the following row.
+    // A header-only probe has no following work, so also cap the source reader
+    // to prevent an invalid header from causing an unbounded discard scan.
+    let max_bytes = u64::try_from(MAX_JSONL_LINE_BYTES)
+        .unwrap_or(u64::MAX.saturating_sub(2))
+        .saturating_add(2);
+    let mut reader = BufReader::new(file.take(max_bytes));
     let Some(header_line) =
         read_capped_utf8_line(&mut reader).map_err(|err| Error::Io(Box::new(err)))?
     else {
@@ -17801,6 +17844,52 @@ mod tests {
         assert_eq!(loaded.persisted_entry_count.load(Ordering::SeqCst), 3);
         assert!(!loaded.header_dirty);
         assert_eq!(loaded.appends_since_checkpoint, 0);
+    }
+
+    #[test]
+    fn persistence_receipt_excludes_pending_or_incomplete_entries() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("saved"));
+        assert!(!session.entry_is_persisted(0));
+
+        session.path = Some(temp_dir.path().join("receipt.jsonl"));
+        run_async(session.save()).expect("save receipt");
+        assert!(session.entry_is_persisted(0));
+        session.append_message(make_test_message("pending"));
+        assert!(!session.entry_is_persisted(1));
+
+        session.v2_partial_hydration = true;
+        assert!(!session.entry_is_persisted(0));
+        session.v2_partial_hydration = false;
+        session.source_integrity_failed = true;
+        assert!(!session.entry_is_persisted(0));
+        session.source_integrity_failed = false;
+        session.persisted_entry_count.store(3, Ordering::SeqCst);
+        assert!(!session.entry_is_persisted(0));
+    }
+
+    #[test]
+    fn persisted_header_probe_does_not_read_jsonl_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("header-only.jsonl");
+        let header = SessionHeader::new();
+        std::fs::write(
+            &path,
+            format!("{}\n{{\n", serde_json::to_string(&header).unwrap()),
+        )
+        .expect("write header and malformed history");
+        assert_eq!(
+            read_persisted_session_header(&path).expect("header only").id,
+            header.id
+        );
+
+        #[cfg(unix)]
+        {
+            let link = temp_dir.path().join("header-link.jsonl");
+            std::os::unix::fs::symlink(&path, &link).expect("header link");
+            assert!(read_persisted_session_header(&link).is_err());
+        }
     }
 
     #[test]

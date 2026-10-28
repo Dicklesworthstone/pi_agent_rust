@@ -592,9 +592,21 @@ unreported/unpriced usage cannot be estimated. Spend is checkpointed with
 session saves, including normal turn completion, replacement and SDK shutdown.
 Only settled charges enter saved cost checkpoints; an in-flight estimate
 cannot permanently inflate the restored balance if its final bill is lower.
-A crash before a checkpoint, or background work that finishes after its
-owning session has been replaced, can leave auxiliary spend absent from the
-saved session; that work still charges its original in-memory account.
+When a saved session is replaced or shuts down, captured background requests
+retain a durable billing destination for that original session. Their final
+charges go to a separate cost journal beside the session file, without
+rewriting its transcript or racing a newly reopened session's saves. Resume
+combines those charges with saved checkpoints exactly once; a reopened live
+account also imports newly arrived charges before admitting another request.
+This applies to JSONL and SQLite sessions, including the first charge arriving
+after a zero-spend checkpoint. Failed replacements and same-file reloads keep
+the foreground account live. Cost journals are not created for `--no-session`.
+
+Keep the adjacent `.pi-cost-*.json` files with their session files when backing
+up or moving a session directory. Failure to acknowledge a journal write blocks
+further requests on the affected account. A crash before a normal checkpoint or
+before a final charge receives its durable acknowledgement can still lose
+uncheckpointed spend; these limits do not replace the provider's billing records.
 
 ### Native Subagents and Orchestration
 
