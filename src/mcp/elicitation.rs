@@ -1,4 +1,4 @@
-//! Form elicitation belongs to the tool invocation that admitted it.
+//! Server prompts belong to the request invocation that admitted them.
 //!
 //! Transport readers only enqueue bounded requests. User interaction and
 //! responses run on the initiating caller, with its original deadline,
@@ -48,7 +48,7 @@ fn failure(message: &str) -> Error {
     Error::tool("mcp", format!("[MCP_CANCELLED] {message}"))
 }
 
-fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
+pub(super) fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "error":{"code":code, "message":message}})
 }
 
@@ -91,7 +91,7 @@ fn within_budget(value: &Value, depth: usize, nodes: &mut usize) -> bool {
     }
 }
 
-fn bounded(value: &Value, bytes: usize) -> bool {
+pub(super) fn bounded(value: &Value, bytes: usize) -> bool {
     let mut nodes = 4096;
     within_budget(value, 8, &mut nodes)
         && serde_json::to_writer(&mut ByteBudget(bytes), value).is_ok()
@@ -118,7 +118,23 @@ struct SlotState {
     waiter: Option<Waker>,
 }
 
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Form,
+    Sampling,
+}
+
+impl RequestKind {
+    fn cancelled(self, id: &Value, related_task: Option<&str>) -> Value {
+        match self {
+            Self::Form => action(id, "cancel", related_task),
+            Self::Sampling => super::sampling::rejected(id),
+        }
+    }
+}
+
 struct ServerRequest {
+    kind: RequestKind,
     id: Value,
     params: Value,
     related_task: Option<String>,
@@ -127,8 +143,9 @@ struct ServerRequest {
     authorized: bool,
 }
 
-/// Connection-owned form request routing. Custom transports may opt in by
-/// exposing this registry and implementing generation-pinned server replies.
+/// Connection-owned form and sampling request routing. Both methods share
+/// request IDs and one active interaction per caller. Custom transports may
+/// opt in by exposing this registry and generation-pinned server replies.
 #[derive(Default)]
 pub struct ElicitationRegistry {
     next_id: AtomicU64,
@@ -186,13 +203,30 @@ impl ElicitationRegistry {
     /// caller. This never compiles schemas, invokes a UI, or performs I/O.
     #[must_use]
     pub fn route(&self, id: &Value, params: Option<&Value>, generation: u64) -> Option<Value> {
+        self.route_request(RequestKind::Form, id, params, generation)
+    }
+
+    /// Route sampling with the same ownership, duplicate-ID and cancellation
+    /// rules as forms. A transport reader never receives a provider handle.
+    #[must_use]
+    pub fn route_sampling(&self, id: &Value, params: Option<&Value>, generation: u64) -> Option<Value> {
+        self.route_request(RequestKind::Sampling, id, params, generation)
+    }
+
+    fn route_request(
+        &self,
+        kind: RequestKind,
+        id: &Value,
+        params: Option<&Value>,
+        generation: u64,
+    ) -> Option<Value> {
         if !matches!(id, Value::Number(_) | Value::String(_))
             || id.as_str().is_some_and(|id| id.len() > 1024)
         {
             return Some(rpc_error(
                 &Value::Null,
                 -32600,
-                "invalid elicitation request id",
+                "invalid client request id",
             ));
         }
         let slots = lock(&self.slots);
@@ -210,19 +244,20 @@ impl ElicitationRegistry {
             return Some(rpc_error(
                 id,
                 -32602,
-                "elicitation params must be an object",
+                "client request params must be an object",
             ));
         };
         if !bounded(params, MAX_FORM_BYTES)
             || params.get("task").is_some()
-            || params
-                .get("mode")
-                .is_some_and(|mode| mode.as_str() != Some("form"))
+            || (matches!(kind, RequestKind::Form)
+                && params
+                    .get("mode")
+                    .is_some_and(|mode| mode.as_str() != Some("form")))
         {
             return Some(rpc_error(
                 id,
                 -32602,
-                "only bounded, non-task-augmented form elicitation is supported",
+                "only bounded, non-task-augmented client requests are supported",
             ));
         }
         let related_task = match params.get("_meta") {
@@ -244,7 +279,7 @@ impl ElicitationRegistry {
                 return Some(rpc_error(
                     id,
                     -32602,
-                    "elicitation metadata must be an object",
+                    "client request metadata must be an object",
                 ));
             }
         };
@@ -276,7 +311,7 @@ impl ElicitationRegistry {
             &exact
         };
         let [slot] = candidates.as_slice() else {
-            return Some(action(id, "cancel", related_task));
+            return Some(kind.cancelled(id, related_task));
         };
         let mut state = lock(&slot.state);
         if state.closed
@@ -293,12 +328,13 @@ impl ElicitationRegistry {
                     !cancelled.load(Ordering::Acquire) && !responding.load(Ordering::Acquire)
                 })
         {
-            return Some(action(id, "cancel", related_task));
+            return Some(kind.cancelled(id, related_task));
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let responding = Arc::new(AtomicBool::new(false));
         state.seen.push(id.clone());
         state.pending.push_back(ServerRequest {
+            kind,
             id: id.clone(),
             params: params.clone(),
             related_task: related_task.map(str::to_string),
@@ -315,7 +351,7 @@ impl ElicitationRegistry {
         None
     }
 
-    /// Server cancellation dismisses the exact queued or visible form. It
+    /// Server cancellation dismisses the exact queued or active request. It
     /// cannot cancel the caller's tool or a newer connection's request.
     pub fn cancel(&self, params: Option<&Value>, generation: u64) {
         let Some(id) = params.and_then(|params| params.get("requestId")) else {
@@ -437,7 +473,7 @@ impl Drop for Subscription {
 /// Escape controls, bidi text, markup, and URL punctuation before displaying
 /// server strings. The full escaped value is shown; data is never truncated
 /// into a misleading preview or rendered as a clickable server-supplied URL.
-fn display(value: &str) -> String {
+pub(super) fn display(value: &str) -> String {
     use std::fmt::Write as _;
     let mut text = String::new();
     for character in value.chars() {
@@ -882,6 +918,7 @@ async fn fill_form(ask: &AskTool, server: &str, form: &Form, request: &ServerReq
 }
 
 struct Active<'a> {
+    kind: RequestKind,
     id: Value,
     related_task: Option<String>,
     cancelled: Arc<AtomicBool>,
@@ -891,7 +928,7 @@ struct Active<'a> {
 }
 
 /// Poll protocol work and its user interaction on the same caller. Completing
-/// the tool closes admission and cancels any accepted pending form before
+/// the request closes admission and cancels any accepted server prompt before
 /// returning, so a reader cannot leave an unanswered request or orphaned card.
 pub(crate) async fn observe<'a>(
     operation: impl Future<Output = Result<Value>> + Send + 'a,
@@ -899,6 +936,7 @@ pub(crate) async fn observe<'a>(
     ask: Option<AskTool>,
     server: &'a str,
     transport: &'a Arc<dyn McpTransport>,
+    sampling: Option<&'a super::sampling::SamplingContext<'a>>,
     current: impl Fn() -> bool + Send + Sync + 'a,
 ) -> Result<Value> {
     let Some(subscription) = subscription else {
@@ -936,7 +974,7 @@ pub(crate) async fn observe<'a>(
             && (completed.is_some() || pending.cancelled.load(Ordering::Acquire))
         {
             // Replacing this future drops AskTool's pending-reply lease.
-            let response = action(&pending.id, "cancel", pending.related_task.as_deref());
+            let response = pending.kind.cancelled(&pending.id, pending.related_task.as_deref());
             pending.future =
                 Box::pin(async move { send_response(transport, response, generation).await });
             pending.cancelling = true;
@@ -953,6 +991,7 @@ pub(crate) async fn observe<'a>(
             let ask = ask.clone();
             let cancelling = !request.authorized || cancelled.load(Ordering::Acquire);
             active = Some(Active {
+                kind: request.kind,
                 id,
                 related_task,
                 cancelled,
@@ -960,7 +999,18 @@ pub(crate) async fn observe<'a>(
                 cancelling,
                 future: Box::pin(async move {
                     let mut response = if cancelling {
-                        action(&request.id, "cancel", request.related_task.as_deref())
+                        request.kind.cancelled(&request.id, request.related_task.as_deref())
+                    } else if matches!(request.kind, RequestKind::Sampling) {
+                        let active = || current() && !request.cancelled.load(Ordering::Acquire);
+                        super::sampling::respond(
+                            &request.id,
+                            &request.params,
+                            request.related_task.as_deref(),
+                            ask.as_ref(),
+                            sampling,
+                            server,
+                            &active,
+                        ).await
                     } else if let Some(form) = Form::parse(&request.params) {
                         if let Some(ask) = ask {
                             fill_form(&ask, server, &form, &request).await
@@ -978,7 +1028,7 @@ pub(crate) async fn observe<'a>(
                         return Err(failure("elicitation caller changed before its response"));
                     }
                     if request.cancelled.load(Ordering::Acquire) {
-                        response = action(&request.id, "cancel", request.related_task.as_deref());
+                        response = request.kind.cancelled(&request.id, request.related_task.as_deref());
                     }
                     response_started.store(true, Ordering::Release);
                     send_response(transport, response, generation).await
@@ -1013,6 +1063,6 @@ async fn send_response(
     generation: u64,
 ) -> Result<()> {
     transport.respond_to_server_request(response, generation).await.map_err(|_| {
-        Error::tool("mcp", "[MCP_DELIVERY_INDETERMINATE] elicitation response could not be delivered in the originating protocol session; remote effects may already have occurred and the tool was not replayed")
+        Error::tool("mcp", "[MCP_DELIVERY_INDETERMINATE] client request response could not be delivered in the originating protocol session; remote effects may already have occurred and the tool was not replayed")
     })
 }

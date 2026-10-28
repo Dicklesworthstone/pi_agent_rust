@@ -70,6 +70,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+mod sampling;
+
 const MIN_COMPATIBLE_TOOL_PARALLELISM: usize = 8;
 const MAX_AUTO_COMPATIBLE_TOOL_PARALLELISM: usize = 64;
 const MAX_CONFIGURED_COMPATIBLE_TOOL_PARALLELISM: usize = 256;
@@ -6984,6 +6986,22 @@ impl Drop for NestedToolEvent {
 
 #[async_trait]
 impl crate::tools::ToolInvocationHost for AgentToolInvocationHost<'_> {
+    fn sampling_model(&self) -> Result<crate::tools::ToolSamplingModel> {
+        sampling::model(self)
+    }
+
+    async fn check_sampling_session(&self, expected_session: &str) -> Result<()> {
+        sampling::check_session(self, expected_session).await
+    }
+
+    async fn sample(
+        &self,
+        request: crate::tools::ToolSamplingRequest,
+        expected_session: &str,
+    ) -> Result<crate::tools::ToolSamplingResult> {
+        sampling::sample(self, request, expected_session).await
+    }
+
     async fn call_tool(&self, call: ToolCall, expected_session: &str) -> Result<ToolOutput> {
         // Eval owns an exclusive kernel lease. The dispatcher is unnecessary:
         // registered discoverable tools can be called by their actual names.

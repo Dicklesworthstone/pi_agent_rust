@@ -173,7 +173,7 @@ fn final_result_cancels_an_accepted_unshown_form_and_does_not_duplicate_inflight
             Ok(json!({"content":[]}))
         };
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(observe(operation, Some(subscription), Some(ask), "peer", &transport, || true)).unwrap();
+        runtime.block_on(observe(operation, Some(subscription), Some(ask), "peer", &transport, None, || true)).unwrap();
         let replies = lock(&native.replies);
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0]["result"]["action"], if early { "cancel" } else { "accept" });
@@ -194,7 +194,7 @@ fn headless_recommended_policy_never_supplies_server_form_values() {
         Ok(json!({"content":[]}))
     };
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    runtime.block_on(observe(operation, Some(subscription), Some(AskTool::new(AskPolicy::Recommended)), "peer", &transport, || true)).unwrap();
+    runtime.block_on(observe(operation, Some(subscription), Some(AskTool::new(AskPolicy::Recommended)), "peer", &transport, None, || true)).unwrap();
     assert_eq!(lock(&native.replies)[0]["result"]["action"], "cancel");
     assert!(lock(&native.replies)[0]["result"].get("content").is_none());
 }

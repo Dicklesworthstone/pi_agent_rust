@@ -134,8 +134,9 @@ Connections advertise task-aware result handling with `tasks: {}`. When the
 server negotiates MCP 2025-11-25 and task-augmented tool calls, mounted tools can
 wait for their remote task to finish within the original call deadline.
 Connections also advertise form elicitation with `elicitation: {"form": {}}`.
-Server prompts use the session's installed host picker. Sampling and URL-mode
-elicitation are not advertised.
+Server prompts use the session's installed host picker. Basic text sampling
+is advertised with `sampling: {}`; generation requires the invoking Agent's
+model authority and an installed picker. URL-mode elicitation is not advertised.
 HTTP OAuth is available through the native authentication flow below.
 Configured authentication headers and credential references remain supported.
 
@@ -215,8 +216,8 @@ when delivery of an accepted form response is uncertain.
 Unsolicited requests, ambiguous concurrent calls without task correlation, and
 requests from an obsolete session receive no user data.
 
-Admission is bounded to 64 observed requests per connection, eight form requests
-per request, 16 fields per form, 32 KiB of request data, 4 KiB per answer, and 16 KiB
+Admission is bounded to 64 observed requests per connection, eight form or sampling
+requests per request, 16 fields per form, 32 KiB of request data, 4 KiB per answer, and 16 KiB
 of submitted content. One replacement form can queue after its predecessor is
 cancelled or its response begins dispatch. Unsupported or oversized schemas
 return an invalid-params response. Requests to make the elicitation itself a
@@ -224,6 +225,67 @@ remote task are not supported; a form can still belong to an existing tool task.
 When all request ownership slots are occupied, a new request is rejected before
 dispatch so its forms cannot be attributed to an existing caller. Cancelling a
 catalog refresh before dispatch leaves another caller's active form intact.
+
+## Server-requested model replies
+
+During an admitted tool call, a server can request a text generation through
+[`sampling/createMessage`](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling).
+Pi uses the model selected by the Agent that invoked the tool. The server does
+not receive provider credentials or choose a different provider through model
+hints. The request has its own messages and optional system prompt; it does
+not inherit the Agent's conversation or executable tools. Server `metadata`
+is not merged into provider settings.
+
+Sampling has two separate approvals in the existing ask picker:
+
+1. Review the requesting server, selected provider/model, complete prompt,
+   effective token limit, and temperature. Choose **Generate this reply** to
+   spend tokens, or **Decline request** to stop. Use **Other** to replace the
+   displayed prompt JSON; Pi validates and protects the edited prompt and
+   presents it for another review before generation.
+2. Review the complete generated reply. Choose **Send reply to server** to
+   share it, or **Discard reply** to withhold it. Use **Other** to edit the reply
+   text and review the protected replacement before sending. Generation costs
+   still count toward the session budget if you discard the reply or cancel
+   this second review.
+
+Classic TUI, ftui, RPC, and SDK-installed ask handlers use the same approvals
+when the mounted tool runs through an Agent. The host picker works even when
+the model-facing `ask` tool is disabled. Headless sessions, direct manager calls
+without invocation-scoped model authority, and hosts without sampling support
+reject the request. Resource/prompt retrieval can show forms, but does not
+inherit sampling authority. `askPolicy: "recommended"` never approves generation
+or releases a reply automatically.
+
+Supported prompts contain one to 64 user/assistant messages with text content,
+either a single text block or an array of text blocks. Optional `systemPrompt`,
+`temperature`, and advisory `modelPreferences` are accepted. `maxTokens` is
+required, positive, and capped by the invoking Agent's configured output limit
+and the 65,536-token sampling ceiling. The default cap is 4,096 tokens when no
+limit is configured. Requests are limited to 32 KiB and generated replies to
+64 KiB. Normal completion returns `stopReason: "endTurn"`; a completed response
+at the token limit returns `"maxTokens"`.
+
+Image/audio content, sampling tools, tool-choice instructions, nonempty stop
+sequences, and `includeContext` values other than `"none"` are unsupported and
+receive an invalid-params response. Sampling itself cannot create a remote
+task. A request can belong to an existing tool task through its validated
+related-task metadata, including while that task waits for input.
+
+The invoking session's privacy policy protects complete prompts, edited values,
+and generated output before they reach the provider or server. Reviews escape
+terminal controls, misleading markup, and clickable server-provided URLs.
+Changing the selected model or session invalidates an outstanding approval.
+The server's configured timeout covers the entire originating tool call,
+including both reviews and generation, so configure enough time for the user
+to respond.
+
+Sampling shares form elicitation's caller, transport-session, cancellation,
+and admission bounds. Unsolicited or ambiguously owned requests cannot start
+generation. Cancelling the tool or the server's sampling request drops its
+pending picker or provider operation, and late answers cannot restart it.
+Provider failures produce a bounded error response without exposing provider
+error details. A reply is never replayed into a replacement MCP session.
 
 ## Legacy HTTP+SSE servers
 

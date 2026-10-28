@@ -31,6 +31,9 @@ mod task_tests;
 #[cfg(all(test, unix))]
 mod elicitation_tests;
 
+#[cfg(all(test, unix))]
+mod sampling_tests;
+
 mod tasks;
 
 /// Setup and recovery include more than JSON-RPC requests: lock admission,
@@ -452,6 +455,20 @@ impl McpManager {
         arguments: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<Value> {
+        self.call_tool_with_sampling(server, tool, arguments, on_update, None).await
+    }
+
+    /// The host is borrowed from this invocation, never stored in the
+    /// manager. Standalone SDK calls remain able to execute tools but cannot
+    /// silently obtain a provider or approve a server's sampling request.
+    pub(crate) async fn call_tool_with_sampling(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        sampling: Option<crate::mcp::sampling::SamplingContext<'_>>,
+    ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         // Reject an attenuated/cancelled caller before setup can resolve
         // secrets, run a command, or open a connection.
@@ -469,7 +486,7 @@ impl McpManager {
                 // connection. No locks or delivery guard surround validation.
                 super::output_schema::validate_arguments(&contract.input_schema, &arguments)?;
                 match self
-                    .execute_tool_call(
+                    .execute_tool_call_with_sampling(
                         &entry,
                         &transport,
                         tool,
@@ -479,6 +496,7 @@ impl McpManager {
                         contract.task_support,
                         contract.transport_generation,
                         on_update.as_deref(),
+                        sampling.as_ref(),
                     )
                     .await
                 {
@@ -557,7 +575,8 @@ impl McpManager {
         .await
     }
 
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     async fn execute_tool_call(
         &self,
         entry: &Arc<ServerEntry>,
@@ -569,6 +588,26 @@ impl McpManager {
         task_support: TaskSupport,
         expected_generation: u64,
         on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    ) -> Result<Value> {
+        self.execute_tool_call_with_sampling(
+            entry, transport, tool, arguments, timeout, output_schema,
+            task_support, expected_generation, on_update, None,
+        ).await
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn execute_tool_call_with_sampling(
+        &self,
+        entry: &Arc<ServerEntry>,
+        transport: &Arc<dyn McpTransport>,
+        tool: &str,
+        arguments: &Value,
+        timeout: Duration,
+        output_schema: Option<super::McpOutputSchema>,
+        task_support: TaskSupport,
+        expected_generation: u64,
+        on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+        sampling: Option<&crate::mcp::sampling::SamplingContext<'_>>,
     ) -> Result<Value> {
         let owner = AgentCx::for_current_or_request();
         catalog::check_request_owner(&owner)?;
@@ -666,6 +705,7 @@ impl McpManager {
                     ask,
                     &entry.config.name,
                     transport,
+                    sampling,
                     || {
                         catalog::check_request_owner(&owner).is_ok()
                             && self.check_running().is_ok()

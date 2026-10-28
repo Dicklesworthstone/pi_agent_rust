@@ -230,7 +230,45 @@ impl ToolModelScope {
     }
 }
 
-/// Borrowed authority to call tools through the owning Agent's execution path.
+/// Public model identity and limits available for an approved sampling request.
+/// Credentials, conversation history and provider handles stay in the Agent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSamplingModel {
+    pub provider: String,
+    pub model: String,
+    pub session_id: String,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSamplingRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolSamplingMessage {
+    pub role: ToolSamplingRole,
+    pub text: String,
+}
+
+/// An isolated, reviewed prompt. No Agent transcript or tools are inherited.
+#[derive(Debug, Clone)]
+pub struct ToolSamplingRequest {
+    pub system_prompt: Option<String>,
+    pub messages: Vec<ToolSamplingMessage>,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolSamplingResult {
+    pub text: String,
+    pub stop_reason: crate::model::StopReason,
+}
+
+/// Borrowed authority to call tools or sample through the owning Agent.
 ///
 /// Implementations must enforce the live registry, approval, plan, cancellation
 /// and privacy policies. A tool receives this only for the current invocation;
@@ -245,6 +283,32 @@ pub trait ToolInvocationHost: Send + Sync {
         call: crate::model::ToolCall,
         expected_session: &str,
     ) -> Result<ToolOutput>;
+
+    /// Capture non-secret model affinity before presenting a sampling review.
+    /// Standalone or custom hosts must explicitly opt into this capability.
+    fn sampling_model(&self) -> Result<ToolSamplingModel> {
+        Err(Error::tool("mcp", "sampling is unavailable for this caller"))
+    }
+
+    /// Recheck live session ownership after a user review can have suspended.
+    /// Hosts with a mutable session resolver must validate it here as well.
+    async fn check_sampling_session(&self, expected_session: &str) -> Result<()> {
+        if self.sampling_model()?.session_id != expected_session {
+            return Err(Error::tool("mcp", "sampling session changed"));
+        }
+        Ok(())
+    }
+
+    /// Execute only the already reviewed prompt under the original session,
+    /// cancellation owner and cost account. The caller owns consent, privacy
+    /// projection and reply review; this method never publishes to a server.
+    async fn sample(
+        &self,
+        _request: ToolSamplingRequest,
+        _expected_session: &str,
+    ) -> Result<ToolSamplingResult> {
+        Err(Error::tool("mcp", "sampling is unavailable for this caller"))
+    }
 }
 
 /// Authority borrowed for one native invocation.

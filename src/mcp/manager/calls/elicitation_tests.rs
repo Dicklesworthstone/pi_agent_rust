@@ -61,7 +61,7 @@ def exchange(frame, emit):
         return
     if method == 'initialize':
         assert frame['params']['capabilities']['elicitation'] == {'form':{}}
-        assert 'sampling' not in frame['params']['capabilities']
+        assert frame['params']['capabilities']['sampling'] == {}
         caps = {'tools':{}}
         if scenario == 'task':
             caps['tasks'] = {'requests':{'tools':{'call':{}}},'cancel':{}}

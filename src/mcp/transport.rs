@@ -156,9 +156,9 @@ impl ClientRoots {
 
     fn capabilities(&self) -> Value {
         if self.roots.get().is_some() {
-            serde_json::json!({"roots": {"listChanged": false}, "tasks": {}, "elicitation": {"form": {}}})
+            serde_json::json!({"roots": {"listChanged": false}, "tasks": {}, "elicitation": {"form": {}}, "sampling": {}})
         } else {
-            serde_json::json!({"tasks": {}, "elicitation": {"form": {}}})
+            serde_json::json!({"tasks": {}, "elicitation": {"form": {}}, "sampling": {}})
         }
     }
 
@@ -188,6 +188,8 @@ impl ClientRoots {
     ) -> Option<Value> {
         if method == "elicitation/create" {
             self.elicitation.route(id, params, generation)
+        } else if method == "sampling/createMessage" {
+            self.elicitation.route_sampling(id, params, generation)
         } else {
             Some(self.response(method, id))
         }
@@ -228,7 +230,7 @@ pub trait McpTransport: Send + Sync {
     /// Implementations may only enqueue bounded cleanup; acknowledgement and
     /// rollback of remote effects are not implied by this call.
     fn cancel_task(&self, _task_id: &str, _generation: u64) {}
-    /// Connection-owned form mailbox. User interaction runs only on a
+    /// Connection-owned form/sampling mailbox. User interaction runs only on a
     /// registered tool caller; custom transports opt in explicitly.
     fn elicitation_registry(
         &self,
@@ -4593,7 +4595,7 @@ pub(crate) mod tests {
             &serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": "server-request-1",
-                "method": "sampling/createMessage",
+                "method": "sampling/unsupported",
                 "params": {},
             }),
             &pending,
@@ -5398,7 +5400,7 @@ pub(crate) mod tests {
         std::fs::create_dir(&workspace).expect("workspace");
         std::fs::create_dir(&other).expect("other workspace");
         let roots = ClientRoots::default();
-        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}}}));
+        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}}));
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
             -32601
@@ -5413,7 +5415,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             roots.capabilities(),
-            serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}}})
+            serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}},"sampling":{}})
         );
 
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
@@ -5453,7 +5455,7 @@ pub(crate) mod tests {
             let error = roots.configure(&path).expect_err("invalid workspace");
             assert!(error.to_string().contains("MCP_ROOT_INVALID"), "{error}");
         }
-        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}}}));
+        assert_eq!(roots.capabilities(), serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}}));
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
             -32601
@@ -5559,7 +5561,7 @@ for line in sys.stdin:
                 assert_eq!(observed["initialize"]["protocolVersion"], "2025-11-25");
                 assert_eq!(
                     observed["initialize"]["capabilities"],
-                    serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}}})
+                    serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}},"sampling":{}})
                 );
                 let uri = observed["rootsReply"]["result"]["roots"][0]["uri"]
                     .as_str()
@@ -6083,7 +6085,7 @@ for line in sys.stdin:
             assert_eq!(frame["params"]["protocolVersion"], "2025-11-25");
             assert_eq!(
                 frame["params"]["capabilities"],
-                serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}}})
+                serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}},"sampling":{}})
             );
             assert!(
                 !captured[index]

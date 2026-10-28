@@ -468,6 +468,7 @@ impl McpManager {
                     None,
                     &entry.config.name,
                     transport,
+                    None,
                     || {
                         check_request_owner(&owner).is_ok()
                             && self.check_running().is_ok()

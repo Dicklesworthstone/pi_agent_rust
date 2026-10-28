@@ -13,6 +13,7 @@ mod content;
 pub mod elicitation;
 pub mod manager;
 pub mod progress;
+pub(crate) mod sampling;
 pub mod tasks;
 pub mod transport;
 pub mod trust;
@@ -28,7 +29,7 @@ use serde_json::Value;
 
 #[cfg(test)]
 use crate::model::ContentBlock;
-use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
+use crate::tools::{Tool, ToolEffects, ToolInvocationContext, ToolOutput, ToolUpdate};
 
 /// Mounted tool name cap (provider schemas reject longer names).
 const MAX_MOUNTED_NAME: usize = 64;
@@ -152,6 +153,22 @@ impl Tool for McpTool {
             .manager
             .call_tool_with_updates(&self.server, &self.tool_name, input, on_update)
             .await?;
+        Ok(mcp_result_to_output(&result))
+    }
+
+    async fn execute_with_invocation(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        context: ToolInvocationContext<'_>,
+    ) -> crate::error::Result<ToolOutput> {
+        let sampling = context.host.and_then(|host| {
+            sampling::SamplingContext::capture(host, (context.snapshot_privacy)()).ok()
+        });
+        let result = self.manager.call_tool_with_sampling(
+            &self.server, &self.tool_name, input, on_update, sampling,
+        ).await?;
         Ok(mcp_result_to_output(&result))
     }
 }
