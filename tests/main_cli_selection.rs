@@ -58,6 +58,7 @@ fn custom_model_entry(provider: &str, api_key: Option<&str>) -> ModelEntry {
             reasoning: true,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,

@@ -645,6 +645,7 @@ mod tests {
                 cache_read: 3,
                 cache_write: 2,
                 total_tokens: 23,
+                billing: None,
                 cost: Cost {
                     input: 0.1,
                     output: 0.2,

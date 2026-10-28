@@ -71,6 +71,7 @@ fn test_model(id: &str, reasoning: bool) -> Model {
         reasoning,
         input: vec![InputType::Text],
         cost: ModelCost {
+            audio: None,
             input: 3.0,
             output: 15.0,
             cache_read: 0.3,

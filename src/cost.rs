@@ -17,6 +17,8 @@ mod durability;
 use durability::{Coverage, Journal, Origin, Retirement};
 
 const CHECKPOINT_TYPE: &str = "cost_budget";
+const RECORDED_BILLING_FAILURE: &str =
+    "recorded model billing is unavailable; cost accounting cannot be restored";
 const MAX_PENDING_ATTEMPTS: usize = 1024;
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
@@ -271,6 +273,9 @@ impl CostBudget {
 
     /// A native child always remains charged to its original parent tree.
     pub fn for_replacement(&self, session: &Session, preserve: bool) -> Result<Self> {
+        if self.remote.is_some() || preserve {
+            validate_recorded_billing(session)?;
+        }
         if self.remote.is_some() {
             return Ok(self.clone());
         }
@@ -500,22 +505,30 @@ impl CostBudget {
         if self.remote.is_none() {
             self.refresh_origin()?;
         }
-        let state = self
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recorded_billing_unavailable(session) && state.failure.is_none() {
+            state.failure = Some(RECORDED_BILLING_FAILURE.to_string());
+        }
         let spent = state.snapshot.spent;
         let main_spent = main_spend(session);
         let mut covered = state.observed.clone();
         covered.insert(state.account.clone(), state.own_finalized);
         durability::validate_coverage(&covered)?;
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "spent": spent,
             "mainSpent": main_spent,
             "account": state.account,
             "ownFinalized": state.own_finalized,
             "lateCovered": covered,
         });
+        if state.failure.is_some() {
+            // Persist only a bounded stable marker. Detailed live failures
+            // may contain transport diagnostics and must not enter storage.
+            data["failure"] = serde_json::json!(RECORDED_BILLING_FAILURE);
+        }
         drop(state);
         let unchanged = session
             .entries
@@ -736,6 +749,36 @@ fn main_spend(session: &Session) -> f64 {
         })
 }
 
+fn recorded_billing_unavailable(session: &Session) -> bool {
+    session.entries.iter().any(|entry| match entry {
+        SessionEntry::Message(entry) => match &entry.message {
+            SessionMessage::Assistant { message } => matches!(
+                message.usage.billing,
+                Some(crate::model::BillingUsage::Unavailable { .. })
+            ),
+            _ => false,
+        },
+        SessionEntry::Custom(entry) if entry.custom_type == CHECKPOINT_TYPE => entry
+            .data
+            .as_ref()
+            .and_then(|data| data.get("failure"))
+            .is_some_and(|failure| !failure.is_null()),
+        _ => false,
+    })
+}
+
+fn validate_recorded_billing(session: &Session) -> Result<()> {
+    if session.has_partial_v2_hydration() {
+        let mut complete = session.clone();
+        complete.ensure_full_v2_hydration_before_save()?;
+        return validate_recorded_billing(&complete);
+    }
+    if recorded_billing_unavailable(session) {
+        return Err(Error::session(RECORDED_BILLING_FAILURE));
+    }
+    Ok(())
+}
+
 /// Account for every retained branch, plus auxiliary/child spend checkpoints.
 pub fn recorded_spend(session: &Session) -> Result<f64> {
     let origin = Origin::for_session(session)?;
@@ -749,6 +792,9 @@ fn recorded_account(session: &Session, journal: Option<&Journal>) -> Result<(f64
         complete.ensure_full_v2_hydration_before_save()?;
         return recorded_account(&complete, journal);
     }
+    // A finite retained amount is only the known lower bound when the
+    // provider or a prior live account reported unavailable billing.
+    validate_recorded_billing(session)?;
     let main_spent = main_spend(session);
     let mut spent = main_spent;
     let mut observed = Coverage::new();
@@ -823,7 +869,7 @@ pub fn resolve_budget(
     shared: Option<CostBudget>,
 ) -> Result<Option<CostBudget>> {
     if let Some(inherited) = crate::agent_hub::ipc::cost::inherited_budget()? {
-        return Ok(Some(inherited));
+        return inherited.for_replacement(session, true).map(Some);
     }
     if let Some(shared) = shared {
         return shared.for_replacement(session, true).map(Some);
@@ -1258,6 +1304,161 @@ mod tests {
             let resumed = budget.for_replacement(&retried, false).unwrap();
             assert_eq!(resumed.spent(), 1.75);
             assert!(matches!(resumed.admit(), Err(Error::CostCap { .. })));
+        }
+    }
+
+    #[test]
+    fn unavailable_billing_survives_jsonl_sqlite_and_retained_branch_replacement() {
+        fn assert_unavailable<T: std::fmt::Debug>(result: Result<T>) {
+            assert!(matches!(
+                result.unwrap_err(),
+                Error::Session(message) if message == RECORDED_BILLING_FAILURE
+            ));
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for checkpoint_only in [false, true] {
+            for with_v2_sidecar in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("unavailable-billing.jsonl");
+                let mut session = Session::create();
+                session.path = Some(path.clone());
+                let completed = session.append_message(assistant(1.0));
+                let budget = CostBudget::new(None, Some(10.0), 1.0).unwrap();
+                if checkpoint_only {
+                    let mut attempt = budget.start_attempt().unwrap();
+                    attempt.observe(0.25).unwrap();
+                    assert!(attempt.finish(f64::NAN).is_err());
+                    budget.quarantine("private transport diagnostic");
+                } else {
+                    let mut failed = assistant(0.25);
+                    if let SessionMessage::Assistant { message } = &mut failed {
+                        message.usage.billing = Some(crate::model::BillingUsage::Unavailable {
+                            reason: "missing audio usage".to_string(),
+                        });
+                    }
+                    session.append_message(failed);
+                    budget.record(0.25).unwrap();
+                }
+
+                // A quarantined account must still save its known charge and
+                // a stable failure marker, even without a public usage event.
+                let mut checkpointed = session.clone();
+                budget.checkpoint(&mut checkpointed).unwrap();
+                let SessionEntry::Custom(checkpoint) = checkpointed.entries.last().unwrap() else {
+                    panic!("cost checkpoint");
+                };
+                let data = checkpoint.data.as_ref().unwrap();
+                assert_eq!(data["spent"], 1.25);
+                assert_eq!(data["failure"], RECORDED_BILLING_FAILURE);
+                let encoded = serde_json::to_string(data).unwrap();
+                assert!(!encoded.contains("private transport diagnostic"));
+                assert!(!encoded.contains("NaN"));
+                assert!(budget.admit().is_err());
+                if checkpoint_only {
+                    session = checkpointed;
+                }
+                // Keep the other case free of any failed checkpoint, proving
+                // Usage::Unavailable itself blocks restoration as well.
+                assert_unavailable(recorded_spend(&session));
+                assert!(session.create_branch_from(&completed));
+                let active = session.append_message(assistant(0.0));
+                let main_spent = main_spend(&session);
+                session.append_custom_entry(
+                    CHECKPOINT_TYPE.to_string(),
+                    Some(serde_json::json!({"spent": 1.25, "mainSpent": main_spent})),
+                );
+                assert!(session.navigate_to(&active));
+                runtime.block_on(session.save()).unwrap();
+
+                let reopened = if with_v2_sidecar {
+                    let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+                    let (mut reopened, diagnostics) = Session::open_from_v2(
+                        &store,
+                        session.header.clone(),
+                        crate::session::V2OpenMode::ActivePath,
+                    )
+                    .unwrap();
+                    assert!(diagnostics.skipped_entries.is_empty());
+                    assert!(reopened.has_partial_v2_hydration());
+                    reopened.path = Some(path.clone());
+                    reopened
+                } else {
+                    runtime
+                        .block_on(Session::open(path.to_str().unwrap()))
+                        .unwrap()
+                };
+                assert_unavailable(recorded_spend(&reopened));
+                assert_unavailable(CostBudget::from_session(&reopened, None, Some(10.0)));
+                let current = CostBudget::new(None, Some(10.0), 2.0).unwrap();
+                for preserve in [false, true] {
+                    assert_unavailable(current.for_replacement(&reopened, preserve));
+                }
+                current.admit().unwrap();
+                assert_eq!(
+                    current.spent(),
+                    2.0,
+                    "a refused switch leaves its source intact"
+                );
+                let preserved = budget.for_replacement(&Session::in_memory(), true).unwrap();
+                assert!(
+                    preserved.admit().is_err(),
+                    "preserving an account cannot clear failure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_zero_bills_remain_valid_after_durable_restore() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for billing in [
+            crate::model::BillingUsage::ReportedTotal { total: 0.0 },
+            crate::model::BillingUsage::Tokens {
+                text: crate::model::BillingTokenCounts {
+                    input: 20,
+                    ..Default::default()
+                },
+                audio: crate::model::BillingTokenCounts {
+                    input: 5,
+                    ..Default::default()
+                },
+                reported_total: Some(0.0),
+            },
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("zero-bill.jsonl");
+            let mut session = Session::create();
+            session.path = Some(path.clone());
+            session.append_message(assistant(0.25));
+            let mut free = assistant(0.0);
+            if let SessionMessage::Assistant { message } = &mut free {
+                message.usage.billing = Some(billing);
+            }
+            session.append_message(free);
+            let budget = CostBudget::new(None, Some(1.0), 0.25).unwrap();
+            budget.checkpoint(&mut session).unwrap();
+            let SessionEntry::Custom(checkpoint) = session.entries.last().unwrap() else {
+                panic!("cost checkpoint");
+            };
+            assert!(checkpoint.data.as_ref().unwrap().get("failure").is_none());
+            runtime.block_on(session.save()).unwrap();
+            let reopened = runtime
+                .block_on(Session::open(path.to_str().unwrap()))
+                .unwrap();
+            assert_eq!(recorded_spend(&reopened).unwrap(), 0.25);
+            let resumed = CostBudget::from_session(&reopened, None, Some(1.0)).unwrap();
+            assert_eq!(resumed.spent(), 0.25);
+            resumed.admit().unwrap();
+            resumed
+                .for_replacement(&reopened, true)
+                .unwrap()
+                .admit()
+                .unwrap();
         }
     }
 

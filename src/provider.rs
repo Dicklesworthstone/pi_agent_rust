@@ -186,18 +186,33 @@ impl Provider for CostGuardedProvider {
                 cache_read: cached,
                 ..Default::default()
             };
-            priced.cost.total = usage
-                .get("cost")
-                .map_or(0.0, |cost| cost.as_f64().unwrap_or(f64::NAN));
-            // Invalid reported billing must quarantine the account, not be
-            // replaced with a plausible catalog estimate.
-            if priced.cost.total.is_finite()
-                && priced.cost.total >= 0.0
-                && let Some(rates) = self.inner.model_cost()
-            {
-                rates.price_usage(&mut priced);
+            if let Some(cost) = usage.get("cost") {
+                priced.billing = Some(
+                    match cost
+                        .as_f64()
+                        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                    {
+                        Some(total) => crate::model::BillingUsage::ReportedTotal { total },
+                        None => crate::model::BillingUsage::Unavailable {
+                            reason: "Native compaction reported an invalid billed total"
+                                .to_string(),
+                        },
+                    },
+                );
             }
-            if let Err(error) = attempt.finish(priced.cost.total) {
+            let cost = match self
+                .inner
+                .model_cost()
+                .unwrap_or_default()
+                .price_usage(&mut priced)
+            {
+                Ok(()) => priced.cost.total,
+                Err(error) => {
+                    tracing::warn!(%error, "native compaction billing is unavailable");
+                    f64::NAN
+                }
+            };
+            if let Err(error) = attempt.finish(cost) {
                 tracing::warn!(%error, "native compaction spend accounting failed; budget quarantined");
             }
         }
@@ -221,6 +236,19 @@ impl UsageObserver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .observe(&mut usage.clone(), false)
     }
+
+    /// A complete bill can replace a provisional estimate before the public
+    /// terminal event is consumed. Keep the attempt open for trailing usage
+    /// and source cleanup; its owner still performs the only settlement.
+    pub(crate) fn observe_authoritative(
+        &self,
+        usage: &mut crate::model::Usage,
+    ) -> crate::error::Result<()> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_snapshot(usage, false, true)
+    }
 }
 
 impl std::fmt::Debug for UsageObserver {
@@ -243,13 +271,22 @@ impl CostAccounting {
         usage: &mut crate::model::Usage,
         terminal: bool,
     ) -> crate::error::Result<()> {
+        self.observe_snapshot(usage, terminal, terminal)
+    }
+
+    fn observe_snapshot(
+        &mut self,
+        usage: &mut crate::model::Usage,
+        terminal: bool,
+        authoritative: bool,
+    ) -> crate::error::Result<()> {
         if self.settled {
             return Ok(());
         }
         if let Some(error) = self.failure() {
             return Err(error);
         }
-        let result = self.observe_usage(usage, terminal);
+        let result = self.observe_usage(usage, terminal, authoritative);
         if let Err(error) = &result {
             self.failure = Some(error.to_string());
         }
@@ -266,10 +303,41 @@ impl CostAccounting {
         &mut self,
         usage: &mut crate::model::Usage,
         terminal: bool,
+        authoritative: bool,
     ) -> crate::error::Result<()> {
-        // price_usage treats nonpositive/NaN totals as missing billing. The
-        // spend guard must distinguish an absent zero from invalid usage
-        // before that fallback can erase evidence of an accounting failure.
+        // Invalid numeric evidence must quarantine the account before any
+        // pricing fallback can erase it. NaN stays internal to the ledger;
+        // explicit failure metadata is safe to persist and replay.
+        if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
+            usage.billing = Some(crate::model::BillingUsage::Unavailable {
+                reason: "The provider reported an invalid billed total".to_string(),
+            });
+            usage.cost = crate::model::Cost::default();
+            self.known_cost = f64::NAN;
+            return self
+                .attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(f64::NAN);
+        }
+        let priced = if let Some(rates) = &self.rates {
+            rates.price_usage(usage)
+        } else if usage.billing.is_some() {
+            // An explicit bill or failure is meaningful even for an otherwise
+            // unpriced provider. Unknown audio rates still fail checked pricing.
+            ModelCost::default().price_usage(usage)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = priced {
+            self.known_cost = f64::NAN;
+            let _ = self
+                .attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(f64::NAN);
+            return Err(error);
+        }
         if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
             self.known_cost = f64::NAN;
             return self
@@ -278,18 +346,10 @@ impl CostAccounting {
                 .expect("active cost attempt")
                 .observe(f64::NAN);
         }
-        if let Some(rates) = &self.rates {
-            rates.price_usage(usage);
-        }
-        if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
-            self.known_cost = f64::NAN;
-            return self
-                .attempt
-                .as_mut()
-                .expect("active cost attempt")
-                .observe(f64::NAN);
-        }
-        self.remember_cost(usage.cost.total, terminal && usage.cost.total > 0.0);
+        self.remember_cost(
+            usage.cost.total,
+            authoritative && (usage.cost.total > 0.0 || usage.has_explicit_billing()),
+        );
         if terminal {
             Ok(())
         } else {
@@ -813,45 +873,192 @@ impl InputType {
     }
 }
 
-/// Model pricing per million tokens.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Audio prices per million billable tokens. An absent rate is unknown;
+/// `Some(0.0)` explicitly declares a free bucket. Unknown audio is never
+/// silently charged at the text rate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AudioModelCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+/// Model pricing per million tokens. Legacy fields price text; an explicit
+/// billing partition can additionally price audio without changing the token
+/// counts used for context-window management.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ModelCost {
     pub input: f64,
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioModelCost>,
 }
 
 impl ModelCost {
-    /// True when at least one rate is non-zero, i.e. the catalog actually
-    /// knows this model's pricing.
+    /// Legacy zero text rates do not prove known pricing, but explicit audio
+    /// metadata must survive the provider wrapper even for a free model.
     #[must_use]
     pub fn is_priced(&self) -> bool {
         [self.input, self.output, self.cache_read, self.cache_write]
             .iter()
             .any(|rate| *rate > 0.0)
+            || self.audio.as_ref().is_some_and(|audio| {
+                [
+                    audio.input,
+                    audio.output,
+                    audio.cache_read,
+                    audio.cache_write,
+                ]
+                .iter()
+                .any(Option::is_some)
+            })
     }
 
-    /// Fill `usage.cost` from these per-million-token rates (gh #221).
+    /// Price the provider's billing evidence without confusing billable units
+    /// with context tokens. Explicit bills, including zero, are authoritative.
+    /// Legacy usage retains its established text-only pricing semantics.
     ///
-    /// The component costs always come from the catalog rates. A provider-
-    /// reported total (OpenRouter's `usage.cost`, the amount actually billed)
-    /// is authoritative and kept as `total`; otherwise `total` is the sum of
-    /// the components. Mirrors upstream pi's `calculateCost`.
-    #[allow(clippy::cast_precision_loss)] // Token counts within practical range won't lose precision
-    pub fn price_usage(&self, usage: &mut crate::model::Usage) {
-        let per_million = |rate: f64, tokens: u64| (rate / 1_000_000.0) * tokens as f64;
-        let provider_reported_total = usage.cost.total;
-        usage.cost.input = per_million(self.input, usage.input);
-        usage.cost.output = per_million(self.output, usage.output);
-        usage.cost.cache_read = per_million(self.cache_read, usage.cache_read);
-        usage.cost.cache_write = per_million(self.cache_write, usage.cache_write);
-        usage.cost.total = if provider_reported_total > 0.0 {
-            provider_reported_total
-        } else {
-            usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write
+    /// Missing or invalid accounting is an error and remains explicit in the
+    /// serializable usage record. The spend guard quarantines the account
+    /// while retaining known partial spend instead of inventing a zero bill.
+    pub fn price_usage(&self, usage: &mut crate::model::Usage) -> crate::error::Result<()> {
+        let priced = match usage.billing.as_ref() {
+            Some(crate::model::BillingUsage::Tokens {
+                text,
+                audio,
+                reported_total,
+            }) => self.price_billing_tokens(*text, *audio, *reported_total),
+            Some(crate::model::BillingUsage::ReportedTotal { total }) => Self::checked_bill(*total)
+                .map(|total| crate::model::Cost {
+                    total,
+                    ..Default::default()
+                }),
+            Some(crate::model::BillingUsage::Unavailable { reason }) => {
+                Err(crate::error::Error::session(format!(
+                    "model cost accounting is unavailable: {reason}"
+                )))
+            }
+            None => Self::checked_bill(usage.cost.total).and_then(|total| {
+                self.price_billing_tokens(
+                    crate::model::BillingTokenCounts {
+                        input: usage.input,
+                        output: usage.output,
+                        cache_read: usage.cache_read,
+                        cache_write: usage.cache_write,
+                    },
+                    crate::model::BillingTokenCounts::default(),
+                    (total > 0.0).then_some(total),
+                )
+            }),
         };
+        match priced {
+            Ok(cost) => {
+                usage.cost = cost;
+                Ok(())
+            }
+            Err(error) => {
+                if !matches!(
+                    usage.billing,
+                    Some(crate::model::BillingUsage::Unavailable { .. })
+                ) {
+                    usage.billing = Some(crate::model::BillingUsage::Unavailable {
+                        reason: error.to_string(),
+                    });
+                }
+                // Do not expose NaN/Infinity through session or RPC JSON.
+                if [
+                    usage.cost.input,
+                    usage.cost.output,
+                    usage.cost.cache_read,
+                    usage.cost.cache_write,
+                    usage.cost.total,
+                ]
+                .iter()
+                .any(|cost| !cost.is_finite() || *cost < 0.0)
+                {
+                    usage.cost = crate::model::Cost::default();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn checked_bill(total: f64) -> crate::error::Result<f64> {
+        if total.is_finite() && total >= 0.0 {
+            Ok(total)
+        } else {
+            Err(crate::error::Error::session(
+                "model cost accounting has an invalid billed total",
+            ))
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)] // Practical token counts fit precisely enough in f64.
+    fn price_bucket(rate: Option<f64>, tokens: u64) -> crate::error::Result<f64> {
+        if tokens == 0 {
+            return Ok(0.0);
+        }
+        let rate = rate.filter(|rate| rate.is_finite() && *rate >= 0.0)
+            .ok_or_else(|| crate::error::Error::session("model cost accounting requires a finite nonnegative rate for every used billing bucket"))?;
+        Self::checked_bill((rate / 1_000_000.0) * tokens as f64)
+    }
+
+    fn price_billing_tokens(
+        &self,
+        text: crate::model::BillingTokenCounts,
+        audio: crate::model::BillingTokenCounts,
+        reported_total: Option<f64>,
+    ) -> crate::error::Result<crate::model::Cost> {
+        let reported_total = reported_total.map(Self::checked_bill).transpose()?;
+        let audio_rates = self.audio.as_ref();
+        let components: crate::error::Result<_> = (|| {
+            let input = Self::price_bucket(Some(self.input), text.input)?
+                + Self::price_bucket(audio_rates.and_then(|rates| rates.input), audio.input)?;
+            let output = Self::price_bucket(Some(self.output), text.output)?
+                + Self::price_bucket(audio_rates.and_then(|rates| rates.output), audio.output)?;
+            let cache_read = Self::price_bucket(Some(self.cache_read), text.cache_read)?
+                + Self::price_bucket(
+                    audio_rates.and_then(|rates| rates.cache_read),
+                    audio.cache_read,
+                )?;
+            let cache_write = Self::price_bucket(Some(self.cache_write), text.cache_write)?
+                + Self::price_bucket(
+                    audio_rates.and_then(|rates| rates.cache_write),
+                    audio.cache_write,
+                )?;
+            let total = Self::checked_bill(input + output + cache_read + cache_write)?;
+            Ok(crate::model::Cost {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                total,
+            })
+        })();
+        match (components, reported_total) {
+            (Ok(mut cost), reported_total) => {
+                if let Some(total) = reported_total {
+                    cost.total = total;
+                }
+                Ok(cost)
+            }
+            // A trustworthy bill can still enforce a cap when catalog rates
+            // cannot supply a trustworthy component breakdown.
+            (Err(_), Some(total)) => Ok(crate::model::Cost {
+                total,
+                ..Default::default()
+            }),
+            (Err(error), None) => Err(error),
+        }
     }
 }
 
@@ -1354,6 +1561,7 @@ mod tests {
                     output: 0.0,
                     cache_read: 0.0,
                     cache_write: 0.0,
+                    audio: None,
                 }),
             );
             let provider = guard_with_cost_budget(probe.clone(), budget.clone());
@@ -1407,6 +1615,7 @@ mod tests {
                     output: 0.0,
                     cache_read: 0.0,
                     cache_write: 0.0,
+                    audio: None,
                 }),
             );
             let provider = guard_with_cost_budget(probe, budget.clone());
@@ -1510,6 +1719,7 @@ mod tests {
                             output: 0.0,
                             cache_read: 0.0,
                             cache_write: 0.0,
+                            audio: None,
                         }),
                     );
                     let provider = guard_with_cost_budget(probe.clone(), budget.clone());
@@ -1548,6 +1758,7 @@ mod tests {
                         output: 4.0,
                         cache_read: 1.0,
                         cache_write: 0.0,
+                        audio: None,
                     }),
                 );
                 Arc::get_mut(&mut probe).unwrap().native_cost = Some(reported);
@@ -1579,6 +1790,7 @@ mod tests {
                     output: 4.0,
                     cache_read: 1.0,
                     cache_write: 0.0,
+                    audio: None,
                 }),
             );
             let provider = guard_with_cost_budget(probe.clone(), budget.clone());
@@ -1594,6 +1806,31 @@ mod tests {
                     .await,
                 Err(crate::error::Error::CostCap { .. })
             ));
+            assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn native_compaction_preserves_an_explicit_zero_bill() {
+        futures::executor::block_on(async {
+            let budget = crate::cost::CostBudget::new(None, Some(0.1), 0.0).unwrap();
+            let mut probe = spend_probe(
+                vec![],
+                Some(ModelCost {
+                    input: 2.0,
+                    output: 4.0,
+                    cache_read: 1.0,
+                    ..Default::default()
+                }),
+            );
+            Arc::get_mut(&mut probe).unwrap().native_cost = Some(serde_json::json!(0));
+            let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+            provider
+                .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(budget.spent(), 0.0);
+            budget.admit().unwrap();
             assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
     }
@@ -1780,6 +2017,7 @@ mod tests {
                 output: 15.0, // $15 per million output tokens
                 cache_read: 0.3,
                 cache_write: 3.75,
+                audio: None,
             },
             context_window: 200_000,
             max_tokens: 8192,
@@ -1826,8 +2064,9 @@ mod tests {
             cache_write: 1000,
             total_tokens: 4500,
             cost: crate::model::Cost::default(),
+            billing: None,
         };
-        model.cost.price_usage(&mut usage);
+        model.cost.price_usage(&mut usage).unwrap();
         let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
         assert!(close(usage.cost.input, 0.003));
         assert!(close(usage.cost.output, 0.0075));
@@ -1844,6 +2083,7 @@ mod tests {
                 output: 0.0,
                 cache_read: 0.0,
                 cache_write: 0.0,
+                audio: None,
             }
             .is_priced()
         );
@@ -1861,15 +2101,172 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             total_tokens: 1500,
+            billing: None,
             cost: crate::model::Cost {
                 total: 0.0421,
                 ..crate::model::Cost::default()
             },
         };
-        model.cost.price_usage(&mut usage);
+        model.cost.price_usage(&mut usage).unwrap();
         assert!((usage.cost.total - 0.0421).abs() < 1e-12);
         assert!((usage.cost.input - 0.003).abs() < 1e-12);
         assert!((usage.cost.output - 0.0075).abs() < 1e-12);
+    }
+
+    #[test]
+    fn audio_pricing_uses_exclusive_billing_buckets_without_changing_context_counts() {
+        use crate::model::{BillingTokenCounts, BillingUsage, Usage};
+
+        let rates = ModelCost {
+            input: 2.5,
+            output: 10.0,
+            cache_read: 0.5,
+            cache_write: 1.0,
+            audio: Some(AudioModelCost {
+                input: Some(32.0),
+                output: Some(64.0),
+                cache_read: Some(4.0),
+                cache_write: Some(8.0),
+            }),
+        };
+        let mut usage = Usage {
+            input: 10_000,
+            output: 500,
+            cache_read: 20,
+            total_tokens: 10_520,
+            billing: Some(BillingUsage::Tokens {
+                text: BillingTokenCounts {
+                    input: 10,
+                    output: 3,
+                    cache_read: 2,
+                    cache_write: 1,
+                },
+                audio: BillingTokenCounts {
+                    input: 1000,
+                    output: 5,
+                    cache_read: 6,
+                    cache_write: 7,
+                },
+                reported_total: None,
+            }),
+            ..Default::default()
+        };
+        rates.price_usage(&mut usage).unwrap();
+        assert!((usage.cost.input - 0.032_025).abs() < 1e-12);
+        assert!((usage.cost.output - 0.000_35).abs() < 1e-12);
+        assert!((usage.cost.cache_read - 0.000_025).abs() < 1e-12);
+        assert!((usage.cost.cache_write - 0.000_057).abs() < 1e-12);
+        assert!((usage.cost.total - 0.032_457).abs() < 1e-12);
+        let first = serde_json::to_value(&usage).unwrap();
+        rates.price_usage(&mut usage).unwrap();
+        assert_eq!(serde_json::to_value(&usage).unwrap(), first);
+        assert_eq!(
+            (
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.total_tokens
+            ),
+            (10_000, 500, 20, 10_520)
+        );
+    }
+
+    #[test]
+    fn audio_pricing_distinguishes_unknown_rates_from_explicit_free_buckets() {
+        use crate::model::{BillingTokenCounts, BillingUsage, Usage};
+
+        let fresh_usage = || Usage {
+            billing: Some(BillingUsage::Tokens {
+                text: BillingTokenCounts::default(),
+                audio: BillingTokenCounts {
+                    input: 1000,
+                    ..Default::default()
+                },
+                reported_total: None,
+            }),
+            ..Default::default()
+        };
+        let mut unknown = fresh_usage();
+        assert!(ModelCost::default().price_usage(&mut unknown).is_err());
+        assert!(matches!(
+            unknown.billing,
+            Some(BillingUsage::Unavailable { .. })
+        ));
+        assert_eq!(unknown.cost.total, 0.0);
+        assert!(!serde_json::to_string(&unknown).unwrap().contains("NaN"));
+
+        let free = ModelCost {
+            audio: Some(AudioModelCost {
+                input: Some(0.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            free.is_priced(),
+            "explicitly free audio metadata reaches the provider"
+        );
+        let mut usage = fresh_usage();
+        free.price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.0);
+        assert!(usage.has_explicit_billing());
+        assert!(
+            serde_json::to_value(ModelCost::default())
+                .unwrap()
+                .get("audio")
+                .is_none()
+        );
+        let restored: ModelCost =
+            serde_json::from_value(serde_json::to_value(&free).unwrap()).unwrap();
+        assert_eq!(restored.audio.as_ref().unwrap().input, Some(0.0));
+        assert_eq!(restored.audio.as_ref().unwrap().cache_read, None);
+
+        usage.billing = Some(BillingUsage::Tokens {
+            text: BillingTokenCounts::default(),
+            audio: BillingTokenCounts {
+                cache_read: 1,
+                ..Default::default()
+            },
+            reported_total: None,
+        });
+        assert!(
+            free.price_usage(&mut usage).is_err(),
+            "unknown audio cache is not silently free"
+        );
+    }
+
+    #[test]
+    fn authoritative_billing_overrides_missing_rates_and_prior_estimates() {
+        use crate::model::{BillingTokenCounts, BillingUsage, Usage};
+
+        let mut usage = Usage {
+            input: 999,
+            billing: Some(BillingUsage::Tokens {
+                text: BillingTokenCounts::default(),
+                audio: BillingTokenCounts {
+                    input: 1000,
+                    ..Default::default()
+                },
+                reported_total: Some(0.0),
+            }),
+            ..Default::default()
+        };
+        usage.cost.total = 3.0;
+        ModelCost::default().price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.0);
+        ModelCost::default().price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.0);
+        usage.billing = Some(BillingUsage::ReportedTotal { total: 0.25 });
+        ModelCost::default().price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.25);
+        assert_eq!(usage.input, 999);
+        usage.billing = Some(BillingUsage::ReportedTotal { total: -1.0 });
+        assert!(ModelCost::default().price_usage(&mut usage).is_err());
+        assert!(matches!(
+            usage.billing,
+            Some(BillingUsage::Unavailable { .. })
+        ));
+        assert!(usage.cost.total.is_finite());
     }
 
     #[test]
@@ -2016,6 +2413,7 @@ mod tests {
             output: 15.0,
             cache_read: 0.3,
             cache_write: 3.75,
+            audio: None,
         };
         let json = serde_json::to_string(&cost).unwrap();
         assert!(
@@ -2050,6 +2448,7 @@ mod tests {
                     output: rate,
                     cache_read: rate,
                     cache_write: rate,
+                    audio: None,
                 },
                 context_window: 128_000,
                 max_tokens: 8192,
@@ -2176,7 +2575,7 @@ mod tests {
                 cr in 0.0f64..1000.0,
                 cw in 0.0f64..1000.0,
             ) {
-                let cost = ModelCost { input, output, cache_read: cr, cache_write: cw };
+                let cost = ModelCost { input, output, cache_read: cr, cache_write: cw, audio: None };
                 let json = serde_json::to_string(&cost).unwrap();
                 let parsed: ModelCost = serde_json::from_str(&json).unwrap();
                 assert!((parsed.input - input).abs() < 1e-10);

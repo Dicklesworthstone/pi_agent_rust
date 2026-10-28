@@ -469,6 +469,7 @@ mod tests {
 
     fn zero_cost() -> ModelCost {
         ModelCost {
+            audio: None,
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,
@@ -623,6 +624,7 @@ mod tests {
             "openai",
             "gpt-test",
             ModelCost {
+                audio: None,
                 input: 6.0,
                 output: 20.0,
                 cache_read: 0.5,
@@ -653,6 +655,7 @@ mod tests {
             "openai",
             "gpt-test",
             ModelCost {
+                audio: None,
                 input: 6.0,
                 output: 20.0,
                 cache_read: 0.5,

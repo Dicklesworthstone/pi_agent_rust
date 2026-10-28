@@ -61,6 +61,7 @@ fn test_model_entry() -> ModelEntry {
             reasoning: true,
             input: vec![crate::provider::InputType::Text],
             cost: crate::provider::ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,

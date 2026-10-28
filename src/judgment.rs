@@ -420,7 +420,12 @@ impl Judge {
             .checkpoint()
             .map_err(|_| failure("PI_JUDGE_CANCELLED"))?;
         if let (Some(rates), Some(usage)) = (self.provider.model_cost(), usage.as_mut()) {
-            rates.price_usage(usage);
+            rates.price_usage(usage).map_err(|error| {
+                JudgmentFailure::provider(
+                    error,
+                    "PI_JUDGE_BILLING: response billing is unavailable",
+                )
+            })?;
         }
         Ok((answer, usage))
     }

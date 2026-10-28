@@ -4831,8 +4831,10 @@ impl Agent {
         message.content = vec![ContentBlock::Text(TextContent::new(diagnostic.clone()))];
         message.error_message = Some(diagnostic);
         message.stop_details = None;
-        if let Some(rates) = self.provider.model_cost() {
-            rates.price_usage(&mut message.usage);
+        if let Some(rates) = self.provider.model_cost()
+            && let Err(error) = rates.price_usage(&mut message.usage)
+        {
+            tracing::warn!(%error, "stream-rule response has unavailable billing");
         }
         let shared = Arc::new(message);
         if !sent_start {
@@ -5761,8 +5763,10 @@ impl Agent {
         // gh #221: price the finished turn from the catalog rates. Transports
         // only fill token counts (plus OpenRouter's billed total); without
         // this every `usage.cost` stayed 0.0 on every provider.
-        if let Some(rates) = self.provider.model_cost() {
-            rates.price_usage(&mut message.usage);
+        if let Some(rates) = self.provider.model_cost()
+            && let Err(error) = rates.price_usage(&mut message.usage)
+        {
+            tracing::warn!(%error, "completed response has unavailable billing");
         }
         self.emit_cost_warning(on_event);
         let arc = Arc::new(message);
@@ -10742,6 +10746,7 @@ mod extensions_integration_tests {
                 reasoning: false,
                 input: vec![crate::provider::InputType::Text],
                 cost: crate::provider::ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,

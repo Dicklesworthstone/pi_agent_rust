@@ -1302,6 +1302,8 @@ fn create_transport_provider(
                     .with_compat(entry.compat.clone())
                     .with_auth_header(entry.auth_header)
                     .with_reasoning(entry.model.reasoning)
+                    .with_input_types(&entry.model.input)
+                    .with_model_cost(entry.model.cost.clone())
                     .with_client(client),
             ))
         }
@@ -2825,6 +2827,7 @@ export default function init(pi) {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 3.0,
                     output: 15.0,
                     cache_read: 0.3,
@@ -2865,6 +2868,7 @@ export default function init(pi) {
             "https://openrouter.ai/api/v1",
         );
         unpriced.model.cost = ModelCost {
+            audio: None,
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,

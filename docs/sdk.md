@@ -194,6 +194,16 @@ end. Audio/video blocks remain in the prompt. Providers use their existing
 native media transport where supported; unsupported media becomes a visible
 omission placeholder. The local transcript retains the native content.
 
+Gemini-family providers accept native audio/video. OpenAI Chat Completions
+models that declare audio input and explicit audio pricing accept WAV/MP3 and
+return text; the bundled `openai/gpt-audio-1.5` is configured for this path.
+The same behavior applies to saved history and media returned by tools.
+Text and audio charges contribute to the shared spend limit separately;
+missing or ambiguous audio billing prevents further requests and remains
+recorded across session restoration. See
+[native audio model configuration](models.md#native-audio-with-openai-chat-completions)
+for pricing and transport bounds.
+
 Media names respect the configured secret-screening policy. A MIME type that
 contains secret material is refused when screening is enabled because replacing
 part of that identifier could change how the provider handles the attachment.

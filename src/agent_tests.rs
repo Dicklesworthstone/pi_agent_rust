@@ -175,6 +175,7 @@ mod tests {
 
         fn model_cost(&self) -> Option<crate::provider::ModelCost> {
             Some(crate::provider::ModelCost {
+                audio: None,
                 input: 2.0,
                 output: 10.0,
                 cache_read: 0.2,
@@ -4656,6 +4657,7 @@ mod tests {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -5573,6 +5575,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -5640,6 +5643,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -6041,6 +6045,7 @@ mod tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -6448,6 +6453,7 @@ mod tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -6533,6 +6539,7 @@ mod tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,

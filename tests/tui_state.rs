@@ -112,6 +112,7 @@ fn dummy_model_entry() -> ModelEntry {
         reasoning: false,
         input: vec![InputType::Text],
         cost: ModelCost {
+            audio: None,
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,
@@ -1127,6 +1128,7 @@ fn parse_scroll_percent(view: &str) -> Option<u32> {
 
 fn sample_usage(input: u64, output: u64) -> Usage {
     Usage {
+        billing: None,
         input,
         output,
         cache_read: 0,
@@ -5302,6 +5304,7 @@ fn create_two_branch_session() -> (Session, String, String, String) {
             provider: "dummy".to_string(),
             model: "dummy-model".to_string(),
             usage: Usage {
+                billing: None,
                 input: 10,
                 output: 5,
                 cache_read: 0,
@@ -5331,6 +5334,7 @@ fn create_two_branch_session() -> (Session, String, String, String) {
             provider: "dummy".to_string(),
             model: "dummy-model".to_string(),
             usage: Usage {
+                billing: None,
                 input: 10,
                 output: 5,
                 cache_read: 0,
@@ -5373,6 +5377,7 @@ fn create_many_branch_session(branch_count: usize) -> Session {
                 provider: "dummy".to_string(),
                 model: "dummy-model".to_string(),
                 usage: Usage {
+                    billing: None,
                     input: 10,
                     output: 5,
                     cache_read: 0,
@@ -8451,6 +8456,7 @@ fn tui_perf_streaming_to_cache_transition() {
         "AgentDone(stop)",
         PiMsg::AgentDone {
             usage: Some(Usage {
+                billing: None,
                 input: 100,
                 output: 50,
                 cache_read: 0,

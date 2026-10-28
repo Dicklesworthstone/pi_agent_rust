@@ -211,8 +211,9 @@ pub enum ContentBlock {
     /// An inline image (base64 + MIME type).
     Image(ImageContent),
     /// Inline non-image media — video or audio (base64 + MIME type + source
-    /// name). Serialized natively only for Gemini-family transports (gh
-    /// #212); every other provider degrades it to a text placeholder.
+    /// name). Gemini transports accept video/audio; declared audio-capable
+    /// Chat Completions models accept WAV/MP3. Unsupported media becomes an
+    /// explicit text placeholder.
     Media(MediaContent),
     /// A request to call a tool with JSON arguments.
     ToolCall(ToolCall),
@@ -259,8 +260,8 @@ pub struct ImageContent {
 /// `data` is the base64 payload, `mime_type` the container/codec label
 /// (`video/mp4`, `audio/wav`, …), and `name` the human-readable source label
 /// (usually the file name) that survives into the text placeholder providers
-/// without a media path receive. Only Gemini-family transports serialize the
-/// payload itself; see [`MediaContent::placeholder`] for the degradation.
+/// without a media path receive. Providers serialize supported media natively;
+/// see [`MediaContent::placeholder`] for the unsupported-media representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaContent {
@@ -403,6 +404,58 @@ pub struct Usage {
     pub cache_write: u64,
     pub total_tokens: u64,
     pub cost: Cost,
+    /// A complete billing partition, an authoritative bill, or an explicit
+    /// accounting failure. Context token counts above remain independent of
+    /// billed units (for example, Cohere's billed units and audio token rates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<BillingUsage>,
+}
+
+impl Usage {
+    /// A complete provider billing record may legitimately replace a larger
+    /// provisional charge with zero. An absent legacy cost is not such proof.
+    #[must_use]
+    pub fn has_explicit_billing(&self) -> bool {
+        matches!(
+            self.billing,
+            Some(BillingUsage::Tokens { .. } | BillingUsage::ReportedTotal { .. })
+        )
+    }
+}
+
+/// Mutually exclusive billable token buckets for one modality. Input excludes
+/// cache reads and writes; no token belongs to two buckets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BillingTokenCounts {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+/// Provider billing evidence, kept separate from context-window token counts.
+/// Unknown accounting is never represented as a fabricated zero or NaN bill.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum BillingUsage {
+    /// Complete exclusive text/audio buckets. A reported total, including
+    /// zero, remains authoritative over the catalog's component estimates.
+    Tokens {
+        text: BillingTokenCounts,
+        #[serde(default)]
+        audio: BillingTokenCounts,
+        #[serde(
+            default,
+            rename = "reportedTotal",
+            skip_serializing_if = "Option::is_none"
+        )]
+        reported_total: Option<f64>,
+    },
+    /// The provider supplied a bill but no trustworthy modality partition.
+    ReportedTotal { total: f64 },
+    /// Required billing evidence was absent or internally inconsistent.
+    Unavailable { reason: String },
 }
 
 /// Cost breakdown in dollars.
@@ -806,6 +859,7 @@ mod tests {
             cache_read: 10,
             cache_write: 5,
             total_tokens: 165,
+            billing: None,
             cost: Cost {
                 input: 0.001,
                 output: 0.002,
@@ -813,6 +867,51 @@ mod tests {
                 cache_write: 0.0002,
                 total: 0.0033,
             },
+        }
+    }
+
+    #[test]
+    fn billing_evidence_round_trips_without_changing_context_counts() {
+        let mut usage = sample_usage();
+        let legacy = serde_json::to_value(&usage).expect("legacy usage");
+        assert!(legacy.get("billing").is_none());
+        assert!(
+            serde_json::from_value::<Usage>(legacy)
+                .unwrap()
+                .billing
+                .is_none()
+        );
+
+        for billing in [
+            BillingUsage::Tokens {
+                text: BillingTokenCounts {
+                    input: 7,
+                    output: 3,
+                    ..Default::default()
+                },
+                audio: BillingTokenCounts {
+                    input: 80,
+                    ..Default::default()
+                },
+                reported_total: Some(0.0),
+            },
+            BillingUsage::ReportedTotal { total: 0.0 },
+            BillingUsage::Unavailable {
+                reason: "missing audio usage".to_string(),
+            },
+        ] {
+            usage.billing = Some(billing.clone());
+            let encoded = serde_json::to_value(&usage).unwrap();
+            let replayed: Usage = serde_json::from_value(encoded).unwrap();
+            assert_eq!(replayed.input, 100);
+            assert_eq!(replayed.output, 50);
+            assert_eq!(replayed.total_tokens, 165);
+            assert_eq!(replayed.billing, Some(billing.clone()));
+            assert_eq!(
+                replayed.has_explicit_billing(),
+                !matches!(billing, BillingUsage::Unavailable { .. })
+            );
+            assert!(replayed.cost.total.is_finite());
         }
     }
 
@@ -2030,6 +2129,7 @@ mod tests {
                     cache_read: u64::from(cache_read),
                     cache_write: u64::from(cache_write),
                     total_tokens: u64::from(total_tokens),
+                    billing: None,
                     cost: Cost {
                         input: f64::from(cost_input) / 1_000_000.0,
                         output: f64::from(cost_output) / 1_000_000.0,

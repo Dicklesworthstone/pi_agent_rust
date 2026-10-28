@@ -1079,6 +1079,7 @@ mod backpressure_tests {
 
     fn pressure_usage(seed: u64) -> Usage {
         Usage {
+            billing: None,
             input: 100 + seed,
             output: 20 + seed,
             cache_read: seed,

@@ -590,6 +590,8 @@ fn observed_wire(
             "test-model".to_string(),
             "openai-completions".to_string(),
             "openai".to_string(),
+            false,
+            None,
         ),
         observation,
     )
@@ -773,6 +775,207 @@ fn dropping_an_unpolled_or_pending_wire_stream_releases_its_source() {
         drop(output);
         assert!(observation.dropped.load(Ordering::SeqCst));
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AudioSourceEnd {
+    Error,
+    Eof,
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AudioEvidence {
+    Missing,
+    Partial,
+    Complete,
+    Zero,
+}
+
+struct AudioSourceProvider {
+    ending: AudioSourceEnd,
+    evidence: AudioEvidence,
+    observation: Arc<SourceObservation>,
+}
+
+#[async_trait::async_trait]
+impl crate::provider::Provider for AudioSourceProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+    fn api(&self) -> &'static str {
+        "openai-completions"
+    }
+    fn model_id(&self) -> &str {
+        "gpt-audio-1.5"
+    }
+
+    fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+        Some(crate::provider::ModelCost {
+            input: 2.5,
+            output: 10.0,
+            audio: Some(crate::provider::AudioModelCost {
+                input: Some(32.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    async fn stream(
+        &self,
+        _: &crate::provider::Context<'_>,
+        options: &crate::provider::StreamOptions,
+    ) -> crate::error::Result<EventStream> {
+        let complete = matches!(self.evidence, AudioEvidence::Complete | AudioEvidence::Zero);
+        let mut frame = json!({"choices":[{"delta":{"content":"heard"},"finish_reason": if complete { Some("stop") } else { None }}]});
+        if !matches!(self.evidence, AudioEvidence::Missing) {
+            frame["usage"] = json!({"prompt_tokens":1000,"completion_tokens":0,"total_tokens":1000,"prompt_tokens_details":{"audio_tokens":1000}});
+            if matches!(self.evidence, AudioEvidence::Zero) {
+                frame["usage"]["cost"] = json!(0);
+            }
+        }
+        let mut chunks = VecDeque::from([Ok(wire_bytes([frame]))]);
+        if matches!(self.ending, AudioSourceEnd::Error) {
+            chunks.push_back(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "audio fixture reset",
+            )));
+        }
+        Ok(wire_stream(
+            ObservedSource {
+                chunks,
+                pending_at_end: matches!(self.ending, AudioSourceEnd::Pending),
+                observation: Arc::clone(&self.observation),
+            },
+            self.model_id().to_string(),
+            self.api().to_string(),
+            self.name().to_string(),
+            true,
+            options.usage_observer.clone(),
+        ))
+    }
+}
+
+#[test]
+fn interrupted_audio_sources_quarantine_missing_final_billing_and_retain_known_spend() {
+    futures::executor::block_on(async {
+        for ending in [
+            AudioSourceEnd::Error,
+            AudioSourceEnd::Eof,
+            AudioSourceEnd::Pending,
+        ] {
+            for evidence in [AudioEvidence::Missing, AudioEvidence::Partial] {
+                for unpolled in [false, true] {
+                    let observation = Arc::new(SourceObservation::default());
+                    let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+                    let provider = crate::provider::guard_with_cost_budget(
+                        Arc::new(AudioSourceProvider {
+                            ending,
+                            evidence,
+                            observation: Arc::clone(&observation),
+                        }),
+                        budget.clone(),
+                    );
+                    let mut output = provider
+                        .stream(
+                            &crate::provider::Context::default(),
+                            &crate::provider::StreamOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                    let mut stopped = unpolled;
+                    if !unpolled {
+                        for _ in 0..12 {
+                            match output.next().now_or_never() {
+                                Some(Some(Ok(_))) => {}
+                                Some(Some(Err(_))) => {
+                                    assert!(!matches!(ending, AudioSourceEnd::Pending));
+                                    stopped = true;
+                                    break;
+                                }
+                                None => {
+                                    assert!(matches!(ending, AudioSourceEnd::Pending));
+                                    stopped = true;
+                                    break;
+                                }
+                                Some(None) => panic!("incomplete audio source silently ended"),
+                            }
+                        }
+                    }
+                    assert!(stopped, "{ending:?} {evidence:?}");
+                    drop(output);
+                    assert!(observation.dropped.load(Ordering::SeqCst));
+                    let expected = if !unpolled && matches!(evidence, AudioEvidence::Partial) {
+                        0.032
+                    } else {
+                        0.0
+                    };
+                    assert!(
+                        (budget.spent() - expected).abs() < 1e-12,
+                        "{ending:?} {evidence:?} unpolled={unpolled}"
+                    );
+                    assert_eq!(budget.snapshot().pending, 0.0);
+                    assert!(matches!(
+                        budget.admit(),
+                        Err(crate::error::Error::Session(_))
+                    ));
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn acknowledged_audio_bills_survive_dropping_before_the_terminator() {
+    futures::executor::block_on(async {
+        for ending in [
+            AudioSourceEnd::Error,
+            AudioSourceEnd::Eof,
+            AudioSourceEnd::Pending,
+        ] {
+            for evidence in [AudioEvidence::Complete, AudioEvidence::Zero] {
+                let observation = Arc::new(SourceObservation::default());
+                let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+                let provider = crate::provider::guard_with_cost_budget(
+                    Arc::new(AudioSourceProvider {
+                        ending,
+                        evidence,
+                        observation: Arc::clone(&observation),
+                    }),
+                    budget.clone(),
+                );
+                let mut output = provider
+                    .stream(
+                        &crate::provider::Context::default(),
+                        &crate::provider::StreamOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                let mut saw_end = false;
+                for _ in 0..8 {
+                    if matches!(
+                        output.next().now_or_never().unwrap().unwrap().unwrap(),
+                        StreamEvent::TextEnd { .. }
+                    ) {
+                        saw_end = true;
+                        break;
+                    }
+                }
+                assert!(saw_end);
+                drop(output);
+                assert!(observation.dropped.load(Ordering::SeqCst));
+                let expected = if matches!(evidence, AudioEvidence::Zero) {
+                    0.0
+                } else {
+                    0.032
+                };
+                assert!((budget.spent() - expected).abs() < 1e-12);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                budget.admit().unwrap();
+            }
+        }
+    });
 }
 
 struct WakeFlag(AtomicBool);

@@ -41,6 +41,7 @@ fn make_smoke_entry(provider: &str, model_id: &str, base_url: &str) -> ModelEntr
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,

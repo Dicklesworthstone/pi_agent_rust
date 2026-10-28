@@ -3879,6 +3879,7 @@ mod stream_delta_batcher_tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,

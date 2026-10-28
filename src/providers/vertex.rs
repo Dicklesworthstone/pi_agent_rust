@@ -724,6 +724,7 @@ mod tests {
                     output: 0.0,
                     cache_read: 0.0,
                     cache_write: 0.0,
+                    audio: None,
                 },
                 context_window: 128_000,
                 max_tokens: 8192,

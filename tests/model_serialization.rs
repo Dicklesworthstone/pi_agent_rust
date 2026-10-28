@@ -159,6 +159,7 @@ fn test_assistant_message_round_trip() {
         provider: "anthropic".to_string(),
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage {
+            billing: None,
             input: 100,
             output: 50,
             cache_read: 10,
@@ -753,6 +754,7 @@ fn test_usage_round_trip() {
     let harness = TestHarness::new("usage_round_trip");
 
     let usage = Usage {
+        billing: None,
         input: 1000,
         output: 500,
         cache_read: 200,

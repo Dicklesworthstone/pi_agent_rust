@@ -643,6 +643,7 @@ fn factory_routes_anthropic_correctly() {
             reasoning: true,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.003,
                 output: 0.015,
                 cache_read: 0.0003,
@@ -680,6 +681,7 @@ fn factory_routes_openai_completions_correctly() {
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0025,
                 output: 0.01,
                 cache_read: 0.00125,
@@ -717,6 +719,7 @@ fn factory_routes_openai_responses_correctly() {
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0025,
                 output: 0.01,
                 cache_read: 0.00125,
@@ -754,6 +757,7 @@ fn factory_routes_cohere_correctly() {
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.003,
                 output: 0.015,
                 cache_read: 0.0,
@@ -791,6 +795,7 @@ fn factory_routes_google_correctly() {
             reasoning: true,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -829,6 +834,7 @@ fn oai_compat_entry(provider: &str, base_url: &str) -> pi::models::ModelEntry {
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.001,
                 output: 0.002,
                 cache_read: 0.0,
@@ -954,6 +960,7 @@ fn factory_routes_gitlab_native_provider() {
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,

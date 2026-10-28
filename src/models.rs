@@ -2572,6 +2572,7 @@ fn append_upstream_nonlegacy_models(
                     reasoning,
                     input: defaults.input.to_vec(),
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -2674,6 +2675,7 @@ fn built_in_models(
         );
 
         let default_cost = ModelCost {
+            audio: None,
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,
@@ -2769,6 +2771,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -2859,6 +2862,7 @@ fn built_in_models(
                     reasoning: true,
                     input: vec![InputType::Text, InputType::Image],
                     cost: ModelCost {
+                        audio: None,
                         input,
                         output,
                         cache_read,
@@ -2881,6 +2885,56 @@ fn built_in_models(
                 oauth_config: None,
             });
         }
+    }
+
+    // Native Chat Completions audio is a separate model capability, not a
+    // property of every OpenAI-compatible endpoint. Pricing and limits:
+    // https://developers.openai.com/api/docs/models/gpt-audio-1.5
+    if !models
+        .iter()
+        .any(|entry| entry.model.provider == "openai" && entry.model.id == "gpt-audio-1.5")
+    {
+        models.push(ModelEntry {
+            model: Model {
+                id: "gpt-audio-1.5".to_string(),
+                name: "GPT Audio 1.5".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "openai".to_string(),
+                base_url: if mode == ModelRegistryLoadMode::Full {
+                    "https://api.openai.com/v1".to_string()
+                } else {
+                    String::new()
+                },
+                reasoning: false,
+                input: vec![InputType::Text, InputType::Audio],
+                cost: ModelCost {
+                    input: 2.5,
+                    output: 10.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    audio: Some(crate::provider::AudioModelCost {
+                        input: Some(32.0),
+                        output: Some(64.0),
+                        cache_read: None,
+                        cache_write: None,
+                    }),
+                },
+                context_window: 128_000,
+                max_tokens: 16_384,
+                headers: HashMap::new(),
+            },
+            api_key: resolve_provider_api_key_cached(
+                auth,
+                "openai",
+                "openai",
+                &mut canonical_api_key_cache,
+                &mut provider_api_key_cache,
+            ),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        });
     }
 
     // Ensure the latest GPT-5 default exists for OpenAI routing.
@@ -2909,6 +2963,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -2954,6 +3009,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3003,6 +3059,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3048,6 +3105,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3093,6 +3151,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3139,6 +3198,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3184,6 +3244,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3224,6 +3285,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3264,6 +3326,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3590,16 +3653,7 @@ fn apply_custom_models_with_provider_headers(
                 .map_or_else(|| vec![InputType::Text], |defaults| defaults.input.to_vec());
             let input_types = model_cfg.input.as_ref().map_or_else(
                 || default_input_types.clone(),
-                |input| {
-                    input
-                        .iter()
-                        .filter_map(|i| match i.as_str() {
-                            "text" => Some(InputType::Text),
-                            "image" => Some(InputType::Image),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                },
+                |input| parse_input_types(input),
             );
             let input_types = if input_types.is_empty() {
                 default_input_types
@@ -3626,6 +3680,7 @@ fn apply_custom_models_with_provider_headers(
                 }),
                 input: input_types,
                 cost: model_cfg.cost.clone().unwrap_or(ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3783,14 +3838,7 @@ fn apply_model_override(
         entry.model.reasoning = reasoning;
     }
     if let Some(input) = &override_cfg.input {
-        let parsed: Vec<InputType> = input
-            .iter()
-            .filter_map(|value| match value.as_str() {
-                "text" => Some(InputType::Text),
-                "image" => Some(InputType::Image),
-                _ => None,
-            })
-            .collect();
+        let parsed = parse_input_types(input);
         if !parsed.is_empty() {
             entry.model.input = parsed;
         }
@@ -5061,6 +5109,7 @@ where
                 reasoning: effective_reasoning(model_id, true),
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -5094,6 +5143,7 @@ where
             reasoning,
             input: defaults.input.to_vec(),
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -5479,6 +5529,59 @@ mod tests {
             ]
         );
         assert_eq!(parse_input_types(&["hologram".to_string()]), Vec::new());
+    }
+
+    #[test]
+    fn model_overrides_preserve_audio_and_video_inputs() {
+        let (_directory, auth) = test_auth_storage();
+        let custom: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "audio-fixture": {
+                    "api": "openai-completions",
+                    "baseUrl": "http://127.0.0.1:1/v1",
+                    "models": [{
+                        "id": "listen",
+                        "input": ["text", "AUDIO", "video", "audio"],
+                        "cost": {
+                            "input": 2.5, "output": 10, "cacheRead": 0, "cacheWrite": 0,
+                            "audio": {"input": 0}
+                        }
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let mut entries = Vec::new();
+        apply_custom_models(&auth, &mut entries, &custom, None);
+        let entry = entries.first().expect("custom audio model");
+        assert_eq!(
+            entry.model.input,
+            [InputType::Text, InputType::Audio, InputType::Video]
+        );
+        assert_eq!(entry.model.cost.audio.as_ref().unwrap().input, Some(0.0));
+        assert!(entry.model.cost.is_priced());
+
+        let patch: ModelOverrideConfig = serde_json::from_value(serde_json::json!({
+            "input": ["audio", "text", "AUDIO"],
+            "cost": {"input": 2.5, "output": 10, "cacheRead": 0, "cacheWrite": 0, "audio": {"input": 32}}
+        })).unwrap();
+        apply_model_override(&mut entries[0], &patch, None);
+        assert_eq!(entries[0].model.input, [InputType::Audio, InputType::Text]);
+        assert_eq!(
+            entries[0].model.cost.audio.as_ref().unwrap().input,
+            Some(32.0)
+        );
+
+        let builtins = built_in_models(&auth, ModelRegistryLoadMode::Full);
+        let native = builtins
+            .iter()
+            .find(|entry| entry.model.provider == "openai" && entry.model.id == "gpt-audio-1.5")
+            .expect("native audio model");
+        assert_eq!(native.model.api, "openai-completions");
+        assert_eq!(native.model.input, [InputType::Text, InputType::Audio]);
+        assert_eq!(native.model.cost.audio.as_ref().unwrap().input, Some(32.0));
+        assert_eq!(native.model.cost.audio.as_ref().unwrap().output, Some(64.0));
+        assert_eq!(native.model.context_window, 128_000);
     }
 
     #[test]
@@ -5874,6 +5977,7 @@ mod tests {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -5928,6 +6032,7 @@ mod tests {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -6751,6 +6856,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -8741,6 +8847,7 @@ mod tests {
                 reasoning,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -10820,6 +10927,7 @@ mod tests {
                     context_window: 128_000,
                     max_tokens: 4096,
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -10934,6 +11042,7 @@ mod tests {
                     context_window: 128_000,
                     max_tokens: 4096,
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,

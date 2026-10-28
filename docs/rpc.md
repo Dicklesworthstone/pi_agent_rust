@@ -120,8 +120,12 @@ Extension commands reject image/media attachments because their command
 handlers have no attachment input path.
 
 Gemini-family providers receive native audio/video input through their media
-transport. Other providers receive the documented `[media omitted: ...]`
-placeholder. Session and RPC message events retain the native content blocks.
+transport. Audio-capable OpenAI Chat Completions models with explicit audio
+pricing (including `openai/gpt-audio-1.5`) receive WAV/MP3 as native audio and
+return text. Other media uses the documented `[media omitted: ...]` placeholder.
+Session and RPC message events retain the native content blocks. Native Chat
+audio also enforces per-request transport bounds and requires detailed streamed
+billing; see [model configuration](models.md#native-audio-with-openai-chat-completions).
 
 ### Compact output and attachment retrieval
 

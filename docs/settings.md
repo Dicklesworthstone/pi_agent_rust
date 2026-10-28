@@ -549,8 +549,8 @@ They remain outside project recall, reflection, and startup memory.
 - `media.tts_voice` (string): Voice identifier (e.g. `"alloy"`, `"rachel"`).
 - `media.image_gen_provider` (string): Default `"gemini"`. Supported: `"gemini"`, `"dall-e-3"`.
 - `media.output_dir` (string): Destination folder for generated media artifacts.
-- `media.enable_read_media` / `media.enableReadMedia` (bool): Default `false`. When `true`, activates `read_media`, which attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Only Gemini-family models consume it natively; other providers see `[media omitted: <name>, <mime>, <size>]`.
-- `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Hard cap on one `read_media` file in bytes; larger files are rejected with an error naming the cap. The payload is base64-inlined into the session file and re-sent every turn until compaction, so keep this small.
+- `media.enable_read_media` / `media.enableReadMedia` (bool): Default `false`. When `true`, activates `read_media`, which attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as a native media block. Gemini-family models consume audio/video natively. OpenAI Chat Completions models declaring audio input and separate audio pricing consume WAV/MP3 natively and return text; `openai/gpt-audio-1.5` includes that configuration. Unsupported media produces `[media omitted: <name>, <mime>, <size>]`. See [native audio model configuration](models.md#native-audio-with-openai-chat-completions).
+- `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Hard cap on one `read_media` file in bytes; larger files are rejected with an error naming the cap. Session media can be stored in sidecars and is restored for subsequent provider requests until compaction, so keep this small. Provider-specific per-request transport bounds also apply.
 
 ### Computer (desktop automation)
 

@@ -8,6 +8,7 @@ use pi::session::{EntryBase, MessageEntry, SessionEntry, SessionMessage};
 fn test_compaction_usage_double_counting_bug() {
     // Create an assistant message with specific usage
     let usage = Usage {
+        billing: None,
         input: 100, // Total input tokens (includes cached)
         output: 10,
         cache_read: 20,

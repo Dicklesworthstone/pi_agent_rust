@@ -34,6 +34,7 @@ fn make_model_entry(provider: &str, model_id: &str, base_url: &str) -> ModelEntr
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -2464,6 +2465,7 @@ fn known_provider_from_str_empty_rejected() {
 fn model_calculate_cost_zero_is_zero() {
     let harness = TestHarness::new("model_calculate_cost_zero_is_zero");
     let model = make_model_with_cost(ModelCost {
+        audio: None,
         input: 3.0,
         output: 6.0,
         cache_read: 1.0,
@@ -2480,6 +2482,7 @@ fn model_calculate_cost_zero_is_zero() {
 fn model_calculate_cost_matches_per_million_rates() {
     let harness = TestHarness::new("model_calculate_cost_matches_per_million_rates");
     let model = make_model_with_cost(ModelCost {
+        audio: None,
         input: 3.0,
         output: 6.0,
         cache_read: 1.0,
@@ -2506,6 +2509,7 @@ fn model_calculate_cost_matches_per_million_rates() {
 fn model_calculate_cost_is_monotonic() {
     let harness = TestHarness::new("model_calculate_cost_is_monotonic");
     let model = make_model_with_cost(ModelCost {
+        audio: None,
         input: 1.0,
         output: 1.0,
         cache_read: 1.0,

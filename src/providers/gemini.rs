@@ -1604,6 +1604,7 @@ mod tests {
 
             fn model_cost(&self) -> Option<crate::provider::ModelCost> {
                 Some(crate::provider::ModelCost {
+                    audio: None,
                     input: 1_000_000.0,
                     output: 1_000_000.0,
                     cache_read: 1_000_000.0,

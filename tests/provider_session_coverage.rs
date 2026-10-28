@@ -40,6 +40,7 @@ fn make_model(provider: &str, api: &str, base_url: &str) -> Model {
         reasoning: false,
         input: vec![],
         cost: ModelCost {
+            audio: None,
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,

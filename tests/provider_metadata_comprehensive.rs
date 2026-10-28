@@ -717,6 +717,7 @@ fn oai_entry(provider: &str, api: &str, base_url: &str) -> pi::models::ModelEntr
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.001,
                 output: 0.002,
                 cache_read: 0.0,
@@ -775,6 +776,7 @@ fn factory_dispatches_native_established_providers() {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.003,
                     output: 0.015,
                     cache_read: 0.0,
@@ -807,6 +809,7 @@ fn factory_dispatches_native_established_providers() {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.001,
                     output: 0.004,
                     cache_read: 0.0,
@@ -839,6 +842,7 @@ fn factory_dispatches_native_established_providers() {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.003,
                     output: 0.015,
                     cache_read: 0.0,
@@ -871,6 +875,7 @@ fn factory_dispatches_native_established_providers() {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,

@@ -164,8 +164,50 @@ Every key of `compat.openRouterRouting` is copied verbatim onto the top level of
 | `contextWindow` | number | Context window size in tokens |
 | `maxTokens` | number | Max output tokens |
 | `reasoning` | boolean | True if model supports extended thinking |
-| `input` | string[] | Any of `"text"`, `"image"`, `"video"`, `"audio"`. Unknown labels are dropped with a warning. `video`/`audio` are honored only by the Gemini-family transports (`google-generative-ai`, `google-gemini-cli`, `google-vertex`), which get them added automatically for bundled Gemini models; other transports degrade media blocks to a text placeholder |
-| `cost` | object | Cost per million tokens |
+| `input` | string[] | Any of `"text"`, `"image"`, `"video"`, `"audio"`. Unknown labels are dropped with a warning. Gemini-family transports accept native audio/video. OpenAI Chat Completions accepts native WAV/MP3 when the model declares `"audio"` and supplies audio pricing; unsupported media becomes a visible text placeholder. Custom models and `modelOverrides` both preserve these capabilities |
+| `cost` | object | Text/cache cost per million tokens, with optional separate `audio` rates |
+
+### Native audio with OpenAI Chat Completions
+
+The bundled `openai/gpt-audio-1.5` model accepts native WAV and MP3 input and
+returns text, including tool calls. Select it with `pi --model openai/gpt-audio-1.5`.
+Audio can come from an attached file, `read_media`, or an SDK/RPC/ACP native media
+block. Audio returned by a tool is sent after the complete group of tool replies.
+Saved session media is replayed through the same transport.
+
+For a custom audio-capable Chat Completions model, declare `"audio"` in `input`
+and provide separate rates in `cost.audio`. For example, the bundled model uses:
+
+```json
+{
+  "id": "gpt-audio-1.5",
+  "api": "openai-completions",
+  "input": ["text", "audio"],
+  "cost": {
+    "input": 2.5,
+    "output": 10,
+    "audio": { "input": 32, "output": 64 }
+  }
+}
+```
+
+All rates are per million tokens. Omitted audio rates are unknown; an explicit
+`0` means free. Audio requests require a known input rate and streamed usage.
+Pi prices text and audio separately and keeps context-token totals separate from
+billable token counts. If the provider omits required audio billing or reports
+cached tokens without enough detail to price the modalities, the spending
+account refuses further requests unless an authoritative provider bill resolves
+the amount. Accounting failures remain recorded when the session is resumed.
+
+The Chat transport validates native payloads before dispatch, including provider
+request hooks: at most 10 MiB decoded per audio block, 32 audio blocks, and 64 MiB
+decoded audio per request. The configured ingress limit (5 MiB per media item by
+default) still applies. Video and unsupported audio formats retain omission
+placeholders; OpenAI Responses and Codex do not use this Chat audio path.
+
+Provider contract and published rates:
+[audio in Chat Completions](https://developers.openai.com/api/docs/guides/audio-chat-completions)
+and [GPT-Audio-1.5](https://developers.openai.com/api/docs/models/gpt-audio-1.5).
 
 ### Compatibility Flags (`compat`)
 

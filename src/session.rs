@@ -16004,6 +16004,7 @@ mod tests {
                 cache_write: 0,
                 total_tokens: 150,
                 cost: Cost::default(),
+                billing: None,
             },
             stop_reason: StopReason::ToolUse,
             stop_details: None,

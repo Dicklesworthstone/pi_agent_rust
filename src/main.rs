@@ -16040,6 +16040,7 @@ mod tests {
                         reasoning: false,
                         input: vec![InputType::Text],
                         cost: pi::provider::ModelCost {
+                            audio: None,
                             input: 0.0,
                             output: 0.0,
                             cache_read: 0.0,
@@ -16461,6 +16462,7 @@ mod tests {
                         reasoning: false,
                         input: vec![InputType::Text],
                         cost: pi::provider::ModelCost {
+                            audio: None,
                             input: 0.0,
                             output: 0.0,
                             cache_read: 0.0,
@@ -16816,6 +16818,7 @@ mod tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: pi::provider::ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -16953,6 +16956,7 @@ mod tests {
                     reasoning,
                     input: vec![InputType::Text],
                     cost: pi::provider::ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -17096,6 +17100,7 @@ mod tests {
                     reasoning: true,
                     input: vec![InputType::Text, InputType::Image],
                     cost: pi::provider::ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,

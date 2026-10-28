@@ -58,6 +58,7 @@ fn make_entry(provider: &str, model_id: &str, base_url: &str) -> ModelEntry {
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,

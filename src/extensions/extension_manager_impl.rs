@@ -4178,12 +4178,17 @@ impl ExtensionManager {
 
                 let cost = model_spec.get("cost").and_then(Value::as_object).map_or(
                     ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
                         cache_write: 0.0,
                     },
                     |c| ModelCost {
+                        audio: c.get("audio").and_then(|audio| {
+                            serde_json::from_value::<crate::provider::AudioModelCost>(audio.clone())
+                                .ok()
+                        }),
                         input: c.get("input").and_then(Value::as_f64).unwrap_or(0.0),
                         output: c.get("output").and_then(Value::as_f64).unwrap_or(0.0),
                         cache_read: c
