@@ -1483,6 +1483,28 @@ impl KeyBindings {
             .collect()
     }
 
+    /// Whether configuration removed this chord from any of its default actions.
+    ///
+    /// Hosts should dispatch configured actions first, then use this to prevent
+    /// a widget's native keymap from reviving a removed default. The chord can
+    /// still belong to another action, such as `up` remaining a picker binding
+    /// after cursor movement is disabled, or `ctrl+enter` being reassigned to submit.
+    /// Native shortcuts absent from the default catalog are unaffected.
+    #[must_use]
+    pub fn is_removed_default_binding(&self, binding: &KeyBinding) -> bool {
+        static DEFAULTS: std::sync::LazyLock<KeyBindings> =
+            std::sync::LazyLock::new(KeyBindings::new);
+
+        // Ordinary typing and native-only shortcuts need no per-action scan.
+        if DEFAULTS.lookup(binding).is_none() {
+            return false;
+        }
+        AppAction::all().iter().copied().any(|action| {
+            DEFAULTS.get_bindings(action).contains(binding)
+                && !self.get_bindings(action).contains(binding)
+        })
+    }
+
     /// Get all key bindings for an action.
     #[must_use]
     pub fn get_bindings(&self, action: AppAction) -> &[KeyBinding] {
@@ -2375,6 +2397,118 @@ mod tests {
 
         let down_bindings = result.bindings.get_bindings(AppAction::CursorDown);
         assert_eq!(down_bindings, &[KeyBinding::plain("down")]);
+    }
+
+    #[test]
+    fn removed_defaults_are_detected_after_either_config_loader() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "newLine": ["ctrl+j"],
+                "submit": ["ctrl+enter"],
+                "cursorUp": [],
+                "cursorLineStart": [],
+                "cursorWordLeft": [],
+                "deleteToLineEnd": [],
+                "followUp": []
+            }"#,
+        )
+        .expect("write bindings");
+        let strict = KeyBindings::load(&path).expect("strict bindings");
+        let diagnostic = KeyBindings::load_from_path_with_diagnostics(&path);
+        assert!(!diagnostic.has_warnings());
+
+        for bindings in [strict, diagnostic.bindings] {
+            for binding in [
+                KeyBinding::plain("enter"),
+                KeyBinding::shift("enter"),
+                KeyBinding::ctrl("enter"),
+                KeyBinding::plain("up"),
+                KeyBinding::plain("home"),
+                KeyBinding::ctrl("a"),
+                KeyBinding::alt("b"),
+                KeyBinding::ctrl("k"),
+                KeyBinding::alt("enter"),
+            ] {
+                assert!(bindings.is_removed_default_binding(&binding), "{binding}");
+            }
+            // Sharing a chord does not hide removal from another context.
+            assert_eq!(
+                bindings.lookup(&KeyBinding::plain("up")),
+                Some(AppAction::SelectUp)
+            );
+            // The host must still execute this reassignment before its guard.
+            assert_eq!(
+                bindings.lookup(&KeyBinding::ctrl("enter")),
+                Some(AppAction::Submit)
+            );
+            assert_eq!(
+                bindings.lookup(&KeyBinding::ctrl("j")),
+                Some(AppAction::NewLine)
+            );
+            for binding in [
+                KeyBinding::ctrl("j"),
+                KeyBinding::plain("right"),
+                KeyBinding::ctrl("y"),
+                KeyBinding::shift("left"),
+                KeyBinding::ctrl_shift("left"),
+                KeyBinding::plain("x"),
+            ] {
+                assert!(!bindings.is_removed_default_binding(&binding), "{binding}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_and_retained_aliases_are_not_removed() {
+        let defaults = KeyBindings::new();
+        for binding in [
+            KeyBinding::plain("enter"),
+            KeyBinding::shift("enter"),
+            KeyBinding::ctrl("enter"),
+            KeyBinding::alt("enter"),
+            KeyBinding::plain("up"),
+            KeyBinding::ctrl("a"),
+        ] {
+            assert!(!defaults.is_removed_default_binding(&binding), "{binding}");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(&path, r#"{"newLine": ["shift+enter", "ctrl+j"]}"#).expect("write bindings");
+        let bindings = KeyBindings::load(&path).expect("bindings");
+        assert!(!bindings.is_removed_default_binding(&KeyBinding::shift("enter")));
+        assert!(bindings.is_removed_default_binding(&KeyBinding::ctrl("enter")));
+        assert!(!bindings.is_removed_default_binding(&KeyBinding::ctrl("j")));
+    }
+
+    #[test]
+    fn invalid_overrides_do_not_mark_retained_defaults_as_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "newLine": ["invalidkey123"],
+                "submit": 42,
+                "cursorUp": [false]
+            }"#,
+        )
+        .expect("write bindings");
+        assert!(KeyBindings::load(&path).is_err());
+        let diagnostic = KeyBindings::load_from_path_with_diagnostics(&path);
+        assert!(diagnostic.has_warnings());
+        for (binding, action) in [
+            (KeyBinding::shift("enter"), AppAction::NewLine),
+            (KeyBinding::ctrl("enter"), AppAction::NewLine),
+            (KeyBinding::plain("enter"), AppAction::Submit),
+            (KeyBinding::plain("up"), AppAction::CursorUp),
+        ] {
+            assert_eq!(diagnostic.bindings.lookup(&binding), Some(action));
+            assert!(!diagnostic.bindings.is_removed_default_binding(&binding));
+        }
     }
 
     #[test]

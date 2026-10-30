@@ -1793,12 +1793,20 @@ fn apply_editor_action(input: &mut TextArea, action: AppAction) {
         AppAction::DeleteWordBackward => input.delete_word_backward(),
         AppAction::DeleteWordForward => input.delete_word_forward(),
         AppAction::DeleteToLineStart => {
-            // The editor has no kill-to-start, but it has both halves of one:
-            // the cursor's grapheme offset within its line, and a backward
-            // delete. The count stops at column 0, so this cannot run on and
-            // join the previous line.
-            for _ in 0..input.cursor().grapheme {
+            // Native deletion removes a selection in one operation, which
+            // moves the cursor to its start. Reusing the old head's column
+            // after that could continue deleting into the previous line.
+            if input
+                .selection()
+                .is_some_and(|selection| !selection.is_empty())
+            {
                 input.delete_backward();
+            } else {
+                // Without a selection, the original grapheme count stops
+                // exactly at this logical line's start, leaving its newline.
+                for _ in 0..input.cursor().grapheme {
+                    input.delete_backward();
+                }
             }
         }
         AppAction::DeleteToLineEnd => input.delete_to_end_of_line(),
@@ -5716,8 +5724,10 @@ impl PiFtuiModel {
                 // several context-dependent actions (ctrl+d = delete-forward
                 // in a non-empty editor, exit otherwise), so resolve the set
                 // against UI state.
-                let actions = KeyBinding::from_ftui_key(key)
-                    .map(|binding| self.keybindings.matching_actions(&binding))
+                let binding = KeyBinding::from_ftui_key(key);
+                let actions = binding
+                    .as_ref()
+                    .map(|binding| self.keybindings.matching_actions(binding))
                     .unwrap_or_default();
                 // The completion popup owns navigation/accept/dismiss keys
                 // while it shows (issue #208); anything it doesn't consume
@@ -6042,10 +6052,20 @@ impl PiFtuiModel {
                     }
                     _ => {}
                 }
+                // Configured actions above win, including reassigned default
+                // chords. A removed default must not acquire a second meaning
+                // from the widget: retired Ctrl+A otherwise selects the whole
+                // draft, and retired Enter chords still insert newlines.
+                if binding
+                    .as_ref()
+                    .is_some_and(|binding| self.keybindings.is_removed_default_binding(binding))
+                {
+                    return Cmd::none();
+                }
                 if self.input_active() && self.input.handle_event(event) {
-                    // Unrouted keys reach the editor (its own emacs-style
-                    // bindings cover cursor/delete/kill-ring behavior); every
-                    // edit or cursor move re-derives the completion popup.
+                    // Ordinary text and unchanged native shortcuts (selection,
+                    // redo) still reach the editor. Every edit or cursor move
+                    // re-derives the completion popup.
                     self.maybe_trigger_autocomplete();
                 }
             }
@@ -11447,6 +11467,15 @@ mod tests {
         (tx, PiFtuiModel::new(rx))
     }
 
+    fn keybindings_from_json(config: &str) -> KeyBindings {
+        let dir = tempfile::tempdir().expect("bindings directory");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, config).expect("write bindings");
+        let loaded = KeyBindings::load_from_path_with_diagnostics(&path);
+        assert!(!loaded.has_warnings(), "{:?}", loaded.warnings);
+        loaded.bindings
+    }
+
     /// Body width for tests that call `conversation_text` directly. Cached
     /// blocks are width-specific (issue #227), so repeated calls in one test
     /// must agree on a width or every frame reads as cold.
@@ -12276,6 +12305,172 @@ mod tests {
             submit_rx.try_recv().expect("configured submission"),
             UiCommand::Prompt(String::from("first\nsecond"))
         );
+    }
+
+    #[test]
+    fn removed_enter_chords_cannot_reactivate_native_newlines_or_submission() {
+        for (config, replacement_keys) in [
+            (r#"{"newLine": [], "submit": []}"#, false),
+            (r#"{"newLine": ["ctrl+j"], "submit": ["ctrl+r"]}"#, true),
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let model = PiFtuiModel::new(rx)
+                .with_keybindings(keybindings_from_json(config))
+                .with_submit_channel(submit_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, "keep");
+            let _ = frame_with_cursor(sim.model(), 20, 12);
+            let before = sim.model().input.cursor();
+            let undo_ops = sim.model().input.undo_op_count();
+            for modifiers in [Modifiers::empty(), Modifiers::SHIFT, Modifiers::CTRL] {
+                sim.inject_event(key(KeyCode::Enter, modifiers));
+                assert_eq!(sim.model().input.text(), "keep", "{config}");
+                assert_eq!(sim.model().input.cursor(), before);
+                assert_eq!(sim.model().input.undo_op_count(), undo_ops);
+                assert!(submit_rx.try_recv().is_err());
+            }
+            if replacement_keys {
+                sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+                type_str(&mut sim, "safe");
+                let (_, cursor) = frame_with_cursor(sim.model(), 20, 12);
+                assert_eq!(cursor, Some((4, 10)));
+                sim.inject_event(key(KeyCode::Char('r'), Modifiers::CTRL));
+                assert_eq!(
+                    submit_rx.try_recv().expect("configured submit"),
+                    UiCommand::Prompt(String::from("keep\nsafe"))
+                );
+                assert!(submit_rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn removed_editing_chords_cannot_select_delete_undo_or_type_into_the_draft() {
+        let bindings = keybindings_from_json(
+            r#"{
+                "cursorLineStart": [],
+                "cursorWordLeft": [],
+                "deleteToLineEnd": [],
+                "suspend": []
+            }"#,
+        );
+        let (_tx, mut model) = new_model();
+        model.input.insert_text("keep\nabcdef");
+        model.input.move_left();
+        model.input.move_left();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(bindings));
+        sim.init();
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        let before = sim.model().input.cursor();
+        let undo_ops = sim.model().input.undo_op_count();
+        for (code, modifiers) in [
+            (KeyCode::Char('a'), Modifiers::CTRL),
+            (KeyCode::Home, Modifiers::empty()),
+            (KeyCode::Char('k'), Modifiers::CTRL),
+            (KeyCode::Char('b'), Modifiers::ALT),
+            (KeyCode::Left, Modifiers::ALT),
+            (KeyCode::Left, Modifiers::CTRL),
+            (KeyCode::Char('z'), Modifiers::CTRL),
+        ] {
+            sim.inject_event(key(code, modifiers));
+            assert_eq!(sim.model().input.text(), "keep\nabcdef");
+            assert_eq!(sim.model().input.cursor(), before);
+            assert!(sim.model().input.selection().is_none());
+            assert_eq!(sim.model().input.undo_op_count(), undo_ops);
+        }
+        // The retired Ctrl+A must not turn the next character into a full
+        // draft replacement through the widget's select-all shortcut.
+        sim.inject_event(key(KeyCode::Char('X'), Modifiers::SHIFT));
+        assert_eq!(sim.model().input.text(), "keep\nabcdXef");
+    }
+
+    #[test]
+    fn removed_arrows_and_delete_keys_preserve_multiline_text_cursor_and_history() {
+        let bindings = keybindings_from_json(
+            r#"{
+                "cursorUp": [], "cursorDown": [],
+                "cursorLeft": [], "cursorRight": [],
+                "deleteCharBackward": [], "deleteCharForward": [],
+                "pageUp": [], "pageDown": []
+            }"#,
+        );
+        let (_tx, mut model) = new_model();
+        model.record_history("an older prompt");
+        model.input.set_text("keep\nabcdef");
+        model.input.move_left();
+        model.input.move_left();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(bindings));
+        sim.init();
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        let before = sim.model().input.cursor();
+        for (code, modifiers) in [
+            (KeyCode::Up, Modifiers::empty()),
+            (KeyCode::Down, Modifiers::empty()),
+            (KeyCode::Left, Modifiers::empty()),
+            (KeyCode::Right, Modifiers::empty()),
+            (KeyCode::Backspace, Modifiers::empty()),
+            (KeyCode::Delete, Modifiers::empty()),
+            (KeyCode::Char('d'), Modifiers::CTRL),
+            (KeyCode::PageUp, Modifiers::empty()),
+            (KeyCode::PageDown, Modifiers::empty()),
+            (KeyCode::Up, Modifiers::SHIFT),
+            (KeyCode::Down, Modifiers::SHIFT),
+        ] {
+            sim.inject_event(key(code, modifiers));
+            assert_eq!(sim.model().input.text(), "keep\nabcdef");
+            assert_eq!(sim.model().input.cursor(), before);
+            assert!(sim.model().input.selection().is_none());
+            assert_eq!(sim.model().history_cursor, None);
+            assert_eq!(sim.model().input.undo_op_count(), 0);
+        }
+    }
+
+    #[test]
+    fn native_selection_redo_and_paste_survive_keybinding_removals() {
+        let bindings =
+            keybindings_from_json(r#"{"cursorUp": [], "cursorLineStart": [], "selectUp": ["j"]}"#);
+        let (_tx, mut model) = new_model();
+        model.input.set_text("keep");
+        model.input.insert_text("!");
+        let mut sim = ProgramSimulator::new(model.with_keybindings(bindings));
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep");
+        sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep!");
+        sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
+        assert_eq!(sim.model().input.selected_text().as_deref(), Some("!"));
+        type_str(&mut sim, "?");
+        assert_eq!(sim.model().input.text(), "keep?");
+
+        sim.model_mut().input.set_text("alpha beta");
+        sim.inject_event(key(KeyCode::Left, Modifiers::CTRL | Modifiers::SHIFT));
+        assert_eq!(sim.model().input.selected_text().as_deref(), Some("beta"));
+        type_str(&mut sim, "界j");
+        sim.inject_event(key(KeyCode::Char('J'), Modifiers::SHIFT));
+        assert_eq!(sim.model().input.text(), "alpha 界jJ");
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new("\r\nsecond", true)));
+        assert_eq!(sim.model().input.text(), "alpha 界jJ\nsecond");
+    }
+
+    #[test]
+    fn idle_alt_enter_respects_removal_and_explicit_reassignment() {
+        for (config, expected) in [
+            ("{}", "keep\n"),
+            (r#"{"followUp": []}"#, "keep"),
+            (r#"{"followUp": ["ctrl+r"]}"#, "keep"),
+            (r#"{"followUp": [], "newLine": ["alt+enter"]}"#, "keep\n"),
+        ] {
+            let (_tx, model) = new_model();
+            let mut sim =
+                ProgramSimulator::new(model.with_keybindings(keybindings_from_json(config)));
+            sim.init();
+            type_str(&mut sim, "keep");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+            assert_eq!(sim.model().input.text(), expected, "{config}");
+        }
     }
 
     #[test]
@@ -13784,6 +13979,101 @@ mod tests {
         // newline.
         sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
         assert_eq!(sim.model().input.text(), "keep\n", "ctrl+u at column 0");
+    }
+
+    #[test]
+    fn ctrl_u_deletes_selection_once_and_undo_restores_the_multiline_draft() {
+        use ftui::text::CursorPosition;
+
+        for (original, anchor, head, selected, expected, deleted_cursor) in [
+            (
+                "keep\nabcdef\nnext",
+                (1, 2),
+                (1, 5),
+                "cde",
+                "keep\nabf\nnext",
+                (1, 2),
+            ),
+            (
+                "keep\nabcdef\nnext",
+                (1, 3),
+                (1, 0),
+                "abc",
+                "keep\ndef\nnext",
+                (1, 0),
+            ),
+            (
+                "before\nabc\ndef\nafter",
+                (1, 1),
+                (2, 2),
+                "bc\nde",
+                "before\naf\nafter",
+                (1, 1),
+            ),
+            (
+                "before\nabc\ndef\nafter",
+                (2, 2),
+                (1, 0),
+                "abc\nde",
+                "before\nf\nafter",
+                (1, 0),
+            ),
+        ] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text(original);
+            model
+                .input
+                .set_cursor_position(CursorPosition::new(anchor.0, anchor.1, anchor.1));
+            model
+                .input
+                .editor_mut()
+                .extend_selection_to(CursorPosition::new(head.0, head.1, head.1));
+            let before_cursor = model.input.cursor();
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            assert_eq!(sim.model().input.selected_text().as_deref(), Some(selected));
+
+            sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), expected, "{selected:?}");
+            let after_cursor =
+                CursorPosition::new(deleted_cursor.0, deleted_cursor.1, deleted_cursor.1);
+            assert_eq!(sim.model().input.cursor(), after_cursor);
+            assert!(sim.model().input.selection().is_none());
+            assert_eq!(sim.model().input.undo_group_count(), 1);
+            assert_eq!(sim.model().input.undo_op_count(), 1);
+
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), original);
+            assert_eq!(sim.model().input.cursor(), before_cursor);
+            sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), expected);
+            assert_eq!(sim.model().input.cursor(), after_cursor);
+        }
+    }
+
+    #[test]
+    fn ctrl_u_with_an_empty_selection_still_deletes_only_the_line_prefix() {
+        use ftui::text::CursorPosition;
+
+        let (_tx, mut model) = new_model();
+        model.input.set_text("keep\nabc tail\nnext");
+        let cursor = CursorPosition::new(1, 3, 3);
+        model.input.set_cursor_position(cursor);
+        model.input.editor_mut().extend_selection_to(cursor);
+        assert!(
+            model
+                .input
+                .selection()
+                .is_some_and(|selection| selection.is_empty())
+        );
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep\n tail\nnext");
+        assert_eq!(sim.model().input.cursor(), CursorPosition::new(1, 0, 0));
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep\nabc tail\nnext");
+        assert_eq!(sim.model().input.cursor(), cursor);
     }
 
     #[test]
