@@ -749,6 +749,26 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
+**ACP model selection.** After `initialize`, `session/new`, `session/load`, and
+`session/resume` return model choices and the active selection. Modern clients
+use the `model` selector in `configOptions` and send
+`session/set_config_option` with `configId: "model"`. Older clients can use
+`models.currentModelId`, `models.availableModels`, and `session/set_model` with
+`modelId`. Both surfaces use the same opaque `provider/model` values, including
+custom BYO IDs containing slashes or query strings. Successful selections
+publish a complete `config_option_update` before the response, including any
+change to the model's supported thinking level.
+
+Choices come from Pi's existing model registry and credential availability,
+with the requested workspace's disabled-provider policy applied. `--models`
+and `enabled_models` guide startup and cycling; explicit editor selections can
+choose other registered models. The current model stays visible when restoring
+a saved session or making an explicit selection outside those preferences.
+An explicit `--api-key` admits additional models only for its bound provider;
+other providers still need their own credentials unless they require no key.
+If an editor shows an empty picker, compare its `session/new` response with
+`pi --list-models` using the same configuration and launch environment.
+
 **ACP attachments.** `session/prompt` accepts ordered text, images, native
 `audio` blocks, and embedded audio/video resource blobs. Audio-only prompts
 work. Gemini-family providers receive native media; other transports show an

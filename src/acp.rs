@@ -594,21 +594,21 @@ const ACP_PERMISSION_TIMEOUT_MS: u64 = 120_000;
 // Note: AcpServerCapabilities and AcpServerInfo are constructed inline
 // via json!() in handle_initialize for simplicity.
 
-/// ACP model descriptor.
+/// Legacy ACP model state. Modern clients use `configOptions`; older clients
+/// still require this object (not a bare model array) during session setup.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpModelState {
+    current_model_id: String,
+    available_models: Vec<AcpModel>,
+}
+
+/// Model identifiers are opaque, provider-qualified values on both ACP
+/// selection surfaces, including when the model's own ID contains slashes.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AcpModel {
-    id: String,
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
-}
-
-/// ACP mode descriptor.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AcpMode {
-    slug: String,
+    model_id: String,
     name: String,
     description: String,
 }
@@ -1089,33 +1089,8 @@ async fn run(
                                     ));
                                     continue;
                                 }
-                                let models: Vec<AcpModel> = state
-                                    .available_models
-                                    .iter()
-                                    .map(|entry| AcpModel {
-                                        id: entry.model.id.clone(),
-                                        name: entry.model.name.clone(),
-                                        provider: Some(entry.model.provider.clone()),
-                                    })
-                                    .collect();
-
-                                let modes = vec![
-                                    AcpMode {
-                                        slug: "agent".to_string(),
-                                        name: "Agent".to_string(),
-                                        description:
-                                            "Full autonomous coding agent with tool access"
-                                                .to_string(),
-                                    },
-                                    AcpMode {
-                                        slug: "chat".to_string(),
-                                        name: "Chat".to_string(),
-                                        description: "Conversational mode without tool execution"
-                                            .to_string(),
-                                    },
-                                ];
-
-                                let config_options = config_options_for(&state);
+                                let result = session_setup_response(&session_id, &state)
+                                    .ok_or_else(|| Error::session("New session is unavailable"))?;
                                 let mcp_state = state.mcp.clone();
                                 let state_arc = Arc::new(Mutex::new(state));
                                 {
@@ -1125,18 +1100,7 @@ async fn run(
                                     guard.insert(session_id.clone(), state_arc);
                                 }
 
-                                // `configOptions` is the ACP-standard surface (model +
-                                // thought_level selects); `models`/`modes` stay for
-                                // clients built against the earlier shape.
-                                let _ = out_tx.send(json_rpc_ok(
-                                    id,
-                                    json!({
-                                        "sessionId": session_id,
-                                        "configOptions": config_options,
-                                        "models": models,
-                                        "modes": modes,
-                                    }),
-                                ));
+                                let _ = out_tx.send(json_rpc_ok(id, result));
                                 if let Some(mcp_state) = mcp_state {
                                     mcp::announce(&mcp_state, &session_id, &out_tx)
                                         .await
@@ -1479,6 +1443,14 @@ async fn run(
                             ));
                             continue;
                         };
+                        if out_tx.prompt_is_active(&session_id) {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                PROMPT_IN_PROGRESS,
+                                "Cannot change model while a prompt is in progress",
+                            ));
+                            continue;
+                        }
 
                         let session_state = {
                             sessions
@@ -1497,6 +1469,17 @@ async fn run(
 
                         match apply_set_model_request(&session_state, &request.params, &cx).await {
                             Ok((provider, model)) => {
+                                if let Err(error) = publish_config_options(
+                                    &session_state,
+                                    &session_id,
+                                    &cx,
+                                    &out_tx,
+                                )
+                                .await
+                                {
+                                    let _ = out_tx.send(json_rpc_error(id, INTERNAL_ERROR, error));
+                                    continue;
+                                }
                                 let _ = out_tx.send(json_rpc_ok(
                                     id,
                                     json!({
@@ -1529,6 +1512,14 @@ async fn run(
                             ));
                             continue;
                         };
+                        if out_tx.prompt_is_active(&session_id) {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                PROMPT_IN_PROGRESS,
+                                "Cannot change configuration while a prompt is in progress",
+                            ));
+                            continue;
+                        }
 
                         // ACP's `configId` names the option (`name`/`key` accepted
                         // too); the value lives under `value`.
@@ -1599,11 +1590,21 @@ async fn run(
                         match applied {
                             Ok(()) => {
                                 // ACP answers with the complete config state.
-                                let config_options = session_state
-                                    .lock(&cx)
-                                    .await
-                                    .ok()
-                                    .and_then(|guard| config_options_for(&guard));
+                                let config_options = match publish_config_options(
+                                    &session_state,
+                                    &session_id,
+                                    &cx,
+                                    &out_tx,
+                                )
+                                .await
+                                {
+                                    Ok(configuration) => configuration,
+                                    Err(error) => {
+                                        let _ =
+                                            out_tx.send(json_rpc_error(id, INTERNAL_ERROR, error));
+                                        continue;
+                                    }
+                                };
                                 let _ = out_tx.send(json_rpc_ok(
                                     id,
                                     json!({
@@ -1954,7 +1955,7 @@ fn handle_initialize() -> Value {
                 "sse": true,
             },
             "promptCapabilities": content::prompt_capabilities(),
-            "sessionCapabilities": { "list": {} },
+            "sessionCapabilities": { "list": {}, "resume": {} },
             "_meta": {
                 "pi.dev": {
                     "toolApproval": true,
@@ -1978,7 +1979,13 @@ fn acp_model_registry(options: &AcpOptions) -> ModelRegistry {
 fn acp_automatic_fallback(
     options: &AcpOptions,
     registry: &ModelRegistry,
+    cwd: &std::path::Path,
 ) -> crate::app::AutomaticModelFallback {
+    let available_models = crate::app::model_choices_for_workspace(
+        options.available_models.clone(),
+        &options.config,
+        cwd,
+    );
     let preferred = options
         .config
         .default_provider
@@ -1991,7 +1998,7 @@ fn acp_automatic_fallback(
                     .trim()
                     .eq_ignore_ascii_case(provider.trim())
             });
-            options.available_models.iter().find(|entry| {
+            available_models.iter().find(|entry| {
                 if exact_provider_exists {
                     entry
                         .model
@@ -2004,7 +2011,7 @@ fn acp_automatic_fallback(
             })
         });
     let model_entry = preferred
-        .or_else(|| options.available_models.first())
+        .or_else(|| available_models.first())
         .and_then(|entry| registry.find(&entry.model.provider, &entry.model.id));
     let warning = if preferred.is_none() {
         options
@@ -2015,7 +2022,7 @@ fn acp_automatic_fallback(
                 model_entry.as_ref().map(|entry| {
                     format!(
                         "Configured default_provider '{provider}' has no admitted ACP model. \
-                         Using {}/{}. Check default_provider and credentials, run pi --list-models, \
+                         Using {}/{}. Check default_provider, disabled_providers and credentials, run pi --list-models, \
                          or use --provider/--model to select a destination explicitly.",
                         entry.model.provider, entry.model.id,
                     )
@@ -2111,7 +2118,7 @@ fn resolve_acp_selection(
             ));
         }
     }
-    let fallback = acp_automatic_fallback(options, &registry);
+    let fallback = acp_automatic_fallback(options, &registry, cwd);
     crate::app::select_model_and_thinking_with_fallback(
         cli,
         &options.config,
@@ -2276,7 +2283,23 @@ fn build_acp_session(
     let mut registry = acp_model_registry(options);
     registry.merge_missing_entries(vec![model_entry.clone()]);
     crate::app::update_session_for_selection(&mut session, &selection, &registry);
-    let mut available_models = options.available_models.clone();
+    let mut available_models = crate::app::model_choices_for_workspace(
+        options.available_models.clone(),
+        &options.config,
+        &cwd,
+    );
+    if cli.api_key.is_some() {
+        // The host admits the full registry when --api-key is supplied, but
+        // runtime overrides belong only to the selected provider. Do not offer
+        // another provider's uncredentialed models as usable choices.
+        available_models.retain(|entry| {
+            crate::models::model_entry_is_ready(entry)
+                || entry
+                    .model
+                    .provider
+                    .eq_ignore_ascii_case(&model_entry.model.provider)
+        });
+    }
     if !available_models.iter().any(|entry| {
         entry
             .model
@@ -2440,6 +2463,42 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
 /// Thinking levels offered by the `thought_level` config option, in order.
 const THOUGHT_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// Adapt the admitted registry entries once for both ACP model selectors.
+/// Keep the current runtime identity visible after an explicit switch or a
+/// restored session, even if it is outside the launch catalog or scope.
+fn session_model_state(
+    current_model: (&str, &str),
+    available_models: &[ModelEntry],
+) -> AcpModelState {
+    let (provider, model_id) = current_model;
+    let current_model_id = format!("{provider}/{model_id}");
+    let mut models: Vec<AcpModel> = available_models
+        .iter()
+        .map(|entry| AcpModel {
+            model_id: format!("{}/{}", entry.model.provider, entry.model.id),
+            name: entry.model.name.clone(),
+            description: entry.model.provider.clone(),
+        })
+        .collect();
+    if !models
+        .iter()
+        .any(|model| model.model_id == current_model_id)
+    {
+        models.insert(
+            0,
+            AcpModel {
+                model_id: current_model_id.clone(),
+                name: model_id.to_string(),
+                description: provider.to_string(),
+            },
+        );
+    }
+    AcpModelState {
+        current_model_id,
+        available_models: models,
+    }
+}
+
 /// The session's ACP `configOptions` (GH #245): a `model` select (values are
 /// `provider/id`) and a `thought_level` select, each with its current value.
 /// `current_model` is `(provider, id)`; `thinking` the current level name.
@@ -2448,23 +2507,22 @@ fn session_config_options(
     thinking: &str,
     available_models: &[ModelEntry],
 ) -> Value {
-    let (provider, model_id) = current_model;
-    let current = format!("{provider}/{model_id}");
-    let mut model_options: Vec<Value> = available_models
+    let models = session_model_state(current_model, available_models);
+    config_options_with_models(&models, thinking)
+}
+
+fn config_options_with_models(models: &AcpModelState, thinking: &str) -> Value {
+    let model_options: Vec<Value> = models
+        .available_models
         .iter()
-        .map(|entry| {
+        .map(|model| {
             json!({
-                "value": format!("{}/{}", entry.model.provider, entry.model.id),
-                "name": entry.model.name,
+                "value": model.model_id,
+                "name": model.name,
+                "description": model.description,
             })
         })
         .collect();
-    if !model_options
-        .iter()
-        .any(|option| option["value"].as_str() == Some(current.as_str()))
-    {
-        model_options.insert(0, json!({ "value": current, "name": model_id }));
-    }
     let thought_options: Vec<Value> = THOUGHT_LEVELS
         .iter()
         .map(|level| json!({ "value": level, "name": level }))
@@ -2475,7 +2533,7 @@ fn session_config_options(
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": current,
+            "currentValue": models.current_model_id,
             "options": model_options,
         },
         {
@@ -2487,6 +2545,23 @@ fn session_config_options(
             "options": thought_options,
         },
     ])
+}
+
+/// New, loaded and resumed sessions expose identical discovery contracts.
+/// Do not advertise `modes`: this server has no `session/set_mode` handler.
+fn session_setup_response(session_id: &str, state: &AcpSessionState) -> Option<Value> {
+    let handle = state.agent_session.as_ref()?;
+    let (provider, model) = handle.model();
+    let models = session_model_state((&provider, &model), &state.available_models);
+    let config_options = config_options_with_models(
+        &models,
+        &handle.thinking_level().unwrap_or_default().to_string(),
+    );
+    Some(json!({
+        "sessionId": session_id,
+        "models": models,
+        "configOptions": config_options,
+    }))
 }
 
 /// [`session_config_options`] for a live session, or `None` while a prompt
@@ -2509,6 +2584,41 @@ fn config_options_for_handle(
         &handle.thinking_level().unwrap_or_default().to_string(),
         available_models,
     )
+}
+
+fn config_options_update(session_id: &str, configuration: &Value) -> String {
+    json_rpc_notification(
+        "session/update",
+        json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": configuration,
+            },
+        }),
+    )
+}
+
+/// Both client selection methods can change the model and clamp its thinking
+/// level. Publish the complete committed state before acknowledging either
+/// method so clients using the other selection surface stay synchronized.
+async fn publish_config_options(
+    state: &Arc<Mutex<AcpSessionState>>,
+    session_id: &str,
+    cx: &AgentCx,
+    out: &AcpOutput,
+) -> std::result::Result<Value, String> {
+    let configuration = {
+        let guard = state
+            .lock(cx)
+            .await
+            .map_err(|_| "session state lock unavailable".to_string())?;
+        config_options_for(&guard)
+            .ok_or_else(|| "Session configuration is unavailable during a prompt".to_string())?
+    };
+    out.send(config_options_update(session_id, &configuration))
+        .map_err(|_| "ACP output is unavailable".to_string())?;
+    Ok(configuration)
 }
 
 /// ACP does not expose Pi's retry/failover event types. Keep the editor informed
@@ -2634,16 +2744,9 @@ impl AcpRecoveryUpdates {
             }
             previous.clone_from(configuration);
         }
-        let _ = self.out.send(json_rpc_notification(
-            "session/update",
-            json!({
-                "sessionId": self.session_id,
-                "update": {
-                    "sessionUpdate": "config_option_update",
-                    "configOptions": configuration,
-                },
-            }),
-        ));
+        let _ = self
+            .out
+            .send(config_options_update(&self.session_id, configuration));
     }
 
     fn finish(&self, handle: &AgentSessionHandle) {

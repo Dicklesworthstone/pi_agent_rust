@@ -8,7 +8,7 @@
 use super::{
     AcpOptions, AcpOutput, AcpPermissionClient, AcpSessionsMap, AgentCx, INTERNAL_ERROR,
     INVALID_PARAMS, PROMPT_IN_PROGRESS, SESSION_NOT_FOUND, build_acp_session, classify_tool_kind,
-    config_options_for, content, json_rpc_notification,
+    content, json_rpc_notification, session_setup_response,
 };
 use crate::model::{ContentBlock, Message, UserContent};
 use crate::session::{Session, SessionEntry, session_message_to_model};
@@ -263,7 +263,7 @@ pub(super) async fn load(
         .agent_session
         .as_ref()
         .ok_or_else(HistoryError::busy)?;
-    let configuration = config_options_for(&guard).ok_or_else(HistoryError::busy)?;
+    let response = session_setup_response(id, &guard).ok_or_else(HistoryError::busy)?;
     if replay {
         let session = OwnedMutexGuard::lock(agent.session_store(), cx)
             .await
@@ -275,7 +275,7 @@ pub(super) async fn load(
         // remains history-free. Servers connect only through native trust.
         send_line(out, super::mcp::commands_notification(id)).await?;
     }
-    Ok(json!({ "sessionId": id, "configOptions": configuration }))
+    Ok(response)
 }
 
 /// Bounded backpressure without blocking an async worker on SyncSender::send.

@@ -2814,23 +2814,16 @@ async fn run(
         // builds its model list: without it the setting was silently
         // ignored on this frontend and every catalog provider still
         // appeared in the picker.
-        let ftui_models = model_registry
-            .get_available()
-            .into_iter()
-            .filter(|entry| {
-                !pi::failover::provider_is_disabled(
-                    &disabled_providers,
-                    scope_override,
-                    &entry.model.provider,
-                )
-            })
-            .map(|entry| {
-                (
-                    format!("{}/{}", entry.model.provider, entry.model.id),
-                    entry.model.name,
-                )
-            })
-            .collect::<Vec<_>>();
+        let ftui_models =
+            pi::app::model_choices_for_workspace(model_registry.get_available(), &config, &cwd)
+                .into_iter()
+                .map(|entry| {
+                    (
+                        format!("{}/{}", entry.model.provider, entry.model.id),
+                        entry.model.name,
+                    )
+                })
+                .collect::<Vec<_>>();
         // The picker shows each model's display name beside its identity
         // (GH #214); switching still uses the identity.
         let ftui_model_names = ftui_models
@@ -3503,17 +3496,8 @@ async fn run(
             .iter()
             .map(|sm| sm.model.clone())
             .collect::<Vec<_>>();
-        let available_models = model_registry
-            .get_available()
-            .into_iter()
-            .filter(|entry| {
-                !pi::failover::provider_is_disabled(
-                    &disabled_providers,
-                    scope_override,
-                    &entry.model.provider,
-                )
-            })
-            .collect::<Vec<_>>();
+        let available_models =
+            pi::app::model_choices_for_workspace(model_registry.get_available(), &config, &cwd);
         let title_client =
             pi::app::titling_model_entry(&cli, &config, &model_registry).and_then(|entry| {
                 pi::session_title::TitleClient::for_model_entry(

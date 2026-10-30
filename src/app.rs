@@ -1879,6 +1879,29 @@ pub fn parse_models_arg(models: &str) -> Vec<String> {
         .collect()
 }
 
+/// Apply the workspace's provider visibility policy to an admitted model list.
+///
+/// Callers resolve credential availability before reaching this boundary. Keep
+/// their ordering and any explicit-key admission intact. `enabled_models`
+/// controls startup and cycling; it is not an allowlist for explicit selection.
+pub fn model_choices_for_workspace(
+    models: Vec<ModelEntry>,
+    config: &Config,
+    cwd: &Path,
+) -> Vec<ModelEntry> {
+    let scope_override = config
+        .model_scope_overrides
+        .as_deref()
+        .and_then(|overrides| crate::failover::best_scope_override(overrides, cwd));
+    let disabled = config.disabled_providers.as_deref().unwrap_or_default();
+    models
+        .into_iter()
+        .filter(|entry| {
+            !crate::failover::provider_is_disabled(disabled, scope_override, &entry.model.provider)
+        })
+        .collect()
+}
+
 /// Resolve scoped startup candidates under the current directory's provider policy.
 ///
 /// Explicit and resumed identities remain the normal selector's responsibility,
@@ -2272,6 +2295,102 @@ mod tests {
 
     fn registry_with_entries(entries: Vec<ModelEntry>) -> ModelRegistry {
         ModelRegistry::from_entries_for_tests(entries)
+    }
+
+    #[test]
+    fn model_choices_preserve_credential_admission_and_explicit_selection_scope() {
+        let remote = test_model_entry("remote-chat", "openai", true);
+        let mut local = test_model_entry("local-chat", "byo-local", false);
+        local.api_key = None;
+        local.auth_header = false;
+        let mut missing_key = test_model_entry("locked-chat", "byo-remote", false);
+        missing_key.api_key = None;
+        let registry = registry_with_entries(vec![remote, local, missing_key]);
+        let config = Config {
+            enabled_models: Some(vec!["openai/remote-chat".to_string()]),
+            ..Default::default()
+        };
+
+        let choices = model_choices_for_workspace(
+            registry.get_available(),
+            &config,
+            Path::new("/choice-test"),
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only credential/scope regression oracle.
+        assert_eq!(
+            choices
+                .iter()
+                .map(|entry| entry.model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["remote-chat", "local-chat"],
+            "the startup scope does not hide an admitted explicit destination"
+        );
+
+        // A caller may admit entries without catalog keys when an explicit
+        // credential override is available. Visibility filtering must not
+        // second-guess that decision or invent entries excluded by the caller.
+        let override_choices = model_choices_for_workspace(
+            registry.models().to_vec(),
+            &config,
+            Path::new("/choice-test"),
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only explicit admission regression oracle.
+        assert_eq!(
+            override_choices
+                .iter()
+                .map(|entry| entry.model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["remote-chat", "local-chat", "locked-chat"]
+        );
+    }
+
+    #[test]
+    fn model_choices_apply_global_and_most_specific_workspace_provider_disables() {
+        let admitted = vec![
+            test_model_entry("router-chat", "openrouter", false),
+            test_model_entry("first", "anthropic", true),
+            test_model_entry("openai-chat", "openai", true),
+            test_model_entry("second", "anthropic", true),
+            test_model_entry("byo-chat", "byo", false),
+        ];
+        let config = Config {
+            disabled_providers: Some(vec![" OPEN-ROUTER ".to_string()]),
+            model_scope_overrides: Some(vec![
+                crate::config::ModelScopeOverride {
+                    path: "/choice-policy".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["anthropic".to_string()]),
+                },
+                crate::config::ModelScopeOverride {
+                    path: "/choice-policy/project".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["OpEnAi".to_string()]),
+                },
+            ]),
+            ..Default::default()
+        };
+        for (cwd, expected) in [
+            (
+                "/choice-policy/project/src",
+                vec!["first", "second", "byo-chat"],
+            ),
+            ("/choice-policy/other", vec!["openai-chat", "byo-chat"]),
+            (
+                "/other-workspace",
+                vec!["first", "openai-chat", "second", "byo-chat"],
+            ),
+        ] {
+            let choices = model_choices_for_workspace(admitted.clone(), &config, Path::new(cwd));
+            // ubs:ignore[rust.panic.assert-macros] -- Test-only provider visibility regression oracle.
+            assert_eq!(
+                choices
+                    .iter()
+                    .map(|entry| entry.model.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "provider visibility for {cwd}"
+            );
+        }
     }
 
     #[test]

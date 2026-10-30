@@ -370,6 +370,857 @@ fn configuration_updates(updates: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+const DISCOVERY_FIRST: &str = "acp-discovery-first";
+const DISCOVERY_SECOND: &str = "acp-discovery-second";
+const DISCOVERY_LOCKED: &str = "acp-discovery-locked";
+const DISCOVERY_LOCAL: &str = "acp-discovery-local";
+const DISCOVERY_BYO_MODEL: &str = "team/deepseek-flash?provider=sail&mode=balanced";
+
+/// Load the fixture through models.json before isolating its providers from the
+/// built-in catalog. No ambient credential or paid provider is involved.
+fn discovery_options(root: &Path, url: &str, runtime: RuntimeHandle) -> AcpOptions {
+    let model = |id: &str, name: &str, reasoning: bool| {
+        json!({
+            "id": id, "name": name, "reasoning": reasoning,
+            "input": ["text"], "contextWindow": 32_000, "maxTokens": 512,
+        })
+    };
+    let route = |models: Vec<Value>, auth_header: bool| {
+        json!({
+            "api": "openai-completions", "baseUrl": url,
+            "authHeader": auth_header, "models": models,
+        })
+    };
+    let path = root.join("models.json");
+    std::fs::write(
+        &path,
+        json!({"providers": {
+            DISCOVERY_FIRST: route(vec![model("shared", "First shared", true)], true),
+            DISCOVERY_SECOND: route(vec![model("shared", "Second shared", true)], true),
+            "dalsh": route(vec![model(DISCOVERY_BYO_MODEL, "DeepSeek [Sail]", true)], true),
+            DISCOVERY_LOCKED: route(vec![model("private", "Missing credential", true)], true),
+            DISCOVERY_LOCAL: route(vec![model("local", "Keyless local", false)], false),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let loaded = ModelRegistry::load_with_credential_resolver(Some(path), |provider| {
+        matches!(provider, DISCOVERY_FIRST | DISCOVERY_SECOND | "dalsh")
+            .then(|| format!("{provider}-fixture-key"))
+    });
+    assert!(loaded.error().is_none(), "{:?}", loaded.error());
+    let registry = ModelRegistry::from_entries_for_tests(
+        [
+            (DISCOVERY_FIRST, "shared"),
+            (DISCOVERY_SECOND, "shared"),
+            ("dalsh", DISCOVERY_BYO_MODEL),
+            (DISCOVERY_LOCKED, "private"),
+            (DISCOVERY_LOCAL, "local"),
+        ]
+        .into_iter()
+        .map(|(provider, id)| loaded.find(provider, id).expect("registered fixture model"))
+        .collect(),
+    );
+    let mut options = options(root, url, runtime, 0);
+    options.available_models = registry.get_available();
+    options.model_registry = registry;
+    options.auth = AuthStorage::empty_at(root.join("isolated-auth.json"));
+    options.config.default_provider = Some(DISCOVERY_FIRST.to_string());
+    options.config.default_model = Some("shared".to_string());
+    options.config.retry = None;
+    options.launch.no_tools = true;
+    options.launch.no_mcp = true;
+    options.launch.no_context_files = true;
+    options.launch.system_prompt = Some("ACP model discovery fixture".to_string());
+    options.session_dir = Some(root.join("sessions"));
+    options
+}
+
+/// A small editor peer for the production JSON-RPC dispatcher. Requests are
+/// serialized on the input channel; responses and notifications are decoded
+/// independently of the server's response-building helpers.
+async fn discovery_request(
+    input: &asupersync::channel::mpsc::Sender<String>,
+    output: &std::sync::mpsc::Receiver<String>,
+    transcript: &mut Vec<Value>,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Value {
+    input
+        .try_send(
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
+        )
+        .unwrap();
+    loop {
+        match output.try_recv() {
+            Ok(line) => {
+                let message: Value = serde_json::from_str(&line).expect("valid ACP frame");
+                assert_eq!(message["jsonrpc"], "2.0");
+                let response = message.get("id") == Some(&json!(id));
+                transcript.push(message.clone());
+                if response {
+                    return message;
+                }
+                assert_eq!(
+                    message["method"], "session/update",
+                    "unexpected server request"
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                sleep(wall_now(), Duration::from_millis(1)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("ACP stopped before replying to {method}");
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveredModelState {
+    current_model_id: String,
+    available_models: Vec<DiscoveredModel>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveredModel {
+    model_id: String,
+    name: String,
+}
+
+fn assert_discovery_state(result: &Value, current: &str, expected: &[&str]) {
+    // This is the legacy ACP client's object contract, not Pi's former flat
+    // array of {id, name, provider}. A valid configOptions field cannot repair
+    // an incompatible sibling field for a client decoding the whole response.
+    let models: DiscoveredModelState =
+        serde_json::from_value(result["models"].clone()).expect("ACP model state object");
+    assert_eq!(models.current_model_id, current);
+    let config = result["configOptions"].as_array().expect("config options");
+    let selector = config
+        .iter()
+        .find(|option| option["id"] == "model")
+        .unwrap();
+    assert_eq!(selector["category"], "model");
+    assert_eq!(selector["type"], "select");
+    assert_eq!(selector["currentValue"], current);
+    let choices = selector["options"].as_array().unwrap();
+    assert_eq!(choices.len(), models.available_models.len());
+    for entry in &models.available_models {
+        let choice = choices
+            .iter()
+            .find(|choice| choice["value"] == entry.model_id)
+            .unwrap();
+        assert!(!entry.name.is_empty());
+        assert_eq!(choice["name"], entry.name);
+    }
+    let mut ids: Vec<_> = models
+        .available_models
+        .iter()
+        .map(|entry| entry.model_id.as_str())
+        .collect();
+    ids.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(ids, expected);
+    assert!(ids.contains(&current), "active model must be selectable");
+    assert!(
+        result.get("modes").is_none(),
+        "do not advertise unsupported mode selectors"
+    );
+}
+
+fn assert_discovery_update(transcript: &[Value], id: u64, session: &str, current: &str) {
+    let response = transcript
+        .iter()
+        .position(|frame| frame.get("id") == Some(&json!(id)))
+        .unwrap();
+    let update = &transcript[response.checked_sub(1).expect("update before response")];
+    assert_eq!(update["method"], "session/update");
+    assert_eq!(update["params"]["sessionId"], session);
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        "config_option_update"
+    );
+    let options = update["params"]["update"]["configOptions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        options
+            .iter()
+            .find(|option| option["id"] == "model")
+            .unwrap()["currentValue"],
+        current
+    );
+    assert!(options.iter().any(|option| option["id"] == "thought_level"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_discovers_selects_and_restores_provider_qualified_byo_models() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let mut provider = ProviderFixture::new(vec![200, 200]);
+    let runtime = runtime();
+    let first = format!("{DISCOVERY_FIRST}/shared");
+    let second = format!("{DISCOVERY_SECOND}/shared");
+    let byo = format!("dalsh/{DISCOVERY_BYO_MODEL}");
+    let local = format!("{DISCOVERY_LOCAL}/local");
+    let choices = [
+        first.as_str(),
+        second.as_str(),
+        byo.as_str(),
+        local.as_str(),
+    ];
+    let session_id = runtime.block_on(bounded_launch_controls(async {
+        let options = discovery_options(root.path(), &provider.url, runtime.handle());
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            let initialized = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({"protocolVersion": 1}),
+            )
+            .await;
+            assert_eq!(initialized["result"]["protocolVersion"], 1);
+            assert_eq!(
+                initialized["result"]["agentCapabilities"]["loadSession"],
+                true
+            );
+            assert_eq!(
+                initialized["result"]["agentCapabilities"]["sessionCapabilities"]["resume"],
+                json!({})
+            );
+            let created = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert!(created.get("error").is_none(), "{created}");
+            let id = created["result"]["sessionId"].as_str().unwrap().to_string();
+            assert_discovery_state(&created["result"], &first, &choices);
+            assert!(!created.to_string().contains(DISCOVERY_LOCKED));
+
+            let switched = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                3,
+                "session/set_model",
+                json!({"sessionId": id, "modelId": second}),
+            )
+            .await;
+            assert_eq!(
+                switched["result"]["model"],
+                json!({"provider": DISCOVERY_SECOND, "id": "shared"})
+            );
+            assert_discovery_update(&transcript, 3, &id, &second);
+            let switched = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                4,
+                "session/set_config_option",
+                json!({"sessionId": id, "configId": "model", "value": byo}),
+            )
+            .await;
+            assert_eq!(switched["result"]["configOptions"][0]["currentValue"], byo);
+            assert_discovery_update(&transcript, 4, &id, &byo);
+            let effort = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                5,
+                "session/set_config_option",
+                json!({"sessionId": id, "configId": "thought_level", "value": "low"}),
+            )
+            .await;
+            assert_eq!(effort["result"]["configOptions"][1]["currentValue"], "low");
+            assert_discovery_update(&transcript, 5, &id, &byo);
+
+            for (request_id, model) in [
+                (6, format!("{DISCOVERY_LOCKED}/private")),
+                (7, "unknown/no-model".to_string()),
+            ] {
+                let before = transcript.len();
+                let rejected = discovery_request(
+                    &input,
+                    &outgoing,
+                    &mut transcript,
+                    request_id,
+                    "session/set_model",
+                    json!({"sessionId": id, "modelId": model}),
+                )
+                .await;
+                assert_eq!(rejected["error"]["code"], INVALID_PARAMS);
+                assert_eq!(
+                    transcript.len(),
+                    before + 1,
+                    "rejection must not publish a model change"
+                );
+            }
+            let answer = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                8,
+                "session/prompt",
+                json!({
+                    "sessionId": id,
+                    "prompt": [{"type": "text", "text": "Use the selected BYO model"}],
+                }),
+            )
+            .await;
+            assert_eq!(answer["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            let live = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                9,
+                "session/resume",
+                json!({"sessionId": id, "cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&live["result"], &byo, &choices);
+            assert_eq!(live["result"]["configOptions"][1]["currentValue"], "low");
+            assert_no_private_diagnostics(&transcript);
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+            id
+        };
+        let (served, id) = futures::join!(
+            Box::pin(run(options, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+        id
+    }));
+
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = discovery_options(root.path(), &provider.url, runtime.handle());
+        options.launch.provider = Some(DISCOVERY_SECOND.to_string());
+        options.launch.model = Some("shared".to_string());
+        options.launch.thinking = Some("high".to_string());
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({"protocolVersion": 1}),
+            )
+            .await;
+            let restored = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/load",
+                json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&restored["result"], &byo, &choices);
+            assert_eq!(
+                restored["result"]["configOptions"][1]["currentValue"],
+                "low"
+            );
+            assert!(transcript.iter().any(|frame| {
+                frame["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+            }));
+            assert!(transcript.iter().any(|frame| {
+                frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            }));
+            let before = transcript.len();
+            let resumed = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                3,
+                "session/resume",
+                json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&resumed["result"], &byo, &choices);
+            assert_eq!(
+                transcript.len(),
+                before + 1,
+                "resume does not replay history"
+            );
+            let switched = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                4,
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": "model", "value": local}),
+            )
+            .await;
+            assert_eq!(
+                switched["result"]["configOptions"][0]["currentValue"],
+                local
+            );
+            assert_eq!(
+                switched["result"]["configOptions"][1]["currentValue"],
+                "off"
+            );
+            assert_discovery_update(&transcript, 4, &session_id, &local);
+            let answer = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                5,
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "Use the selected keyless model"}],
+                }),
+            )
+            .await;
+            assert_eq!(answer["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            assert_no_private_diagnostics(&transcript);
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+        };
+        let (served, ()) = futures::join!(
+            Box::pin(run(options, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+    }));
+
+    // Resume must also restore from disk in a new server process, not only
+    // reattach an in-memory session that session/load has already rebuilt.
+    runtime.block_on(bounded_launch_controls(async {
+        let options = discovery_options(root.path(), &provider.url, runtime.handle());
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({"protocolVersion": 1}),
+            )
+            .await;
+            let resumed = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/resume",
+                json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&resumed["result"], &local, &choices);
+            assert_eq!(resumed["result"]["configOptions"][1]["currentValue"], "off");
+            assert_eq!(
+                transcript.len(),
+                2,
+                "fresh-process resume must not replay stored messages"
+            );
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+        };
+        let (served, ()) = futures::join!(
+            Box::pin(run(options, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+    }));
+    let requests = provider.finish(2);
+    assert_eq!(requests[0].1["model"], DISCOVERY_BYO_MODEL);
+    assert!(
+        requests[0]
+            .0
+            .to_ascii_lowercase()
+            .contains("authorization: bearer dalsh-fixture-key")
+    );
+    assert_eq!(requests[1].1["model"], "local");
+    assert!(
+        !requests[1]
+            .0
+            .to_ascii_lowercase()
+            .contains("authorization:")
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_model_discovery_respects_workspace_visibility_and_startup_scopes() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let cwd = project.path().canonicalize().unwrap();
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = discovery_options(
+            root.path(),
+            "https://acp-discovery.invalid/v1",
+            runtime.handle(),
+        );
+        let first = format!("{DISCOVERY_FIRST}/shared");
+        let second = format!("{DISCOVERY_SECOND}/shared");
+        let byo = format!("dalsh/{DISCOVERY_BYO_MODEL}");
+        options.config.default_provider = None;
+        options.config.default_model = None;
+        options.config.enabled_models = Some(vec![first.clone()]);
+        options.config.disabled_providers = Some(vec![DISCOVERY_LOCAL.to_string()]);
+        options.config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+            path: cwd.display().to_string(),
+            enabled_models: Some(vec![format!("{second}:low")]),
+            disabled_providers: Some(vec!["dalsh".to_string()]),
+        }]);
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({"protocolVersion": 1}),
+            )
+            .await;
+            let created = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&created["result"], &second, &[&first, &second]);
+            assert_eq!(created["result"]["configOptions"][1]["currentValue"], "low");
+            let id = created["result"]["sessionId"].as_str().unwrap();
+            // enabled_models chooses startup/cycling; explicit editor selection
+            // may still choose another ready provider outside that preference.
+            let selected = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                3,
+                "session/set_config_option",
+                json!({"sessionId": id, "configId": "model", "value": first}),
+            )
+            .await;
+            assert_eq!(
+                selected["result"]["configOptions"][0]["currentValue"],
+                first
+            );
+            assert_discovery_update(&transcript, 3, id, &first);
+            // Provider visibility is not an authorization boundary for an
+            // explicit selection. Its actual current value must be discoverable.
+            let selected = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                4,
+                "session/set_model",
+                json!({"sessionId": id, "provider": "dalsh", "model": DISCOVERY_BYO_MODEL}),
+            )
+            .await;
+            assert!(selected.get("error").is_none(), "{selected}");
+            let resumed = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                5,
+                "session/resume",
+                json!({"sessionId": id, "cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&resumed["result"], &byo, &[&first, &second, &byo]);
+            assert_no_private_diagnostics(&transcript);
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+        };
+        let (served, ()) = futures::join!(
+            Box::pin(run(options, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+    }));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_automatic_discovery_never_reintroduces_disabled_providers() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let cwd = project.path().canonicalize().unwrap();
+    let runtime = runtime();
+    for (preferred, all_disabled) in [
+        (None, false),
+        (Some(DISCOVERY_FIRST), false),
+        (None, true),
+        (Some(DISCOVERY_FIRST), true),
+    ] {
+        runtime.block_on(bounded_launch_controls(async {
+            let mut options = discovery_options(
+                root.path(),
+                "https://acp-discovery.invalid/v1",
+                runtime.handle(),
+            );
+            options.config.default_provider = preferred.map(str::to_string);
+            options.config.default_model = None;
+            options.config.enabled_models = None;
+            options.config.disabled_providers = Some(vec![
+                DISCOVERY_FIRST.to_string(),
+                DISCOVERY_LOCAL.to_string(),
+            ]);
+            let mut disabled = vec![DISCOVERY_SECOND.to_string()];
+            if all_disabled {
+                disabled.push("dalsh".to_string());
+            }
+            options.config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+                path: cwd.display().to_string(),
+                enabled_models: None,
+                disabled_providers: Some(disabled),
+            }]);
+            options.session_dir = None;
+            let (input, incoming) = asupersync::channel::mpsc::channel(16);
+            let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+            let mut transcript = Vec::new();
+            let editor = async {
+                discovery_request(
+                    &input,
+                    &outgoing,
+                    &mut transcript,
+                    1,
+                    "initialize",
+                    json!({"protocolVersion": 1}),
+                )
+                .await;
+                let created = discovery_request(
+                    &input,
+                    &outgoing,
+                    &mut transcript,
+                    2,
+                    "session/new",
+                    json!({"cwd": cwd, "mcpServers": []}),
+                )
+                .await;
+                if all_disabled {
+                    assert_eq!(created["error"]["code"], INTERNAL_ERROR);
+                    assert!(created.get("result").is_none());
+                } else {
+                    let byo = format!("dalsh/{DISCOVERY_BYO_MODEL}");
+                    assert_discovery_state(&created["result"], &byo, &[&byo]);
+                }
+                let listed = discovery_request(
+                    &input,
+                    &outgoing,
+                    &mut transcript,
+                    3,
+                    "session/list",
+                    json!({"cwd": cwd}),
+                )
+                .await;
+                assert_eq!(
+                    listed["result"]["sessions"].as_array().unwrap().len(),
+                    usize::from(!all_disabled),
+                    "failed discovery must not install a phantom session",
+                );
+                input
+                    .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                    .unwrap();
+            };
+            let (served, ()) = futures::join!(
+                Box::pin(run(options, incoming, AcpOutput::new(output))),
+                editor
+            );
+            served.unwrap();
+        }));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatcher_api_key_override_admits_only_its_exact_provider_models() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let mut provider = ProviderFixture::new(vec![200, 200]);
+    let runtime = runtime();
+    runtime.block_on(bounded_launch_controls(async {
+        let mut options = discovery_options(root.path(), &provider.url, runtime.handle());
+        let mut entries = options.model_registry.models().to_vec();
+        for entry in &mut entries {
+            if entry.model.provider == DISCOVERY_FIRST {
+                entry.model.provider = "openrouter".to_string();
+                entry.model.id = "override-first".to_string();
+                entry.api_key = None;
+            } else if entry.model.provider == DISCOVERY_SECOND {
+                entry.api_key = None;
+            }
+        }
+        let mut sibling = entries
+            .iter()
+            .find(|entry| entry.model.provider == "openrouter")
+            .unwrap()
+            .clone();
+        sibling.model.id = "override-second".to_string();
+        sibling.model.name = "Second override model".to_string();
+        entries.push(sibling.clone());
+        // Provider aliases may match for display/policy, but the runtime pins
+        // --api-key to the exact provider identity installed at startup.
+        sibling.model.provider = "open-router".to_string();
+        sibling.model.id = "alias-only".to_string();
+        entries.push(sibling);
+        options.model_registry = ModelRegistry::from_entries_for_tests(entries);
+        // main admits all registry entries with --api-key. ACP then narrows
+        // that list to credentials usable under its provider-bound override.
+        options.available_models = options.model_registry.models().to_vec();
+        options.launch.provider = Some("openrouter".to_string());
+        options.launch.model = Some("override-first".to_string());
+        options.launch.api_key = Some("launch-fixture-key".to_string());
+        let byo = format!("dalsh/{DISCOVERY_BYO_MODEL}");
+        let local = format!("{DISCOVERY_LOCAL}/local");
+        let choices = [
+            "openrouter/override-first",
+            "openrouter/override-second",
+            byo.as_str(),
+            local.as_str(),
+        ];
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({"protocolVersion": 1}),
+            )
+            .await;
+            let created = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&created["result"], "openrouter/override-first", &choices);
+            let id = created["result"]["sessionId"].as_str().unwrap();
+            let selected = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                3,
+                "session/set_config_option",
+                json!({
+                    "sessionId": id,
+                    "configId": "model",
+                    "value": "openrouter/override-second",
+                }),
+            )
+            .await;
+            assert_eq!(
+                selected["result"]["configOptions"][0]["currentValue"],
+                "openrouter/override-second"
+            );
+            let answer = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                4,
+                "session/prompt",
+                json!({
+                    "sessionId": id,
+                    "prompt": [{"type": "text", "text": "Use the provider-bound override"}],
+                }),
+            )
+            .await;
+            assert_eq!(answer["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            let selected = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                5,
+                "session/set_model",
+                json!({"sessionId": id, "modelId": byo}),
+            )
+            .await;
+            assert!(selected.get("error").is_none(), "{selected}");
+            let answer = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                6,
+                "session/prompt",
+                json!({
+                    "sessionId": id,
+                    "prompt": [{"type": "text", "text": "Use this model's own credential"}],
+                }),
+            )
+            .await;
+            assert_eq!(answer["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            let resumed = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                7,
+                "session/resume",
+                json!({"sessionId": id, "cwd": cwd, "mcpServers": []}),
+            )
+            .await;
+            assert_discovery_state(&resumed["result"], &byo, &choices);
+            assert_no_private_diagnostics(&transcript);
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+        };
+        let (served, ()) = futures::join!(
+            Box::pin(run(options, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+    }));
+    let requests = provider.finish(2);
+    assert_eq!(requests[0].1["model"], "override-second");
+    assert!(
+        requests[0]
+            .0
+            .to_ascii_lowercase()
+            .contains("authorization: bearer launch-fixture-key")
+    );
+    assert_eq!(requests[1].1["model"], DISCOVERY_BYO_MODEL);
+    assert!(
+        requests[1]
+            .0
+            .to_ascii_lowercase()
+            .contains("authorization: bearer dalsh-fixture-key")
+    );
+    assert!(!requests[1].0.contains("launch-fixture-key"));
+}
+
 fn user_content(request: &Value) -> &Value {
     &request["messages"]
         .as_array()
