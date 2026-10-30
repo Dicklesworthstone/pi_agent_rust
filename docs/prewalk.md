@@ -12,13 +12,13 @@ continue across the handoff and any provider retries.
 ## Interactive startup
 
 ```sh
-# Use the explicitly configured smol role as the destination.
+# Use prewalk.into (the explicitly configured smol role by default).
 pi --prewalk
 
 # Assign a role for this launch and arm it.
 pi --smol openai/gpt-5-mini --prewalk
 
-# Choose a registered destination directly, optionally including thinking.
+# Override prewalk.into for this launch, optionally including thinking.
 pi --prewalk-into openai/gpt-5-mini:low
 pi --prewalk-into @smol
 
@@ -27,7 +27,8 @@ pi --no-prewalk
 ```
 
 The starting model is selected normally by `--provider`, `--model`, or saved
-session settings. The destination must resolve to a registered model and have
+session settings. `prewalk.from` is used by `/prewalk restart`; it does not
+replace the startup model. The destination must resolve to a registered model and have
 usable credentials before prewalk is armed. Unknown model names, unconfigured
 roles, and disabled destination providers are errors. Prewalk does not change
 your role assignments or persist an enabled flag.
@@ -37,7 +38,7 @@ To arm prewalk automatically on fresh interactive launches, configure:
 ```json
 {
   "modelRoles": { "smol": "openai/gpt-5-mini" },
-  "prewalk": { "enabled": true }
+  "prewalk": { "enabled": true, "from": "@default", "into": "@smol" }
 }
 ```
 
@@ -46,21 +47,51 @@ prewalk; an explicit startup flag can arm a resumed session. After `/new`,
 `/resume`, a fork, or another session replacement, use `/prewalk` to arm the
 current session explicitly.
 
+`prewalk.from` and `prewalk.into` accept exact registered `provider/model`
+selectors or explicitly configured roles such as `@slow`, `@plan`, and
+`@smol`. Both support a `:thinking` suffix. `@default` resolves the configured
+default role, falling back to `defaultProvider`/`defaultModel`; a temporary
+`--model` selection or a previous handoff does not redefine it. Project
+settings override individual prewalk fields while preserving other inherited
+fields. Setting the two selectors alone does not enable startup arming.
+
 ## Commands
 
 Both interactive frontends provide:
 
 | Command | Effect |
 | --- | --- |
-| `/prewalk` | Arm the `smol` role, or keep the existing armed destination. |
+| `/prewalk` | Arm `prewalk.into`, or keep the existing armed destination. |
+| `/prewalk <into>` | Arm a one-command destination, without changing saved settings. |
+| `/prewalk restart` | Return to `prewalk.from` and arm `prewalk.into`. |
+| `/prewalk restart <from> [into]` | Use a one-command planning model and optional destination. |
 | `/prewalk status` | Show whether a handoff is armed and its destination. |
 | `/prewalk off` | Cancel an armed handoff. |
 
-The default frontend uses the `--smol` launch override or `modelRoles.smol`.
-The classic frontend also honors a live `/model smol provider/model` role
-assignment. If no role is configured, choose one before arming. An identical
+Both frontends resolve roles when the command runs, including CLI role
+overrides. The classic frontend also honors live `/model <role> provider/model`
+assignments. If no role is configured, choose one before arming. An identical
 destination model and thinking level reports that there is nothing to switch.
-After a handoff, `/prewalk` can arm another one.
+
+Restart validates both models, credentials, and workspace provider policy
+before changing the session. It saves the planning model and thinking level
+together, then arms the handoff. A conflicting already-armed destination is
+rejected; use `/prewalk off` before choosing a different destination. A matching
+arm is preserved. After a consumed handoff, a new restart cycle requires a new
+successful todo when the todo tool is enabled; old todos cannot trigger the
+next handoff. Invalid selectors or failed saves leave the prior live selection
+and handoff intact. Restart does not submit another user message or replay any
+completed tools.
+
+For example, to plan on a powerful role and implement on the usual default:
+
+```text
+/prewalk restart @slow @default
+/prewalk status
+```
+
+The arguments apply to this command only. A later bare restart uses the saved
+`prewalk.from` and `prewalk.into` again.
 
 Successful `write`, `edit`, and `hashline_edit` calls trigger the handoff.
 Native `conflict://` writes also count when their result confirms applied
@@ -120,7 +151,9 @@ let answer = handle.prompt("Implement the requested change", |event| {
 
 The SDK's prompt, image/content, and continuation entrypoints share this
 workflow. `prewalk_target()` reports the armed destination and
-`disarm_prewalk()` cancels it. A logical SDK turn still emits one `AgentStart`
+`disarm_prewalk()` cancels it. `restart_prewalk(source, target)` validates and
+durably selects the planning model before arming a new cycle; both arguments
+are `PrewalkTarget` values. A logical SDK turn still emits one `AgentStart`
 and one `AgentEnd`. The low-level `Agent` loop does not perform a handoff by
 itself. Native `AgentSession` drivers can share the same durable transition:
 call `begin_prewalk_turn()` once per logical request, retain its token through
@@ -151,4 +184,4 @@ setting does not implicitly arm ACP sessions, and `--no-prewalk` disables launch
 arming. ACP's built-in tool set does not include `todo`, so an approved successful
 project edit can trigger the handoff without a todo prerequisite.
 
-Behavior reference: [OMP prewalk documentation](https://omp.sh/docs/prewalk).
+Behavior reference: [OMP v18.14.0 prewalk documentation](https://github.com/can1357/oh-my-pi/blob/v18.14.0/docs/prewalk.md).

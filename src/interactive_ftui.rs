@@ -3250,6 +3250,10 @@ impl PiFtuiModel {
                 owner_session_id,
                 message,
             }
+            | PiMsg::SessionModelChanged {
+                owner_session_id,
+                message,
+            }
             | PiMsg::ReviewFinished {
                 owner_session_id,
                 message,
@@ -4204,16 +4208,13 @@ impl PiFtuiModel {
             return true;
         }
         if let Some(rest) = strip_command(clean, "/prewalk") {
-            if matches!(rest.trim(), "" | "status" | "off") {
+            if crate::prewalk::PrewalkCommand::parse(rest).is_ok() {
                 self.begin_busy("updating prewalk ...");
                 self.send_command(UiCommand::Prewalk {
                     action: rest.trim().to_string(),
                 });
             } else {
-                self.push_entry(
-                    EntryRole::Error,
-                    String::from("Usage: /prewalk [status|off]"),
-                );
+                self.push_entry(EntryRole::Error, crate::prewalk::COMMAND_USAGE.to_string());
             }
             return true;
         }
@@ -4463,7 +4464,7 @@ impl PiFtuiModel {
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
                      /commit [--dry-run], /review [target], /handoff [focus], \
                      /handoff --report [to] [path], /handoff --model [preview options], \
-                     /handoff --import <bundle> [import options], /prewalk [status|off], /approval [mode], \
+                     /handoff --import <bundle> [import options], /prewalk [into] | restart [from] [into] | status | off, /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget|sync], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
@@ -8413,37 +8414,26 @@ async fn run_set_model_command(
 async fn run_prewalk_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     action: &str,
-    default_target: Option<&crate::prewalk::PrewalkTarget>,
+    config: &crate::config::Config,
+    cwd: &std::path::Path,
+    role_overrides: &HashMap<crate::models::ModelRole, String>,
     agent_tx: &Sender<PiMsg>,
-) {
-    let message = match action {
-        "off" => {
-            handle.disarm_prewalk();
-            PiMsg::System(String::from("Prewalk disarmed"))
-        }
-        "status" => PiMsg::System(handle.prewalk_target().map_or_else(
-            || String::from("Prewalk is not armed"),
-            |target| format!("Prewalk armed → {}", target.label()),
-        )),
-        _ => {
-            let target = handle.prewalk_target().or(default_target).cloned();
-            match target {
-                Some(target) => match handle.arm_prewalk(target).await {
-                    Ok(Some(target)) => {
-                        PiMsg::System(format!("Prewalk armed → {}", target.label()))
-                    }
-                    Ok(None) => PiMsg::System(String::from(
-                        "Prewalk: nothing to switch; target model and thinking already match",
-                    )),
-                    Err(error) => PiMsg::AgentError(format!("Prewalk: {error}")),
-                },
-                None => PiMsg::AgentError(String::from(
-                    "Prewalk requires a configured @smol model; set --smol provider/model or modelRoles.smol",
-                )),
-            }
-        }
+) -> bool {
+    let result = crate::app::run_prewalk_command(handle, action, config, cwd, |role| {
+        role_overrides.get(&role).cloned()
+    })
+    .await;
+    let restarted = result.is_ok()
+        && matches!(
+            crate::prewalk::PrewalkCommand::parse(action),
+            Ok(crate::prewalk::PrewalkCommand::Restart { .. })
+        );
+    let message = match result {
+        Ok(message) => PiMsg::System(message),
+        Err(error) => PiMsg::AgentError(format!("Prewalk: {error}")),
     };
     let _ = agent_tx.send(message);
+    restarted
 }
 
 /// Handle `/compact` in the driver: run compaction with events translated to
@@ -10287,8 +10277,9 @@ pub struct FtuiSettings {
     pub plan_disabled_providers: Vec<String>,
     /// Workspace restrictions are matched against the current session workdir.
     pub plan_scope_overrides: Vec<crate::config::ModelScopeOverride>,
-    /// Resolved @smol destination for `/prewalk`; admission checks credentials.
-    pub prewalk_target: Option<crate::prewalk::PrewalkTarget>,
+    /// Launch role overrides for live prewalk selectors. Concrete models are
+    /// resolved against the current session registry when each command runs.
+    pub prewalk_role_overrides: HashMap<crate::models::ModelRole, String>,
     /// CLI files and their first authored message, already read and bounded.
     pub initial_content: Option<crate::app::InitialMessage>,
     /// Remaining CLI messages, routed through the ordinary prompt path.
@@ -10371,7 +10362,7 @@ pub fn run(
         plan_model_spec,
         plan_disabled_providers,
         plan_scope_overrides,
-        prewalk_target,
+        prewalk_role_overrides,
         mut initial_content,
         initial_messages,
     } = settings;
@@ -10576,7 +10567,12 @@ pub fn run(
                             }
                         }
                         Ok(UiCommand::Prewalk { action }) => {
-                            run_prewalk_command(&mut handle, &action, prewalk_target.as_ref(), &agent_tx).await;
+                            if run_prewalk_command(
+                                &mut handle, &action, settings_controller.config(), &bash_cwd,
+                                &prewalk_role_overrides, &agent_tx,
+                            ).await {
+                                plans.forget_model_restore();
+                            }
                         }
                         Ok(UiCommand::Settings) => {
                             let _ = agent_tx.send(PiMsg::Settings {
@@ -17134,6 +17130,45 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("compacting")),
             "compact note missing"
+        );
+    }
+
+    #[test]
+    fn slash_prewalk_routes_selectors_and_rejects_extra_arguments() {
+        for action in [
+            "",
+            "Provider/Model:high",
+            "restart",
+            "restart @slow @default",
+            "status",
+            "off",
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let mut sim =
+                ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+            sim.init();
+            type_str(&mut sim, &format!("/prewalk {action}"));
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().ok(),
+                Some(UiCommand::Prewalk {
+                    action: action.to_string()
+                })
+            );
+        }
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        type_str(&mut sim, "/prewalk restart @slow @smol extra");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains(crate::prewalk::COMMAND_USAGE))
         );
     }
 

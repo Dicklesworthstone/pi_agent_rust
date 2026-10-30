@@ -2567,6 +2567,492 @@ fn prewalk_destination() -> crate::prewalk::PrewalkTarget {
     }
 }
 
+fn prewalk_source() -> crate::prewalk::PrewalkTarget {
+    crate::prewalk::PrewalkTarget {
+        provider: "openai".to_string(),
+        model: "walk-source".to_string(),
+        thinking: Some(crate::model::ThinkingLevel::Off),
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn prewalk_restart_persists_the_planner_and_requires_fresh_todos_on_later_cycles() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![
+        prewalk_tool_batch(&[
+            (
+                "cycle-one-plan",
+                "todo",
+                serde_json::json!({"op":"init", "tasks":["implement the first change"]}),
+            ),
+            (
+                "cycle-one-edit",
+                "write",
+                serde_json::json!({"path":"first.txt", "content":"first"}),
+            ),
+        ]),
+        prewalk_tool_batch(&[(
+            "cycle-two-unplanned-edit",
+            "write",
+            serde_json::json!({"path":"second.txt", "content":"second"}),
+        )]),
+        completion_response(),
+        prewalk_tool_batch(&[
+            (
+                "cycle-two-plan",
+                "todo",
+                serde_json::json!({"op":"init", "tasks":["finish the next change"]}),
+            ),
+            (
+                "cycle-two-planned-edit",
+                "write",
+                serde_json::json!({"path":"third.txt", "content":"third"}),
+            ),
+        ]),
+    ]);
+    let mut target = RecoveryHttpFixture::new(vec![completion_response(), completion_response()]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, true, 32);
+    run_async(handle.set_model("groq", "walk-target")).unwrap();
+    let (events, callback) = event_log();
+
+    assert_eq!(
+        run_async(handle.restart_prewalk(prewalk_source(), prewalk_destination())).unwrap(),
+        Some(prewalk_destination())
+    );
+    assert_eq!(
+        handle.model(),
+        ("openai".to_string(), "walk-source".to_string())
+    );
+    assert!(source.requests.lock().unwrap().is_empty());
+    assert!(target.requests.lock().unwrap().is_empty());
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        reopened.effective_model_for_current_path(),
+        Some(handle.model())
+    );
+    assert_eq!(
+        reopened
+            .effective_thinking_level_for_current_path()
+            .as_deref(),
+        Some("off")
+    );
+    let first_callback = Arc::clone(&callback);
+    assert_eq!(
+        run_async(handle.prompt("first cycle", move |event| first_callback(event)))
+            .unwrap()
+            .stop_reason,
+        StopReason::Stop
+    );
+    assert_eq!(
+        handle.model(),
+        ("groq".to_string(), "walk-target".to_string())
+    );
+    assert!(handle.prewalk_target().is_none());
+
+    run_async(handle.restart_prewalk(prewalk_source(), prewalk_destination())).unwrap();
+    let second_callback = Arc::clone(&callback);
+    assert_eq!(
+        run_async(
+            handle.prompt("second cycle without a new todo", move |event| {
+                second_callback(event);
+            })
+        )
+        .unwrap()
+        .stop_reason,
+        StopReason::Stop
+    );
+    assert_eq!(
+        handle.model(),
+        ("openai".to_string(), "walk-source".to_string())
+    );
+    assert!(handle.prewalk_target().is_some());
+    assert_eq!(
+        target.requests.lock().unwrap().len(),
+        1,
+        "old todos cannot hand off a new cycle"
+    );
+
+    // Repeating restart with the same arm keeps its planning gate intact.
+    run_async(handle.restart_prewalk(prewalk_source(), prewalk_destination())).unwrap();
+    assert_eq!(
+        run_async(handle.prompt("finish the new plan", move |event| callback(event)))
+            .unwrap()
+            .stop_reason,
+        StopReason::Stop
+    );
+    source.finish();
+    target.finish();
+    assert_eq!(
+        handle.model(),
+        ("groq".to_string(), "walk-target".to_string())
+    );
+    assert!(handle.prewalk_target().is_none());
+    assert_eq!(source.requests.lock().unwrap().len(), 4);
+    assert_eq!(target.requests.lock().unwrap().len(), 2);
+    for (path, content) in [
+        ("first.txt", "first"),
+        ("second.txt", "second"),
+        ("third.txt", "third"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(path)).unwrap(),
+            content
+        );
+    }
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "prewalk_switched")
+            .count(),
+        2
+    );
+    for kind in ["agent_start", "agent_end"] {
+        assert_eq!(
+            events.iter().filter(|event| event["type"] == kind).count(),
+            3,
+            "{kind}"
+        );
+    }
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        reopened.effective_model_for_current_path(),
+        Some(handle.model())
+    );
+    assert_eq!(
+        reopened
+            .to_messages_for_current_path()
+            .iter()
+            .filter(|message| matches!(message, Message::ToolResult(_)))
+            .count(),
+        5,
+        "completed work is retained once through both cycles"
+    );
+}
+
+#[test]
+fn prewalk_restart_refuses_invalid_models_credentials_and_changed_arm_before_mutation() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(Vec::new());
+    let mut target = RecoveryHttpFixture::new(Vec::new());
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 32);
+    let mut unready = recovery_route_entry("prewalk-uncredentialed", "unready");
+    unready.api_key = None;
+    unready.auth_header = true;
+    let mut entries = handle.session.model_registry().unwrap().models().to_vec();
+    entries.push(unready);
+    handle
+        .session
+        .set_model_registry(ModelRegistry::from_entries_for_tests(entries));
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    run_async(handle.session.persist_session()).unwrap();
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let before_model = handle.model();
+    let before_thinking = handle.thinking_level();
+    let missing = crate::prewalk::PrewalkTarget {
+        provider: "missing-prewalk-provider".into(),
+        model: "missing".into(),
+        thinking: None,
+    };
+    let unready = crate::prewalk::PrewalkTarget {
+        provider: "prewalk-uncredentialed".into(),
+        model: "unready".into(),
+        thinking: None,
+    };
+    for (from, into, expected) in [
+        (missing.clone(), prewalk_destination(), "PREWALK_SOURCE"),
+        (prewalk_source(), missing, "PREWALK_TARGET"),
+        (
+            unready.clone(),
+            prewalk_destination(),
+            "Missing credentials",
+        ),
+        (prewalk_source(), unready, "Missing credentials"),
+        (prewalk_destination(), prewalk_source(), "PREWALK_ARMED"),
+    ] {
+        let error = run_async(handle.restart_prewalk(from, into)).unwrap_err();
+        assert!(error.to_string().contains(expected), "{expected}: {error}");
+        assert_eq!(handle.model(), before_model);
+        assert_eq!(handle.thinking_level(), before_thinking);
+        assert_eq!(handle.prewalk_target(), Some(&prewalk_destination()));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+    }
+    source.finish();
+    target.finish();
+    assert!(source.requests.lock().unwrap().is_empty());
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn prewalk_restart_equal_models_normalizes_thinking_and_retires_fallback() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(Vec::new());
+    let mut target = RecoveryHttpFixture::new(Vec::new());
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 32);
+    let mut entries = handle.session.model_registry().unwrap().models().to_vec();
+    for entry in &mut entries {
+        entry.model.reasoning = false;
+    }
+    handle
+        .session
+        .set_model_registry(ModelRegistry::from_entries_for_tests(entries));
+    let provenance = crate::session::ModelChangeFailover {
+        primary_provider: "groq".into(),
+        primary_model_id: "walk-target".into(),
+        primary_thinking_level: Some("off".into()),
+        fallback_provider: "openai".into(),
+        fallback_model_id: "walk-source".into(),
+        chain_position: Some(2),
+        cooldown_deadline: None,
+        cooldown_secs: Some(300),
+        lifecycle_id: Some("prewalk-restart-fallback".into()),
+    };
+    install_reconciliation_provenance(&mut handle, provenance.clone());
+    handle.failover_state = crate::failover::FailoverState::reconstruct_from_provenance(
+        &provenance,
+        300,
+        chrono::Utc::now(),
+    );
+    let mut planner = prewalk_destination();
+    planner.thinking = Some(crate::model::ThinkingLevel::High);
+    let mut destination = prewalk_destination();
+    destination.thinking = None;
+    assert!(
+        run_async(handle.restart_prewalk(planner, destination))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        handle.model(),
+        ("groq".to_string(), "walk-target".to_string())
+    );
+    assert_eq!(
+        handle.thinking_level(),
+        Some(crate::model::ThinkingLevel::Off)
+    );
+    assert!(handle.prewalk_target().is_none());
+    assert!(handle.failover_state.primary().is_none());
+    assert!(handle.failover_state.lifecycle_id().is_none());
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        reopened.effective_model_for_current_path(),
+        Some(handle.model())
+    );
+    assert_eq!(
+        reopened
+            .effective_thinking_level_for_current_path()
+            .as_deref(),
+        Some("off")
+    );
+    assert!(
+        reopened
+            .active_failover_provenance_for_current_path()
+            .is_none()
+    );
+    source.finish();
+    target.finish();
+    assert!(source.requests.lock().unwrap().is_empty());
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn prewalk_restart_failed_save_preserves_live_model_arm_and_fallback_state() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(Vec::new());
+    let mut target = RecoveryHttpFixture::new(Vec::new());
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 32);
+    let provenance = crate::session::ModelChangeFailover {
+        primary_provider: "groq".into(),
+        primary_model_id: "walk-target".into(),
+        primary_thinking_level: Some("off".into()),
+        fallback_provider: "openai".into(),
+        fallback_model_id: "walk-source".into(),
+        chain_position: Some(2),
+        cooldown_deadline: None,
+        cooldown_secs: Some(300),
+        lifecycle_id: Some("prewalk-restart-save-failure".into()),
+    };
+    install_reconciliation_provenance(&mut handle, provenance.clone());
+    handle.failover_state = crate::failover::FailoverState::reconstruct_from_provenance(
+        &provenance,
+        300,
+        chrono::Utc::now(),
+    );
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let blocked = dir.path().join("blocked-prewalk.jsonl");
+    std::fs::create_dir(&blocked).unwrap();
+    handle.session_store().try_lock().unwrap().path = Some(blocked);
+    let result = run_async(handle.restart_prewalk(prewalk_destination(), prewalk_destination()));
+    assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+    assert_eq!(
+        handle.model(),
+        ("openai".to_string(), "walk-source".to_string())
+    );
+    assert_eq!(handle.prewalk_target(), Some(&prewalk_destination()));
+    assert_eq!(
+        handle.failover_state.lifecycle_id(),
+        Some("prewalk-restart-save-failure")
+    );
+    assert_eq!(handle.failover_state.chain_position(), 2);
+    assert!(handle.session.ensure_provider_reentry_allowed().is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    source.finish();
+    target.finish();
+    assert!(source.requests.lock().unwrap().is_empty());
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn prewalk_commands_resolve_current_roles_and_keep_overrides_local_to_one_command() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(Vec::new());
+    let mut target = RecoveryHttpFixture::new(Vec::new());
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 32);
+    let mut config = Config {
+        prewalk: Some(crate::config::PrewalkSettings {
+            from: Some("@slow".into()),
+            into: Some("@smol".into()),
+            ..Default::default()
+        }),
+        model_roles: Some(crate::config::ModelRoleSettings {
+            slow: Some("openai/walk-source:off".into()),
+            smol: Some("groq/walk-target:off".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let message = run_async(crate::app::run_prewalk_command(
+        &mut handle,
+        "restart groq/walk-target:off openai/walk-source:off",
+        &config,
+        dir.path(),
+        |_| None,
+    ))
+    .unwrap();
+    assert!(message.starts_with("Prewalk restarted"));
+    assert_eq!(
+        handle.model(),
+        ("groq".to_string(), "walk-target".to_string())
+    );
+    assert_eq!(handle.prewalk_target(), Some(&prewalk_source()));
+
+    run_async(crate::app::run_prewalk_command(
+        &mut handle,
+        "off",
+        &config,
+        dir.path(),
+        |_| None,
+    ))
+    .unwrap();
+    run_async(crate::app::run_prewalk_command(
+        &mut handle,
+        "restart",
+        &config,
+        dir.path(),
+        |_| None,
+    ))
+    .unwrap();
+    assert_eq!(
+        handle.model(),
+        ("openai".to_string(), "walk-source".to_string())
+    );
+    assert_eq!(handle.prewalk_target(), Some(&prewalk_destination()));
+
+    // The same command resolves a live role reassignment at execution time.
+    run_async(crate::app::run_prewalk_command(
+        &mut handle,
+        "restart",
+        &config,
+        dir.path(),
+        |role| (role == crate::models::ModelRole::Slow).then(|| "groq/walk-target:off".to_string()),
+    ))
+    .unwrap();
+    assert_eq!(
+        handle.model(),
+        ("groq".to_string(), "walk-target".to_string())
+    );
+    assert!(handle.prewalk_target().is_none());
+    run_async(crate::app::run_prewalk_command(
+        &mut handle,
+        "restart",
+        &config,
+        dir.path(),
+        |_| None,
+    ))
+    .unwrap();
+    assert_eq!(
+        handle.model(),
+        ("openai".to_string(), "walk-source".to_string())
+    );
+
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    for (command, disabled, expected) in [
+        ("restart @slow @smol extra", None, "Usage: /prewalk"),
+        ("restart", Some("openai"), "provider is disabled"),
+        ("restart", Some("groq"), "provider is disabled"),
+    ] {
+        config.disabled_providers = disabled.map(|provider| vec![provider.to_string()]);
+        let error = run_async(crate::app::run_prewalk_command(
+            &mut handle,
+            command,
+            &config,
+            dir.path(),
+            |_| None,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(
+            handle.model(),
+            ("openai".to_string(), "walk-source".to_string())
+        );
+        assert_eq!(handle.prewalk_target(), Some(&prewalk_destination()));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    source.finish();
+    target.finish();
+    assert!(source.requests.lock().unwrap().is_empty());
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn prewalk_cross_provider_persists_the_whole_batch_and_retains_hook_prompt_across_retry() {

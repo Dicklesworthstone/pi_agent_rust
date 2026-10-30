@@ -509,12 +509,16 @@ pub struct TitlingSettings {
     pub auto_title: Option<bool>,
 }
 
-/// Prewalk is off unless explicitly enabled. The destination is the `smol`
-/// model role; CLI `--prewalk-into` can choose a destination for one launch.
+/// Prewalk is off unless explicitly enabled. Selectors are resolved when a
+/// cycle is armed; command overrides never change these saved defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrewalkSettings {
     pub enabled: Option<bool>,
+    /// Planning model selected by `/prewalk restart` (default: `@default`).
+    pub from: Option<String>,
+    /// Handoff destination (default: `@smol`).
+    pub into: Option<String>,
 }
 
 /// A path-scoped model-set override (bd-cv653.3.2).
@@ -1014,6 +1018,8 @@ impl Config {
             prewalk: match (base.prewalk, other.prewalk) {
                 (Some(base), Some(other)) => Some(PrewalkSettings {
                     enabled: other.enabled.or(base.enabled),
+                    from: other.from.or(base.from),
+                    into: other.into.or(base.into),
                 }),
                 (base, other) => other.or(base),
             },
@@ -1179,6 +1185,24 @@ impl Config {
             .as_ref()
             .and_then(|t| t.auto_title)
             .unwrap_or(true)
+    }
+
+    /// Planning selector for an explicit prewalk restart.
+    #[must_use]
+    pub fn prewalk_from(&self) -> &str {
+        self.prewalk
+            .as_ref()
+            .and_then(|settings| settings.from.as_deref())
+            .unwrap_or("@default")
+    }
+
+    /// Destination for startup arming and commands without an override.
+    #[must_use]
+    pub fn prewalk_into(&self) -> &str {
+        self.prewalk
+            .as_ref()
+            .and_then(|settings| settings.into.as_deref())
+            .unwrap_or("@smol")
     }
 
     /// Seconds before the primary model is retried after a failover
@@ -2658,6 +2682,41 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn prewalk_selectors_merge_independently_without_enabling_the_workflow()
+    -> serde_json::Result<()> {
+        let base: Config = serde_json::from_value(json!({
+            "prewalk": {"enabled": true, "from": "@slow", "into": "@smol"}
+        }))?;
+        let project: Config = serde_json::from_value(json!({
+            "prewalk": {"enabled": false, "into": "openai/gpt-5-mini:low"}
+        }))?;
+        let merged = Config::merge(base, project);
+        assert_eq!(
+            merged
+                .prewalk
+                .as_ref()
+                .and_then(|settings| settings.enabled),
+            Some(false)
+        );
+        assert_eq!(merged.prewalk_from(), "@slow");
+        assert_eq!(merged.prewalk_into(), "openai/gpt-5-mini:low");
+
+        let selectors_only: Config = serde_json::from_value(json!({
+            "prewalk": {"from": "@plan", "into": "@default"}
+        }))?;
+        assert_eq!(
+            selectors_only
+                .prewalk
+                .as_ref()
+                .and_then(|settings| settings.enabled),
+            None
+        );
+        assert_eq!(Config::default().prewalk_from(), "@default");
+        assert_eq!(Config::default().prewalk_into(), "@smol");
+        Ok(())
+    }
 
     #[test]
     fn session_cost_thresholds_validate_and_merge_individually() {

@@ -1367,6 +1367,7 @@ fn editor_prewalk_requires_explicit_intent_and_validates_workspace_policy() {
         );
         options.config.prewalk = Some(crate::config::PrewalkSettings {
             enabled: Some(true),
+            ..Default::default()
         });
         let params = json!({"cwd": root.path(), "mcpServers": []});
         let (_, mut state) = handle_session_new(&params, &options, None).unwrap();
@@ -1418,6 +1419,20 @@ fn editor_prewalk_requires_explicit_intent_and_validates_workspace_policy() {
                 .prewalk_target()
                 .is_none()
         );
+        options.launch.no_prewalk = false;
+        options.launch.smol = None;
+        options.config.model_scope_overrides = None;
+        options.config.prewalk.as_mut().unwrap().into =
+            Some(format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}"));
+        arm_acp_prewalk(&mut state, &options).await.unwrap();
+        let target = state
+            .agent_session
+            .as_ref()
+            .unwrap()
+            .prewalk_target()
+            .unwrap();
+        assert_eq!(target.provider, FALLBACK_PROVIDER);
+        assert_eq!(target.model, FALLBACK_MODEL);
     });
 }
 

@@ -739,10 +739,13 @@ impl PiApp {
         }
         // The source stays live if any candidate preparation fails. Once
         // retirement succeeds, install the replacement without another await.
-        if save_enabled && retiring_session && let Some(budget) = agent_guard.cost_budget() {
-            budget.retire_session(&session_guard, cx.cx()).map_err(|_| {
-                "Failed to preserve background model spend; session change was not applied"
-            })?;
+        if save_enabled
+            && retiring_session
+            && let Some(budget) = agent_guard.cost_budget()
+        {
+            budget.retire_session(&session_guard, cx.cx()).map_err(
+                |_| "Failed to preserve background model spend; session change was not applied",
+            )?;
         }
         *session_guard = new_session;
         agent_guard.set_cost_budget(cost_budget);
@@ -2112,6 +2115,13 @@ pub enum PiMsg {
     SystemNote(String),
     /// Session-bound system note; discarded if its origin is no longer current.
     SessionSystemNote {
+        owner_session_id: String,
+        message: String,
+    },
+    /// A durable async selection completed. Read the owning session's current
+    /// model when delivered, so an older completion cannot overwrite a newer
+    /// selection or relabel a replacement session.
+    SessionModelChanged {
         owner_session_id: String,
         message: String,
     },

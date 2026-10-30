@@ -2831,6 +2831,19 @@ impl AgentSessionHandle {
         self.session.arm_prewalk(target).await
     }
 
+    /// Durably return to a planning model and arm its implementation model.
+    /// Both destinations are validated before changing the session. A
+    /// successful restart retires the previous automatic fallback cycle.
+    pub async fn restart_prewalk(
+        &mut self,
+        source: crate::prewalk::PrewalkTarget,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        let armed = self.session.restart_prewalk(source, target).await?;
+        self.failover_state.clear();
+        Ok(armed)
+    }
+
     #[must_use]
     pub fn prewalk_target(&self) -> Option<&crate::prewalk::PrewalkTarget> {
         self.session.agent.prewalk_target()

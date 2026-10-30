@@ -1335,6 +1335,46 @@ impl PiApp {
                     attempts_remaining,
                 );
             }
+            PiMsg::SessionModelChanged {
+                owner_session_id,
+                message,
+            } => {
+                let selection: std::result::Result<_, ()> = (|| {
+                    let agent = self.agent.try_lock().map_err(|_| ())?;
+                    let session = self.session.try_lock().map_err(|_| ())?;
+                    if session.header.id != owner_session_id {
+                        return Ok(None);
+                    }
+                    Ok(Some((
+                        agent.handle.model(),
+                        agent.handle.session().current_model_entry(),
+                    )))
+                })();
+                let ((provider, model), entry) = match selection {
+                    Ok(Some(selection)) => selection,
+                    Ok(None) => return None,
+                    Err(()) => {
+                        return self.retry_busy_session_event(
+                            PiMsg::SessionModelChanged {
+                                owner_session_id,
+                                message,
+                            },
+                            attempts_remaining,
+                        );
+                    }
+                };
+                self.model = format!("{provider}/{model}");
+                if let Some(entry) = entry {
+                    self.model_entry = entry.clone();
+                    if let Ok(mut shared) = self.model_entry_shared.lock() {
+                        *shared = entry;
+                    }
+                }
+                self.status_message = Some(message.clone());
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
+                self.scroll_to_bottom();
+            }
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
@@ -6197,6 +6237,41 @@ mod stream_delta_batcher_tests {
             matches!(app.agent_state, AgentState::Processing),
             "current idle-session input must still run"
         );
+    }
+
+    #[test]
+    fn async_model_completion_refreshes_current_selection_and_rejects_replaced_owner() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let session_id = app.session.try_lock().unwrap().header.id.clone();
+        let (provider, model) = app.agent.try_lock().unwrap().handle.model();
+        app.model = "stale/display".to_string();
+        let agent = Arc::clone(&app.agent);
+        let held = agent.try_lock().unwrap();
+        assert!(
+            app.handle_pi_message(PiMsg::SessionModelChanged {
+                owner_session_id: session_id.clone(),
+                message: "pending restart".to_string(),
+            })
+            .is_some(),
+            "a contended model refresh must be retried"
+        );
+        drop(held);
+        let _ = app.handle_pi_message(PiMsg::SessionModelChanged {
+            owner_session_id: session_id.clone(),
+            message: "restart completed".to_string(),
+        });
+        assert_eq!(app.model, format!("{provider}/{model}"));
+        assert_eq!(app.status_message.as_deref(), Some("restart completed"));
+
+        app.session.try_lock().unwrap().header.id = "replacement-session".to_string();
+        app.model = "replacement/display".to_string();
+        let count = app.messages.len();
+        let _ = app.handle_pi_message(PiMsg::SessionModelChanged {
+            owner_session_id: session_id,
+            message: "obsolete restart".to_string(),
+        });
+        assert_eq!(app.model, "replacement/display");
+        assert_eq!(app.messages.len(), count);
     }
 
     #[test]

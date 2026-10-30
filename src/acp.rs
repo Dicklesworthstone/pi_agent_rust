@@ -1162,16 +1162,14 @@ async fn run(
                                 continue;
                             }
                         };
-                        let message_content = match content::extract_prompt_content(
-                            prompt_blocks,
-                            &options.config,
-                        ) {
-                            Ok(content) => content,
-                            Err(err) => {
-                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
-                                continue;
-                            }
-                        };
+                        let message_content =
+                            match content::extract_prompt_content(prompt_blocks, &options.config) {
+                                Ok(content) => content,
+                                Err(err) => {
+                                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
+                                    continue;
+                                }
+                            };
 
                         let session_state = {
                             sessions
@@ -2422,7 +2420,9 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
         .model_registry()
         .ok_or_else(|| Error::config("Prewalk requires a model registry"))?;
     let target = crate::app::resolve_prewalk_target(
-        cli.prewalk_into.as_deref().unwrap_or("@smol"),
+        cli.prewalk_into
+            .as_deref()
+            .unwrap_or_else(|| options.config.prewalk_into()),
         &cli,
         &options.config,
         registry,

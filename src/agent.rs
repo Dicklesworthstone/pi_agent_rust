@@ -17176,6 +17176,94 @@ impl AgentSession {
         Ok(Some(target))
     }
 
+    /// Return to a planning model and arm a new one-shot handoff. Both
+    /// registered models and their credentials are admitted before changing
+    /// the active model or its persisted history. An existing arm must name
+    /// the same normalized destination; callers must disarm it explicitly to
+    /// replace it. A fresh cycle requires a new todo when that tool is enabled.
+    #[allow(clippy::too_many_lines)]
+    pub async fn restart_prewalk(
+        &mut self,
+        source: crate::prewalk::PrewalkTarget,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        self.ensure_provider_reentry_allowed()?;
+        let session_actions = self.session_action_admission.clone();
+        let origin = session_actions.capture_origin();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let _session_action = session_actions.acquire_origin(&origin).await?;
+
+        let registry = self
+            .model_registry
+            .as_ref()
+            .ok_or_else(|| Error::validation("PREWALK_SOURCE: select a registered model"))?;
+        let source_entry = registry
+            .find(&source.provider, &source.model)
+            .ok_or_else(|| Error::validation("PREWALK_SOURCE: select a registered model"))?;
+        let target_entry = registry
+            .find(&target.provider, &target.model)
+            .ok_or_else(|| Error::validation("PREWALK_TARGET: select a registered model"))?;
+        let source = self.prepare_model_selection(
+            &source_entry.model.provider,
+            &source_entry.model.id,
+            source.thinking.unwrap_or_else(|| {
+                self.agent
+                    .stream_options()
+                    .thinking_level
+                    .unwrap_or_default()
+            }),
+        )?;
+        let prepared_target = self.prepare_model_selection(
+            &target_entry.model.provider,
+            &target_entry.model.id,
+            target.thinking.unwrap_or(source.thinking_level),
+        )?;
+        let target = crate::prewalk::PrewalkTarget {
+            provider: prepared_target.provider_id,
+            model: prepared_target.model_id,
+            thinking: Some(prepared_target.thinking_level),
+        };
+        if self
+            .agent
+            .prewalk_target()
+            .is_some_and(|current| current != &target)
+        {
+            return Err(Error::validation(
+                "PREWALK_ARMED: the requested destination differs from the armed handoff; disarm prewalk before changing its destination",
+            ));
+        }
+        let next = if source.provider_id == target.provider
+            && source.model_id == target.model
+            && Some(source.thinking_level) == target.thinking
+        {
+            None
+        } else {
+            Some(self.agent.prewalk.clone().unwrap_or_else(|| {
+                let todo_ready = self.agent.shared_tools().snapshot().get("todo").is_none();
+                crate::prewalk::PrewalkState::new(target.clone(), todo_ready)
+            }))
+        };
+
+        self.set_provider_model_selection(
+            &source.provider_id,
+            &source.model_id,
+            source.thinking_level,
+            ProviderSwapAdmission::Held(&authority),
+            false,
+        )
+        .await?;
+        // No await may separate durable source installation from the arm.
+        // On a failed save, the previous arm and live model remain untouched.
+        self.agent.prewalk = next;
+        self.agent.prewalk_budget = None;
+        if let Some(policy) = &mut self.child_fallback_policy {
+            policy.use_default_role();
+        }
+        Ok(self.agent.prewalk_target().cloned())
+    }
+
     /// Update the thinking/reasoning level for this session at runtime.
     ///
     /// Clamps the requested level to what the active model supports (e.g. a

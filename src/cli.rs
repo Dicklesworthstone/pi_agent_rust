@@ -393,11 +393,11 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub subagent_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
 
-    /// Plan with the initial model, then hand off to @smol after the first edit.
+    /// Plan with the initial model, then hand off to prewalk.into (default @smol).
     #[arg(long, conflicts_with = "no_prewalk")]
     pub prewalk: bool,
 
-    /// Prewalk destination: provider/model[:thinking] or an explicit @role.
+    /// Override prewalk.into: provider/model[:thinking] or an explicit @role.
     #[arg(long, value_name = "MODEL_OR_ROLE", conflicts_with = "no_prewalk")]
     pub prewalk_into: Option<String>,
 

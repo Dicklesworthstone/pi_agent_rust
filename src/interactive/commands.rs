@@ -414,7 +414,7 @@ impl SlashCommand {
   /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
   /mcp               - Manage MCP servers: list, add, remove, test, trust, reauth, unauth
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
-  /prewalk [status|off] - Hand off to @smol after planning and the first edit
+  /prewalk [into]    - Arm a model handoff; restart [from] [into], status, off
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
   /handoff [focus]   - Compact context into a continuation brief in this session
   /handoff --report [to] [path] - Generate or deliver a local session report
@@ -3236,97 +3236,81 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
-    #[allow(clippy::too_many_lines)]
     fn handle_slash_prewalk(&mut self, args: &str) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
             self.status_message =
                 Some("Wait for the current turn before changing prewalk".to_string());
             return None;
         }
-        let Ok(mut agent) = self.agent.try_lock() else {
+        if let Err(usage) = crate::prewalk::PrewalkCommand::parse(args) {
+            self.status_message = Some(usage.to_string());
+            return None;
+        }
+        let Ok(agent) = self.agent.try_lock() else {
             self.status_message = Some("Agent busy; try again".to_string());
             return None;
         };
-        match args.trim() {
-            "off" => {
-                agent.handle.disarm_prewalk();
-                self.status_message = Some("Prewalk disarmed".to_string());
-                return None;
-            }
-            "status" => {
-                self.status_message = Some(agent.handle.prewalk_target().map_or_else(
-                    || "Prewalk is not armed".to_string(),
-                    |target| format!("Prewalk armed → {}", target.label()),
-                ));
-                return None;
-            }
-            "" => {}
-            _ => {
-                self.status_message = Some("Usage: /prewalk [status|off]".to_string());
-                return None;
-            }
-        }
-        let target = if let Some(target) = agent.handle.prewalk_target() {
-            target.clone()
-        } else {
-            let spec = self
-                .role_model_overrides
-                .get(&ModelRole::Smol)
-                .map(|(provider, model)| format!("{provider}/{model}"))
-                .or_else(|| {
-                    self.config
-                        .model_roles
-                        .as_ref()
-                        .and_then(|roles| roles.smol.clone())
-                });
-            let Some(spec) = spec else {
-                self.status_message = Some(
-                    "Prewalk requires a configured @smol model; use /model smol provider/model"
-                        .to_string(),
-                );
-                return None;
-            };
-            let Some(registry) = agent.handle.session().model_registry() else {
-                self.status_message = Some("Prewalk requires a model registry".to_string());
-                return None;
-            };
-            match crate::app::resolve_prewalk_model_spec(&spec, &self.config, registry, &self.cwd) {
-                Ok(target) => target,
-                Err(error) => {
-                    self.status_message = Some(format!("Prewalk: {error}"));
-                    return None;
-                }
-            }
-        };
         let owner = self.displayed_session_id.clone();
         drop(agent);
+        let command = args.to_string();
+        let restarting = matches!(
+            crate::prewalk::PrewalkCommand::parse(args),
+            Ok(crate::prewalk::PrewalkCommand::Restart { .. })
+        );
+        let config = self.config.clone();
+        let cwd = self.cwd.clone();
+        let roles = self.role_model_overrides.clone();
         let agent = Arc::clone(&self.agent);
         let event_tx = self.event_tx.clone();
         self.runtime_handle.spawn(async move {
             let cx = Cx::for_request();
-            let note = match OwnedMutexGuard::lock(agent, &cx).await {
+            let message = match OwnedMutexGuard::lock(agent, &cx).await {
                 Ok(mut agent) => {
-                    let current = agent
+                    let Ok(current) = agent
                         .handle
                         .with_session(|session| session.header.id.clone())
-                        .await;
-                    if current.ok().as_ref() != owner.as_ref() {
+                        .await
+                    else {
+                        return;
+                    };
+                    if Some(&current) != owner.as_ref() {
                         return;
                     }
-                    match agent.handle.arm_prewalk(target).await {
-                        Ok(Some(target)) => format!("Prewalk armed → {}", target.label()),
-                        Ok(None) => {
-                            "Prewalk: nothing to switch; target model and thinking already match"
-                                .to_string()
+                    match crate::app::run_prewalk_command(
+                        &mut agent.handle,
+                        &command,
+                        &config,
+                        &cwd,
+                        |role| {
+                            roles
+                                .get(&role)
+                                .map(|(provider, model)| format!("{provider}/{model}"))
+                        },
+                    )
+                    .await
+                    {
+                        Ok(note) if restarting => {
+                            agent.plan_state().take_previous_model();
+                            PiMsg::SessionModelChanged {
+                                owner_session_id: current,
+                                message: note,
+                            }
                         }
-                        Err(error) => format!("Prewalk: {error}"),
+                        Ok(note) => PiMsg::SessionSystemNote {
+                            owner_session_id: current,
+                            message: note,
+                        },
+                        Err(error) => PiMsg::SessionSystemNote {
+                            owner_session_id: current,
+                            message: format!("Prewalk: {error}"),
+                        },
                     }
                 }
-                Err(error) => format!("Prewalk: {error}"),
+                Err(error) => PiMsg::SystemNote(format!("Prewalk: {error}")),
             };
-            let _ = enqueue_pi_event(&event_tx, &cx, PiMsg::SystemNote(note)).await;
+            let _ = enqueue_pi_event(&event_tx, &cx, message).await;
         });
-        self.status_message = Some("Arming prewalk...".to_string());
+        self.status_message = Some("Updating prewalk...".to_string());
         None
     }
 

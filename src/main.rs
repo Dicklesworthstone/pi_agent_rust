@@ -2673,7 +2673,9 @@ async fn run(
                     == Some(true)));
     let prewalk_target = if prewalk_enabled {
         Some(pi::app::resolve_prewalk_target(
-            cli.prewalk_into.as_deref().unwrap_or("@smol"),
+            cli.prewalk_into
+                .as_deref()
+                .unwrap_or_else(|| config.prewalk_into()),
             &cli,
             &config,
             &model_registry,
@@ -2872,14 +2874,15 @@ async fn run(
                 }),
                 plan_disabled_providers: disabled_providers.clone(),
                 plan_scope_overrides: config.model_scope_overrides.clone().unwrap_or_default(),
-                prewalk_target: pi::app::resolve_prewalk_target(
-                    "@smol",
-                    &cli,
-                    &config,
-                    &model_registry,
-                    &cwd,
-                )
-                .ok(),
+                prewalk_role_overrides: [
+                    (pi::models::ModelRole::Smol, cli.smol.clone()),
+                    (pi::models::ModelRole::Slow, cli.slow.clone()),
+                    (pi::models::ModelRole::Plan, cli.plan.clone()),
+                    (pi::models::ModelRole::Advisor, cli.advisor.clone()),
+                ]
+                .into_iter()
+                .filter_map(|(role, spec)| spec.map(|spec| (role, spec)))
+                .collect(),
                 initial_content: initial,
                 initial_messages: messages,
                 double_escape_action: pi::interactive_ftui::DoubleEscapeAction::from_setting(
@@ -3515,11 +3518,20 @@ async fn run(
             cli.api_key.clone(),
         );
 
+        // Preserve launch role assignments in the classic command surface.
+        // This is an in-memory view; command overrides never rewrite settings.
+        let mut interactive_config = config.clone();
+        let roles = interactive_config.model_roles.get_or_insert_default();
+        roles.smol = cli.smol.clone().or_else(|| roles.smol.take());
+        roles.slow = cli.slow.clone().or_else(|| roles.slow.take());
+        roles.plan = cli.plan.clone().or_else(|| roles.plan.take());
+        roles.advisor = cli.advisor.clone().or_else(|| roles.advisor.take());
+
         Box::pin(run_interactive_mode(
             agent_session,
             initial,
             messages,
-            config.clone(),
+            interactive_config,
             selection.model_entry.clone(),
             model_scope,
             available_models,

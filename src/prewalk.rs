@@ -9,6 +9,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ThinkingLevel, ToolCall, ToolResultMessage};
 
+pub const COMMAND_USAGE: &str = "Usage: /prewalk [into] | restart [from] [into] | status | off";
+
+/// Shared syntax for both terminal frontends. Only command keywords are case
+/// insensitive; model IDs and role selectors retain their exact spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrewalkCommand<'a> {
+    Arm {
+        into: Option<&'a str>,
+    },
+    Restart {
+        from: Option<&'a str>,
+        into: Option<&'a str>,
+    },
+    Status,
+    Off,
+}
+
+impl<'a> PrewalkCommand<'a> {
+    pub fn parse(input: &'a str) -> Result<Self, &'static str> {
+        let mut words = input.split_whitespace();
+        let Some(first) = words.next() else {
+            return Ok(Self::Arm { into: None });
+        };
+        let command = if first.eq_ignore_ascii_case("restart") {
+            Self::Restart {
+                from: words.next(),
+                into: words.next(),
+            }
+        } else if first.eq_ignore_ascii_case("status") {
+            Self::Status
+        } else if first.eq_ignore_ascii_case("off") {
+            Self::Off
+        } else {
+            Self::Arm { into: Some(first) }
+        };
+        if words.next().is_some() {
+            return Err(COMMAND_USAGE);
+        }
+        Ok(command)
+    }
+}
+
 /// Explicit destination for an OMP-style prewalk. Credentials are resolved by
 /// the owning session at admission and again when installing the destination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +182,48 @@ fn project_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn command_selectors_preserve_case_and_reject_extra_arguments() {
+        assert_eq!(
+            PrewalkCommand::parse("  "),
+            Ok(PrewalkCommand::Arm { into: None })
+        );
+        assert_eq!(
+            PrewalkCommand::parse("Provider/Model:high"),
+            Ok(PrewalkCommand::Arm {
+                into: Some("Provider/Model:high")
+            })
+        );
+        assert_eq!(
+            PrewalkCommand::parse("ReStArT @slow Provider/Model:low"),
+            Ok(PrewalkCommand::Restart {
+                from: Some("@slow"),
+                into: Some("Provider/Model:low"),
+            })
+        );
+        assert_eq!(
+            PrewalkCommand::parse("restart @plan"),
+            Ok(PrewalkCommand::Restart {
+                from: Some("@plan"),
+                into: None
+            })
+        );
+        assert_eq!(PrewalkCommand::parse("STATUS"), Ok(PrewalkCommand::Status));
+        assert_eq!(PrewalkCommand::parse("Off"), Ok(PrewalkCommand::Off));
+        for invalid in [
+            "status extra",
+            "off @smol",
+            "@smol extra",
+            "restart @slow @smol extra",
+        ] {
+            assert_eq!(
+                PrewalkCommand::parse(invalid),
+                Err(COMMAND_USAGE),
+                "{invalid}"
+            );
+        }
+    }
 
     fn target() -> PrewalkTarget {
         PrewalkTarget {

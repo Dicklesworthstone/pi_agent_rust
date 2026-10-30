@@ -18,7 +18,7 @@ use pi::extensions_js::PiJsRuntimeConfig;
 use pi::package_manager::{PackageManager, PackageScope, ResolveRoots};
 use pi::session::encode_cwd;
 use pi::tools::ToolRegistry;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -4495,12 +4495,15 @@ fn configure_prewalk_cli(
     server
 }
 
-fn run_prewalk_cli(harness: &CliTestHarness, mode: &str, tool_limit: &str) -> CliResult {
+fn run_prewalk_cli(
+    harness: &CliTestHarness,
+    mode: &str,
+    tool_limit: &str,
+    into: Option<&str>,
+) -> CliResult {
     let mut args = vec![
         "--mode",
         mode,
-        "--prewalk-into",
-        "prewalk-target/target:off",
         // Print and RPC runs have no approval surface, so the default
         // always-ask mode denies the edit and nothing arms the handoff.
         "--approval-mode",
@@ -4516,6 +4519,11 @@ fn run_prewalk_cli(harness: &CliTestHarness, mode: &str, tool_limit: &str) -> Cl
         "--max-tool-iterations",
         tool_limit,
     ];
+    if let Some(into) = into {
+        args.extend(["--prewalk-into", into]);
+    } else {
+        args.push("--prewalk");
+    }
     if mode == "rpc" {
         harness.run_with_stdin(
             &args,
@@ -4593,7 +4601,7 @@ fn e2e_cli_print_prewalk_continues_even_with_retries_disabled() {
     for mode in ["text", "json"] {
         let harness = CliTestHarness::new(&format!("print_prewalk_{mode}"));
         let server = configure_prewalk_cli(&harness, vec![prewalk_stream_response(None)], 0);
-        let result = run_prewalk_cli(&harness, mode, "8");
+        let result = run_prewalk_cli(&harness, mode, "8", Some("prewalk-target/target:off"));
         assert_exit_code(&harness.harness, &result, 0);
         assert_contains(
             &harness.harness,
@@ -4630,7 +4638,7 @@ fn e2e_cli_rpc_prewalk_retries_the_destination_without_replaying_tools() {
         ],
         1,
     );
-    let result = run_prewalk_cli(&harness, "rpc", "8");
+    let result = run_prewalk_cli(&harness, "rpc", "8", Some("prewalk-target/target:off"));
     assert_exit_code(&harness.harness, &result, 0);
     assert_prewalk_cli_transcript(&harness, &server, 3);
     let events = parse_json_mode_stdout_lines(&result.stdout);
@@ -4671,7 +4679,7 @@ fn e2e_cli_prewalk_preserves_the_original_tool_iteration_limit() {
             vec![prewalk_stream_response(Some("must-not-execute.txt"))],
             0,
         );
-        let result = run_prewalk_cli(&harness, mode, "1");
+        let result = run_prewalk_cli(&harness, mode, "1", Some("prewalk-target/target:off"));
         assert_prewalk_cli_transcript(&harness, &server, 2);
         assert!(!harness.harness.temp_path("must-not-execute.txt").exists());
         let events = parse_json_mode_stdout_lines(&result.stdout);
@@ -4687,6 +4695,40 @@ fn e2e_cli_prewalk_preserves_the_original_tool_iteration_limit() {
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn e2e_cli_prewalk_into_settings_and_launch_overrides_reach_native_drivers() {
+    for mode in ["text", "json", "rpc"] {
+        for explicit in [false, true] {
+            let harness = CliTestHarness::new(&format!("prewalk_config_{mode}_{explicit}"));
+            let server = configure_prewalk_cli(&harness, vec![prewalk_stream_response(None)], 0);
+            let settings_path = &harness.env["PI_CONFIG_PATH"];
+            let mut settings: Value =
+                serde_json::from_slice(&fs::read(settings_path).unwrap()).unwrap();
+            settings["prewalk"] = json!({
+                "enabled": false,
+                // from is for restart; startup must not resolve or select it.
+                "from": "unregistered/planner",
+                "into": if explicit { "unregistered/target" } else { "prewalk-target/target:off" }
+            });
+            settings["modelRoles"] = json!({"smol": "prewalk-source/source"});
+            fs::write(settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+            let result = run_prewalk_cli(
+                &harness,
+                mode,
+                "8",
+                explicit.then_some("prewalk-target/target:off"),
+            );
+            assert_exit_code(&harness.harness, &result, 0);
+            assert_prewalk_cli_transcript(&harness, &server, 2);
+            let after: Value = serde_json::from_slice(&fs::read(settings_path).unwrap()).unwrap();
+            assert_eq!(
+                after, settings,
+                "launch selectors must not rewrite configuration"
+            );
+        }
     }
 }
 

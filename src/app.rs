@@ -1360,20 +1360,64 @@ pub fn resolve_prewalk_target(
     registry: &ModelRegistry,
     cwd: &Path,
 ) -> Result<crate::prewalk::PrewalkTarget> {
+    resolve_prewalk_selector(spec, config, registry, cwd, |role| {
+        role_spec_from_cli(cli, role).map(str::to_string)
+    })
+}
+
+/// Strict selector resolution shared by launch flags and live commands.
+/// Runtime role assignments take precedence over settings. `@default` uses
+/// the configured default, never the transient model left by a handoff.
+pub fn resolve_prewalk_selector(
+    spec: &str,
+    config: &Config,
+    registry: &ModelRegistry,
+    cwd: &Path,
+    role_override: impl FnOnce(ModelRole) -> Option<String>,
+) -> Result<crate::prewalk::PrewalkTarget> {
     let spec = spec.trim();
-    let spec = if let Some(name) = spec.strip_prefix('@') {
+    let (selector, thinking) = match spec.rsplit_once(':') {
+        Some((prefix, suffix)) if parse_thinking_level_opt(suffix).is_some() => {
+            (prefix, parse_thinking_level_opt(suffix))
+        }
+        _ => (spec, None),
+    };
+    let mut target = if let Some(name) = selector.strip_prefix('@') {
         let role = ModelRole::from_name(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown prewalk role: {spec}"))?;
-        role_spec_from_cli(cli, role)
-            .or_else(|| config.model_roles.as_ref()
-                .and_then(|roles| role_spec_from_settings(roles, role)))
+        let configured = role_override(role).or_else(|| {
+            config
+                .model_roles
+                .as_ref()
+                .and_then(|roles| role_spec_from_settings(roles, role))
+                .map(str::to_string)
+        });
+        let uses_legacy_default = configured.is_none() && role == ModelRole::Default;
+        let configured = if uses_legacy_default {
+            resolve_configured_model(config, registry, &[])?
+                .map(|(entry, _)| format!("{}/{}", entry.model.provider, entry.model.id))
+        } else {
+            configured
+        };
+        let configured = configured
             .ok_or_else(|| anyhow::anyhow!(
-                "Prewalk requires an explicit {spec} destination; configure modelRoles.{role} or use --prewalk-into provider/model"
-            ))?
+                "Prewalk requires an explicit {selector} model; configure modelRoles.{role} or select provider/model"
+            ))?;
+        let mut target = resolve_prewalk_model_spec(&configured, config, registry, cwd)?;
+        if uses_legacy_default && target.thinking.is_none() {
+            target.thinking = config
+                .default_thinking_level
+                .as_deref()
+                .and_then(parse_thinking_level_opt);
+        }
+        target
     } else {
-        spec
+        resolve_prewalk_model_spec(spec, config, registry, cwd)?
     };
-    resolve_prewalk_model_spec(spec, config, registry, cwd)
+    if thinking.is_some() {
+        target.thinking = thinking;
+    }
+    Ok(target)
 }
 
 /// Resolve a concrete prewalk model spec under the workspace provider policy.
@@ -1404,15 +1448,101 @@ pub fn resolve_prewalk_model_spec(
         scope,
         &entry.model.provider,
     ) {
-        bail!(
-            "Prewalk destination provider is disabled: {}",
-            entry.model.provider
-        );
+        bail!("Prewalk provider is disabled: {}", entry.model.provider);
     }
     Ok(crate::prewalk::PrewalkTarget {
         provider: entry.model.provider,
         model: entry.model.id,
         thinking,
+    })
+}
+
+/// Execute a user-authored prewalk command through the owning SDK session.
+/// Both frontends share selection, validation, restart, and status behavior.
+pub(crate) async fn run_prewalk_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    input: &str,
+    config: &Config,
+    cwd: &Path,
+    role_override: impl Fn(ModelRole) -> Option<String>,
+) -> Result<String> {
+    use crate::prewalk::PrewalkCommand;
+
+    let command = PrewalkCommand::parse(input).map_err(anyhow::Error::msg)?;
+    match command {
+        PrewalkCommand::Off => {
+            handle.disarm_prewalk();
+            return Ok("Prewalk disarmed".to_string());
+        }
+        PrewalkCommand::Status => {
+            return Ok(handle.prewalk_target().map_or_else(
+                || "Prewalk is not armed".to_string(),
+                |target| format!("Prewalk armed → {}", target.label()),
+            ));
+        }
+        PrewalkCommand::Arm { into: None } => {
+            if let Some(target) = handle.prewalk_target() {
+                return Ok(format!("Prewalk armed → {}", target.label()));
+            }
+        }
+        PrewalkCommand::Restart { .. } | PrewalkCommand::Arm { into: Some(_) } => {}
+    }
+    let (source, target) = {
+        let registry = handle
+            .session()
+            .model_registry()
+            .ok_or_else(|| anyhow::anyhow!("Prewalk requires a model registry"))?;
+        let resolve =
+            |spec: &str| resolve_prewalk_selector(spec, config, registry, cwd, &role_override);
+        match command {
+            PrewalkCommand::Arm { into } => (
+                None,
+                resolve(into.unwrap_or_else(|| config.prewalk_into()))?,
+            ),
+            PrewalkCommand::Restart { from, into } => (
+                Some(resolve(from.unwrap_or_else(|| config.prewalk_from()))?),
+                resolve(into.unwrap_or_else(|| config.prewalk_into()))?,
+            ),
+            PrewalkCommand::Status | PrewalkCommand::Off => {
+                return Err(anyhow::anyhow!(crate::prewalk::COMMAND_USAGE));
+            }
+        }
+    };
+    if let Some(source) = source {
+        let label = source.label();
+        return Ok(match handle.restart_prewalk(source, target).await? {
+            Some(target) => format!(
+                "Prewalk restarted: using {label} for planning → {}",
+                target.label()
+            ),
+            None => format!(
+                "Prewalk reset: using {label}; destination model and thinking already match"
+            ),
+        });
+    }
+    if let Some(current) = handle.prewalk_target() {
+        let thinking = handle.session().clamp_thinking_level_for_model(
+            &target.provider,
+            &target.model,
+            target
+                .thinking
+                .or(handle.thinking_level())
+                .unwrap_or_default(),
+        );
+        if current.provider != target.provider
+            || current.model != target.model
+            || current.thinking != Some(thinking)
+        {
+            bail!(
+                "Prewalk is already armed for {}; use /prewalk off before choosing another destination",
+                current.label()
+            );
+        }
+        return Ok(format!("Prewalk armed → {}", current.label()));
+    }
+    Ok(match handle.arm_prewalk(target).await? {
+        Some(target) => format!("Prewalk armed → {}", target.label()),
+        None => "Prewalk: nothing to switch; target model and thinking already match".to_string(),
     })
 }
 
@@ -3291,6 +3421,75 @@ mod tests {
             model_roles: Some(roles),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn prewalk_selectors_use_exact_roles_and_keep_launch_default_independent() {
+        let registry = role_test_registry();
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("openai/gpt-5.5:high".to_string()),
+            smol: Some("openai/gpt-5-mini:low".to_string()),
+            ..Default::default()
+        });
+        let cli = cli::Cli::parse_from([
+            "pi",
+            "--model",
+            "anthropic/claude-haiku-4-5",
+            "--smol",
+            "openai/gpt-5.5:medium",
+        ]);
+        let default = resolve_prewalk_target("@default", &cli, &config, &registry, Path::new("."))
+            .expect("configured default");
+        assert_eq!(default.model, "gpt-5.5");
+        assert_eq!(default.thinking, Some(model::ThinkingLevel::High));
+        let override_target =
+            resolve_prewalk_target("@smol:off", &cli, &config, &registry, Path::new("."))
+                .expect("launch role with command thinking override");
+        assert_eq!(override_target.model, "gpt-5.5");
+        assert_eq!(override_target.thinking, Some(model::ThinkingLevel::Off));
+        let live = resolve_prewalk_selector("@smol", &config, &registry, Path::new("."), |_| {
+            Some("anthropic/claude-haiku-4-5".to_string())
+        })
+        .expect("live role override");
+        assert_eq!(live.provider, "anthropic");
+        assert_eq!(live.model, "claude-haiku-4-5");
+        for invalid in ["@missing", "@plan", "unknown/gpt-5.5", "openai/missing", ""] {
+            assert!(
+                resolve_prewalk_target(invalid, &cli, &config, &registry, Path::new(".")).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn prewalk_default_uses_configured_model_and_workspace_provider_policy() {
+        let registry = role_test_registry();
+        let cwd = tempfile::tempdir().expect("workspace");
+        let mut config = Config {
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+            default_thinking_level: Some("high".to_string()),
+            ..Config::default()
+        };
+        let target = resolve_prewalk_selector("@default", &config, &registry, cwd.path(), |_| None)
+            .expect("legacy default settings");
+        assert_eq!(target.model, "gpt-5.5");
+        assert_eq!(target.thinking, Some(model::ThinkingLevel::High));
+        config.default_provider = Some("anthropic".to_string());
+        config.default_model = Some("openai/gpt-5.5".to_string());
+        assert_eq!(
+            resolve_prewalk_selector("@default", &config, &registry, cwd.path(), |_| None)
+                .expect("qualified configured model wins over the separate provider"),
+            target,
+        );
+        config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+            path: cwd.path().display().to_string(),
+            disabled_providers: Some(vec!["openai".to_string()]),
+            enabled_models: None,
+        }]);
+        let error = resolve_prewalk_selector("@default", &config, &registry, cwd.path(), |_| None)
+            .expect_err("workspace policy applies to aliases too");
+        assert!(error.to_string().contains("disabled"));
     }
 
     #[test]
