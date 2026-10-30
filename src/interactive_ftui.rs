@@ -2830,6 +2830,28 @@ impl PiFtuiModel {
         }
     }
 
+    /// An edited recall becomes the current draft, so subsequent vertical
+    /// movement cannot replace it with another history entry. Compare the
+    /// actual text: cursor movement, selection, and ineffective edits must
+    /// leave untouched multiline recall traversable.
+    fn detach_edited_history(&mut self) {
+        if self.active_ask.is_some() || self.active_ext.is_some() {
+            // The reply editor is separate from the saved pre-card draft.
+            return;
+        }
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+        let unchanged = self.input_history.get(index).is_some_and(|recalled| {
+            let rope = self.input.editor().rope();
+            rope.len_bytes() == recalled.len() && rope.chars().eq(recalled.chars())
+        });
+        if !unchanged {
+            self.history_cursor = None;
+            self.history_draft.clear();
+        }
+    }
+
     /// Up/down recall applies to a draft occupying one visual row, and keeps
     /// applying once recall has begun (a recalled entry may itself wrap or
     /// contain newlines; stopping there would strand the user mid-history).
@@ -3901,6 +3923,16 @@ impl PiFtuiModel {
     /// of anything already typed. Messages the agent already received cannot
     /// be recalled; the lane guarantees each one is either here or there.
     fn restore_queued_input(&mut self) {
+        // These messages belong to the prompt editor, never to an Ask,
+        // extension, or login reply. Draining them into another input flow
+        // would lose them on dismissal or submit them as an unrelated answer.
+        if !self.input_active()
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            || self.login_pending.is_some()
+        {
+            return;
+        }
         let Some(control) = self.live_turn_control() else {
             return;
         };
@@ -3919,7 +3951,7 @@ impl PiFtuiModel {
             .collect::<Vec<_>>()
             .join("\n\n");
         let typed = self.input.text();
-        if !typed.trim().is_empty() {
+        if !typed.is_empty() {
             text.push_str("\n\n");
             text.push_str(&typed);
         }
@@ -6513,6 +6545,19 @@ impl Model for PiFtuiModel {
             }
             PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed => LoopPhase::AgentEvent,
         };
+        // Reconcile only events that can edit the draft. Streaming output,
+        // ticks, and resize events must not repeatedly scan recalled text.
+        let reconcile_history = matches!(
+            &msg,
+            PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_))
+                | PiFtuiMsg::Edited { .. }
+                | PiFtuiMsg::PastedImage(_)
+                | PiFtuiMsg::Agent(PiMsg::SetEditorText { .. } | PiMsg::RestorePendingInput { .. })
+        ) || matches!(
+            &msg,
+            PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(request))
+                if request.method == "set_editor_text"
+        );
         let cmd = match msg {
             PiFtuiMsg::Term(event) => self.handle_term(&event),
             PiFtuiMsg::Edited {
@@ -6544,6 +6589,9 @@ impl Model for PiFtuiModel {
                 Cmd::none()
             }
         };
+        if reconcile_history {
+            self.detach_edited_history();
+        }
         self.watchdog.finish(phase, probe);
         cmd
     }
@@ -13104,6 +13152,134 @@ mod tests {
             (0, 0),
             "{snapshot:?}"
         );
+        drop(turn);
+    }
+
+    fn dequeue_test_session() -> crate::sdk::AgentSessionHandle {
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("ftui-dequeue-fixture")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        )
+    }
+
+    #[test]
+    fn dequeue_preserves_queued_prompts_and_answers_until_modal_cards_close() {
+        for (extension, code, modifiers, config) in [
+            (false, KeyCode::Up, Modifiers::ALT, "{}"),
+            (
+                true,
+                KeyCode::F(6),
+                Modifiers::empty(),
+                r#"{"dequeue": ["f6"]}"#,
+            ),
+        ] {
+            let mut handle = dequeue_test_session();
+            // Keep the control lane live without polling a provider request.
+            let turn = handle.prompt_controlled(String::from("start"), |_| {});
+            let control = turn.control();
+            control.steer("steer\nfirst").expect("queue steering");
+            control
+                .follow_up("follow\nsecond")
+                .expect("queue follow-up");
+            let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+            let (_tx, model) = new_model();
+            let model = model
+                .with_turn_control(slot)
+                .with_keybindings(keybindings_from_json(config));
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new("saved\ndraft", true)));
+            if extension {
+                sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "dequeue-extension",
+                    "input",
+                    serde_json::json!({"title": "Reply"}),
+                ))));
+                assert!(sim.model().active_ext.is_some());
+            } else {
+                sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                    "dequeue-ask",
+                    vec![question("Continue?", &["yes", "no"], false)],
+                ))));
+                assert!(sim.model().active_ask.is_some());
+            }
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new("partial\nanswer", true)));
+            let cursor = sim.model().input.cursor();
+            let undo_ops = sim.model().input.undo_op_count();
+            let pending = control.snapshot();
+            sim.inject_event(key(code, modifiers));
+            assert_eq!(sim.model().input.text(), "partial\nanswer");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.undo_op_count(), undo_ops);
+            assert_eq!(control.snapshot(), pending);
+
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "saved\ndraft");
+            assert_eq!(control.snapshot(), pending);
+            sim.inject_event(key(code, modifiers));
+            assert_eq!(
+                sim.model().input.text(),
+                "steer\nfirst\n\nfollow\nsecond\n\nsaved\ndraft"
+            );
+            let pending = control.snapshot();
+            assert_eq!(
+                (pending.pending_steering, pending.pending_follow_up),
+                (0, 0)
+            );
+            drop(turn);
+        }
+    }
+
+    #[test]
+    fn dequeue_waits_for_login_and_preserves_whitespace_only_multiline_drafts() {
+        let mut handle = dequeue_test_session();
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        control
+            .follow_up("queued\nmessage")
+            .expect("queue follow-up");
+        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_turn_control(slot));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: Some(String::from("openai")),
+            accepts_empty_input: false,
+        }));
+        type_str(&mut sim, "login answer");
+        let pending = control.snapshot();
+        sim.inject_event(key(KeyCode::Up, Modifiers::ALT));
+        assert_eq!(sim.model().input.text(), "login answer");
+        assert_eq!(control.snapshot(), pending);
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: None,
+            accepts_empty_input: false,
+        }));
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new(" \n\t\n", true)));
+        sim.inject_event(key(KeyCode::Up, Modifiers::ALT));
+        assert_eq!(sim.model().input.text(), "queued\nmessage\n\n \n\t\n");
+        assert_eq!(control.snapshot().pending_follow_up, 0);
         drop(turn);
     }
 
@@ -19857,6 +20033,26 @@ mod tests {
     }
 
     #[test]
+    fn accepting_completion_detaches_recall_and_preserves_the_completed_draft() {
+        let mut sim = recalled_prompt_sim("/he", KeyBindings::default());
+        // Recall itself leaves completion closed; a real cursor action
+        // recomputes suggestions without changing the recalled text.
+        sim.inject_event(key(KeyCode::End, Modifiers::empty()));
+        assert!(sim.model().completion_visible());
+        assert_eq!(sim.model().history_cursor, Some(1));
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/help");
+        assert!(!sim.model().autocomplete.open);
+        assert_eq!(sim.model().history_cursor, None);
+
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/he");
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/help");
+        assert_eq!(sim.model().history_cursor, None);
+    }
+
+    #[test]
     fn arrow_keys_navigate_and_enter_accepts_the_highlighted_row() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
@@ -21668,6 +21864,213 @@ mod tests {
         );
         assert!(submit_rx.try_recv().is_err());
         assert!(sim.model().input.is_empty());
+    }
+
+    fn recalled_prompt_sim(
+        prompt: &str,
+        keybindings: KeyBindings,
+    ) -> ProgramSimulator<PiFtuiModel> {
+        let (_tx, mut model) = new_model();
+        model.record_history("older prompt");
+        model.record_history(prompt);
+        let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings));
+        sim.init();
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), prompt);
+        assert_eq!(sim.model().history_cursor, Some(1));
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        sim
+    }
+
+    #[test]
+    fn editing_a_recalled_prompt_keeps_configured_vertical_keys_in_the_multiline_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let bindings = keybindings_from_json(
+            r#"{"newLine": ["ctrl+n"], "cursorUp": ["f7"], "cursorDown": ["f8"]}"#,
+        );
+        let mut model = PiFtuiModel::new(rx)
+            .with_keybindings(bindings)
+            .with_submit_channel(submit_tx);
+        model.record_history("older prompt");
+        model.record_history("first");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::F(7), Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "first");
+        assert_eq!(sim.model().history_cursor, Some(1));
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+
+        sim.inject_event(key(KeyCode::Char('n'), Modifiers::CTRL));
+        assert_eq!(sim.model().history_cursor, None);
+        type_str(&mut sim, "second");
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        for (code, line) in [(KeyCode::F(7), 0), (KeyCode::F(8), 1)] {
+            sim.inject_event(key(code, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "first\nsecond");
+            assert_eq!(sim.model().input.cursor().line, line);
+            assert_eq!(sim.model().history_cursor, None);
+        }
+        assert!(submit_rx.try_recv().is_err());
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("submitted edited recall"),
+            UiCommand::Prompt(String::from("first\nsecond"))
+        );
+        assert!(submit_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn same_byte_length_replacement_detaches_recall_and_survives_history_roundtrip() {
+        let mut sim = recalled_prompt_sim("abé", KeyBindings::default());
+        sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
+        assert_eq!(sim.model().input.selected_text().as_deref(), Some("é"));
+        assert_eq!(sim.model().history_cursor, Some(1));
+        type_str(&mut sim, "è");
+        assert_eq!(sim.model().input.text(), "abè");
+        assert_eq!(sim.model().history_cursor, None);
+
+        // A one-row edit may start a fresh recall, but Down must recover the
+        // edited draft rather than the draft from before the original recall.
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "abé");
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "abè");
+        assert_eq!(sim.model().history_cursor, None);
+    }
+
+    #[test]
+    fn deleting_or_pasting_into_recall_detaches_without_losing_undo() {
+        for (config, event, expected) in [
+            ("{}", key(KeyCode::Backspace, Modifiers::empty()), "one\ntw"),
+            (
+                r#"{"deleteCharBackward": ["f6"]}"#,
+                key(KeyCode::F(6), Modifiers::empty()),
+                "one\ntw",
+            ),
+            ("{}", key(KeyCode::Char('u'), Modifiers::CTRL), "one\n"),
+            (
+                "{}",
+                Event::Paste(ftui::PasteEvent::new("\r\npaste", true)),
+                "one\ntwo\npaste",
+            ),
+        ] {
+            let mut sim = recalled_prompt_sim("one\ntwo", keybindings_from_json(config));
+            sim.inject_event(event);
+            assert_eq!(sim.model().input.text(), expected);
+            assert_eq!(sim.model().history_cursor, None);
+            sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), expected);
+            assert_eq!(sim.model().history_cursor, None);
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), "one\ntwo");
+            assert_eq!(sim.model().history_cursor, None, "undo must not reattach");
+        }
+    }
+
+    #[test]
+    fn cursor_selection_and_noop_edits_keep_untouched_multiline_recall_traversable() {
+        let mut sim = recalled_prompt_sim("first\nsecond", KeyBindings::default());
+        for (code, modifiers) in [
+            (KeyCode::Home, Modifiers::empty()),
+            (KeyCode::Char('u'), Modifiers::CTRL),
+            (KeyCode::Right, Modifiers::empty()),
+            (KeyCode::Left, Modifiers::SHIFT),
+            (KeyCode::Char(']'), Modifiers::CTRL),
+            (KeyCode::Delete, Modifiers::empty()),
+        ] {
+            sim.inject_event(key(code, modifiers));
+            assert_eq!(sim.model().input.text(), "first\nsecond");
+            assert_eq!(sim.model().history_cursor, Some(1));
+        }
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "older prompt");
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "first\nsecond");
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert!(sim.model().input.is_empty());
+        assert_eq!(sim.model().history_cursor, None);
+    }
+
+    #[test]
+    fn asynchronous_editor_writes_detach_recall_before_vertical_movement() {
+        for (message, expected) in [
+            (
+                PiFtuiMsg::Edited {
+                    text: Ok(String::from("new\n")),
+                    width: 20,
+                    height: 12,
+                },
+                "new",
+            ),
+            (
+                PiFtuiMsg::PastedImage(Some(String::from("@shot.png"))),
+                "old@shot.png ",
+            ),
+            (
+                PiFtuiMsg::Agent(PiMsg::SetEditorText {
+                    owner_session_id: String::from("current"),
+                    text: String::from("new\ntext"),
+                }),
+                "new\ntext",
+            ),
+            (
+                PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+                    owner_session_id: String::from("current"),
+                    text: String::from("queued\nlines"),
+                }),
+                "queued\nlines\n\nold",
+            ),
+            (
+                PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "set-draft",
+                    "set_editor_text",
+                    serde_json::json!({"text": "new"}),
+                ))),
+                "new",
+            ),
+        ] {
+            let mut sim = recalled_prompt_sim("old", KeyBindings::default());
+            sim.send(message);
+            assert_eq!(sim.model().input.text(), expected);
+            assert_eq!(sim.model().history_cursor, None);
+            sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), expected);
+        }
+    }
+
+    #[test]
+    fn unchanged_external_edits_and_modal_answers_preserve_recall() {
+        let mut sim = recalled_prompt_sim("old", KeyBindings::default());
+        for message in [
+            PiFtuiMsg::Edited {
+                text: Ok(String::from("old\n")),
+                width: 20,
+                height: 12,
+            },
+            PiFtuiMsg::Edited {
+                text: Err(String::from("editor cancelled")),
+                width: 20,
+                height: 12,
+            },
+            PiFtuiMsg::PastedImage(None),
+        ] {
+            sim.send(message);
+            assert_eq!(sim.model().input.text(), "old");
+            assert_eq!(sim.model().history_cursor, Some(1));
+        }
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "recall-card",
+            vec![question("Continue?", &["yes", "no"], false)],
+        ))));
+        type_str(&mut sim, "partial answer");
+        assert_eq!(sim.model().history_cursor, Some(1));
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "old");
+        assert_eq!(sim.model().history_cursor, Some(1));
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "older prompt");
     }
 
     /// Recall walks past a multi-line entry in both directions and back to
