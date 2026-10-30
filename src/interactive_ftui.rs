@@ -1855,6 +1855,14 @@ impl AgentUiState {
     }
 }
 
+/// Unsent prompt text returned by the driver, waiting for its session's
+/// ordinary draft rather than an answer or another modal input owner.
+#[derive(Debug)]
+struct PendingInputRestore {
+    owner_session_id: String,
+    text: String,
+}
+
 /// Seed ftui model: proves the Elm loop shape against real pi message types.
 ///
 /// Covers init/update/view/subscriptions end to end but holds only what its
@@ -1948,6 +1956,9 @@ pub struct PiFtuiModel {
     /// editor. Successor cards share the snapshot; the last terminal path
     /// restores it only after clearing card-owned input.
     card_draft_snapshot: Option<String>,
+    /// Driver returns deferred across modal ownership, in arrival order.
+    /// Replaced-session entries are discarded before any draft is changed.
+    pending_input_restores: VecDeque<PendingInputRestore>,
     /// Where completed extension UI replies go (driver pairs them back to the
     /// pending request via `FtuiExtensionUiHandler::resolve`).
     ext_reply_tx: Option<Sender<ExtensionUiResponse>>,
@@ -2342,6 +2353,7 @@ impl PiFtuiModel {
             active_ext: None,
             ext_queue: VecDeque::new(),
             card_draft_snapshot: None,
+            pending_input_restores: VecDeque::new(),
             ext_reply_tx: None,
             ask_reply_tx: None,
             current_ask: None,
@@ -3582,13 +3594,10 @@ impl PiFtuiModel {
                 .is_none_or(|shown| shown == owner_session_id)
                 && !text.is_empty() =>
             {
-                let draft = self.input.text();
-                let restored = if draft.is_empty() {
-                    text
-                } else {
-                    format!("{text}\n\n{draft}")
-                };
-                self.input.set_text(&restored);
+                self.pending_input_restores.push_back(PendingInputRestore {
+                    owner_session_id,
+                    text,
+                });
             }
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
@@ -3972,6 +3981,48 @@ impl PiFtuiModel {
             EntryRole::System,
             format!("Restored {count} queued message(s) to the editor."),
         );
+    }
+
+    /// Return a batch to the prompt only after its current input owner has
+    /// settled. Card dismissal restores the saved draft before this runs;
+    /// answers and login input must never consume returned prompt text.
+    fn apply_pending_input_restores(&mut self) {
+        if self.pending_input_restores.is_empty() {
+            return;
+        }
+        let shown = self.displayed_session_id.as_deref();
+        self.pending_input_restores.retain(|pending| {
+            shown.is_none_or(|shown| shown == pending.owner_session_id.as_str())
+        });
+        if self.pending_input_restores.is_empty()
+            || !self.input_active()
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            || !self.ext_queue.is_empty()
+            || self.login_pending.is_some()
+            || self.picker.is_some()
+            || self.custom_overlay_open()
+            || self.settings_pending
+            || self.suspending
+        {
+            return;
+        }
+        // Each flush prepends its returned batches in arrival order. Keep
+        // the live draft byte-for-byte, including whitespace-only input.
+        let mut restored = self
+            .pending_input_restores
+            .drain(..)
+            .map(|pending| pending.text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let draft = self.input.text();
+        if !draft.is_empty() {
+            restored.push_str("\n\n");
+            restored.push_str(&draft);
+        }
+        self.input.set_text(&restored);
+        self.detach_edited_history();
+        self.maybe_trigger_autocomplete();
     }
 
     /// Submit the editor content: echo into the transcript, hand it to the
@@ -6592,6 +6643,7 @@ impl Model for PiFtuiModel {
         {
             // The event was intended for the expired card, not the restored
             // pre-card draft or a newly promoted extension question.
+            self.apply_pending_input_restores();
             self.watchdog.finish(LoopPhase::Input, probe);
             return Cmd::none();
         }
@@ -6608,7 +6660,7 @@ impl Model for PiFtuiModel {
             PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_))
                 | PiFtuiMsg::Edited { .. }
                 | PiFtuiMsg::PastedImage(_)
-                | PiFtuiMsg::Agent(PiMsg::SetEditorText { .. } | PiMsg::RestorePendingInput { .. })
+                | PiFtuiMsg::Agent(PiMsg::SetEditorText { .. })
         ) || matches!(
             &msg,
             PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(request))
@@ -6649,6 +6701,7 @@ impl Model for PiFtuiModel {
         if reconcile_history {
             self.detach_edited_history();
         }
+        self.apply_pending_input_restores();
         // Reset as soon as ownership changes, even if a modal opens and
         // closes without receiving a mouse event between those updates.
         if !self.editor_mouse_active() {
@@ -8043,8 +8096,8 @@ fn prepare_prompt_with_source(
 
 /// Run what the user typed as a turn: `@file` references, `/skill:name`
 /// and prompt templates are resolved first (see [`prepare_prompt`]). When
-/// that fails nothing is sent, and the text goes back to the editor (the UI
-/// already cleared it), as the classic stack keeps it.
+/// that fails nothing is sent, and the returned text is merged with the
+/// current prompt draft once its input owner is available.
 #[allow(clippy::too_many_arguments)]
 async fn run_typed_prompt(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -8089,7 +8142,7 @@ async fn run_typed_prompt(
                 .with_session(|session| session.header.id.clone())
                 .await
             {
-                let _ = agent_tx.send(PiMsg::SetEditorText {
+                let _ = agent_tx.send(PiMsg::RestorePendingInput {
                     owner_session_id,
                     text: prompt,
                 });
@@ -19776,6 +19829,303 @@ mod tests {
         );
     }
 
+    fn returned_input(owner: &str, text: &str) -> PiFtuiMsg {
+        PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: owner.to_string(),
+            text: text.to_string(),
+        })
+    }
+
+    #[test]
+    fn returned_prompts_wait_for_card_bursts_without_changing_answers_or_recall() {
+        for first_card in ["ask", "extension"] {
+            let mut sim = recalled_prompt_sim("saved\nprompt", KeyBindings::default());
+            sim.model_mut().displayed_session_id = Some(String::from("current"));
+            if first_card == "ask" {
+                sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                    "first",
+                    vec![question("Choose?", &["A", "B"], false)],
+                ))));
+            } else {
+                sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "first",
+                    "input",
+                    serde_json::json!({"title": "First answer"}),
+                ))));
+            }
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                "successor",
+                "input",
+                serde_json::json!({"title": "Next answer"}),
+            ))));
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new("partial\nanswer", true)));
+            sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
+            let cursor = sim.model().input.cursor();
+            let selection = sim.model().input.selected_text();
+            let undo_ops = sim.model().input.undo_op_count();
+            sim.send(returned_input("current", "first\nreturn"));
+            sim.send(returned_input("current", "second return"));
+            assert_eq!(sim.model().input.text(), "partial\nanswer");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.selected_text(), selection);
+            assert_eq!(sim.model().input.undo_op_count(), undo_ops);
+            assert_eq!(sim.model().history_cursor, Some(1));
+            assert_eq!(sim.model().pending_input_restores.len(), 2);
+
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            assert_eq!(
+                sim.model()
+                    .active_ext
+                    .as_ref()
+                    .map(|request| request.id.as_str()),
+                Some("successor")
+            );
+            assert!(sim.model().input.is_empty());
+            assert_eq!(sim.model().pending_input_restores.len(), 2);
+            type_str(&mut sim, "next answer");
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            let expected = "first\nreturn\n\nsecond return\n\nsaved\nprompt";
+            assert_eq!(sim.model().input.text(), expected);
+            assert!(sim.model().card_draft_snapshot.is_none());
+            assert!(sim.model().pending_input_restores.is_empty());
+            assert_eq!(sim.model().history_cursor, None);
+            sim.inject_event(Event::Tick);
+            assert_eq!(sim.model().input.text(), expected, "restore only once");
+        }
+    }
+
+    #[test]
+    fn returned_prompts_wait_through_other_modal_and_inactive_owners() {
+        for owner in ["settings", "custom", "suspending", "working"] {
+            let (_tx, mut model) = new_model();
+            let (submit_tx, _submit_rx) = mpsc::channel();
+            model.displayed_session_id = Some(String::from("current"));
+            model.input.set_text("saved\ndraft");
+            let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+            sim.init();
+            sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
+            match owner {
+                "settings" => sim.inject_event(key(KeyCode::F(2), Modifiers::empty())),
+                "custom" => send_ui_effect(
+                    &mut sim,
+                    "setWidget",
+                    serde_json::json!({
+                        "widgetKey": EXT_CUSTOM_OVERLAY_KEY,
+                        "lines": ["modal"],
+                    }),
+                ),
+                "suspending" => sim.model_mut().suspending = true,
+                _ => sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart)),
+            }
+            let cursor = sim.model().input.cursor();
+            let selection = sim.model().input.selected_text();
+            sim.send(returned_input("current", "first"));
+            sim.send(returned_input("current", "second"));
+            sim.send(returned_input("current", ""));
+            assert_eq!(sim.model().input.text(), "saved\ndraft", "{owner}");
+            assert_eq!(sim.model().input.cursor(), cursor, "{owner}");
+            assert_eq!(sim.model().input.selected_text(), selection, "{owner}");
+            assert_eq!(sim.model().pending_input_restores.len(), 2, "{owner}");
+            match owner {
+                "settings" => {
+                    assert!(sim.model().settings_pending);
+                    sim.send(PiFtuiMsg::Agent(PiMsg::Settings {
+                        snapshot: settings_snapshot_fixture(),
+                        changed: None,
+                    }));
+                    assert!(sim.model().picker.is_some());
+                    assert_eq!(sim.model().pending_input_restores.len(), 2);
+                    sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                }
+                "custom" => send_ui_effect(
+                    &mut sim,
+                    "setWidget",
+                    serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "clear": true}),
+                ),
+                "suspending" => sim.send(PiFtuiMsg::Resumed),
+                _ => sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+                    usage: None,
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                })),
+            }
+            assert_eq!(
+                sim.model().input.text(),
+                "first\n\nsecond\n\nsaved\ndraft",
+                "{owner}"
+            );
+            assert!(sim.model().pending_input_restores.is_empty(), "{owner}");
+        }
+    }
+
+    #[test]
+    fn returned_prompts_wait_until_login_secret_is_submitted_and_login_settles() {
+        let (_tx, mut model) = new_model();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        model.displayed_session_id = Some(String::from("current"));
+        let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: Some(String::from("openai")),
+            accepts_empty_input: false,
+        }));
+        type_str(&mut sim, "private-code");
+        sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
+        let cursor = sim.model().input.cursor();
+        sim.send(returned_input("current", "first"));
+        sim.send(returned_input("current", "second"));
+        assert_eq!(sim.model().input.text(), "private-code");
+        assert_eq!(sim.model().input.cursor(), cursor);
+        assert_eq!(sim.model().input.selected_text().as_deref(), Some("e"));
+
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(matches!(
+            submit_rx.try_recv().expect("login reply"),
+            UiCommand::LoginSubmit(secret) if secret.0 == "private-code"
+        ));
+        assert!(sim.model().input.is_empty());
+        assert_eq!(sim.model().pending_input_restores.len(), 2);
+        sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: None,
+            accepts_empty_input: false,
+        }));
+        assert_eq!(sim.model().input.text(), "first\n\nsecond");
+        assert!(sim.model().pending_input_restores.is_empty());
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("restored ordinary prompt"),
+            UiCommand::Prompt(String::from("first\n\nsecond"))
+        );
+    }
+
+    #[test]
+    fn session_replacement_discards_deferred_returns_before_modal_release() {
+        for retry in [false, true] {
+            let (_tx, mut model) = new_model();
+            model.displayed_session_id = Some(String::from("old"));
+            model.input.set_text("old draft");
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            send_ui_effect(
+                &mut sim,
+                "setWidget",
+                serde_json::json!({
+                    "widgetKey": EXT_CUSTOM_OVERLAY_KEY,
+                    "lines": ["modal"],
+                }),
+            );
+            sim.send(returned_input("old", "old return"));
+            assert_eq!(sim.model().pending_input_restores.len(), 1);
+            let reset = if retry {
+                PiMsg::RetryCommitted {
+                    session_id: String::from("new"),
+                    messages: Vec::new(),
+                    usage: crate::model::Usage::default(),
+                    status: None,
+                    text: String::from("retried prompt"),
+                }
+            } else {
+                PiMsg::ConversationReset {
+                    session_id: String::from("new"),
+                    messages: Vec::new(),
+                    usage: crate::model::Usage::default(),
+                    status: None,
+                }
+            };
+            sim.send(PiFtuiMsg::Agent(reset));
+            assert!(sim.model().custom_overlay_open());
+            assert!(sim.model().pending_input_restores.is_empty());
+            sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+                owner_session_id: String::from("new"),
+                text: String::from("new draft"),
+            }));
+            sim.send(returned_input("old", "late old return"));
+            assert!(sim.model().pending_input_restores.is_empty());
+            sim.send(returned_input("new", "new return"));
+            assert_eq!(sim.model().input.text(), "new draft");
+            send_ui_effect(
+                &mut sim,
+                "setWidget",
+                serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "clear": true}),
+            );
+            assert_eq!(sim.model().input.text(), "new return\n\nnew draft");
+            assert!(sim.model().pending_input_restores.is_empty());
+        }
+    }
+
+    #[test]
+    fn expired_ask_flushes_returned_prompts_before_dropping_its_input_event() {
+        for event in [
+            key(KeyCode::Enter, Modifiers::empty()),
+            Event::Paste(ftui::PasteEvent::new("must not reach the draft", true)),
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+        ] {
+            let (_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+            tool.register_channel_ui_request_for_tests("expired-restore");
+            let current = Arc::new(Mutex::new(Some(tool.clone())));
+            let mut model = PiFtuiModel::new(rx)
+                .with_current_ask(current)
+                .with_submit_channel(submit_tx);
+            model.displayed_session_id = Some(String::from("current"));
+            model.input.set_text("saved draft");
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                "expired-restore",
+                vec![question("Choose?", &["A", "B"], false)],
+            ))));
+            type_str(&mut sim, "unfinished answer");
+            sim.send(returned_input("current", "returned prompt"));
+            tool.respond_ui(
+                "expired-restore",
+                AskResponse {
+                    answers: Vec::new(),
+                    dismissed: true,
+                },
+            );
+            sim.inject_event(event);
+            assert!(sim.model().active_ask.is_none());
+            assert_eq!(
+                sim.model().input.text(),
+                "returned prompt\n\nsaved draft"
+            );
+            assert!(sim.model().pending_input_restores.is_empty());
+            assert!(submit_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn restored_prompts_preserve_whitespace_and_refresh_completion_only_when_applied() {
+        for (returned, draft, completion) in [
+            ("returned", "", false),
+            ("returned", " \n\t", false),
+            ("returned", "/he", false),
+            ("/he", "", true),
+        ] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text(draft);
+            model.maybe_trigger_autocomplete();
+            let was_open = model.completion_visible();
+            model.suspending = true;
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.send(returned_input("current", returned));
+            assert_eq!(sim.model().input.text(), draft);
+            assert_eq!(sim.model().completion_visible(), was_open);
+            sim.send(PiFtuiMsg::Resumed);
+            let expected = if draft.is_empty() {
+                returned.to_string()
+            } else {
+                format!("{returned}\n\n{draft}")
+            };
+            assert_eq!(sim.model().input.text(), expected);
+            assert_eq!(sim.model().completion_visible(), completion);
+            assert!(sim.model().pending_input_restores.is_empty());
+        }
+    }
+
     /// The fork keeps everything before the selected user message, drops that
     /// message and what followed, and returns its text for the editor.
     #[test]
@@ -21772,6 +22122,81 @@ mod tests {
         }));
         sim.send(submitted("current"));
         assert!(sim.model().transcript.is_empty());
+    }
+
+    #[test]
+    fn typed_prompt_preparation_failure_preserves_a_newer_draft_through_its_error() {
+        let dir = tempfile::tempdir().expect("prompt fixture");
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir(&cwd).expect("workspace");
+        std::fs::write(dir.path().join("outside.txt"), "outside workspace")
+            .expect("out-of-scope attachment");
+        let prompt = String::from("keep\n@../outside.txt\nlast");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let owner = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+                .expect("session identity");
+            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let (agent_tx, agent_rx) = mpsc::channel();
+            run_typed_prompt(
+                &mut handle,
+                prompt.clone(),
+                None,
+                &cwd,
+                false,
+                &agent_tx,
+                &control,
+            )
+            .await;
+            assert!(provider.calls.lock().expect("provider calls").is_empty());
+            let events = agent_rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(events.len(), 2);
+            assert!(matches!(
+                &events[0],
+                PiMsg::RestorePendingInput { owner_session_id, text }
+                    if owner_session_id == &owner && text == &prompt
+            ));
+            assert!(matches!(
+                &events[1],
+                PiMsg::AgentError(error)
+                    if error.starts_with("Not sent:")
+                        && error.contains("Cannot read outside")
+            ));
+
+            let (_tx, mut model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.displayed_session_id = Some(owner);
+            let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+            sim.init();
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new(&prompt, true)));
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("original submission"),
+                UiCommand::Prompt(prompt.clone())
+            );
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new("newer\ndraft", true)));
+            for event in events {
+                sim.send(PiFtuiMsg::Agent(event));
+            }
+            assert_eq!(
+                sim.model().input.text(),
+                format!("{prompt}\n\nnewer\ndraft")
+            );
+            assert!(sim.model().pending_input_restores.is_empty());
+            assert!(
+                sim.model()
+                    .error_banner
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("Not sent:"))
+            );
+            assert!(submit_rx.try_recv().is_err(), "failure must not resubmit");
+        });
     }
 
     #[test]
