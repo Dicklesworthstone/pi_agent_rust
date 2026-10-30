@@ -21214,6 +21214,8 @@ pub fn extension_event_from_agent(
         // Session-level compaction/retry/failover events are not dispatched to extensions.
         AgentEvent::AutoCompactionStart { .. }
         | AgentEvent::AutoCompactionEnd { .. }
+        | AgentEvent::ManualCompactionStart { .. }
+        | AgentEvent::ManualCompactionEnd { .. }
         | AgentEvent::AutoRetryStart { .. }
         | AgentEvent::AutoRetryEnd { .. }
         | AgentEvent::FailoverStart { .. }
@@ -21246,6 +21248,8 @@ pub const fn extension_event_name_from_agent(event: &AgentEvent) -> Option<Exten
         AgentEvent::ToolExecutionEnd { .. } => Some(ExtensionEventName::ToolExecutionEnd),
         AgentEvent::AutoCompactionStart { .. }
         | AgentEvent::AutoCompactionEnd { .. }
+        | AgentEvent::ManualCompactionStart { .. }
+        | AgentEvent::ManualCompactionEnd { .. }
         | AgentEvent::AutoRetryStart { .. }
         | AgentEvent::AutoRetryEnd { .. }
         | AgentEvent::FailoverStart { .. }

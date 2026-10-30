@@ -3102,6 +3102,7 @@ impl PiFtuiModel {
                     | PiMsg::ToolStart { .. }
                     | PiMsg::ToolInvocation { .. }
                     | PiMsg::ToolUpdate { .. }
+                    | PiMsg::InterimResponse { .. }
             )
         {
             self.busy = None;
@@ -3181,6 +3182,35 @@ impl PiFtuiModel {
                 let output = output.map(|o| sanitize(&o).into_owned());
                 let diff_styled = matches!(name.as_str(), "edit" | "hashline_edit");
                 self.finish_tool_card(&pair, &name, !is_error, output, diff_styled);
+                self.current_tool = None;
+            }
+            PiMsg::InterimResponse { tool_id, text } => {
+                self.flush_stream();
+                let pair = sanitize(&tool_id).into_owned();
+                let text = sanitize(&text).into_owned();
+                let revision = self.next_revision();
+                if let Some(entry) = self
+                    .transcript
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.pair_key.as_deref() == Some(pair.as_str()))
+                {
+                    // Replace the pending write card in place. Keeping its
+                    // identity also makes a repeated terminal delivery idempotent.
+                    entry.role = EntryRole::Assistant;
+                    entry.text = text;
+                    entry.revision = revision;
+                    entry.card = None;
+                    entry.detail = None;
+                    entry.diff_styled = false;
+                    entry.tool_name = None;
+                    entry.group_count = 1;
+                } else {
+                    self.push_entry(EntryRole::Assistant, text);
+                    if let Some(entry) = self.transcript.last_mut() {
+                        entry.pair_key = Some(pair);
+                    }
+                }
                 self.current_tool = None;
             }
             PiMsg::TodoSummary { summary } => {
@@ -6980,12 +7010,24 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
             is_error,
             result,
             ..
-        } => vec![PiMsg::ToolEnd {
-            name: tool_name.clone(),
-            tool_id: tool_call_id.clone(),
-            is_error: *is_error,
-            output: tool_output_preview(result),
-        }],
+        } => {
+            if tool_name == "write"
+                && !is_error
+                && let Some(text) = crate::tools::interim_response_text(result)
+            {
+                vec![PiMsg::InterimResponse {
+                    tool_id: tool_call_id.clone(),
+                    text: text.to_string(),
+                }]
+            } else {
+                vec![PiMsg::ToolEnd {
+                    name: tool_name.clone(),
+                    tool_id: tool_call_id.clone(),
+                    is_error: *is_error,
+                    output: tool_output_preview(result),
+                }]
+            }
+        }
         E::AutoRetryStart {
             attempt,
             max_attempts,
@@ -6996,6 +7038,27 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         ))],
         E::AutoCompactionStart { reason } => {
             vec![PiMsg::SystemNote(format!("compacting context: {reason}"))]
+        }
+        E::ManualCompactionStart { mode } => {
+            let mode = mode.as_deref().unwrap_or("summary");
+            vec![PiMsg::SystemNote(format!("compacting context: {mode}"))]
+        }
+        E::ManualCompactionEnd {
+            aborted,
+            skipped,
+            error_message,
+            ..
+        } => {
+            let note = if *aborted {
+                String::from("compaction aborted")
+            } else if skipped.unwrap_or(false) {
+                String::from("compaction skipped: context is already small enough")
+            } else if let Some(error) = error_message {
+                format!("compaction failed: {error}")
+            } else {
+                String::from("compaction complete")
+            };
+            vec![PiMsg::SystemNote(note)]
         }
         E::AdvisorNote { level, rationale } => {
             vec![PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}"))]
@@ -10378,6 +10441,10 @@ pub fn run(
     let mut session_options =
         futures::executor::block_on(prepare_driver_session_options(session_options))
             .map_err(std::io::Error::other)?;
+    // This host can display interim replies even when entered directly by
+    // an SDK caller. Keep the surface default distinct from an explicit
+    // override, so each session reload still honors its fresh configuration.
+    session_options.out_default_enabled = true;
     // One undo history for the process, as on the classic stack. `/new`,
     // `/resume`, `/reload` and `/fork` rebuild the session from a template
     // cloned from these options, so every handle shares this recorder.
@@ -11487,6 +11554,8 @@ mod tests {
             no_session: true,
             session_path: Some(std::path::PathBuf::from("original.jsonl")),
             enabled_tools: Some(vec!["read".to_string()]),
+            out_enabled: Some(false),
+            out_default_enabled: true,
             repair_policy: Some("auto-safe".to_string()),
             extension_flags: vec![crate::cli::ExtensionCliFlag {
                 name: "verbose".to_string(),
@@ -11504,6 +11573,8 @@ mod tests {
         assert!(!template.no_session);
         assert!(template.session_path.is_none());
         assert_eq!(template.enabled_tools, options.enabled_tools);
+        assert_eq!(template.out_enabled, Some(false));
+        assert!(template.out_default_enabled);
         assert_eq!(template.repair_policy, options.repair_policy);
         assert_eq!(template.extension_flags, options.extension_flags);
         assert_eq!(template.max_tool_iterations, 17);
@@ -16554,6 +16625,118 @@ mod tests {
                 && entry.text == "Model spend reached $2.50 (warning at $2.00)."
         }));
         assert_eq!(sim.model().streaming.as_str(), "Still working.");
+    }
+
+    #[test]
+    fn interim_reply_replaces_its_tool_card_without_ending_or_truncating_the_turn() {
+        use crate::agent::AgentEvent as E;
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta(
+            "Before the reply.".into(),
+        )));
+        for message in agent_event_to_pi_msgs(&E::ToolExecutionStart {
+            tool_call_id: "reply".into(),
+            tool_name: "write".into(),
+            args: serde_json::json!({"path": "out://", "content": "not accepted yet"}),
+        }) {
+            sim.send(PiFtuiMsg::Agent(message));
+        }
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "not accepted yet")
+        );
+        let markdown = format!("# Progress\n\n{}", "A complete detail line.\n".repeat(40));
+        let result = crate::tools::ToolOutput {
+            content: vec![crate::model::ContentBlock::Text(
+                crate::model::TextContent::new("Shown to the user."),
+            )],
+            details: Some(
+                serde_json::json!({"schema": "pi.interim_response.v1", "text": markdown}),
+            ),
+            is_error: false,
+        };
+        let event = E::ToolExecutionEnd {
+            tool_call_id: "reply".into(),
+            tool_name: "write".into(),
+            result: result.clone(),
+            is_error: false,
+        };
+        // A repeated terminal notification must update the same transcript entry.
+        for _ in 0..2 {
+            for message in agent_event_to_pi_msgs(&event) {
+                sim.send(PiFtuiMsg::Agent(message));
+            }
+        }
+        assert_eq!(sim.model().state, AgentUiState::Working);
+        assert!(sim.model().current_tool.is_none());
+        let entries: Vec<_> = sim
+            .model()
+            .transcript
+            .iter()
+            .filter(|entry| entry.pair_key.as_deref() == Some("reply"))
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, EntryRole::Assistant);
+        assert_eq!(entries[0].text, markdown);
+        assert!(entries[0].card.is_none());
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta(
+            "Continuing afterwards.".into(),
+        )));
+        assert_eq!(sim.model().streaming, "Continuing afterwards.");
+        for (tool_name, is_error) in [("write", true), ("read", false)] {
+            let rejected = E::ToolExecutionEnd {
+                tool_call_id: "not-a-reply".into(),
+                tool_name: tool_name.into(),
+                result: result.clone(),
+                is_error,
+            };
+            assert!(matches!(
+                agent_event_to_pi_msgs(&rejected).as_slice(),
+                [PiMsg::ToolEnd { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn manual_compaction_progress_is_nonterminal_and_distinguishes_skipped_work() {
+        use crate::agent::AgentEvent as E;
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        for event in [
+            E::ManualCompactionStart {
+                mode: Some("shake".into()),
+            },
+            E::ManualCompactionEnd {
+                result: None,
+                aborted: false,
+                skipped: Some(true),
+                error_message: Some("Nothing to compact".into()),
+            },
+        ] {
+            for message in agent_event_to_pi_msgs(&event) {
+                sim.send(PiFtuiMsg::Agent(message));
+            }
+        }
+        assert_eq!(sim.model().state, AgentUiState::Working);
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "compacting context: shake")
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text.starts_with("compaction skipped:"))
+        );
     }
 
     #[test]

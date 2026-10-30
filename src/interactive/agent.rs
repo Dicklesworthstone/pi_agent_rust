@@ -329,6 +329,27 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AutoCompactionStart { reason } => {
             batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {reason}")));
         }
+        AgentEvent::ManualCompactionStart { mode } => {
+            let mode = mode.as_deref().unwrap_or("summary");
+            batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {mode}")));
+        }
+        AgentEvent::ManualCompactionEnd {
+            aborted,
+            skipped,
+            error_message,
+            ..
+        } => {
+            let message = if *aborted {
+                "Compaction aborted".to_string()
+            } else if skipped.unwrap_or(false) {
+                "Compaction skipped: context is already small enough".to_string()
+            } else if let Some(error) = error_message {
+                format!("Compaction failed: {error}")
+            } else {
+                "Compaction complete".to_string()
+            };
+            batcher.send_immediate(PiMsg::SystemNote(message));
+        }
         AgentEvent::PrewalkSwitched {
             provider,
             model,
@@ -386,6 +407,13 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             partial_result,
             ..
         } => {
+            // out:// is promoted to assistant prose only by its successful
+            // terminal result; updates may be coalesced or followed by an
+            // execution failure and must not create duplicate replies.
+            if tool_name == "write" && crate::tools::interim_response_text(partial_result).is_some()
+            {
+                return;
+            }
             batcher.send_immediate(PiMsg::ToolUpdate {
                 name: tool_name.clone(),
                 tool_id: tool_call_id.clone(),
@@ -399,6 +427,16 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             is_error,
             result,
         } => {
+            if tool_name == "write"
+                && !is_error
+                && let Some(text) = crate::tools::interim_response_text(result)
+            {
+                batcher.send_immediate(PiMsg::InterimResponse {
+                    tool_id: tool_call_id.clone(),
+                    text: text.to_string(),
+                });
+                return;
+            }
             // Todo footer (bd-cv653.3.9): state-driven off the tool result's
             // todo_list.v1 details, never a side channel.
             if tool_name == "todo"
@@ -1045,6 +1083,34 @@ impl PiApp {
                     let follow_tail = self.follow_stream_tail;
                     self.refresh_conversation_viewport(follow_tail);
                 }
+            }
+            PiMsg::InterimResponse { tool_id, text } => {
+                // Commit preceding narration before the interim reply, so a
+                // later model response or retry cannot move it out of order.
+                if !self.current_response.is_empty() || !self.current_thinking.is_empty() {
+                    self.messages.push(ConversationMessage::new(
+                        MessageRole::Assistant,
+                        std::mem::take(&mut self.current_response),
+                        (!self.current_thinking.is_empty())
+                            .then(|| std::mem::take(&mut self.current_thinking)),
+                    ));
+                    self.current_assistant_start = (0, 0);
+                    self.discard_incomplete_on_next_assistant = false;
+                }
+                self.current_tool_summary.remove(&tool_id);
+                if self.current_tool_id.as_deref() == Some(tool_id.as_str()) {
+                    self.current_tool = None;
+                    self.current_tool_id = None;
+                    self.tool_progress = None;
+                    self.pending_tool_output = None;
+                    self.agent_state = AgentState::Processing;
+                }
+                self.messages.push(ConversationMessage::new(
+                    MessageRole::Assistant,
+                    super::tool_render::sanitize_terminal_text(&text).into_owned(),
+                    None,
+                ));
+                self.refresh_conversation_viewport(self.follow_stream_tail);
             }
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary;
@@ -4032,6 +4098,70 @@ mod stream_delta_batcher_tests {
     fn build_test_app() -> PiApp {
         let (app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app
+    }
+
+    #[test]
+    fn interim_reply_dispatch_is_once_and_preserves_the_running_turn() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        let result = crate::tools::ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("Shown to the user."))],
+            details: Some(serde_json::json!({
+                "schema": "pi.interim_response.v1",
+                "text": "## Progress\n\nStill checking."
+            })),
+            is_error: false,
+        };
+        dispatch_agent_event_to_ui(
+            &AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "reply".to_string(),
+                tool_name: "write".to_string(),
+                args: serde_json::json!({"path": "out://"}),
+                partial_result: result.clone(),
+            },
+            &mut batcher,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "provisional updates must not be promoted"
+        );
+        dispatch_agent_event_to_ui(
+            &AgentEvent::ToolExecutionEnd {
+                tool_call_id: "reply".to_string(),
+                tool_name: "write".to_string(),
+                result,
+                is_error: false,
+            },
+            &mut batcher,
+        );
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::AgentStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("Earlier narration.".to_string()));
+        let _ = app.handle_pi_message(PiMsg::ToolStart {
+            name: "write".to_string(),
+            tool_id: "reply".to_string(),
+        });
+        let _ = app.handle_pi_message(rx.try_recv().expect("accepted reply"));
+        assert!(
+            rx.try_recv().is_err(),
+            "reply has one authoritative delivery"
+        );
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.current_tool.is_none());
+        assert!(app.current_response.is_empty());
+        let replies: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            replies,
+            ["Earlier narration.", "## Progress\n\nStill checking."]
+        );
+        let _ = app.handle_pi_message(PiMsg::TextDelta("The later answer.".to_string()));
+        assert_eq!(app.current_response, "The later answer.");
+        assert_eq!(app.agent_state, AgentState::Processing);
     }
 
     #[test]

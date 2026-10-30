@@ -381,6 +381,14 @@ pub struct SessionOptions {
     /// Plan entry and checkpoint restoration report `PLAN_TOOLS_DISABLED`
     /// under that policy; opening a saved conversation remains available.
     pub enabled_tools: Option<Vec<String>>,
+    /// Per-session override for `out://` interim replies. `None` uses loaded
+    /// configuration; SDK/noninteractive sessions default to disabled.
+    /// Child agents always reject these replies, even when explicitly enabled.
+    pub out_enabled: Option<bool>,
+    /// Host surface default for `out://` replies, used only when both
+    /// `out_enabled` and loaded configuration leave the setting unset.
+    /// Interactive hosts enable this; SDK/noninteractive hosts default to false.
+    pub out_default_enabled: bool,
     /// Primary workspace for a new session. When resuming, an explicit value
     /// must identify the saved workspace; omitting it selects the session's
     /// latest workdir attachment rather than the caller's process cwd.
@@ -600,6 +608,8 @@ impl Default for SessionOptions {
             system_prompt: None,
             append_system_prompt: None,
             enabled_tools: None,
+            out_enabled: None,
+            out_default_enabled: false,
             working_directory: None,
             workspace_trusted: false,
             package_dir: None,
@@ -1475,8 +1485,8 @@ impl RpcTransportClient {
         })
     }
 
-    /// Clone a write-only lane that remains usable while `prompt*` or
-    /// `handoff*` borrows this client for its single response consumer.
+    /// Clone a write-only lane that remains usable while `prompt*`, `compact*`,
+    /// or `handoff*` borrows this client for its single response consumer.
     #[must_use]
     pub fn control_handle(&self) -> RpcControlHandle {
         RpcControlHandle {
@@ -1736,6 +1746,8 @@ impl RpcTransportClient {
         self.request_no_data("abort_bash", Map::new()).await
     }
 
+    /// Compact this session, including when automatic compaction is disabled.
+    /// Use [`Self::compact_with_events`] to display progress while waiting.
     pub async fn compact(&mut self) -> Result<RpcCompactionResult> {
         self.compact_with_instructions(None).await
     }
@@ -1744,6 +1756,19 @@ impl RpcTransportClient {
         &mut self,
         custom_instructions: Option<&str>,
     ) -> Result<RpcCompactionResult> {
+        self.compact_with_events(custom_instructions, |_| {}).await
+    }
+
+    /// Compact with live `manual_compaction_start` / `manual_compaction_end`
+    /// frames, followed by the terminal response after durable installation.
+    /// A skipped pass still emits both events and returns the server's error.
+    /// Use [`Self::control_handle`] to abort while this request is pending, and
+    /// continue polling until the terminal response arrives.
+    pub async fn compact_with_events(
+        &mut self,
+        custom_instructions: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCompactionResult> {
         let mut payload = Map::new();
         if let Some(custom_instructions) = custom_instructions {
             payload.insert(
@@ -1751,7 +1776,10 @@ impl RpcTransportClient {
                 Value::String(custom_instructions.to_string()),
             );
         }
-        self.request_typed("compact", payload).await
+        let data = self
+            .request_with_events("compact", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "compact")
     }
 
     /// Durably replace an older safe prefix with a continuation brief in the
@@ -3397,21 +3425,27 @@ impl AgentSessionHandle {
     /// threshold and with auto-compaction off too. `instructions`
     /// (`/compact <focus>`) steer the summary. Returns whether it changed
     /// the session; `false` means there was too little history to compact.
+    /// The callback and session subscribers receive exactly one
+    /// `ManualCompactionStart` / `ManualCompactionEnd` pair for an admitted
+    /// request, including a skipped pass, failure, or dropped operation.
     pub async fn compact(
         &mut self,
         instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
         self.session.compact_now(instructions, on_event).await
     }
 
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
-    /// Returns whether it changed the session.
+    /// Returns whether it changed the session. Subscribers and the callback
+    /// receive manual compaction progress with start mode `"shake"`.
     pub async fn shake(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
         self.session.shake_now(on_event).await
     }
 
@@ -3494,10 +3528,13 @@ impl AgentSessionHandle {
 
     /// Build a combined callback that fans out to the per-prompt callback,
     /// session-level subscribers, and typed hooks.
-    fn make_combined_callback(
+    fn make_combined_callback<F>(
         &self,
-        per_prompt: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
+        per_prompt: F,
+    ) -> impl Fn(AgentEvent) + Send + Sync + 'static + use<F>
+    where
+        F: Fn(AgentEvent) + Send + Sync + 'static,
+    {
         let listeners = self.listeners.clone();
         // Extension observation events (bd-82331). Lifecycle events reach
         // extensions from inside the agent loop, but message_* and
@@ -3695,6 +3732,14 @@ fn load_session_config(
     Config::load_with_roots_and_project_trust(config_override, global_dir, cwd, workspace_trusted)
 }
 
+fn apply_session_out_config(config: &mut Config, options: &SessionOptions) {
+    let enabled = options
+        .out_enabled
+        .or_else(|| config.out.as_ref().and_then(|out| out.enabled))
+        .unwrap_or(options.out_default_enabled);
+    config.out.get_or_insert_with(Default::default).enabled = Some(enabled);
+}
+
 fn build_stream_options_with_optional_key(
     config: &Config,
     api_key: Option<String>,
@@ -3835,12 +3880,13 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 
     let global_dir = Config::global_dir();
     let config_override = Config::config_path_override_from_env(&cwd);
-    let config = load_session_config(
+    let mut config = load_session_config(
         &cwd,
         &global_dir,
         config_override.as_deref(),
         options.workspace_trusted,
     )?;
+    apply_session_out_config(&mut config, &options);
     let mut session = Session::new(&cli, &config).await?;
     if let Some(saved) = &saved_workdir {
         // Recheck the observation after native transcript validation and
@@ -6923,6 +6969,53 @@ mod tests {
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
     }
 
+    #[test]
+    fn out_surface_default_respects_reloaded_workspace_settings_and_sdk_overrides() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let options = SessionOptions {
+            out_default_enabled: true,
+            ..SessionOptions::default()
+        };
+
+        let mut initial = load_session_config(&cwd, &global_dir, None, true).unwrap();
+        apply_session_out_config(&mut initial, &options);
+        assert_eq!(initial.out.as_ref().unwrap().enabled, Some(true));
+        assert!(options.out_enabled.is_none());
+
+        std::fs::write(cwd.join(".pi/settings.json"), r#"{"out":{"enabled":false}}"#).unwrap();
+        let rebuilt_options = options.clone();
+        assert!(options.out_enabled.is_none());
+        let mut rebuilt = load_session_config(&cwd, &global_dir, None, true).unwrap();
+        apply_session_out_config(&mut rebuilt, &rebuilt_options);
+        assert_eq!(rebuilt.out.as_ref().unwrap().enabled, Some(false));
+
+        let override_options = SessionOptions {
+            out_enabled: Some(true),
+            ..SessionOptions::default()
+        };
+        let mut overridden = load_session_config(&cwd, &global_dir, None, true).unwrap();
+        apply_session_out_config(&mut overridden, &override_options);
+        assert_eq!(overridden.out.as_ref().unwrap().enabled, Some(true));
+
+        let mut sdk_default = Config::default();
+        apply_session_out_config(&mut sdk_default, &SessionOptions::default());
+        assert_eq!(sdk_default.out.as_ref().unwrap().enabled, Some(false));
+        let mut explicit_disabled = initial;
+        apply_session_out_config(
+            &mut explicit_disabled,
+            &SessionOptions {
+                out_enabled: Some(false),
+                out_default_enabled: true,
+                ..SessionOptions::default()
+            },
+        );
+        assert_eq!(explicit_disabled.out.as_ref().unwrap().enabled, Some(false));
+    }
+
     /// Configured secrets settings govern an SDK-built session (the default
     /// FTUI stack): user patterns are obfuscated and block mode refuses,
     /// where the session used to run the built-in default regardless.
@@ -7726,13 +7819,23 @@ mod tests {
         .expect("compact");
         assert!(!changed, "an empty session reports no change"); // ubs:ignore[rust.panic.assert-macros] -- boolean result; assert_eq! on a bool fails clippy
 
-        assert!(
-            events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "expected no compaction lifecycle events for empty session"
-        );
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            AgentEvent::ManualCompactionStart { mode: None }
+        ));
+        assert!(matches!(
+            events[1],
+            AgentEvent::ManualCompactionEnd {
+                result: None,
+                aborted: false,
+                skipped: Some(true),
+                ..
+            }
+        ));
     }
 
     /// `/compact <focus>`: the focus text reaches the summary request.
@@ -7776,11 +7879,36 @@ mod tests {
                 EventListeners::new(),
             );
 
+            let subscribed = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = Arc::clone(&subscribed);
+            handle.subscribe(move |event| {
+                subscriber
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            });
+            let callbacks = Arc::new(Mutex::new(Vec::new()));
+            let callback = Arc::clone(&callbacks);
             let changed = handle
-                .compact(Some("keep the retry-count decision"), |_| {})
+                .compact(Some("keep the retry-count decision"), move |event| {
+                    callback
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                })
                 .await
                 .expect("compact");
             assert!(changed, "the history compacts"); // ubs:ignore[rust.panic.assert-macros] -- boolean result
+            let events = callbacks.lock().unwrap();
+            assert_eq!(*events, *subscribed.lock().unwrap());
+            assert_eq!(events.len(), 2, "one pair reaches both SDK consumers");
+            assert_eq!(events[0]["type"], "manual_compaction_start");
+            assert_eq!(events[1]["type"], "manual_compaction_end");
+            assert_eq!(events[1]["aborted"], false);
+            assert!(events[1]["result"]["summary"].is_string());
+            assert!(events[1].get("skipped").is_none());
+            assert!(events[1].get("errorMessage").is_none());
+            drop(events);
             let sent = requests.lock().expect("requests").clone();
             assert!(
                 sent.iter()

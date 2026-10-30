@@ -4439,6 +4439,63 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_progress_pairs_interruption_and_ignores_late_results() {
+        let events = Arc::new(StdTestMutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let progress = ManualCompactionProgress::start(
+            move |event| sink.lock().unwrap().push(serde_json::to_value(event).unwrap()),
+            Some("shake".to_string()),
+        );
+        let callback = progress.callback();
+        callback(AgentEvent::AutoCompactionStart {
+            reason: "threshold".to_string(),
+        });
+        drop(progress);
+        // A callback retained by a cancelled provider cannot turn interruption
+        // into a second terminal, or claim a commit that was never installed.
+        callback(AgentEvent::AutoCompactionEnd {
+            result: Some(json!({"summary":"late summary"})),
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            json!({"type":"manual_compaction_start","mode":"shake"})
+        );
+        assert_eq!(events[1]["type"], "manual_compaction_end");
+        assert_eq!(events[1]["aborted"], true);
+        assert!(events[1].get("result").is_none());
+        assert!(events[1].get("willRetry").is_none());
+    }
+
+    #[test]
+    fn manual_compaction_progress_emits_failure_once_before_guard_drop() {
+        let events = Arc::new(StdTestMutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let progress = ManualCompactionProgress::start(
+            move |event| sink.lock().unwrap().push(serde_json::to_value(event).unwrap()),
+            None,
+        );
+        let error = Error::session_persistence("summary save failed");
+        progress.finish_outcome(&Err(error));
+        drop(progress);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], json!({"type":"manual_compaction_start"}));
+        assert_eq!(events[1]["aborted"], false);
+        assert!(events[1].get("result").is_none());
+        assert!(
+            events[1]["errorMessage"]
+                .as_str()
+                .unwrap()
+                .contains("summary save failed")
+        );
+    }
+
+    #[test]
     fn auto_compaction_start_serializes_with_pi_mono_compatible_type_tag() {
         let event = AgentEvent::AutoCompactionStart {
             reason: "threshold".to_string(),

@@ -780,17 +780,22 @@ fn sdk_compact_empty_session() {
 
     let captured_len = {
         let captured = events.lock().expect("lock");
-        assert!(
-            captured.is_empty(),
-            "compact on empty session should emit no events, got {}",
-            captured.len()
-        );
+        assert_eq!(captured.len(), 2, "a skipped request must end its progress");
+        assert!(matches!(
+            captured[0],
+            AgentEvent::ManualCompactionStart { mode: None }
+        ));
+        assert!(matches!(
+            captured[1],
+            AgentEvent::ManualCompactionEnd {
+                result: None,
+                aborted: false,
+                skipped: Some(true),
+                ..
+            }
+        ));
         captured.len()
     };
-    assert!(
-        captured_len == 0,
-        "compact on empty session should emit no events, got {captured_len}"
-    );
 
     harness.log().info_ctx("sdk", "compact noop ok", |ctx| {
         ctx.push(("event_count".to_string(), captured_len.to_string()));
@@ -1298,6 +1303,8 @@ fn sdk_conformance_event_ordering() {
             AgentEvent::ToolExecutionEnd { .. } => "ToolExecutionEnd",
             AgentEvent::AutoCompactionStart { .. } => "AutoCompactionStart",
             AgentEvent::AutoCompactionEnd { .. } => "AutoCompactionEnd",
+            AgentEvent::ManualCompactionStart { .. } => "ManualCompactionStart",
+            AgentEvent::ManualCompactionEnd { .. } => "ManualCompactionEnd",
             AgentEvent::AutoRetryStart { .. } => "AutoRetryStart",
             AgentEvent::AutoRetryEnd { .. } => "AutoRetryEnd",
             AgentEvent::FailoverStart { .. } => "FailoverStart",

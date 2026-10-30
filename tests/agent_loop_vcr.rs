@@ -95,6 +95,20 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "willRetry": will_retry,
             "errorMessage": error_message,
         }),
+        AgentEvent::ManualCompactionStart { mode } => {
+            json!({ "event": "manual_compaction_start", "mode": mode })
+        }
+        AgentEvent::ManualCompactionEnd {
+            aborted,
+            skipped,
+            error_message,
+            ..
+        } => json!({
+            "event": "manual_compaction_end",
+            "aborted": aborted,
+            "skipped": skipped,
+            "errorMessage": error_message,
+        }),
         AgentEvent::AutoRetryStart {
             attempt,
             max_attempts,

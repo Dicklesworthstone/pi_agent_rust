@@ -132,6 +132,22 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
                 is_error,
                 ..
             } => {
+                // Only a committed, successful write can become user-facing
+                // prose. Requested arguments and provisional tool updates do
+                // not establish that an interim reply was accepted.
+                if tool_name == "write"
+                    && !is_error
+                    && let Some(text) = details
+                        .as_ref()
+                        .and_then(crate::tools::interim_response_text_from_details)
+                {
+                    messages.push(ConversationMessage::new(
+                        MessageRole::Assistant,
+                        super::tool_render::sanitize_terminal_text(text).into_owned(),
+                        None,
+                    ));
+                    continue;
+                }
                 let (mut text, _) = assistant_content_to_text(content);
                 if let Some(diff) = details
                     .as_ref()
@@ -238,6 +254,55 @@ mod tests {
         ToolCall, UserContent, UserMessage,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn accepted_interim_replies_replay_in_order_and_failures_stay_tools() {
+        let mut session = Session::in_memory();
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("Before the tool."))],
+                ..Default::default()
+            },
+        });
+        for (id, tool_name, is_error, text) in [
+            ("first", "write", false, "\u{1b}[31m## First update\u{1b}[0m"),
+            ("denied", "write", true, "must not become a reply"),
+            ("other", "read", false, "must remain a tool result"),
+            ("second", "write", false, "## Second update"),
+        ] {
+            let result = SessionMessage::ToolResult {
+                tool_call_id: id.to_string(),
+                tool_name: tool_name.to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("Tool acknowledgment"))],
+                details: Some(json!({"schema": "pi.interim_response.v1", "text": text})),
+                is_error,
+                timestamp: Some(1),
+            };
+            // Exercise the persisted representation used by a resumed session.
+            let restored = serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+            session.append_message(restored);
+        }
+        let (messages, _) = conversation_from_session(&session);
+        let replies: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            replies,
+            ["Before the tool.", "## First update", "## Second update"]
+        );
+        assert_eq!(messages[2].role, MessageRole::Tool);
+        assert!(messages[2].content.contains("Tool error (write)"));
+        assert_eq!(messages[3].role, MessageRole::Tool);
+        let (reloaded, _) = conversation_from_session(&session);
+        assert_eq!(reloaded.len(), messages.len());
+        assert!(
+            reloaded
+                .iter()
+                .all(|message| !message.content.contains("must not"))
+        );
+    }
 
     // ── user_content_to_text ────────────────────────────────────────────
 

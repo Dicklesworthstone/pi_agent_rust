@@ -136,6 +136,11 @@ while IFS= read -r line; do
       printf '{"type":"agent_start","sessionId":"sess-1"}\n'
       printf '{"type":"agent_end","sessionId":"sess-1","messages":[]}\n'
       ;;
+    compact)
+      printf '{"type":"manual_compaction_start"}\n'
+      printf '{"type":"manual_compaction_end","result":{"summary":"manual summary","firstKeptEntryId":"kept-2","tokensBefore":8000,"tokensAfter":600},"aborted":false}\n'
+      printf '{"type":"response","id":"%s","command":"compact","success":true,"data":{"summary":"manual summary","firstKeptEntryId":"kept-2","tokensBefore":8000,"tokensAfter":600}}\n' "$id"
+      ;;
     handoff)
       printf '{"type":"auto_compaction_start","reason":"handoff"}\n'
       printf '{"type":"auto_compaction_end","result":{"summary":"continuation brief","firstKeptEntryId":"kept-1","tokensBefore":9000,"tokensAfter":500},"aborted":false,"willRetry":false}\n'
@@ -201,6 +206,20 @@ done
             .await
             .expect("extension_ui_response");
         assert!(resolved);
+
+        let mut compaction_events = Vec::new();
+        let compaction = client
+            .compact_with_events(Some("retain decisions"), |event| {
+                compaction_events.push(event);
+            })
+            .await
+            .expect("compact_with_events");
+        assert_eq!(compaction.summary, "manual summary");
+        assert_eq!(compaction.tokens_after, 600);
+        assert_eq!(compaction_events.len(), 2);
+        assert_eq!(compaction_events[0]["type"], "manual_compaction_start");
+        assert_eq!(compaction_events[1]["type"], "manual_compaction_end");
+        assert_eq!(client.compact().await.unwrap().first_kept_entry_id, "kept-2");
 
         assert!(client.handoff(Some(&"x".repeat(4097))).await.is_err());
         let mut handoff_events = Vec::new();

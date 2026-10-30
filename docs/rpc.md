@@ -239,6 +239,45 @@ in-memory content; session resume still hydrates saved sidecar payloads.
 - **fork**: Fork from a message.
   - Params: `entryId`.
 
+### Manual compaction progress
+
+```json
+{"id":"compact-1","type":"compact","customInstructions":"Retain the decisions and unresolved failures"}
+```
+
+An admitted `compact` request emits exactly one `manual_compaction_start` and
+one `manual_compaction_end`, followed by its terminal `compact` response. This
+pair is also emitted when there is too little history to compact. Rejected
+requests, such as a request while the agent is busy or invalid token overrides,
+do not start progress. Manual requests remain available when automatic
+compaction is disabled and do not emit automatic compaction events.
+
+```json
+{"type":"manual_compaction_start"}
+{"type":"manual_compaction_end","result":{"summary":"Retained decisions...","firstKeptEntryId":"entry-kept","tokensBefore":48000,"tokensAfter":12000,"details":{}},"aborted":false}
+{"id":"compact-1","type":"response","command":"compact","success":true,"data":{"summary":"Retained decisions...","firstKeptEntryId":"entry-kept","tokensBefore":48000,"tokensAfter":12000,"details":{}}}
+```
+
+`manual_compaction_end.result` is present only after the resulting context has
+been installed and, for persistent sessions, saved. A skipped pass instead has
+`skipped: true`, `aborted: false`, and an explanatory `errorMessage`; treat this
+as a completed no-op when dismissing progress. Failure has an `errorMessage`
+without a result. Cancellation sets `aborted: true`. The final RPC response for
+a skipped, failed, or cancelled request has `success: false`. No `agent_end` is
+emitted for this maintenance operation.
+
+While the summary is generated, `get_state` reports `isCompacting: true`, and
+the dispatcher continues handling `abort`, state reads, and history reads.
+Aborting before persistence leaves the original history intact. Once a save
+begins, the operation finishes the durable transaction before replying. Closing
+input drains an admitted request through its final response.
+
+The SDK exposes the same progress through session subscribers and the
+callback passed to `AgentSessionHandle::compact` or `shake`. A shake start has
+`mode: "shake"`; a normal compaction start omits `mode`. Subprocess clients can
+use `RpcTransportClient::compact_with_events` and send cancellation through
+`control_handle().abort()` while continuing to poll the compaction request.
+
 ### In-place handoff
 
 ```json
@@ -362,6 +401,8 @@ already admitted handoff through its terminal response before shutdown.
 - `agent_end`: Turn complete.
 - `auto_retry_start` / `auto_retry_end`: Transient error retries.
 - `auto_compaction_start` / `auto_compaction_end`: Auto-compaction status.
+- `manual_compaction_start` / `manual_compaction_end`: User-requested
+  compaction status, including skipped passes, failure, and cancellation.
 - `extension_error`: Extension event dispatch/runtime error.
 - `error`: Fatal process error (gh #217). Printed exactly once on stdout
   before a non-zero exit, in both `--mode rpc` and `--mode json`:

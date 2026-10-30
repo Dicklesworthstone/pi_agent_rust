@@ -157,6 +157,8 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolExecutionEnd { .. } => "tool_end",
         AgentEvent::AutoCompactionStart { .. } => "auto_compaction_start",
         AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
+        AgentEvent::ManualCompactionStart { .. } => "manual_compaction_start",
+        AgentEvent::ManualCompactionEnd { .. } => "manual_compaction_end",
         AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
         AgentEvent::FailoverStart { .. } => "failover_start",

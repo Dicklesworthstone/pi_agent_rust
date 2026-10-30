@@ -12,8 +12,9 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use crate::agent::{
-    AbortHandle, AgentEvent, AgentSession, InputSource, ProviderAdmissionGate, QueueMode,
-    QueuedAgentMessage, SessionActionAdmissionGate,
+    AbortHandle, AgentEvent, AgentSession, InputSource, ManualCompactionProgress,
+    ProviderAdmissionGate, QueueMode, QueuedAgentMessage, SessionActionAdmissionGate,
+    SessionEditSnapshot,
 };
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
@@ -1562,6 +1563,253 @@ struct RpcHandoffObservation {
     started: bool,
     ended: bool,
     result: Option<Value>,
+}
+
+/// A manual request owns both progress and its response before runtime
+/// admission. A dropped or never-polled task cannot strand a client's spinner.
+struct RpcManualCompactionCompletion {
+    id: Option<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    progress: ManualCompactionProgress,
+    answered: bool,
+}
+
+impl RpcManualCompactionCompletion {
+    fn finish(&mut self, result: Result<Value>, skipped: bool) {
+        if self.answered {
+            return;
+        }
+        let response = match result {
+            Ok(data) => {
+                self.progress.finish(Some(data.clone()), false, false, None);
+                response_ok(self.id.clone(), "compact", Some(data))
+            }
+            Err(error) => {
+                self.progress.finish(
+                    None,
+                    matches!(error, Error::Aborted),
+                    skipped,
+                    Some(error.to_string()),
+                );
+                response_error_with_hints(self.id.clone(), "compact", &error)
+            }
+        };
+        let _ = self.out_tx.send(response);
+        self.answered = true;
+    }
+}
+
+impl Drop for RpcManualCompactionCompletion {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.finish(Err(Error::Aborted), false);
+        }
+        // Keep EOF draining and admission blocked until terminal frames are
+        // queued, even if the runtime rejected this task before polling it.
+        self.is_compacting.store(false, Ordering::SeqCst);
+    }
+}
+
+fn run_rpc_manual_compaction(
+    runtime: RuntimeHandle,
+    client_cx: AgentCx,
+    session: Arc<Mutex<AgentSession>>,
+    id: Option<String>,
+    custom_instructions: Option<String>,
+    settings: ResolvedCompactionSettings,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    output: RpcOutput,
+    is_compacting: Arc<AtomicBool>,
+    retry_abort: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+) -> impl Future<Output = ()> {
+    let event_tx = out_tx.clone();
+    let progress = ManualCompactionProgress::start(
+        move |event| {
+            let _ = event_tx.send(output.event_line(&event));
+        },
+        None,
+    );
+    let mut completion = RpcManualCompactionCompletion {
+        id,
+        out_tx,
+        is_compacting,
+        progress,
+        answered: false,
+    };
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    async move {
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = rpc_operation_owner(&runtime, &client_cx);
+        let future = owner.with_current(async {
+            let mut skipped = false;
+            let result: Result<Value> = async {
+                {
+                    let mut slot =
+                        OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &supervisor)
+                            .await
+                            .map_err(|err| Error::session(format!("abort lock failed: {err}")))?;
+                    if retry_abort.load(Ordering::SeqCst) {
+                        abort_handle.abort();
+                    }
+                    *slot = Some(abort_handle.clone());
+                }
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let mut guard = OwnedMutexGuard::lock(session, &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                let provider_admission = guard.provider_admission_gate();
+                guard.invalidate_background_compaction();
+                let _provider_call = provider_admission.acquire(&owner).await?;
+                provider_admission.ensure_allowed()?;
+                let (mut candidate, source) = {
+                    let mut inner_session =
+                        OwnedMutexGuard::lock(Arc::clone(&guard.session), &owner)
+                            .await
+                            .map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                    inner_session.ensure_full_v2_hydration_before_save()?;
+                    (
+                        inner_session.clone(),
+                        SessionEditSnapshot::capture(&inner_session)?,
+                    )
+                };
+                candidate.ensure_entry_ids();
+                let path_entries = candidate
+                    .entries_for_current_path()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                // The automatic setting does not disable an explicit request.
+                let Some(prep) =
+                    crate::compaction::prepare_manual_compaction(&path_entries, settings)
+                else {
+                    skipped = true;
+                    return Err(Error::session(
+                        "Compaction not available (already compacted or too little history)",
+                    ));
+                };
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let stream_options = guard.agent.stream_options().clone();
+                let privacy = guard.agent.compaction_privacy();
+                let compact = compact(
+                    prep,
+                    guard.agent.provider(),
+                    &stream_options,
+                    custom_instructions.as_deref(),
+                    &privacy,
+                );
+                let cancelled = abort_signal.wait();
+                futures::pin_mut!(compact, cancelled);
+                let result_data = match futures::future::select(cancelled, compact).await {
+                    futures::future::Either::Left(_) => return Err(Error::Aborted),
+                    futures::future::Either::Right((result, _)) => result?,
+                };
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let details_value = compaction_details_to_value(&result_data.details)?;
+                let details_value = match result_data.snap_payload.as_ref() {
+                    Some(payload) => {
+                        crate::compaction_snap::payload_to_details(Some(details_value), payload)
+                    }
+                    None => details_value,
+                };
+                candidate.append_compaction(
+                    result_data.summary.clone(),
+                    result_data.first_kept_entry_id.clone(),
+                    result_data.tokens_before,
+                    Some(details_value.clone()),
+                    None,
+                );
+                let tokens_after = crate::compaction::estimate_entries_context_tokens(
+                    &candidate.entries_for_current_path(),
+                );
+                let messages = candidate.to_messages_for_current_path();
+                let session_actions = guard.session_action_admission_gate();
+                let _session_action = session_actions.acquire(&owner).await?;
+                let mut inner_session = OwnedMutexGuard::lock(Arc::clone(&guard.session), &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                if SessionEditSnapshot::capture(&inner_session)? != source {
+                    return Err(Error::session(
+                        "Manual compaction context changed during summary generation; retry against the current session",
+                    ));
+                }
+                let save_enabled = guard.save_enabled();
+                if save_enabled {
+                    provider_admission.block(
+                        "manual compaction persistence was interrupted before live installation completed"
+                            .to_string(),
+                    );
+                    if let Err(first_err) = candidate.save().await
+                        && let Err(retry_err) = candidate.save().await
+                    {
+                        let reason = format!(
+                            "manual compaction persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                        );
+                        provider_admission.block(reason.clone());
+                        return Err(Error::session_persistence(reason));
+                    }
+                }
+                // Cancellation after persistence begins must not discard the
+                // committed candidate or publish an uncommitted success.
+                *inner_session = candidate;
+                guard.agent.replace_messages(messages);
+                if save_enabled {
+                    provider_admission.clear();
+                }
+                Ok(json!({
+                    "summary": result_data.summary,
+                    "firstKeptEntryId": result_data.first_kept_entry_id,
+                    "tokensBefore": result_data.tokens_before,
+                    "tokensAfter": tokens_after,
+                    "details": details_value,
+                }))
+            }
+            .await;
+            let result = match result {
+                Err(error) if abort_signal.is_aborted() && !error.is_session_persistence() => {
+                    Err(Error::Aborted)
+                }
+                other => other,
+            };
+            if let Ok(mut slot) = OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await {
+                *slot = None;
+            }
+            completion.finish(result, skipped);
+        });
+        supervisor
+            .with_current(async {
+                let cancellation = async {
+                    loop {
+                        if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
+                            retry_abort.store(true, Ordering::SeqCst);
+                            abort_handle.abort();
+                            break;
+                        }
+                        supervisor.time().sleep(Duration::from_millis(25)).await;
+                    }
+                };
+                futures::pin_mut!(cancellation, future);
+                if let futures::future::Either::Left(((), pending)) =
+                    futures::future::select(cancellation, future).await
+                {
+                    pending.await;
+                }
+            })
+            .await;
+    }
 }
 
 /// Own a maintenance request before spawning it. Handoff has one terminal RPC
@@ -4649,16 +4897,6 @@ pub async fn run(
             }
 
             "compact" => {
-                if rpc_turn_phase(&is_streaming, &is_compacting) != RpcTurnPhase::Idle {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "compact",
-                        "Agent is currently busy; wait before compacting".to_string(),
-                    ));
-                    continue;
-                }
-                let _compacting_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
-                is_compacting.store(true, Ordering::SeqCst);
                 let custom_instructions = parsed
                     .get("customInstructions")
                     .and_then(Value::as_str)
@@ -4682,123 +4920,46 @@ pub async fn run(
                         }
                     };
 
-                let result: Result<Value> = async {
-                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let provider_admission = guard.provider_admission_gate();
-                    guard.invalidate_background_compaction();
-                    let _provider_call = provider_admission.acquire(&cx).await?;
-                    provider_admission.ensure_allowed()?;
-                    let session_store = Arc::clone(&guard.session);
-                    let mut inner_session = OwnedMutexGuard::lock(session_store, &cx)
-                        .await
-                        .map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                    let mut candidate = inner_session.clone();
-                    candidate.ensure_entry_ids();
-                    let path_entries = candidate
-                        .entries_for_current_path()
-                        .into_iter()
-                        .cloned()
-                        .collect::<Vec<_>>();
-
-                    let stream_options = guard.agent.stream_options().clone();
-                    let provider = guard.agent.provider();
-
-                    let settings = ResolvedCompactionSettings {
-                        enabled: options.config.compaction_enabled(),
-                        reserve_tokens: reserve_tokens_override
-                            .unwrap_or_else(|| options.config.compaction_reserve_tokens()),
-                        keep_recent_tokens: keep_recent_tokens_override
-                            .unwrap_or_else(|| options.config.compaction_keep_recent_tokens()),
-                        ..Default::default()
-                    };
-
-                    // A requested compaction ignores the automatic threshold
-                    // but still honors a disabled configuration.
-                    let enabled = settings.enabled;
-                    let prep = enabled
-                        .then(|| crate::compaction::prepare_manual_compaction(&path_entries, settings))
-                        .flatten()
-                        .ok_or_else(|| {
-                            Error::session(
-                                "Compaction not available (disabled, already compacted, or too little history)",
-                            )
-                        })?;
-
-                    let privacy = guard.agent.compaction_privacy();
-                    let compact_res = compact(
-                        prep,
-                        provider,
-                        &stream_options,
-                        custom_instructions.as_deref(),
-                        &privacy,
-                    )
-                    .await;
-                    let result_data = compact_res?;
-
-                    let details_value = compaction_details_to_value(&result_data.details)?;
-                    let details_value = match result_data.snap_payload.as_ref() {
-                        Some(payload) => {
-                            crate::compaction_snap::payload_to_details(Some(details_value), payload)
-                        }
-                        None => details_value,
-                    };
-
-                    candidate.append_compaction(
-                        result_data.summary.clone(),
-                        result_data.first_kept_entry_id.clone(),
-                        result_data.tokens_before,
-                        Some(details_value.clone()),
-                        None,
-                    );
-                    // Post-compaction context estimate (heuristic, ignores usage).
-                    let tokens_after = crate::compaction::estimate_entries_context_tokens(
-                        &candidate.entries_for_current_path(),
-                    );
-                    let messages = candidate.to_messages_for_current_path();
-                    let save_enabled = guard.save_enabled();
-                    if save_enabled {
-                        provider_admission.block(
-                            "manual compaction persistence was interrupted before live installation completed"
-                                .to_string(),
-                        );
-                        if let Err(first_err) = candidate.save().await
-                            && let Err(retry_err) = candidate.save().await
-                        {
-                            let reason = format!(
-                                "manual compaction persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                            );
-                            provider_admission.block(reason.clone());
-                            return Err(Error::session_persistence(reason));
-                        }
+                let admitted = {
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                    if rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle {
+                        retry_abort.store(false, Ordering::SeqCst);
+                        is_compacting.store(true, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
                     }
-                    *inner_session = candidate;
-                    guard.agent.replace_messages(messages);
-                    if save_enabled {
-                        provider_admission.clear();
-                    }
-
-                    Ok(json!({
-                        "summary": result_data.summary,
-                        "firstKeptEntryId": result_data.first_kept_entry_id,
-                        "tokensBefore": result_data.tokens_before,
-                        "tokensAfter": tokens_after,
-                        "details": details_value,
-                    }))
+                };
+                if !admitted {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "compact",
+                        "Agent is currently busy; wait before compacting",
+                    ));
+                    continue;
                 }
-                .await;
-
-                match result {
-                    Ok(data) => {
-                        let _ = out_tx.send(response_ok(id, "compact", Some(data)));
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "compact", &err));
-                    }
-                }
+                let settings = ResolvedCompactionSettings {
+                    enabled: options.config.compaction_enabled(),
+                    reserve_tokens: reserve_tokens_override
+                        .unwrap_or_else(|| options.config.compaction_reserve_tokens()),
+                    keep_recent_tokens: keep_recent_tokens_override
+                        .unwrap_or_else(|| options.config.compaction_keep_recent_tokens()),
+                    ..Default::default()
+                };
+                let task = run_rpc_manual_compaction(
+                    options.runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&session),
+                    id,
+                    custom_instructions,
+                    settings,
+                    out_tx.clone(),
+                    output.for_turn(),
+                    Arc::clone(&is_compacting),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle),
+                );
+                let _ = options.runtime_handle.try_spawn(task);
             }
 
             "checkpoint" => {
@@ -17606,6 +17767,258 @@ mod tests {
                 ..ResolvedCompactionSettings::default()
             },
         )
+    }
+
+    #[test]
+    fn rpc_manual_compaction_progress_precedes_durable_result_and_drains_eof() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut stored = seed_auto_compaction_session(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            )));
+            stored.save().await.unwrap();
+            let path = stored.path.clone().unwrap();
+            let agent_session =
+                handoff_agent_session(stored, true, Arc::new(CompactionSummaryProvider));
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            options.config.compaction = Some(crate::config::CompactionSettings {
+                enabled: Some(false),
+                ..Default::default()
+            });
+            let (in_tx, in_rx) = mpsc::channel(4);
+            in_tx
+                .send(
+                    &asupersync::Cx::for_testing(),
+                    json!({"id":"compact-1","type":"compact","keepRecentTokens":1})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            Box::pin(run(agent_session, options, in_rx, out_tx))
+                .await
+                .expect("EOF drains manual maintenance");
+            let events = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 3, "start, committed end, terminal response");
+            assert_eq!(events[0], json!({"type":"manual_compaction_start"}));
+            assert_eq!(events[1]["type"], "manual_compaction_end");
+            assert_eq!(events[1]["aborted"], false);
+            assert!(events[1].get("skipped").is_none());
+            assert!(events[1].get("errorMessage").is_none());
+            assert_ok(&events[2], "compact");
+            assert_eq!(events[2]["id"], "compact-1");
+            assert_eq!(events[1]["result"], events[2]["data"]);
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            let compactions = reopened
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    SessionEntry::Compaction(entry) => Some(entry),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(compactions.len(), 1);
+            assert_eq!(
+                compactions[0].summary,
+                events[1]["result"]["summary"].as_str().unwrap()
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_manual_compaction_skip_and_save_failure_have_one_terminal_pair() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for skip in [true, false] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut stored = if skip {
+                    Session::in_memory()
+                } else {
+                    seed_auto_compaction_session(Session::in_memory())
+                };
+                if !skip {
+                    let blocked = temp.path().join("blocked.jsonl");
+                    std::fs::create_dir(&blocked).unwrap();
+                    stored.path = Some(blocked);
+                }
+                let before = serde_json::to_value(&stored.entries).unwrap();
+                let session = Arc::new(asupersync::sync::Mutex::new(handoff_agent_session(
+                    stored,
+                    !skip,
+                    Arc::new(CompactionSummaryProvider),
+                )));
+                let compacting = Arc::new(AtomicBool::new(true));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+                run_rpc_manual_compaction(
+                    runtime_handle.clone(),
+                    AgentCx::for_testing(),
+                    Arc::clone(&session),
+                    Some("manual".to_string()),
+                    None,
+                    ResolvedCompactionSettings {
+                        keep_recent_tokens: 1,
+                        ..Default::default()
+                    },
+                    out_tx,
+                    RpcOutput::default(),
+                    Arc::clone(&compacting),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(asupersync::sync::Mutex::new(None)),
+                )
+                .await;
+                assert!(!compacting.load(Ordering::SeqCst));
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert_eq!(events.len(), 3);
+                assert_eq!(events[0]["type"], "manual_compaction_start");
+                assert_eq!(events[1]["type"], "manual_compaction_end");
+                assert_eq!(events[1]["aborted"], false);
+                assert!(events[1].get("result").is_none());
+                assert_eq!(
+                    events[1].get("skipped").and_then(Value::as_bool),
+                    skip.then_some(true)
+                );
+                assert!(events[1]["errorMessage"].is_string());
+                assert_err(&events[2], "compact");
+                let guard = session.try_lock().unwrap();
+                let stored = guard.session.try_lock().unwrap();
+                assert_eq!(serde_json::to_value(&stored.entries).unwrap(), before);
+                assert_eq!(guard.provider_admission_gate().reason().is_some(), !skip);
+            }
+        }));
+    }
+
+    #[test]
+    fn rpc_unpolled_manual_compaction_answers_once_and_releases_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let session = handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+        let compacting = Arc::new(AtomicBool::new(true));
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+        let future = run_rpc_manual_compaction(
+            runtime.handle(),
+            AgentCx::for_testing(),
+            Arc::new(asupersync::sync::Mutex::new(session)),
+            Some("not-polled".to_string()),
+            None,
+            ResolvedCompactionSettings::default(),
+            out_tx,
+            RpcOutput::default(),
+            Arc::clone(&compacting),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(asupersync::sync::Mutex::new(None)),
+        );
+        drop(future);
+        assert!(!compacting.load(Ordering::SeqCst));
+        let events = out_rx
+            .try_iter()
+            .map(|line| parse_response(&line))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "manual_compaction_start");
+        assert_eq!(events[1]["type"], "manual_compaction_end");
+        assert_eq!(events[1]["aborted"], true);
+        assert_err(&events[2], "compact");
+        assert_eq!(events[2]["id"], "not-polled");
+    }
+
+    #[test]
+    fn rpc_manual_compaction_keeps_state_and_abort_responsive() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (entered_tx, mut entered_rx) = oneshot::channel();
+            let (_gate_tx, gate_rx) = oneshot::channel();
+            let provider = Arc::new(GatedAutoCompactionProvider {
+                calls: Arc::new(AtomicUsize::new(1)),
+                compaction_entered: Mutex::new(Some(entered_tx)),
+                compaction_gate: Mutex::new(Some(gate_rx)),
+            });
+            let agent_session = handoff_agent_session(
+                seed_auto_compaction_session(Session::in_memory()),
+                false,
+                provider,
+            );
+            let inner = Arc::clone(&agent_session.session);
+            let before = serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap();
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(
+                        &cx,
+                        json!({"id":"c","type":"compact","keepRecentTokens":1}).to_string(),
+                    )
+                    .await
+                    .unwrap();
+                let started = parse_response(&recv_line(&out_rx, "manual start").await.unwrap());
+                assert_eq!(started, json!({"type":"manual_compaction_start"}));
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    entered_rx.recv(&cx),
+                )
+                .await
+                .expect("summary starts")
+                .unwrap();
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"state","type":"get_state"}"#,
+                    "state during manual compaction",
+                )
+                .await;
+                assert_ok(&state, "get_state");
+                assert_eq!(state["data"]["isCompacting"], true);
+                let abort = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"abort","type":"abort"}"#,
+                    "abort manual compaction",
+                )
+                .await;
+                assert_ok(&abort, "abort");
+                let ended = parse_response(&recv_line(&out_rx, "manual end").await.unwrap());
+                assert_eq!(ended["type"], "manual_compaction_end");
+                assert_eq!(ended["aborted"], true);
+                let response = parse_response(&recv_line(&out_rx, "manual response").await.unwrap());
+                assert_err(&response, "compact");
+                assert_eq!(response["id"], "c");
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
+            result.expect("cancelled compaction drains");
+            assert_eq!(
+                serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap(),
+                before,
+            );
+        }));
     }
 
     #[test]

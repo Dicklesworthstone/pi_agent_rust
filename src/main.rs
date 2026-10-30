@@ -2273,6 +2273,15 @@ async fn run(
         (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
 
     let is_interactive = !cli.acp && !cli.print && cli.mode.is_none() && cli.export.is_none();
+    // out:// replies default on only in the interactive host. Resolve the
+    // default before constructing any registry, and carry it through the
+    // SDK's independent configuration load below. The write tool separately
+    // refuses child-agent use, including explicitly enabled configurations.
+    config
+        .out
+        .get_or_insert_with(Default::default)
+        .enabled
+        .get_or_insert(is_interactive);
     let supports_prewalk = is_interactive
         || cli.acp
         || (cli.export.is_none()
@@ -2759,6 +2768,7 @@ async fn run(
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
             enabled_tools: Some(ftui_enabled_tools),
+            out_default_enabled: true,
             thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
             include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
             // The model learns which skills exist from this block, as on
@@ -9924,7 +9934,8 @@ async fn execute_print_command(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match &event {
-                AgentEvent::AutoCompactionStart { .. } => state.started = true,
+                AgentEvent::AutoCompactionStart { .. }
+                | AgentEvent::ManualCompactionStart { .. } => state.started = true,
                 AgentEvent::AutoCompactionEnd {
                     result,
                     aborted,
@@ -9936,6 +9947,22 @@ async fn execute_print_command(
                     state.failure = error_message
                         .clone()
                         .or_else(|| aborted.then(|| "Compaction cancelled".to_string()));
+                }
+                AgentEvent::ManualCompactionEnd {
+                    result,
+                    aborted,
+                    skipped,
+                    error_message,
+                } => {
+                    state.started = false;
+                    state.result.clone_from(result);
+                    state.failure = if *skipped == Some(true) {
+                        None
+                    } else {
+                        error_message
+                            .clone()
+                            .or_else(|| aborted.then(|| "Compaction cancelled".to_string()))
+                    };
                 }
                 _ => {}
             }
@@ -9981,7 +10008,9 @@ async fn execute_print_command(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .started;
-            if started {
+            // Manual compaction owns its terminal guard; dropping the operation
+            // emits its one aborted end. Handoff still uses automatic events.
+            if started && command == PrintCommand::Handoff {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: true,
@@ -10142,14 +10171,23 @@ async fn run_print_mode_inner(
             }
             if emit_json_events {
                 emit_json_event(&event);
-            } else if stream_text_events
-                && let Some(delta) = streamed_text_delta(&event)
-                && emit_text_delta(delta).is_ok()
-            {
+            } else if stream_text_events {
                 let mut guard = text_stream_state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.observe_delta(delta);
+                if let Some(text) = accepted_interim_text(&event) {
+                    if emit_text_delta(&format!("\n{text}\n\n")).is_ok() {
+                        // This is visible output for retry admission, but it
+                        // must not suppress a final answer from a provider
+                        // that returns a complete message without deltas.
+                        guard.emitted_interim = true;
+                        guard.ends_with_newline = true;
+                    }
+                } else if let Some(delta) = streamed_text_delta(&event)
+                    && emit_text_delta(delta).is_ok()
+                {
+                    guard.observe_delta(delta);
+                }
             }
             // Route non-lifecycle events through the coalescer for
             // batched/coalesced dispatch with lazy serialization.
@@ -10444,6 +10482,7 @@ async fn run_print_mode_inner(
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct PrintTextStreamState {
     streamed_text: bool,
+    emitted_interim: bool,
     ends_with_newline: bool,
 }
 
@@ -10461,11 +10500,23 @@ impl PrintTextStreamState {
     }
 
     const fn can_retry(self, is_json: bool) -> bool {
-        is_json || !self.streamed_text
+        is_json || (!self.streamed_text && !self.emitted_interim)
     }
 
     const fn needs_trailing_newline(self) -> bool {
         self.streamed_text && !self.ends_with_newline
+    }
+}
+
+fn accepted_interim_text(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::ToolExecutionEnd {
+            tool_name,
+            result,
+            is_error: false,
+            ..
+        } if tool_name == "write" => pi::tools::interim_response_text(result),
+        _ => None,
     }
 }
 
@@ -15265,7 +15316,7 @@ mod tests {
             assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
             assert!(provider.requests.lock().unwrap().is_empty());
             assert!(events.lock().unwrap().iter().any(|event| {
-                matches!(event, AgentEvent::AutoCompactionEnd { aborted: true, .. })
+                matches!(event, AgentEvent::ManualCompactionEnd { aborted: true, .. })
             }));
             let cx = pi::agent_cx::AgentCx::for_request();
             let stored = session.session.lock(cx.cx()).await.unwrap();
@@ -17545,6 +17596,55 @@ mod tests {
 
         state.observe_delta(" world\n");
         assert!(!state.needs_trailing_newline());
+    }
+
+    #[test]
+    fn interim_print_output_blocks_replay_without_hiding_an_unstreamed_final_answer() {
+        let mut state = PrintTextStreamState::default();
+        state.emitted_interim = true;
+        state.ends_with_newline = true;
+        assert!(state.should_render_final_message());
+        assert!(!state.can_retry(false));
+        assert!(state.can_retry(true));
+        assert!(!state.needs_trailing_newline());
+        state.observe_delta("The final answer");
+        assert!(!state.should_render_final_message());
+        assert!(state.needs_trailing_newline());
+    }
+
+    #[test]
+    fn interim_print_output_requires_a_successful_write_terminal_event() {
+        let result = pi::tools::ToolOutput {
+            content: Vec::new(),
+            details: Some(
+                serde_json::json!({"schema":"pi.interim_response.v1", "text":"Progress"}),
+            ),
+            is_error: false,
+        };
+        for (tool_name, is_error, expected) in [
+            ("write", false, Some("Progress")),
+            ("write", true, None),
+            ("read", false, None),
+        ] {
+            assert_eq!(
+                accepted_interim_text(&AgentEvent::ToolExecutionEnd {
+                    tool_call_id: "reply".to_string(),
+                    tool_name: tool_name.to_string(),
+                    result: result.clone(),
+                    is_error,
+                }),
+                expected
+            );
+        }
+        assert_eq!(
+            accepted_interim_text(&AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "reply".to_string(),
+                tool_name: "write".to_string(),
+                args: serde_json::json!({"path":"out://"}),
+                partial_result: result,
+            }),
+            None
+        );
     }
 
     #[test]

@@ -2073,6 +2073,9 @@ pub enum PiMsg {
         content: Vec<ContentBlock>,
         details: Option<Value>,
     },
+    /// An accepted out:// write. It is assistant prose within the current
+    /// turn, not a task completion or a tool-output preview.
+    InterimResponse { tool_id: String, text: String },
     /// Tool execution ended. `output` carries an OPTIONAL size-capped text
     /// preview of the tool result (bd-cv653.9.2 diff cards); `None` when
     /// the surface folds output elsewhere (e.g. the ftui bash flow) or the

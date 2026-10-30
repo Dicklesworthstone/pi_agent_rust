@@ -1494,6 +1494,21 @@ pub enum AgentEvent {
         #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
         error_message: Option<String>,
     },
+    /// A user-requested compaction began, independently of automatic thresholds.
+    ManualCompactionStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
+    /// A manual compaction finished, was skipped, failed, or was cancelled.
+    ManualCompactionEnd {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+        aborted: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skipped: Option<bool>,
+        #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    },
     /// Auto-retry lifecycle start.
     AutoRetryStart {
         attempt: u32,
@@ -1588,6 +1603,112 @@ pub enum AgentEvent {
         event: String,
         error: String,
     },
+}
+
+/// Own the progress pair for an admitted manual compaction. The native
+/// compaction engine is shared with automatic recovery; its callback is adapted
+/// at the manual boundary so those internals never publish automatic progress
+/// for a user's request. Dropping an in-flight operation still ends its pair.
+pub(crate) struct ManualCompactionProgress {
+    state: Arc<ManualCompactionProgressState>,
+}
+
+struct ManualCompactionProgressState {
+    on_event: AgentEventHandler,
+    ended: AtomicBool,
+}
+
+impl ManualCompactionProgressState {
+    fn finish(
+        &self,
+        result: Option<Value>,
+        aborted: bool,
+        skipped: bool,
+        error_message: Option<String>,
+    ) {
+        if !self.ended.swap(true, Ordering::SeqCst) {
+            (self.on_event)(AgentEvent::ManualCompactionEnd {
+                result,
+                aborted,
+                skipped: skipped.then_some(true),
+                error_message,
+            });
+        }
+    }
+}
+
+impl ManualCompactionProgress {
+    pub(crate) fn start(
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        mode: Option<String>,
+    ) -> Self {
+        let state = Arc::new(ManualCompactionProgressState {
+            on_event: Arc::new(on_event),
+            ended: AtomicBool::new(false),
+        });
+        (state.on_event)(AgentEvent::ManualCompactionStart { mode });
+        Self { state }
+    }
+
+    pub(crate) fn callback(&self) -> impl Fn(AgentEvent) + Send + Sync + 'static + use<> {
+        let state = Arc::clone(&self.state);
+        move |event| match event {
+            AgentEvent::AutoCompactionStart { .. } => {}
+            AgentEvent::AutoCompactionEnd {
+                result,
+                aborted,
+                error_message,
+                ..
+            } => state.finish(
+                result,
+                aborted,
+                false,
+                error_message.or_else(|| aborted.then(|| "Compaction cancelled".to_string())),
+            ),
+            other => (state.on_event)(other),
+        }
+    }
+
+    pub(crate) fn finish(
+        &self,
+        result: Option<Value>,
+        aborted: bool,
+        skipped: bool,
+        error_message: Option<String>,
+    ) {
+        self.state.finish(result, aborted, skipped, error_message);
+    }
+
+    fn finish_outcome(&self, outcome: &Result<bool>) {
+        match outcome {
+            Ok(false) => self.finish(
+                None,
+                false,
+                true,
+                Some("Nothing to compact: already compacted or too little history".to_string()),
+            ),
+            Err(error) => self.finish(
+                None,
+                matches!(error, Error::Aborted),
+                false,
+                Some(error.to_string()),
+            ),
+            // Successful installation already published its result through
+            // the callback. Do not report success before that transaction.
+            Ok(true) => {}
+        }
+    }
+}
+
+impl Drop for ManualCompactionProgress {
+    fn drop(&mut self) {
+        self.finish(
+            None,
+            true,
+            false,
+            Some("Manual compaction interrupted before completion".to_string()),
+        );
+    }
 }
 
 // ============================================================================
@@ -14337,6 +14458,8 @@ mod abort_tests {
             AgentEvent::ToolExecutionEnd { .. } => "tool_end",
             AgentEvent::AutoCompactionStart { .. } => "auto_compaction_start",
             AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
+            AgentEvent::ManualCompactionStart { .. } => "manual_compaction_start",
+            AgentEvent::ManualCompactionEnd { .. } => "manual_compaction_end",
             AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
             AgentEvent::FailoverStart { .. } => "failover_start",
@@ -18530,8 +18653,18 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, instructions, None, None)
-            .await
+        let progress = ManualCompactionProgress::start(on_event, None);
+        let outcome = self
+            .compact_synchronous(
+                Arc::new(progress.callback()),
+                false,
+                instructions,
+                None,
+                None,
+            )
+            .await;
+        progress.finish_outcome(&outcome);
+        outcome
     }
 
     /// OMP `/shake` (bd-cv653.3.18): compact by dropping bulky tool output
@@ -18542,8 +18675,13 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.compact_synchronous(Arc::new(on_event), true, None, None, None)
-            .await
+        self.ensure_provider_reentry_allowed()?;
+        let progress = ManualCompactionProgress::start(on_event, Some("shake".to_string()));
+        let outcome = self
+            .compact_synchronous(Arc::new(progress.callback()), true, None, None, None)
+            .await;
+        progress.finish_outcome(&outcome);
+        outcome
     }
 
     /// Recover an overflowing request using the same durable compaction
