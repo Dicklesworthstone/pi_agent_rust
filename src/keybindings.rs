@@ -2965,6 +2965,111 @@ mod tests {
             assert_eq!(bindings.lookup(&page_up), Some(AppAction::PageUp));
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn terminal_enter_normalization_preserves_newline_chords_and_event_kinds() {
+            use crossterm::event as ct;
+
+            let bindings = KeyBindings::default();
+            let chords = [
+                (ct::KeyModifiers::NONE, "enter", Some(AppAction::Submit)),
+                (
+                    ct::KeyModifiers::SHIFT,
+                    "shift+enter",
+                    Some(AppAction::NewLine),
+                ),
+                (
+                    ct::KeyModifiers::CONTROL,
+                    "ctrl+enter",
+                    Some(AppAction::NewLine),
+                ),
+                (
+                    ct::KeyModifiers::ALT,
+                    "alt+enter",
+                    Some(AppAction::FollowUp),
+                ),
+                (
+                    ct::KeyModifiers::CONTROL | ct::KeyModifiers::SHIFT,
+                    "ctrl+shift+enter",
+                    None,
+                ),
+                (
+                    ct::KeyModifiers::ALT | ct::KeyModifiers::SHIFT,
+                    "alt+shift+enter",
+                    None,
+                ),
+                (
+                    ct::KeyModifiers::CONTROL | ct::KeyModifiers::ALT,
+                    "ctrl+alt+enter",
+                    None,
+                ),
+            ];
+            for (kind, expected_kind) in [
+                (ct::KeyEventKind::Press, ftui::KeyEventKind::Press),
+                (ct::KeyEventKind::Repeat, ftui::KeyEventKind::Repeat),
+                (ct::KeyEventKind::Release, ftui::KeyEventKind::Release),
+            ] {
+                for (modifiers, chord, expected_action) in chords {
+                    // Exercise the same backend boundary as TerminalSession,
+                    // rather than synthesizing an already-normalized FTUI key.
+                    let terminal = ct::Event::Key(ct::KeyEvent::new_with_kind(
+                        ct::KeyCode::Enter,
+                        modifiers,
+                        kind,
+                    ));
+                    let Some(ftui::Event::Key(key)) = ftui::Event::from_crossterm(terminal) else {
+                        panic!("terminal Enter event was dropped: {chord} {kind:?}"); // ubs:ignore test assertion: normalization must preserve this known key event.
+                    };
+                    assert_eq!(key.code, ftui::KeyCode::Enter);
+                    // The model must still be able to discard releases without
+                    // suppressing auto-repeat on multiline input.
+                    assert_eq!(key.kind, expected_kind);
+                    let binding = KeyBinding::from_ftui_key(&key).expect("Enter binding");
+                    assert_eq!(binding, chord.parse::<KeyBinding>().unwrap());
+                    assert_eq!(bindings.lookup(&binding), expected_action, "{chord}");
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn terminal_newline_actions_respect_user_config() {
+            use crossterm::event as ct;
+
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("keybindings.json");
+            std::fs::write(
+                &path,
+                r#"{"newLine": ["ctrl+j"], "submit": ["ctrl+enter"]}"#,
+            )
+            .unwrap();
+            let loaded = KeyBindings::load_from_path_with_diagnostics(&path);
+            assert!(!loaded.has_warnings());
+
+            for (code, modifiers, newline, submit) in [
+                // Raw-mode LF is a Ctrl+J event, distinct from Enter. Users
+                // can bind it without an unconditional newline alias.
+                (
+                    ct::KeyCode::Char('j'),
+                    ct::KeyModifiers::CONTROL,
+                    true,
+                    false,
+                ),
+                (ct::KeyCode::Enter, ct::KeyModifiers::CONTROL, false, true),
+                (ct::KeyCode::Enter, ct::KeyModifiers::SHIFT, false, false),
+                (ct::KeyCode::Enter, ct::KeyModifiers::NONE, false, false),
+            ] {
+                let terminal = ct::Event::Key(ct::KeyEvent::new(code, modifiers));
+                let Some(ftui::Event::Key(key)) = ftui::Event::from_crossterm(terminal) else {
+                    panic!("configured terminal chord was dropped: {code:?} {modifiers:?}"); // ubs:ignore test assertion: normalization must preserve this known key event.
+                };
+                let binding = KeyBinding::from_ftui_key(&key).expect("configured binding");
+                let actions = loaded.bindings.matching_actions(&binding);
+                assert_eq!(actions.contains(&AppAction::NewLine), newline, "{binding}");
+                assert_eq!(actions.contains(&AppAction::Submit), submit, "{binding}");
+            }
+        }
+
         #[test]
         fn session_picker_default_bindings_and_hotkeys() {
             let bindings = KeyBindings::default();
