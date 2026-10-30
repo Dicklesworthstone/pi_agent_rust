@@ -1352,9 +1352,12 @@ packages. Project packages take priority over user packages.
 Skills additionally discover universal `.agents/skills/` directories from the
 working directory through its ancestors up to the Git root (or filesystem root
 when no Git root exists), plus `~/.agents/skills/` in the user's home directory.
-Within each scope, Pi-specific skills and settings entries take priority over
-universal skills; nearer project universal roots take priority over farther
-ancestors, and project universal skills still take priority over user skills. Managed
+Ancestor probing is capped at 64 locations and each selected skill root has a
+16,384-entry discovery budget; an over-budget root is rejected rather than
+partially loaded. Within each scope, Pi-specific skills and settings entries take
+priority over universal skills; nearer project universal roots take priority over
+farther ancestors, and project universal skills still take priority over user
+skills. Managed
 skills from `<agent_dir>/skills.managed/` load last. See the complete
 [skill precedence table](docs/skills.md#precedence).
 

@@ -14,8 +14,9 @@ Pi automatically discovers skills in both Pi-specific and universal locations:
 Pi-specific project skills are relative to the current working directory.
 Universal project skills are discovered from `.agents/skills/` in the current
 working directory and each ancestor directory, stopping at the nearest Git root
-(or at the filesystem root when no Git root exists). Discovery checks only those
-bounded candidate roots; it does not recursively scan unrelated directories.
+(or at the filesystem root when no Git root exists). At most 64 ancestor
+locations are probed. Discovery checks only those bounded candidate roots; it
+does not recursively scan unrelated directories.
 `PI_CODING_AGENT_DIR` changes the Pi-specific user directory; the universal user
 directory remains `.agents/skills/` under the user's home directory.
 
@@ -31,8 +32,11 @@ packages. Agent-authored managed skills live in the configured agent directory's
 
 Missing default directories are silently ignored. Symlinked skills are supported;
 the same canonical file is loaded once, and directory cycles do not cause
-unbounded traversal. Unreadable, oversized, invalid UTF-8, and missing-description
-skill files are skipped with diagnostics while valid skills continue to load.
+unbounded traversal. Each selected skill root has a 16,384-entry discovery
+budget. A root that exceeds the budget is rejected as a whole rather than
+returning a filesystem-order-dependent partial catalog. Unreadable, oversized,
+invalid UTF-8, and missing-description skill files are skipped with diagnostics
+while valid skills continue to load.
 
 ### Precedence
 

@@ -3029,7 +3029,17 @@ fn collect_files_recursive_any(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new("node_modules"));
 
     let mut out = Vec::new();
+    let mut scanned = 0usize;
     for entry in builder.build().filter_map(std::result::Result::ok) {
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_SKILL_DISCOVERY_ENTRIES {
+            warn!(
+                root = %dir.display(),
+                limit = MAX_SKILL_DISCOVERY_ENTRIES,
+                "Skill discovery root exceeded entry budget; ignoring the root"
+            );
+            return Vec::new();
+        }
         let path = entry.path();
         if path.is_file()
             && path
@@ -3042,6 +3052,9 @@ fn collect_files_recursive_any(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
     }
     out
 }
+
+const MAX_SKILL_DISCOVERY_ENTRIES: usize = 16_384;
+const MAX_PROJECT_SKILL_ANCESTORS: usize = 64;
 
 fn canonical_identity_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -3058,12 +3071,13 @@ pub(crate) fn project_universal_skill_dirs(
 ) -> Vec<PathBuf> {
     let git_root = cwd
         .ancestors()
+        .take(MAX_PROJECT_SKILL_ANCESTORS)
         .find(|ancestor| ancestor.join(".git").exists())
         .map(Path::to_path_buf);
     let home_identity = home_dir.map(canonical_identity_path);
     let mut roots = Vec::new();
 
-    for ancestor in cwd.ancestors() {
+    for ancestor in cwd.ancestors().take(MAX_PROJECT_SKILL_ANCESTORS) {
         let ancestor_identity = canonical_identity_path(ancestor);
         let is_home = home_identity
             .as_ref()
@@ -3125,7 +3139,6 @@ fn collect_skill_entries_with_parent_ignores(
         .git_global(false)
         .git_exclude(false)
         .add_custom_ignore_filename(".fdignore")
-        .sort_by_file_path(Path::cmp)
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
             if name == "node_modules" {
@@ -3166,6 +3179,7 @@ fn collect_skill_entries_with_parent_ignores(
         }
     }
 
+    out.sort();
     out
 }
 
@@ -7563,6 +7577,19 @@ mod tests {
                 .iter()
                 .any(|p| p.file_name().unwrap() == "readme.txt")
         );
+    }
+
+    #[test]
+    fn project_universal_skill_dirs_caps_ancestor_probes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut cwd = temp.path().to_path_buf();
+        for index in 0..(MAX_PROJECT_SKILL_ANCESTORS + 8) {
+            cwd.push(format!("level-{index}"));
+        }
+
+        let roots = project_universal_skill_dirs(&cwd, None);
+        assert_eq!(roots.len(), MAX_PROJECT_SKILL_ANCESTORS);
+        assert_eq!(roots[0], cwd.join(".agents/skills"));
     }
 
     #[test]

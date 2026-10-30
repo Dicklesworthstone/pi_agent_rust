@@ -62,14 +62,23 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> St
     )
 }
 
-fn read_dir_sorted_paths(dir: &Path) -> Vec<PathBuf> {
+fn read_dir_sorted_paths_bounded(dir: &Path, remaining: usize) -> Option<Vec<PathBuf>> {
     let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
 
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        if paths.len() >= remaining {
+            // Read one entry beyond the budget only to prove that this root
+            // exceeds its cap. Fail the whole root closed instead of returning
+            // an OS-order-dependent partial catalogue.
+            return None;
+        }
+        paths.push(entry.path());
+    }
     paths.sort();
-    paths
+    Some(paths)
 }
 
 fn canonical_identity_path(path: &Path) -> PathBuf {
@@ -118,6 +127,7 @@ pub struct ResourceDiagnostic {
 
 const MAX_SKILL_NAME_LEN: usize = 64;
 const MAX_SKILL_DESC_LEN: usize = 1024;
+const MAX_SKILL_DISCOVERY_ENTRIES: usize = 16_384;
 
 const ALLOWED_SKILL_FRONTMATTER: [&str; 8] = [
     "name",
@@ -1194,6 +1204,8 @@ fn load_skills_from_dir_with_visited(
 ) -> LoadSkillsResult {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
+    let root_dir = dir.clone();
+    let mut scanned_entries = 0usize;
     let mut stack = vec![(dir, source, include_root_files)];
 
     while let Some((current_dir, current_source, current_include_root)) = stack.pop() {
@@ -1221,8 +1233,23 @@ fn load_skills_from_dir_with_visited(
         };
 
         let mut child_dirs = Vec::new();
+        let remaining = MAX_SKILL_DISCOVERY_ENTRIES.saturating_sub(scanned_entries);
+        let Some(paths) = read_dir_sorted_paths_bounded(&current_dir, remaining) else {
+            return LoadSkillsResult {
+                skills: Vec::new(),
+                diagnostics: vec![ResourceDiagnostic {
+                    kind: DiagnosticKind::Warning,
+                    message: format!(
+                        "skill discovery root exceeds the {MAX_SKILL_DISCOVERY_ENTRIES}-entry limit"
+                    ),
+                    path: root_dir,
+                    collision: None,
+                }],
+            };
+        };
+        scanned_entries = scanned_entries.saturating_add(paths.len());
 
-        for full_path in read_dir_sorted_paths(&current_dir) {
+        for full_path in paths {
             let file_name = full_path.file_name().unwrap_or_default().to_string_lossy();
 
             if file_name.starts_with('.') || file_name == "node_modules" {
@@ -2717,6 +2744,27 @@ mod tests {
     use std::fs;
     use std::future::Future;
     use std::io::Write;
+
+    #[test]
+    fn bounded_skill_directory_read_fails_closed_instead_of_returning_a_partial_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["c.md", "a.md", "b.md"] {
+            fs::write(dir.path().join(name), name).expect("write fixture");
+        }
+
+        assert!(
+            read_dir_sorted_paths_bounded(dir.path(), 2).is_none(),
+            "an over-budget directory must fail closed"
+        );
+        let paths = read_dir_sorted_paths_bounded(dir.path(), 3).expect("within budget");
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.md", "b.md", "c.md"]
+        );
+    }
 
     fn write_resource_at_limit(path: &Path, prefix: &[u8]) {
         assert!(prefix.len() <= MAX_RESOURCE_FILE_BYTES);
