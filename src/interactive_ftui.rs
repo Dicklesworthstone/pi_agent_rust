@@ -51,7 +51,6 @@ use ftui::text::{Text, WrapMode, display_width};
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::spinner::{DOTS, SpinnerState};
-use ftui::widgets::textarea::TextArea;
 use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::ask::{AskAnswer, AskResponse, AskUiRequest, QuestionReply};
@@ -66,9 +65,11 @@ mod info_commands;
 mod plan_commands;
 pub mod session_pins;
 mod settings;
+mod textarea;
 mod workspace_commands;
 
 pub use settings::{SettingsKey, SettingsSnapshot};
+use textarea::TextArea;
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -2591,14 +2592,19 @@ impl PiFtuiModel {
 
     /// Rows the input editor currently needs (content-driven, clamped).
     fn input_rows(&self) -> u16 {
-        let lines = if self.input.is_empty() {
-            1
-        } else {
-            self.input.text().lines().count().max(1)
-        };
-        u16::try_from(lines)
-            .unwrap_or(MAX_INPUT_ROWS)
-            .min(MAX_INPUT_ROWS)
+        self.input_rows_at_width(self.term.0)
+    }
+
+    fn input_rows_at_width(&self, width: u16) -> u16 {
+        // gh #276: `str::lines()` hides the new empty row immediately after
+        // Enter, and hard-line counts miss soft wraps. Ask the actual widget
+        // so its layout, viewport, and cursor use the same visual rows.
+        u16::try_from(
+            self.input
+                .visual_line_count_up_to(width, usize::from(MAX_INPUT_ROWS)),
+        )
+        .unwrap_or(MAX_INPUT_ROWS)
+        .min(MAX_INPUT_ROWS)
     }
 
     /// Visible conversation rows given the tracked terminal size.
@@ -6639,7 +6645,7 @@ impl PiFtuiModel {
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let regions = layout_regions(
             area,
-            self.input_rows(),
+            self.input_rows_at_width(area.width),
             u16::from(self.error_banner.is_some()),
             self.widget_rows(),
             self.completion_rows(),
@@ -12104,6 +12110,22 @@ mod tests {
         out
     }
 
+    /// Render through the real view, including the TextArea's remembered
+    /// viewport, and retain the hardware cursor for editor regressions.
+    fn frame_with_cursor(
+        model: &PiFtuiModel,
+        width: u16,
+        height: u16,
+    ) -> (String, Option<(u16, u16)>) {
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = Frame::new(width, height, &mut pool);
+        model.view(&mut frame);
+        (
+            buffer_text(&frame.buffer, width, height),
+            frame.cursor_position,
+        )
+    }
+
     #[test]
     fn view_renders_transcript_and_status() {
         let (_tx, model) = new_model();
@@ -12146,16 +12168,196 @@ mod tests {
     }
 
     #[test]
-    fn alt_enter_inserts_newline_and_grows_input_region() {
+    fn newline_chords_grow_immediately_and_keep_prior_lines_visible() {
+        // gh #276's recording: the newline was in the submitted prompt but
+        // the editor hid "Hello world" while composing. Render before and
+        // after each edit: a state-only test never establishes the old
+        // one-row viewport and therefore misses the stale scroll anchor.
+        for modifiers in [Modifiers::ALT, Modifiers::SHIFT, Modifiers::CTRL] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            let _ = frame_with_cursor(sim.model(), 40, 12);
+            for ch in "Hello world".chars() {
+                sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+                let _ = frame_with_cursor(sim.model(), 40, 12);
+            }
+
+            sim.inject_event(key(KeyCode::Enter, modifiers));
+            assert_eq!(sim.model().input.text(), "Hello world\n");
+            assert_eq!(sim.model().input_rows(), 2, "{modifiers:?}");
+            let (frame, cursor) = frame_with_cursor(sim.model(), 40, 12);
+            let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+            assert_eq!(&rows[9..11], &["Hello world", ""], "{modifiers:?}");
+            assert_eq!(cursor, Some((0, 10)), "{modifiers:?}");
+
+            // Windows and enhanced Linux key protocols can emit releases.
+            sim.inject_event(Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                modifiers,
+                kind: KeyEventKind::Release,
+            }));
+            assert_eq!(sim.model().input.text(), "Hello world\n");
+            assert!(submit_rx.try_recv().is_err());
+            sim.inject_event(Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                modifiers,
+                kind: KeyEventKind::Repeat,
+            }));
+            assert_eq!(sim.model().input_rows(), 3);
+            let (frame, cursor) = frame_with_cursor(sim.model(), 40, 12);
+            let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+            assert_eq!(&rows[8..11], &["Hello world", "", ""]);
+            assert_eq!(cursor, Some((0, 10)));
+
+            type_str(&mut sim, "asd");
+            let (frame, cursor) = frame_with_cursor(sim.model(), 40, 12);
+            let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+            assert_eq!(&rows[8..11], &["Hello world", "", "asd"]);
+            assert_eq!(cursor, Some((3, 10)));
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("multiline prompt submitted"),
+                UiCommand::Prompt(String::from("Hello world\n\nasd"))
+            );
+            assert_eq!(sim.model().transcript[0].text, "Hello world\n\nasd");
+            assert!(sim.model().input.is_empty());
+        }
+    }
+
+    #[test]
+    fn configured_newline_and_submit_keep_multiline_rendering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{"newLine": ["ctrl+n"], "submit": ["ctrl+enter"]}"#,
+        )
+        .expect("write bindings");
+        let bindings = KeyBindings::load(&path).expect("load bindings");
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx)
+            .with_keybindings(bindings)
+            .with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "first");
+        let _ = frame_with_cursor(sim.model(), 30, 10);
+        sim.inject_event(key(KeyCode::Char('n'), Modifiers::CTRL));
+        let (frame, cursor) = frame_with_cursor(sim.model(), 30, 10);
+        let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+        assert_eq!(&rows[7..9], &["first", ""]);
+        assert_eq!(cursor, Some((0, 8)));
+        assert!(submit_rx.try_recv().is_err());
+        type_str(&mut sim, "second");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::CTRL));
+        assert_eq!(
+            submit_rx.try_recv().expect("configured submission"),
+            UiCommand::Prompt(String::from("first\nsecond"))
+        );
+    }
+
+    #[test]
+    fn multiline_paste_and_capped_editor_deletion_backfill_prior_rows() {
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model);
         sim.init();
-        assert_eq!(sim.model().input_rows(), 1);
-        sim.inject_event(key(KeyCode::Char('a'), Modifiers::empty()));
-        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
-        sim.inject_event(key(KeyCode::Char('b'), Modifiers::empty()));
-        assert_eq!(sim.model().input.text(), "a\nb");
+        let _ = frame_with_cursor(sim.model(), 40, 12);
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new(
+            "first\r\nsecond\r\nthird\r\nfourth\r\nfifth\r\n",
+            true,
+        )));
+        assert_eq!(
+            sim.model().input.text(),
+            "first\nsecond\nthird\nfourth\nfifth\n"
+        );
+        assert_eq!(sim.model().input_rows(), MAX_INPUT_ROWS);
+        let (frame, cursor) = frame_with_cursor(sim.model(), 40, 12);
+        let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+        assert_eq!(&rows[6..11], &["second", "third", "fourth", "fifth", ""]);
+        assert_eq!(cursor, Some((0, 10)));
+
+        // Six logical lines become five: the viewport's height stays capped,
+        // but it must reveal the first line instead of keeping a blank tail.
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::empty()));
+        assert_eq!(sim.model().input_rows(), MAX_INPUT_ROWS);
+        let (frame, cursor) = frame_with_cursor(sim.model(), 40, 12);
+        let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+        assert_eq!(
+            &rows[6..11],
+            &["first", "second", "third", "fourth", "fifth"]
+        );
+        assert_eq!(cursor, Some((5, 10)));
+
+        sim.model_mut().input.undo();
+        let (frame, cursor) = frame_with_cursor(sim.model(), 40, 12);
+        let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+        assert_eq!(&rows[6..11], &["second", "third", "fourth", "fifth", ""]);
+        assert_eq!(cursor, Some((0, 10)));
+    }
+
+    #[test]
+    fn editor_grows_for_soft_wraps_and_reflows_at_the_actual_frame_width() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 10,
+            height: 12,
+        });
+        let _ = frame_with_cursor(sim.model(), 10, 12);
+        for ch in "aaaa bbbb cccc".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+            let _ = frame_with_cursor(sim.model(), 10, 12);
+        }
         assert_eq!(sim.model().input_rows(), 2);
+        let (frame, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+        assert_eq!(&rows[9..11], &["aaaa bbbb", "cccc"]);
+        assert_eq!(cursor, Some((4, 10)));
+        assert_eq!(sim.model().input.text(), "aaaa bbbb cccc");
+
+        // A wider frame must use its own width even before Resize reaches
+        // the model. The old wrapped anchor cannot hide the first words.
+        let (frame, cursor) = frame_with_cursor(sim.model(), 30, 12);
+        let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+        assert_eq!(rows[10], "aaaa bbbb cccc");
+        assert_eq!(cursor, Some((14, 10)));
+        assert_eq!(sim.model().input.cursor().line, 0);
+
+        sim.inject_event(Event::Resize {
+            width: 10,
+            height: 12,
+        });
+        sim.inject_event(key(KeyCode::Enter, Modifiers::SHIFT));
+        let (frame, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        let rows: Vec<_> = frame.lines().map(str::trim_end).collect();
+        assert_eq!(&rows[8..11], &["aaaa bbbb", "cccc", ""]);
+        assert_eq!(cursor, Some((0, 10)));
+        assert_eq!(sim.model().input.text(), "aaaa bbbb cccc\n");
+    }
+
+    #[test]
+    fn editor_counts_empty_rows_and_wrapped_unicode_without_changing_text() {
+        let (_tx, mut model) = new_model();
+        for (text, width, expected) in [
+            ("", 10, 1),
+            ("\n", 10, 2),
+            ("\n\n", 10, 3),
+            ("12345\n", 5, 2),
+            ("界界界\n", 4, 3),
+            ("e\u{301}e\u{301}e\u{301}\n", 2, 3),
+            ("👩\u{200d}🚀👩\u{200d}🚀x\n", 4, 3),
+            ("ab\tcd\n", 3, 3),
+            ("a\nb\nc\nd\ne\nf", 10, MAX_INPUT_ROWS),
+        ] {
+            model.input.set_text(text);
+            assert_eq!(model.input_rows_at_width(width), expected, "{text:?}");
+            assert_eq!(model.input.text(), text);
+        }
     }
 
     #[test]
