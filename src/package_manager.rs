@@ -2184,17 +2184,32 @@ impl PackageManager {
         // top-level Markdown files have different semantics at each root.
         let mut skill_roots = Vec::new();
         if roots.project_settings_enabled {
-            skill_roots.push((project_skills, project_metadata.clone(), &project.skills));
             skill_roots.push((
-                self.cwd.join(".agents").join("skills"),
-                PathMetadata {
-                    origin: ResourceOrigin::Universal,
-                    ..project_metadata
-                },
+                project_skills,
+                project_metadata.clone(),
                 &project.skills,
+                true,
             ));
+            for universal_dir in
+                project_universal_skill_dirs(&self.cwd, roots.home_dir.as_deref())
+            {
+                skill_roots.push((
+                    universal_dir,
+                    PathMetadata {
+                        origin: ResourceOrigin::Universal,
+                        ..project_metadata.clone()
+                    },
+                    &project.skills,
+                    false,
+                ));
+            }
         }
-        skill_roots.push((user_skills, user_metadata.clone(), &global.skills));
+        skill_roots.push((
+            user_skills,
+            user_metadata.clone(),
+            &global.skills,
+            true,
+        ));
         if let Some(home) = &roots.home_dir {
             skill_roots.push((
                 home.join(".agents").join("skills"),
@@ -2203,6 +2218,7 @@ impl PackageManager {
                     ..user_metadata.clone()
                 },
                 &global.skills,
+                false,
             ));
         }
         skill_roots.push((
@@ -2212,15 +2228,16 @@ impl PackageManager {
                 ..user_metadata
             },
             &global.skills,
+            true,
         ));
 
         let mut cache = SkillEntryCache::default();
-        for (dir, metadata, overrides) in skill_roots {
+        for (dir, metadata, overrides, include_root_files) in skill_roots {
             let base_dir = metadata
                 .base_dir
                 .as_deref()
                 .unwrap_or(&roots.global_base_dir);
-            for path in cache.collect(&dir) {
+            for path in cache.collect(&dir, include_root_files) {
                 let enabled = is_enabled_by_overrides(&path, overrides, base_dir);
                 accumulator.skills.add(path, &metadata, enabled);
             }
@@ -3030,18 +3047,49 @@ fn canonical_identity_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Project-level universal skill roots, ordered from the launch directory
+/// outward. When inside a Git worktree/repository, discovery stops at the
+/// nearest ancestor carrying `.git`; otherwise it is bounded by path depth and
+/// stops at the filesystem root. The user's global `~/.agents/skills` root is
+/// kept out of this project list so it retains user-scope provenance.
+pub(crate) fn project_universal_skill_dirs(
+    cwd: &Path,
+    home_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let git_root = cwd
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf);
+    let home_identity = home_dir.map(canonical_identity_path);
+    let mut roots = Vec::new();
+
+    for ancestor in cwd.ancestors() {
+        let ancestor_identity = canonical_identity_path(ancestor);
+        let is_home = home_identity
+            .as_ref()
+            .is_some_and(|home| ancestor_identity.as_path() == home.as_path());
+        if !is_home {
+            roots.push(ancestor.join(".agents").join("skills"));
+        }
+        if git_root.as_deref() == Some(ancestor) {
+            break;
+        }
+    }
+    roots
+}
+
 #[derive(Default)]
 struct SkillEntryCache {
-    relative_paths: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+    relative_paths: std::collections::HashMap<(PathBuf, bool), Vec<PathBuf>>,
 }
 
 impl SkillEntryCache {
-    fn collect(&mut self, dir: &Path) -> Vec<PathBuf> {
+    fn collect(&mut self, dir: &Path, include_root_files: bool) -> Vec<PathBuf> {
         let paths = self
             .relative_paths
-            .entry(canonical_identity_path(dir))
+            .entry((canonical_identity_path(dir), include_root_files))
             .or_insert_with(|| {
-                collect_skill_entries_with_parent_ignores(dir, false)
+                collect_skill_entries_with_parent_ignores(dir, false, include_root_files)
                     .into_iter()
                     .map(|path| path.strip_prefix(dir).unwrap_or(&path).to_path_buf())
                     .collect()
@@ -3051,12 +3099,13 @@ impl SkillEntryCache {
 }
 
 fn collect_skill_entries(dir: &Path) -> Vec<PathBuf> {
-    collect_skill_entries_with_parent_ignores(dir, true)
+    collect_skill_entries_with_parent_ignores(dir, true, true)
 }
 
 fn collect_skill_entries_with_parent_ignores(
     dir: &Path,
     inherit_parent_ignores: bool,
+    include_root_files: bool,
 ) -> Vec<PathBuf> {
     if !dir.exists() {
         return Vec::new();
@@ -3103,7 +3152,9 @@ fn collect_skill_entries_with_parent_ignores(
         let rel = path.strip_prefix(dir).unwrap_or(path);
         let depth = rel.components().count();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let is_top_level_md = depth == 1 && path.extension().and_then(|e| e.to_str()) == Some("md");
+        let is_top_level_md = include_root_files
+            && depth == 1
+            && path.extension().and_then(|e| e.to_str()) == Some("md");
         let is_nested_skill = depth > 1 && name == "SKILL.md";
         if !is_top_level_md && !is_nested_skill {
             continue;
@@ -7525,7 +7576,7 @@ mod tests {
 
         assert!(collect_skill_entries(&skills_dir).is_empty());
         let mut cache = SkillEntryCache::default();
-        assert_eq!(cache.collect(&skills_dir), vec![skill]);
+        assert_eq!(cache.collect(&skills_dir, true), vec![skill]);
     }
 
     #[cfg(unix)]

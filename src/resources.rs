@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::package_manager::{
     PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolvedResource, ResourceOrigin,
+    project_universal_skill_dirs,
 };
 use crate::theme::{MAX_RESOURCE_FILE_BYTES, Theme};
 use serde_json::{Value, json};
@@ -976,11 +977,13 @@ pub(crate) fn default_skill_dirs(
     agent_dir: &Path,
     home_dir: Option<&Path>,
 ) -> Vec<(PathBuf, &'static str)> {
-    let mut roots = vec![
-        (cwd.join(Config::project_dir()).join("skills"), "project"),
-        (cwd.join(".agents").join("skills"), "project"),
-        (agent_dir.join("skills"), "user"),
-    ];
+    let mut roots = vec![(cwd.join(Config::project_dir()).join("skills"), "project")];
+    roots.extend(
+        project_universal_skill_dirs(cwd, home_dir)
+            .into_iter()
+            .map(|path| (path, "project")),
+    );
+    roots.push((agent_dir.join("skills"), "user"));
     if let Some(home) = home_dir {
         roots.push((home.join(".agents").join("skills"), "user"));
     }
@@ -1033,16 +1036,24 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         &options.agent_dir,
         options.home_dir.as_deref(),
     );
+    let project_universal_dirs =
+        project_universal_skill_dirs(&options.cwd, options.home_dir.as_deref());
+    let user_universal_dir = options
+        .home_dir
+        .as_ref()
+        .map(|home| home.join(".agents").join("skills"));
     let managed_dir = options.agent_dir.join("skills.managed");
     let mut source_dirs = default_dirs.clone();
     source_dirs.push((managed_dir.clone(), "managed"));
     if options.include_defaults {
         for (dir, source) in &default_dirs {
+            let universal_root = project_universal_dirs.iter().any(|root| root == dir)
+                || user_universal_dir.as_ref() == Some(dir);
             merge_skills(
                 load_skills_from_dir_with_visited(
                     dir.clone(),
                     (*source).to_string(),
-                    true,
+                    !universal_root,
                     &mut visited_dirs,
                 ),
                 &mut skill_map,

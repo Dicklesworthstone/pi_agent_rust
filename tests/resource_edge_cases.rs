@@ -430,6 +430,76 @@ fn universal_skills_deduplicate_alias_roots_and_stop_symlink_cycles() {
     assert_eq!(result.diagnostics[0].message, "description is required");
 }
 
+#[test]
+fn universal_skills_follow_ancestors_to_git_root_and_ignore_root_markdown() {
+    let harness =
+        TestHarness::new("universal_skills_follow_ancestors_to_git_root_and_ignore_root_markdown");
+    let repo = harness.create_dir("repo");
+    harness.create_dir("repo/.git");
+    let cwd = harness.create_dir("repo/crates/app/src");
+
+    let nearest = write_skill(
+        &harness,
+        &repo.join("crates/app/.agents/skills/shared"),
+        "shared",
+        "Nearest universal definition",
+        "",
+    );
+    write_skill(
+        &harness,
+        &repo.join(".agents/skills/shared"),
+        "shared",
+        "Repository universal definition",
+        "",
+    );
+    let root_only = write_skill(
+        &harness,
+        &repo.join(".agents/skills/root-only"),
+        "root-only",
+        "Repository root skill",
+        "",
+    );
+    harness.create_file(
+        "repo/.agents/skills/loose.md",
+        b"---\nname: loose\ndescription: Must be ignored in universal roots\n---\nBody\n",
+    );
+    write_skill(
+        &harness,
+        &harness.temp_path(".agents/skills/outside"),
+        "outside",
+        "Outside repository boundary",
+        "",
+    );
+
+    let result = load_skills(LoadSkillsOptions {
+        cwd,
+        agent_dir: harness.temp_path("agent"),
+        home_dir: None,
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
+
+    assert_eq!(result.skills.len(), 2);
+    let shared = result
+        .skills
+        .iter()
+        .find(|skill| skill.name == "shared")
+        .expect("shared skill");
+    assert_eq!(shared.file_path, nearest);
+    assert!(result.skills.iter().any(|skill| skill.file_path == root_only));
+    assert!(!result.skills.iter().any(|skill| skill.name == "loose"));
+    assert!(!result.skills.iter().any(|skill| skill.name == "outside"));
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::Collision)
+            .count(),
+        1,
+        "farther ancestor duplicate should be reported as shadowed"
+    );
+}
+
 // ─── Prompt Templates ────────────────────────────────────────────────────────
 
 #[test]

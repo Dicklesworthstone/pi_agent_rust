@@ -1349,10 +1349,12 @@ Resource resolution gives explicit CLI paths priority, followed by CLI `-e`
 sources, configured project resources, configured user resources, and installed
 packages. Project packages take priority over user packages.
 
-Skills additionally discover the universal `.agents/skills/` directory in the
-working directory and `~/.agents/skills/` in the user's home directory. Within
-each scope, Pi-specific skills and settings entries take priority over universal
-skills; project universal skills still take priority over user skills. Managed
+Skills additionally discover universal `.agents/skills/` directories from the
+working directory through its ancestors up to the Git root (or filesystem root
+when no Git root exists), plus `~/.agents/skills/` in the user's home directory.
+Within each scope, Pi-specific skills and settings entries take priority over
+universal skills; nearer project universal roots take priority over farther
+ancestors, and project universal skills still take priority over user skills. Managed
 skills from `<agent_dir>/skills.managed/` load last. See the complete
 [skill precedence table](docs/skills.md#precedence).
 

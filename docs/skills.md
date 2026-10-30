@@ -11,16 +11,19 @@ Pi automatically discovers skills in both Pi-specific and universal locations:
 | Project | `.pi/skills/` | `.agents/skills/` |
 | User | `~/.pi/agent/skills/` | `~/.agents/skills/` |
 
-Project locations are relative to the current working directory. Pi does not
-search ancestor directories or scan the rest of the project for skills.
+Pi-specific project skills are relative to the current working directory.
+Universal project skills are discovered from `.agents/skills/` in the current
+working directory and each ancestor directory, stopping at the nearest Git root
+(or at the filesystem root when no Git root exists). Discovery checks only those
+bounded candidate roots; it does not recursively scan unrelated directories.
 `PI_CODING_AGENT_DIR` changes the Pi-specific user directory; the universal user
 directory remains `.agents/skills/` under the user's home directory.
 
-Place each skill in its own directory, such as
-`.agents/skills/sql-expert/SKILL.md`. Root-level Markdown files such as
-`.agents/skills/sql-expert.md` are also supported, as with Pi-specific skill
-directories. Discovery is recursive within these skill roots and skips hidden
-entries and `node_modules`.
+Place universal skills in their own directories, such as
+`.agents/skills/sql-expert/SKILL.md`. Universal roots follow the interoperable
+Agent Skills convention and ignore root-level Markdown files; Pi-specific roots
+continue to support their existing root-level Markdown form. Discovery is
+recursive within each skill root and skips hidden entries and `node_modules`.
 
 Skills can also come from `--skill` paths, `skills` entries in settings, and
 packages. Agent-authored managed skills live in the configured agent directory's
@@ -41,7 +44,7 @@ wins, using this order:
 | 1 | Explicit `--skill` paths, in command-line order |
 | 2 | Skills supplied by CLI `-e` sources |
 | 3 | Project `skills` settings entries and `.pi/skills/` |
-| 4 | Project `.agents/skills/` |
+| 4 | Project `.agents/skills/`, nearest ancestor first through the Git/filesystem root |
 | 5 | User `skills` settings entries and `<agent_dir>/skills/` |
 | 6 | User `~/.agents/skills/` |
 | 7 | Installed project packages |

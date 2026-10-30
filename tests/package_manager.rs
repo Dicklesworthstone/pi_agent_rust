@@ -299,11 +299,11 @@ fn resolve_with_roots_disabled_alias_does_not_hide_enabled_user_skill() {
 
 #[cfg(unix)]
 #[test]
-fn resolve_with_roots_walks_nested_skill_root_with_its_own_markdown_rules() {
+fn resolve_with_roots_universal_alias_ignores_root_markdown() {
     use std::os::unix::fs::symlink;
 
     let harness =
-        TestHarness::new("resolve_with_roots_walks_nested_skill_root_with_its_own_markdown_rules");
+        TestHarness::new("resolve_with_roots_universal_alias_ignores_root_markdown");
     let (manager, roots) = isolated_skill_roots(&harness);
     let nested = roots.project_base_dir.join("skills/nested");
     create_resolver_skill(&harness, "project/.pi/skills/nested/standalone.md");
@@ -318,10 +318,69 @@ fn resolve_with_roots_walks_nested_skill_root_with_its_own_markdown_rules() {
         .into_iter()
         .map(|item| item.path)
         .collect::<Vec<_>>();
-    assert_eq!(paths.len(), 3);
+    assert_eq!(paths.len(), 2);
     assert!(paths.contains(&native_skill));
     assert!(paths.contains(&harness.temp_path("project/.agents/skills/child/SKILL.md")));
-    assert!(paths.contains(&harness.temp_path("project/.agents/skills/standalone.md")));
+    assert!(!paths.contains(&harness.temp_path("project/.agents/skills/standalone.md")));
+}
+
+#[test]
+fn resolve_with_roots_discovers_universal_skill_ancestors_only_to_git_root() {
+    let harness =
+        TestHarness::new("resolve_with_roots_discovers_universal_skill_ancestors_only_to_git_root");
+    let repo = harness.create_dir("repo");
+    harness.create_dir("repo/.git");
+    let cwd = harness.create_dir("repo/crates/app/src");
+    let global_base_dir = harness.create_dir("agent");
+    let project_base_dir = cwd.join(".pi");
+    let roots = ResolveRoots {
+        global_settings_path: global_base_dir.join("settings.json"),
+        project_settings_path: project_base_dir.join("settings.json"),
+        global_base_dir,
+        project_base_dir,
+        project_settings_enabled: true,
+        home_dir: Some(harness.create_dir("home")),
+    };
+    write_json(&roots.global_settings_path, &serde_json::json!({}));
+    write_json(&roots.project_settings_path, &serde_json::json!({}));
+
+    let local = create_resolver_skill(
+        &harness,
+        "repo/crates/app/src/.agents/skills/local/SKILL.md",
+    );
+    let near = create_resolver_skill(
+        &harness,
+        "repo/crates/app/.agents/skills/near/SKILL.md",
+    );
+    let root = create_resolver_skill(&harness, "repo/.agents/skills/root/SKILL.md");
+    create_resolver_skill(&harness, ".agents/skills/outside/SKILL.md");
+    create_resolver_skill(&harness, "repo/.agents/skills/loose.md");
+
+    let manager = PackageManager::new(cwd);
+    let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve ancestor skills");
+    let universal = resolved
+        .skills
+        .iter()
+        .filter(|item| {
+            item.metadata.scope == PackageScope::Project
+                && item.metadata.origin == ResourceOrigin::Universal
+        })
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(universal, vec![local, near, root]);
+    assert!(
+        resolved
+            .skills
+            .iter()
+            .all(|item| !item.path.ends_with(Path::new("outside/SKILL.md")))
+    );
+    assert!(
+        resolved
+            .skills
+            .iter()
+            .all(|item| !item.path.ends_with(Path::new("skills/loose.md")))
+    );
 }
 
 #[test]
