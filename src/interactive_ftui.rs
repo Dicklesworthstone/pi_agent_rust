@@ -96,9 +96,12 @@ pub enum PiFtuiMsg {
         width: u16,
         height: u16,
     },
-    /// A clipboard image paste finished off the loop thread (WSL): the
-    /// `@file` reference to insert, or `None` when there was no image.
-    PastedImage(Option<String>),
+    /// A clipboard image request finished off the loop thread (WSL). Only
+    /// the still-live request may insert its result into its owning draft.
+    PastedImage {
+        request_id: u64,
+        reference: Option<String>,
+    },
 }
 
 impl From<Event> for PiFtuiMsg {
@@ -1902,6 +1905,20 @@ struct PendingInputRestore {
     text: String,
 }
 
+/// Bound captures retained for one draft while slow WSL interop finishes.
+const MAX_PENDING_IMAGE_PASTES: usize = 8;
+
+/// An admitted capture belongs to one ordinary draft. Each result is
+/// applied independently when it arrives, so a stalled capture cannot
+/// block later requests or retain their completed results.
+#[derive(Debug)]
+struct PendingImagePaste {
+    request_id: u64,
+    session_id: Option<String>,
+    replacement_generation: u64,
+    banner_at_admission: Option<String>,
+}
+
 /// Seed ftui model: proves the Elm loop shape against real pi message types.
 ///
 /// Covers init/update/view/subscriptions end to end but holds only what its
@@ -1998,6 +2015,10 @@ pub struct PiFtuiModel {
     /// Driver returns deferred across modal ownership, in arrival order.
     /// Replaced-session entries are discarded before any draft is changed.
     pending_input_restores: VecDeque<PendingInputRestore>,
+    /// Clipboard captures still owned by the ordinary composer.
+    pending_image_pastes: VecDeque<PendingImagePaste>,
+    /// Never reused, including after a request's owner has been invalidated.
+    next_image_paste_id: u64,
     /// Where completed extension UI replies go (driver pairs them back to the
     /// pending request via `FtuiExtensionUiHandler::resolve`).
     ext_reply_tx: Option<Sender<ExtensionUiResponse>>,
@@ -2084,6 +2105,10 @@ pub struct PiFtuiModel {
     /// on a headless test host). `None` in production.
     #[cfg(test)]
     suspend_task_override: Option<Box<dyn FnOnce() -> PiFtuiMsg + Send>>,
+    /// Clipboard-only seam: exercise the real request admission and task
+    /// completion path without accessing the test host's clipboard or WSL.
+    #[cfg(test)]
+    image_paste_task_override: Option<Box<dyn FnOnce() -> Option<String> + Send>>,
     /// Blocking work an input handler queued for the runtime (a mid-turn
     /// `/btw`); the key handler returns it as a `Cmd::task`.
     pending_task: Option<Box<dyn FnOnce() -> PiFtuiMsg + Send>>,
@@ -2392,6 +2417,8 @@ impl PiFtuiModel {
             ext_queue: VecDeque::new(),
             card_draft_snapshot: None,
             pending_input_restores: VecDeque::new(),
+            pending_image_pastes: VecDeque::new(),
+            next_image_paste_id: 0,
             ext_reply_tx: None,
             ask_reply_tx: None,
             current_ask: None,
@@ -2418,6 +2445,8 @@ impl PiFtuiModel {
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             #[cfg(test)]
             suspend_task_override: None,
+            #[cfg(test)]
+            image_paste_task_override: None,
             pending_task: None,
             last_ctrl_c: None,
             tools_expanded: false,
@@ -2861,14 +2890,88 @@ impl PiFtuiModel {
         });
     }
 
-    /// Put a pasted image's `@file` reference in the draft, or say there was
-    /// no image.
-    fn insert_pasted_image(&mut self, reference: Option<String>) {
+    /// Image attachments belong to the ordinary prompt, never a secret or
+    /// a modal answer. Streaming with a live control lane still owns a draft.
+    fn image_paste_allowed(&self) -> bool {
+        self.input_active()
+            && self.active_ask.is_none()
+            && self.active_ext.is_none()
+            && self.ext_queue.is_empty()
+            && self.login_pending.is_none()
+            && self.picker.is_none()
+            && !self.custom_overlay_open()
+            && !self.settings_pending
+            && !self.suspending
+            && !self.handoff_in_progress()
+            && self.mcp_auth_request.is_none()
+    }
+
+    /// Invalidation is permanent: returning from a modal to identical text
+    /// must not resurrect a capture admitted before that owner transition.
+    fn discard_stale_image_pastes(&mut self) {
+        if !self.image_paste_allowed() {
+            self.pending_image_pastes.clear();
+            return;
+        }
+        let session = self.displayed_session_id.as_deref();
+        let generation = self.input.replacement_generation();
+        self.pending_image_pastes.retain(|pending| {
+            pending.session_id.as_deref() == session
+                && pending.replacement_generation == generation
+        });
+    }
+
+    /// Admit before reading the clipboard, for synchronous and background
+    /// platforms alike. IDs are never recycled after clear/submit/session
+    /// transitions, and one draft's live completion queue stays bounded.
+    fn begin_image_paste(&mut self) -> Option<u64> {
+        self.discard_stale_image_pastes();
+        if !self.image_paste_allowed() {
+            return None;
+        }
+        if self.pending_image_pastes.len() >= MAX_PENDING_IMAGE_PASTES {
+            self.error_banner = Some(String::from(
+                "Clipboard image pastes are still running; wait before pasting another image.",
+            ));
+            return None;
+        }
+        let Some(request_id) = self.next_image_paste_id.checked_add(1) else {
+            self.error_banner = Some(String::from("Clipboard image request limit reached."));
+            return None;
+        };
+        self.next_image_paste_id = request_id;
+        self.pending_image_pastes.push_back(PendingImagePaste {
+            request_id,
+            session_id: self.displayed_session_id.clone(),
+            replacement_generation: self.input.replacement_generation(),
+            banner_at_admission: self.error_banner.clone(),
+        });
+        Some(request_id)
+    }
+
+    fn complete_image_paste(&mut self, request_id: u64, reference: Option<String>) {
+        self.discard_stale_image_pastes();
+        let Some(index) = self
+            .pending_image_pastes
+            .iter()
+            .position(|pending| pending.request_id == request_id)
+        else {
+            return;
+        };
+        let pending = self
+            .pending_image_pastes
+            .remove(index)
+            .expect("matching capture");
         match reference {
-            Some(reference) => self.input.insert_text(&format!("{reference} ")),
-            None => {
+            Some(reference) => {
+                self.input.insert_text(&format!("{reference} "));
+                self.detach_edited_history();
+                self.maybe_trigger_autocomplete();
+            }
+            None if self.error_banner == pending.banner_at_admission => {
                 self.error_banner = Some(String::from("No image on the clipboard to paste."));
             }
+            None => {}
         }
     }
 
@@ -6152,23 +6255,31 @@ impl PiFtuiModel {
                         let task = external_editor_task(draft, self.alt_screen, self.mouse);
                         return self.update(task());
                     }
-                    Some(AppAction::PasteImage)
-                        if self.input_active()
-                            && self.active_ask.is_none()
-                            && self.active_ext.is_none() =>
-                    {
+                    Some(AppAction::PasteImage) => {
+                        let Some(request_id) = self.begin_image_paste() else {
+                            return Cmd::none();
+                        };
+                        #[cfg(test)]
+                        if let Some(task) = self.image_paste_task_override.take() {
+                            return Cmd::task(move || PiFtuiMsg::PastedImage {
+                                request_id,
+                                reference: task(),
+                            });
+                        }
                         // The pasted screenshot is attached when the prompt
                         // is sent, through its `@file` reference. Under WSL
                         // the paste starts powershell.exe (seconds), so it
                         // runs off the loop thread there.
                         if crate::interactive::running_under_wsl() {
-                            return Cmd::task(|| {
-                                PiFtuiMsg::PastedImage(
-                                    crate::interactive::paste_clipboard_image_ref(),
-                                )
+                            return Cmd::task(move || PiFtuiMsg::PastedImage {
+                                request_id,
+                                reference: crate::interactive::paste_clipboard_image_ref(),
                             });
                         }
-                        self.insert_pasted_image(crate::interactive::paste_clipboard_image_ref());
+                        self.complete_image_paste(
+                            request_id,
+                            crate::interactive::paste_clipboard_image_ref(),
+                        );
                         return Cmd::none();
                     }
                     Some(AppAction::ExpandTools) => {
@@ -6684,6 +6795,9 @@ impl Model for PiFtuiModel {
 
     fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
         let probe = self.watchdog.start();
+        // Also inspect entry: a synchronous external editor recursively
+        // updates after transiently handing ownership to the terminal.
+        self.discard_stale_image_pastes();
         if self.prune_expired_ask_card()
             && matches!(
                 &msg,
@@ -6693,11 +6807,12 @@ impl Model for PiFtuiModel {
             // The event was intended for the expired card, not the restored
             // pre-card draft or a newly promoted extension question.
             self.apply_pending_input_restores();
+            self.discard_stale_image_pastes();
             self.watchdog.finish(LoopPhase::Input, probe);
             return Cmd::none();
         }
         let phase = match &msg {
-            PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage(_) => {
+            PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage { .. } => {
                 LoopPhase::Input
             }
             PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed | PiFtuiMsg::SuspendFinished(_) => {
@@ -6710,7 +6825,6 @@ impl Model for PiFtuiModel {
             &msg,
             PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_))
                 | PiFtuiMsg::Edited { .. }
-                | PiFtuiMsg::PastedImage(_)
                 | PiFtuiMsg::Agent(PiMsg::SetEditorText { .. })
         ) || matches!(
             &msg,
@@ -6736,8 +6850,11 @@ impl Model for PiFtuiModel {
                 }
                 cmd
             }
-            PiFtuiMsg::PastedImage(reference) => {
-                self.insert_pasted_image(reference);
+            PiFtuiMsg::PastedImage {
+                request_id,
+                reference,
+            } => {
+                self.complete_image_paste(request_id, reference);
                 Cmd::none()
             }
             PiFtuiMsg::Agent(agent) => self.handle_agent(agent),
@@ -6765,6 +6882,7 @@ impl Model for PiFtuiModel {
             self.detach_edited_history();
         }
         self.apply_pending_input_restores();
+        self.discard_stale_image_pastes();
         // Reset as soon as ownership changes, even if a modal opens and
         // closes without receiving a mouse event between those updates.
         if !self.editor_mouse_active() {
@@ -12485,6 +12603,414 @@ mod tests {
             type_str(&mut sim, "X");
             assert_eq!(sim.model().input.text(), "Xpartial answer");
         }
+    }
+
+    fn image_paste_result(
+        sim: &mut ProgramSimulator<PiFtuiModel>,
+        request_id: u64,
+        reference: Option<&str>,
+    ) {
+        sim.send(PiFtuiMsg::PastedImage {
+            request_id,
+            reference: reference.map(str::to_string),
+        });
+    }
+
+    #[test]
+    fn image_paste_binding_admits_only_the_ordinary_composer() {
+        for login in [false, true] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text("first\nsecond");
+            model.image_paste_task_override = Some(Box::new(|| Some(String::from("@shot.png"))));
+            let mut sim = ProgramSimulator::new(
+                model.with_keybindings(keybindings_from_json(r#"{"pasteImage": ["f6"]}"#)),
+            );
+            sim.init();
+            if login {
+                sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                    provider: Some(String::from("example")),
+                    accepts_empty_input: false,
+                }));
+            }
+            sim.inject_event(key(KeyCode::Char('v'), Modifiers::CTRL));
+            assert!(sim.model().image_paste_task_override.is_some());
+            assert_eq!(sim.model().input.text(), "first\nsecond");
+            sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
+            if login {
+                assert!(sim.model().image_paste_task_override.is_some());
+                assert_eq!(sim.model().next_image_paste_id, 0);
+                assert_eq!(sim.model().input.text(), "first\nsecond");
+                assert!(
+                    !sim.command_log()
+                        .iter()
+                        .any(|record| matches!(record, CmdRecord::Task))
+                );
+                sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                    provider: None,
+                    accepts_empty_input: false,
+                }));
+                sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
+            }
+            assert_eq!(sim.model().input.text(), "first\nsecond@shot.png ");
+            assert_eq!(sim.model().next_image_paste_id, 1);
+            assert!(sim.model().pending_image_pastes.is_empty());
+            assert!(sim.model().image_paste_task_override.is_none());
+            assert!(
+                sim.command_log()
+                    .iter()
+                    .any(|record| matches!(record, CmdRecord::Task))
+            );
+        }
+    }
+
+    #[test]
+    fn image_paste_keeps_live_edits_and_uses_the_current_selection() {
+        let mut sim = recalled_prompt_sim("first\nsecond", KeyBindings::default());
+        let request_id = sim.model_mut().begin_image_paste().expect("admitted paste");
+        let generation = sim.model().input.replacement_generation();
+        sim.model_mut().turn_control = Some(Arc::default());
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new(" extra", true)));
+        assert_eq!(sim.model().input.text(), "first\nsecond extra");
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "first\nsecond");
+        sim.inject_event(key(KeyCode::Home, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::End, Modifiers::SHIFT));
+        assert_eq!(sim.model().input.selected_text().as_deref(), Some("second"));
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+        image_paste_result(&mut sim, request_id, Some("@capture.png"));
+        assert_eq!(sim.model().input.text(), "first\n@capture.png ");
+        assert_eq!(sim.model().input.cursor().line, 1);
+        assert_eq!(sim.model().input.cursor().grapheme, 13);
+        assert!(sim.model().input.selection().is_none());
+        assert_eq!(sim.model().history_cursor, None);
+        assert!(frame_with_cursor(sim.model(), 12, 12).1.is_some());
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "first\nsecond");
+        assert_eq!(sim.model().history_cursor, None);
+    }
+
+    #[test]
+    fn image_paste_results_do_not_wait_for_an_earlier_capture_or_apply_twice() {
+        let (_tx, mut model) = new_model();
+        model.input.set_text("draft ");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let first = sim.model_mut().begin_image_paste().expect("first capture");
+        let second = sim.model_mut().begin_image_paste().expect("second capture");
+        image_paste_result(&mut sim, second, Some("@second.png"));
+        assert_eq!(sim.model().input.text(), "draft @second.png ");
+        assert_eq!(sim.model().pending_image_pastes.len(), 1);
+        image_paste_result(&mut sim, second, Some("@duplicate.png"));
+        image_paste_result(&mut sim, first, Some("@first.png"));
+        assert_eq!(sim.model().input.text(), "draft @second.png @first.png ");
+        assert!(sim.model().pending_image_pastes.is_empty());
+        let undo = sim.model().input.undo_op_count();
+        sim.model_mut().error_banner = Some(String::from("newer error"));
+        image_paste_result(&mut sim, first, None);
+        image_paste_result(&mut sim, second, Some("@duplicate.png"));
+        image_paste_result(&mut sim, u64::MAX, Some("@unknown.png"));
+        assert_eq!(sim.model().input.text(), "draft @second.png @first.png ");
+        assert_eq!(sim.model().input.undo_op_count(), undo);
+        assert_eq!(sim.model().error_banner.as_deref(), Some("newer error"));
+    }
+
+    #[test]
+    fn missing_image_completion_preserves_a_newer_error() {
+        let mut sim = recalled_prompt_sim("old", KeyBindings::default());
+        let first = sim.model_mut().begin_image_paste().expect("first capture");
+        let second = sim.model_mut().begin_image_paste().expect("second capture");
+        image_paste_result(&mut sim, second, Some("@second.png"));
+        sim.model_mut().error_banner = Some(String::from("provider failed while capturing"));
+        image_paste_result(&mut sim, first, None);
+        assert_eq!(sim.model().input.text(), "old@second.png ");
+        assert_eq!(sim.model().history_cursor, None);
+        assert_eq!(
+            sim.model().error_banner.as_deref(),
+            Some("provider failed while capturing")
+        );
+        assert!(sim.model().pending_image_pastes.is_empty());
+
+        sim.model_mut().error_banner = None;
+        let empty = sim.model_mut().begin_image_paste().expect("empty capture");
+        let undo = sim.model().input.undo_op_count();
+        image_paste_result(&mut sim, empty, None);
+        assert_eq!(sim.model().input.text(), "old@second.png ");
+        assert_eq!(sim.model().input.undo_op_count(), undo);
+        assert_eq!(
+            sim.model().error_banner.as_deref(),
+            Some("No image on the clipboard to paste.")
+        );
+    }
+
+    fn assert_stale_image_result_is_ignored(sim: &mut ProgramSimulator<PiFtuiModel>, id: u64) {
+        sim.model_mut().error_banner = Some(String::from("current error"));
+        let text = sim.model().input.text();
+        let cursor = sim.model().input.cursor();
+        let selection = sim.model().input.selection();
+        let undo = sim.model().input.undo_op_count();
+        let history = sim.model().history_cursor;
+        let completion_open = sim.model().autocomplete.open;
+        for reference in [Some("@stale.png"), None] {
+            image_paste_result(sim, id, reference);
+            assert_eq!(sim.model().input.text(), text);
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.selection(), selection);
+            assert_eq!(sim.model().input.undo_op_count(), undo);
+            assert_eq!(sim.model().history_cursor, history);
+            assert_eq!(sim.model().autocomplete.open, completion_open);
+            assert_eq!(sim.model().error_banner.as_deref(), Some("current error"));
+        }
+    }
+
+    #[test]
+    fn image_paste_full_replacements_invalidate_even_identical_drafts() {
+        for replacement in [
+            "submit", "clear", "history", "agent", "extension", "editor", "restore",
+        ] {
+            let (_tx, mut model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.displayed_session_id = Some(String::from("current"));
+            model.record_history("same text");
+            model.input.set_text("same text");
+            let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+            sim.init();
+            let request_id = sim.model_mut().begin_image_paste().expect("admitted paste");
+            let generation = sim.model().input.replacement_generation();
+            match replacement {
+                "submit" => {
+                    sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+                    assert_eq!(
+                        submit_rx.try_recv().expect("original prompt submitted"),
+                        UiCommand::Prompt(String::from("same text"))
+                    );
+                    sim.inject_event(Event::Paste(ftui::PasteEvent::new("same text", true)));
+                }
+                "clear" => {
+                    sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+                    sim.inject_event(Event::Paste(ftui::PasteEvent::new("same text", true)));
+                }
+                "history" => sim.inject_event(key(KeyCode::Up, Modifiers::empty())),
+                "agent" => sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+                    owner_session_id: String::from("current"),
+                    text: String::from("same text"),
+                })),
+                "extension" => send_ui_effect(
+                    &mut sim,
+                    "set_editor_text",
+                    serde_json::json!({"text": "same text"}),
+                ),
+                "editor" => sim.send(PiFtuiMsg::Edited {
+                    text: Ok(String::from("same text\n")),
+                    width: 80,
+                    height: 24,
+                }),
+                _ => sim.send(returned_input("current", "returned")),
+            }
+            assert_ne!(sim.model().input.replacement_generation(), generation);
+            assert_eq!(
+                sim.model().input.text(),
+                if replacement == "restore" {
+                    "returned\n\nsame text"
+                } else {
+                    "same text"
+                }
+            );
+            sim.model_mut().input.select_all();
+            assert_stale_image_result_is_ignored(&mut sim, request_id);
+            assert!(sim.model().pending_image_pastes.is_empty());
+            assert!(submit_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn image_paste_owner_roundtrips_never_revive_an_old_capture() {
+        for draft in ["", "kept\ntext"] {
+            for owner in [
+                "login", "ask", "extension", "picker", "custom", "settings", "suspend", "working",
+                "handoff", "mcp",
+            ] {
+                let (_tx, mut model) = new_model();
+                model.displayed_session_id = Some(String::from("current"));
+                model.input.set_text(draft);
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                let request_id = sim.model_mut().begin_image_paste().expect("admitted paste");
+                match owner {
+                    "login" => sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                        provider: Some(String::from("example")),
+                        accepts_empty_input: false,
+                    })),
+                    "ask" => sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                        "clipboard-owner",
+                        vec![question("Continue?", &["yes", "no"], false)],
+                    )))),
+                    "extension" => sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                        "clipboard-owner", "input", serde_json::json!({"title": "Reply"}),
+                    )))),
+                    "picker" => sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+                        fork: false,
+                        messages: vec![(String::from("choice"), String::from("entry"))],
+                    })),
+                    "custom" => send_ui_effect(
+                        &mut sim,
+                        "setWidget",
+                        serde_json::json!({
+                            "widgetKey": EXT_CUSTOM_OVERLAY_KEY,
+                            "lines": ["custom"],
+                        }),
+                    ),
+                    "settings" => sim.model_mut().settings_pending = true,
+                    "suspend" => sim.model_mut().suspending = true,
+                    "working" => sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart)),
+                    "handoff" => {
+                        sim.model_mut().begin_busy("handoff ...");
+                        sim.model_mut().busy.as_mut().expect("busy").handoff =
+                            Some(HandoffRequest::new(String::from("current")));
+                    }
+                    _ => sim.model_mut().mcp_auth_request =
+                        Some(McpAuthRequest::new(String::from("current"))),
+                }
+                sim.inject_event(Event::Tick);
+                assert!(sim.model().pending_image_pastes.is_empty(), "{owner}");
+                assert!(sim.model_mut().begin_image_paste().is_none(), "{owner}");
+                assert_stale_image_result_is_ignored(&mut sim, request_id);
+                match owner {
+                    "login" => sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                        provider: None,
+                        accepts_empty_input: false,
+                    })),
+                    "ask" | "extension" | "picker" =>
+                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty())),
+                    "custom" => send_ui_effect(
+                        &mut sim,
+                        "setWidget",
+                        serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "clear": true}),
+                    ),
+                    "settings" => sim.model_mut().settings_pending = false,
+                    "suspend" => sim.send(PiFtuiMsg::Resumed),
+                    "working" => sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+                        usage: None,
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                    })),
+                    "handoff" => sim.model_mut().busy = None,
+                    _ => sim.model_mut().mcp_auth_request = None,
+                }
+                sim.inject_event(Event::Tick);
+                assert!(sim.model().image_paste_allowed(), "{owner}");
+                assert_eq!(sim.model().input.text(), draft, "{owner}");
+                assert_stale_image_result_is_ignored(&mut sim, request_id);
+                let new_id = sim.model_mut().begin_image_paste().expect("new owner capture");
+                assert_ne!(new_id, request_id);
+                image_paste_result(&mut sim, request_id, Some("@old-owner.png"));
+                assert_eq!(sim.model().pending_image_pastes.len(), 1);
+                image_paste_result(&mut sim, new_id, Some("@new-owner.png"));
+                assert!(sim.model().input.text().contains("@new-owner.png"));
+                assert!(!sim.model().input.text().contains("@old-owner.png"));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_external_editor_invalidates_capture_without_replacing_the_draft() {
+        let (_tx, mut model) = new_model();
+        model.input.set_text("saved\ndraft");
+        model.input.select_all();
+        let model = model.with_suspend_task(|| PiFtuiMsg::Edited {
+            text: Err(String::from("external editor failed")),
+            width: 80,
+            height: 24,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let request_id = sim.model_mut().begin_image_paste().expect("admitted paste");
+        let generation = sim.model().input.replacement_generation();
+        let selection = sim.model().input.selection();
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        assert!(!sim.model().suspending);
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+        assert!(sim.model().pending_image_pastes.is_empty());
+        for reference in [Some("@stale.png"), None] {
+            image_paste_result(&mut sim, request_id, reference);
+            assert_eq!(sim.model().input.text(), "saved\ndraft");
+            assert_eq!(sim.model().input.selection(), selection);
+            assert_eq!(sim.model().error_banner.as_deref(), Some("external editor failed"));
+        }
+        assert!(sim.model_mut().begin_image_paste().is_some());
+    }
+
+    #[test]
+    fn image_paste_tracks_session_identity_without_losing_same_session_replay() {
+        for retry in [false, true] {
+            let (_tx, mut model) = new_model();
+            model.displayed_session_id = Some(String::from("original"));
+            model.input.set_text("kept\ndraft");
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            let same_session = sim.model_mut().begin_image_paste().expect("first capture");
+            let reset = |session: &str| {
+                if retry {
+                    PiMsg::RetryCommitted {
+                        session_id: session.to_string(),
+                        messages: Vec::new(),
+                        usage: crate::model::Usage::default(),
+                        status: None,
+                        text: String::from("retried prompt"),
+                    }
+                } else {
+                    PiMsg::ConversationReset {
+                        session_id: session.to_string(),
+                        messages: Vec::new(),
+                        usage: crate::model::Usage::default(),
+                        status: None,
+                    }
+                }
+            };
+            sim.send(PiFtuiMsg::Agent(reset("original")));
+            image_paste_result(&mut sim, same_session, Some("@same.png"));
+            assert_eq!(sim.model().input.text(), "kept\ndraft@same.png ");
+            let replaced = sim.model_mut().begin_image_paste().expect("second capture");
+            sim.send(PiFtuiMsg::Agent(reset("replacement")));
+            sim.send(PiFtuiMsg::Agent(reset("original")));
+            assert_stale_image_result_is_ignored(&mut sim, replaced);
+            assert!(sim.model().pending_image_pastes.is_empty());
+        }
+    }
+
+    #[test]
+    fn image_paste_admission_bounds_pending_results_and_never_reuses_ids() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.model_mut().begin_busy("ordinary background operation");
+        let mut ids = Vec::new();
+        for _ in 0..MAX_PENDING_IMAGE_PASTES {
+            ids.push(sim.model_mut().begin_image_paste().expect("bounded capture"));
+        }
+        assert!(sim.model_mut().begin_image_paste().is_none());
+        assert_eq!(sim.model().pending_image_pastes.len(), MAX_PENDING_IMAGE_PASTES);
+        let completed = ids.remove(3);
+        image_paste_result(&mut sim, completed, Some("@completed.png"));
+        assert_eq!(sim.model().pending_image_pastes.len(), MAX_PENDING_IMAGE_PASTES - 1);
+        ids.push(sim.model_mut().begin_image_paste().expect("capacity released"));
+        assert_eq!(sim.model().pending_image_pastes.len(), MAX_PENDING_IMAGE_PASTES);
+        sim.model_mut().input.set_text("new draft");
+        let next = sim.model_mut().begin_image_paste().expect("replacement capture");
+        assert!(ids.iter().all(|old| *old < next));
+        assert_eq!(sim.model().pending_image_pastes.len(), 1);
+        for id in ids {
+            image_paste_result(&mut sim, id, Some("@stale.png"));
+        }
+        assert_eq!(sim.model().input.text(), "new draft");
+        sim.model_mut().next_image_paste_id = u64::MAX;
+        assert!(sim.model_mut().begin_image_paste().is_none());
+        assert_eq!(sim.model().pending_image_pastes.len(), 1);
+        assert_eq!(sim.model().next_image_paste_id, u64::MAX);
+        image_paste_result(&mut sim, next, Some("@valid.png"));
+        assert_eq!(sim.model().input.text(), "new draft@valid.png ");
+        assert!(sim.model().pending_image_pastes.is_empty());
     }
 
     /// ctrl+g hands the draft to the external-editor task (faked here: the
@@ -23411,7 +23937,7 @@ mod tests {
 
     #[test]
     fn asynchronous_editor_writes_detach_recall_before_vertical_movement() {
-        for (message, expected) in [
+        for (mut message, expected) in [
             (
                 PiFtuiMsg::Edited {
                     text: Ok(String::from("new\n")),
@@ -23421,7 +23947,10 @@ mod tests {
                 "new",
             ),
             (
-                PiFtuiMsg::PastedImage(Some(String::from("@shot.png"))),
+                PiFtuiMsg::PastedImage {
+                    request_id: 0,
+                    reference: Some(String::from("@shot.png")),
+                },
                 "old@shot.png ",
             ),
             (
@@ -23448,6 +23977,9 @@ mod tests {
             ),
         ] {
             let mut sim = recalled_prompt_sim("old", KeyBindings::default());
+            if let PiFtuiMsg::PastedImage { request_id, .. } = &mut message {
+                *request_id = sim.model_mut().begin_image_paste().expect("admitted paste");
+            }
             sim.send(message);
             assert_eq!(sim.model().input.text(), expected);
             assert_eq!(sim.model().history_cursor, None);
@@ -23460,7 +23992,7 @@ mod tests {
     #[test]
     fn unchanged_external_edits_and_modal_answers_preserve_recall() {
         let mut sim = recalled_prompt_sim("old", KeyBindings::default());
-        for message in [
+        for mut message in [
             PiFtuiMsg::Edited {
                 text: Ok(String::from("old\n")),
                 width: 20,
@@ -23471,8 +24003,14 @@ mod tests {
                 width: 20,
                 height: 12,
             },
-            PiFtuiMsg::PastedImage(None),
+            PiFtuiMsg::PastedImage {
+                request_id: 0,
+                reference: None,
+            },
         ] {
+            if let PiFtuiMsg::PastedImage { request_id, .. } = &mut message {
+                *request_id = sim.model_mut().begin_image_paste().expect("admitted paste");
+            }
             sim.send(message);
             assert_eq!(sim.model().input.text(), "old");
             assert_eq!(sim.model().history_cursor, Some(1));

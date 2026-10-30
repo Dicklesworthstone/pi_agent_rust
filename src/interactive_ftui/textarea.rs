@@ -146,6 +146,8 @@ pub type LineHighlighter = Arc<dyn Fn(usize, &str) -> Vec<(Range<usize>, Style)>
 #[allow(clippy::struct_excessive_bools)]
 pub struct TextArea {
     editor: Editor,
+    /// Full-buffer replacements, distinct from edits within the same draft.
+    replacement_generation: u64,
     /// Placeholder text shown when empty.
     placeholder: String,
     /// Whether the widget has input focus.
@@ -209,6 +211,7 @@ impl std::fmt::Debug for TextArea {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextArea")
             .field("editor", &self.editor)
+            .field("replacement_generation", &self.replacement_generation)
             .field("placeholder", &self.placeholder)
             .field("focused", &self.focused)
             .field("show_line_numbers", &self.show_line_numbers)
@@ -293,6 +296,7 @@ impl TextArea {
     pub fn new() -> Self {
         Self {
             editor: Editor::new(),
+            replacement_generation: 0,
             placeholder: String::new(),
             focused: false,
             show_line_numbers: false,
@@ -656,6 +660,7 @@ impl TextArea {
     #[must_use]
     pub fn with_text(mut self, text: &str) -> Self {
         self.reset_mouse_interaction();
+        self.replacement_generation = self.replacement_generation.wrapping_add(1);
         self.editor = Editor::with_text(text);
         self.editor.move_to_document_start();
         self
@@ -773,9 +778,18 @@ impl TextArea {
     /// Set the full text content (resets cursor and undo history).
     pub fn set_text(&mut self, text: &str) {
         self.reset_mouse_interaction();
+        self.replacement_generation = self.replacement_generation.wrapping_add(1);
         self.editor.set_text(text);
         self.scroll_anchor.set((0, 0));
         self.scroll_left.set(0);
+    }
+
+    /// Identify the current draft across delayed work. Full replacements
+    /// advance this generation even when their bytes are unchanged; typing,
+    /// deletion, undo, selection, and cursor movement retain it.
+    #[must_use]
+    pub const fn replacement_generation(&self) -> u64 {
+        self.replacement_generation
     }
 
     /// Number of lines.
@@ -3347,6 +3361,55 @@ mod tests {
         ta.insert_text(" stuff");
         ta.set_text("new");
         assert_eq!(ta.text(), "new");
+    }
+
+    #[test]
+    fn replacement_generation_tracks_drafts_without_invalidating_edits() {
+        let mut ta = TextArea::new().with_text("界e\u{301}\nsecond");
+        let draft = ta.replacement_generation();
+        for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Backspace] {
+            ta.handle_event(&Event::Key(KeyEvent {
+                code,
+                modifiers: Modifiers::NONE,
+                kind: KeyEventKind::Press,
+            }));
+            assert_eq!(ta.replacement_generation(), draft);
+        }
+        ta.handle_event(&Event::Paste(ftui_core::event::PasteEvent::bracketed(
+            "pasted\ntext",
+        )));
+        ta.move_to_document_end();
+        ta.select_left();
+        ta.delete_backward();
+        ta.undo();
+        ta.redo();
+        ta.insert_newline();
+        ta.insert_char('界');
+        ta.insert_text(" tail");
+        ta.set_cursor_position(CursorPosition::new(0, 0, 0));
+        ta.select_all();
+        ta.clear_selection();
+        ta.set_focused(false);
+        ta.reset_mouse_interaction();
+        assert_eq!(ta.replacement_generation(), draft);
+
+        // Restoring the same bytes is a new draft, even though comparing
+        // content or editor length would miss the ownership change.
+        let text = ta.text();
+        ta.set_text(&text);
+        assert_ne!(ta.replacement_generation(), draft);
+        assert_eq!(ta.text(), text);
+        let replaced = ta.replacement_generation();
+        ta = ta.with_text(&text);
+        assert_ne!(ta.replacement_generation(), replaced);
+        assert_eq!(ta.text(), text);
+
+        // An empty prompt can also be replaced repeatedly between owners.
+        ta.set_text("");
+        let empty = ta.replacement_generation();
+        ta.set_text("");
+        assert_ne!(ta.replacement_generation(), empty);
+        assert!(ta.is_empty());
     }
 
     #[test]
