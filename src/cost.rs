@@ -14,7 +14,7 @@ use std::time::Instant;
 
 mod durability;
 
-use durability::{Coverage, Journal, Origin, Retirement};
+use durability::{Coverage, Journal, Origin, Retirement, Writer, Writers};
 
 const CHECKPOINT_TYPE: &str = "cost_budget";
 const RECORDED_BILLING_FAILURE: &str =
@@ -131,7 +131,7 @@ struct CostState {
     failure: Option<String>,
     account: String,
     own_finalized: f64,
-    observed: Coverage,
+    imported: Writers,
     retired: BTreeMap<std::path::PathBuf, Retirement>,
 }
 
@@ -151,6 +151,7 @@ impl CostState {
                 &self.account,
                 self.own_finalized,
                 self.failure.is_some(),
+                &self.imported,
                 deadline,
             ) {
                 // Keep the valid bill even if its durable acknowledgement fails.
@@ -176,30 +177,77 @@ impl CostState {
         }
     }
 
-    fn import(&mut self, journal: &Journal) -> Result<()> {
+    fn coverage(&self) -> Coverage {
+        self.imported
+            .iter()
+            .map(|(account, writer)| (account.clone(), writer.own_total))
+            .collect()
+    }
+
+    fn validate_origins(&self, origins: &BTreeMap<std::path::PathBuf, Arc<Origin>>) -> Result<()> {
+        let count = origins.len()
+            + self
+                .retired
+                .keys()
+                .filter(|path| !origins.contains_key(*path))
+                .count();
+        if count > durability::MAX_TARGETS {
+            return Err(Error::session("too many retained model cost sources"));
+        }
+        Ok(())
+    }
+
+    /// Validate the complete merged view before changing the shared account.
+    /// A candidate replacement with excessive coverage must leave its source
+    /// and all previously retired journals untouched.
+    fn import(&mut self, journal: &Journal) -> Result<bool> {
+        let mut imported = self.imported.clone();
         let mut added = 0.0;
+        let mut changed = false;
         for (account, writer) in &journal.writers {
             if account == &self.account {
                 continue;
             }
-            let observed = self.observed.entry(account.clone()).or_default();
-            added = add_cost(
-                added,
-                (writer.own_total - observed.max(writer.baseline_own)).max(0.0),
-            );
-            *observed = observed.max(writer.own_total);
+            let observed = imported.entry(account.clone()).or_insert_with(|| {
+                changed = true;
+                Writer {
+                    baseline_own: writer.baseline_own,
+                    own_total: writer.baseline_own,
+                    billing_unavailable: false,
+                }
+            });
+            // Once a writer is known, every later increase belongs to this
+            // account. A newer fork's higher baseline must not hide increases
+            // between our last observation and that fork's saved checkpoint.
+            let delta = (writer.own_total - observed.own_total).max(0.0);
+            added = add_cost(added, delta);
+            changed |= delta > 0.0 || (writer.billing_unavailable && !observed.billing_unavailable);
+            observed.own_total = observed.own_total.max(writer.own_total);
+            observed.billing_unavailable |= writer.billing_unavailable;
         }
-        durability::validate_coverage(&self.observed)?;
+        let mut coverage: Coverage = imported
+            .iter()
+            .map(|(account, writer)| (account.clone(), writer.own_total))
+            .collect();
+        // Every checkpoint and retirement also publishes the local writer.
+        // Reserve that slot before accepting a candidate's foreign coverage.
+        coverage.insert(self.account.clone(), self.own_finalized);
+        durability::validate_coverage(&coverage)?;
+        if added > 0.0 && self.snapshot.revision == u64::MAX {
+            return Err(Error::session("model cost account revisions exhausted"));
+        }
+        self.imported = imported;
         if added > 0.0 {
             self.snapshot.spent = add_cost(self.snapshot.spent, added);
             self.changed()?;
         }
         // The refusal is valid accounting data. Import the known lower bound
         // and preserve it in checkpoints; admission checks health separately.
-        if journal.billing_unavailable() {
-            self.quarantine(RECORDED_BILLING_FAILURE);
+        if journal.billing_unavailable() && self.failure.is_none() {
+            self.failure = Some(RECORDED_BILLING_FAILURE.to_string());
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn changed(&mut self) -> Result<()> {
@@ -236,7 +284,9 @@ impl CostState {
 pub struct CostBudget {
     state: Arc<Mutex<CostState>>,
     remote: Option<Arc<dyn CostRemote>>,
-    origin: Option<Arc<Origin>>,
+    // A replacement owns its read ancestry. Preparing and then abandoning a
+    // candidate never registers its path in another live handle's ancestry.
+    origins: BTreeMap<std::path::PathBuf, Arc<Origin>>,
 }
 
 impl std::fmt::Debug for CostBudget {
@@ -268,11 +318,11 @@ impl CostBudget {
                 failure: None,
                 account: uuid::Uuid::new_v4().to_string(),
                 own_finalized: 0.0,
-                observed: Coverage::new(),
+                imported: Writers::new(),
                 retired: BTreeMap::new(),
             })),
             remote: None,
-            origin: None,
+            origins: BTreeMap::new(),
         })
     }
 
@@ -287,11 +337,11 @@ impl CostBudget {
                 failure: None,
                 account: uuid::Uuid::new_v4().to_string(),
                 own_finalized: 0.0,
-                observed: Coverage::new(),
+                imported: Writers::new(),
                 retired: BTreeMap::new(),
             })),
             remote: Some(remote),
-            origin: None,
+            origins: BTreeMap::new(),
         })
     }
 
@@ -312,14 +362,20 @@ impl CostBudget {
                 return Ok(self.clone());
             }
             let mut replacement = self.clone();
-            replacement.origin = origin;
-            if let Some(journal) = &journal {
-                replacement
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .import(journal)?;
+            if let Some(origin) = origin {
+                replacement.origins.insert(origin.key.clone(), origin);
             }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.validate_origins(&replacement.origins)?;
+            if let Some(journal) = &journal
+                && state.import(journal)?
+            {
+                state.persist_retired(None)?;
+            }
+            drop(state);
             return Ok(replacement);
         }
         let snapshot = self.snapshot();
@@ -333,30 +389,85 @@ impl CostBudget {
         if let Some(journal) = &journal {
             journal.cover(&mut covered)?;
         }
+        if covered.len() >= durability::MAX_ACCOUNTS {
+            return Err(Error::session("too many imported model cost accounts"));
+        }
         let mut budget = Self::new(warn, max, spent)?;
-        budget.origin = origin;
+        if let Some(origin) = origin {
+            budget.origins.insert(origin.key.clone(), origin);
+        }
         budget
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .observed = covered;
+            .imported = covered
+            .into_iter()
+            .map(|(account, total)| {
+                (
+                    account,
+                    Writer {
+                        baseline_own: total,
+                        own_total: total,
+                        billing_unavailable: false,
+                    },
+                )
+            })
+            .collect();
         Ok(budget)
     }
 
     fn refresh_origin(&self) -> Result<()> {
-        let Some(origin) = &self.origin else {
-            return Ok(());
-        };
-        let journal = origin
-            .read()
-            .inspect_err(|error| self.quarantine(&error.to_string()))?;
+        let mut origins = self.origins.clone();
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.validate_origins(&origins)?;
+            // Retirements are committed write capabilities shared by every
+            // clone. They also keep earlier sources observable after a fork.
+            for (path, retired) in &state.retired {
+                origins
+                    .entry(path.clone())
+                    .or_insert_with(|| Arc::clone(&retired.origin));
+            }
+        }
+        let mut journals = Vec::with_capacity(origins.len());
+        let mut read_error = None;
+        for origin in origins.values() {
+            // Read without holding the account mutex or another journal lock.
+            match origin.read() {
+                Ok(journal) => journals.push(journal),
+                Err(error) => {
+                    read_error = Some(error);
+                    break;
+                }
+            }
+        }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(error) = state.import(&journal) {
+        let mut changed = false;
+        for journal in &journals {
+            match state.import(journal) {
+                Ok(imported) => changed |= imported,
+                Err(error) => {
+                    state.quarantine(&error.to_string());
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(error) = read_error {
+            // Preserve charges from sources already read before reporting the
+            // unavailable source, including their durable lower bounds.
             state.quarantine(&error.to_string());
             return Err(error);
+        }
+        if changed {
+            // One deadline covers all sinks, regardless of how many ancestors
+            // were read. Repeated unchanged imports do not rewrite journals.
+            state.persist_retired(None)?;
         }
         Ok(())
     }
@@ -548,7 +659,7 @@ impl CostBudget {
         }
         let spent = state.snapshot.spent;
         let main_spent = main_spend(session);
-        let mut covered = state.observed.clone();
+        let mut covered = state.coverage();
         covered.insert(state.account.clone(), state.own_finalized);
         durability::validate_coverage(&covered)?;
         let mut data = serde_json::json!({
@@ -608,15 +719,19 @@ impl CostBudget {
         }
         let origin = Origin::for_session(session)?
             .ok_or_else(|| Error::session("late model cost source is not saved"))?;
+        let mut origins = self.origins.clone();
+        origins.insert(origin.key.clone(), Arc::clone(&origin));
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.validate_origins(&origins)?;
         if let Some(retired) = state.retired.get(&origin.key) {
             let result = retired.persist(
                 &state.account,
                 state.own_finalized,
                 state.failure.is_some(),
+                &state.imported,
                 durability::settlement_deadline(None),
             );
             if let Err(error) = &result {
@@ -627,7 +742,7 @@ impl CostBudget {
         if state.retired.len() >= durability::MAX_TARGETS {
             return Err(Error::session("too many retired model cost sources"));
         }
-        let baseline = session
+        let checkpoint = session
             .entries
             .iter()
             .enumerate()
@@ -645,12 +760,36 @@ impl CostBudget {
                 {
                     return None;
                 }
-                data.get("ownFinalized").and_then(serde_json::Value::as_f64)
+                Some(data)
             })
+            .ok_or_else(|| {
+                Error::session("late model cost retirement requires a saved checkpoint")
+            })?;
+        let baseline = checkpoint
+            .get("ownFinalized")
+            .and_then(serde_json::Value::as_f64)
             .filter(|baseline| baseline.is_finite() && *baseline >= 0.0)
             .filter(|baseline| *baseline <= state.own_finalized)
-            .ok_or_else(|| Error::session("late model cost retirement requires a saved checkpoint"))?;
-        let retired = Retirement::prepare(origin, baseline, owner)?;
+            .ok_or_else(|| {
+                Error::session("late model cost retirement requires a saved checkpoint")
+            })?;
+        let covered = checkpoint
+            .get("lateCovered")
+            .map(|value| serde_json::from_value::<Coverage>(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        if covered.iter().any(|(account, total)| {
+            account != &state.account
+                && state
+                    .imported
+                    .get(account)
+                    .is_none_or(|writer| writer.own_total < *total)
+        }) {
+            return Err(Error::session(
+                "saved model cost coverage exceeds the live account",
+            ));
+        }
+        let retired = Retirement::prepare(origin, baseline, covered, owner)?;
         // Hold the account mutex across initial persistence and registration:
         // settlement during the asynchronous source save is included relative
         // to the exact saved counter, and no later settlement can miss its sink.
@@ -658,6 +797,7 @@ impl CostBudget {
             &state.account,
             state.own_finalized,
             state.failure.is_some(),
+            &state.imported,
             durability::settlement_deadline(None),
         ) {
             state.failure = Some(error.to_string());
@@ -1272,9 +1412,17 @@ mod tests {
                     assert!(journal.writers[&account].billing_unavailable);
                     // A stale healthy acknowledgement must never erase a
                     // refusal already written by this account.
-                    let stale = Retirement::prepare(Arc::clone(&origin), 1.0, owner.cx()).unwrap();
+                    let stale =
+                        Retirement::prepare(Arc::clone(&origin), 1.0, Coverage::new(), owner.cx())
+                            .unwrap();
                     stale
-                        .persist(&account, 1.75, false, durability::settlement_deadline(None))
+                        .persist(
+                            &account,
+                            1.75,
+                            false,
+                            &Writers::new(),
+                            durability::settlement_deadline(None),
+                        )
                         .unwrap();
                     assert!(origin.read().unwrap().writers[&account].billing_unavailable);
                     let encoded = std::fs::read_to_string(&origin.key).unwrap();
@@ -1440,6 +1588,303 @@ mod tests {
         assert_eq!(second_view.refresh().unwrap().spent, 4.0);
         assert_eq!(recorded_spend(&source).unwrap(), 4.0);
         assert_eq!(recorded_spend(&fork).unwrap(), 4.0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both live handoffs and the independent cold resume together.
+    fn resumed_forks_relay_late_ancestor_charges_without_refunding_the_cap() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let original = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        original.record(2.0).unwrap();
+        let mut first = original.start_attempt().unwrap();
+        first.observe(1.0).unwrap();
+        let mut second = original.start_attempt().unwrap();
+        second.observe(0.25).unwrap();
+        let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        original.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        original.retire_session(&source, owner.cx()).unwrap();
+        let source_path = source.path.clone().unwrap();
+        let mut source = runtime
+            .block_on(Session::open(source_path.to_str().unwrap()))
+            .unwrap();
+        let resumed = CostBudget::from_session(&source, None, Some(5.0)).unwrap();
+        assert!(!original.same_tree(&resumed));
+
+        // Match the saved outgoing checkpoint and preserved-budget handoff
+        // used by interactive forks. Each replacement outlives its old handle.
+        resumed.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        let mut fork = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        resumed.checkpoint(&mut fork).unwrap();
+        runtime.block_on(fork.save()).unwrap();
+        let fork_budget = resumed.for_replacement(&fork, true).unwrap();
+        resumed.retire_session(&source, owner.cx()).unwrap();
+        drop(resumed);
+
+        let mut descendant = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        fork_budget.checkpoint(&mut descendant).unwrap();
+        runtime.block_on(descendant.save()).unwrap();
+        let descendant_budget = fork_budget.for_replacement(&descendant, true).unwrap();
+        fork_budget.retire_session(&fork, owner.cx()).unwrap();
+        drop(fork_budget);
+        let fork_path = fork.path.clone().unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let fork_bytes = std::fs::read(&fork_path).unwrap();
+        let unrelated = descendant_budget
+            .for_replacement(&Session::in_memory(), false)
+            .unwrap();
+        assert!(!descendant_budget.same_tree(&unrelated));
+
+        // Only the original source receives this writer's final bill directly.
+        // The newest fork must still observe it and relay it to the retired fork.
+        first.finish(3.0).unwrap();
+        assert!(matches!(
+            descendant_budget.admit(),
+            Err(Error::CostCap { spent, cap }) if spent == 5.0 && cap == 5.0
+        ));
+        assert_eq!(descendant_budget.refresh().unwrap().spent, 5.0);
+        assert_eq!(recorded_spend(&fork).unwrap(), 5.0);
+        let cold_fork = runtime
+            .block_on(Session::open(fork_path.to_str().unwrap()))
+            .unwrap();
+        let cold = CostBudget::from_session(&cold_fork, None, Some(5.0)).unwrap();
+        assert!(matches!(cold.admit(), Err(Error::CostCap { .. })));
+
+        second.finish(0.5).unwrap();
+        assert_eq!(descendant_budget.refresh().unwrap().spent, 5.5);
+        assert_eq!(descendant_budget.refresh().unwrap().spent, 5.5);
+        assert_eq!(cold.refresh().unwrap().spent, 5.5);
+        assert_eq!(recorded_spend(&fork).unwrap(), 5.5);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        assert_eq!(std::fs::read(&fork_path).unwrap(), fork_bytes);
+        unrelated.admit().unwrap();
+        assert_eq!(unrelated.spent(), 0.0);
+
+        let original_id = original.state.lock().unwrap().account.clone();
+        let resumed_id = descendant_budget.state.lock().unwrap().account.clone();
+        assert_eq!(descendant_budget.state.lock().unwrap().own_finalized, 0.0);
+        let journal = Origin::for_session(&fork).unwrap().unwrap().read().unwrap();
+        assert_eq!(journal.writers[&original_id].own_total, 5.5);
+        assert_eq!(journal.writers[&original_id].baseline_own, 2.0);
+        assert_eq!(journal.writers[&resumed_id].own_total, 0.0);
+
+        descendant_budget.checkpoint(&mut descendant).unwrap();
+        runtime.block_on(descendant.save()).unwrap();
+        descendant_budget
+            .retire_session(&descendant, owner.cx())
+            .unwrap();
+        let descendant_path = descendant.path.clone().unwrap();
+        let cold_descendant = runtime
+            .block_on(Session::open(descendant_path.to_str().unwrap()))
+            .unwrap();
+        let restored = CostBudget::from_session(&cold_descendant, None, Some(5.0)).unwrap();
+        assert_eq!(restored.spent(), 5.5);
+        assert!(matches!(restored.admit(), Err(Error::CostCap { .. })));
+    }
+
+    #[test]
+    fn preserved_unsaved_replacement_keeps_ancestry_without_retaining_abandoned_targets() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let original = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+        let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        original.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        original.retire_session(&source, owner.cx()).unwrap();
+        let resumed = CostBudget::from_session(&source, None, Some(100.0)).unwrap();
+
+        // SDK callers can share a budget with an unsaved replacement without
+        // retiring the old handle. Its read ancestry must survive that drop.
+        let replacement = resumed
+            .for_replacement(&Session::in_memory(), true)
+            .unwrap();
+        drop(resumed);
+        original.record(1.0).unwrap();
+        assert_eq!(replacement.refresh().unwrap().spent, 1.0);
+
+        let foreign = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+        let mut candidate = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        foreign.checkpoint(&mut candidate).unwrap();
+        runtime.block_on(candidate.save()).unwrap();
+        foreign.retire_session(&candidate, owner.cx()).unwrap();
+        let abandoned = replacement.for_replacement(&candidate, true).unwrap();
+        drop(abandoned);
+        foreign.record(2.0).unwrap();
+        original.record(0.5).unwrap();
+        assert_eq!(replacement.refresh().unwrap().spent, 1.5);
+        assert_eq!(recorded_spend(&candidate).unwrap(), 2.0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both source orderings must use the same original writer identity.
+    fn foreign_relay_keeps_its_first_floor_across_newer_fork_baselines() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for higher_baseline_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+            let original = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+            original.record(50.0).unwrap();
+            let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            original.checkpoint(&mut source).unwrap();
+            runtime.block_on(source.save()).unwrap();
+            original.retire_session(&source, owner.cx()).unwrap();
+            original.record(5.0).unwrap();
+
+            let observer = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+            observer.record(10.0).unwrap();
+            let mut destination = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            observer.checkpoint(&mut destination).unwrap();
+            runtime.block_on(destination.save()).unwrap();
+            observer.retire_session(&destination, owner.cx()).unwrap();
+            let observer = observer.for_replacement(&source, true).unwrap();
+            assert_eq!(observer.spent(), 15.0);
+            assert_eq!(recorded_spend(&destination).unwrap(), 15.0);
+            let (observer_id, stale_imports) = {
+                let state = observer.state.lock().unwrap();
+                (state.account.clone(), state.imported.clone())
+            };
+
+            original.record(5.0).unwrap();
+            let mut newer = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            original.checkpoint(&mut newer).unwrap();
+            runtime.block_on(newer.save()).unwrap();
+            original.retire_session(&newer, owner.cx()).unwrap();
+            original.record(5.0).unwrap();
+            if !higher_baseline_first {
+                assert_eq!(observer.refresh().unwrap().spent, 25.0);
+            }
+            // The incoming writer has baseline 60 and total 65. This tree
+            // already observed 55, so all ten new dollars must be retained.
+            let observer = observer.for_replacement(&newer, true).unwrap();
+            assert_eq!(observer.spent(), 25.0);
+            assert_eq!(observer.refresh().unwrap().spent, 25.0);
+            assert_eq!(observer.refresh().unwrap().spent, 25.0);
+            assert_eq!(observer.state.lock().unwrap().own_finalized, 10.0);
+
+            let target = Origin::for_session(&destination).unwrap().unwrap();
+            let stale = Retirement::prepare(Arc::clone(&target), 10.0, Coverage::new(), owner.cx())
+                .unwrap();
+            stale
+                .persist(
+                    &observer_id,
+                    10.0,
+                    false,
+                    &stale_imports,
+                    durability::settlement_deadline(None),
+                )
+                .unwrap();
+            let original_id = original.state.lock().unwrap().account.clone();
+            let journal = target.read().unwrap();
+            assert_eq!(journal.writers[&original_id].baseline_own, 50.0);
+            assert_eq!(journal.writers[&original_id].own_total, 65.0);
+            assert_eq!(journal.writers[&observer_id].own_total, 10.0);
+            assert!(
+                stale
+                    .persist(
+                        &observer_id,
+                        9.0,
+                        false,
+                        &stale_imports,
+                        durability::settlement_deadline(None),
+                    )
+                    .is_err(),
+                "the owning writer still cannot move its counter backwards"
+            );
+            let destination_path = destination.path.as_ref().unwrap();
+            let reopened = runtime
+                .block_on(Session::open(destination_path.to_str().unwrap()))
+                .unwrap();
+            let cold = CostBudget::from_session(&reopened, None, Some(25.0)).unwrap();
+            assert_eq!(
+                cold.spent(),
+                25.0,
+                "do not import the original fifty dollars"
+            );
+            assert!(matches!(cold.admit(), Err(Error::CostCap { .. })));
+            assert_eq!(original.spent(), 65.0);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercise both bounded resources through the public replacement seam.
+    fn rejected_cost_replacements_leave_the_source_and_journals_unchanged() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for exhaust_origins in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+            let mut budget = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+            budget.record(1.0).unwrap();
+            let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            budget.checkpoint(&mut source).unwrap();
+            runtime.block_on(source.save()).unwrap();
+            budget.retire_session(&source, owner.cx()).unwrap();
+
+            let other = CostBudget::new(None, Some(100.0), 0.0).unwrap();
+            let mut candidate = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            other.checkpoint(&mut candidate).unwrap();
+            runtime.block_on(candidate.save()).unwrap();
+            other.retire_session(&candidate, owner.cx()).unwrap();
+            other.record(2.0).unwrap();
+            let candidate_origin = Origin::for_session(&candidate).unwrap().unwrap();
+            if exhaust_origins {
+                // One committed retirement plus MAX_TARGETS-1 read ancestors
+                // fills the combined bound, although neither map alone is full.
+                for _ in 1..durability::MAX_TARGETS {
+                    let mut ancestor =
+                        Session::create_with_dir(Some(directory.path().to_path_buf()));
+                    budget.checkpoint(&mut ancestor).unwrap();
+                    runtime.block_on(ancestor.save()).unwrap();
+                    budget = budget.for_replacement(&ancestor, true).unwrap();
+                }
+            } else {
+                // A valid journal can contain MAX_ACCOUNTS writers, but an
+                // observer also needs a slot for its own new account UUID.
+                let mut journal = serde_json::to_value(candidate_origin.read().unwrap()).unwrap();
+                let writers = journal["writers"].as_object_mut().unwrap();
+                while writers.len() < durability::MAX_ACCOUNTS {
+                    writers.insert(
+                        uuid::Uuid::new_v4().to_string(),
+                        serde_json::json!({"baselineOwn": 0.0, "ownTotal": 0.0}),
+                    );
+                }
+                std::fs::write(&candidate_origin.key, serde_json::to_vec(&journal).unwrap())
+                    .unwrap();
+                assert!(CostBudget::from_session(&candidate, None, Some(100.0)).is_err());
+            }
+            let source_origin = Origin::for_session(&source).unwrap().unwrap();
+            let source_journal = std::fs::read(&source_origin.key).unwrap();
+            let candidate_journal = std::fs::read(&candidate_origin.key).unwrap();
+            let previous_revision = budget.snapshot().revision;
+
+            assert!(budget.for_replacement(&candidate, true).is_err());
+            assert_eq!(budget.spent(), 1.0);
+            assert_eq!(budget.snapshot().revision, previous_revision);
+            assert!(budget.state.lock().unwrap().imported.is_empty());
+            budget.admit().unwrap();
+            assert_eq!(std::fs::read(&source_origin.key).unwrap(), source_journal);
+            assert_eq!(
+                std::fs::read(&candidate_origin.key).unwrap(),
+                candidate_journal
+            );
+            if exhaust_origins {
+                let independent = budget.for_replacement(&candidate, false).unwrap();
+                assert!(!budget.same_tree(&independent));
+                assert_eq!(independent.spent(), 2.0);
+                independent.admit().unwrap();
+            }
+        }
     }
 
     #[test]

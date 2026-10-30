@@ -37,12 +37,14 @@ pub(super) struct Writer {
     pub billing_unavailable: bool,
 }
 
+pub(super) type Writers = BTreeMap<String, Writer>;
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Journal {
     version: u8,
     session_id: String,
-    pub writers: BTreeMap<String, Writer>,
+    pub writers: Writers,
 }
 
 impl Journal {
@@ -339,9 +341,9 @@ impl Origin {
     fn update(
         &self,
         account: &str,
-        baseline: f64,
-        total: f64,
-        billing_unavailable: bool,
+        own: Writer,
+        imported: &Writers,
+        covered: &Coverage,
         deadline: Instant,
     ) -> Result<()> {
         remaining(deadline)?;
@@ -360,21 +362,50 @@ impl Origin {
         // Dropping this handle releases the dedicated journal lock. Transcript
         // locks are never acquired here, including during canceled cleanup.
         let mut journal = self.read()?;
-        if !journal.writers.contains_key(account) && journal.writers.len() >= MAX_ACCOUNTS {
+        let additional = usize::from(!journal.writers.contains_key(account))
+            + imported
+                .keys()
+                .filter(|id| id.as_str() != account && !journal.writers.contains_key(*id))
+                .count();
+        if journal.writers.len().saturating_add(additional) > MAX_ACCOUNTS {
             return Err(Error::session("too many late model cost accounts"));
         }
         let writer = journal.writers.entry(account.to_owned()).or_insert(Writer {
-            baseline_own: baseline,
-            own_total: baseline,
+            baseline_own: own.baseline_own,
+            own_total: own.baseline_own,
             billing_unavailable: false,
         });
-        if writer.baseline_own > baseline || writer.own_total > total {
+        // Only this account owns its finalized counter. A decreasing local
+        // counter is an accounting error; relayed observations below may be
+        // older than another process's already-persisted observation.
+        if writer.baseline_own > own.baseline_own || writer.own_total > own.own_total {
             return Err(Error::session("late model cost counter moved backwards"));
         }
         // Keep the first baseline on repeated retirement. A later checkpoint
         // covers it independently; resetting it would erase unimported charges.
-        writer.own_total = total;
-        writer.billing_unavailable |= billing_unavailable;
+        writer.own_total = own.own_total;
+        writer.billing_unavailable |= own.billing_unavailable;
+        for (id, observed) in imported {
+            if id == account {
+                continue;
+            }
+            // The saved checkpoint already includes its covered counters.
+            // For an account first seen after retirement, retain the original
+            // import floor instead of charging fees predating this tree.
+            let baseline = covered
+                .get(id)
+                .copied()
+                .unwrap_or(0.0)
+                .max(observed.baseline_own);
+            let writer = journal.writers.entry(id.clone()).or_insert(Writer {
+                baseline_own: baseline,
+                own_total: baseline,
+                billing_unavailable: false,
+            });
+            writer.baseline_own = writer.baseline_own.min(baseline);
+            writer.own_total = writer.own_total.max(observed.own_total);
+            writer.billing_unavailable |= observed.billing_unavailable;
+        }
         self.write(&journal, deadline)
     }
 }
@@ -382,21 +413,31 @@ impl Origin {
 pub(super) struct Retirement {
     pub origin: Arc<Origin>,
     pub baseline: f64,
+    covered: Coverage,
     // Retain the initiating capability owner for this fixed-target cleanup.
     // Cancellation may stop new work; it cannot revoke an admitted bill.
     _owner: asupersync::Cx,
 }
 
 impl Retirement {
-    pub fn prepare(origin: Arc<Origin>, baseline: f64, owner: &asupersync::Cx) -> Result<Self> {
+    pub fn prepare(
+        origin: Arc<Origin>,
+        baseline: f64,
+        covered: Coverage,
+        owner: &asupersync::Cx,
+    ) -> Result<Self> {
         let capabilities = owner.capabilities();
         if !capabilities.io || !capabilities.time {
-            return Err(Error::session("late model cost retirement requires I/O and timer authority"));
+            return Err(Error::session(
+                "late model cost retirement requires I/O and timer authority",
+            ));
         }
+        validate_coverage(&covered)?;
         origin.validate_source()?;
         Ok(Self {
             origin,
             baseline,
+            covered,
             _owner: owner.clone(),
         })
     }
@@ -406,10 +447,20 @@ impl Retirement {
         account: &str,
         total: f64,
         billing_unavailable: bool,
+        imported: &Writers,
         deadline: Instant,
     ) -> Result<()> {
-        self.origin
-            .update(account, self.baseline, total, billing_unavailable, deadline)
+        self.origin.update(
+            account,
+            Writer {
+                baseline_own: self.baseline,
+                own_total: total,
+                billing_unavailable,
+            },
+            imported,
+            &self.covered,
+            deadline,
+        )
     }
 }
 
