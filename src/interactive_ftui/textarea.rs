@@ -10,9 +10,11 @@
 //! this file. Published archive SHA-256:
 //! `7ba05f7d99b86ad2a58752f4ad7393baf3785b488d8df51952dd21b64f57d706`.
 //!
-//! The editor, event handling, selection, undo, and word/grapheme wrapping
-//! remain FrankenTUI's implementation. Pi adds visual row measurement and
-//! reconciles the viewport after growth, deletion, or reflow (issue #276).
+//! The editor, event handling, selection, undo, and word/grapheme segmentation
+//! remain FrankenTUI's implementation. Pi adds visual row measurement,
+//! reconciles the viewport after growth, deletion, or reflow, and gives a
+//! full-width insertion caret a continuation row. Cursor movement and clicks
+//! share those wrapped-row boundaries (issue #276).
 //! Keeping this component in the source package also delivers the fix to
 //! `cargo install`; Cargo discards registry patches when publishing a crate.
 //!
@@ -260,6 +262,25 @@ struct WrappedSlice<'a> {
     width: usize,
 }
 
+impl WrappedSlice<'_> {
+    /// A wrapped boundary belongs to the next slice. A click or vertical
+    /// movement targeting this row must remain before that boundary.
+    fn clamp_cursor_column(&self, column: usize, continues: bool) -> usize {
+        column.min(if continues {
+            self.width.saturating_sub(1)
+        } else {
+            self.width
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WrapMetrics {
+    rows: usize,
+    last_width: usize,
+    total_width: usize,
+}
+
 impl TextArea {
     /// Create a new empty text area.
     #[must_use]
@@ -414,7 +435,7 @@ impl TextArea {
                 .line(line_idx)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             let line_text = line_text.trim_end_matches(['\n', '\r']);
-            let slices = Self::wrap_line_slices(line_text, width);
+            let slices = self.line_wrap_slices(line_idx, line_text, width);
             let skip = if line_idx == top_line { top_vrow } else { 0 };
             let visible = slices.len().saturating_sub(skip);
             if remaining < visible {
@@ -422,12 +443,8 @@ impl TextArea {
                 let slice = &slices[index];
                 // Past the end of a slice that wraps, stay on that row
                 // rather than landing at the start of the next one.
-                let max = if index + 1 < slices.len() {
-                    slice.width.saturating_sub(1)
-                } else {
-                    slice.width
-                };
-                return nav.from_visual_col(line_idx, slice.start_col + col.min(max));
+                let column = slice.clamp_cursor_column(col, index + 1 < slices.len());
+                return nav.from_visual_col(line_idx, slice.start_col + column);
             }
             remaining -= visible;
         }
@@ -782,7 +799,8 @@ impl TextArea {
             let line = rope
                 .line(line_idx)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
-            rows = rows.saturating_add(Self::measure_wrap_count(
+            rows = rows.saturating_add(self.line_wrap_count(
+                line_idx,
                 line.trim_end_matches(['\n', '\r']),
                 text_width,
             ));
@@ -791,6 +809,15 @@ impl TextArea {
             }
         }
         rows
+    }
+
+    /// Width of the last nonempty render, when the editor has been displayed.
+    /// Input ownership should follow the geometry the user actually sees,
+    /// even if a resize event has not reached the host model yet.
+    #[must_use]
+    pub fn rendered_width(&self) -> Option<u16> {
+        let width = self.last_area.get().width;
+        (width > 0).then_some(width)
     }
 
     /// Current cursor position.
@@ -1068,10 +1095,10 @@ impl TextArea {
             .unwrap_or(std::borrow::Cow::Borrowed(""));
         let line_text = line_text.trim_end_matches(['\n', '\r']);
         let (mut current_v_row, _) =
-            Self::cursor_wrap_position(line_text, width, cursor.visual_col);
+            self.cursor_wrap_position(cursor.line, line_text, width, cursor.visual_col);
 
         // Calculate target screen X (relative to slice start) to preserve column
-        let initial_slices = Self::wrap_line_slices(line_text, width);
+        let initial_slices = self.line_wrap_slices(cursor.line, line_text, width);
         let initial_slice_start = initial_slices.get(current_v_row).map_or(0, |s| s.start_col);
         let target_screen_x = cursor.visual_col.saturating_sub(initial_slice_start);
 
@@ -1080,7 +1107,7 @@ impl TextArea {
                 .line(cursor.line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             let line_text = line_text.trim_end_matches(['\n', '\r']);
-            let wrap_count = Self::measure_wrap_count(line_text, width);
+            let wrap_count = self.line_wrap_count(cursor.line, line_text, width);
 
             let available_in_line = wrap_count.saturating_sub(1).saturating_sub(current_v_row);
 
@@ -1103,10 +1130,11 @@ impl TextArea {
             .line(cursor.line)
             .unwrap_or(std::borrow::Cow::Borrowed(""));
         let line_text = line_text.trim_end_matches(['\n', '\r']);
-        let slices = Self::wrap_line_slices(line_text, width);
+        let slices = self.line_wrap_slices(cursor.line, line_text, width);
 
         if let Some(slice) = slices.get(current_v_row) {
-            let target_in_slice = target_screen_x.min(slice.width);
+            let target_in_slice =
+                slice.clamp_cursor_column(target_screen_x, current_v_row + 1 < slices.len());
 
             let mut g_idx = 0;
             let mut v_w = 0;
@@ -1155,10 +1183,10 @@ impl TextArea {
             .unwrap_or(std::borrow::Cow::Borrowed(""));
         let line_text = line_text.trim_end_matches(['\n', '\r']);
         let (mut current_v_row, _) =
-            Self::cursor_wrap_position(line_text, width, cursor.visual_col);
+            self.cursor_wrap_position(cursor.line, line_text, width, cursor.visual_col);
 
         // Calculate target screen X (relative to slice start) to preserve column
-        let initial_slices = Self::wrap_line_slices(line_text, width);
+        let initial_slices = self.line_wrap_slices(cursor.line, line_text, width);
         let initial_slice_start = initial_slices.get(current_v_row).map_or(0, |s| s.start_col);
         let target_screen_x = cursor.visual_col.saturating_sub(initial_slice_start);
 
@@ -1174,7 +1202,7 @@ impl TextArea {
                         .line(cursor.line)
                         .unwrap_or(std::borrow::Cow::Borrowed(""));
                     let line_text = line_text.trim_end_matches(['\n', '\r']);
-                    let wrap_count = Self::measure_wrap_count(line_text, width);
+                    let wrap_count = self.line_wrap_count(cursor.line, line_text, width);
                     current_v_row = wrap_count.saturating_sub(1);
                 } else {
                     current_v_row = 0;
@@ -1187,10 +1215,11 @@ impl TextArea {
             .line(cursor.line)
             .unwrap_or(std::borrow::Cow::Borrowed(""));
         let line_text = line_text.trim_end_matches(['\n', '\r']);
-        let slices = Self::wrap_line_slices(line_text, width);
+        let slices = self.line_wrap_slices(cursor.line, line_text, width);
 
         if let Some(slice) = slices.get(current_v_row) {
-            let target_in_slice = target_screen_x.min(slice.width);
+            let target_in_slice =
+                slice.clamp_cursor_column(target_screen_x, current_v_row + 1 < slices.len());
 
             let mut g_idx = 0;
             let mut v_w = 0;
@@ -1328,37 +1357,102 @@ impl TextArea {
         digits + 2 // digit width + space + separator
     }
 
-    /// Count how many wrapped lines this text will occupy.
+    /// Measure wrapped content without allocating the rendered slices.
     ///
-    /// This is a zero-allocation version of `wrap_line_slices` for layout calculations.
-    fn measure_wrap_count(line_text: &str, max_width: usize) -> usize {
+    /// The last row's width also tells layout whether an insertion cursor at
+    /// the end needs its own cell on a continuation row.
+    fn measure_wrap_metrics(line_text: &str, max_width: usize) -> WrapMetrics {
         if line_text.is_empty() {
-            return 1;
+            return WrapMetrics {
+                rows: 1,
+                last_width: 0,
+                total_width: 0,
+            };
         }
 
-        let mut count = 0;
+        let mut metrics = WrapMetrics {
+            rows: 0,
+            last_width: 0,
+            total_width: 0,
+        };
         let mut has_content = false;
 
         Self::run_wrapping_logic(line_text, max_width, |_, width, flush| {
             if flush {
                 if width > 0 {
-                    count += 1;
+                    metrics.rows += 1;
+                    metrics.total_width = metrics.total_width.saturating_add(width);
                 }
+                metrics.last_width = 0;
                 has_content = false;
             } else {
+                metrics.last_width = width;
                 has_content = true;
             }
         });
 
-        // If there's pending content or if we flushed but started a new empty line (which shouldn't happen with this logic usually,
-        // but let's be safe), count the last line.
-        // Actually run_wrapping_logic only flushes when a line is full.
-        // We need to count the current line if it has content or if it's the only line.
-        if has_content || count == 0 {
-            count += 1;
+        if has_content || metrics.rows == 0 {
+            metrics.rows += 1;
+            metrics.total_width = metrics.total_width.saturating_add(metrics.last_width);
         }
 
-        count
+        metrics
+    }
+
+    /// A full final line retains its continuation while the cursor moves
+    /// within the document, so Up/Down can reach its insertion position.
+    /// Earlier hard lines need one only while the caret is at their end:
+    /// typing a hard newline replaces, rather than duplicates, the final
+    /// continuation row. An unfocused widget has no insertion caret.
+    fn has_caret_continuation(
+        &self,
+        line_idx: usize,
+        max_width: usize,
+        last_width: usize,
+        total_width: usize,
+    ) -> bool {
+        let cursor = self.editor.cursor();
+        self.focused
+            && max_width > 0
+            && last_width == max_width
+            && (line_idx == self.line_count().saturating_sub(1)
+                || (cursor.line == line_idx && cursor.visual_col == total_width))
+    }
+
+    fn line_wrap_count(&self, line_idx: usize, line_text: &str, max_width: usize) -> usize {
+        let metrics = Self::measure_wrap_metrics(line_text, max_width);
+        metrics
+            .rows
+            .saturating_add(usize::from(self.has_caret_continuation(
+                line_idx,
+                max_width,
+                metrics.last_width,
+                metrics.total_width,
+            )))
+    }
+
+    /// The same visual rows drive rendering, hit-testing, and navigation.
+    /// A virtual continuation has no bytes, so it cannot alter submission,
+    /// selection ranges, or the undo buffer.
+    fn line_wrap_slices<'a>(
+        &self,
+        line_idx: usize,
+        line_text: &'a str,
+        max_width: usize,
+    ) -> Vec<WrappedSlice<'a>> {
+        let mut slices = Self::wrap_line_slices(line_text, max_width);
+        if let Some(last) = slices.last() {
+            let total_width = last.start_col.saturating_add(last.width);
+            if self.has_caret_continuation(line_idx, max_width, last.width, total_width) {
+                slices.push(WrappedSlice {
+                    text: "",
+                    start_byte: line_text.len(),
+                    start_col: total_width,
+                    width: 0,
+                });
+            }
+        }
+        slices
     }
 
     /// Core wrapping logic that emits events for layout or slicing.
@@ -1406,7 +1500,7 @@ impl TextArea {
         }
     }
 
-    fn wrap_line_slices(line_text: &str, max_width: usize) -> Vec<WrappedSlice<'_>> {
+    fn wrap_line_slices<'a>(line_text: &'a str, max_width: usize) -> Vec<WrappedSlice<'a>> {
         if line_text.is_empty() {
             return vec![WrappedSlice {
                 text: "",
@@ -1499,11 +1593,13 @@ impl TextArea {
     }
 
     fn cursor_wrap_position(
+        &self,
+        line_idx: usize,
         line_text: &str,
         max_width: usize,
         cursor_col: usize,
     ) -> (usize, usize) {
-        let slices = Self::wrap_line_slices(line_text, max_width);
+        let slices = self.line_wrap_slices(line_idx, line_text, max_width);
         if slices.is_empty() {
             return (0, 0);
         }
@@ -1564,7 +1660,7 @@ impl TextArea {
                 .line(anchor_line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             anchor_vrow.min(
-                Self::measure_wrap_count(line.trim_end_matches(['\n', '\r']), vp_width)
+                self.line_wrap_count(anchor_line, line.trim_end_matches(['\n', '\r']), vp_width)
                     .saturating_sub(1),
             )
         } else {
@@ -1600,7 +1696,8 @@ impl TextArea {
             let line = rope
                 .line(line_idx)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
-            let wraps = Self::measure_wrap_count(line.trim_end_matches(['\n', '\r']), vp_width);
+            let wraps =
+                self.line_wrap_count(line_idx, line.trim_end_matches(['\n', '\r']), vp_width);
             let skipped = if line_idx == anchor_line {
                 anchor_vrow
             } else {
@@ -1621,7 +1718,8 @@ impl TextArea {
             let line = rope
                 .line(anchor_line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
-            let wraps = Self::measure_wrap_count(line.trim_end_matches(['\n', '\r']), vp_width);
+            let wraps =
+                self.line_wrap_count(anchor_line, line.trim_end_matches(['\n', '\r']), vp_width);
             let taken = missing.min(wraps);
             anchor_vrow = wraps - taken;
             missing -= taken;
@@ -1679,7 +1777,8 @@ impl TextArea {
                 .line(cursor.line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             let line_text = line_text.trim_end_matches(['\n', '\r']);
-            let (v_row, _) = Self::cursor_wrap_position(line_text, vp_width, cursor.visual_col);
+            let (v_row, _) =
+                self.cursor_wrap_position(cursor.line, line_text, vp_width, cursor.visual_col);
             self.scroll_anchor.set((cursor.line, v_row));
             return;
         }
@@ -1689,7 +1788,8 @@ impl TextArea {
                 .line(cursor.line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             let line_text = line_text.trim_end_matches(['\n', '\r']);
-            let (v_row, _) = Self::cursor_wrap_position(line_text, vp_width, cursor.visual_col);
+            let (v_row, _) =
+                self.cursor_wrap_position(cursor.line, line_text, vp_width, cursor.visual_col);
             if v_row < anchor_vrow {
                 self.scroll_anchor.set((cursor.line, v_row));
                 return;
@@ -1711,11 +1811,11 @@ impl TextArea {
                 .line(current_line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             let line_text = line_text.trim_end_matches(['\n', '\r']);
-            let wrap_count = Self::measure_wrap_count(line_text, vp_width);
+            let wrap_count = self.line_wrap_count(current_line, line_text, vp_width);
 
             if current_line == cursor.line {
                 let (cursor_v_row, _) =
-                    Self::cursor_wrap_position(line_text, vp_width, cursor.visual_col);
+                    self.cursor_wrap_position(cursor.line, line_text, vp_width, cursor.visual_col);
                 if cursor_v_row >= current_v_start {
                     let displayed_row_index = cursor_v_row - current_v_start;
                     if displayed_row_index < visual_rows_capacity {
@@ -1754,7 +1854,8 @@ impl TextArea {
             .line(scan_line)
             .unwrap_or(std::borrow::Cow::Borrowed(""));
         let line_text = line_text.trim_end_matches(['\n', '\r']);
-        let (cursor_v, _) = Self::cursor_wrap_position(line_text, vp_width, cursor.visual_col);
+        let (cursor_v, _) =
+            self.cursor_wrap_position(cursor.line, line_text, vp_width, cursor.visual_col);
 
         let rows_above = cursor_v + 1;
         if rows_above >= needed {
@@ -1772,7 +1873,7 @@ impl TextArea {
                 .line(scan_line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             let line_text = line_text.trim_end_matches(['\n', '\r']);
-            let wrap_count = Self::measure_wrap_count(line_text, vp_width);
+            let wrap_count = self.line_wrap_count(scan_line, line_text, vp_width);
 
             if wrap_count >= needed {
                 let new_v_start = wrap_count - needed;
@@ -1867,8 +1968,12 @@ impl Widget for TextArea {
                 .line(cursor.line)
                 .unwrap_or(std::borrow::Cow::Borrowed(""));
             let cursor_line_text = cursor_line_text.trim_end_matches(['\n', '\r']);
-            let (cursor_wrap_idx, cursor_col_in_wrap) =
-                Self::cursor_wrap_position(cursor_line_text, text_area_w, cursor.visual_col);
+            let (cursor_wrap_idx, cursor_col_in_wrap) = self.cursor_wrap_position(
+                cursor.line,
+                cursor_line_text,
+                text_area_w,
+                cursor.visual_col,
+            );
 
             // Render wrapped lines starting from anchor
             let mut current_y = area.y;
@@ -1889,7 +1994,7 @@ impl Widget for TextArea {
                 // Syntax highlight spans for the whole logical line, computed
                 // once and reused across every wrapped slice.
                 let hl_spans = self.line_spans(line_idx, line_text, deg.apply_styling());
-                let slices = Self::wrap_line_slices(line_text, text_area_w);
+                let slices = self.line_wrap_slices(line_idx, line_text, text_area_w);
 
                 // If this is the start line, skip slices before anchor_vrow
                 let start_slice = if line_idx == scroll_top_line {
@@ -2550,6 +2655,208 @@ mod tests {
         assert_eq!(textarea.visual_line_count(0), 2, "no available width");
         let textarea = textarea.with_soft_wrap(false);
         assert_eq!(textarea.visual_line_count(5), 2, "hard lines only");
+    }
+
+    #[test]
+    fn exact_width_caret_rows_preserve_graphemes_mouse_mapping_and_vertical_selection() {
+        for (text, width) in [
+            ("12345", 5),
+            ("界界", 4),
+            ("e\u{301}e\u{301}", 2),
+            ("👩\u{200d}🚀👩\u{200d}🚀", 4),
+            ("ab\tcd", 5),
+        ] {
+            let mut textarea = TextArea::new().with_soft_wrap(true).with_focus(true);
+            textarea.insert_text(text);
+            let end = textarea.cursor();
+            let undo_groups = textarea.undo_group_count();
+            assert_eq!(textarea.visual_line_count(width), 2, "{text:?}");
+            assert_eq!(textarea.visual_line_count_up_to(width, 1), 1);
+            assert_eq!(viewport_snapshot(&textarea, width, 2).1, Some((0, 1)));
+
+            let click = |x, y| {
+                Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    x,
+                    y,
+                ))
+            };
+            assert!(textarea.handle_event_at(&click(width - 1, 0), 0));
+            assert!(textarea.cursor().grapheme < end.grapheme, "{text:?}");
+            assert_eq!(
+                viewport_snapshot(&textarea, width, 2).1.map(|(_, y)| y),
+                Some(0)
+            );
+            assert!(textarea.handle_event_at(&click(width - 1, 1), 1000));
+            assert_eq!(textarea.cursor(), end, "clicking the empty caret row");
+
+            textarea.move_up();
+            assert_eq!(textarea.cursor(), CursorPosition::new(0, 0, 0));
+            assert_eq!(viewport_snapshot(&textarea, width, 2).1, Some((0, 0)));
+            textarea.move_down();
+            assert_eq!(textarea.cursor(), end);
+            assert_eq!(viewport_snapshot(&textarea, width, 2).1, Some((0, 1)));
+            textarea.select_up();
+            assert_eq!(textarea.selected_text().as_deref(), Some(text));
+            assert_eq!(textarea.text(), text);
+            assert_eq!(textarea.undo_group_count(), undo_groups);
+        }
+    }
+
+    #[test]
+    fn hard_newline_reuses_the_caret_row_and_nonfinal_end_rows_are_transient() {
+        let mut textarea = TextArea::new().with_soft_wrap(true).with_focus(true);
+        textarea.insert_text("12345");
+        assert_eq!(textarea.visual_line_count(5), 2);
+        assert_eq!(viewport_snapshot(&textarea, 5, 2).1, Some((0, 1)));
+        textarea.insert_newline();
+        assert_eq!(textarea.text(), "12345\n");
+        assert_eq!(textarea.visual_line_count(5), 2);
+        let (rows, cursor) = viewport_snapshot(&textarea, 5, 2);
+        assert_eq!(rows, ["12345", ""]);
+        assert_eq!(cursor, Some((0, 1)));
+        textarea.insert_text("x");
+        assert_eq!(textarea.visual_line_count(5), 2);
+        assert_eq!(viewport_snapshot(&textarea, 5, 2).1, Some((1, 1)));
+
+        textarea.move_to_document_start();
+        textarea.move_to_line_end();
+        assert_eq!(textarea.visual_line_count(5), 3);
+        let (rows, cursor) = viewport_snapshot(&textarea, 5, 3);
+        assert_eq!(rows, ["12345", "", "x"]);
+        assert_eq!(cursor, Some((0, 1)));
+        textarea.move_down();
+        assert_eq!(textarea.cursor(), CursorPosition::new(1, 0, 0));
+        assert_eq!(textarea.visual_line_count(5), 2);
+        let (rows, cursor) = viewport_snapshot(&textarea, 5, 2);
+        assert_eq!(rows, ["12345", "x"]);
+        assert_eq!(cursor, Some((0, 1)));
+        textarea.move_up();
+        textarea.move_to_line_end();
+        assert_eq!(textarea.visual_line_count(5), 3);
+        textarea.move_left();
+        assert_eq!(textarea.visual_line_count(5), 2);
+        assert_eq!(viewport_snapshot(&textarea, 5, 2).1, Some((4, 0)));
+        assert_eq!(textarea.text(), "12345\nx");
+    }
+
+    #[test]
+    fn exact_width_caret_reflows_on_resize_and_focus_without_changing_editor_state() {
+        let mut textarea = TextArea::new().with_soft_wrap(true).with_focus(true);
+        assert_eq!(textarea.rendered_width(), None);
+        textarea.insert_text("1234567890");
+        let end = textarea.cursor();
+        let undo_groups = textarea.undo_group_count();
+        for (width, height, cursor) in [
+            (5, 3, (0, 2)),
+            (6, 2, (4, 1)),
+            (10, 2, (0, 1)),
+            (11, 1, (10, 0)),
+            (5, 3, (0, 2)),
+        ] {
+            assert_eq!(textarea.visual_line_count(width), usize::from(height));
+            assert_eq!(viewport_snapshot(&textarea, width, height).1, Some(cursor));
+            assert_eq!(textarea.rendered_width(), Some(width));
+            assert_eq!(textarea.cursor(), end);
+            assert_eq!(textarea.text(), "1234567890");
+            assert_eq!(textarea.undo_group_count(), undo_groups);
+        }
+        textarea.set_focused(false);
+        assert_eq!(textarea.visual_line_count(10), 1);
+        assert_eq!(viewport_snapshot(&textarea, 10, 1).1, None);
+        textarea.set_focused(true);
+        assert_eq!(textarea.visual_line_count(10), 2);
+        assert_eq!(viewport_snapshot(&textarea, 10, 2).1, Some((0, 1)));
+        assert_eq!(textarea.cursor(), end);
+        assert_eq!(textarea.undo_group_count(), undo_groups);
+    }
+
+    #[test]
+    fn capped_caret_viewport_backfills_after_delete_and_undo_restores_pasted_text() {
+        let mut textarea = TextArea::new().with_soft_wrap(true).with_focus(true);
+        let original = "a\nb\nc\nd\n12345";
+        textarea.handle_event_at(
+            &Event::Paste(ftui_core::event::PasteEvent::bracketed(original)),
+            0,
+        );
+        assert_eq!(textarea.visual_line_count(5), 6);
+        assert_eq!(textarea.visual_line_count_up_to(5, 5), 5);
+        let (rows, cursor) = viewport_snapshot(&textarea, 5, 5);
+        assert_eq!(rows, ["b", "c", "d", "12345", ""]);
+        assert_eq!(cursor, Some((0, 4)));
+        textarea.delete_backward();
+        assert_eq!(textarea.visual_line_count(5), 5);
+        let (rows, cursor) = viewport_snapshot(&textarea, 5, 5);
+        assert_eq!(rows, ["a", "b", "c", "d", "1234"]);
+        assert_eq!(cursor, Some((4, 4)));
+        textarea.undo();
+        assert_eq!(textarea.text(), original);
+        assert_eq!(textarea.visual_line_count(5), 6);
+        assert_eq!(viewport_snapshot(&textarea, 5, 5).1, Some((0, 4)));
+        textarea.redo();
+        assert_eq!(textarea.text(), "a\nb\nc\nd\n1234");
+        assert_eq!(textarea.visual_line_count(5), 5);
+        assert_eq!(viewport_snapshot(&textarea, 5, 5).1, Some((4, 4)));
+    }
+
+    #[test]
+    fn vertical_movement_stays_on_short_wrapped_rows_at_grapheme_boundaries() {
+        for (text, start, expected) in [
+            (
+                "abc defgh",
+                CursorPosition::new(0, 8, 8),
+                CursorPosition::new(0, 3, 3),
+            ),
+            (
+                "a界bcdef",
+                CursorPosition::new(0, 6, 7),
+                CursorPosition::new(0, 1, 1),
+            ),
+        ] {
+            let mut textarea = TextArea::new()
+                .with_text(text)
+                .with_soft_wrap(true)
+                .with_focus(true);
+            let _ = viewport_snapshot(&textarea, 5, 3);
+            textarea.set_cursor_position(start);
+            assert_eq!(viewport_snapshot(&textarea, 5, 3).1, Some((4, 1)));
+            textarea.move_up();
+            assert_eq!(textarea.cursor(), expected, "{text:?}");
+            assert_eq!(
+                viewport_snapshot(&textarea, 5, 3).1.map(|(_, y)| y),
+                Some(0)
+            );
+            textarea.move_down();
+            assert_eq!(
+                viewport_snapshot(&textarea, 5, 3).1.map(|(_, y)| y),
+                Some(1)
+            );
+            textarea.set_cursor_position(start);
+            textarea.select_up();
+            assert_eq!(textarea.cursor(), expected);
+            assert!(textarea.selected_text().is_some());
+            assert_eq!(textarea.text(), text);
+        }
+
+        for (text, expected, drawn) in [
+            ("abcdefgh ijklm", CursorPosition::new(0, 8, 8), (3, 1)),
+            ("abcdea界bcdef", CursorPosition::new(0, 6, 6), (1, 1)),
+        ] {
+            let mut textarea = TextArea::new()
+                .with_text(text)
+                .with_soft_wrap(true)
+                .with_focus(true);
+            let _ = viewport_snapshot(&textarea, 5, 4);
+            textarea.set_cursor_position(CursorPosition::new(0, 4, 4));
+            textarea.move_down();
+            assert_eq!(textarea.cursor(), expected, "{text:?}");
+            assert_eq!(viewport_snapshot(&textarea, 5, 4).1, Some(drawn));
+            textarea.set_cursor_position(CursorPosition::new(0, 4, 4));
+            textarea.select_down();
+            assert_eq!(textarea.cursor(), expected);
+            assert!(textarea.selected_text().is_some());
+            assert_eq!(textarea.text(), text);
+        }
     }
 
     #[test]

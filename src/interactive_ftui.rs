@@ -1752,6 +1752,7 @@ const fn is_editor_action(action: AppAction) -> bool {
             | AppAction::CursorWordLeft
             | AppAction::CursorWordRight
             | AppAction::CursorLineStart
+            | AppAction::CursorLineEnd
             | AppAction::JumpBackward
             | AppAction::JumpForward
             | AppAction::DeleteCharBackward
@@ -1784,6 +1785,7 @@ fn apply_editor_action(input: &mut TextArea, action: AppAction) {
         AppAction::CursorWordLeft => input.move_word_left(),
         AppAction::CursorWordRight => input.move_word_right(),
         AppAction::CursorLineStart => input.move_to_line_start(),
+        AppAction::CursorLineEnd => input.move_to_line_end(),
         AppAction::JumpBackward => input.move_to_document_start(),
         AppAction::JumpForward => input.move_to_document_end(),
         AppAction::DeleteCharBackward => input.delete_backward(),
@@ -2820,14 +2822,18 @@ impl PiFtuiModel {
         }
     }
 
-    /// Up/down recall applies to the plain editor with a one-line draft, and
-    /// keeps applying once recall has begun (a recalled entry may itself be
-    /// multi-line; stopping there would strand the user mid-history).
+    /// Up/down recall applies to a draft occupying one visual row, and keeps
+    /// applying once recall has begun (a recalled entry may itself wrap or
+    /// contain newlines; stopping there would strand the user mid-history).
     fn history_navigable(&self) -> bool {
         self.input_active()
             && self.active_ask.is_none()
             && self.active_ext.is_none()
-            && (self.history_cursor.is_some() || !self.input.text().contains('\n'))
+            && (self.history_cursor.is_some()
+                || self
+                    .input
+                    .visual_line_count_up_to(self.input.rendered_width().unwrap_or(self.term.0), 2)
+                    == 1)
     }
 
     /// Show the next-older prompt (staying on the oldest).
@@ -6009,9 +6015,8 @@ impl PiFtuiModel {
                         self.maybe_trigger_autocomplete();
                         return Cmd::none();
                     }
-                    // Input history: up/down recall earlier prompts while the
-                    // draft is one line (a multi-line draft keeps up/down for
-                    // moving between its lines).
+                    // Input history: a draft spanning several visible rows
+                    // keeps up/down for editing, including soft-wrapped rows.
                     Some(AppAction::CursorUp) if self.history_navigable() => {
                         self.history_back();
                         return Cmd::none();
@@ -6020,6 +6025,19 @@ impl PiFtuiModel {
                         if self.history_navigable() && self.history_cursor.is_some() =>
                     {
                         self.history_forward();
+                        return Cmd::none();
+                    }
+                    // Catalog actions must dispatch directly: a configured
+                    // ctrl+n/ctrl+j is not a physical arrow key, so replaying
+                    // the raw event through the widget would discard it.
+                    Some(AppAction::CursorUp) if self.input_active() => {
+                        self.input.move_up();
+                        self.maybe_trigger_autocomplete();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CursorDown) if self.input_active() => {
+                        self.input.move_down();
+                        self.maybe_trigger_autocomplete();
                         return Cmd::none();
                     }
                     _ => {}
@@ -12338,6 +12356,69 @@ mod tests {
         assert_eq!(&rows[8..11], &["aaaa bbbb", "cccc", ""]);
         assert_eq!(cursor, Some((0, 10)));
         assert_eq!(sim.model().input.text(), "aaaa bbbb cccc\n");
+    }
+
+    #[test]
+    fn full_width_draft_keeps_cursor_history_and_newline_submission_consistent() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.record_history("an old prompt");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // The frame establishes the actual editor width without a Resize.
+        let _ = frame_with_cursor(sim.model(), 10, 12);
+        type_str(&mut sim, "abcdefghij");
+        assert_eq!(sim.model().input_rows_at_width(10), 2);
+        let (frame, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        let editor_rows: Vec<_> = frame
+            .lines()
+            .rev()
+            .skip(1)
+            .take(2)
+            .map(str::trim_end)
+            .collect();
+        assert_eq!(editor_rows, ["", "abcdefghij"]);
+        assert_eq!(cursor, Some((0, 10)));
+
+        for (code, grapheme, expected_cursor) in [
+            (KeyCode::Up, 0, Some((0, 9))),
+            (KeyCode::Down, 10, Some((0, 10))),
+        ] {
+            sim.inject_event(key(code, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "abcdefghij");
+            assert_eq!(sim.model().input.cursor().grapheme, grapheme);
+            assert_eq!(sim.model().history_cursor, None);
+            let (_, cursor) = frame_with_cursor(sim.model(), 10, 12);
+            assert_eq!(cursor, expected_cursor);
+        }
+
+        sim.inject_event(key(KeyCode::Enter, Modifiers::SHIFT));
+        assert_eq!(sim.model().input.text(), "abcdefghij\n");
+        assert_eq!(sim.model().input_rows_at_width(10), 2);
+        let (frame, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        let editor_rows: Vec<_> = frame
+            .lines()
+            .rev()
+            .skip(1)
+            .take(2)
+            .map(str::trim_end)
+            .collect();
+        assert_eq!(editor_rows, ["", "abcdefghij"]);
+        assert_eq!(cursor, Some((0, 10)));
+        type_str(&mut sim, "x");
+        let (_, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        assert_eq!(cursor, Some((1, 10)));
+        assert!(submit_rx.try_recv().is_err());
+
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("submitted intact draft"),
+            UiCommand::Prompt(String::from("abcdefghij\nx"))
+        );
+        assert!(submit_rx.try_recv().is_err());
+        assert!(sim.model().input.is_empty());
     }
 
     #[test]
@@ -20997,6 +21078,123 @@ mod tests {
         sim.model_mut().input.set_text("line one\nline two");
         sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "line one\nline two");
+    }
+
+    #[test]
+    fn wrapped_draft_keeps_vertical_movement_out_of_history() {
+        let (_tx, mut model) = new_model();
+        model.record_history("an old prompt");
+        model.input.set_text("abcdefghijklmnopq");
+        model.input.move_to_document_end();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // The displayed width is authoritative even before a Resize event.
+        // This single logical line occupies two rows, so Up must edit it.
+        let (_, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        assert_eq!(cursor, Some((7, 10)));
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "abcdefghijklmnopq");
+        assert_eq!(sim.model().input.cursor().grapheme, 7);
+        assert_eq!(sim.model().history_cursor, None);
+        let (_, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        assert_eq!(cursor, Some((7, 9)));
+
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().input.cursor().grapheme, 17);
+        let (_, cursor) = frame_with_cursor(sim.model(), 10, 12);
+        assert_eq!(cursor, Some((7, 10)));
+
+        // Once the draft really fits on one row, normal history recall and
+        // draft restoration still work, including after a width change.
+        let _ = frame_with_cursor(sim.model(), 40, 12);
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "an old prompt");
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "abcdefghijklmnopq");
+        assert_eq!(sim.model().history_cursor, None);
+    }
+
+    #[test]
+    fn configured_movement_edits_multiline_drafts_and_recalled_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "cursorUp": ["ctrl+n"],
+                "cursorDown": ["ctrl+j"],
+                "cursorLineEnd": ["ctrl+r"]
+            }"#,
+        )
+        .expect("write bindings");
+        let bindings = KeyBindings::load(&path).expect("load bindings");
+        let (_tx, mut model) = new_model();
+        model.record_history("older\nprompt");
+        model.input.set_text("abcdefghij\nklmnopqr");
+        model.input.move_to_document_end();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(bindings));
+        sim.init();
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+
+        sim.inject_event(key(KeyCode::Char('n'), Modifiers::CTRL));
+        let (_, cursor) = frame_with_cursor(sim.model(), 20, 12);
+        assert_eq!(cursor, Some((8, 9)));
+        sim.inject_event(key(KeyCode::Char('r'), Modifiers::CTRL));
+        let (_, cursor) = frame_with_cursor(sim.model(), 20, 12);
+        assert_eq!(cursor, Some((10, 9)));
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+        let (_, cursor) = frame_with_cursor(sim.model(), 20, 12);
+        assert_eq!(cursor, Some((8, 10)));
+        assert_eq!(sim.model().input.text(), "abcdefghij\nklmnopqr");
+        assert_eq!(sim.model().history_cursor, None);
+
+        sim.model_mut().input.set_text("draft");
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        sim.inject_event(key(KeyCode::Char('n'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "older\nprompt");
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "draft");
+        assert_eq!(sim.model().history_cursor, None);
+    }
+
+    #[test]
+    fn ctrl_e_positions_newline_insertion_before_multiline_submission() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.input.set_text("first\nsecond");
+        model.input.move_to_document_start();
+        model.input.move_right();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+
+        sim.inject_event(key(KeyCode::Char('e'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.cursor().line, 0);
+        assert_eq!(sim.model().input.cursor().grapheme, 5);
+        sim.inject_event(key(KeyCode::Enter, Modifiers::SHIFT));
+        type_str(&mut sim, "middle");
+        let (frame, cursor) = frame_with_cursor(sim.model(), 20, 12);
+        let editor_rows: Vec<_> = frame
+            .lines()
+            .rev()
+            .skip(1)
+            .take(3)
+            .map(str::trim_end)
+            .collect();
+        assert_eq!(editor_rows, ["second", "middle", "first"]);
+        assert_eq!(cursor, Some((6, 9)));
+        assert!(submit_rx.try_recv().is_err());
+
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("submitted intact draft"),
+            UiCommand::Prompt(String::from("first\nmiddle\nsecond"))
+        );
+        assert!(submit_rx.try_recv().is_err());
+        assert!(sim.model().input.is_empty());
     }
 
     /// Recall walks past a multi-line entry in both directions and back to
