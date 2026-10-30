@@ -140,16 +140,40 @@ impl CostState {
         self.snapshot.spent = add_cost(self.snapshot.spent, cost);
         self.own_finalized = add_cost(self.own_finalized, cost);
         self.changed()?;
+        self.persist_retired(deadline)
+    }
+
+    fn persist_retired(&mut self, deadline: Option<Instant>) -> Result<()> {
         let deadline = durability::settlement_deadline(deadline);
+        let mut first_error = None;
         for retired in self.retired.values() {
-            if let Err(error) = retired.persist(&self.account, self.own_finalized, deadline) {
+            if let Err(error) = retired.persist(
+                &self.account,
+                self.own_finalized,
+                self.failure.is_some(),
+                deadline,
+            ) {
                 // Keep the valid bill even if its durable acknowledgement fails.
                 // A later request must not silently run with incomplete storage.
                 self.failure = Some(error.to_string());
-                return Err(error);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn quarantine(&mut self, message: &str) {
+        self.failure = Some(message.to_string());
+        // A retired source may never be checkpointed again. Persist the refusal
+        // even when no charge is finalized, without changing its known spend.
+        if let Err(error) = self.persist_retired(None) {
+            tracing::warn!(%error, "retired model cost quarantine could not be persisted");
+        }
     }
 
     fn import(&mut self, journal: &Journal) -> Result<()> {
@@ -169,6 +193,11 @@ impl CostState {
         if added > 0.0 {
             self.snapshot.spent = add_cost(self.snapshot.spent, added);
             self.changed()?;
+        }
+        // The refusal is valid accounting data. Import the known lower bound
+        // and preserve it in checkpoints; admission checks health separately.
+        if journal.billing_unavailable() {
+            self.quarantine(RECORDED_BILLING_FAILURE);
         }
         Ok(())
     }
@@ -274,15 +303,23 @@ impl CostBudget {
     /// A native child always remains charged to its original parent tree.
     pub fn for_replacement(&self, session: &Session, preserve: bool) -> Result<Self> {
         if self.remote.is_some() || preserve {
-            validate_recorded_billing(session)?;
-        }
-        if self.remote.is_some() {
-            return Ok(self.clone());
-        }
-        if preserve {
+            let origin = Origin::for_session(session)?;
+            let journal = origin.as_ref().map(|origin| origin.read()).transpose()?;
+            // Validate the candidate before touching the source's shared state.
+            // A refused switch must not quarantine a healthy source account.
+            validate_recorded_billing(session, journal.as_ref())?;
+            if self.remote.is_some() {
+                return Ok(self.clone());
+            }
             let mut replacement = self.clone();
-            replacement.origin = Origin::for_session(session)?;
-            replacement.refresh_origin()?;
+            replacement.origin = origin;
+            if let Some(journal) = &journal {
+                replacement
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .import(journal)?;
+            }
             return Ok(replacement);
         }
         let snapshot = self.snapshot();
@@ -318,7 +355,7 @@ impl CostBudget {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Err(error) = state.import(&journal) {
-            state.failure = Some(error.to_string());
+            state.quarantine(&error.to_string());
             return Err(error);
         }
         Ok(())
@@ -458,7 +495,7 @@ impl CostBudget {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .failure = Some(message.to_string());
+            .quarantine(message);
     }
 
     /// Record exactly once per provider attempt, including known usage from a
@@ -466,10 +503,7 @@ impl CostBudget {
     pub fn record(&self, cost: f64) -> Result<()> {
         if !cost.is_finite() || cost < 0.0 {
             let message = "provider returned invalid model cost; further requests are blocked";
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .failure = Some(message.to_string());
+            self.quarantine(message);
             return Err(Error::session(message));
         }
         if cost == 0.0 {
@@ -510,7 +544,7 @@ impl CostBudget {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if recorded_billing_unavailable(session) && state.failure.is_none() {
-            state.failure = Some(RECORDED_BILLING_FAILURE.to_string());
+            state.quarantine(RECORDED_BILLING_FAILURE);
         }
         let spent = state.snapshot.spent;
         let main_spent = main_spend(session);
@@ -582,6 +616,7 @@ impl CostBudget {
             let result = retired.persist(
                 &state.account,
                 state.own_finalized,
+                state.failure.is_some(),
                 durability::settlement_deadline(None),
             );
             if let Err(error) = &result {
@@ -622,6 +657,7 @@ impl CostBudget {
         if let Err(error) = retired.persist(
             &state.account,
             state.own_finalized,
+            state.failure.is_some(),
             durability::settlement_deadline(None),
         ) {
             state.failure = Some(error.to_string());
@@ -696,9 +732,6 @@ impl CostAttempt {
         }
         self.settled = true;
         let valid = !self.invalid_usage && cost.is_finite() && cost >= 0.0;
-        if !valid {
-            self.budget.quarantine("provider returned invalid model cost");
-        }
         let result = match &mut self.source {
             AttemptSource::Local(id) => {
                 let mut state = self
@@ -706,6 +739,12 @@ impl CostAttempt {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !valid {
+                    // Finalization writes the failure and known charge together
+                    // under its supplied cleanup deadline. Do not start a
+                    // separate quarantine write with a fresh timeout here.
+                    state.failure = Some("provider returned invalid model cost".to_string());
+                }
                 let known = state
                     .pending
                     .remove(id)
@@ -713,6 +752,12 @@ impl CostAttempt {
                 state.finalize(if valid { cost } else { known }, deadline)
             }
             AttemptSource::Remote(remote) => {
+                if !valid {
+                    // Remote budgets never acquire retired local sinks. The
+                    // parent receives the failure through finish(None) below.
+                    self.budget
+                        .quarantine("provider returned invalid model cost");
+                }
                 self.budget
                     .accept_remote(remote.finish(valid.then_some(cost), deadline))
             }
@@ -767,14 +812,17 @@ fn recorded_billing_unavailable(session: &Session) -> bool {
     })
 }
 
-fn validate_recorded_billing(session: &Session) -> Result<()> {
+fn validate_recorded_billing(session: &Session, journal: Option<&Journal>) -> Result<()> {
     if session.has_partial_v2_hydration() {
         let mut complete = session.clone();
         complete.ensure_full_v2_hydration_before_save()?;
-        return validate_recorded_billing(&complete);
+        return validate_recorded_billing(&complete, journal);
     }
     if recorded_billing_unavailable(session) {
         return Err(Error::session(RECORDED_BILLING_FAILURE));
+    }
+    if let Some(journal) = journal {
+        journal.ensure_billing_available()?;
     }
     Ok(())
 }
@@ -794,7 +842,7 @@ fn recorded_account(session: &Session, journal: Option<&Journal>) -> Result<(f64
     }
     // A finite retained amount is only the known lower bound when the
     // provider or a prior live account reported unavailable billing.
-    validate_recorded_billing(session)?;
+    validate_recorded_billing(session, journal)?;
     let main_spent = main_spend(session);
     let mut spent = main_spent;
     let mut observed = Coverage::new();
@@ -1151,6 +1199,189 @@ mod tests {
         assert_eq!(resumed.refresh().unwrap().spent, 9.5);
         assert_eq!(recorded_spend(&reopened).unwrap(), 9.5);
         assert_eq!(budget.spent(), 9.0, "imported or inherited fees are not own charges");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercise the complete retirement and reopen lifecycle together.
+    fn late_billing_failure_quarantines_live_and_reopened_accounts() {
+        fn assert_unavailable<T: std::fmt::Debug>(result: Result<T>) {
+            assert!(matches!(
+                result.unwrap_err(),
+                Error::Session(message) if message == RECORDED_BILLING_FAILURE
+            ));
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for with_v2_sidecar in [false, true] {
+            for through_attempt in [false, true] {
+                for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let path = directory.path().join("late-unavailable-billing.jsonl");
+                    let mut session = Session::create();
+                    session.path = Some(path.clone());
+                    session.append_message(assistant(1.0));
+                    let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+                    let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+                    budget.record(1.0).unwrap();
+                    let mut failed = budget.start_attempt().unwrap();
+                    failed.observe(0.25).unwrap();
+                    let mut surviving = budget.start_attempt().unwrap();
+                    surviving.observe(0.5).unwrap();
+                    budget.checkpoint(&mut session).unwrap();
+                    runtime.block_on(session.save()).unwrap();
+                    let transcript = std::fs::read(&path).unwrap();
+                    budget.retire_session(&session, owner.cx()).unwrap();
+                    let resumed = CostBudget::from_session(&session, None, Some(10.0)).unwrap();
+                    resumed.admit().unwrap();
+                    let mut fork = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                    resumed.checkpoint(&mut fork).unwrap();
+                    runtime.block_on(fork.save()).unwrap();
+                    resumed.retire_session(&fork, owner.cx()).unwrap();
+
+                    if through_attempt {
+                        assert!(failed.finish(invalid).is_err());
+                        assert_eq!(budget.spent(), 1.25);
+                    } else {
+                        assert!(budget.record(invalid).is_err());
+                        assert_eq!(budget.spent(), 1.0, "invalid records add no charge");
+                    }
+                    // In the direct-record case this precedes any finalization:
+                    // quarantine itself must write the durable refusal.
+                    assert_unavailable(recorded_spend(&session));
+                    assert!(budget.admit().is_err());
+                    if !through_attempt {
+                        failed.finish(0.25).unwrap();
+                    }
+                    budget.quarantine("private transport diagnostic");
+                    // Work admitted before quarantine still owns its final bill.
+                    surviving.finish(0.5).unwrap();
+                    assert_eq!(budget.spent(), 1.75);
+                    assert_eq!(std::fs::read(&path).unwrap(), transcript);
+
+                    let origin = Origin::for_session(&session).unwrap().unwrap();
+                    let account = budget
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .account
+                        .clone();
+                    let journal = origin.read().unwrap();
+                    assert_eq!(journal.writers[&account].own_total, 1.75);
+                    assert!(journal.writers[&account].billing_unavailable);
+                    // A stale healthy acknowledgement must never erase a
+                    // refusal already written by this account.
+                    let stale = Retirement::prepare(Arc::clone(&origin), 1.0, owner.cx()).unwrap();
+                    stale
+                        .persist(&account, 1.75, false, durability::settlement_deadline(None))
+                        .unwrap();
+                    assert!(origin.read().unwrap().writers[&account].billing_unavailable);
+                    let encoded = std::fs::read_to_string(&origin.key).unwrap();
+                    assert!(!encoded.contains("private transport diagnostic"));
+                    assert!(!encoded.contains("NaN"));
+
+                    assert!(resumed.refresh().is_err());
+                    assert_eq!(resumed.spent(), 1.75, "retain the known lower bound");
+                    assert!(resumed.admit().is_err());
+                    assert_unavailable(recorded_spend(&fork));
+                    // Refusing new requests must not prevent saving the
+                    // known charges and refusal during shutdown or replacement.
+                    resumed.checkpoint(&mut fork).unwrap();
+                    runtime.block_on(fork.save()).unwrap();
+                    let SessionEntry::Custom(checkpoint) = fork.entries.last().unwrap() else {
+                        panic!("cost checkpoint");
+                    };
+                    assert_eq!(
+                        checkpoint.data.as_ref().unwrap()["failure"],
+                        RECORDED_BILLING_FAILURE
+                    );
+
+                    let reopened = if with_v2_sidecar {
+                        let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+                        let (mut reopened, diagnostics) = Session::open_from_v2(
+                            &store,
+                            session.header.clone(),
+                            crate::session::V2OpenMode::ActivePath,
+                        )
+                        .unwrap();
+                        assert!(diagnostics.skipped_entries.is_empty());
+                        reopened.path = Some(path.clone());
+                        reopened
+                    } else {
+                        runtime
+                            .block_on(Session::open(path.to_str().unwrap()))
+                            .unwrap()
+                    };
+                    assert_unavailable(recorded_spend(&reopened));
+                    assert_unavailable(CostBudget::from_session(&reopened, None, Some(10.0)));
+                    let current = CostBudget::new(None, Some(10.0), 2.0).unwrap();
+                    for preserve in [false, true] {
+                        assert_unavailable(current.for_replacement(&reopened, preserve));
+                        current.admit().unwrap();
+                        assert_eq!(
+                            current.spent(),
+                            2.0,
+                            "a refused switch leaves its source intact"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_zero_usage_observation_quarantines_a_legacy_retired_journal() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let budget = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        let mut outstanding = budget.start_attempt().unwrap();
+        budget.checkpoint(&mut session).unwrap();
+        runtime.block_on(session.save()).unwrap();
+        budget.retire_session(&session, owner.cx()).unwrap();
+        let origin = Origin::for_session(&session).unwrap().unwrap();
+
+        // Journals written before this field existed remain readable. Use the
+        // real journal reader so the schema check and file admission both run.
+        let mut legacy = serde_json::to_value(origin.read().unwrap()).unwrap();
+        for writer in legacy["writers"].as_object_mut().unwrap().values_mut() {
+            let _ = writer.as_object_mut().unwrap().remove("billingUnavailable");
+        }
+        std::fs::write(&origin.key, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(recorded_spend(&session).unwrap(), 0.0);
+        assert!(
+            origin
+                .read()
+                .unwrap()
+                .writers
+                .values()
+                .all(|writer| !writer.billing_unavailable)
+        );
+
+        assert!(outstanding.observe(f64::NAN).is_err());
+        assert!(matches!(
+            recorded_spend(&session),
+            Err(Error::Session(message)) if message == RECORDED_BILLING_FAILURE
+        ));
+        assert_eq!(budget.spent(), 0.0);
+        drop(outstanding);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert!(
+            origin
+                .read()
+                .unwrap()
+                .writers
+                .values()
+                .all(|writer| writer.billing_unavailable && writer.own_total == 0.0)
+        );
+        assert!(matches!(
+            CostBudget::from_session(&session, None, Some(1.0)),
+            Err(Error::Session(message)) if message == RECORDED_BILLING_FAILURE
+        ));
     }
 
     #[test]

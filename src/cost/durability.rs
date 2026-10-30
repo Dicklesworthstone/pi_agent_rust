@@ -2,7 +2,7 @@
 //! separate from both transcript backends, so a retained provider request never
 //! rewrites a transcript which another session instance may now be saving.
 
-use super::{Error, Result, add_cost};
+use super::{Error, RECORDED_BILLING_FAILURE, Result, add_cost};
 use crate::file_identity::FileIdentity;
 use crate::session::{Session, read_persisted_session_header};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,10 @@ pub(super) type Coverage = BTreeMap<String, f64>;
 pub(super) struct Writer {
     pub baseline_own: f64,
     pub own_total: f64,
+    /// A finalized counter is only a lower bound after billing is lost.
+    /// Keep that refusal with the writer across later successful settlements.
+    #[serde(default)]
+    pub billing_unavailable: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -48,6 +52,19 @@ impl Journal {
             session_id: session_id.to_owned(),
             writers: BTreeMap::new(),
         }
+    }
+
+    pub fn billing_unavailable(&self) -> bool {
+        self.writers
+            .values()
+            .any(|writer| writer.billing_unavailable)
+    }
+
+    pub fn ensure_billing_available(&self) -> Result<()> {
+        if self.billing_unavailable() {
+            return Err(Error::session(RECORDED_BILLING_FAILURE));
+        }
+        Ok(())
     }
 
     pub fn uncovered(&self, coverage: &Coverage) -> f64 {
@@ -319,7 +336,14 @@ impl Origin {
         Ok(())
     }
 
-    fn update(&self, account: &str, baseline: f64, total: f64, deadline: Instant) -> Result<()> {
+    fn update(
+        &self,
+        account: &str,
+        baseline: f64,
+        total: f64,
+        billing_unavailable: bool,
+        deadline: Instant,
+    ) -> Result<()> {
         remaining(deadline)?;
         let lock_name = format!("{}.lock", self.journal_name);
         let lock = self.open_member(OsStr::new(&lock_name), true)?;
@@ -342,6 +366,7 @@ impl Origin {
         let writer = journal.writers.entry(account.to_owned()).or_insert(Writer {
             baseline_own: baseline,
             own_total: baseline,
+            billing_unavailable: false,
         });
         if writer.baseline_own > baseline || writer.own_total > total {
             return Err(Error::session("late model cost counter moved backwards"));
@@ -349,6 +374,7 @@ impl Origin {
         // Keep the first baseline on repeated retirement. A later checkpoint
         // covers it independently; resetting it would erase unimported charges.
         writer.own_total = total;
+        writer.billing_unavailable |= billing_unavailable;
         self.write(&journal, deadline)
     }
 }
@@ -375,8 +401,15 @@ impl Retirement {
         })
     }
 
-    pub fn persist(&self, account: &str, total: f64, deadline: Instant) -> Result<()> {
-        self.origin.update(account, self.baseline, total, deadline)
+    pub fn persist(
+        &self,
+        account: &str,
+        total: f64,
+        billing_unavailable: bool,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.origin
+            .update(account, self.baseline, total, billing_unavailable, deadline)
     }
 }
 
