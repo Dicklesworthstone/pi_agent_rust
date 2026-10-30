@@ -75,8 +75,8 @@ use textarea::TextArea;
 ///
 /// `Model::Message` must be `From<Event>`, so terminal input arrives through
 /// [`PiFtuiMsg::Term`]; everything async arrives through [`PiFtuiMsg::Agent`]
-/// via [`AgentEventSubscription`]. [`PiFtuiMsg::Resumed`] is produced by the
-/// suspend task after the process returns from a SIGTSTP stop (ctrl+z).
+/// via [`AgentEventSubscription`]. [`PiFtuiMsg::SuspendFinished`] reports the
+/// terminal outcome after a SIGTSTP stop (ctrl+z), including failed attempts.
 #[derive(Debug)]
 pub enum PiFtuiMsg {
     /// A raw terminal event (key, mouse, resize, paste, focus, ...).
@@ -86,6 +86,9 @@ pub enum PiFtuiMsg {
     /// The process came back from a SIGTSTP suspension: the terminal has
     /// been re-acquired and the next frame must repaint everything.
     Resumed,
+    /// A suspend attempt finished. Terminal failures belong to the UI and
+    /// must not cancel the agent's active turn or pending questions.
+    SuspendFinished(std::result::Result<(u16, u16), String>),
     /// The external editor (ctrl+g) closed and the terminal is back: the
     /// saved draft (or why there is none) and the size for a full repaint.
     Edited {
@@ -427,11 +430,31 @@ fn drain_agent_events(
 /// byte-identical and the diff engine emits nothing.
 #[cfg(unix)]
 fn perform_terminal_suspend(alt_screen: bool, mouse: bool) -> std::io::Result<(u16, u16)> {
-    release_terminal(alt_screen)?;
-    // Stops the process here; resumes after `fg`.
-    signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
-    // --- continued ---
-    reacquire_terminal(alt_screen, mouse)
+    suspend_terminal_with(
+        || release_terminal(alt_screen),
+        || signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP),
+        || reacquire_terminal(alt_screen, mouse),
+    )
+}
+
+/// Recover terminal ownership even if release stopped halfway through or
+/// the stop signal failed. Injected operations keep recovery tests away
+/// from the real terminal and process signals.
+#[cfg(unix)]
+fn suspend_terminal_with(
+    release: impl FnOnce() -> std::io::Result<()>,
+    stop: impl FnOnce() -> std::io::Result<()>,
+    reacquire: impl FnOnce() -> std::io::Result<(u16, u16)>,
+) -> std::io::Result<(u16, u16)> {
+    let suspended = release().and_then(|()| stop());
+    let restored = reacquire();
+    match (suspended, restored) {
+        (Ok(()), result) => result,
+        (Err(error), Ok(_)) => Err(error),
+        (Err(error), Err(restore_error)) => Err(std::io::Error::other(format!(
+            "{error}; terminal restore failed: {restore_error}"
+        ))),
+    }
 }
 
 /// Hand the terminal back in shell-safe cooked state (suspend, external
@@ -543,9 +566,11 @@ fn external_editor_task(
 /// state and triggers a full repaint.
 #[cfg(unix)]
 fn suspend_task(alt_screen: bool, mouse: bool) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
-    move || match perform_terminal_suspend(alt_screen, mouse) {
-        Ok((width, height)) => PiFtuiMsg::Term(Event::Resize { width, height }),
-        Err(err) => PiFtuiMsg::Agent(PiMsg::AgentError(format!("suspend/resume: {err}"))),
+    move || {
+        PiFtuiMsg::SuspendFinished(
+            perform_terminal_suspend(alt_screen, mouse)
+                .map_err(|error| format!("suspend/resume: {error}")),
+        )
     }
 }
 
@@ -1432,11 +1457,25 @@ struct ExtCustomOverlay {
     source: Option<String>,
     /// The latest frame, sanitized.
     lines: Vec<String>,
-    /// Keys typed since the last poll, as terminal input bytes.
+    /// Key and paste payloads since the last poll, as terminal input bytes.
     keys: std::collections::VecDeque<String>,
     /// Ctrl+C closed it. The next poll tells the component, and frames that
     /// arrive before then do not reopen it.
     closed: bool,
+}
+
+impl ExtCustomOverlay {
+    /// A paste occupies one queue entry, just like an encoded key. Empty
+    /// input must not evict an event the component has yet to read.
+    fn push_input(&mut self, input: String) {
+        if input.is_empty() {
+            return;
+        }
+        if self.keys.len() >= EXT_CUSTOM_MAX_KEYS {
+            let _ = self.keys.pop_front();
+        }
+        self.keys.push_back(input);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2037,10 +2076,9 @@ pub struct PiFtuiModel {
     /// terminal selection, and then the suspend/resume mirror must not turn
     /// tracking back on behind their back (pi_agent_rust#78).
     mouse: bool,
-    /// Set while a ctrl+z suspension is in flight: freezes spinner ticks so
-    /// the pre-stop frames stay byte-identical (the diff engine then emits
-    /// nothing into the restored cooked terminal). Cleared by
-    /// [`PiFtuiMsg::Resumed`].
+    /// Set while a terminal handoff is in flight: freezes ticks and terminal
+    /// input until [`PiFtuiMsg::SuspendFinished`], [`PiFtuiMsg::Resumed`], or
+    /// [`PiFtuiMsg::Edited`] reports that the operation has finished.
     suspending: bool,
     /// Test seam replacing the real SIGTSTP task (which would stop or fail
     /// on a headless test host). `None` in production.
@@ -5725,6 +5763,12 @@ impl PiFtuiModel {
 
     #[allow(clippy::too_many_lines)]
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
+        // The shell owns terminal input between release and completion.
+        // Buffered keys must not edit, submit, quit, or scroll the TUI while
+        // its suspend task is handing off the terminal.
+        if self.suspending && matches!(event, Event::Key(_) | Event::Paste(_) | Event::Mouse(_)) {
+            return Cmd::none();
+        }
         match event {
             Event::Tick => {
                 // While a ctrl+z stop is in flight the model must not
@@ -5771,10 +5815,7 @@ impl PiFtuiModel {
                     if ctrl_c {
                         overlay.closed = true;
                     } else if let Some(encoded) = encode_custom_ui_key(key) {
-                        if overlay.keys.len() >= EXT_CUSTOM_MAX_KEYS {
-                            overlay.keys.pop_front();
-                        }
-                        overlay.keys.push_back(encoded);
+                        overlay.push_input(encoded);
                     }
                     return Cmd::none();
                 }
@@ -6236,9 +6277,9 @@ impl PiFtuiModel {
                 }
                 self.term = (*width, *height);
                 self.term_size_known = true;
-                // The suspend task reports back through a Resize; the flag
-                // unfreezes tick-driven model changes from here on.
-                self.suspending = false;
+                // A resize may arrive while the suspend worker still owns
+                // the terminal. Only its completion message can unfreeze
+                // input; geometry may be updated in the meantime.
                 // Re-clamp: a taller window may make the old offset overshoot.
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
@@ -6247,6 +6288,14 @@ impl PiFtuiModel {
             Event::Paste(paste) if self.picker.is_some() => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.push_query_str(&paste.text);
+                }
+            }
+            Event::Paste(paste) if self.custom_overlay_open() => {
+                // The bridge passes each string to component.handleInput.
+                // Keep the payload intact, without applying composer CR
+                // normalization or replaying embedded controls as app keys.
+                if let Some(overlay) = self.ext_custom.as_mut() {
+                    overlay.push_input(paste.text.clone());
                 }
             }
             Event::Paste(_) if self.settings_pending => {}
@@ -6651,7 +6700,9 @@ impl Model for PiFtuiModel {
             PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage(_) => {
                 LoopPhase::Input
             }
-            PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed => LoopPhase::AgentEvent,
+            PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed | PiFtuiMsg::SuspendFinished(_) => {
+                LoopPhase::AgentEvent
+            }
         };
         // Reconcile only events that can edit the draft. Streaming output,
         // ticks, and resize events must not repeatedly scan recalled text.
@@ -6673,7 +6724,8 @@ impl Model for PiFtuiModel {
                 width,
                 height,
             } => {
-                // The resize path repaints and clears `suspending`.
+                // The external editor has returned terminal ownership.
+                self.suspending = false;
                 let cmd = self.handle_term(&Event::Resize { width, height });
                 match text {
                     Ok(text) => {
@@ -6696,6 +6748,17 @@ impl Model for PiFtuiModel {
                 self.input.reset_mouse_interaction();
                 self.suspending = false;
                 Cmd::none()
+            }
+            PiFtuiMsg::SuspendFinished(result) => {
+                self.input.reset_mouse_interaction();
+                self.suspending = false;
+                match result {
+                    Ok((width, height)) => self.handle_term(&Event::Resize { width, height }),
+                    Err(error) => {
+                        self.error_banner = Some(sanitize(&error).into_owned());
+                        Cmd::none()
+                    }
+                }
             }
         };
         if reconcile_history {
@@ -12183,6 +12246,247 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn suspend_reacquires_terminal_after_every_operation_failure() {
+        for (fail_release, fail_stop, fail_restore) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = suspend_terminal_with(
+                || {
+                    calls.borrow_mut().push("release");
+                    if fail_release {
+                        Err(std::io::Error::other("release failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("stop");
+                    if fail_stop {
+                        Err(std::io::Error::other("stop failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("reacquire");
+                    if fail_restore {
+                        Err(std::io::Error::other("reacquire failed"))
+                    } else {
+                        Ok((100, 30))
+                    }
+                },
+            );
+            let expected = if fail_release {
+                &["release", "reacquire"][..]
+            } else {
+                &["release", "stop", "reacquire"][..]
+            };
+            assert_eq!(calls.borrow().as_slice(), expected);
+            if fail_release || fail_stop || fail_restore {
+                let error = result.expect_err("injected failure").to_string();
+                if fail_release {
+                    assert!(error.contains("release failed"), "{error}");
+                }
+                if fail_stop {
+                    assert!(error.contains("stop failed"), "{error}");
+                }
+                if fail_restore {
+                    assert!(error.contains("reacquire failed"), "{error}");
+                }
+            } else {
+                assert_eq!(result.expect("terminal recovered"), (100, 30));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_suspend_returns_a_local_terminal_completion() {
+        let (_tx, model) = new_model();
+        let model = model
+            .with_keybindings(keybindings_from_json(r#"{"suspend": ["f6"]}"#))
+            .with_suspend_task(|| PiFtuiMsg::SuspendFinished(Ok((100, 30))));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "keep this draft");
+        sim.inject_event(key(KeyCode::Char('z'), Modifiers::CTRL));
+        assert!(
+            !sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Task)),
+            "the removed default cannot suspend"
+        );
+        sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
+        assert!(
+            sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Task))
+        );
+        assert!(!sim.model().suspending);
+        assert_eq!(sim.model().term, (100, 30));
+        assert_eq!(sim.model().input.text(), "keep this draft");
+        assert!(sim.model().error_banner.is_none());
+    }
+
+    #[test]
+    fn suspended_input_stays_frozen_across_resize_until_completion() {
+        let (_tx, mut model) = new_model();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        model.input.set_text("first\nsecond");
+        model.input.insert_text("!");
+        model.input.select_all();
+        for index in 0..40 {
+            model.push_entry(EntryRole::System, format!("transcript line {index}"));
+        }
+        model.scroll_from_tail = 3;
+        let model = model
+            .with_alt_screen(true)
+            .with_submit_channel(submit_tx)
+            .with_suspend_task(|| panic!("frozen input must not launch a terminal task"));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let text = sim.model().input.text();
+        let cursor = sim.model().input.cursor();
+        let selection = sim.model().input.selection();
+        let undo = sim.model().input.undo_op_count();
+        let transcript: Vec<String> = sim
+            .model()
+            .transcript
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect();
+        sim.model_mut().suspending = true;
+        sim.send(PiFtuiMsg::Agent(PiMsg::RestorePendingInput {
+            owner_session_id: String::from("current"),
+            text: String::from("returned"),
+        }));
+        sim.inject_event(Event::Resize {
+            width: 100,
+            height: 30,
+        });
+        assert!(sim.model().suspending, "resize is not terminal completion");
+        assert_eq!(sim.model().pending_input_restores.len(), 1);
+        // Resize may clamp transcript scrolling; take its resulting value.
+        let scroll = sim.model().scroll_from_tail;
+        assert!(scroll > 0 && scroll < sim.model().max_scroll_from_tail());
+        for event in [
+            key(KeyCode::Char('x'), Modifiers::empty()),
+            key(KeyCode::Enter, Modifiers::empty()),
+            key(KeyCode::Char('c'), Modifiers::CTRL),
+            key(KeyCode::Char('c'), Modifiers::CTRL),
+            key(KeyCode::Char('z'), Modifiers::CTRL),
+            key(KeyCode::Char('g'), Modifiers::CTRL),
+            Event::Paste(ftui::PasteEvent::new("pasted\r\ntext", true)),
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 28),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4, 28),
+            mouse(MouseEventKind::Up(MouseButton::Left), 4, 28),
+            mouse(MouseEventKind::ScrollUp, 1, 28),
+            mouse(MouseEventKind::ScrollDown, 1, 28),
+        ] {
+            sim.inject_event(event);
+            assert_eq!(sim.model().scroll_from_tail, scroll);
+        }
+        assert_eq!(sim.model().input.text(), text);
+        assert_eq!(sim.model().input.cursor(), cursor);
+        assert_eq!(sim.model().input.selection(), selection);
+        assert_eq!(sim.model().input.undo_op_count(), undo);
+        assert_eq!(sim.model().scroll_from_tail, scroll);
+        assert_eq!(
+            sim.model()
+                .transcript
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect::<Vec<_>>(),
+            transcript
+        );
+        assert!(sim.model().error_banner.is_none());
+        assert!(submit_rx.try_recv().is_err(), "nothing was submitted");
+        assert!(
+            !sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Quit | CmdRecord::Task))
+        );
+
+        sim.send(PiFtuiMsg::SuspendFinished(Ok((100, 30))));
+        assert!(!sim.model().suspending);
+        assert!(sim.model().pending_input_restores.is_empty());
+        assert_eq!(sim.model().input.text(), format!("returned\n\n{text}"));
+        type_str(&mut sim, "X");
+        assert_eq!(sim.model().input.text(), format!("returned\n\n{text}X"));
+    }
+
+    #[test]
+    fn suspend_failure_preserves_working_turn_and_pending_questions() {
+        for extension in [false, true] {
+            let (_tx, mut model) = new_model();
+            let (ask_tx, ask_rx) = mpsc::channel();
+            let (ext_tx, ext_rx) = mpsc::channel();
+            model.input.set_text("saved prompt");
+            let model = model
+                .with_alt_screen(true)
+                .with_ask_reply_channel(ask_tx)
+                .with_ext_reply_channel(ext_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+            if extension {
+                sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "active-question",
+                    "input",
+                    serde_json::json!({"title": "Reply"}),
+                ))));
+            } else {
+                sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                    "active-question",
+                    vec![question("Continue?", &["yes", "no"], false)],
+                ))));
+            }
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                "queued-question",
+                "input",
+                serde_json::json!({"title": "Next reply"}),
+            ))));
+            type_str(&mut sim, "partial answer");
+            let cursor = sim.model().input.cursor();
+            let undo = sim.model().input.undo_op_count();
+            sim.model_mut().suspending = true;
+            sim.send(PiFtuiMsg::SuspendFinished(Err(String::from(
+                "suspend/resume: terminal unavailable",
+            ))));
+            assert!(!sim.model().suspending);
+            assert_eq!(sim.model().state, AgentUiState::Working);
+            assert_eq!(sim.model().active_ext.is_some(), extension);
+            assert_eq!(sim.model().active_ask.is_some(), !extension);
+            assert_eq!(sim.model().ext_queue.len(), 1);
+            assert_eq!(
+                sim.model().card_draft_snapshot.as_deref(),
+                Some("saved prompt")
+            );
+            assert_eq!(sim.model().input.text(), "partial answer");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.undo_op_count(), undo);
+            assert!(ask_rx.try_recv().is_err());
+            assert!(ext_rx.try_recv().is_err());
+            assert_eq!(
+                sim.model().error_banner.as_deref(),
+                Some("suspend/resume: terminal unavailable")
+            );
+            let _ = frame_with_cursor(sim.model(), 30, 12);
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 10));
+            sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 0, 10));
+            type_str(&mut sim, "X");
+            assert_eq!(sim.model().input.text(), "Xpartial answer");
+        }
+    }
+
     /// ctrl+g hands the draft to the external-editor task (faked here: the
     /// real one takes over the terminal) and the saved text replaces the
     /// draft, minus the editor's trailing newline.
@@ -12269,7 +12573,7 @@ mod tests {
     }
 
     #[test]
-    fn suspend_freeze_gates_ticks_until_resize_clears_it() {
+    fn suspend_freeze_gates_ticks_until_explicit_completion() {
         let (_tx, mut model) = new_model();
         model.state = AgentUiState::Working;
         model.suspending = true;
@@ -12283,14 +12587,17 @@ mod tests {
         sim.send(PiFtuiMsg::Term(Event::Tick));
         assert_eq!(sim.model().spinner.current_frame, before);
 
-        // The suspend task reports back through a Resize after SIGCONT:
-        // unfreezes ticks and adopts the post-resume size.
+        // A queued resize can arrive before terminal reacquisition finishes.
         sim.send(PiFtuiMsg::Term(Event::Resize {
             width: 100,
             height: 30,
         }));
-        assert!(!sim.model().suspending);
+        assert!(sim.model().suspending);
         assert_eq!(sim.model().term, (100, 30));
+        sim.send(PiFtuiMsg::Term(Event::Tick));
+        assert_eq!(sim.model().spinner.current_frame, before);
+        sim.send(PiFtuiMsg::SuspendFinished(Ok((100, 30))));
+        assert!(!sim.model().suspending);
 
         let before = sim.model().spinner.current_frame;
         sim.send(PiFtuiMsg::Term(Event::Tick));
@@ -16516,6 +16823,162 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
         assert!(sim.model().ext_custom.is_none());
+    }
+
+    #[test]
+    fn custom_paste_is_atomic_and_preserves_the_selected_recalled_draft() {
+        for bracketed in [false, true] {
+            let (_tx, mut model) = new_model();
+            let (ext_tx, ext_rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.record_history("saved\nprompt");
+            model.history_back();
+            model.input.select_all();
+            let model = model
+                .with_ext_reply_channel(ext_tx)
+                .with_submit_channel(submit_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            send_ui_effect(
+                &mut sim,
+                "setWidget",
+                serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "lines": ["custom input"]}),
+            );
+            let cursor = sim.model().input.cursor();
+            let selection = sim.model().input.selection();
+            let undo = sim.model().input.undo_op_count();
+            let pasted = "line one\r\n界\tline two\u{3}\n";
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new(pasted, bracketed)));
+            assert_eq!(sim.model().input.text(), "saved\nprompt");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.selection(), selection);
+            assert_eq!(sim.model().input.undo_op_count(), undo);
+            assert_eq!(sim.model().history_cursor, Some(0));
+            assert!(submit_rx.try_recv().is_err());
+            assert!(!sim.model().ext_custom.as_ref().expect("component").closed);
+            for expected in [Some(serde_json::json!(pasted)), None] {
+                sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "paste-poll",
+                    "custom",
+                    serde_json::json!({"mode": "poll"}),
+                ))));
+                let reply = ext_rx
+                    .try_recv()
+                    .expect("poll response")
+                    .value
+                    .expect("value");
+                assert_eq!(reply.get("key"), expected.as_ref());
+                assert!(reply.get("closed").is_none());
+            }
+            send_ui_effect(
+                &mut sim,
+                "setWidget",
+                serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "clear": true}),
+            );
+            assert_eq!(sim.model().input.text(), "saved\nprompt");
+            type_str(&mut sim, "X");
+            assert_eq!(sim.model().input.text(), "X", "selection was retained");
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), "saved\nprompt");
+        }
+    }
+
+    #[test]
+    fn custom_paste_respects_queue_capacity_without_splitting_or_empty_eviction() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "lines": ["custom input"]}),
+        );
+        sim.model_mut()
+            .ext_custom
+            .as_mut()
+            .expect("component")
+            .keys
+            .extend((0..EXT_CUSTOM_MAX_KEYS).map(|index| format!("key-{index}")));
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new("", true)));
+        let overlay = sim.model().ext_custom.as_ref().expect("component");
+        assert_eq!(overlay.keys.len(), EXT_CUSTOM_MAX_KEYS);
+        assert_eq!(overlay.keys.front().map(String::as_str), Some("key-0"));
+        let pasted = "first\r\nsecond\u{3}";
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new(pasted, true)));
+        let overlay = sim.model().ext_custom.as_ref().expect("component");
+        assert_eq!(overlay.keys.len(), EXT_CUSTOM_MAX_KEYS);
+        assert_eq!(overlay.keys.front().map(String::as_str), Some("key-1"));
+        assert_eq!(overlay.keys.back().map(String::as_str), Some(pasted));
+        assert!(!overlay.closed);
+        assert!(sim.model().input.is_empty());
+    }
+
+    #[test]
+    fn picker_and_question_pastes_keep_precedence_over_a_custom_component() {
+        for owner in ["picker", "ask", "extension"] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text("saved\nprompt");
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            send_ui_effect(
+                &mut sim,
+                "setWidget",
+                serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "lines": ["custom input"]}),
+            );
+            match owner {
+                "picker" => sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+                    fork: false,
+                    messages: vec![(String::from("choice"), String::from("entry"))],
+                })),
+                "ask" => sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                    "paste-question",
+                    vec![question("Choose?", &["A", "B"], false)],
+                )))),
+                _ => sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "paste-question",
+                    "input",
+                    serde_json::json!({"title": "Reply"}),
+                )))),
+            }
+            assert!(!sim.model().custom_overlay_open());
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new("choice\r\nnext", true)));
+            assert!(
+                sim.model()
+                    .ext_custom
+                    .as_ref()
+                    .expect("component")
+                    .keys
+                    .is_empty()
+            );
+            if owner == "picker" {
+                assert_eq!(
+                    sim.model().picker.as_ref().expect("picker").query,
+                    "choicenext"
+                );
+                assert_eq!(sim.model().input.text(), "saved\nprompt");
+            } else {
+                assert_eq!(sim.model().input.text(), "choice\nnext");
+                assert_eq!(
+                    sim.model().card_draft_snapshot.as_deref(),
+                    Some("saved\nprompt")
+                );
+            }
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "saved\nprompt");
+            assert!(sim.model().custom_overlay_open());
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new("back to component", true)));
+            assert_eq!(
+                sim.model()
+                    .ext_custom
+                    .as_ref()
+                    .expect("component")
+                    .keys
+                    .front()
+                    .map(String::as_str),
+                Some("back to component")
+            );
+            assert_eq!(sim.model().input.text(), "saved\nprompt");
+        }
     }
 
     #[test]
