@@ -10,11 +10,14 @@
 //! this file. Published archive SHA-256:
 //! `7ba05f7d99b86ad2a58752f4ad7393baf3785b488d8df51952dd21b64f57d706`.
 //!
-//! The editor, event handling, selection, undo, and word/grapheme segmentation
+//! The buffer, selection, undo, and word/grapheme segmentation
 //! remain FrankenTUI's implementation. Pi adds visual row measurement,
 //! reconciles the viewport after growth, deletion, or reflow, and gives a
 //! full-width insertion caret a continuation row. Cursor movement and clicks
 //! share those wrapped-row boundaries (issue #276).
+//! Mouse gestures are cancelled on draft replacement, focus or input
+//! ownership loss, and rendered geometry changes, so stale presses cannot
+//! select another draft.
 //! Keeping this component in the source package also delivers the fix to
 //! `cargo install`; Cargo discards registry patches when publishing a crate.
 //!
@@ -184,10 +187,12 @@ pub struct TextArea {
     undo_clock: Instant,
     /// Area of the last render, for mapping mouse positions to text.
     last_area: std::cell::Cell<Rect>,
+    /// Whether the last rendered area still belongs to this input flow.
+    mouse_area_valid: std::cell::Cell<bool>,
     /// The previous left press, for double and triple clicks.
-    last_click: Option<LastClick>,
+    last_click: std::cell::Cell<Option<LastClick>>,
     /// A left press inside the area started a drag selection.
-    mouse_selecting: bool,
+    mouse_selecting: std::cell::Cell<bool>,
 }
 
 /// A left press, remembered to count multi-clicks.
@@ -221,6 +226,7 @@ impl std::fmt::Debug for TextArea {
             .field("highlighter", &self.highlighter.as_ref().map(|_| "<fn>"))
             .field("undo_clock", &self.undo_clock)
             .field("last_area", &self.last_area)
+            .field("mouse_area_valid", &self.mouse_area_valid)
             .field("last_click", &self.last_click)
             .field("mouse_selecting", &self.mouse_selecting)
             .finish()
@@ -304,8 +310,9 @@ impl TextArea {
             highlighter: None,
             undo_clock: Instant::now(),
             last_area: std::cell::Cell::new(Rect::default()),
-            last_click: None,
-            mouse_selecting: false,
+            mouse_area_valid: std::cell::Cell::new(false),
+            last_click: std::cell::Cell::new(None),
+            mouse_selecting: std::cell::Cell::new(false),
         }
     }
 
@@ -335,6 +342,7 @@ impl TextArea {
                 true
             }
             Event::Focus(false) => {
+                self.reset_mouse_interaction();
                 self.editor.break_undo_group();
                 false
             }
@@ -351,16 +359,20 @@ impl TextArea {
     /// the area last rendered are ignored, and so is a drag that started
     /// outside it, so a host can forward every mouse event.
     fn handle_mouse(&mut self, mouse: &MouseEvent, now_ms: u64) -> bool {
+        if !self.mouse_area_valid.get() {
+            return false;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(pos) = self.position_at(mouse.x, mouse.y) else {
-                    self.mouse_selecting = false;
+                    self.mouse_selecting.set(false);
+                    self.last_click.set(None);
                     return false;
                 };
                 let config = GestureConfig::default();
                 let window =
                     u64::try_from(config.multi_click_timeout.as_millis()).unwrap_or(u64::MAX);
-                let count = match self.last_click {
+                let count = match self.last_click.get() {
                     Some(last)
                         if now_ms >= last.at_ms
                             && now_ms - last.at_ms <= window
@@ -371,13 +383,13 @@ impl TextArea {
                     }
                     _ => 1,
                 };
-                self.last_click = Some(LastClick {
+                self.last_click.set(Some(LastClick {
                     at_ms: now_ms,
                     x: mouse.x,
                     y: mouse.y,
                     count,
-                });
-                self.mouse_selecting = count == 1;
+                }));
+                self.mouse_selecting.set(count == 1);
                 match count {
                     1 => self.editor.set_cursor(pos),
                     2 => self.select_word_at(pos),
@@ -385,7 +397,7 @@ impl TextArea {
                 }
                 true
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.mouse_selecting => {
+            MouseEventKind::Drag(MouseButton::Left) if self.mouse_selecting.get() => {
                 let area = self.last_area.get();
                 if area.is_empty() {
                     return false;
@@ -397,7 +409,7 @@ impl TextArea {
                 true
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.mouse_selecting = false;
+                self.mouse_selecting.set(false);
                 false
             }
             _ => false,
@@ -643,6 +655,7 @@ impl TextArea {
     /// Set initial text content (builder).
     #[must_use]
     pub fn with_text(mut self, text: &str) -> Self {
+        self.reset_mouse_interaction();
         self.editor = Editor::with_text(text);
         self.editor.move_to_document_start();
         self
@@ -759,6 +772,7 @@ impl TextArea {
 
     /// Set the full text content (resets cursor and undo history).
     pub fn set_text(&mut self, text: &str) {
+        self.reset_mouse_interaction();
         self.editor.set_text(text);
         self.scroll_anchor.set((0, 0));
         self.scroll_left.set(0);
@@ -820,6 +834,15 @@ impl TextArea {
         (width > 0).then_some(width)
     }
 
+    /// Cancel an in-flight drag and multi-click sequence when the host hides
+    /// or replaces this editor. Mouse input waits for its next nonempty
+    /// render; text, selection, undo, and the known layout width are retained.
+    pub fn reset_mouse_interaction(&self) {
+        self.mouse_selecting.set(false);
+        self.last_click.set(None);
+        self.mouse_area_valid.set(false);
+    }
+
     /// Current cursor position.
     #[inline]
     #[must_use]
@@ -861,6 +884,7 @@ impl TextArea {
     /// Set focus state.
     pub fn set_focused(&mut self, focused: bool) {
         if !focused {
+            self.reset_mouse_interaction();
             self.editor.break_undo_group();
         }
         self.focused = focused;
@@ -1893,7 +1917,14 @@ impl Widget for TextArea {
     #[allow(clippy::too_many_lines)]
     fn render(&self, area: Rect, frame: &mut Frame) {
         if area.width < 1 || area.height < 1 {
+            self.reset_mouse_interaction();
             return;
+        }
+
+        if self.last_area.get() != area {
+            // A press in the old rectangle cannot start a selection in the
+            // relocated or resized editor. Unchanged frames keep the gesture.
+            self.reset_mouse_interaction();
         }
 
         if frame.a11y_enabled() {
@@ -1902,6 +1933,7 @@ impl Widget for TextArea {
 
         self.last_viewport_height.set(usize::from(area.height));
         self.last_area.set(area);
+        self.mouse_area_valid.set(true);
 
         let deg = frame.buffer.degradation;
         let base_style = if deg.apply_styling() {
@@ -2306,6 +2338,7 @@ mod tests {
             let mut ta = TextArea::new().with_text("hello brave world");
             rendered(&ta, AREA);
             press(&mut ta, AREA.x + 8, AREA.y, 0);
+            rendered(&ta, AREA);
             press(&mut ta, AREA.x + 8, AREA.y, 200);
             assert_eq!(ta.selected_text().as_deref(), Some("brave"));
         }
@@ -2316,6 +2349,7 @@ mod tests {
             rendered(&ta, AREA);
             for at in [0, 150, 300] {
                 press(&mut ta, AREA.x + 3, AREA.y + 1, at);
+                rendered(&ta, AREA);
             }
             assert_eq!(ta.selected_text().as_deref(), Some("hello brave world"));
         }
@@ -2338,6 +2372,7 @@ mod tests {
             rendered(&ta, AREA);
             let down = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), AREA.x + 6, AREA.y);
             ta.handle_event_at(&Event::Mouse(down), 0);
+            rendered(&ta, AREA);
             let drag = MouseEvent::new(
                 MouseEventKind::Drag(MouseButton::Left),
                 AREA.x + 2,
@@ -2345,6 +2380,188 @@ mod tests {
             );
             assert!(ta.handle_event_at(&Event::Mouse(drag), 10));
             assert_eq!(ta.selected_text().as_deref(), Some("brave world\nne"));
+        }
+
+        #[test]
+        fn mouse_reset_preserves_editor_state_and_waits_for_render() {
+            let mut ta = TextArea::new().with_text("hello world\nnext");
+            ta.move_to_document_end();
+            ta.insert_text("!");
+            rendered(&ta, AREA);
+            let down = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), AREA.x + 1, AREA.y);
+            let drag = MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), AREA.x + 5, AREA.y);
+            ta.handle_event_at(&Event::Mouse(down), 0);
+            ta.handle_event_at(&Event::Mouse(drag), 10);
+            assert_eq!(ta.selected_text().as_deref(), Some("ello"));
+            let cursor = ta.cursor();
+            let selection = ta.selection();
+            let history = (
+                ta.undo_group_count(),
+                ta.undo_op_count(),
+                ta.redo_group_count(),
+            );
+            assert!(history.0 > 0);
+
+            ta.reset_mouse_interaction();
+            assert_eq!(ta.rendered_width(), Some(AREA.width));
+            assert!(!ta.handle_event_at(&Event::Mouse(drag), 20));
+            assert!(!ta.handle_event_at(&Event::Mouse(down), 30));
+            assert_eq!(ta.text(), "hello world\nnext!");
+            assert_eq!(ta.cursor(), cursor);
+            assert_eq!(ta.selection(), selection);
+            assert_eq!(
+                (
+                    ta.undo_group_count(),
+                    ta.undo_op_count(),
+                    ta.redo_group_count(),
+                ),
+                history
+            );
+
+            rendered(&ta, AREA);
+            assert!(!ta.handle_event_at(&Event::Mouse(drag), 40));
+            assert!(press(&mut ta, down.x, down.y, 100));
+            assert_eq!(ta.selection(), None, "the old click sequence was cancelled");
+            assert_eq!(ta.cursor().grapheme, 1);
+            ta.undo();
+            assert_eq!(ta.text(), "hello world\nnext");
+            ta.redo();
+            assert_eq!(ta.text(), "hello world\nnext!");
+        }
+
+        #[test]
+        fn replacing_text_cancels_mouse_and_keeps_cursor_contracts() {
+            for builder in [false, true] {
+                let mut ta = TextArea::new().with_text("hello world");
+                rendered(&ta, AREA);
+                let down =
+                    MouseEvent::new(MouseEventKind::Down(MouseButton::Left), AREA.x + 1, AREA.y);
+                let drag =
+                    MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), AREA.x + 3, AREA.y);
+                ta.handle_event_at(&Event::Mouse(down), 0);
+                if builder {
+                    ta = ta.with_text("new\ntext");
+                } else {
+                    ta.set_text("new\ntext");
+                }
+                let expected = if builder { (0, 0) } else { (1, 4) };
+                assert_eq!((ta.cursor().line, ta.cursor().grapheme), expected);
+                assert_eq!(ta.rendered_width(), Some(AREA.width));
+                assert!(!ta.handle_event_at(&Event::Mouse(down), 20));
+                assert!(!ta.handle_event_at(&Event::Mouse(drag), 30));
+                assert_eq!((ta.cursor().line, ta.cursor().grapheme), expected);
+
+                rendered(&ta, AREA);
+                assert!(!ta.handle_event_at(&Event::Mouse(drag), 40));
+                assert!(press(&mut ta, down.x, down.y, 100));
+                assert_eq!(ta.selection(), None, "builder={builder}");
+                assert_eq!((ta.cursor().line, ta.cursor().grapheme), (0, 1));
+                assert_eq!(ta.text(), "new\ntext");
+            }
+        }
+
+        #[test]
+        fn focus_loss_cancels_mouse_without_clearing_selection() {
+            for focus_event in [false, true] {
+                let mut ta = TextArea::new().with_text("hello world").with_focus(true);
+                rendered(&ta, AREA);
+                let down =
+                    MouseEvent::new(MouseEventKind::Down(MouseButton::Left), AREA.x + 1, AREA.y);
+                let drag =
+                    MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), AREA.x + 5, AREA.y);
+                ta.handle_event_at(&Event::Mouse(down), 0);
+                ta.handle_event_at(&Event::Mouse(drag), 10);
+                let cursor = ta.cursor();
+                let selection = ta.selection();
+                if focus_event {
+                    ta.handle_event_at(&Event::Focus(false), 20);
+                } else {
+                    ta.set_focused(false);
+                }
+                assert!(!ta.handle_event_at(&Event::Mouse(down), 30));
+                assert!(!ta.handle_event_at(&Event::Mouse(drag), 40));
+                assert_eq!(ta.cursor(), cursor);
+                assert_eq!(ta.selection(), selection);
+                assert_eq!(ta.text(), "hello world");
+                assert_eq!(ta.rendered_width(), Some(AREA.width));
+
+                ta.set_focused(true);
+                rendered(&ta, AREA);
+                assert!(!ta.handle_event_at(&Event::Mouse(drag), 50));
+                assert!(press(&mut ta, down.x, down.y, 100));
+                assert_eq!(ta.selection(), None, "focus_event={focus_event}");
+            }
+        }
+
+        #[test]
+        fn empty_render_invalidates_mouse_but_retains_layout_width() {
+            for empty in [
+                Rect::new(AREA.x, AREA.y, 0, AREA.height),
+                Rect::new(AREA.x, AREA.y, AREA.width, 0),
+            ] {
+                let mut ta = TextArea::new().with_text("hello world");
+                rendered(&ta, AREA);
+                let down =
+                    MouseEvent::new(MouseEventKind::Down(MouseButton::Left), AREA.x + 1, AREA.y);
+                let drag =
+                    MouseEvent::new(MouseEventKind::Drag(MouseButton::Left), AREA.x + 5, AREA.y);
+                ta.handle_event_at(&Event::Mouse(down), 0);
+                let cursor = ta.cursor();
+                rendered(&ta, empty);
+                assert_eq!(ta.rendered_width(), Some(AREA.width));
+                assert!(!ta.handle_event_at(&Event::Mouse(drag), 20));
+                assert!(!ta.handle_event_at(&Event::Mouse(down), 30));
+                assert_eq!(ta.cursor(), cursor);
+
+                rendered(&ta, AREA);
+                assert!(!ta.handle_event_at(&Event::Mouse(drag), 40));
+                assert!(press(&mut ta, down.x, down.y, 100));
+                assert_eq!(ta.selection(), None, "empty={empty:?}");
+                assert_eq!(ta.text(), "hello world");
+            }
+        }
+
+        #[test]
+        fn changed_render_rectangle_cancels_drag_and_click_sequence() {
+            for moved in [
+                Rect::new(AREA.x + 1, AREA.y, AREA.width, AREA.height),
+                Rect::new(AREA.x, AREA.y + 1, AREA.width, AREA.height),
+                Rect::new(AREA.x, AREA.y, AREA.width - 1, AREA.height),
+                Rect::new(AREA.x, AREA.y, AREA.width, AREA.height - 1),
+            ] {
+                let mut ta = TextArea::new().with_text("hello world\nnext line");
+                rendered(&ta, AREA);
+                let down = MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    AREA.x + 2,
+                    AREA.y + 1,
+                );
+                ta.handle_event_at(&Event::Mouse(down), 0);
+                let cursor = ta.cursor();
+                rendered(&ta, moved);
+                assert_eq!(ta.rendered_width(), Some(moved.width));
+                let drag = MouseEvent::new(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    moved.x + 5,
+                    moved.y,
+                );
+                assert!(!ta.handle_event_at(&Event::Mouse(drag), 50));
+                assert_eq!(ta.cursor(), cursor);
+                assert!(press(&mut ta, down.x, down.y, 100));
+                assert_eq!(ta.selection(), None, "moved={moved:?}");
+                assert_eq!(ta.text(), "hello world\nnext line");
+            }
+        }
+
+        #[test]
+        fn outside_press_breaks_click_sequence_without_invalidating_area() {
+            let mut ta = TextArea::new().with_text("hello world");
+            rendered(&ta, AREA);
+            assert!(press(&mut ta, AREA.x + 2, AREA.y, 0));
+            assert!(!press(&mut ta, AREA.x - 1, AREA.y, 50));
+            assert!(press(&mut ta, AREA.x + 2, AREA.y, 100));
+            assert_eq!(ta.selection(), None);
+            assert_eq!(ta.cursor().grapheme, 2);
         }
 
         #[test]
