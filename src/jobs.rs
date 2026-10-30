@@ -2338,6 +2338,37 @@ impl Drop for JobPumpThreadTestGuard {
     }
 }
 
+/// Output-state contention must not turn a nonblocking pipe reader into an
+/// uncancellable worker. The monitor can seal output without acquiring these
+/// mutexes, so observe that fence while waiting and again after acquisition.
+fn lock_job_output_state<'a, T>(
+    state: &'a Mutex<T>,
+    output_sealed: &AtomicBool,
+    state_name: &str,
+) -> std::io::Result<Option<std::sync::MutexGuard<'a, T>>> {
+    loop {
+        if output_sealed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match state.try_lock() {
+            Ok(guard) => {
+                if output_sealed.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                return Ok(Some(guard));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other(format!(
+                    "job {state_name} state poisoned"
+                )));
+            }
+        }
+    }
+}
+
 fn pump_job_stream<R: Read>(
     mut reader: R,
     artifact: &Mutex<ArtifactSink>,
@@ -2372,12 +2403,20 @@ fn pump_job_stream<R: Read>(
                     return Ok(());
                 }
                 let data = &chunk[..n];
-                artifact
-                    .lock()
-                    .map_err(|_| std::io::Error::other("job artifact state poisoned"))?
-                    .write(data);
-                if let Ok(mut tail) = tail.lock() {
-                    tail.push(data);
+                {
+                    let Some(mut artifact) =
+                        lock_job_output_state(artifact, output_sealed, "artifact")?
+                    else {
+                        return Ok(());
+                    };
+                    artifact.write(data);
+                }
+                match lock_job_output_state(tail, output_sealed, "tail") {
+                    Ok(Some(mut tail)) => tail.push(data),
+                    Ok(None) => return Ok(()),
+                    // A poisoned tail remains best-effort; artifact failures
+                    // retain their existing error path above.
+                    Err(_) => {}
                 }
             }
         }
@@ -3921,6 +3960,70 @@ mod tests {
 
         sink.seal();
         assert!(sink.file.is_none(), "settlement must close the artifact fd");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // Keep contention through cancellation.
+    fn sealed_pump_joins_while_output_tail_remains_locked() {
+        const OUTPUT: &[u8] = b"buffered output before cancellation";
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("contended-pump.log");
+        let file = std::fs::File::create(&path).expect("pump artifact");
+        let artifact = Arc::new(Mutex::new(ArtifactSink::new(file, 64)));
+        let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let tail_guard = tail.lock().expect("hold output tail");
+        let pump_artifact = Arc::clone(&artifact);
+        let pump_tail = Arc::clone(&tail);
+        let pump_sealed = Arc::clone(&sealed);
+        let mut pump = Some(std::thread::spawn(move || {
+            pump_job_stream(
+                std::io::Cursor::new(OUTPUT),
+                &pump_artifact,
+                &pump_tail,
+                &pump_sealed,
+            )
+        }));
+
+        // Artifact publication proves the real pump passed its post-read seal
+        // check. It must now acquire the tail mutex before it can observe EOF;
+        // sealing before the read would not exercise the original deadlock.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let artifact_written = loop {
+            if artifact
+                .try_lock()
+                .is_ok_and(|sink| sink.bytes_written == OUTPUT.len())
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        sealed.store(true, Ordering::Release);
+        let joined_while_locked = finish_pump(&mut pump, Instant::now() + Duration::from_secs(2));
+
+        // Always release contention and reap the worker before assertions, so
+        // the old blocking implementation fails without leaking a test thread.
+        drop(tail_guard);
+        let cleaned_up = finish_pump(&mut pump, Instant::now() + Duration::from_secs(2));
+        assert!(
+            artifact_written,
+            "the pump must consume and persist its input"
+        );
+        assert!(cleaned_up, "the pump must stop after test cleanup");
+        assert!(
+            joined_while_locked,
+            "sealing must join the pump without waiting for the output-state mutex"
+        );
+        assert!(pump.is_none());
+        assert!(
+            tail.lock().expect("output tail").text().is_empty(),
+            "a sealed pump must not publish its buffered chunk after contention clears"
+        );
+        assert_eq!(std::fs::read(&path).expect("artifact output"), OUTPUT);
     }
 
     #[cfg(unix)]
