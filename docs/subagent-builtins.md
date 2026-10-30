@@ -238,11 +238,13 @@ their closed handle is evicted. Existing filesystem effects are not rolled back.
   privacy policy and known secrets; completed output is screened before retention
   and notices, and observations are screened again under the caller's current
   policy. A canceled or closing job cannot accept another turn or a late result.
-- `worker_start` accepts `agent`, `task`, `cwd`, `scope`, `timeoutSeconds` and
-  `isolation: "none"`. Follow-ups cannot change frozen launch options. This first
-  worker implementation requires Unix nonblocking pipes and refuses worktree
-  isolation, output schemas, schema-bearing definitions and historical `seance`
-  consultation. Ordinary delegation continues to provide those workflows.
+- `worker_start` accepts `agent`, `task`, `model`, `cwd`, `scope`, `timeoutSeconds`
+  and `isolation: "none"` on Unix and Windows. Follow-ups cannot change frozen
+  launch options. An `outputSchema` or the definition's `output_schema` freezes
+  a strict contract for every turn: answers must be bare JSON that validates,
+  with no corrective retry. `schemaMode`, when supplied, must be `"strict"`.
+  Worktree isolation and historical `seance` consultation remain on the ordinary
+  delegation path.
 
 The native regression suite includes a controlled RPC child that remembers a
 first prompt in its second response while keeping one PID, queued turn ordering,
@@ -435,9 +437,11 @@ runtime's error result rather than a successful aggregate manifest.
   time. The host limit defaults to 900 seconds; `timeoutSeconds` may shorten it.
   Push, finish and observation waits never renew the deadline.
 - Children use the definition, model selection, tools and working directory
-  captured at startup. Pools currently require Unix and `isolation: "none"`.
-  Worktree isolation, output schemas, schema-bearing definitions and historical
-  `seance` consultation remain on the ordinary delegation path.
+  captured at startup. Pools support Unix and Windows with `isolation: "none"`.
+  A launch-time `outputSchema` or schema-bearing definition applies one strict
+  output contract to every member and turn, without corrective retries.
+  Worktree isolation and historical `seance` consultation remain on the ordinary
+  delegation path.
 - Every native operation checks the current owning session and cancellation
   state. An eval request also passes its active Agent's current tool, approval,
   plan and extension policy. Captured IDs grant no permission in another

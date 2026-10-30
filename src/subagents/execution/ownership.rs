@@ -155,7 +155,7 @@ impl HubLease {
     /// A persistent RPC worker owns process control but has no one-shot
     /// revival policy. Replacing it would lose the conversation it promises
     /// to retain, so ordinary native revival must remain unavailable.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn register_worker(&mut self, name: &str, kind: ChildKind) -> Result<ChildEntry> {
         if self.id.is_some() {
             return Err(Error::tool(

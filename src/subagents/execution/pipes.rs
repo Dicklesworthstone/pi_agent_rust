@@ -169,6 +169,11 @@ fn next_pipe_frame<R: Read>(
 }
 
 impl<O: Read, E: Read> ChildPipes<O, E> {
+    #[cfg(windows)]
+    pub(super) fn into_frames(self) -> (FramedPipe<O>, FramedPipe<E>) {
+        (self.stdout, self.stderr)
+    }
+
     pub(super) fn drain(
         &mut self,
         protocol: &mut protocol::ChildProtocol,

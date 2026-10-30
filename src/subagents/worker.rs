@@ -241,10 +241,10 @@ async fn start(
             "schemaMode",
         ],
     )?;
-    if !cfg!(unix) {
+    if !cfg!(any(unix, windows)) {
         return Err(Error::tool(
             "subagent",
-            "PI_SUBAGENT_WORKER_UNSUPPORTED: reusable RPC workers currently require Unix nonblocking pipes",
+            "PI_SUBAGENT_WORKER_UNSUPPORTED: reusable RPC workers require Unix or Windows nonblocking pipes",
         ));
     }
     let task = required_text(&input, "task", MAX_PROMPT_BYTES)?.to_string();

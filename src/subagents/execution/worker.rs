@@ -12,19 +12,18 @@ use crate::subagents::AgentDefinition;
 use crate::subagents::worker::Shared;
 use crate::tools::ToolOutput;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(in crate::subagents) async fn run(
     _runner: ChildRunner,
     _agent: AgentDefinition,
     state: Shared,
 ) -> Result<ToolOutput> {
-    let reason =
-        "PI_SUBAGENT_WORKER_UNSUPPORTED: warm workers require Unix nonblocking process pipes";
+    let reason = "PI_SUBAGENT_WORKER_UNSUPPORTED: warm workers require Unix or Windows nonblocking process pipes";
     crate::subagents::worker::finish(&state, Some(reason));
     Err(Error::tool("subagent", reason))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(in crate::subagents) fn run(
     runner: ChildRunner,
     agent: AgentDefinition,
@@ -48,7 +47,7 @@ pub(in crate::subagents) fn run(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use {
     super::ownership::HubLease,
     super::pipes::FramedPipe,
@@ -60,30 +59,46 @@ use {
     },
     serde_json::{Value, json},
     std::future::Future,
-    std::io::{self, Write},
-    std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
+    std::io,
+    std::process::{Command, Stdio},
     std::time::Duration,
 };
 
 #[cfg(unix)]
-const CANCELLED: &str =
-    "PI_SUBAGENT_WORKER_CANCELLED: worker stopped before completion; prior side effects may remain";
-#[cfg(unix)]
-const INVALID_RPC: &str = "PI_SUBAGENT_WORKER_PROTOCOL: unexpected or malformed RPC frame";
-#[cfg(unix)]
-const COMMAND_LIMIT: usize = 512 * 1024;
-#[cfg(unix)]
-const STDERR_LIMIT: usize = 16 * 1024;
-#[cfg(unix)]
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+use std::io::Write as _;
 
 #[cfg(unix)]
+type WorkerStdin = std::process::ChildStdin;
+#[cfg(unix)]
+type WorkerStdout = std::process::ChildStdout;
+#[cfg(unix)]
+type WorkerStderr = std::process::ChildStderr;
+#[cfg(windows)]
+type WorkerStdin = crate::jobs::windows_job_pipe::Writer;
+#[cfg(windows)]
+type WorkerStdout = super::pipes::WindowsReader;
+#[cfg(windows)]
+type WorkerStderr = super::pipes::WindowsReader;
+
+#[cfg(any(unix, windows))]
+const CANCELLED: &str =
+    "PI_SUBAGENT_WORKER_CANCELLED: worker stopped before completion; prior side effects may remain";
+#[cfg(any(unix, windows))]
+const INVALID_RPC: &str = "PI_SUBAGENT_WORKER_PROTOCOL: unexpected or malformed RPC frame";
+#[cfg(any(unix, windows))]
+const COMMAND_LIMIT: usize = 512 * 1024;
+#[cfg(any(unix, windows))]
+const STDERR_LIMIT: usize = 16 * 1024;
+#[cfg(any(unix, windows))]
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[cfg(any(unix, windows))]
 struct PendingWrite {
     bytes: Vec<u8>,
     offset: usize,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Actor {
     runner: ChildRunner,
     agent: AgentDefinition,
@@ -92,9 +107,9 @@ struct Actor {
     hub: HubLease,
     lifecycle: SubagentResult,
     child: Option<ChildProcessGuard>,
-    stdin: Option<ChildStdin>,
-    stdout: Option<FramedPipe<ChildStdout>>,
-    stderr: Option<FramedPipe<ChildStderr>>,
+    stdin: Option<WorkerStdin>,
+    stdout: Option<FramedPipe<WorkerStdout>>,
+    stderr: Option<FramedPipe<WorkerStderr>>,
     diagnostic: String,
     pending: Option<PendingWrite>,
     request_sequence: u64,
@@ -102,7 +117,7 @@ struct Actor {
     output_contract: Option<crate::subagents::worker::output_contract::OutputContract>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Actor {
     fn new(runner: ChildRunner, agent: AgentDefinition, state: Shared) -> Self {
         let lifecycle = SubagentResult::starting(
@@ -165,6 +180,7 @@ impl Actor {
 
     #[allow(clippy::too_many_lines)] // One ordered launch: hub entry, channel, command, lease.
     fn spawn(&mut self) -> Result<()> {
+        #[cfg(unix)]
         use std::os::unix::process::CommandExt as _;
         self.check()?;
         let capabilities = self.owner.capabilities();
@@ -230,6 +246,19 @@ impl Actor {
             )
             .env("PI_SUBAGENT_STEER_FILE", &entry.steer_path)
             .env("PI_SUBAGENT_RUN_ID", &entry.id);
+        #[cfg(windows)]
+        let (stdin, stdout, stderr) = {
+            // All parent endpoints are nonblocking before the guarded spawn.
+            // The child receives ordinary synchronous standard handles.
+            let (stdin, child_stdin) = crate::jobs::windows_job_pipe::stdin_pair()
+                .map_err(|_| Error::tool("subagent", INVALID_RPC))?;
+            command.stdin(Stdio::from(child_stdin));
+            let (stdout, stderr) = super::pipes::ChildPipes::configure(&mut command)
+                .map_err(|_| Error::tool("subagent", INVALID_RPC))?
+                .into_frames();
+            (stdin, stdout, stderr)
+        };
+        #[cfg(unix)]
         command.process_group(0);
         self.check()?;
         self.child = Some(
@@ -243,6 +272,9 @@ impl Actor {
                 .with_process_lifetime(self.hub.process_lifetime())
                 .with_hub_channel(channel),
         );
+        // On Windows Command retains duplicate child pipe handles until it
+        // drops. Close them now so actor retirement owns the whole transport.
+        drop(command);
         let child = self
             .child
             .as_mut()
@@ -251,39 +283,48 @@ impl Actor {
         if !self.hub.mark_running(child.id(), &mut self.lifecycle) {
             return Err(Error::tool("subagent", CANCELLED));
         }
-        let process = child
-            .child
-            .as_mut()
-            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
-        let stdin = process
-            .stdin
-            .take()
-            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
-        let flags =
-            rustix::fs::fcntl_getfl(&stdin).map_err(|_| Error::tool("subagent", INVALID_RPC))?;
-        rustix::fs::fcntl_setfl(&stdin, flags | rustix::fs::OFlags::NONBLOCK)
-            .map_err(|_| Error::tool("subagent", INVALID_RPC))?;
-        self.stdin = Some(stdin);
-        self.stdout = Some(
-            FramedPipe::new(
-                process
-                    .stdout
-                    .take()
-                    .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?,
-                protocol::MAX_FRAME_BYTES,
-            )
-            .map_err(|_| Error::tool("subagent", INVALID_RPC))?,
-        );
-        self.stderr = Some(
-            FramedPipe::new(
-                process
-                    .stderr
-                    .take()
-                    .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?,
-                protocol::MAX_FRAME_BYTES,
-            )
-            .map_err(|_| Error::tool("subagent", INVALID_RPC))?,
-        );
+        #[cfg(unix)]
+        {
+            let process = child
+                .child
+                .as_mut()
+                .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+            let stdin = process
+                .stdin
+                .take()
+                .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+            let flags = rustix::fs::fcntl_getfl(&stdin)
+                .map_err(|_| Error::tool("subagent", INVALID_RPC))?;
+            rustix::fs::fcntl_setfl(&stdin, flags | rustix::fs::OFlags::NONBLOCK)
+                .map_err(|_| Error::tool("subagent", INVALID_RPC))?;
+            self.stdin = Some(stdin);
+            self.stdout = Some(
+                FramedPipe::new(
+                    process
+                        .stdout
+                        .take()
+                        .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?,
+                    protocol::MAX_FRAME_BYTES,
+                )
+                .map_err(|_| Error::tool("subagent", INVALID_RPC))?,
+            );
+            self.stderr = Some(
+                FramedPipe::new(
+                    process
+                        .stderr
+                        .take()
+                        .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?,
+                    protocol::MAX_FRAME_BYTES,
+                )
+                .map_err(|_| Error::tool("subagent", INVALID_RPC))?,
+            );
+        }
+        #[cfg(windows)]
+        {
+            self.stdin = Some(stdin);
+            self.stdout = Some(stdout);
+            self.stderr = Some(stderr);
+        }
         self.check()
     }
 
@@ -327,7 +368,11 @@ impl Actor {
             .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
         for _ in 0..4 {
             let end = pending.bytes.len().min(pending.offset.saturating_add(8192));
-            match stdin.write(&pending.bytes[pending.offset..end]) {
+            #[cfg(unix)]
+            let written = stdin.write(&pending.bytes[pending.offset..end]);
+            #[cfg(windows)]
+            let written = stdin.try_write(&pending.bytes[pending.offset..end]);
+            match written {
                 Ok(0) => {
                     return Err(Error::tool(
                         "subagent",
@@ -508,7 +553,7 @@ impl Actor {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for Actor {
     fn drop(&mut self) {
         // Descriptor retirement and process-tree reaping precede every
@@ -527,7 +572,7 @@ impl Drop for Actor {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn task(agent: &AgentDefinition, text: String) -> SubagentTask {
     SubagentTask {
         agent: agent.name.clone(),
@@ -545,7 +590,7 @@ fn task(agent: &AgentDefinition, text: String) -> SubagentTask {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn frame(line: &str) -> Result<Value> {
     let event: Value =
         serde_json::from_str(line).map_err(|_| Error::tool("subagent", INVALID_RPC))?;
@@ -555,7 +600,7 @@ fn frame(line: &str) -> Result<Value> {
     Ok(event)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn turn_event(kind: &str) -> bool {
     matches!(
         kind,
@@ -572,7 +617,7 @@ fn turn_event(kind: &str) -> bool {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn idle_event(line: &str) -> Result<()> {
     let event = frame(line)?;
     let kind = event
@@ -585,7 +630,7 @@ fn idle_event(line: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct IdleReply {
     id: String,
     idle: Option<bool>,
@@ -593,7 +638,7 @@ struct IdleReply {
     context_window: Option<u64>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl IdleReply {
     const fn new(id: String) -> Self {
         Self {
@@ -632,7 +677,7 @@ impl IdleReply {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn context_metric(event: &Value, field: &str, allow_zero: bool) -> Result<Option<u64>> {
     match event.get("data").and_then(|data| data.get(field)) {
         None | Some(Value::Null) => Ok(None),
@@ -644,7 +689,7 @@ fn context_metric(event: &Value, field: &str, allow_zero: bool) -> Result<Option
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct TurnReply {
     id: String,
     acknowledged: bool,
@@ -653,7 +698,7 @@ struct TurnReply {
     protocol: protocol::ChildProtocol,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl TurnReply {
     fn new(id: String) -> Self {
         Self {
@@ -1021,5 +1066,410 @@ exec sleep 30
                 .ingest(&unknown.to_string(), true)
                 .is_err()
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::subagents::SubagentTool;
+    use crate::tools::Tool as _;
+    use std::time::Instant;
+
+    fn run_isolated(case: &str) -> bool {
+        const CHILD_CASE: &str = "PI_TEST_WINDOWS_WARM_WORKER_CASE";
+        if std::env::var(CHILD_CASE).as_deref() == Ok(case) {
+            return false;
+        }
+        // A regression that blocks a pipe destructor would also prevent an
+        // in-process timeout or Fixture::drop from running. Keep that failure
+        // inside a child whose complete process tree has an independent owner.
+        let _guard = crate::jobs::process_test_guard();
+        let mut command = Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args([
+                "--exact",
+                &format!("subagents::execution::worker::windows_tests::{case}"),
+                "--nocapture",
+            ])
+            .env(CHILD_CASE, case)
+            .stdin(Stdio::null());
+        let mut child = ChildProcessGuard::spawn(&AgentCx::for_request(), &mut command)
+            .expect("isolated Windows worker regression");
+        drop(command);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().expect("observe worker regression") {
+                assert!(
+                    status.success(),
+                    "Windows worker regression failed: {status}"
+                );
+                return true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Windows worker regression stalled"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        tool: SubagentTool,
+        owner: String,
+    }
+
+    impl Fixture {
+        fn new(script: &str) -> Self {
+            let root = tempfile::tempdir().expect("worker fixture root");
+            let global = root.path().join("global");
+            std::fs::create_dir_all(global.join("agents")).expect("agent directory");
+            std::fs::write(
+                global.join("agents/worker.md"),
+                "---\nname: worker\ndescription: Windows RPC fixture\ntools: []\n---\nRemember previous assignments.\n",
+            )
+            .expect("agent definition");
+            // The real public launch path passes its normal worker arguments.
+            // Keep the definition body on one line for Windows batch argv;
+            // every RPC request still travels through the production actor.
+            let binary = root.path().join("child.bat");
+            std::fs::write(
+                &binary,
+                format!("@echo off\r\n{}\r\n", script.replace('\n', "\r\n")),
+            )
+            .expect("RPC child");
+            let owner = format!("windows-worker-{}", uuid::Uuid::new_v4());
+            let mut tool = SubagentTool::with_paths(root.path().to_path_buf(), global, binary)
+                .with_timeout(Duration::from_secs(15));
+            tool.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(&owner));
+            Self { root, tool, owner }
+        }
+
+        async fn call(&self, input: Value) -> Value {
+            self.tool
+                .execute("windows-worker-fixture", input, None)
+                .await
+                .expect("native retained operation")
+                .details
+                .expect("retained operation details")
+        }
+
+        async fn await_file(&self, name: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.root.path().join(name).exists() {
+                assert!(Instant::now() < deadline, "child did not reach {name}");
+                AgentCx::for_request().time().sleep(POLL_INTERVAL).await;
+            }
+        }
+
+        fn release(&self) {
+            std::fs::write(self.root.path().join("release"), b"continue")
+                .expect("release first turn");
+        }
+
+        fn assert_two_turn_exchange(&self) {
+            let requests = std::fs::read_to_string(self.root.path().join("requests.log"))
+                .expect("recorded RPC requests");
+            let frames: Vec<Value> = requests
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("JSON RPC request"))
+                .collect();
+            let kinds: Vec<_> = frames
+                .iter()
+                .map(|frame| frame["type"].as_str().expect("request type"))
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    "get_state",
+                    "prompt",
+                    "get_state",
+                    "get_state",
+                    "prompt",
+                    "get_state",
+                    "get_state",
+                ]
+            );
+            for (index, frame) in frames.iter().enumerate() {
+                assert_eq!(frame["id"], format!("warm-{}", index + 1));
+            }
+            let launches =
+                std::fs::read_to_string(self.root.path().join("launches")).expect("launch count");
+            assert_eq!(launches.lines().count(), 1);
+            assert!(self.root.path().join("compacting").exists());
+        }
+
+        fn live_child_pids(&self) -> Vec<u32> {
+            let path = self.tool.child_binary.to_string_lossy();
+            let mut system = sysinfo::System::new();
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+            );
+            system
+                .processes()
+                .values()
+                .filter(|process| {
+                    process.parent() == Some(sysinfo::Pid::from_u32(std::process::id()))
+                        && process
+                            .cmd()
+                            .iter()
+                            .any(|argument| argument.to_string_lossy().contains(path.as_ref()))
+                })
+                .map(|process| process.pid().as_u32())
+                .collect()
+        }
+
+        fn running_pid(&self) -> u32 {
+            let pids = self.live_child_pids();
+            assert_eq!(pids.len(), 1, "one live native batch child");
+            pids[0]
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Assertion cleanup must also work if a broken actor gets stuck
+            // dropping a backpressured pipe before reaching its process guard.
+            // Only this fixture's direct child can match its unique batch path.
+            for pid in self.live_child_pids() {
+                crate::tools::kill_process_tree(Some(pid));
+            }
+            if let Ok(runtime) = asupersync::runtime::RuntimeBuilder::current_thread().build() {
+                let _ = runtime.block_on(crate::jobs::kill_session(&self.owner));
+            }
+        }
+    }
+
+    fn field(value: &Value, key: &str) -> String {
+        value[key].as_str().expect("native identity").to_string()
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        let pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).is_some()
+    }
+
+    async fn assert_reaped(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "retained child survived shutdown"
+            );
+            AgentCx::for_request().time().sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    // JSON-only stdout lets the strict production RPC parser reject every
+    // unexpected frame. Read counters validate IDs and command kinds; the
+    // second prompt can succeed only after both post-turn get_state replies.
+    const RPC_CHILD: &str = r#"
+setlocal EnableExtensions EnableDelayedExpansion
+set "sequence=0"
+set "memory="
+>>launches echo started
+:read
+set "line="
+set /p "line="
+if not defined line exit /b 0
+set /a sequence+=1 >nul
+if !sequence! GTR 7 exit /b 20
+>request.json echo(!line!
+>>requests.log echo(!line!
+"%SystemRoot%\System32\findstr.exe" /L /C:"warm-!sequence!" request.json >nul || exit /b 21
+if !sequence! EQU 2 goto remember
+if !sequence! EQU 5 goto recall
+"%SystemRoot%\System32\findstr.exe" /L /C:"get_state" request.json >nul || exit /b 22
+set "compacting=false"
+if !sequence! EQU 3 set "compacting=true"
+if !sequence! EQU 6 set "compacting=true"
+if "!compacting!"=="true" >compacting echo busy
+echo {"type":"response","id":"warm-!sequence!","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":!compacting!,"contextTokens":64,"contextWindow":1000}}
+goto read
+:remember
+"%SystemRoot%\System32\findstr.exe" /L /C:"prompt" request.json >nul || exit /b 23
+"%SystemRoot%\System32\findstr.exe" /L /C:"remember silver" request.json >nul || exit /b 24
+set "memory=silver"
+echo {"type":"response","id":"warm-!sequence!","command":"prompt","success":true}
+echo {"type":"agent_start"}
+>first-running echo ready
+:wait_release
+if exist release goto answer
+"%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul
+goto wait_release
+:recall
+"%SystemRoot%\System32\findstr.exe" /L /C:"prompt" request.json >nul || exit /b 25
+"%SystemRoot%\System32\findstr.exe" /L /C:"recall" request.json >nul || exit /b 26
+echo {"type":"response","id":"warm-!sequence!","command":"prompt","success":true}
+echo {"type":"agent_start"}
+:answer
+echo {"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"!memory!"}]}]}
+goto read
+"#;
+
+    #[test]
+    fn windows_queued_turns_retain_context_and_close_the_idle_process() {
+        if run_isolated("windows_queued_turns_retain_context_and_close_the_idle_process") {
+            return;
+        }
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(RPC_CHILD);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let started = fixture
+                .call(json!({"operation":"worker_start","agent":"worker","task":"remember silver"}))
+                .await;
+            let worker = field(&started, "workerId");
+            fixture.await_file("first-running").await;
+            let queued = fixture
+                .call(json!({"operation":"worker_send","workerId":worker,"task":"recall the remembered word"}))
+                .await;
+            assert_eq!(queued.pointer("/turn/status"), Some(&json!("queued")));
+            fixture.release();
+            let first = fixture
+                .call(json!({"operation":"worker_wait","workerId":worker,"turnId":1,"timeoutMs":5000}))
+                .await;
+            let second = fixture
+                .call(json!({"operation":"worker_wait","workerId":worker,"turnId":2,"timeoutMs":5000}))
+                .await;
+            assert_eq!(first.pointer("/turn/status"), Some(&json!("completed")));
+            assert_eq!(second.pointer("/turn/status"), Some(&json!("completed")));
+            let first = first.pointer("/turn/result/details/results/0").expect("first result");
+            let second_result = second.pointer("/turn/result/details/results/0").expect("second result");
+            assert_eq!(first["pid"], second_result["pid"]);
+            assert_eq!(second_result["output"], "silver");
+            assert_eq!(second["contextTokens"], 64);
+            assert_eq!(second["contextWindow"], 1000);
+            let pid = u32::try_from(second_result["pid"].as_u64().expect("child PID"))
+                .expect("Windows PID");
+            assert!(process_alive(pid), "a completed turn must leave its worker alive");
+            fixture.assert_two_turn_exchange();
+            let closed = fixture
+                .call(json!({"operation":"worker_close","workerId":worker}))
+                .await;
+            assert_eq!(closed["status"], "closed");
+            assert_reaped(pid).await;
+        });
+    }
+
+    #[test]
+    fn windows_pool_drains_reused_members_and_reaps_them_after_finish() {
+        if run_isolated("windows_pool_drains_reused_members_and_reaps_them_after_finish") {
+            return;
+        }
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(RPC_CHILD);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let started = fixture
+                .call(json!({"operation":"pool_start","agent":"worker","concurrency":1,"tasks":["remember silver","recall the remembered word"]}))
+                .await;
+            let pool = field(&started, "poolId");
+            fixture.await_file("first-running").await;
+            fixture.release();
+            let first = fixture
+                .call(json!({"operation":"pool_wait","poolId":pool,"itemId":1,"timeoutMs":5000}))
+                .await;
+            let second = fixture
+                .call(json!({"operation":"pool_wait","poolId":pool,"itemId":2,"timeoutMs":5000}))
+                .await;
+            assert_eq!(first.pointer("/item/status"), Some(&json!("completed")));
+            assert_eq!(second.pointer("/item/status"), Some(&json!("completed")));
+            let first = first.pointer("/item/result/details/results/0").expect("first item");
+            let second_result = second.pointer("/item/result/details/results/0").expect("second item");
+            assert_eq!(first["pid"], second_result["pid"]);
+            assert_eq!(second_result["output"], "silver");
+            assert_eq!(second["status"], "open");
+            assert_eq!(second.pointer("/workerContexts/0/tokens"), Some(&json!(64)));
+            let pid = u32::try_from(second_result["pid"].as_u64().expect("member PID"))
+                .expect("Windows PID");
+            assert!(process_alive(pid), "an open pool must retain its idle member");
+            fixture.assert_two_turn_exchange();
+            fixture.call(json!({"operation":"pool_finish","poolId":pool})).await;
+            let settled = fixture
+                .call(json!({"operation":"pool_wait","poolId":pool,"timeoutMs":5000}))
+                .await;
+            assert_eq!(settled["status"], "completed");
+            assert_eq!(settled["completedItems"], 2);
+            assert_eq!(settled["sealed"], true);
+            assert_reaped(pid).await;
+        });
+    }
+
+    const STOP_READING_CHILD: &str = r#"
+setlocal EnableExtensions EnableDelayedExpansion
+set "line="
+set /p "line="
+if not defined line exit /b 0
+>request.json echo(!line!
+"%SystemRoot%\System32\findstr.exe" /L /C:"warm-1" request.json >nul || exit /b 21
+"%SystemRoot%\System32\findstr.exe" /L /C:"get_state" request.json >nul || exit /b 22
+echo {"type":"response","id":"warm-1","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}}
+>stopped-reading echo ready
+:blocked
+"%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul
+goto blocked
+"#;
+
+    #[test]
+    fn windows_close_and_session_shutdown_cancel_backpressured_worker_input() {
+        if run_isolated("windows_close_and_session_shutdown_cancel_backpressured_worker_input") {
+            return;
+        }
+        let _guard = crate::jobs::process_test_guard();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for session_shutdown in [false, true] {
+            let fixture = Fixture::new(STOP_READING_CHILD);
+            runtime.block_on(async {
+                // Escaping doubles this valid 64 KiB task on the wire, beyond
+                // the 64 KiB pipe buffer plus Mio's one accepted 8 KiB chunk.
+                // The child reads only the small initial get_state command.
+                let started = fixture
+                    .call(json!({"operation":"worker_start","agent":"worker","task":"\"".repeat(64 * 1024)}))
+                    .await;
+                let worker = field(&started, "workerId");
+                fixture.await_file("stopped-reading").await;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let state = fixture
+                        .call(json!({"operation":"worker_status","workerId":worker}))
+                        .await;
+                    if state.pointer("/turn/status") == Some(&json!("running")) {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "the actor did not begin its prompt");
+                    AgentCx::for_request().time().sleep(POLL_INTERVAL).await;
+                }
+                AgentCx::for_request().time().sleep(Duration::from_millis(200)).await;
+                let pid = fixture.running_pid();
+                let started = Instant::now();
+                if session_shutdown {
+                    crate::jobs::kill_session(&fixture.owner).await.expect("session shutdown");
+                } else {
+                    fixture.call(json!({"operation":"worker_close","workerId":worker})).await;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5));
+                assert_reaped(pid).await;
+                let observed = fixture
+                    .call(json!({"operation":"worker_status","workerId":worker}))
+                    .await;
+                assert!(matches!(observed["status"].as_str(), Some("closed" | "failed")));
+                assert!(matches!(
+                    observed.pointer("/turn/status").and_then(Value::as_str),
+                    Some("cancelled" | "failed")
+                ));
+            });
+        }
     }
 }

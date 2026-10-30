@@ -2086,7 +2086,7 @@ pub(crate) mod windows_job_pipe {
     use mio::windows::NamedPipe;
     use mio::{Events, Interest, Poll, Registry, Token};
     use std::fs::{File, OpenOptions};
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -2094,8 +2094,9 @@ pub(crate) mod windows_job_pipe {
 
     const REACTOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
     const REACTOR_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+    const STDIN_WRITE_BYTES: usize = 8192;
 
-    /// Mio retains an Arc for every submitted read until Poll consumes its
+    /// Mio retains an Arc for every submitted operation until Poll consumes its
     /// completion, including cancellation. A per-job Poll cannot safely retire
     /// on a deadline: its last callback may arrive afterward. This one reactor
     /// lives until process exit and never owns job writers, pumps, or artifacts.
@@ -2259,6 +2260,61 @@ pub(crate) mod windows_job_pipe {
         }
     }
 
+    pub(crate) struct Writer {
+        pipe: NamedPipe,
+        reactor: &'static Reactor,
+    }
+
+    impl Writer {
+        /// Queue at most one bounded input chunk without waiting for the child.
+        /// Mio owns the submitted bytes until their completion; acceptance here
+        /// is not an RPC acknowledgment or proof that the child consumed them.
+        ///
+        /// # Errors
+        ///
+        /// Returns WouldBlock while a previous chunk remains pending, or an
+        /// I/O error when the shared reactor or pipe fails.
+        pub(crate) fn try_write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.reactor.check()?;
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.pipe
+                .write(&buffer[..buffer.len().min(STDIN_WRITE_BYTES)])
+        }
+    }
+
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.reactor.registry.deregister(&mut self.pipe);
+            // Mio's Drop cancels reads and connects, but preserves writes so
+            // they can flush. Disconnect instead: a cancelled RPC must discard
+            // pending input even when duplicated clients remain open and never
+            // read. Never flush here. The shared Poll reaps the outstanding
+            // completions after this endpoint has been retired.
+            let _ = self.pipe.disconnect();
+        }
+    }
+
+    pub(crate) fn stdin_pair() -> io::Result<(Writer, File)> {
+        let reactor = reactor()?;
+        let name = format!(
+            r"\\.\pipe\pi-worker-stdin-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut pipe = NamedPipe::new(&name)?;
+        // The child receives an ordinary synchronous stdin handle. As with
+        // output pipes, connect the client first so there is no pending connect
+        // completion that could submit fresh I/O after this owner is dropped.
+        let reader = OpenOptions::new().read(true).open(&name)?;
+        reactor
+            .registry
+            .register(&mut pipe, Token(0), Interest::WRITABLE)?;
+        pipe.connect()?;
+        reactor.check()?;
+        Ok((Writer { pipe, reactor }, reader))
+    }
+
     pub(crate) fn pair() -> io::Result<(Reader, File)> {
         let reactor = reactor()?;
         let name = format!(r"\\.\pipe\pi-job-{}", uuid::Uuid::new_v4().simple());
@@ -2289,6 +2345,49 @@ pub(crate) mod windows_job_pipe {
     mod tests {
         use super::*;
 
+        fn stdin_bytes() -> Vec<u8> {
+            (0_u8..=250).cycle().take(256 * 1024).collect()
+        }
+
+        fn backpressure_stdin(writer: &mut Writer, bytes: &[u8]) -> usize {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut accepted = 0;
+            loop {
+                assert!(accepted < bytes.len(), "fixture never filled the pipe");
+                match writer.try_write(&bytes[accepted..]) {
+                    Ok(count) => {
+                        assert!(count > 0 && count <= STDIN_WRITE_BYTES);
+                        accepted += count;
+                    }
+                    // Mio 1.2.4 creates a 64 KiB pipe buffer. Queue beyond
+                    // that capacity without any client reading, so this is
+                    // actual stdin backpressure, not only a delayed callback.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock && accepted > 64 * 1024 =>
+                    {
+                        return accepted;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("queue worker stdin: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "stdin did not reach backpressure"
+                );
+            }
+        }
+
+        fn assert_disconnected(reader: &mut File) {
+            let read = reader.read(&mut [0]);
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "cancelled stdin delivered buffered command bytes: {read:?}"
+            );
+        }
+
         #[test]
         fn try_read_does_not_wait_for_the_readiness_notification_lock() {
             let _guard = super::super::process_test_guard();
@@ -2313,6 +2412,174 @@ pub(crate) mod windows_job_pipe {
             assert_eq!(result, Ok(Err(io::ErrorKind::WouldBlock)));
             drop(reader);
             drop(writer);
+        }
+
+        #[test]
+        fn try_write_does_not_wait_for_the_readiness_notification_lock() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, reader) = stdin_pair().expect("Windows worker stdin");
+            let state = Arc::clone(&writer.reactor.state);
+            let progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = writer.try_write(b"x").map_err(|error| error.kind());
+                let _ = sent.send(result);
+                writer
+            });
+            let result = received.recv_timeout(Duration::from_secs(2));
+            drop(progress);
+            let writer = worker.join().expect("worker stdin poll thread");
+            drop(writer);
+            drop(reader);
+            assert_eq!(result, Ok(Ok(1)));
+        }
+
+        #[test]
+        fn dropping_backpressured_stdin_disconnects_duplicated_readers() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+            let mut retained_reader = reader.try_clone().expect("retained stdin client");
+            backpressure_stdin(&mut writer, &stdin_bytes());
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                drop(writer);
+                let _ = sent.send(());
+            });
+            let retired = received.recv_timeout(Duration::from_secs(2));
+            // Both clients remain open while Drop runs. A mistaken flush is
+            // detected without stranding this test's cleanup: release clients
+            // before joining even when the bounded retirement check fails.
+            let reads = retired
+                .is_ok()
+                .then(|| (reader.read(&mut [0]), retained_reader.read(&mut [0])));
+            drop(reader);
+            drop(retained_reader);
+            worker.join().expect("stdin retirement thread");
+            assert!(retired.is_ok(), "stdin Drop waited for a client to read");
+            let (first, retained) = reads.expect("retired stdin observations");
+            for read in [first, retained] {
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "cancelled stdin retained command bytes: {read:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn stdin_bytes_remain_exact_across_backpressure() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+            let bytes = stdin_bytes();
+            let mut accepted = backpressure_stdin(&mut writer, &bytes);
+            let expected = bytes.len();
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let mut actual = vec![0; expected];
+                let read = reader.read_exact(&mut actual).map(|()| actual);
+                let _ = sent.send(());
+                read
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut failure = None;
+            while accepted < bytes.len() && Instant::now() < deadline {
+                match writer.try_write(&bytes[accepted..]) {
+                    Ok(0) => {
+                        failure = Some(io::Error::new(io::ErrorKind::WriteZero, "worker stdin"));
+                        break;
+                    }
+                    Ok(count) => accepted += count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            // Acceptance into Mio is not delivery. Keep the writer alive until
+            // the client confirms every byte, or disconnect it to release the
+            // blocked reader before reporting any failed assertion.
+            let wait = if accepted == bytes.len() {
+                Duration::from_secs(10)
+            } else {
+                Duration::ZERO
+            };
+            let delivered = received.recv_timeout(wait);
+            drop(writer);
+            let actual = worker.join().expect("stdin consumer thread");
+            assert!(failure.is_none(), "stdin write failed: {failure:?}");
+            assert_eq!(accepted, bytes.len(), "stdin writes stopped progressing");
+            assert!(delivered.is_ok(), "accepted stdin never reached the client");
+            assert_eq!(actual.expect("complete stdin command"), bytes);
+        }
+
+        #[test]
+        fn repeated_stdin_cancellation_reclaims_completion_handles() {
+            const CHILD: &str = "PI_TEST_WINDOWS_STDIN_HANDLE_RECLAIM";
+            if std::env::var_os(CHILD).is_some() {
+                reactor().expect("warm shared reactor");
+                let pid = sysinfo::get_current_pid().expect("current process");
+                let mut system = sysinfo::System::new();
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                let process = system.process(pid).expect("current process handle");
+                let baseline = process.open_files().expect("Windows handle count");
+                let bytes = stdin_bytes();
+                let mut clients = Vec::new();
+                for _ in 0..16 {
+                    let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+                    let mut retained = reader.try_clone().expect("retained stdin client");
+                    backpressure_stdin(&mut writer, &bytes);
+                    drop(writer);
+                    assert_disconnected(&mut reader);
+                    assert_disconnected(&mut retained);
+                    clients.extend([reader, retained]);
+                }
+                // Retained client handles are intentional. Server handles
+                // held by cancelled read/write completions must still retire.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let handles = process.open_files().expect("Windows handle count");
+                    if handles <= baseline + clients.len() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "cancelled stdin completions retained server handles: {handles} vs {}",
+                        baseline + clients.len()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return;
+            }
+            // Run handle accounting in its own process: parallel unit tests
+            // legitimately open unrelated handles and cannot share a baseline.
+            let _guard = super::super::process_test_guard();
+            let mut command = Command::new(std::env::current_exe().expect("test binary"));
+            command
+                .args([
+                    "--exact",
+                    "jobs::windows_job_pipe::tests::repeated_stdin_cancellation_reclaims_completion_handles",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null());
+            let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+                .expect("isolated stdin handle regression");
+            let mut child = super::super::BackgroundChild::new(child);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(status) = child.try_wait().expect("observe handle regression") {
+                    assert!(status.success(), "stdin handle regression failed: {status}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "stdin handle regression stalled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }

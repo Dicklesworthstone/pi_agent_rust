@@ -182,10 +182,10 @@ async fn start(
             "schemaMode",
         ],
     )?;
-    if !cfg!(unix) {
+    if !cfg!(any(unix, windows)) {
         return Err(Error::tool(
             "subagent",
-            "PI_SUBAGENT_POOL_UNSUPPORTED: reusable pools require Unix nonblocking pipes",
+            "PI_SUBAGENT_POOL_UNSUPPORTED: reusable pools require Unix or Windows nonblocking pipes",
         ));
     }
     let assignments = tasks(&input, true)?;

@@ -505,11 +505,13 @@ input order, and shares one timeout across the collection. Python also accepts
 and `details.results[0]`, including the child PID, hub identity and
 `sessionIsolation: "persistent_rpc_worker"`.
 
-Reusable workers are currently supported on Unix and accept `agent`, `cwd`,
+Reusable workers support Unix and Windows and accept `agent`, `model`, `cwd`,
 `scope`, `timeoutSeconds` / `timeout_seconds`, and `isolation: "none"`.
-Worktree isolation, output schemas and `isoApply` / `iso_apply` remain on the
-independent-task path. A schema-bearing agent definition cannot be reused as
-a worker. Invalid combinations are rejected before a worker starts.
+`outputSchema` / `output_schema` or a schema-bearing definition freezes a strict
+contract for every turn, without corrective retries. If supplied,
+`schemaMode` / `schema_mode` must be `"strict"`. Worktree isolation and
+`isoApply` / `iso_apply` remain on the independent-task path. Invalid
+combinations are rejected before a worker starts.
 
 Each worker admits at most 32 turns, with at most 64 KiB of UTF-8 text per
 prompt and no NUL characters. Its fixed lifetime includes startup, idle time,
@@ -744,12 +746,14 @@ through `jobs`. Recovery uses those direct native operations; an unacknowledged
 guest object does not automatically bind to a recovered identity. No batch is
 replayed during recovery.
 
-Pool options are `name`, `agent`, `concurrency`, `cwd`, `scope`,
+Pool options are `name`, `agent`, `model`, `concurrency`, `cwd`, `scope`,
 `isolation: "none"`, and `timeoutSeconds` / `timeout_seconds`. Names are labels
 for the guest object. Agent definition, model, child tools and working directory
 are captured at native startup and cannot be changed by later pushes. Pools
-currently require Unix, refuse worktree isolation and output schemas, and do
-not support schema-bearing definitions or historical `seance` consultation.
+support Unix and Windows. `outputSchema` / `output_schema` or a schema-bearing
+definition freezes one strict output contract for every member and turn;
+`schemaMode` / `schema_mode`, when supplied, must be `"strict"`. Pools do not
+support worktree isolation or historical `seance` consultation.
 
 Every native launch, control request and result read re-enters the active
 Agent's current policy. Pool operations need `subagent`; aggregate job methods

@@ -334,7 +334,7 @@ impl AgentHubRegistry {
 
     /// A persistent worker has a native cleanup owner but no one-shot
     /// revival policy: a replacement process cannot retain its conversation.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn register_worker(&mut self, name: &str, kind: ChildKind) -> Result<ChildEntry> {
         let entry = self.register_kind(name, "Persistent RPC worker", kind)?;
         self.active_executions.insert(entry.id.clone());
