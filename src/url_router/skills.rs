@@ -158,6 +158,7 @@ pub(super) fn resolve(reference: &str, cwd: &Path) -> Result<ResolvedDoc> {
     let loaded = crate::resources::load_skills(crate::resources::LoadSkillsOptions {
         cwd: cwd.to_path_buf(),
         agent_dir: crate::config::Config::global_dir(),
+        home_dir: dirs::home_dir(),
         skill_paths: Vec::new(),
         include_defaults: true,
     });

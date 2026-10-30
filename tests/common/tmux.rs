@@ -9,7 +9,7 @@
 
 use super::harness::TestHarness;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -321,6 +321,7 @@ pub struct TuiSession {
     pub tmux: TmuxInstance,
     binary_path: PathBuf,
     env: BTreeMap<String, String>,
+    removed_env: BTreeSet<String>,
     steps: Vec<TuiStep>,
     start: Instant,
 }
@@ -379,6 +380,7 @@ impl TuiSession {
             tmux,
             binary_path,
             env,
+            removed_env: BTreeSet::new(),
             steps: Vec::new(),
             start: Instant::now(),
         })
@@ -386,7 +388,14 @@ impl TuiSession {
 
     /// Set an environment variable for the session.
     pub fn set_env(&mut self, key: &str, value: &str) {
+        self.removed_env.remove(key);
         self.env.insert(key.to_string(), value.to_string());
+    }
+
+    /// Remove a harness override and any inherited value from the child.
+    pub fn remove_env(&mut self, key: &str) {
+        self.env.remove(key);
+        self.removed_env.insert(key.to_string());
     }
 
     /// Launch the interactive session with the given CLI arguments.
@@ -395,6 +404,9 @@ impl TuiSession {
         let mut script = String::new();
         script.push_str("#!/usr/bin/env sh\n");
         script.push_str("set -eu\n");
+        for key in &self.removed_env {
+            let _ = writeln!(script, "unset {}", sh_escape(key));
+        }
         for (key, value) in &self.env {
             let _ = writeln!(script, "export {key}={}", sh_escape(value));
         }

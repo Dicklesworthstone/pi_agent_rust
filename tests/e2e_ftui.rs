@@ -157,6 +157,69 @@ fn e2e_ftui_launch_help_bash_quit() {
     session.write_artifacts();
 }
 
+/// Universal defaults must reach both the interactive command catalogue and
+/// the actual SDK session prompt. Neither assertion uses the low-level loader.
+#[test]
+fn e2e_ftui_universal_skills_reach_catalogue_and_session_prompt() {
+    let Some((_lock, mut session)) =
+        new_locked_session("e2e_ftui_universal_skills_reach_catalogue_and_session_prompt")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let home = session.harness.create_dir("env/home");
+    session.remove_env("PI_CONFIG_PATH");
+    session.set_env("HOME", home.to_str().expect("isolated home"));
+    session.set_env("USERPROFILE", home.to_str().expect("isolated home"));
+    session.harness.create_file(
+        ".agents/skills/project-check/SKILL.md",
+        b"---\nname: project-check\ndescription: Project universal check\n---\nProject instructions.\n",
+    );
+    session.harness.create_file(
+        "env/home/.agents/skills/user-check/SKILL.md",
+        b"---\nname: user-check\ndescription: User universal check\n---\nUser instructions.\n",
+    );
+    let mut args = ftui_args();
+    args.retain(|flag| *flag != "--no-skills");
+    args.extend([
+        "--trust",
+        "--no-mcp",
+        "--no-context-files",
+        "--tools",
+        "read",
+    ]);
+    session.launch(&args);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+
+    let pane =
+        session.send_text_and_wait("skills", "/skills", "User universal check", COMMAND_TIMEOUT);
+    assert!(pane.contains("Project universal check"), "{pane}");
+    assert!(pane.contains("User universal check"), "{pane}");
+
+    // `/skillful status` reads the live SDK agent's prompt, so this catches
+    // discovery that populated only the UI while omitting model visibility.
+    let pane = session.send_text_and_wait(
+        "skill_prompt_status",
+        "/skillful status",
+        "Skill listing: on for this session.",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        pane.contains("Skill listing: on for this session."),
+        "{pane}"
+    );
+
+    session.tmux.send_literal("/skill:proj");
+    let pane = session.wait_and_capture(
+        "skill_autocomplete",
+        "/skill:project-check",
+        COMMAND_TIMEOUT,
+    );
+    assert!(pane.contains("/skill:project-check"), "{pane}");
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 /// bd-2crrf: a default (FTUI) launch initializes ONE extension runtime and
 /// one agent session. main used to build a classic `AgentSession`, boot the
 /// extension runtime on it and drop it, before the FTUI driver built its own

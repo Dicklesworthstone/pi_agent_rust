@@ -725,7 +725,7 @@ Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
 
 ### Customization (Skills & Prompt Templates)
 
-- **Skills**: Drop `SKILL.md` under `~/.pi/agent/skills/` or `.pi/skills/` and invoke with `/skill:name`.
+- **Skills**: Place a skill directory containing `SKILL.md` under `.pi/skills/`, `.agents/skills/`, `~/.pi/agent/skills/`, or `~/.agents/skills/` and invoke it with `/skill:name`. See [skill discovery and precedence](docs/skills.md#locations).
 - **Prompt templates**: Markdown files under `~/.pi/agent/prompts/` or `.pi/prompts/`; invoke via `/<template> [args]`.
 - **Packages**: Share bundles with `pi install npm:@org/pi-packages` (skills, prompts, themes, extensions).
 
@@ -1345,16 +1345,26 @@ This means a CLI flag always overrides a `settings.json` value, and a project-le
 
 ### Resource Resolution
 
-Skills, prompt templates, themes, and extensions follow the same resolution order:
+Resource resolution gives explicit CLI paths priority, followed by CLI `-e`
+sources, configured project resources, configured user resources, and installed
+packages. Project packages take priority over user packages.
 
-1. CLI-specified paths (`--skill`, `--prompt-template`, `--theme`, `-e`)
-2. Project directory (`.pi/skills/`, `.pi/prompts/`, `.pi/themes/`, `.pi/extensions/`)
-3. Global directory (`~/.pi/agent/skills/`, `~/.pi/agent/prompts/`, etc.)
-4. Installed packages (`~/.pi/agent/packages/`)
+Skills additionally discover the universal `.agents/skills/` directory in the
+working directory and `~/.agents/skills/` in the user's home directory. Within
+each scope, Pi-specific skills and settings entries take priority over universal
+skills; project universal skills still take priority over user skills. Managed
+skills from `<agent_dir>/skills.managed/` load last. See the complete
+[skill precedence table](docs/skills.md#precedence).
 
 When multiple resources share the same name, the first occurrence wins. Collisions are logged as diagnostics.
 
-`--no-skills` (and its siblings `--no-prompt-templates`, `--no-themes`, `--no-extensions`) disables tiers 2–4 **including** `skills` entries listed in `settings.json` — upstream-pi parity. Explicit CLI paths (tier 1) still load, so `pi --no-skills --skill /path/to/skill-a --skill /path/to/skill-b` is the way to run with an exact, isolated skill set (e.g. per-profile setups via shell aliases or wrapper scripts).
+`--no-skills` disables automatic discovery (including universal and managed
+skills), installed package skills, and `skills` entries in `settings.json`.
+Explicit CLI `--skill` paths and skills supplied by CLI `-e` sources still load,
+so `pi --no-skills --skill /path/to/skill-a --skill /path/to/skill-b` selects an
+isolated skill set. The sibling `--no-prompt-templates`, `--no-themes`, and
+`--no-extensions` flags likewise preserve explicit CLI resources while disabling
+configured discovery for their categories.
 
 Project context files are a separate switch. By default pi appends `AGENTS.md` / `CLAUDE.md` from `~/.pi/agent/`, the working directory, and every ancestor directory to the system prompt (plus imported foreign-format workspace rules). `--no-context-files` (or `PI_NO_CONTEXT_FILES=1`) disables that discovery entirely; `--no-skills` does not cover it. Hosts that compose the whole prompt with `--system-prompt` typically pass `--no-context-files --no-skills` together.
 

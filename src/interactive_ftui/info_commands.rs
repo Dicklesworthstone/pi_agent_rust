@@ -252,7 +252,7 @@ pub async fn run(
         InfoCommand::Skills => format_named(
             "Skills",
             &catalog.skills,
-            "No skills available (add SKILL.md files under .pi/skills or ~/.pi/agent/skills).",
+            "No skills available (add a skill directory containing SKILL.md under .pi/skills, .agents/skills, ~/.pi/agent/skills, or ~/.agents/skills).",
         ),
         InfoCommand::Templates => format_named(
             "Prompt templates (run one as /<name> [args])",

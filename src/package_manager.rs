@@ -73,6 +73,10 @@ pub struct PathMetadata {
 pub enum ResourceOrigin {
     Package,
     TopLevel,
+    /// Automatically discovered universal `.agents/skills` resources.
+    Universal,
+    /// Agent-authored skills, below every user-selected resource tier.
+    Managed,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +105,9 @@ pub struct ResolveRoots {
     pub global_base_dir: PathBuf,
     pub project_base_dir: PathBuf,
     pub project_settings_enabled: bool,
+    /// Home for universal user skills, independent of `global_base_dir`.
+    /// `None` disables that root for hermetic callers.
+    pub home_dir: Option<PathBuf>,
 }
 
 impl ResolveRoots {
@@ -114,6 +121,7 @@ impl ResolveRoots {
             global_base_dir: Config::global_dir(),
             project_base_dir: cwd.join(Config::project_dir()),
             project_settings_enabled: config_override_path.is_none(),
+            home_dir: dirs::home_dir(),
         }
     }
 
@@ -778,14 +786,7 @@ impl PackageManager {
             }
 
             // 3) Auto-discovered resources from standard dirs (global and project)
-            this.add_auto_discovered_resources(
-                &mut accumulator,
-                &global,
-                &project,
-                &roots.global_base_dir,
-                &roots.project_base_dir,
-                roots.project_settings_enabled,
-            );
+            this.add_auto_discovered_resources(&mut accumulator, &global, &project, &roots);
 
             let resolved = accumulator.clone().into_resolved_paths();
             drop(accumulator);
@@ -2075,16 +2076,15 @@ impl PackageManager {
         }
     }
 
-    #[allow(clippy::unused_self)]
     fn add_auto_discovered_resources(
         &self,
         accumulator: &mut ResourceAccumulator,
         global: &SettingsSnapshot,
         project: &SettingsSnapshot,
-        global_base_dir: &Path,
-        project_base_dir: &Path,
-        project_settings_enabled: bool,
+        roots: &ResolveRoots,
     ) {
+        let global_base_dir = &roots.global_base_dir;
+        let project_base_dir = &roots.project_base_dir;
         let user_metadata = PathMetadata {
             source: "auto".to_string(),
             scope: PackageScope::User,
@@ -2102,16 +2102,16 @@ impl PackageManager {
         let project_dirs = AutoDirs::new(project_base_dir);
 
         for resource_type in ResourceType::all() {
+            if resource_type == ResourceType::Skills {
+                continue;
+            }
             let target = accumulator.target_mut(resource_type);
             let (user_paths, user_overrides) = match resource_type {
                 ResourceType::Extensions => (
                     collect_auto_extension_entries(&user_dirs.extensions),
                     &global.extensions,
                 ),
-                ResourceType::Skills => (
-                    collect_auto_skill_entries(&user_dirs.skills),
-                    &global.skills,
-                ),
+                ResourceType::Skills => unreachable!("skills use shared discovery below"),
                 ResourceType::Prompts => (
                     collect_auto_prompt_entries(&user_dirs.prompts),
                     &global.prompts,
@@ -2126,16 +2126,13 @@ impl PackageManager {
                 target.add(path, &user_metadata, enabled);
             }
 
-            if project_settings_enabled {
+            if roots.project_settings_enabled {
                 let (project_paths, project_overrides) = match resource_type {
                     ResourceType::Extensions => (
                         collect_auto_extension_entries(&project_dirs.extensions),
                         &project.extensions,
                     ),
-                    ResourceType::Skills => (
-                        collect_auto_skill_entries(&project_dirs.skills),
-                        &project.skills,
-                    ),
+                    ResourceType::Skills => unreachable!("skills use shared discovery below"),
                     ResourceType::Prompts => (
                         collect_auto_prompt_entries(&project_dirs.prompts),
                         &project.prompts,
@@ -2150,6 +2147,82 @@ impl PackageManager {
                         is_enabled_by_overrides(&path, project_overrides, project_base_dir);
                     target.add(path, &project_metadata, enabled);
                 }
+            }
+        }
+
+        self.add_auto_discovered_skills(
+            accumulator,
+            global,
+            project,
+            roots,
+            [project_dirs.skills, user_dirs.skills],
+        );
+    }
+
+    fn add_auto_discovered_skills(
+        &self,
+        accumulator: &mut ResourceAccumulator,
+        global: &SettingsSnapshot,
+        project: &SettingsSnapshot,
+        roots: &ResolveRoots,
+        native_dirs: [PathBuf; 2],
+    ) {
+        let [project_skills, user_skills] = native_dirs;
+        let user_metadata = PathMetadata {
+            source: "auto".to_string(),
+            scope: PackageScope::User,
+            origin: ResourceOrigin::TopLevel,
+            base_dir: Some(roots.global_base_dir.clone()),
+        };
+        let project_metadata = PathMetadata {
+            scope: PackageScope::Project,
+            base_dir: Some(roots.project_base_dir.clone()),
+            ..user_metadata.clone()
+        };
+        // Cache exact root aliases, but evaluate each spelling's settings
+        // filters independently. Nested roots still need their own walk:
+        // top-level Markdown files have different semantics at each root.
+        let mut skill_roots = Vec::new();
+        if roots.project_settings_enabled {
+            skill_roots.push((project_skills, project_metadata.clone(), &project.skills));
+            skill_roots.push((
+                self.cwd.join(".agents").join("skills"),
+                PathMetadata {
+                    origin: ResourceOrigin::Universal,
+                    ..project_metadata
+                },
+                &project.skills,
+            ));
+        }
+        skill_roots.push((user_skills, user_metadata.clone(), &global.skills));
+        if let Some(home) = &roots.home_dir {
+            skill_roots.push((
+                home.join(".agents").join("skills"),
+                PathMetadata {
+                    origin: ResourceOrigin::Universal,
+                    ..user_metadata.clone()
+                },
+                &global.skills,
+            ));
+        }
+        skill_roots.push((
+            roots.global_base_dir.join("skills.managed"),
+            PathMetadata {
+                origin: ResourceOrigin::Managed,
+                ..user_metadata
+            },
+            &global.skills,
+        ));
+
+        let mut cache = SkillEntryCache::default();
+        for (dir, metadata, overrides) in skill_roots {
+            let base_dir = metadata
+                .base_dir
+                .as_deref()
+                .unwrap_or(&roots.global_base_dir);
+            for path in cache.collect(&dir) {
+                let enabled = is_enabled_by_overrides(&path, overrides, base_dir);
+                accumulator.skills.add(path, &metadata, enabled);
             }
         }
     }
@@ -2957,7 +3030,34 @@ fn canonical_identity_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[derive(Default)]
+struct SkillEntryCache {
+    relative_paths: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+}
+
+impl SkillEntryCache {
+    fn collect(&mut self, dir: &Path) -> Vec<PathBuf> {
+        let paths = self
+            .relative_paths
+            .entry(canonical_identity_path(dir))
+            .or_insert_with(|| {
+                collect_skill_entries_with_parent_ignores(dir, false)
+                    .into_iter()
+                    .map(|path| path.strip_prefix(dir).unwrap_or(&path).to_path_buf())
+                    .collect()
+            });
+        paths.iter().map(|path| dir.join(path)).collect()
+    }
+}
+
 fn collect_skill_entries(dir: &Path) -> Vec<PathBuf> {
+    collect_skill_entries_with_parent_ignores(dir, true)
+}
+
+fn collect_skill_entries_with_parent_ignores(
+    dir: &Path,
+    inherit_parent_ignores: bool,
+) -> Vec<PathBuf> {
     if !dir.exists() {
         return Vec::new();
     }
@@ -2970,9 +3070,13 @@ fn collect_skill_entries(dir: &Path) -> Vec<PathBuf> {
     builder
         .hidden(true)
         .follow_links(true)
+        // Defaults are standalone roots. Explicit/package paths retain their
+        // existing parent-ignore behavior (for example package/.ignore).
+        .parents(inherit_parent_ignores)
         .git_global(false)
         .git_exclude(false)
         .add_custom_ignore_filename(".fdignore")
+        .sort_by_file_path(Path::cmp)
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
             if name == "node_modules" {
@@ -3012,10 +3116,6 @@ fn collect_skill_entries(dir: &Path) -> Vec<PathBuf> {
     }
 
     out
-}
-
-fn collect_auto_skill_entries(dir: &Path) -> Vec<PathBuf> {
-    collect_skill_entries(dir)
 }
 
 fn collect_auto_prompt_entries(dir: &Path) -> Vec<PathBuf> {
@@ -4933,6 +5033,7 @@ mod tests {
                 global_base_dir: temp_dir.path().join("global-base"),
                 project_base_dir: project_root.join(".pi"),
                 project_settings_enabled: true,
+                home_dir: None,
             };
             fs::create_dir_all(&roots.global_base_dir).expect("create global base dir");
 
@@ -5045,6 +5146,7 @@ mod tests {
             global_base_dir: global_dir,
             project_base_dir: project_dir,
             project_settings_enabled: true,
+            home_dir: None,
         };
 
         let trusted = PackageManager::new(cwd.clone());
@@ -5128,6 +5230,7 @@ mod tests {
                 global_base_dir: temp_dir.path().join("global-base"),
                 project_base_dir: project_root.join(".pi"),
                 project_settings_enabled: false,
+                home_dir: None,
             };
             fs::create_dir_all(&roots.global_base_dir).expect("create global base dir");
 
@@ -7411,6 +7514,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skill_discovery_cache_isolates_defaults_without_changing_package_ignores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("skills");
+        let skill = skills_dir.join("ignored/SKILL.md");
+        fs::create_dir_all(skill.parent().expect("skill parent")).expect("create skill dir");
+        fs::write(&skill, "# Skill").expect("write skill");
+        fs::write(dir.path().join(".ignore"), "skills/ignored/\n").expect("write package ignore");
+
+        assert!(collect_skill_entries(&skills_dir).is_empty());
+        let mut cache = SkillEntryCache::default();
+        assert_eq!(cache.collect(&skills_dir), vec![skill]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn collect_skill_entries_ignores_symlink_cycles() {
@@ -7881,6 +7998,7 @@ mod tests {
                 global_base_dir: temp_dir.path().join("global-base"),
                 project_base_dir: project_root.join(".pi"),
                 project_settings_enabled: true,
+                home_dir: None,
             };
             fs::create_dir_all(&roots.global_base_dir).expect("create global base dir");
 

@@ -559,6 +559,7 @@ fn resolve_roots_for_cli_harness(harness: &CliTestHarness) -> ResolveRoots {
 
     ResolveRoots {
         project_settings_enabled: true,
+        home_dir: Some(PathBuf::from(&harness.env["HOME"])),
         global_settings_path: harness.global_settings_path(),
         project_settings_path: harness.project_settings_path(),
         global_base_dir,
@@ -1259,7 +1260,26 @@ fn read_catalog_request_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
 fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
     use std::io::BufRead as _;
 
-    let harness = CliTestHarness::new("e2e_acp_launch_options_reach_the_actual_stdio_session");
+    let mut harness = CliTestHarness::new("e2e_acp_launch_options_reach_the_actual_stdio_session");
+    harness.env.remove("PI_CONFIG_PATH");
+    let home = PathBuf::from(&harness.env["HOME"]);
+    harness
+        .env
+        .insert("USERPROFILE".to_string(), home.display().to_string());
+    harness.harness.create_file(
+        ".agents/skills/acp-project/SKILL.md",
+        b"---\nname: acp-project\ndescription: ACP project universal skill\n---\nProject skill body.\n",
+    );
+    let user_skill = home.join(".agents/skills/acp-user/SKILL.md");
+    fs::create_dir_all(user_skill.parent().expect("user skill parent"))
+        .expect("create user skill directory");
+    fs::write(
+        &user_skill,
+        b"---\nname: acp-user\ndescription: ACP user universal skill\n---\nUser skill body.\n",
+    )
+    .expect("write user skill");
+    let server = harness.harness.start_mock_http_server();
+    server.add_route("POST", "/v1/chat/completions", skill_discovery_response());
     let agent_dir = PathBuf::from(
         harness
             .env
@@ -1274,7 +1294,7 @@ fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
             "providers": {
                 "acp-launch-fixture": {
                     "api": "openai-completions",
-                    "baseUrl": "https://acp-launch.invalid/v1",
+                    "baseUrl": format!("{}/v1", server.base_url()),
                     "authHeader": true,
                     "models": [
                         { "id": "configured-default", "reasoning": false },
@@ -1291,7 +1311,9 @@ fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
         serde_json::to_vec_pretty(&json!({
             "defaultProvider": "acp-launch-fixture",
             "defaultModel": "configured-default",
-            "defaultThinkingLevel": "off"
+            "defaultThinkingLevel": "off",
+            "retry": {"enabled": false},
+            "compaction": {"enabled": false}
         }))
         .expect("serialize launch settings"),
     )
@@ -1299,7 +1321,8 @@ fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
 
     // No configured key makes this custom provider unready. The explicit
     // launch key must enable selection without becoming protocol metadata.
-    // We never send a prompt, so no provider HTTP request is needed.
+    // The eventual prompt uses only a loopback provider and also proves that
+    // automatic skills from the launch cwd reach the editor's real session.
     let owner = pi::agent_cx::AgentCx::for_request();
     let stderr_path = harness.harness.temp_path("acp.stderr.txt");
     let stderr = fs::File::create(&stderr_path).expect("create ACP diagnostics");
@@ -1320,6 +1343,14 @@ fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
             "acp-launch-fixture-key",
             "--request-timeout",
             "60",
+            "--trust",
+            "--tools",
+            "read",
+            "--no-mcp",
+            "--no-extensions",
+            "--no-context-files",
+            "--no-prompt-templates",
+            "--no-themes",
         ])
         .env_clear()
         .envs(harness.env.clone())
@@ -1360,10 +1391,17 @@ fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
         serde_json::to_writer(&mut input, &request).expect("write ACP request");
         input.write_all(b"\n").expect("delimit ACP request");
         input.flush().expect("flush ACP request");
-        let response = receiver
-            .recv_timeout(Duration::from_secs(30))
-            .expect("ACP response before deadline")
-            .expect("valid ACP protocol frame");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let response = loop {
+            let response = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("ACP response before deadline")
+                .expect("valid ACP protocol frame");
+            if response.get("id").is_some() {
+                break response;
+            }
+            assert_eq!(response["method"], "session/update");
+        };
         assert_eq!(response["id"], request["id"], "matching JSON-RPC response");
         assert!(response.get("error").is_none(), "ACP error: {response}");
         response
@@ -1398,9 +1436,31 @@ fn e2e_acp_launch_options_reach_the_actual_stdio_session() {
         "a launch credential must not appear in editor metadata"
     );
 
+    let prompted = exchange(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+        "params": {"sessionId": created["result"]["sessionId"],
+            "prompt": [{"type": "text", "text": "Check the skill catalogue."}]}
+    }));
+    assert_eq!(prompted["result"]["stopReason"], "end_turn");
+    let captured = server.requests();
+    assert_eq!(captured.len(), 1, "one ACP provider turn");
+    let request: serde_json::Value =
+        serde_json::from_slice(&captured[0].body).expect("ACP provider request");
+    let system = request["messages"]
+        .as_array()
+        .expect("ACP provider messages")
+        .iter()
+        .find(|message| message["role"] == "system")
+        .and_then(|message| message["content"].as_str())
+        .expect("ACP system prompt");
+    assert!(system.contains("ACP project universal skill"), "{system}");
+    assert!(system.contains("ACP user universal skill"), "{system}");
+    assert!(!system.contains("Project skill body."));
+    assert!(!system.contains("User skill body."));
+
     // Keep stdin open until all replies arrive: this tests the real dispatcher,
     // without a race between an early client EOF and response delivery.
-    let _ = exchange(json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown" }));
+    let _ = exchange(json!({ "jsonrpc": "2.0", "id": 4, "method": "shutdown" }));
     input
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}\n")
         .expect("send ACP exit notification");
@@ -2331,6 +2391,196 @@ fn e2e_cli_config_show_lists_discovered_package_resources() {
     assert_contains(&harness.harness, &result.stdout, "skills/demo/SKILL.md");
     assert_contains(&harness.harness, &result.stdout, "prompts/welcome.md");
     assert_contains(&harness.harness, &result.stdout, "themes/night.json");
+}
+
+#[cfg(unix)]
+fn skill_discovery_response() -> MockHttpResponse {
+    let chunk = json!({
+        "id": "universal-skill-response", "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Skill received."},
+            "finish_reason": null}]
+    });
+    let done = json!({
+        "id": "universal-skill-response",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
+    MockHttpResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body: format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n").into_bytes(),
+    }
+}
+
+/// Exercise the binary's package/resource startup path, prompt construction,
+/// and skill-command expansion against a loopback provider. In particular,
+/// `ResourceLoader::load` must discover the same defaults as `load_skills`.
+/// Unix home lookup honors the child's isolated HOME; Windows known-folder
+/// lookup is covered with explicit homes by the package/resource loader tests.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_cli_universal_skills_reach_print_json_and_rpc() {
+    let mut harness = CliTestHarness::new("e2e_cli_universal_skills_reach_print_json_and_rpc");
+    // An explicit config path intentionally disables project discovery.
+    harness.env.remove("PI_CONFIG_PATH");
+    let home = PathBuf::from(&harness.env["HOME"]);
+    harness
+        .env
+        .insert("USERPROFILE".to_string(), home.display().to_string());
+    let project_skill = harness.harness.create_file(
+        ".agents/skills/project-check/SKILL.md",
+        b"---\nname: project-check\ndescription: Project universal check\n---\nPROJECT_UNIVERSAL_BODY\n",
+    );
+    let user_skill = home.join(".agents/skills/user-check/SKILL.md");
+    fs::create_dir_all(user_skill.parent().expect("user skill parent"))
+        .expect("create universal user directory");
+    fs::write(
+        &user_skill,
+        b"---\nname: user-check\ndescription: User universal check\n---\nUSER_UNIVERSAL_BODY\n",
+    )
+    .expect("write universal user skill");
+    let explicit_skill = harness.harness.create_file(
+        "explicit-check/SKILL.md",
+        b"---\nname: explicit-check\ndescription: Explicit skill check\n---\nEXPLICIT_SKILL_BODY\n",
+    );
+
+    let server = harness.harness.start_mock_http_server();
+    server.add_route("POST", "/v1/chat/completions", skill_discovery_response());
+    let agent_dir = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&agent_dir).expect("create isolated agent directory");
+    fs::write(agent_dir.join("auth.json"), b"{}").expect("write isolated auth");
+    fs::write(
+        agent_dir.join("models.json"),
+        json!({"providers": {"universal-skills-fixture": {
+            "api": "openai-completions", "baseUrl": format!("{}/v1", server.base_url()),
+            "apiKey": "offline-fixture", "authHeader": true,
+            "models": [{"id": "offline", "reasoning": false, "contextWindow": 32_000,
+                "maxTokens": 128}]
+        }}})
+        .to_string(),
+    )
+    .expect("write loopback provider");
+    fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"retry":{"enabled":false},"compaction":{"enabled":false}}"#,
+    )
+    .expect("write isolated settings");
+
+    for mode in ["text", "json", "rpc"] {
+        for no_skills in [false, true] {
+            let mut args = vec![
+                "--mode",
+                mode,
+                "--provider",
+                "universal-skills-fixture",
+                "--model",
+                "offline",
+                "--trust",
+                "--no-session",
+                "--no-mcp",
+                "--no-extensions",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files",
+                "--tools",
+                "read",
+                "--thinking",
+                "off",
+            ];
+            let (input, body_marker) = if no_skills {
+                args.extend([
+                    "--no-skills",
+                    "--skill",
+                    explicit_skill.to_str().expect("skill path"),
+                ]);
+                (
+                    "/skill:explicit-check invocation-argument",
+                    "EXPLICIT_SKILL_BODY",
+                )
+            } else {
+                (
+                    "/skill:project-check invocation-argument",
+                    "PROJECT_UNIVERSAL_BODY",
+                )
+            };
+            let request_count = server.requests().len();
+            let result = if mode == "rpc" {
+                let stdin = format!(
+                    "{}\n{}\n",
+                    json!({"id": "skills", "type": "get_commands"}),
+                    json!({"id": "invoke", "type": "prompt", "message": input}),
+                );
+                harness.run_with_stdin(&args, Some(stdin.as_bytes()))
+            } else {
+                args.extend(["--print", input]);
+                harness.run(&args)
+            };
+            assert_exit_code(&harness.harness, &result, 0);
+            assert_contains(&harness.harness, &result.stdout, "Skill received.");
+
+            if mode == "rpc" {
+                let records = parse_json_mode_stdout_lines(&result.stdout);
+                let response = records
+                    .iter()
+                    .find(|record| record["id"] == "skills")
+                    .expect("RPC get_commands response");
+                assert_eq!(response["success"], true);
+                let commands = response["data"]["commands"]
+                    .as_array()
+                    .expect("RPC commands");
+                let names = commands
+                    .iter()
+                    .map(|command| command["name"].as_str().expect("command name"))
+                    .collect::<Vec<_>>();
+                if no_skills {
+                    assert_eq!(names, ["skill:explicit-check"]);
+                } else {
+                    assert!(names.contains(&"skill:project-check"));
+                    assert!(names.contains(&"skill:user-check"));
+                }
+            }
+
+            let captured = server.requests();
+            assert_eq!(
+                captured.len(),
+                request_count + 1,
+                "one provider turn per invocation"
+            );
+            let request: serde_json::Value = serde_json::from_slice(&captured[request_count].body)
+                .expect("provider request JSON");
+            let messages = request["messages"].as_array().expect("provider messages");
+            let system = messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .map(|message| message["content"].as_str().expect("system text"))
+                .collect::<String>();
+            assert_eq!(system.contains("Project universal check"), !no_skills);
+            assert_eq!(system.contains("User universal check"), !no_skills);
+            assert_eq!(system.contains("Explicit skill check"), no_skills);
+            assert!(
+                !system.contains(body_marker),
+                "skill bodies load on invocation"
+            );
+            if !no_skills {
+                assert!(system.contains(project_skill.to_str().expect("project path")));
+                assert!(system.contains(user_skill.to_str().expect("user path")));
+            }
+            let user = messages
+                .iter()
+                .find(|message| message["role"] == "user")
+                .expect("user request")
+                .to_string();
+            assert!(
+                user.contains(body_marker),
+                "{mode}: skill invocation was not expanded: {user}"
+            );
+            assert!(user.contains("invocation-argument"));
+            assert!(
+                !user.contains("/skill:"),
+                "raw skill command reached the provider"
+            );
+        }
+    }
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //!
 //! Run:
 //! ```bash
-//! cargo test --test resource_edge_cases
+//! dsr quality --tool pi_agent_rust
 //! ```
 
 #![allow(clippy::too_many_lines)]
@@ -76,8 +76,9 @@ fn load_skills_empty_directories_returns_empty() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: Some(harness.temp_path("missing-home")),
         skill_paths: Vec::new(),
-        include_defaults: false,
+        include_defaults: true,
     });
 
     assert!(result.skills.is_empty(), "Expected no skills");
@@ -96,6 +97,7 @@ fn load_skills_nonexistent_skill_path_ignored() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: vec![harness.temp_path("nonexistent/skill_dir")],
         include_defaults: false,
     });
@@ -107,27 +109,74 @@ fn load_skills_nonexistent_skill_path_ignored() {
 }
 
 #[test]
-fn load_skills_explicit_path_takes_priority_over_defaults() {
-    let harness = TestHarness::new("load_skills_explicit_path_takes_priority_over_defaults");
+fn load_skills_no_defaults_only_loads_explicit_paths() {
+    let harness = TestHarness::new("load_skills_no_defaults_only_loads_explicit_paths");
 
     let cwd = harness.temp_path("project");
     std::fs::create_dir_all(&cwd).expect("create cwd");
     let agent_dir = harness.temp_path("agent");
     std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    let home_dir = harness.temp_path("home");
+
+    for default_dir in [
+        cwd.join(".pi/skills"),
+        cwd.join(".agents/skills"),
+        agent_dir.join("skills"),
+        home_dir.join(".agents/skills"),
+        agent_dir.join("skills.managed"),
+    ] {
+        write_skill(
+            &harness,
+            &default_dir.join("unselected"),
+            "unselected",
+            "Must not be discovered",
+            "",
+        );
+    }
 
     // Create skill in explicit path
     let explicit_dir = harness.temp_path("explicit_skills/myskill");
-    write_skill(&harness, &explicit_dir, "myskill", "Explicit skill", "");
+    let explicit = write_skill(&harness, &explicit_dir, "myskill", "Explicit skill", "");
+    let selected_user = write_skill(
+        &harness,
+        &home_dir.join(".agents/skills/selected"),
+        "selected",
+        "Explicit user skill wins by caller order",
+        "",
+    );
+    let selected_project = write_skill(
+        &harness,
+        &cwd.join(".agents/skills/selected"),
+        "selected",
+        "Explicit project skill is second",
+        "",
+    );
 
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
-        skill_paths: vec![explicit_dir],
+        home_dir: Some(home_dir),
+        skill_paths: vec![
+            explicit_dir,
+            selected_user.clone(),
+            selected_project.clone(),
+        ],
         include_defaults: false,
     });
 
-    assert_eq!(result.skills.len(), 1);
+    assert_eq!(result.skills.len(), 2);
     assert_eq!(result.skills[0].name, "myskill");
+    assert_eq!(result.skills[0].file_path, explicit);
+    assert_eq!(result.skills[1].name, "selected");
+    assert_eq!(result.skills[1].file_path, selected_user);
+    assert_eq!(result.skills[1].source, "user");
+    assert_eq!(result.diagnostics.len(), 1);
+    let collision = result.diagnostics[0]
+        .collision
+        .as_ref()
+        .expect("explicit duplicate reports a collision");
+    assert_eq!(collision.winner_path, selected_user);
+    assert_eq!(collision.loser_path, selected_project);
 }
 
 #[test]
@@ -147,6 +196,7 @@ fn load_skills_multiple_explicit_paths() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: vec![skill_a_dir, skill_b_dir],
         include_defaults: false,
     });
@@ -177,12 +227,207 @@ fn load_skills_with_disable_model_invocation_flag() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: vec![skill_dir],
         include_defaults: false,
     });
 
     assert_eq!(result.skills.len(), 1);
     assert!(result.skills[0].disable_model_invocation);
+}
+
+#[test]
+fn universal_skills_reject_invalid_files_without_hiding_valid_skills() {
+    let harness =
+        TestHarness::new("universal_skills_reject_invalid_files_without_hiding_valid_skills");
+    let cwd = harness.temp_path("project");
+    let home_dir = harness.temp_path("home");
+    let healthy = write_skill(
+        &harness,
+        &cwd.join(".agents/skills/healthy"),
+        "healthy",
+        "Valid universal skill",
+        "",
+    );
+    let malformed = harness.create_file(
+        "project/.agents/skills/malformed/SKILL.md",
+        b"---\nname: malformed\n---\nMissing required description.\n",
+    );
+    let non_utf8 = harness.create_file("home/.agents/skills/non-utf8/SKILL.md", [0xff, 0xfe, 0x00]);
+    let oversized = harness.create_file(
+        "home/.agents/skills/oversized/SKILL.md",
+        vec![b'x'; 1024 * 1024 + 1],
+    );
+
+    let result = load_skills(LoadSkillsOptions {
+        cwd,
+        agent_dir: harness.temp_path("agent"),
+        home_dir: Some(home_dir),
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    });
+
+    assert_eq!(result.skills.len(), 1);
+    assert_eq!(result.skills[0].file_path, healthy);
+    assert_eq!(result.diagnostics.len(), 3);
+    for (path, message) in [
+        (malformed, "description is required"),
+        (non_utf8, "is not valid UTF-8"),
+        (oversized, "exceeds the 1048576-byte resource limit"),
+    ] {
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == DiagnosticKind::Warning
+                && diagnostic.path == path
+                && diagnostic.message.contains(message)
+        }));
+    }
+}
+
+#[test]
+fn universal_skill_discovery_stays_within_selected_roots() {
+    let harness = TestHarness::new("universal_skill_discovery_stays_within_selected_roots");
+    let cwd = harness.temp_path("workspace/project");
+    let home_dir = harness.temp_path("home");
+    let visible = write_skill(
+        &harness,
+        &cwd.join(".agents/skills/group/visible"),
+        "visible",
+        "Nested project skill",
+        "",
+    );
+    let personal = write_skill(
+        &harness,
+        &home_dir.join(".agents/skills/personal"),
+        "personal",
+        "User skill",
+        "",
+    );
+    for ignored_dir in [
+        harness.temp_path("workspace/.agents/skills/ignored"),
+        cwd.join("nested/.agents/skills/ignored"),
+        cwd.join(".agents/unrelated/ignored"),
+        cwd.join(".agents/skills/.hidden/ignored"),
+        cwd.join(".agents/skills/node_modules/ignored"),
+        home_dir.join("unrelated/.agents/skills/ignored"),
+    ] {
+        write_skill(&harness, &ignored_dir, "ignored", "Must not be scanned", "");
+    }
+    let options = LoadSkillsOptions {
+        cwd,
+        agent_dir: harness.temp_path("custom-agent"),
+        home_dir: Some(home_dir),
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    };
+
+    let result = load_skills(options.clone());
+    assert_eq!(result.skills.len(), 2);
+    assert_eq!(result.skills[0].file_path, personal);
+    assert_eq!(result.skills[1].file_path, visible);
+    assert!(result.diagnostics.is_empty());
+
+    // An embedding caller can deliberately disable universal user discovery
+    // without changing process-wide HOME or losing project skills.
+    let project_only = load_skills(LoadSkillsOptions {
+        home_dir: None,
+        ..options
+    });
+    assert_eq!(project_only.skills.len(), 1);
+    assert_eq!(project_only.skills[0].file_path, visible);
+    assert!(project_only.diagnostics.is_empty());
+}
+
+#[test]
+fn universal_skill_name_collisions_have_a_deterministic_winner() {
+    let harness = TestHarness::new("universal_skill_name_collisions_have_a_deterministic_winner");
+    let cwd = harness.temp_path("project");
+    let root = cwd.join(".agents/skills");
+    // Create the later path first so creation order cannot decide the winner.
+    let later = write_skill(
+        &harness,
+        &root.join("zeta/shared"),
+        "shared",
+        "Later path",
+        "",
+    );
+    let first = write_skill(
+        &harness,
+        &root.join("alpha/shared"),
+        "shared",
+        "First path",
+        "",
+    );
+    let options = LoadSkillsOptions {
+        cwd,
+        agent_dir: harness.temp_path("agent"),
+        home_dir: None,
+        skill_paths: Vec::new(),
+        include_defaults: true,
+    };
+    for result in [load_skills(options.clone()), load_skills(options)] {
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].file_path, first);
+        assert_eq!(result.skills[0].source, "project");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].kind, DiagnosticKind::Collision);
+        let collision = result.diagnostics[0]
+            .collision
+            .as_ref()
+            .expect("collision details");
+        assert_eq!(collision.name, "shared");
+        assert_eq!(collision.winner_path, first);
+        assert_eq!(collision.loser_path, later);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn universal_skills_deduplicate_alias_roots_and_stop_symlink_cycles() {
+    use std::os::unix::fs::symlink;
+
+    let harness =
+        TestHarness::new("universal_skills_deduplicate_alias_roots_and_stop_symlink_cycles");
+    let cwd = harness.temp_path("project");
+    let home_dir = harness.temp_path("home");
+    let universal_root = cwd.join(".agents/skills");
+    let original = write_skill(
+        &harness,
+        &universal_root.join("shared"),
+        "shared",
+        "Shared definition",
+        "",
+    );
+    write_skill(
+        &harness,
+        &universal_root.join("malformed"),
+        "malformed",
+        "",
+        "",
+    );
+    std::fs::create_dir_all(cwd.join(".pi")).expect("create Pi root");
+    std::fs::create_dir_all(home_dir.join(".agents")).expect("create user root");
+    symlink(&universal_root, cwd.join(".pi/skills")).expect("native alias");
+    symlink(&universal_root, home_dir.join(".agents/skills")).expect("user alias");
+    symlink(&universal_root, universal_root.join("cycle")).expect("directory cycle");
+    symlink(cwd.join("missing-target"), universal_root.join("dangling")).expect("dangling symlink");
+
+    let result = load_skills(LoadSkillsOptions {
+        cwd: cwd.clone(),
+        agent_dir: harness.temp_path("agent"),
+        home_dir: Some(home_dir),
+        skill_paths: vec![universal_root, original],
+        include_defaults: true,
+    });
+
+    assert_eq!(result.skills.len(), 1);
+    assert_eq!(
+        result.skills[0].file_path,
+        cwd.join(".pi/skills/shared/SKILL.md")
+    );
+    assert_eq!(result.skills[0].source, "project");
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].kind, DiagnosticKind::Warning);
+    assert_eq!(result.diagnostics[0].message, "description is required");
 }
 
 // ─── Prompt Templates ────────────────────────────────────────────────────────
@@ -382,6 +627,7 @@ fn load_skills_with_defaults_includes_user_and_project_dirs() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
@@ -419,6 +665,7 @@ fn load_skills_reports_all_unknown_frontmatter_fields() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: vec![skill_dir],
         include_defaults: false,
     });

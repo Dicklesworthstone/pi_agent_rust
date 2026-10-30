@@ -189,14 +189,17 @@ fn resource_diagnostic_error(
 
 fn resolve_skill(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
     let agent_dir = crate::config::Config::global_dir();
-    let roots = [
-        cwd.join(crate::config::Config::project_dir())
-            .join("skills"),
-        agent_dir.join("skills"),
-    ];
+    let home_dir = dirs::home_dir();
+    let mut roots: Vec<PathBuf> =
+        crate::resources::default_skill_dirs(cwd, &agent_dir, home_dir.as_deref())
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+    roots.push(agent_dir.join("skills.managed"));
     let skills = crate::resources::load_skills(crate::resources::LoadSkillsOptions {
         cwd: cwd.to_path_buf(),
         agent_dir,
+        home_dir,
         skill_paths: Vec::new(),
         include_defaults: true,
     });

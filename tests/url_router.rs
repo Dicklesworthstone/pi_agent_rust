@@ -172,6 +172,7 @@ fn read_skill_via_tool_matches_loader() {
     let skills = pi::resources::load_skills(pi::resources::LoadSkillsOptions {
         cwd: root,
         agent_dir: pi::config::Config::global_dir(),
+        home_dir: None,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
@@ -185,6 +186,35 @@ fn read_skill_via_tool_matches_loader() {
         assert!(text.contains(line.trim()), "loader line missing: {line}");
     }
     pi::skills_managed::delete(&name).expect("cleanup");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn read_universal_skill_and_supporting_file_via_tool() {
+    let case = "read_universal_skill_and_supporting_file_via_tool";
+    let harness = TestHarness::new(case);
+    let project = harness.create_dir("project");
+    harness.create_file(
+        "project/.agents/skills/universal-probe/SKILL.md",
+        b"---\nname: universal-probe\ndescription: Universal URI fixture\n---\nUniversal body.\n",
+    );
+    harness.create_file(
+        "project/.agents/skills/universal-probe/references/example.md",
+        b"Universal supporting material.\n",
+    );
+    let tool = pi::tools::ReadTool::new(&project);
+    for (path, expected) in [
+        ("skill://universal-probe", "Universal body."),
+        (
+            "skill://universal-probe/references/example.md",
+            "Universal supporting material.",
+        ),
+    ] {
+        let output = block_on_local(tool.execute("universal-read", json!({"path": path}), None))
+            .expect("read universal skill resource");
+        assert!(!output.is_error, "{}", first_text(&output));
+        assert!(first_text(&output).contains(expected));
+    }
     finish_case(&harness, case);
 }
 

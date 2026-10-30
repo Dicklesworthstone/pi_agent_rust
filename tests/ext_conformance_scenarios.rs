@@ -706,6 +706,7 @@ fn execute_resource_discovery_scenario(extension_path: &Path) -> Value {
     let skills = load_skills(LoadSkillsOptions {
         cwd: extension_root.clone(),
         agent_dir: extension_root.clone(),
+        home_dir: None,
         skill_paths: vec![skill_dir],
         include_defaults: false,
     });

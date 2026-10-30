@@ -75,6 +75,7 @@ fn load_skills_defaults_and_collision_diagnostics() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
@@ -129,6 +130,86 @@ fn load_skills_defaults_and_collision_diagnostics() {
 }
 
 #[test]
+fn load_skills_universal_defaults_preserve_scope_and_native_precedence() {
+    let harness =
+        TestHarness::new("load_skills_universal_defaults_preserve_scope_and_native_precedence");
+    let cwd = harness.temp_path("project");
+    let agent_dir = harness.temp_path("custom-agent");
+    let home_dir = harness.temp_path("home");
+    let explicit_dir = harness.temp_path("explicit");
+    let tiers = [
+        (cwd.join(".pi/skills"), "project"),
+        (cwd.join(".agents/skills"), "project"),
+        (agent_dir.join("skills"), "user"),
+        (home_dir.join(".agents/skills"), "user"),
+        (explicit_dir.clone(), "path"),
+        (agent_dir.join("skills.managed"), "managed"),
+    ];
+    let names = [
+        "all-scopes",
+        "project-universal",
+        "user-native",
+        "user-universal",
+        "explicit-only",
+        "managed-only",
+    ];
+
+    // Every winner competes with all lower tiers, including a custom Pi user
+    // directory unrelated to the home directory used for universal skills.
+    for (first_tier, name) in names.iter().enumerate() {
+        for (dir, _) in &tiers[first_tier..] {
+            write_skill(&harness, &dir.join(name), name, "Skill description", "");
+        }
+    }
+
+    let result = load_skills(LoadSkillsOptions {
+        cwd,
+        agent_dir,
+        home_dir: Some(home_dir),
+        skill_paths: vec![explicit_dir],
+        include_defaults: true,
+    });
+
+    assert_eq!(
+        result
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "all-scopes",
+            "explicit-only",
+            "managed-only",
+            "project-universal",
+            "user-native",
+            "user-universal",
+        ],
+    );
+    assert_eq!(result.diagnostics.len(), 15);
+    for (winner_tier, name) in names.iter().enumerate() {
+        let expected_path = tiers[winner_tier].0.join(name).join("SKILL.md");
+        let skill = result
+            .skills
+            .iter()
+            .find(|skill| skill.name == *name)
+            .expect("skill from winning tier");
+        assert_eq!(skill.file_path, expected_path);
+        assert_eq!(skill.source, tiers[winner_tier].1);
+        for (loser_dir, _) in &tiers[winner_tier + 1..] {
+            let loser_path = loser_dir.join(name).join("SKILL.md");
+            assert!(result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == DiagnosticKind::Collision
+                    && diagnostic.collision.as_ref().is_some_and(|collision| {
+                        collision.name == *name
+                            && collision.winner_path == expected_path
+                            && collision.loser_path == loser_path
+                    })
+            }));
+        }
+    }
+}
+
+#[test]
 fn load_skills_reports_unknown_frontmatter_fields() {
     let harness = TestHarness::new("load_skills_reports_unknown_frontmatter_fields");
 
@@ -143,6 +224,7 @@ fn load_skills_reports_unknown_frontmatter_fields() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: vec![gamma_dir],
         include_defaults: false,
     });
@@ -195,6 +277,7 @@ fn load_skills_requires_description() {
     let result = load_skills(LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: vec![delta_dir],
         include_defaults: false,
     });
@@ -524,9 +607,12 @@ const fn resource_precedence(resource: &ResolvedResource) -> u8 {
     match (resource.metadata.scope, resource.metadata.origin) {
         (PackageScope::Temporary, _) => 0,
         (PackageScope::Project, ResourceOrigin::TopLevel) => 1,
-        (PackageScope::User, ResourceOrigin::TopLevel) => 2,
-        (PackageScope::Project, ResourceOrigin::Package) => 3,
-        (PackageScope::User, ResourceOrigin::Package) => 4,
+        (PackageScope::Project, ResourceOrigin::Universal) => 2,
+        (PackageScope::User, ResourceOrigin::TopLevel) => 3,
+        (PackageScope::User, ResourceOrigin::Universal) => 4,
+        (PackageScope::Project, ResourceOrigin::Package) => 5,
+        (PackageScope::User, ResourceOrigin::Package) => 6,
+        (_, ResourceOrigin::Managed) => 7,
     }
 }
 
@@ -546,6 +632,7 @@ fn resolved_paths_feed_skill_and_prompt_loaders_with_collision_diagnostics() {
     let manager = PackageManager::new(cwd.clone());
     let roots = ResolveRoots {
         project_settings_enabled: true,
+        home_dir: None,
         global_settings_path: global_base_dir.join("settings.json"),
         project_settings_path: project_base_dir.join("settings.json"),
         global_base_dir: global_base_dir.clone(),
@@ -559,6 +646,7 @@ fn resolved_paths_feed_skill_and_prompt_loaders_with_collision_diagnostics() {
     let skills_result = load_skills(LoadSkillsOptions {
         cwd: cwd.clone(),
         agent_dir: global_base_dir.clone(),
+        home_dir: None,
         skill_paths,
         include_defaults: false,
     });

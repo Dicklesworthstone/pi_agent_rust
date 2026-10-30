@@ -8,6 +8,8 @@ use pi::package_manager::{
     PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolveRoots, ResolvedResource,
     ResourceOrigin,
 };
+#[cfg(unix)]
+use pi::resources::{LoadSkillsOptions, load_skills};
 use std::path::{Path, PathBuf};
 
 fn write_json(path: &Path, value: &serde_json::Value) {
@@ -47,6 +49,279 @@ fn log_resolved(harness: &TestHarness, label: &str, items: &[ResolvedResource]) 
                 ));
             }
         });
+}
+
+fn isolated_skill_roots(harness: &TestHarness) -> (PackageManager, ResolveRoots) {
+    let cwd = harness.create_dir("project");
+    let global_base_dir = harness.create_dir("custom-agent");
+    let project_base_dir = cwd.join(".pi");
+    let roots = ResolveRoots {
+        global_settings_path: global_base_dir.join("settings.json"),
+        project_settings_path: project_base_dir.join("settings.json"),
+        global_base_dir,
+        project_base_dir,
+        project_settings_enabled: true,
+        home_dir: Some(harness.create_dir("home")),
+    };
+    write_json(&roots.global_settings_path, &serde_json::json!({}));
+    write_json(&roots.project_settings_path, &serde_json::json!({}));
+    (PackageManager::new(cwd), roots)
+}
+
+fn create_resolver_skill(harness: &TestHarness, path: &str) -> PathBuf {
+    harness.create_file(
+        path,
+        b"---\ndescription: Resolver fixture\n---\nSkill instructions.\n",
+    )
+}
+
+#[test]
+fn resolve_with_roots_discovers_universal_and_managed_skill_metadata() {
+    let harness =
+        TestHarness::new("resolve_with_roots_discovers_universal_and_managed_skill_metadata");
+    let (manager, roots) = isolated_skill_roots(&harness);
+    let locations = [
+        (
+            "project/.pi/skills/native-project/SKILL.md",
+            PackageScope::Project,
+            ResourceOrigin::TopLevel,
+        ),
+        (
+            "project/.agents/skills/universal-project/SKILL.md",
+            PackageScope::Project,
+            ResourceOrigin::Universal,
+        ),
+        (
+            "custom-agent/skills/native-user/SKILL.md",
+            PackageScope::User,
+            ResourceOrigin::TopLevel,
+        ),
+        (
+            "home/.agents/skills/universal-user/SKILL.md",
+            PackageScope::User,
+            ResourceOrigin::Universal,
+        ),
+        (
+            "custom-agent/skills.managed/authored/SKILL.md",
+            PackageScope::User,
+            ResourceOrigin::Managed,
+        ),
+    ];
+    for (relative, _, _) in &locations {
+        create_resolver_skill(&harness, relative);
+    }
+    // Parent ignore rules must not hide selected resource roots. Ignore files
+    // inside a selected root still apply, and unrelated projects are not walked.
+    harness.create_file("project/.ignore", b".agents/\n");
+    harness.create_file("home/.ignore", b".agents/\n");
+    harness.create_file("project/.agents/skills/.ignore", b"ignored/\n");
+    for relative in [
+        "project/.agents/skills/ignored/SKILL.md",
+        "project/nested/.agents/skills/unrelated/SKILL.md",
+        ".agents/skills/ancestor/SKILL.md",
+        "home/another-project/.agents/skills/unrelated/SKILL.md",
+        "custom-agent/.agents/skills/not-home/SKILL.md",
+    ] {
+        create_resolver_skill(&harness, relative);
+    }
+
+    let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve skill roots");
+    log_resolved(&harness, "skills", &resolved.skills);
+    assert_eq!(resolved.skills.len(), locations.len());
+    for (relative, scope, origin) in locations {
+        let expected = harness.temp_path(relative);
+        let item = resolved
+            .skills
+            .iter()
+            .find(|item| item.path == expected)
+            .expect("default skill discovered");
+        assert!(item.enabled);
+        assert_eq!(item.metadata.scope, scope);
+        assert_eq!(item.metadata.origin, origin);
+        assert_eq!(item.metadata.source, "auto");
+        let expected_base = if scope == PackageScope::Project {
+            &roots.project_base_dir
+        } else {
+            &roots.global_base_dir
+        };
+        assert_eq!(item.metadata.base_dir.as_ref(), Some(expected_base));
+    }
+    let repeated = run_async(manager.resolve_with_roots(&roots)).expect("resolve again");
+    assert_eq!(
+        resolved
+            .skills
+            .iter()
+            .map(|item| &item.path)
+            .collect::<Vec<_>>(),
+        repeated
+            .skills
+            .iter()
+            .map(|item| &item.path)
+            .collect::<Vec<_>>(),
+        "discovery order must be deterministic"
+    );
+}
+
+#[test]
+fn resolve_with_roots_skips_project_skills_when_project_settings_disabled() {
+    let harness =
+        TestHarness::new("resolve_with_roots_skips_project_skills_when_project_settings_disabled");
+    let (manager, mut roots) = isolated_skill_roots(&harness);
+    for relative in [
+        "project/.pi/skills/project-native/SKILL.md",
+        "project/.agents/skills/project-universal/SKILL.md",
+        "custom-agent/skills/user-native/SKILL.md",
+        "home/.agents/skills/user-universal/SKILL.md",
+        "custom-agent/skills.managed/authored/SKILL.md",
+    ] {
+        create_resolver_skill(&harness, relative);
+    }
+    // A disabled project scope must not read its settings either.
+    std::fs::write(&roots.project_settings_path, "invalid JSON").expect("write project settings");
+    roots.project_settings_enabled = false;
+    let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve user skills");
+    assert_eq!(resolved.skills.len(), 3);
+    assert!(
+        resolved
+            .skills
+            .iter()
+            .all(|item| item.metadata.scope == PackageScope::User)
+    );
+    assert!(
+        resolved
+            .skills
+            .iter()
+            .any(|item| item.metadata.origin == ResourceOrigin::Universal)
+    );
+
+    roots.home_dir = None;
+    let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve without a home");
+    assert_eq!(resolved.skills.len(), 2);
+    assert!(
+        resolved
+            .skills
+            .iter()
+            .all(|item| item.metadata.origin != ResourceOrigin::Universal)
+    );
+}
+
+#[test]
+fn resolve_with_roots_universal_skills_honor_scope_overrides() {
+    let harness = TestHarness::new("resolve_with_roots_universal_skills_honor_scope_overrides");
+    let (manager, roots) = isolated_skill_roots(&harness);
+    create_resolver_skill(&harness, "project/.agents/skills/shared/SKILL.md");
+    create_resolver_skill(&harness, "home/.agents/skills/shared/SKILL.md");
+    for (force_include, force_exclude, enabled) in [
+        (false, false, false),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        let mut project = vec!["!shared"];
+        let mut global = vec!["!shared"];
+        if force_include {
+            project.push("+../.agents/skills/shared");
+            global.push("+../home/.agents/skills/shared");
+        }
+        if force_exclude {
+            project.push("-../.agents/skills/shared");
+            global.push("-../home/.agents/skills/shared");
+        }
+        write_json(
+            &roots.project_settings_path,
+            &serde_json::json!({"skills": project}),
+        );
+        write_json(
+            &roots.global_settings_path,
+            &serde_json::json!({"skills": global}),
+        );
+        let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve overrides");
+        assert_eq!(resolved.skills.len(), 2);
+        for item in resolved.skills {
+            assert_eq!(item.enabled, enabled, "{}", item.path.display());
+            assert_eq!(item.metadata.origin, ResourceOrigin::Universal);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_with_roots_disabled_alias_does_not_hide_enabled_user_skill() {
+    use std::os::unix::fs::symlink;
+
+    let harness =
+        TestHarness::new("resolve_with_roots_disabled_alias_does_not_hide_enabled_user_skill");
+    let (manager, roots) = isolated_skill_roots(&harness);
+    let native = roots.project_base_dir.join("skills");
+    create_resolver_skill(&harness, "project/.pi/skills/shared/SKILL.md");
+    harness.create_dir("project/.agents");
+    harness.create_dir("home/.agents");
+    symlink(&native, harness.temp_path("project/.agents/skills")).expect("project alias");
+    symlink(&native, harness.temp_path("home/.agents/skills")).expect("user alias");
+    symlink(&native, native.join("shared/loop")).expect("directory cycle");
+    write_json(
+        &roots.project_settings_path,
+        &serde_json::json!({"skills": ["!shared"]}),
+    );
+
+    let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve aliased roots");
+    assert_eq!(
+        resolved.skills.len(),
+        3,
+        "one candidate per root spelling, no loop duplicates"
+    );
+    let user_alias = harness.temp_path("home/.agents/skills/shared/SKILL.md");
+    let skill_paths = resolved
+        .skills
+        .into_iter()
+        .filter(|item| item.enabled)
+        .map(|item| {
+            assert_eq!(item.metadata.scope, PackageScope::User);
+            assert_eq!(item.metadata.origin, ResourceOrigin::Universal);
+            item.path
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(skill_paths.as_slice(), std::slice::from_ref(&user_alias));
+    let loaded = load_skills(LoadSkillsOptions {
+        cwd: harness.temp_path("project"),
+        agent_dir: roots.global_base_dir,
+        home_dir: roots.home_dir,
+        skill_paths,
+        include_defaults: false,
+    });
+    assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+    assert_eq!(loaded.skills.len(), 1);
+    assert_eq!(loaded.skills[0].file_path, user_alias);
+    assert_eq!(
+        loaded.skills[0].source, "user",
+        "the enabled spelling owns provenance"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_with_roots_walks_nested_skill_root_with_its_own_markdown_rules() {
+    use std::os::unix::fs::symlink;
+
+    let harness =
+        TestHarness::new("resolve_with_roots_walks_nested_skill_root_with_its_own_markdown_rules");
+    let (manager, roots) = isolated_skill_roots(&harness);
+    let nested = roots.project_base_dir.join("skills/nested");
+    create_resolver_skill(&harness, "project/.pi/skills/nested/standalone.md");
+    let native_skill = create_resolver_skill(&harness, "project/.pi/skills/nested/child/SKILL.md");
+    create_resolver_skill(&harness, "project/.pi/skills/nested/child/reference.md");
+    harness.create_dir("project/.agents");
+    symlink(&nested, harness.temp_path("project/.agents/skills")).expect("nested root alias");
+
+    let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve nested root");
+    let paths = resolved
+        .skills
+        .into_iter()
+        .map(|item| item.path)
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 3);
+    assert!(paths.contains(&native_skill));
+    assert!(paths.contains(&harness.temp_path("project/.agents/skills/child/SKILL.md")));
+    assert!(paths.contains(&harness.temp_path("project/.agents/skills/standalone.md")));
 }
 
 #[test]
@@ -199,6 +474,7 @@ fn resolve_with_roots_auto_discovery_ignores_parent_gitignore() {
         project_settings_path,
         global_base_dir,
         project_base_dir,
+        home_dir: None,
     };
 
     let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve_with_roots");
@@ -237,6 +513,7 @@ fn resolve_with_roots_applies_auto_discovery_override_patterns() {
         project_settings_path: project_settings_path.clone(),
         global_base_dir,
         project_base_dir,
+        home_dir: None,
     };
 
     harness.section("default enabled (no overrides)");
@@ -374,6 +651,7 @@ fn resolve_with_roots_applies_package_filters_and_prefers_project_package() {
         project_settings_path,
         global_base_dir,
         project_base_dir,
+        home_dir: None,
     };
 
     let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve_with_roots");
@@ -672,6 +950,7 @@ fn resolve_with_roots_auto_discovers_extension_directory_entries() {
         project_settings_path,
         global_base_dir,
         project_base_dir: project_base_dir.clone(),
+        home_dir: None,
     };
 
     let extensions_dir = project_base_dir.join("extensions");
@@ -730,6 +1009,7 @@ fn resolve_with_roots_auto_discovers_extension_directory_index_fallback() {
         project_settings_path,
         global_base_dir,
         project_base_dir: project_base_dir.clone(),
+        home_dir: None,
     };
 
     let extensions_dir = project_base_dir.join("extensions");
@@ -774,6 +1054,7 @@ fn resolve_with_roots_auto_discovery_follows_symlink_extension_dirs() {
         project_settings_path,
         global_base_dir,
         project_base_dir: project_base_dir.clone(),
+        home_dir: None,
     };
 
     let real_pkg_dir = harness.create_dir("real_pkg");
@@ -860,6 +1141,7 @@ fn resolve_with_roots_fixture_project_package_overrides_global_and_filters_resou
         project_settings_path: project_base_dir.join("settings.json"),
         global_base_dir: global_base_dir.clone(),
         project_base_dir: project_base_dir.clone(),
+        home_dir: None,
     };
 
     let resolved = run_async(manager.resolve_with_roots(&roots)).expect("resolve_with_roots");

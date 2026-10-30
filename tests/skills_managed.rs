@@ -111,6 +111,7 @@ fn promote_then_fresh_discovery_finds_managed_skill() {
     let loaded = pi::resources::load_skills(pi::resources::LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
@@ -229,6 +230,7 @@ fn user_skill_shadows_managed_with_diagnostic() {
     let loaded = pi::resources::load_skills(pi::resources::LoadSkillsOptions {
         cwd,
         agent_dir,
+        home_dir: None,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
