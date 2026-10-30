@@ -66,6 +66,13 @@ Keys are specified as `modifier+key`.
 | `pageUp` | `pageup` | Scroll up by page |
 | `pageDown` | `pagedown` | Scroll down by page |
 
+`cursorUp` and `cursorDown` also browse sent prompts when the draft occupies
+one visible row. Recalled entries stay browsable until edited, even if they
+contain newlines or wrap across rows. Editing a recalled entry makes it the
+current draft: multiline drafts use these actions for cursor movement. If you
+start browsing again from a one-row draft, moving forward past the newest
+entry restores that edited draft.
+
 ### Deletion
 
 | Action ID | Default Keys | Description |
@@ -135,6 +142,10 @@ Keys are specified as `modifier+key`.
 |-----------|--------------|-------------|
 | `followUp` | `alt+enter` | Queue follow-up message |
 | `dequeue` | `alt+up` | Restore queued messages to editor |
+
+Finish or dismiss an active ask, extension question, or login prompt before
+restoring queued messages. Restoring places queued messages in send order
+ahead of the current draft, preserving the draft's blank lines and spaces.
 
 ### Selection (Lists/Pickers)
 
