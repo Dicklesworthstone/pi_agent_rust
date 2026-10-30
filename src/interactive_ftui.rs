@@ -1977,6 +1977,12 @@ pub struct PiFtuiModel {
     deferred_notes: Vec<String>,
     /// Terminal size, tracked from `Event::Resize` (cols, rows).
     term: (u16, u16),
+    /// Inline mouse coordinates require a measured physical terminal size,
+    /// not the fallback dimensions used before startup or a resize event.
+    term_size_known: bool,
+    /// Height of the last painted local frame. `InlineAuto` can change this
+    /// without a terminal resize while keeping the UI anchored at the bottom.
+    rendered_frame_height: std::cell::Cell<u16>,
     /// Conversation scroll, measured in lines UP from the tail. 0 means
     /// follow-the-stream (stick to bottom as new content arrives) — the same
     /// semantics as `follow_stream_tail` in the bubbletea stack, but derived
@@ -2343,6 +2349,8 @@ impl PiFtuiModel {
             turn_control: None,
             btw_client: None,
             term: (80, 24),
+            term_size_known: false,
+            rendered_frame_height: std::cell::Cell::new(0),
             scroll_from_tail: 0,
             rendered_total_lines: std::cell::Cell::new(0),
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
@@ -3477,7 +3485,11 @@ impl PiFtuiModel {
                 provider,
                 accepts_empty_input,
             } => {
-                self.login_pending = provider.map(|provider| (provider, accepts_empty_input));
+                let pending = provider.map(|provider| (provider, accepts_empty_input));
+                if self.login_pending != pending {
+                    self.input.reset_mouse_interaction();
+                }
+                self.login_pending = pending;
             }
             PiMsg::StatusSnapshot(snapshot) => {
                 self.status_snapshot = Some(snapshot);
@@ -6131,12 +6143,38 @@ impl PiFtuiModel {
                     self.maybe_trigger_autocomplete();
                 }
             }
+            Event::Mouse(_) if !self.mouse => {}
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_up(3),
                 MouseEventKind::ScrollDown => self.scroll_down(3),
+                _ if self.editor_mouse_active() => {
+                    let mut local = *mouse;
+                    if !self.alt_screen {
+                        let height = self.rendered_frame_height.get();
+                        if !self.term_size_known || height == 0 {
+                            return Cmd::none();
+                        }
+                        // FrankenTUI forwards physical terminal coordinates,
+                        // while its bottom-anchored inline frame starts at 0.
+                        let top = self.term.1.saturating_sub(height);
+                        if mouse.y < top && matches!(mouse.kind, MouseEventKind::Down(_)) {
+                            self.input.reset_mouse_interaction();
+                            return Cmd::none();
+                        }
+                        // A drag above the UI still clamps to its first row;
+                        // releases outside it must still end the gesture.
+                        local.y = mouse.y.saturating_sub(top);
+                    }
+                    if self.input.handle_event(&Event::Mouse(local)) {
+                        self.maybe_trigger_autocomplete();
+                    }
+                }
                 _ => {}
             },
             Event::Resize { width, height } => {
+                // Mouse coordinates belong to the last painted viewport.
+                // Wait for the resized editor to render before using them.
+                self.input.reset_mouse_interaction();
                 // Cached blocks are wrapped (issue #227) and their tables
                 // fitted (gh #195) for one width; drop them when it changes.
                 // Height-only resizes keep the cache. `conversation_text`
@@ -6146,6 +6184,7 @@ impl PiFtuiModel {
                     self.render_cache.borrow_mut().clear();
                 }
                 self.term = (*width, *height);
+                self.term_size_known = true;
                 // The suspend task reports back through a Resize; the flag
                 // unfreezes tick-driven model changes from here on.
                 self.suspending = false;
@@ -6191,6 +6230,17 @@ impl PiFtuiModel {
             || (self.state == AgentUiState::Working && self.turn_control.is_some())
     }
 
+    /// Mouse editing belongs to the visible composer. Pickers and custom
+    /// components may retain its draft while taking ownership of input.
+    fn editor_mouse_active(&self) -> bool {
+        self.mouse
+            && self.input_active()
+            && self.picker.is_none()
+            && !self.custom_overlay_open()
+            && !self.settings_pending
+            && !self.suspending
+    }
+
     /// Fail closed every modal owned by the completed/replaced turn. Replies
     /// are emitted before state is cleared so no Ask or extension waiter can
     /// survive invisibly and consume ordinary editor input later.
@@ -6234,6 +6284,9 @@ impl PiFtuiModel {
     /// Card answers own the editor until the burst settles, so the draft is
     /// cleared before the first card becomes reachable.
     fn capture_preexisting_card_draft(&mut self) {
+        // Even an empty prompt can have a pending mouse gesture. An answer
+        // is a new editor owner regardless of whether a draft was saved.
+        self.input.reset_mouse_interaction();
         let draft = self.input.text();
         if self.card_draft_snapshot.is_none() && !draft.is_empty() {
             self.card_draft_snapshot = Some(draft);
@@ -6532,7 +6585,10 @@ impl Model for PiFtuiModel {
     fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
         let probe = self.watchdog.start();
         if self.prune_expired_ask_card()
-            && matches!(&msg, PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_)))
+            && matches!(
+                &msg,
+                PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_) | Event::Mouse(_))
+            )
         {
             // The event was intended for the expired card, not the restored
             // pre-card draft or a newly promoted extension question.
@@ -6585,12 +6641,18 @@ impl Model for PiFtuiModel {
             // raw mode / alt screen / mouse; the next frame repaints the
             // freshly-cleared alternate buffer in full.
             PiFtuiMsg::Resumed => {
+                self.input.reset_mouse_interaction();
                 self.suspending = false;
                 Cmd::none()
             }
         };
         if reconcile_history {
             self.detach_edited_history();
+        }
+        // Reset as soon as ownership changes, even if a modal opens and
+        // closes without receiving a mouse event between those updates.
+        if !self.editor_mouse_active() {
+            self.input.reset_mouse_interaction();
         }
         self.watchdog.finish(phase, probe);
         cmd
@@ -6599,6 +6661,12 @@ impl Model for PiFtuiModel {
     fn view(&self, frame: &mut Frame) {
         let probe = self.watchdog.start();
         self.render_frame(frame);
+        self.rendered_frame_height.set(frame.height());
+        // A frame may skip the editor or display its retained draft behind
+        // another owner. Neither leaves an interactive hit area behind.
+        if !self.editor_mouse_active() {
+            self.input.reset_mouse_interaction();
+        }
         self.watchdog.finish(LoopPhase::Render, probe);
     }
 
@@ -11381,6 +11449,12 @@ pub fn run(
         .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
+    // The runtime paints once before sending any Resize. Inline pointer
+    // events need the physical size even when that first frame is shorter.
+    if let Ok((width, height)) = crossterm::terminal::size() {
+        model.term = (width.max(1), height.max(1));
+        model.term_size_known = true;
+    }
     if let Some(workspace) = workspace {
         model.autocomplete.provider.set_workspace(workspace);
     }
@@ -11565,6 +11639,7 @@ fn encode_custom_ui_key(key: &ftui::KeyEvent) -> Option<String> {
 mod tests {
     use super::*;
     use crate::model::StopReason;
+    use ftui::core::event::{MouseButton, MouseEvent};
     use ftui::runtime::simulator::{CmdRecord, ProgramSimulator};
     use ftui::{KeyEvent, KeyEventKind};
     use std::sync::mpsc;
@@ -11575,6 +11650,10 @@ mod tests {
             modifiers,
             kind: KeyEventKind::Press,
         })
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent::new(kind, x, y))
     }
 
     fn new_model() -> (mpsc::Sender<PiMsg>, PiFtuiModel) {
@@ -12290,6 +12369,456 @@ mod tests {
             buffer_text(&frame.buffer, width, height),
             frame.cursor_position,
         )
+    }
+
+    #[test]
+    fn mouse_click_edits_an_earlier_line_and_detaches_history_only_on_edit() {
+        let (_tx, mut model) = new_model();
+        model.record_history("first\nsecond");
+        model.input.set_text("saved draft");
+        let mut sim = ProgramSimulator::new(model.with_alt_screen(true));
+        sim.init();
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        let bottom = frame_with_cursor(sim.model(), 20, 12)
+            .1
+            .expect("editor cursor")
+            .1;
+        sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, bottom - 1));
+        sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 2, bottom - 1));
+        let cursor = sim.model().input.cursor();
+        assert_eq!((cursor.line, cursor.grapheme), (0, 2));
+        assert!(sim.model().input.selection().is_none());
+        assert_eq!(sim.model().input.undo_op_count(), 0);
+        assert_eq!(sim.model().history_cursor, Some(0));
+
+        type_str(&mut sim, "X");
+        assert_eq!(sim.model().input.text(), "fiXrst\nsecond");
+        assert_eq!(sim.model().history_cursor, None);
+        assert_eq!(sim.model().input_history[0], "first\nsecond");
+        assert_eq!(
+            frame_with_cursor(sim.model(), 20, 12).1,
+            Some((3, bottom - 1))
+        );
+    }
+
+    #[test]
+    fn mouse_drag_replaces_multiline_selection_and_undo_restores_surrounding_text() {
+        let original = "keep\nfirst\nsecond\nlast";
+        let (_tx, mut model) = new_model();
+        model.input.set_text(original);
+        let mut sim = ProgramSimulator::new(model.with_alt_screen(true));
+        sim.init();
+        let bottom = frame_with_cursor(sim.model(), 20, 12)
+            .1
+            .expect("editor cursor")
+            .1;
+        sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, bottom - 2));
+        sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, bottom - 1));
+        sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 3, bottom - 1));
+        assert_eq!(
+            sim.model().input.selected_text().as_deref(),
+            Some("irst\nsec")
+        );
+        assert_eq!(sim.model().input.undo_op_count(), 0);
+        let selected_cursor = sim.model().input.cursor();
+
+        type_str(&mut sim, "X");
+        assert_eq!(sim.model().input.text(), "keep\nfXond\nlast");
+        assert!(sim.model().input.selection().is_none());
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), original);
+        assert_eq!(sim.model().input.cursor(), selected_cursor);
+        sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep\nfXond\nlast");
+    }
+
+    #[test]
+    fn mouse_clicks_follow_wrapping_graphemes_and_the_scrolled_editor_viewport() {
+        for (text, width, click, logical, caret) in [
+            ("aaaa bbbb cccc", 10, (2, 10), (0, 12), (2, 10)),
+            ("界界x", 4, (1, 9), (0, 0), (0, 9)),
+            ("界界x", 4, (3, 9), (0, 1), (2, 9)),
+            ("界界", 4, (3, 10), (0, 2), (0, 10)),
+            (
+                "zero\none\ntwo\nthree\nfour\nfive\nsix\nseven",
+                20,
+                (2, 6),
+                (3, 2),
+                (2, 6),
+            ),
+        ] {
+            // Independent presses must not turn into timed double clicks.
+            let (_tx, mut model) = new_model();
+            model.input.set_text(text);
+            let mut sim = ProgramSimulator::new(model.with_alt_screen(true));
+            sim.init();
+            let _ = frame_with_cursor(sim.model(), width, 12);
+            sim.inject_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                click.0,
+                click.1,
+            ));
+            sim.inject_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                click.0,
+                click.1,
+            ));
+            let cursor = sim.model().input.cursor();
+            assert_eq!((cursor.line, cursor.grapheme), logical, "{text:?}");
+            assert_eq!(
+                frame_with_cursor(sim.model(), width, 12).1,
+                Some(caret),
+                "{text:?}"
+            );
+            assert_eq!(sim.model().input.text(), text);
+            assert_eq!(sim.model().input.undo_op_count(), 0);
+        }
+    }
+
+    #[test]
+    fn mouse_waits_for_paint_after_resize_or_resume_and_ignores_outside_drags() {
+        for resized in [false, true] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text("first\nsecond");
+            let mut sim = ProgramSimulator::new(model.with_alt_screen(true));
+            sim.init();
+            let before = sim.model().input.cursor();
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 9));
+            assert_eq!(sim.model().input.cursor(), before, "before first paint");
+            let _ = frame_with_cursor(sim.model(), 20, 12);
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 9));
+            let before = sim.model().input.cursor();
+            assert_eq!((before.line, before.grapheme), (0, 2));
+
+            let (width, height) = if resized {
+                sim.inject_event(Event::Resize {
+                    width: 12,
+                    height: 14,
+                });
+                (12, 14)
+            } else {
+                sim.send(PiFtuiMsg::Resumed);
+                (20, 12)
+            };
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 10));
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 4, 9));
+            assert_eq!(sim.model().input.cursor(), before, "stale viewport");
+            assert!(sim.model().input.selection().is_none());
+
+            let _ = frame_with_cursor(sim.model(), width, height);
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, height - 2));
+            let before = sim.model().input.cursor();
+            assert_eq!((before.line, before.grapheme), (1, 1));
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 4, height - 2));
+            assert_eq!(sim.model().input.cursor(), before, "press outside editor");
+            assert!(sim.model().input.selection().is_none());
+            assert_eq!(sim.model().input.text(), "first\nsecond");
+        }
+    }
+
+    #[test]
+    fn inline_mouse_uses_physical_rows_and_tracks_frame_growth() {
+        for (terminal_height, frame_height) in [(24, 12), (36, 10)] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text("first\nsecond");
+            let mut sim = ProgramSimulator::new(model.with_alt_screen(false));
+            sim.init();
+            let _ = frame_with_cursor(sim.model(), 20, frame_height);
+            let before = sim.model().input.cursor();
+            let first_row = terminal_height - 3;
+            let second_row = terminal_height - 2;
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, first_row));
+            assert_eq!(sim.model().input.cursor(), before, "unknown physical size");
+
+            sim.inject_event(Event::Resize {
+                width: 20,
+                height: terminal_height,
+            });
+            let _ = frame_with_cursor(sim.model(), 20, frame_height);
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, first_row));
+            let before = sim.model().input.cursor();
+            assert_eq!((before.line, before.grapheme), (0, 2));
+
+            // A press in shell scrollback must not become a press at row 0.
+            let above = terminal_height - frame_height - 1;
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, above));
+            let _ = frame_with_cursor(sim.model(), 20, frame_height);
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, second_row));
+            assert_eq!(sim.model().input.cursor(), before);
+            assert!(sim.model().input.selection().is_none());
+
+            // A drag and its release outside the UI still reach the editor.
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, first_row));
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 1, above));
+            sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 1, above));
+            assert_eq!(sim.model().input.selected_text().as_deref(), Some("i"));
+            let before = sim.model().input.cursor();
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, second_row));
+            assert_eq!(sim.model().input.cursor(), before, "release above frame");
+            assert_eq!(sim.model().input.selected_text().as_deref(), Some("i"));
+
+            // InlineAuto can grow without Resize. Repaint cancels the old
+            // gesture and changes the physical-to-local row translation.
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 4, first_row));
+            let before = sim.model().input.cursor();
+            let grown_height = frame_height + 2;
+            let _ = frame_with_cursor(sim.model(), 20, grown_height);
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, second_row));
+            assert_eq!(sim.model().input.cursor(), before, "frame grew");
+            assert!(sim.model().input.selection().is_none());
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, first_row));
+            let cursor = sim.model().input.cursor();
+            assert_eq!((cursor.line, cursor.grapheme), (0, 1));
+            assert_eq!(
+                frame_with_cursor(sim.model(), 20, grown_height).1,
+                Some((1, grown_height - 3))
+            );
+            assert_eq!(sim.model().input.text(), "first\nsecond");
+        }
+    }
+
+    #[test]
+    fn modal_round_trips_cancel_mouse_gestures_even_without_blocked_mouse_events() {
+        for owner in ["settings", "custom", "working", "suspending"] {
+            for blocked_mouse in [false, true] {
+                let (_tx, mut model) = new_model();
+                let (submit_tx, _submit_rx) = mpsc::channel();
+                model.input.set_text("first\nsecond");
+                let mut sim = ProgramSimulator::new(
+                    model.with_submit_channel(submit_tx).with_alt_screen(true),
+                );
+                sim.init();
+                let _ = frame_with_cursor(sim.model(), 20, 12);
+                sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 9));
+                let before = sim.model().input.cursor();
+                match owner {
+                    "settings" => {
+                        sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));
+                        assert!(sim.model().settings_pending);
+                    }
+                    "custom" => send_ui_effect(
+                        &mut sim,
+                        "setWidget",
+                        serde_json::json!({
+                            "widgetKey": EXT_CUSTOM_OVERLAY_KEY,
+                            "lines": ["modal"],
+                        }),
+                    ),
+                    "working" => sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart)),
+                    _ => {
+                        sim.model_mut().suspending = true;
+                        sim.inject_event(Event::Tick);
+                    }
+                }
+                assert!(!sim.model().editor_mouse_active(), "{owner}");
+                let _ = frame_with_cursor(sim.model(), 20, 12);
+                if blocked_mouse {
+                    sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 9));
+                    sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 10));
+                    sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 4, 10));
+                    assert_eq!(sim.model().input.cursor(), before, "{owner}");
+                }
+                match owner {
+                    "settings" => {
+                        sim.send(PiFtuiMsg::Agent(PiMsg::Settings {
+                            snapshot: settings_snapshot_fixture(),
+                            changed: None,
+                        }));
+                        assert!(sim.model().picker.is_some());
+                        let _ = frame_with_cursor(sim.model(), 20, 12);
+                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                    }
+                    "custom" => send_ui_effect(
+                        &mut sim,
+                        "setWidget",
+                        serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "clear": true}),
+                    ),
+                    "working" => sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+                        usage: None,
+                        stop_reason: StopReason::Stop,
+                        error_message: None,
+                    })),
+                    _ => sim.send(PiFtuiMsg::Resumed),
+                }
+                assert!(sim.model().editor_mouse_active(), "{owner}");
+                let _ = frame_with_cursor(sim.model(), 20, 12);
+                sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 10));
+                assert_eq!(sim.model().input.cursor(), before, "{owner}");
+                assert!(sim.model().input.selection().is_none(), "{owner}");
+                assert_eq!(sim.model().input.text(), "first\nsecond");
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_capture_opt_out_and_transcript_wheels_preserve_the_editor() {
+        for enabled in [false, true] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text("first\nsecond");
+            let mut sim =
+                ProgramSimulator::new(model.with_mouse_enabled(enabled).with_alt_screen(true));
+            sim.init();
+            sim.inject_event(Event::Resize {
+                width: 30,
+                height: 12,
+            });
+            for index in 0..20 {
+                sim.send(PiFtuiMsg::Agent(PiMsg::System(format!("line {index}"))));
+            }
+            let _ = frame_with_cursor(sim.model(), 30, 12);
+            let before = sim.model().input.cursor();
+            if !enabled {
+                sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 9));
+                sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 10));
+                sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 4, 10));
+            }
+            sim.inject_event(mouse(MouseEventKind::ScrollUp, 2, 9));
+            assert_eq!(sim.model().scroll_from_tail, if enabled { 3 } else { 0 });
+            sim.inject_event(mouse(MouseEventKind::ScrollDown, 2, 9));
+            assert_eq!(sim.model().scroll_from_tail, 0);
+            assert_eq!(sim.model().input.cursor(), before);
+            assert!(sim.model().input.selection().is_none());
+            assert_eq!(sim.model().input.undo_op_count(), 0);
+            assert_eq!(sim.model().input.text(), "first\nsecond");
+        }
+    }
+
+    #[test]
+    fn card_answers_take_mouse_ownership_and_restore_the_preexisting_draft() {
+        for card in ["ask", "extension"] {
+            for draft in ["", "saved\nprompt"] {
+                let (_tx, mut model) = new_model();
+                model.input.set_text(draft);
+                let mut sim = ProgramSimulator::new(
+                    model.with_turn_control(Arc::default()).with_alt_screen(true),
+                );
+                sim.init();
+                sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+                let _ = frame_with_cursor(sim.model(), 20, 12);
+                sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 10));
+                if card == "ask" {
+                    sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                        "mouse-answer",
+                        vec![question("Choose?", &["A", "B"], false)],
+                    ))));
+                } else {
+                    sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                        "mouse-answer",
+                        "input",
+                        serde_json::json!({"title": "Reply"}),
+                    ))));
+                }
+                assert!(sim.model().editor_mouse_active());
+                sim.inject_event(Event::Paste(ftui::PasteEvent::new("first\nsecond", true)));
+                let _ = frame_with_cursor(sim.model(), 20, 12);
+                let before = sim.model().input.cursor();
+                sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 9));
+                assert_eq!(sim.model().input.cursor(), before, "{card}: {draft:?}");
+                assert!(sim.model().input.selection().is_none());
+
+                sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 9));
+                sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 10));
+                sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 3, 10));
+                assert_eq!(
+                    sim.model().input.selected_text().as_deref(),
+                    Some("irst\nsec")
+                );
+                type_str(&mut sim, "X");
+                assert_eq!(sim.model().input.text(), "fXond");
+                sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                assert!(sim.model().active_ask.is_none());
+                assert!(sim.model().active_ext.is_none());
+                assert_eq!(sim.model().input.text(), draft, "{card}");
+            }
+        }
+    }
+
+    #[test]
+    fn login_owner_changes_end_mouse_gestures_and_keep_the_reply_editable() {
+        for provider in [Some(String::from("openai")), None] {
+            let (_tx, mut model) = new_model();
+            model.input.set_text("first\nsecond");
+            let mut sim = ProgramSimulator::new(model.with_alt_screen(true));
+            sim.init();
+            if provider.is_none() {
+                sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                    provider: Some(String::from("openai")),
+                    accepts_empty_input: false,
+                }));
+            }
+            let _ = frame_with_cursor(sim.model(), 20, 12);
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 9));
+            let before = sim.model().input.cursor();
+            sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                provider,
+                accepts_empty_input: false,
+            }));
+            let _ = frame_with_cursor(sim.model(), 20, 12);
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 10));
+            assert_eq!(sim.model().input.cursor(), before);
+            assert!(sim.model().input.selection().is_none());
+            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 9));
+            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 10));
+            sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 3, 10));
+            type_str(&mut sim, "X");
+            assert_eq!(sim.model().input.text(), "fXond");
+        }
+    }
+
+    #[test]
+    fn expired_ask_mouse_event_does_not_move_the_restored_draft() {
+        let (_tx, rx) = mpsc::channel();
+        let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+        tool.register_channel_ui_request_for_tests("expired-mouse");
+        let current = Arc::new(Mutex::new(Some(tool.clone())));
+        let mut model = PiFtuiModel::new(rx)
+            .with_current_ask(current)
+            .with_alt_screen(true);
+        model.input.set_text("original\ndraft");
+        let original_cursor = model.input.cursor();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "expired-mouse",
+            vec![question("Choose?", &["A", "B"], false)],
+        ))));
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new("first\nsecond", true)));
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        tool.respond_ui(
+            "expired-mouse",
+            AskResponse {
+                answers: Vec::new(),
+                dismissed: true,
+            },
+        );
+        sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 9));
+        assert!(sim.model().active_ask.is_none());
+        assert_eq!(sim.model().input.text(), "original\ndraft");
+        assert_eq!(sim.model().input.cursor(), original_cursor);
+        assert!(sim.model().input.selection().is_none());
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 10));
+        assert_eq!(sim.model().input.cursor(), original_cursor);
+        assert!(sim.model().input.selection().is_none());
+    }
+
+    #[test]
+    fn mouse_cursor_moves_refresh_completion_before_accepting_it() {
+        let (_tx, mut model) = new_model();
+        model.input.set_text("/he");
+        let mut sim = ProgramSimulator::new(model.with_alt_screen(true));
+        sim.init();
+        let _ = frame_with_cursor(sim.model(), 20, 12);
+        assert!(!sim.model().completion_visible());
+        sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 10));
+        sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 2, 10));
+        assert_eq!(sim.model().input.text(), "/he");
+        assert_eq!(sim.model().input.cursor().grapheme, 2);
+        assert!(sim.model().completion_visible());
+        assert_eq!(sim.model().autocomplete.items[0].label, "/help");
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/help");
     }
 
     #[test]
