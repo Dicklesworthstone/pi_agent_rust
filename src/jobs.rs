@@ -1167,6 +1167,49 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
     Ok(Some(removed_bytes))
 }
 
+/// Managed writers hold their artifact lock until all output has been written.
+/// A directory scan can observe an earlier length just before that lock is
+/// released, so settled logs must be measured again under the acquired lock.
+fn artifact_file_reserved_bytes(
+    path: &Path,
+    scanned_metadata: &std::fs::Metadata,
+) -> std::io::Result<u64> {
+    if path.extension().is_none_or(|extension| extension != "log") {
+        return Ok(scanned_metadata.len());
+    }
+    let scanned_identity = FileIdentity::of_path_nofollow(path)?;
+    let artifact = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let opened_identity = FileIdentity::of_open_file(&artifact)?;
+    let current = std::fs::symlink_metadata(path)?;
+    let current_identity = FileIdentity::of_path_nofollow(path)?;
+    if !current.file_type().is_file()
+        || scanned_identity != current_identity
+        || opened_identity != current_identity
+    {
+        return Err(std::io::Error::other(format!(
+            "artifact identity changed while inspecting {}",
+            path.display()
+        )));
+    }
+    match fs4::FileExt::try_lock(&artifact) {
+        Ok(()) => {
+            let bytes = artifact.metadata().map(|metadata| metadata.len());
+            // Release the acquired lock even when querying the final size
+            // failed; propagate either error without admitting a new job.
+            fs4::FileExt::unlock(&artifact)?;
+            bytes
+        }
+        Err(fs4::TryLockError::WouldBlock) => Ok(artifact
+            .metadata()?
+            .len()
+            .max(u64::try_from(MAX_ARTIFACT_BYTES).unwrap_or(u64::MAX))),
+        Err(fs4::TryLockError::Error(err)) => Err(err),
+    }
+}
+
 fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
     let mut bytes = 0u64;
     let mut entries = 0usize;
@@ -1179,37 +1222,7 @@ fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_file() {
-            bytes = bytes.saturating_add(metadata.len());
-            if path.extension().is_some_and(|extension| extension == "log") {
-                let scanned_identity = FileIdentity::of_path_nofollow(&path)?;
-                let artifact = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)?;
-                let opened_identity = FileIdentity::of_open_file(&artifact)?;
-                let current = std::fs::symlink_metadata(&path)?;
-                let current_identity = FileIdentity::of_path_nofollow(&path)?;
-                if !current.file_type().is_file()
-                    || scanned_identity != current_identity
-                    || opened_identity != current_identity
-                {
-                    return Err(std::io::Error::other(format!(
-                        "artifact identity changed while inspecting {}",
-                        path.display()
-                    )));
-                }
-                match fs4::FileExt::try_lock(&artifact) {
-                    Ok(()) => fs4::FileExt::unlock(&artifact)?,
-                    Err(fs4::TryLockError::WouldBlock) => {
-                        bytes = bytes.saturating_add(
-                            u64::try_from(MAX_ARTIFACT_BYTES)
-                                .unwrap_or(u64::MAX)
-                                .saturating_sub(metadata.len()),
-                        );
-                    }
-                    Err(fs4::TryLockError::Error(err)) => return Err(err),
-                }
-            }
+            bytes = bytes.saturating_add(artifact_file_reserved_bytes(&path, &metadata)?);
         }
     }
     Ok((bytes, entries))
@@ -4373,21 +4386,64 @@ mod tests {
     }
 
     #[test]
+    fn artifact_budget_counts_growth_before_the_writer_seals() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (path, file) =
+            create_job_artifact(temp.path(), "job-growing").expect("create and reserve artifact");
+        let scanned_metadata = std::fs::symlink_metadata(&path).expect("initial metadata");
+        assert_eq!(scanned_metadata.len(), 0);
+
+        // Reproduce the scan/write/seal interleaving without scheduler timing:
+        // the scanner retains its old metadata while the real sink grows and
+        // releases the lock before per-file accounting resumes.
+        let mut sink = ArtifactSink::new(file, MAX_ARTIFACT_BYTES);
+        sink.write(b"final output");
+        assert!(sink.write_error.is_none());
+        sink.seal();
+        let final_bytes = std::fs::metadata(&path).expect("final metadata").len();
+        assert!(final_bytes > scanned_metadata.len());
+
+        let reserved = artifact_file_reserved_bytes(&path, &scanned_metadata)
+            .expect("measure artifact after sealing");
+        assert_eq!(reserved, final_bytes);
+        let next_job_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert!(
+            !artifact_capacity_available(reserved, 1, next_job_reservation, 10),
+            "growth after the directory snapshot must count against the next job's budget"
+        );
+        assert!(artifact_capacity_available(
+            reserved,
+            1,
+            next_job_reservation + final_bytes,
+            10,
+        ));
+    }
+
+    #[test]
     fn aggregate_artifact_budget_reserves_locked_live_files_at_full_cap() {
         let _guard = process_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let live_path = temp.path().join("job-live.log");
-        let live = std::fs::OpenOptions::new()
+        let mut live = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&live_path)
             .expect("live artifact");
         fs4::FileExt::lock(&live).expect("reserve live artifact");
+        live.write_all(b"partial output")
+            .expect("write live artifact");
 
-        let two_job_budget = u64::try_from(MAX_ARTIFACT_BYTES)
-            .expect("artifact cap fits")
-            .saturating_mul(2);
+        let live_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert_eq!(
+            artifact_directory_usage(temp.path()).expect("account for live artifact"),
+            (live_reservation, 1),
+            "stored bytes are part of the live reservation, not an additional charge"
+        );
+        let two_job_budget = live_reservation.saturating_mul(2);
+        ensure_artifact_budget(temp.path(), two_job_budget, 10)
+            .expect("one live artifact and one prospective job fit exactly two caps");
         let error = ensure_artifact_budget(temp.path(), two_job_budget - 1, 10)
             .expect_err("live artifact plus prospective job must reserve two full caps");
         assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
