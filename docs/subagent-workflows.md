@@ -66,12 +66,22 @@ later wave receives no fresh allowance. Arbitrary child activity and synchronous
 filesystem/Git operations have the same cooperative boundaries as ordinary
 delegation. This does not add recursive delegation or a new guest interpreter.
 
-Each node's `call` contains ordinary per-task fields: `agent`, `task`, `model`, `cwd`,
-`isolation`, `isoApply`, `outputSchema` and `schemaMode`. All call shapes and
+Each node's `call` contains ordinary per-task fields: `agent`, `task` or `taskFile`,
+`model`, `cwd`, `isolation`, `isoApply`, `outputSchema` and `schemaMode`. All call shapes and
 workspace options are validated up front. Agent discovery and all effective
 schema compilation also finish before the first child. Native filesystem
 conditions are still checked at execution; this is not a transactional dry run.
 Mixed modes and unknown fields are refused rather than silently ignored.
+
+`taskFile` follows the [file instruction contract](subagent-definitions.md#instructions-from-a-file).
+Every node's file is captured before the first wave or background acknowledgment,
+even for a conditional branch or later fan-out. An unreadable, invalid or
+oversized source refuses the whole graph without launching a valid prefix.
+The captured body, plus any typed inputs or fan-out item, must still fit the
+64 KiB expanded-task budget. Every executed instance reports the submitted
+`taskFile` and the SHA-256 of the original captured source bytes; its public
+`result.task` displays the reference. Predecessor data cannot replace that source
+or cause a later filesystem read.
 
 An explicit `model` uses the [per-call selector contract](subagent-definitions.md#per-call-model-selection).
 Every node's provider, model and optional thinking suffix is resolved before

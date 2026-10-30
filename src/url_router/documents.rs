@@ -319,6 +319,27 @@ fn scratch_store() -> &'static std::sync::Mutex<std::collections::HashMap<String
     &STORE
 }
 
+/// Capture a scratch document without cloning an oversized instruction body.
+/// This is the same store as ordinary local:// reads, not a filesystem URL.
+pub(crate) fn read_local_bounded(name: &str, limit: usize) -> Result<String> {
+    let store = scratch_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let content = store.get(name).ok_or_else(|| {
+        Error::tool(
+            "read",
+            "PI_URL_UNRESOLVABLE: local scratch document does not exist",
+        )
+    })?;
+    if content.len() > limit {
+        return Err(Error::tool(
+            "read",
+            "PI_URL_LOCAL_LIMIT: scratch document exceeds the requested byte budget",
+        ));
+    }
+    Ok(content.clone())
+}
+
 #[allow(clippy::significant_drop_tightening)]
 fn resolve_local(name: &str) -> Result<ResolvedDoc> {
     let store = scratch_store()

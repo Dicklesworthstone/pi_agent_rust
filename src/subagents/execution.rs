@@ -463,23 +463,37 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let args = super::with_fallback_policy_args(
-            child_args(
-                agent,
-                &task.task,
-                self.role_model_spec.as_deref(),
-                launch.parent_model.as_ref(),
-                task.model_selection.as_ref(),
-                schema,
-            ),
-            task.fallback_policy.as_deref(),
+        let mut args = child_args(
+            agent,
+            &task.task,
+            self.role_model_spec.as_deref(),
+            launch.parent_model.as_ref(),
+            task.model_selection.as_ref(),
+            schema,
         );
+        let stdin = if task.task_file.is_some() {
+            // child_args always appends the instruction as its final argv.
+            // A captured file travels through private regular-file stdin so
+            // multi-megabyte instructions cannot exceed the OS argv limit.
+            args.pop();
+            super::task_file::stdin(&task.task, owner, self.deadline)
+        } else {
+            Ok(Stdio::null())
+        };
+        let args = super::with_fallback_policy_args(args, task.fallback_policy.as_deref());
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
             self.deadline,
         );
         attempt.result.task = launch.display_task().to_string();
+        let stdin = match stdin {
+            Ok(stdin) => stdin,
+            Err(error) => {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+        };
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
@@ -614,7 +628,7 @@ impl ChildRunner {
         command
             .args(&args)
             .current_dir(&attempt.result.cwd)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PI_CODING_AGENT_DIR", &self.global_dir)

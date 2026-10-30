@@ -532,6 +532,8 @@ fn task(agent: &AgentDefinition, text: String) -> SubagentTask {
     SubagentTask {
         agent: agent.name.clone(),
         task: text,
+        task_file: None,
+        task_file_sha256: None,
         model: None,
         model_selection: None,
         fallback_policy: None,

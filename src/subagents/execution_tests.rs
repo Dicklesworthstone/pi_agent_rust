@@ -56,6 +56,265 @@ fn request() -> Value {
     json!({"agent":"worker","task":"produce a result"})
 }
 
+#[test]
+fn file_tasks_reach_real_child_stdin_beyond_argv_limits_with_source_provenance() {
+    use sha2::{Digest as _, Sha256};
+
+    let script = format!(
+        "printf '%s\\n' \"$@\" > arguments\ncat > instructions-used\n{}",
+        emit(&[ended("complete", "stop")])
+    );
+    let (root, tool) = fixture(&script);
+    let source = root.path().join("instructions.md");
+    let text = format!("Inspect every case.\n{}", "résumé 雪\n".repeat(24 * 1024));
+    std::fs::write(&source, &text).unwrap();
+    let output = run(&tool, json!({"agent":"worker", "taskFile":source}));
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("instructions-used")).unwrap(),
+        format!("Task: {text}")
+    );
+    let arguments = std::fs::read_to_string(root.path().join("arguments")).unwrap();
+    assert!(!arguments.contains("Inspect every case."));
+    assert!(!arguments.contains(source.to_str().unwrap()));
+    assert_eq!(
+        result(&output)["taskFile"],
+        source.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        result(&output)["taskFileSha256"],
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    );
+    assert_eq!(result(&output)["task"], source.to_string_lossy().as_ref());
+    let visible = crate::agent_hub::registry()
+        .lock()
+        .expect("hub registry")
+        .get(result(&output)["hubId"].as_str().expect("hub ID"))
+        .expect("registered file task");
+    assert_eq!(visible.task, source.to_string_lossy().as_ref());
+}
+
+#[test]
+fn invalid_later_file_tasks_launch_no_valid_prefix_in_any_delegation_mode() {
+    let (root, tool) = fixture("touch launched");
+    let bad = root.path().join("bad.md");
+    std::fs::write(&bad, [0xff]).unwrap();
+    let first = json!({"agent":"worker", "task":"valid first task"});
+    let later = json!({"agent":"worker", "taskFile":bad});
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    for input in [
+        later.clone(),
+        json!({"tasks":[first.clone(), later.clone()], "concurrency":1}),
+        json!({"chain":[first.clone(), later.clone()]}),
+        json!({"workflow":[
+            {"id":"first", "call":first.clone()},
+            {"id":"later", "needs":["first"], "call":later.clone()}
+        ]}),
+    ] {
+        assert!(
+            runtime
+                .block_on(tool.execute("invalid-file", input, None))
+                .is_err()
+        );
+        assert!(!root.path().join("launched").exists());
+    }
+    std::fs::write(&bad, "x".repeat(64 * 1024 + 1)).unwrap();
+    let oversized_graph = json!({"workflow":[
+        {"id":"first", "call":first},
+        {"id":"later", "needs":["first"], "call":later}
+    ]});
+    assert!(
+        runtime
+            .block_on(tool.execute("oversized-file", oversized_graph, None))
+            .is_err()
+    );
+    assert!(!root.path().join("launched").exists());
+}
+
+#[test]
+fn queued_chain_file_snapshots_keep_original_bytes_and_render_previous_results() {
+    use sha2::{Digest as _, Sha256};
+
+    let script = format!(
+        "cat >> instructions-used\n{}",
+        emit(&[ended("accepted", "stop")])
+    );
+    let (root, tool) = fixture(&script);
+    let source = root.path().join("review.md");
+    let text = "Review {previous}.";
+    std::fs::write(&source, text).unwrap();
+    let request: SubagentRequest = serde_json::from_value(json!({"chain":[
+        {"agent":"worker", "task":"produce evidence"},
+        {"agent":"worker", "taskFile":source}
+    ]}))
+    .unwrap();
+    let prepared = tool.prepare_request(&request).unwrap();
+    std::fs::write(&source, "replacement must not run").unwrap();
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepared.run(None));
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| !result.is_error));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("instructions-used")).unwrap(),
+        "Task: Review accepted."
+    );
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    assert_eq!(
+        results[1].task_file_sha256.as_deref(),
+        Some(digest.as_str())
+    );
+}
+
+#[test]
+fn oversized_raw_and_typed_file_chain_expansion_fails_before_that_child_launches() {
+    use sha2::{Digest as _, Sha256};
+
+    let predecessor = json!({"value":"x".repeat(16 * 1024)}).to_string();
+    for marker in ["{previous}", "{{previous.data.value}}"] {
+        let script = format!(
+            "printf 'launched\\n' >> launches\n{}",
+            emit(&[ended(&predecessor, "stop")])
+        );
+        let (root, tool) = fixture(&script);
+        let source = root.path().join("expand.md");
+        let instructions = marker.repeat(257);
+        std::fs::write(&source, &instructions).expect("bounded authored instructions");
+        let output = run(
+            &tool,
+            json!({"chain":[
+                {"agent":"worker", "task":"produce bounded typed evidence",
+                 "outputSchema":{"type":"object", "required":["value"]}, "schemaMode":"strict"},
+                {"agent":"worker", "taskFile":source}
+            ]}),
+        );
+        assert!(output.is_error, "{output:?}");
+        let records = &output.details.as_ref().expect("chain details")["results"];
+        assert_eq!(records.as_array().expect("chain results").len(), 2);
+        assert_eq!(records[0]["status"], "completed");
+        assert_eq!(records[1]["status"], "failed");
+        assert!(
+            records[1]["error"]
+                .as_str()
+                .expect("expansion failure")
+                .contains("PI_SUBAGENT_TASK_FILE_LIMIT")
+        );
+        assert_eq!(records[1]["taskFile"], source.to_string_lossy().as_ref());
+        assert_eq!(
+            records[1]["taskFileSha256"],
+            format!("{:x}", Sha256::digest(instructions.as_bytes()))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("launches")).expect("real launches"),
+            "launched\n"
+        );
+    }
+}
+
+#[test]
+fn workflow_file_instructions_keep_typed_predecessor_data_and_source_digest() {
+    use sha2::{Digest as _, Sha256};
+
+    let script = format!(
+        "cat >> instructions-used\n{}",
+        emit(&[ended(r#"{"verdict":"accepted"}"#, "stop")])
+    );
+    let (root, tool) = fixture(&script);
+    let source = root.path().join("join.md");
+    let text = "Review the accepted predecessor evidence.";
+    std::fs::write(&source, text).unwrap();
+    let output = run(
+        &tool,
+        json!({"workflow":[
+            {"id":"produce", "call":{"agent":"worker", "task":"produce typed evidence", "outputSchema":{"type":"object"}}},
+            {"id":"join", "needs":["produce"], "inputs":{"evidence":{"from":"produce","pointer":""}},
+             "call":{"agent":"worker", "taskFile":source}}
+        ]}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    let instructions = std::fs::read_to_string(root.path().join("instructions-used")).unwrap();
+    assert!(instructions.starts_with(&format!("Task: {text}")));
+    assert!(instructions.contains("<workflow-inputs>"));
+    assert!(instructions.contains(r#""evidence":{"verdict":"accepted"}"#));
+    assert_eq!(
+        output.details.as_ref().unwrap()["nodes"][1]["result"]["task"],
+        source.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        output.details.as_ref().unwrap()["nodes"][1]["result"]["taskFileSha256"],
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    );
+}
+
+#[test]
+fn revoking_task_file_root_after_preparation_prevents_child_launch() {
+    let (root, tool) = fixture("touch launched");
+    let outside = tempfile::tempdir().expect("additional root");
+    let source = outside.path().join("instructions.md");
+    std::fs::write(&source, "Inspect the admitted workspace.").expect("task file");
+    let mut roots = crate::workspace::WorkspaceHandle::single(root.path());
+    roots.add_root(outside.path());
+    let tool = tool.with_workspace(roots.clone());
+    let request: SubagentRequest =
+        serde_json::from_value(json!({"agent":"worker", "taskFile":source})).expect("file request");
+    let prepared = tool.prepare_request(&request).expect("admitted file");
+    assert!(roots.remove_root(outside.path()));
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("native runtime")
+        .block_on(prepared.run(None));
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error);
+    assert!(!root.path().join("launched").exists());
+}
+
+#[test]
+fn task_file_snapshot_survives_schema_retry_and_explicit_hub_revival() {
+    use sha2::{Digest as _, Sha256};
+
+    let script = format!(
+        "printf '\\n---attempt---\\n' >> instructions-used\ncat >> instructions-used\n\
+         if [ -f retried ]; then\n{}\
+         else\ntouch retried\n{}\
+         fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (root, tool) = fixture(&script);
+    let source = root.path().join("instructions.md");
+    let original = format!("Inspect the frozen assignment {}.", uuid::Uuid::new_v4());
+    std::fs::write(&source, &original).expect("task file");
+    let request: SubagentRequest = serde_json::from_value(json!({
+        "agent":"worker", "taskFile":source,
+        "outputSchema":{"type":"object", "required":["accepted"]}, "schemaMode":"strict"
+    }))
+    .expect("strict file request");
+    let prepared = tool.prepare_request(&request).expect("snapshot");
+    std::fs::write(&source, "replacement must not run").expect("replace source");
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("native runtime")
+        .block_on(prepared.run(None));
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].is_error, "{:?}", results[0]);
+    assert_eq!(results[0].schema_retries, Some(1));
+    let digest = format!("{:x}", Sha256::digest(original.as_bytes()));
+    assert_eq!(
+        results[0].task_file_sha256.as_deref(),
+        Some(digest.as_str())
+    );
+    let revived = revive_through_hub(&tool.cwd, results[0].hub_id.as_deref().expect("hub ID"));
+    assert!(!revived.is_error, "{revived:?}");
+    let instructions = std::fs::read_to_string(root.path().join("instructions-used"))
+        .expect("all native child instructions");
+    assert_eq!(instructions.matches("---attempt---").count(), 3);
+    assert_eq!(instructions.matches(original.as_str()).count(), 3);
+    assert!(!instructions.contains("replacement must not run"));
+}
+
 fn result(output: &ToolOutput) -> &Value {
     &output.details.as_ref().unwrap()["results"][0]
 }

@@ -79,6 +79,7 @@ impl Request {
         }
         workspace::validate_request(&input)?;
         super::model_selection::validate_request(&input)?;
+        super::task_file::validate_request(&input)?;
         let request: SubagentRequest = serde_json::from_value(input)
             .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
         request.mode_name()?;
@@ -418,6 +419,65 @@ mod tests {
         }
 
         #[test]
+        fn background_acknowledgment_freezes_file_instructions_and_source_digest() {
+            use sha2::{Digest as _, Sha256};
+
+            let _guard = crate::jobs::process_test_guard();
+            let script = format!(
+                "touch launched\nwhile [ ! -f release ]; do sleep 0.02; done\ncat > instructions-used\n{}",
+                end("complete"),
+            );
+            let (root, tool, owner) = fixture(&script);
+            let source = root.path().join("instructions.md");
+            let original = "Review the original assignment.\n";
+            std::fs::write(&source, original).expect("task file");
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("native background runtime");
+            runtime.block_on(async {
+                let output = tool
+                    .execute(
+                        "file-launch",
+                        json!({"agent":"worker", "taskFile":source, "async":true}),
+                        None,
+                    )
+                    .await
+                    .expect("file delegation acknowledgment");
+                let details = output.details.expect("job descriptor");
+                let id = details
+                    .get("jobId")
+                    .and_then(Value::as_str)
+                    .expect("job ID");
+                std::fs::write(&source, "replacement must not run").expect("replace source");
+                await_marker(&root.path().join("launched")).await;
+                std::fs::write(root.path().join("release"), "continue").expect("release child");
+                let settled = crate::jobs::wait_async(&owner, id, Duration::from_secs(10))
+                    .await
+                    .expect("wait for file task");
+                assert_eq!(settled.status, "exited", "{settled:?}");
+                let native = settled.result.expect("retained result");
+                assert!(!native.is_error, "{native:?}");
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("instructions-used"))
+                        .expect("captured child stdin"),
+                    format!("Task: {original}")
+                );
+                let result = native
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("results"))
+                    .and_then(Value::as_array)
+                    .and_then(|results| results.first())
+                    .expect("native file result");
+                assert_eq!(result.get("taskFile"), Some(&json!(source)));
+                assert_eq!(
+                    result.get("taskFileSha256"),
+                    Some(&json!(format!("{:x}", Sha256::digest(original.as_bytes()))))
+                );
+            });
+        }
+
+        #[test]
         fn background_cancel_reaps_native_child_before_terminal_publication() {
             let _guard = crate::jobs::process_test_guard();
             let (root, tool, owner) = fixture("printf '%s\\n' \"$$\" > child.pid\nexec sleep 30");
@@ -453,6 +513,8 @@ mod tests {
         fn invalid_background_batch_never_starts_a_valid_prefix() {
             let _guard = crate::jobs::process_test_guard();
             let (root, tool, owner) = fixture("touch launched");
+            let invalid_file = root.path().join("invalid.md");
+            std::fs::write(&invalid_file, [0xff]).expect("invalid UTF-8 task file");
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
                 .unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Admission validation must execute through the native async entry point.
@@ -464,6 +526,10 @@ mod tests {
                     json!({"agent":"seance","task":"history","sourceSession":"missing.jsonl","async":true}),
                     json!({"agent":"worker","task":"bad timeout","timeoutSeconds":null,"async":true}),
                     json!({"agent":"worker","task":"bad workspace","isolation":null,"async":true}),
+                    json!({"agent":"worker","taskFile":invalid_file,"async":true}),
+                    json!({"tasks":[{"agent":"worker","task":"valid"},{"agent":"worker","taskFile":invalid_file}],"async":true}),
+                    json!({"workflow":[{"id":"first","call":{"agent":"worker","task":"valid"}},
+                        {"id":"later","needs":["first"],"call":{"agent":"worker","taskFile":invalid_file}}],"async":true}),
                 ] {
                     assert!(tool.execute("invalid", input, None).await.is_err()); // ubs:ignore[rust.panic.assert-macros] -- Every malformed request must fail before dispatch.
                 }

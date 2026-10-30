@@ -12,6 +12,8 @@ mod conflicts;
 mod documents;
 mod skills;
 
+pub(crate) use documents::read_local_bounded;
+
 pub use documents::{
     ConflictRegion, ResolveOptions, ResolvedDoc, SSH_HOSTKEY_REMEDIATION, SshFailureKind,
     SshTarget, TransferEndpoint, URL_ROUTER_SCHEMA, classify_ssh_failure, has_scheme,

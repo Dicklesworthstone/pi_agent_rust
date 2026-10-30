@@ -451,6 +451,16 @@ impl Plan {
             .map_err(|message| Error::tool("subagent", message))?;
         let agents = tool.discover(self.scope)?;
         self.validate_definitions(&agents)?;
+        for node in &mut self.nodes {
+            super::task_file::prepare(tool, std::iter::once(&mut node.call), deadline)?;
+            if node.call.task.len() > MAX_TASK_BYTES {
+                return Err(invalid(
+                    "workflow taskFile instructions exceed the 64 KiB task budget; no node was launched",
+                ));
+            }
+        }
+        let launch_admission =
+            super::task_file::admission(tool, self.nodes.iter().map(|node| &node.call));
         super::model_selection::prepare(
             tool,
             &agents,
@@ -466,7 +476,8 @@ impl Plan {
             deadline,
         )
         .with_parent_model(parent_model)
-        .with_cost_budget(tool.cost_scope.current());
+        .with_cost_budget(tool.cost_scope.current())
+        .with_launch_admission(launch_admission);
         check_authority(&owner)?;
         deadline
             .check()
@@ -582,7 +593,7 @@ impl Plan {
                 // The node report keeps the authored assignment, not a second
                 // copy of predecessor data. Native hub/revival state retains
                 // the actual child prompt, including its exact input context.
-                result.task.clone_from(&self.nodes[index].call.task);
+                result.task = self.nodes[index].call.display_task().to_string();
                 match item {
                     Some(item) => records[index].settle_fanout(result, item)?,
                     None => records[index].settle(result, wave),
@@ -613,6 +624,7 @@ fn parse_call(value: &Value) -> Result<SubagentTask> {
             key.as_str(),
             "agent"
                 | "task"
+                | "taskFile"
                 | "model"
                 | "cwd"
                 | "isolation"
@@ -623,7 +635,11 @@ fn parse_call(value: &Value) -> Result<SubagentTask> {
     }) {
         return Err(invalid("node call contains unsupported native task fields"));
     }
+    super::task_file::validate_fields(value)?;
     for key in ["agent", "task"] {
+        if key == "task" && fields.contains_key("taskFile") {
+            continue;
+        }
         if fields.get(key).and_then(Value::as_str).is_none_or(|text| {
             text.trim().is_empty() || text.len() > MAX_TASK_BYTES || text.contains('\0')
         }) {

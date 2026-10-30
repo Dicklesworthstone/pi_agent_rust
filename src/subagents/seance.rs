@@ -405,6 +405,8 @@ pub(super) async fn execute(
         let task = SubagentTask {
             agent: NAME.to_string(),
             task: prompt,
+            task_file: None,
+            task_file_sha256: None,
             model: None,
             model_selection: None,
             fallback_policy: Some(super::model_selection::prepare_saved_session(tool, deadline)?),

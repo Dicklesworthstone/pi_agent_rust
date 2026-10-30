@@ -36,6 +36,7 @@ mod execution_tests;
 mod model_selection;
 mod protocol;
 mod seance;
+mod task_file;
 mod worker;
 mod workflow;
 mod workspace;
@@ -127,7 +128,7 @@ impl TanCompletion {
 pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
-    /// Shared admission policy for saved-session reads, including live roots.
+    /// Shared admission policy for saved sessions and task files, including live roots.
     workspace: crate::workspace::WorkspaceHandle,
     child_binary: PathBuf,
     structured_results: bool,
@@ -176,11 +177,14 @@ pub(crate) struct RevivalSpec {
 impl RevivalSpec {
     /// Public assignment label; the private launch keeps its complete prompt.
     pub(crate) fn public_task(&self) -> Option<&str> {
-        self.public_task.as_deref()
+        self.public_task
+            .as_deref()
+            .or(self.task.task_file.as_deref())
     }
 
     fn display_task(&self) -> &str {
-        self.public_task().unwrap_or(&self.task.task)
+        self.public_task()
+            .unwrap_or_else(|| self.task.display_task())
     }
 
     fn check_launch_admission(&self) -> Result<()> {
@@ -422,6 +426,8 @@ impl SubagentTool {
         let mut request = SubagentTask {
             agent: TAN_AGENT_NAME.to_string(),
             task: task.to_string(),
+            task_file: None,
+            task_file_sha256: None,
             model: None,
             model_selection: None,
             fallback_policy: None,
@@ -505,9 +511,11 @@ impl SubagentTool {
         let agents = self.discover(request.scope)?;
         match &mut mode {
             RequestMode::Single(task) => {
+                task_file::prepare(self, std::iter::once(&mut *task), deadline)?;
                 model_selection::prepare(self, &agents, std::iter::once(task), deadline)?;
             }
             RequestMode::Parallel(tasks) | RequestMode::Chain(tasks) => {
+                task_file::prepare(self, tasks.iter_mut(), deadline)?;
                 model_selection::prepare(self, &agents, tasks.iter_mut(), deadline)?;
             }
         }
@@ -515,6 +523,11 @@ impl SubagentTool {
             .concurrency
             .unwrap_or(DEFAULT_CONCURRENCY)
             .clamp(1, MAX_PARALLEL_TASKS);
+        let tasks = match &mode {
+            RequestMode::Single(task) => std::slice::from_ref(task),
+            RequestMode::Parallel(tasks) | RequestMode::Chain(tasks) => tasks.as_slice(),
+        };
+        let launch_admission = task_file::admission(self, tasks);
         Ok(PreparedRequest {
             runner: ChildRunner::new(
                 self.cwd.clone(),
@@ -525,7 +538,8 @@ impl SubagentTool {
                 deadline,
             )
             .with_parent_model(parent_model)
-            .with_cost_budget(self.cost_scope.current()),
+            .with_cost_budget(self.cost_scope.current())
+            .with_launch_admission(launch_admission),
             agents,
             mode,
             concurrency,
@@ -564,8 +578,17 @@ impl PreparedRequest {
             RequestMode::Chain(tasks) => {
                 let mut previous: Option<SubagentResult> = None;
                 let mut results = Vec::with_capacity(tasks.len());
-                for (step, task) in tasks.into_iter().enumerate() {
-                    let task = task.with_rendered_previous_result(previous.as_ref());
+                for (step, mut task) in tasks.into_iter().enumerate() {
+                    if let Err(error) = task.render_previous_result(previous.as_ref()) {
+                        let result = if let Some(agent) = agents.get(&task.agent) {
+                            SubagentResult::failed(agent, task, Some(step + 1), error.to_string()) // ubs:ignore[rust.perf.string-alloc-in-loop] -- This terminal error is allocated once before the chain immediately breaks.
+                        } else {
+                            SubagentResult::unknown(task, Some(step + 1))
+                        };
+                        emit_progress(on_update.as_ref(), &result);
+                        results.push(result);
+                        break;
+                    }
                     let result = runner
                         .run_one(&agents, task, Some(step + 1), on_update.clone())
                         .await;
@@ -596,6 +619,7 @@ impl Tool for SubagentTool {
         concat!(
             "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
             " Model selection: an optional model on one task or workflow call accepts an exact provider/model[:thinking] or unambiguous catalog ID, overriding definition/task-role/parent defaults. Every explicit selector is checked before any child or worktree is created; unknown, unavailable, disabled or unsupported destinations fail without fallback. Put model on each tasks/chain entry, not the batch. worker_start and pool_start freeze the same option for their entire lifetime; send/push cannot switch models.",
+            " File instructions: ordinary single/tasks/chain requests and workflow calls accept taskFile instead of task. Supply an absolute read-admitted workspace/agent file or local:// scratch document, containing nonempty UTF-8 instructions of at most 4 MiB (workflow tasks retain their 64 KiB expanded-task limit). Every source is captured before any child starts or a background job is acknowledged; results retain taskFile and taskFileSha256 for the original bytes. Queued tasks, schema retries and revival use the captured instructions. File content never changes the selected agent, model, tools, workspace or approval policy. Seance and retained workers/pools do not accept taskFile.",
             " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
             " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback.",
             " Set async: true on a single, parallel tasks, chain, or workflow request to return a session-owned background job immediately. Use jobs list/wait/cancel with its jobId; a settled wait includes the native subagent or workflow result. Completion also arrives through the normal background follow-up queue. Definitions, model and request deadline freeze before acknowledgment; queued work does not get a fresh timeout. Background delegation does not retain an eval cell or an Agent callback. Seance remains foreground.",
@@ -617,7 +641,8 @@ impl Tool for SubagentTool {
                 "cursor": {"type":"object","additionalProperties":false,"required":["schema","poolId","itemIds"],"properties":{"schema":{"const":"pi.subagent.pool.cursor.v1"},"poolId":{"type":"string","minLength":1},"itemIds":{"type":"array","maxItems":32,"uniqueItems":true,"items":{"type":"integer","minimum":1,"maximum":32}}},"description":"pool_drain only: caller-owned acknowledgment of already processed terminal items, sorted by item ID. Omit for an empty cursor; replaying a cursor does not consume results."},
                 "maxItems": {"type":"integer","minimum":1,"maximum":4,"description":"pool_drain only: maximum full results in one page, default 4."},
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
-                "task": {"type": "string", "description": "Task for a single delegation."},
+                "task": {"type": "string", "description": "Inline instructions for a single delegation; mutually exclusive with taskFile."},
+                "taskFile": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Alternative to task: an absolute UTF-8 file path inside the read-admitted workspace/agent roots, or a local:// scratch document. Snapshot once before launch, at most 4 MiB; the submitted reference and SHA-256 of its original bytes are returned. Single, tasks, chain and workflow calls only; workflows retain a 64 KiB expanded-task limit."},
                 "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, chain, or workflow request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance."},
                 "sourceSession": {"type": "string", "minLength": 1, "description": "Required only for agent: seance. Explicit v3 JSONL file path, absolute or relative to the host workspace, admitted only within the workspace, live added roots, or configured agent data directory. The source is inspected read only; IDs, discovery and SQLite sessions are not supported."},
                 "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit model for one delegation, worker_start or pool_start: provider/model with optional :thinking, or an unambiguous exact model ID. Overrides agent definition and task/smol/parent defaults. Validated before launch; unknown, unavailable or disabled models fail without fallback. Put model on each tasks/chain entry or workflow call. Workers/pools freeze it for their lifetime. Seance instead defaults to its saved branch model."},
@@ -635,10 +660,15 @@ impl Tool for SubagentTool {
             "definitions": {
                 "task": {
                     "type": "object",
-                    "required": ["agent", "task"],
+                    "required": ["agent"],
+                    "oneOf": [
+                        {"required": ["task"], "not": {"required": ["taskFile"]}},
+                        {"required": ["taskFile"], "not": {"required": ["task"]}}
+                    ],
                     "properties": {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
+                        "taskFile": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute read-admitted file or local:// scratch document, mutually exclusive with task. Captured before any child starts; chain placeholders apply to the captured instructions."},
                         "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit provider/model[:thinking] or unambiguous exact model ID. Overrides the definition and task/smol/parent defaults, frozen before any child or worktree is created."},
                         "cwd": {"type": "string", "minLength": 1},
                         "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
@@ -749,6 +779,7 @@ impl Tool for SubagentTool {
         }
         workspace::validate_request(&input)?;
         model_selection::validate_request(&input)?;
+        task_file::validate_request(&input)?;
         let request: SubagentRequest = serde_json::from_value(input)
             .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
         let update = on_update.map(Arc::from);
@@ -802,6 +833,8 @@ struct SubagentRequest {
     #[serde(default)]
     task: Option<String>,
     #[serde(default)]
+    task_file: Option<String>,
+    #[serde(default)]
     model: Option<String>,
     /// Single-delegation workspace controls use the same runner as array entries.
     #[serde(default)]
@@ -829,6 +862,18 @@ struct SubagentRequest {
 
 impl SubagentRequest {
     fn mode(&self) -> Result<RequestMode> {
+        if self.task.is_some() && self.task_file.is_some() {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_TASK_FILE: provide task or taskFile, never both",
+            ));
+        }
+        if (self.tasks.is_some() || self.chain.is_some()) && self.task_file.is_some() {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_TASK_FILE: taskFile belongs on each tasks/chain entry, not the batch",
+            ));
+        }
         if (self.tasks.is_some() || self.chain.is_some()) && self.model.is_some() {
             return Err(Error::tool(
                 "subagent",
@@ -846,10 +891,12 @@ impl SubagentRequest {
         let single = self
             .agent
             .as_ref()
-            .zip(self.task.as_ref())
-            .map(|(agent, task)| SubagentTask {
+            .filter(|_| self.task.is_some() || self.task_file.is_some())
+            .map(|agent| SubagentTask {
                 agent: agent.clone(),
-                task: task.clone(),
+                task: self.task.clone().unwrap_or_default(),
+                task_file: self.task_file.clone(),
+                task_file_sha256: None,
                 model: self.model.clone(),
                 model_selection: None,
                 fallback_policy: None,
@@ -865,13 +912,13 @@ impl SubagentRequest {
         if selected.ne(&1) {
             return Err(Error::tool(
                 "subagent",
-                "Provide exactly one of agent+task, tasks, or chain.",
+                "Provide exactly one of agent+(task or taskFile), tasks, or chain.",
             ));
         }
-        if self.agent.is_some() != self.task.is_some() {
+        if self.agent.is_some() != (self.task.is_some() || self.task_file.is_some()) {
             return Err(Error::tool(
                 "subagent",
-                "Single delegation requires both agent and task.",
+                "Single delegation requires agent and either task or taskFile.",
             ));
         }
         if let Some(tasks) = &self.tasks
@@ -920,7 +967,13 @@ enum RequestMode {
 #[serde(rename_all = "camelCase")]
 struct SubagentTask {
     agent: String,
+    #[serde(default)]
     task: String,
+    #[serde(default)]
+    task_file: Option<String>,
+    /// Computed from captured source bytes; never accepted from caller JSON.
+    #[serde(skip)]
+    task_file_sha256: Option<String>,
     #[serde(default)]
     model: Option<String>,
     /// Admission resolves the public selector once. Retries, queues and hub
@@ -961,52 +1014,100 @@ enum SchemaMode {
 }
 
 impl SubagentTask {
+    fn display_task(&self) -> &str {
+        self.task_file.as_deref().unwrap_or(&self.task)
+    }
+
     /// Render `{previous}` (raw prior output — historical contract) and, when
     /// the prior result is schema-valid, `{{previous.data.<dotted.path>}}`
     /// field references (bd-cv653.5.1). Unresolvable field references are
     /// left verbatim so mistakes stay visible instead of silently vanishing.
-    fn with_rendered_previous_result(mut self, previous: Option<&SubagentResult>) -> Self {
+    fn render_previous_result(
+        &mut self,
+        previous: Option<&SubagentResult>,
+    ) -> std::result::Result<(), &'static str> {
         let raw = previous.map_or("", |result| result.output.as_str());
-        self.task = self.task.replace(concat!("{", "previous", "}"), raw);
+        let marker = concat!("{", "previous", "}");
+        let limit = if self.task_file.is_some() {
+            task_file::MAX_BYTES
+        } else {
+            usize::MAX
+        };
+        // Count before replace allocates: a small repeated token can otherwise
+        // amplify a bounded file and bounded predecessor into gigabytes.
+        let count = self.task.matches(marker).count();
+        let unchanged = self.task.len() - count * marker.len();
+        if count
+            .checked_mul(raw.len())
+            .and_then(|bytes| bytes.checked_add(unchanged))
+            .is_none_or(|bytes| bytes > limit)
+        {
+            return Err(CHAIN_TASK_LIMIT);
+        }
+        let mut rendered = self.task.replace(marker, raw);
         if let Some(data) = previous
             .filter(|result| result.schema_valid == Some(true))
             .and_then(|result| result.data.as_ref())
         {
-            self.task = render_previous_data_fields(&self.task, data);
+            rendered = render_previous_data_fields(&rendered, data, limit)?;
         }
-        self
+        self.task = rendered;
+        Ok(())
     }
+}
+
+const CHAIN_TASK_LIMIT: &str =
+    "PI_SUBAGENT_TASK_FILE_LIMIT: expanded taskFile chain instructions exceed 4 MiB";
+
+fn push_chain_part(
+    target: &mut String,
+    part: &str,
+    limit: usize,
+) -> std::result::Result<(), &'static str> {
+    if part.len() > limit.saturating_sub(target.len()) {
+        return Err(CHAIN_TASK_LIMIT);
+    }
+    target.push_str(part);
+    Ok(())
 }
 
 /// Replace `{{previous.data.<path>}}` tokens with values addressed out of the
 /// prior task's parsed `data`. Scalars render bare; objects/arrays render as
 /// compact JSON. Missing paths leave the token untouched.
-fn render_previous_data_fields(task: &str, data: &Value) -> String {
+fn render_previous_data_fields(
+    task: &str,
+    data: &Value,
+    limit: usize,
+) -> std::result::Result<String, &'static str> {
     const OPEN: &str = "{{previous.data.";
     const CLOSE: &str = "}}";
     let mut rendered = String::with_capacity(task.len());
     let mut rest = task;
     while let Some(start) = rest.find(OPEN) {
-        rendered.push_str(&rest[..start]);
+        push_chain_part(&mut rendered, &rest[..start], limit)?;
         let after_open = &rest[start + OPEN.len()..];
         let Some(end) = after_open.find(CLOSE) else {
-            rendered.push_str(&rest[start..]);
-            return rendered;
+            push_chain_part(&mut rendered, &rest[start..], limit)?;
+            return Ok(rendered);
         };
         let path = &after_open[..end];
         let pointer = format!("/{}", path.replace('.', "/"));
         match data.pointer(&pointer) {
-            Some(Value::String(text)) => rendered.push_str(text),
+            Some(Value::String(text)) => push_chain_part(&mut rendered, text, limit)?,
             Some(Value::Null) | None => {
                 // Leave the token verbatim so the miss is visible.
-                rendered.push_str(&rest[start..start + OPEN.len() + end + CLOSE.len()]);
+                push_chain_part(
+                    &mut rendered,
+                    &rest[start..start + OPEN.len() + end + CLOSE.len()],
+                    limit,
+                )?;
             }
-            Some(value) => rendered.push_str(&value.to_string()),
+            Some(value) => push_chain_part(&mut rendered, &value.to_string(), limit)?, // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each requested typed substitution serializes a predecessor-bounded value before enforcing the total prompt byte limit.
         }
         rest = &after_open[end + CLOSE.len()..];
     }
-    rendered.push_str(rest);
-    rendered
+    push_chain_part(&mut rendered, rest, limit)?;
+    Ok(rendered)
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1425,6 +1526,10 @@ struct SubagentResult {
     agent: String,
     description: Option<String>,
     task: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_file_sha256: Option<String>,
     step: Option<usize>,
     source: Option<AgentSource>,
     definition_path: Option<PathBuf>,
@@ -1479,7 +1584,9 @@ impl SubagentResult {
         Self {
             agent: agent.name.clone(),
             description: Some(agent.description.clone()),
-            task: task.task,
+            task: task.display_task().to_string(),
+            task_file: task.task_file,
+            task_file_sha256: task.task_file_sha256,
             step,
             source: Some(agent.source),
             definition_path: Some(agent.file_path.clone()),
@@ -1513,7 +1620,9 @@ impl SubagentResult {
         Self {
             agent: task.agent.clone(),
             description: None,
-            task: task.task,
+            task: task.display_task().to_string(),
+            task_file: task.task_file,
+            task_file_sha256: task.task_file_sha256,
             step,
             source: None,
             definition_path: None,
@@ -1900,6 +2009,8 @@ mod tests {
         let task = SubagentTask {
             agent: TAN_AGENT_NAME.to_string(),
             task: "update the changelog".to_string(),
+            task_file: None,
+            task_file_sha256: None,
             model: None,
             model_selection: None,
             fallback_policy: None,
@@ -1932,9 +2043,11 @@ mod tests {
         }))
         .expect("parse");
         assert!(invalid.mode().is_err());
-        let task = SubagentTask {
+        let mut task = SubagentTask {
             agent: "review".to_string(),
             task: concat!("review {", "previous}").to_string(),
+            task_file: None,
+            task_file_sha256: None,
             model: None,
             model_selection: None,
             fallback_policy: None,
@@ -1946,10 +2059,8 @@ mod tests {
         };
         let mut previous = SubagentResult::unknown(task.clone(), None);
         previous.output = "evidence".to_string();
-        assert_eq!(
-            task.with_rendered_previous_result(Some(&previous)).task,
-            "review evidence"
-        );
+        task.render_previous_result(Some(&previous)).unwrap();
+        assert_eq!(task.task, "review evidence");
     }
 
     /// bd-cv653.5.1: `{{previous.data.<path>}}` addresses the prior task's
@@ -1958,10 +2069,12 @@ mod tests {
     /// tokens are untouched.
     #[test]
     fn chain_previous_data_field_addressing() {
-        let base = SubagentTask {
+        let mut base = SubagentTask {
             agent: "review".to_string(),
             task: "verdict {{previous.data.verdict}} n {{previous.data.stats.count}} miss {{previous.data.absent}}"
                 .to_string(),
+            task_file: None,
+            task_file_sha256: None,
             model: None,
             model_selection: None,
             fallback_policy: None,
@@ -1974,10 +2087,10 @@ mod tests {
         let mut previous = SubagentResult::unknown(base.clone(), None);
         previous.schema_valid = Some(true);
         previous.data = Some(json!({"verdict": "pass", "stats": {"count": 3}}));
+        let mut rendered = base.clone();
+        rendered.render_previous_result(Some(&previous)).unwrap();
         assert_eq!(
-            base.clone()
-                .with_rendered_previous_result(Some(&previous))
-                .task,
+            rendered.task,
             "verdict pass n 3 miss {{previous.data.absent}}"
         );
 
@@ -1985,11 +2098,8 @@ mod tests {
         let mut invalid = SubagentResult::unknown(base.clone(), None);
         invalid.schema_valid = Some(false);
         invalid.data = Some(json!({"verdict": "pass"}));
-        assert!(
-            base.with_rendered_previous_result(Some(&invalid))
-                .task
-                .contains("{{previous.data.verdict}}")
-        );
+        base.render_previous_result(Some(&invalid)).unwrap();
+        assert!(base.task.contains("{{previous.data.verdict}}"));
     }
 
     /// bd-cv653.5.1: JSON extraction tolerates prose/fence wrapping, and
@@ -2138,6 +2248,8 @@ mod tests {
         let task = |name: &str| SubagentTask {
             agent: name.to_string(),
             task: "t".to_string(),
+            task_file: None,
+            task_file_sha256: None,
             model: None,
             model_selection: None,
             fallback_policy: None,
@@ -2189,6 +2301,8 @@ mod tests {
         let task = SubagentTask {
             agent: "inj".to_string(),
             task: "t".to_string(),
+            task_file: None,
+            task_file_sha256: None,
             model: None,
             model_selection: None,
             fallback_policy: None,

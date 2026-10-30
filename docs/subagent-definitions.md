@@ -40,6 +40,58 @@ corrective retry count. Invalid output after that retry fails a strict task;
 `schemaMode: "permissive"` retains its existing warning behavior. A task's explicit
 `outputSchema` still overrides the definition's schema.
 
+## Instructions from a file
+
+Ordinary single delegations, each `tasks` or `chain` entry, and each workflow
+`call` accept `taskFile` instead of inline `task`. This is useful for an authored
+implementation plan or a long assignment that should not be copied into a tool
+argument:
+
+```json
+{
+  "agent": "reviewer-json",
+  "taskFile": "/absolute/workspace/review-instructions.md",
+  "schemaMode": "strict",
+  "async": true
+}
+```
+
+Supply exactly one of `task` and `taskFile`; even an empty or null `task` beside
+`taskFile` is rejected. A file reference must be an absolute path within the
+host's ordinary read scope: its workspace, live added roots, or configured agent
+directory. The child's `cwd` does not grant access to another source directory.
+Symlink escapes, unreadable files, directories and special files are refused.
+You can also use `"taskFile": "local://review-instructions"` for an existing
+native scratch document written through `write`. `local://` retains its existing
+scratch-document meaning; it does not name an arbitrary filesystem path.
+
+Instructions must be valid UTF-8, nonempty after a whitespace check, contain no
+NUL bytes, and be at most **4 MiB**. Sources are read without truncation. All
+requested files are captured before the first child starts, including later
+chain steps and conditional workflow branches. A bad source rejects the entire
+request before any valid prefix can run. With `async: true`, capture also finishes
+before the background job is acknowledged. Later file edits do not change queued
+work, corrective retries, or explicit hub revival. Removing an added read root
+still prevents a later child or revival from launching with that source.
+
+Native results include `taskFile`, preserving the submitted reference, and
+`taskFileSha256`, the lowercase SHA-256 digest of the **original bytes**, including
+any BOM, CRLF, or trailing whitespace. `result.task` shows the source reference
+instead of repeating the full body. These are result fields; callers cannot
+inject a digest. The digest identifies the captured source, before chain
+substitution, workflow input framing, or corrective/continuation instructions.
+
+Chains apply their existing `{previous}` and typed-data substitutions to the
+captured text. Expanded file-backed chain tasks are also limited to **4 MiB**;
+an oversized substitution fails that step without launching it, while preserving
+its source digest and the earlier steps' results. Workflows retain their
+**64 KiB** complete task budget, including
+appended typed inputs; using a file does not relax that limit. File content is
+instruction text and cannot select a different agent, model, tools, cwd, schema
+or approval policy. Large captured tasks reach the child through stdin to avoid
+OS command-line limits. Saved-session `seance` and retained worker/pool operations
+continue to use their separate input contracts and reject `taskFile`.
+
 ## Per-call model selection
 
 A single delegation, each `tasks`/`chain` entry, and each workflow `call` may
