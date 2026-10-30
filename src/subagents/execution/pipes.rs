@@ -1,17 +1,20 @@
-//! Cancellation-owned Unix transport for the streaming child protocol.
+//! Cancellation-owned transport for the streaming child protocol.
 //!
 //! A child may exit while a descendant still holds either pipe's write end.
 //! Blocking readers cannot then be joined, even after their receiver is dropped.
-//! Here the run future owns nonblocking descriptors and bounded partial frames;
-//! dropping it closes the read ends without waiting for EOF or leaving threads.
+//! Here the run future owns Unix nonblocking descriptors or Windows overlapped
+//! readers and bounded partial frames. Dropping it retires the read ends without
+//! waiting for EOF or leaving a per-child reader thread behind.
 
 use super::{
     AgentCx, DRAIN_BATCH, Deadline, PIPE_DRAIN_TIMEOUT, PipeFrame, PipeKind, SubagentResult,
     UpdateCallback, apply_child_frame, check_budget, poll_pause, protocol,
 };
 use std::io::{self, BufRead, BufReader, Read};
+#[cfg(unix)]
 use std::os::fd::AsFd;
-use std::process::{ChildStderr, ChildStdout};
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BUFFER_BYTES: usize = 8192;
@@ -27,6 +30,7 @@ pub(super) struct FramedPipe<R> {
     frame_limit: usize,
 }
 
+#[cfg(unix)]
 impl<R: Read + AsFd> FramedPipe<R> {
     pub(super) fn new(pipe: R, frame_limit: usize) -> io::Result<Self> {
         // Preserve all unrelated flags. The descriptors are private to this
@@ -34,15 +38,19 @@ impl<R: Read + AsFd> FramedPipe<R> {
         let flags = rustix::fs::fcntl_getfl(&pipe).map_err(io::Error::from)?;
         rustix::fs::fcntl_setfl(&pipe, flags | rustix::fs::OFlags::NONBLOCK)
             .map_err(io::Error::from)?;
-        Ok(Self {
-            reader: Some(BufReader::with_capacity(BUFFER_BYTES, pipe)),
-            partial: Vec::new(),
-            frame_limit,
-        })
+        Ok(Self::from_nonblocking(pipe, frame_limit))
     }
 }
 
 impl<R: Read> FramedPipe<R> {
+    fn from_nonblocking(pipe: R, frame_limit: usize) -> Self {
+        Self {
+            reader: Some(BufReader::with_capacity(BUFFER_BYTES, pipe)),
+            partial: Vec::new(),
+            frame_limit,
+        }
+    }
+
     /// `None` means no complete frame this slice, not necessarily EOF. Retain
     /// partial bytes across WouldBlock, including a split multibyte character.
     /// CRLF, empty lines and a final unterminated frame match `read_frame`.
@@ -93,17 +101,52 @@ impl<R: Read> FramedPipe<R> {
     }
 }
 
-pub(super) struct ChildPipes<O = ChildStdout, E = ChildStderr> {
+pub(super) struct ChildPipes<O, E> {
     stdout: FramedPipe<O>,
     stderr: FramedPipe<E>,
 }
 
+#[cfg(unix)]
 impl<O: Read + AsFd, E: Read + AsFd> ChildPipes<O, E> {
     pub(super) fn new(stdout: O, stderr: E) -> io::Result<Self> {
         Ok(Self {
             stdout: FramedPipe::new(stdout, protocol::MAX_FRAME_BYTES)?,
             stderr: FramedPipe::new(stderr, protocol::MAX_FRAME_BYTES)?,
         })
+    }
+}
+
+#[cfg(windows)]
+pub(super) struct WindowsReader(crate::jobs::windows_job_pipe::Reader);
+
+#[cfg(windows)]
+impl Read for WindowsReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        // Reader::read waits on a condvar for dedicated job pump threads.
+        // A subagent future must only poll, preserving its per-slice budgets.
+        self.0.try_read(buffer)
+    }
+}
+
+#[cfg(windows)]
+impl ChildPipes<WindowsReader, WindowsReader> {
+    fn from_readers(
+        stdout: crate::jobs::windows_job_pipe::Reader,
+        stderr: crate::jobs::windows_job_pipe::Reader,
+    ) -> Self {
+        Self {
+            stdout: FramedPipe::from_nonblocking(WindowsReader(stdout), protocol::MAX_FRAME_BYTES),
+            stderr: FramedPipe::from_nonblocking(WindowsReader(stderr), protocol::MAX_FRAME_BYTES),
+        }
+    }
+
+    pub(super) fn configure(command: &mut Command) -> io::Result<Self> {
+        let (stdout, stdout_writer) = crate::jobs::windows_job_pipe::pair()?;
+        let (stderr, stderr_writer) = crate::jobs::windows_job_pipe::pair()?;
+        command
+            .stdout(Stdio::from(stdout_writer))
+            .stderr(Stdio::from(stderr_writer));
+        Ok(Self::from_readers(stdout, stderr))
     }
 }
 
@@ -150,7 +193,7 @@ impl<O: Read, E: Read> ChildPipes<O, E> {
     }
 
     const fn is_closed(&self) -> bool {
-        self.stdout.reader.is_none() && self.stderr.reader.is_none()
+        self.stdout.is_closed() && self.stderr.is_closed()
     }
 
     pub(super) async fn finish(
@@ -204,7 +247,7 @@ impl<O: Read, E: Read> ChildPipes<O, E> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -564,5 +607,221 @@ mod tests {
         assert!(protocol.finish().is_ok());
         assert_eq!(result.output, "complete answer");
         assert!(result.stderr.contains("diagnostic frame"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::windows::process::CommandExt as _;
+    use std::path::Path;
+
+    type WindowsPipes = ChildPipes<WindowsReader, WindowsReader>;
+
+    fn pair() -> (WindowsPipes, File, File) {
+        let (stdout, out) = crate::jobs::windows_job_pipe::pair().unwrap();
+        let (stderr, err) = crate::jobs::windows_job_pipe::pair().unwrap();
+        (ChildPipes::from_readers(stdout, stderr), out, err)
+    }
+
+    fn result() -> SubagentResult {
+        let agent = super::super::super::tan_agent_definition();
+        let task = serde_json::from_value(json!({"agent":"tan","task":"pipe fixture"})).unwrap();
+        SubagentResult::starting(&agent, task, None, Path::new("pi"), Path::new("."), &[])
+    }
+
+    fn ended() -> String {
+        json!({"type":"agent_end","messages":[{
+            "role":"assistant","stopReason":"stop",
+            "content":[{"type":"text","text":"complete answer"}]
+        }]})
+        .to_string()
+    }
+
+    fn frame(pipe: &mut FramedPipe<WindowsReader>) -> Result<Option<Vec<u8>>, &'static str> {
+        let mut budget = CHUNKS_PER_DRAIN;
+        pipe.next_frame(&mut budget)
+    }
+
+    fn ready_frame(pipe: &mut FramedPipe<WindowsReader>) -> Result<Vec<u8>, &'static str> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(frame) = frame(pipe)? {
+                return Ok(frame);
+            }
+            assert!(!pipe.is_closed(), "writer closed without a frame");
+            assert!(
+                Instant::now() < deadline,
+                "overlapped output did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_writer_closed(writer: &mut File) {
+        // Probe fewer bytes than the named pipe's capacity. If retirement
+        // leaks its server handle, a retained writer stays writable instead
+        // of blocking this test behind a full pipe.
+        for _ in 0..200 {
+            match writer.write(b"x") {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return,
+                Ok(1) => std::thread::sleep(Duration::from_millis(10)),
+                result => panic!("unexpected reader-retirement probe: {result:?}"),
+            }
+        }
+        panic!("dropped subagent reader retained its Windows server handle");
+    }
+
+    #[test]
+    fn overlapped_framing_retains_split_utf8_and_enforces_the_frame_limit() {
+        let _guard = crate::jobs::process_test_guard();
+        let (reader, mut writer) = crate::jobs::windows_job_pipe::pair().unwrap();
+        let mut pipe = FramedPipe::from_nonblocking(WindowsReader(reader), 4);
+        assert_eq!(frame(&mut pipe).unwrap(), None);
+        assert!(!pipe.is_closed(), "an idle writer is not EOF");
+        writer.write_all(&[b'a', 0xe7]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pipe.partial.len() < 2 {
+            assert_eq!(frame(&mut pipe).unwrap(), None);
+            assert!(Instant::now() < deadline, "partial output did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pipe.partial, [b'a', 0xe7]);
+        writer.write_all(&[0x95, 0x8c, b'\n']).unwrap();
+        assert_eq!(ready_frame(&mut pipe).unwrap(), "a界".as_bytes());
+        assert!(!pipe.is_closed());
+        writer.write_all(b"abcde").unwrap();
+        assert_eq!(ready_frame(&mut pipe), Err(protocol::FRAME_LIMIT));
+        assert!(pipe.is_closed());
+        assert!(pipe.partial.is_empty());
+        assert_writer_closed(&mut writer);
+    }
+
+    #[test]
+    fn pending_and_cancelled_drains_retire_readers_with_duplicated_writers_held() {
+        let _guard = crate::jobs::process_test_guard();
+        for cancel_before_poll in [false, true] {
+            let (pipes, out, err) = pair();
+            // These copies model writers retained outside the child Job.
+            // Neither killing the child nor closing its original handles can
+            // supply EOF; dropping the future must retire both read handles.
+            let mut retained_out = out.try_clone().unwrap();
+            let mut retained_err = err.try_clone().unwrap();
+            drop(out);
+            drop(err);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+            if cancel_before_poll {
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel Windows child drain"),
+                );
+            }
+            let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
+            let mut protocol = protocol::ChildProtocol::default();
+            let mut result = result();
+            runtime.block_on(async {
+                let mut finish =
+                    Box::pin(pipes.finish(&mut protocol, &mut result, None, &owner, deadline));
+                assert_eq!(futures::poll!(&mut finish).is_ready(), cancel_before_poll);
+                drop(finish);
+            });
+            if cancel_before_poll {
+                assert!(matches!(
+                    result.status,
+                    super::super::SubagentStatus::Cancelled
+                ));
+            }
+            assert_writer_closed(&mut retained_out);
+            assert_writer_closed(&mut retained_err);
+        }
+    }
+
+    #[test]
+    fn a_completed_answer_cannot_hide_writers_held_past_the_drain_deadline() {
+        let _guard = crate::jobs::process_test_guard();
+        let (mut pipes, mut out, mut err) = pair();
+        writeln!(out, "{}", ended()).unwrap();
+        let mut protocol = protocol::ChildProtocol::default();
+        let mut result = result();
+        let arrived_by = Instant::now() + Duration::from_secs(2);
+        while result.output.is_empty() {
+            pipes.drain(&mut protocol, &mut result, None);
+            assert!(!result.is_error, "{:?}", result.error);
+            assert!(Instant::now() < arrived_by, "completion did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(protocol.finish().is_ok());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+        let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
+        runtime.block_on(pipes.finish_with_timeout(
+            &mut protocol,
+            &mut result,
+            None,
+            &owner,
+            deadline,
+            Duration::ZERO,
+        ));
+        assert!(result.is_error);
+        assert_eq!(result.error.as_deref(), Some(PIPE_TIMEOUT));
+        assert_writer_closed(&mut out);
+        assert_writer_closed(&mut err);
+    }
+
+    #[test]
+    fn real_child_drains_both_overlapped_streams_and_reaches_eof() {
+        let _guard = crate::jobs::process_test_guard();
+        let script = format!(
+            r#"for /L %i in (1,1,4000) do @(echo {{"type":"usage"}} & echo diagnostic frame to fill the stderr pipe 1>&2) & echo {}"#,
+            ended()
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+        let deadline = Deadline::for_request(Some(Duration::from_secs(30)), None).unwrap();
+        let mut command = Command::new("cmd.exe");
+        // cmd does not use CRT argument escaping. /S removes only the outer
+        // quote pair, leaving this controlled script's JSON quotes intact.
+        command
+            .args(["/D", "/Q", "/E:ON", "/S", "/C"])
+            .raw_arg(format!("\"{script}\""))
+            .stdin(Stdio::null());
+        let mut pipes = ChildPipes::configure(&mut command).unwrap();
+        let mut child = super::super::ChildProcessGuard::spawn(&owner, &mut command).unwrap();
+        // Match the production handoff. Keeping these parent writer copies
+        // would prevent the EOF required for successful protocol acceptance.
+        drop(command);
+        let mut protocol = protocol::ChildProtocol::default();
+        let mut result = result();
+        runtime.block_on(async {
+            loop {
+                assert!(deadline.check().is_ok(), "child output drainage stalled");
+                pipes.drain(&mut protocol, &mut result, None);
+                assert!(!result.is_error, "{:?}", result.error);
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                poll_pause(&owner).await;
+            }
+            child.stop_descendants();
+            pipes
+                .finish(&mut protocol, &mut result, None, &owner, deadline)
+                .await;
+        });
+        assert!(!result.is_error, "{:?}", result.error);
+        assert!(protocol.finish().is_ok());
+        assert_eq!(result.output, "complete answer");
+        assert!(result.stderr.contains("diagnostic frame"));
+        child.disarm();
     }
 }
