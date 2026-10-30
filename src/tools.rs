@@ -37,10 +37,13 @@ use uuid::Uuid;
 pub(crate) mod bash_session;
 mod client_files;
 mod client_terminals;
+mod interim_response;
 mod structured_json;
 mod structured_sqlite;
 pub use client_files::{TextFileClient, TextFileClientScope};
 pub use client_terminals::{TerminalClient, TerminalClientScope, TerminalCommand};
+pub use interim_response::interim_response_text;
+pub(crate) use interim_response::{interim_response_text_from_details, is_interim_response_path};
 
 /// Run an internal, resource-bounded data query before normal Pi startup.
 /// The worker receives admitted bytes and never loads project configuration,
@@ -5948,6 +5951,12 @@ impl ToolRegistry {
                 )),
                 "write" => tools.push(Box::new(
                     WriteTool::new(cwd)
+                        .with_output_enabled(
+                            config
+                                .and_then(|config| config.out.as_ref())
+                                .and_then(|settings| settings.enabled)
+                                .unwrap_or(false),
+                        )
                         .with_mutation_recorder(mutation_recorder.clone())
                         .with_workspace(workspace.clone()),
                 )),
@@ -7157,6 +7166,12 @@ impl Tool for ReadTool {
             return Err(Error::validation(
                 "`offset` must be non-negative".to_string(),
             ));
+        }
+
+        // A reply's ignored suffix must not turn it into a structured-file
+        // query before the URL router can explain that it is write-only.
+        if is_interim_response_path(&input.path) {
+            return self.execute_scheme_read(&input).await;
         }
 
         if !input.raw
@@ -12338,6 +12353,7 @@ struct WriteInput {
 
 pub struct WriteTool {
     cwd: PathBuf,
+    output_enabled: bool,
     text_file_client: TextFileClientScope,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
@@ -12348,11 +12364,20 @@ impl WriteTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            output_enabled: false,
             text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: None,
             mutation_recorder: None,
         }
+    }
+
+    /// Enable the host's interim reply surface. Native child agents remain
+    /// unable to address the user even when their inherited settings opt in.
+    #[must_use]
+    pub const fn with_output_enabled(mut self, enabled: bool) -> Self {
+        self.output_enabled = enabled;
+        self
     }
 
     /// Attach the session workspace root handle (bd-cv653.3.12).
@@ -12441,6 +12466,7 @@ impl WriteTool {
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            output_enabled: false,
             text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: Some(Arc::new(hook)),
@@ -12479,7 +12505,11 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write content to a file, creating parent directories as needed. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        if self.output_enabled && !interim_response::caller_is_child() {
+            "Write content to a file, creating parent directories as needed. Write nonempty Markdown to out:// (up to 64 KiB UTF-8) to answer the user or report progress without ending the task, then keep working; out:// never writes a file. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        } else {
+            "Write content to a file, creating parent directories as needed. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        }
     }
 
     fn effects(&self) -> ToolEffects {
@@ -12492,6 +12522,9 @@ impl Tool for WriteTool {
         let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
             return self.effects();
         };
+        if is_interim_response_path(path) && interim_response::validated_input(input).is_ok() {
+            return ToolEffects::read();
+        }
         if path.starts_with("conflict://") {
             // Git inventory uses a process even though publication is local.
             ToolEffects::write().union(ToolEffects::process())
@@ -12548,12 +12581,17 @@ impl Tool for WriteTool {
                 }
             }
         });
+        let path_description = if self.output_enabled && !interim_response::caller_is_child() {
+            "File path; out:// for a mid-task Markdown reply (no file write, maximum 64 KiB UTF-8); conflict://N/token for literal replacement, or conflict://* for typed choices"
+        } else {
+            "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
+        };
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
+                    "description": path_description
                 },
                 "content": content,
                 "conflicts": conflicts
@@ -12579,8 +12617,15 @@ impl Tool for WriteTool {
         &self,
         tool_call_id: &str,
         input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_interim_response_path)
+        {
+            return self.execute_interim_response(&input, on_update.as_deref());
+        }
         if input
             .get("path")
             .and_then(serde_json::Value::as_str)

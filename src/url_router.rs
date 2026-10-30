@@ -32,6 +32,12 @@ use crate::error::{Error, Result};
 use std::path::Path;
 
 fn agent_reference(path: &str) -> Result<Option<&str>> {
+    if crate::tools::is_interim_response_path(path) {
+        return Err(Error::tool(
+            "read",
+            "out:// is write-only. Write Markdown with the write tool to show an interim reply without ending the task.",
+        ));
+    }
     let Some((scheme, reference)) = path.split_once("://") else {
         return Ok(None);
     };
@@ -102,6 +108,18 @@ pub fn resolve_with(path: &str, cwd: &Path, options: &ResolveOptions) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interim_reply_urls_are_write_only_with_both_resolvers() {
+        for path in ["out://", "OUT://progress", "out://reply.json?q=.text"] {
+            for error in [
+                resolve(path, Path::new(".")).unwrap_err(),
+                resolve_with(path, Path::new("."), &ResolveOptions::default()).unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("write-only"), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn unknown_schemes_advertise_agent_results_without_falling_back() {

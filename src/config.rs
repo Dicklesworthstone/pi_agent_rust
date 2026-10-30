@@ -93,6 +93,8 @@ pub struct Config {
     pub plan: Option<PlanSettings>,
     /// Read-tool settings (bd-cv653.2.2 URL reads).
     pub read: Option<ReadSettings>,
+    /// Mid-turn Markdown replies through `write out://`.
+    pub out: Option<OutSettings>,
     /// Bash-tool mediation settings (bd-cv653.1.7).
     pub bash: Option<BashSettings>,
     /// Memory-bank settings (bd-cv653.4.1).
@@ -547,6 +549,15 @@ pub struct ModelScopeOverride {
 pub struct ToolSettings {
     #[serde(alias = "loadMode")]
     pub load_mode: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Interim responses shown without ending the agent's current task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutSettings {
+    /// Unset follows the host surface: on in the top-level interactive TUI,
+    /// off in unattended sessions. Native child agents never emit replies.
+    pub enabled: Option<bool>,
 }
 
 /// Plan-mode configuration (bd-cv653.3.5).
@@ -1028,6 +1039,12 @@ impl Config {
             tools: merge_tools(base.tools, other.tools),
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
+            out: match (base.out, other.out) {
+                (Some(base), Some(other)) => Some(OutSettings {
+                    enabled: other.enabled.or(base.enabled),
+                }),
+                (base, other) => other.or(base),
+            },
             bash: merge_bash(base.bash, other.bash),
             memory: merge_memory(base.memory, other.memory),
             mcp: match (base.mcp, other.mcp) {
@@ -3896,6 +3913,27 @@ mod tests {
     fn a_nested_struct_key_is_recognised_by_its_own_name() {
         let keys = unrecognised_setting_keys(r#"{ "retry": { "maxRetries": 9 } }"#);
         assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn interim_response_settings_preserve_unset_and_explicit_overrides() {
+        let base: Config = serde_json::from_str(r#"{"out":{"enabled":true}}"#).unwrap();
+        for overlay in [r#"{}"#, r#"{"out":{}}"#, r#"{"out":{"enabled":null}}"#] {
+            let merged = Config::merge(base.clone(), serde_json::from_str(overlay).unwrap());
+            assert_eq!(merged.out.unwrap().enabled, Some(true), "{overlay}");
+        }
+        let off: Config = serde_json::from_str(r#"{"out":{"enabled":false}}"#).unwrap();
+        let merged = Config::merge(base, off);
+        assert_eq!(merged.out.as_ref().unwrap().enabled, Some(false));
+        let roundtrip: Config =
+            serde_json::from_str(&serde_json::to_string(&merged).unwrap()).unwrap();
+        assert_eq!(roundtrip.out.unwrap().enabled, Some(false));
+        assert!(Config::default().out.is_none());
+        assert!(unrecognised_setting_keys(r#"{"out":{"enabled":true}}"#).is_empty());
+        assert_eq!(
+            unrecognised_setting_keys(r#"{"out":{"enabledd":true}}"#),
+            vec!["out.enabledd".to_string()]
+        );
     }
 
     #[test]

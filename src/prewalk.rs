@@ -275,6 +275,8 @@ mod tests {
             "plan://current",
             ".pi/plans/change.md",
             ".omp/plans/change.md",
+            "out://",
+            "OUT://progress",
         ] {
             let preparation = call(path);
             state.observe(
