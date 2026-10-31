@@ -42,6 +42,7 @@ struct Turn {
     status: &'static str,
     result: Option<ToolOutput>,
     privacy: Option<AuxiliaryPrivacySnapshot>,
+    dependency: Arc<crate::agent_hub::ResultDependency>,
 }
 
 #[allow(clippy::struct_excessive_bools)] // Independent lifecycle flags read under one lock.
@@ -49,6 +50,7 @@ pub(super) struct WorkerState {
     owner: String,
     id: String,
     job_id: String,
+    hub_id: Option<String>,
     agent: String,
     deadline: Deadline,
     emit_notices: bool,
@@ -210,6 +212,38 @@ fn identity(state: &Shared) -> Result<(String, String)> {
     Ok((state.owner.clone(), state.job_id.clone()))
 }
 
+/// Called after native hub admission and before the actor launches its process.
+/// Already-admitted waits observe this binding through their own turn tokens.
+pub(super) fn bind_hub(state: &Shared, id: &str) -> Result<()> {
+    let mut state = state.lock().map_err(|_| stopped())?;
+    if state.hub_id.is_some() {
+        return Err(stopped());
+    }
+    for turn in state.turns.values() {
+        turn.dependency.bind(id);
+    }
+    state.hub_id = Some(id.to_string());
+    Ok(())
+}
+
+fn hold_results(
+    results: Arc<crate::agent_hub::ResultDependencies>,
+    acknowledged: Vec<u64>,
+    all: bool,
+    remaining: Duration,
+) -> Result<Option<Arc<crate::agent_hub::DependencyHold>>> {
+    if crate::jobs::current_native_task().is_some() {
+        // An internal background wait does not prevent the root parent from
+        // answering. Do not invent a foreground dependency for that caller.
+        return Ok(None);
+    }
+    crate::agent_hub::registry()
+        .lock()
+        .map_err(|_| Error::tool("subagent", "PI_SUBAGENT_HUB: registry is poisoned"))?
+        .hold_turn_results(results, acknowledged, all, remaining)
+        .map(Some)
+}
+
 /// This guard also covers a never-polled future rejected by jobs admission.
 /// The inner RPC actor drops its process and pipes before the outer guard.
 struct FinishGuard(Shared);
@@ -325,6 +359,7 @@ async fn start(
         owner: owner_id.clone(),
         id: id.clone(),
         job_id: String::new(),
+        hub_id: None,
         agent: name,
         deadline,
         emit_notices: true,
@@ -341,6 +376,7 @@ async fn start(
                 status: "queued",
                 result: None,
                 privacy: Some(privacy.clone()),
+                dependency: crate::agent_hub::ResultDependency::new(None),
             },
         )]),
         result_bytes: 0,
@@ -506,12 +542,14 @@ pub(super) async fn execute(
                     return Ok((false, None));
                 }
                 state.latest = turn_id;
+                let dependency = crate::agent_hub::ResultDependency::new(state.hub_id.as_deref());
                 state.turns.insert(
                     turn_id,
                     Turn {
                         status: "queued",
                         result: None,
                         privacy: Some(privacy.clone()),
+                        dependency,
                     },
                 );
                 state.queue.push_back(PendingTurn {
@@ -542,6 +580,24 @@ pub(super) async fn execute(
     // Capture latest once: a concurrent send cannot retarget an existing wait.
     let turn_id = selected_turn.unwrap_or(state.lock().map_err(|_| stopped())?.latest);
     let started = Instant::now();
+    let _waiting = if operation == "worker_wait" && timeout_ms > 0 {
+        let results = state
+            .lock()
+            .map_err(|_| stopped())?
+            .turns
+            .get(&turn_id)
+            .map(|turn| Arc::clone(&turn.dependency))
+            .into_iter()
+            .collect();
+        hold_results(
+            crate::agent_hub::ResultDependencies::new(results),
+            Vec::new(),
+            true,
+            Duration::from_millis(timeout_ms),
+        )?
+    } else {
+        None
+    };
     loop {
         check_owner(&owner)?;
         if background::resolve_session(&tool.job_session_scope, &owner, budget).await? != owner_id {
@@ -809,6 +865,7 @@ pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>
         }
         turn.status = status;
         turn.result = Some(output);
+        turn.dependency.complete();
         state.result_bytes = state.result_bytes.saturating_add(bytes);
         let notice = state.emit_notices.then(|| {
             format!(
@@ -845,6 +902,7 @@ pub(super) fn finish(shared: &Shared, error: Option<&str>) {
     let status = if state.failed { "failed" } else { "cancelled" };
     state.queue.clear();
     for turn in state.turns.values_mut() {
+        turn.dependency.complete();
         turn.privacy = None;
         if matches!(turn.status, "queued" | "running") {
             turn.status = status;

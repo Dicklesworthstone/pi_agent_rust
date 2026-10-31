@@ -206,6 +206,156 @@ fn foreground_parent_wait_is_blocked_but_an_answerable_sibling_keeps_waiting() {
 }
 
 #[test]
+fn worker_result_dependency_tracks_the_turn_instead_of_the_retained_process() {
+    let (_dir, mut hub, first, _) = fixture();
+    let turn = ResultDependency::new(None);
+    let hold = hub
+        .hold_turn_results(
+            ResultDependencies::new(vec![Arc::clone(&turn)]),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::Pending
+    );
+    turn.bind(&first);
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::PeerBlocked
+    );
+    turn.complete();
+    let next_turn = ResultDependency::new(Some(&first));
+    assert!(next_turn.pending());
+    assert_eq!(hub.control_pid(&first), Some(11));
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::Pending,
+        "completion releases an unpolled observer before a new retained turn"
+    );
+    drop(hold);
+}
+
+#[test]
+fn pool_drain_observes_new_alternatives_and_completed_cursor_items() {
+    let (_dir, mut hub, first, second) = fixture();
+    let prior = ResultDependency::new(Some(&first));
+    prior.complete();
+    let first_turn = ResultDependency::new(Some(&first));
+    let results = ResultDependencies::new(vec![prior, Arc::clone(&first_turn)]);
+    let drain = hub
+        .hold_turn_results(
+            Arc::clone(&results),
+            vec![1],
+            false,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::PeerBlocked
+    );
+    let second_turn = ResultDependency::new(None);
+    results.extend(vec![Arc::clone(&second_turn)]);
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::Pending,
+        "an admitted but not-yet-launched alternative can wake the drain"
+    );
+    second_turn.bind(&second);
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::Pending
+    );
+    let all = hub
+        .hold_turn_results(
+            Arc::clone(&results),
+            Vec::new(),
+            true,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::PeerBlocked,
+        "wait-all cannot complete without the first worker's result"
+    );
+    drop(all);
+    let second_wait = hub
+        .begin_reply_wait(&second, Some(&first), 0, Duration::from_secs(60), None)
+        .unwrap();
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::PeerBlocked,
+        "all drain alternatives now depend transitively on the caller"
+    );
+    second_turn.complete();
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::Pending,
+        "an available completion releases the drain before its next poll"
+    );
+    drop(second_wait);
+    drop(drain);
+    assert_eq!(hub.control_pid(&first), Some(11));
+}
+
+#[test]
+fn job_result_wait_follows_later_waves_and_retires_native_associations() {
+    let (_dir, mut hub, first, second) = fixture();
+    let owner = crate::jobs::NativeTaskOwner {
+        session: "owner".to_string(),
+        job: "job".to_string(),
+    };
+    let hold = hub
+        .hold_job_results(owner.clone(), Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::Pending
+    );
+    hub.native_jobs.insert(first.clone(), owner.clone());
+    assert_eq!(
+        hub.wait_snapshot(&first, Some("parent"), 0).unwrap().status,
+        InboxWaitStatus::PeerBlocked
+    );
+    hub.finish_native_execution(&first);
+    assert!(!hub.native_jobs.contains_key(&first));
+    hub.native_jobs.insert(
+        second.clone(),
+        crate::jobs::NativeTaskOwner {
+            session: "foreign".to_string(),
+            job: owner.job.clone(),
+        },
+    );
+    assert_eq!(
+        hub.wait_snapshot(&second, Some("parent"), 0)
+            .unwrap()
+            .status,
+        InboxWaitStatus::Pending,
+        "job IDs alone never cross the owning session boundary"
+    );
+    hub.native_jobs.insert(second.clone(), owner);
+    assert_eq!(
+        hub.wait_snapshot(&second, Some("parent"), 0)
+            .unwrap()
+            .status,
+        InboxWaitStatus::PeerBlocked,
+        "the same open job wait follows a later registered wave"
+    );
+    drop(hold);
+    assert_eq!(
+        hub.wait_snapshot(&second, Some("parent"), 0)
+            .unwrap()
+            .status,
+        InboxWaitStatus::Pending
+    );
+    assert_eq!(hub.control_pid(&second), Some(12));
+}
+
+#[test]
 fn delivered_reply_releases_dependency_before_the_waiter_polls_again() {
     let (_dir, mut hub, first, second) = fixture();
     let _hold = hub

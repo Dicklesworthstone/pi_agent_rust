@@ -17,18 +17,55 @@ use crate::model::{ContentBlock, TextContent};
 use crate::text_completion::AuxiliaryPrivacySnapshot;
 use crate::tools::ToolOutput;
 use asupersync::sync::Notify;
+use std::cell::RefCell;
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const TASK_SCHEMA: &str = "pi.host_job.v1";
+pub(super) const TASK_SCHEMA: &str = "pi.host_job.v1";
 const PROGRESS_SCHEMA: &str = "pi.host_job.progress.v1";
 const INTERRUPTED_SCHEMA: &str = "pi.host_job.interrupted.v1";
 const MAX_TASK_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_TASK_LABEL_BYTES: usize = 256;
 const TASK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Identity supplied by the owned-task runner, never by a model or a child.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct NativeTaskOwner {
+    pub(crate) session: String,
+    pub(crate) job: String,
+}
+
+thread_local! {
+    static CURRENT_NATIVE_TASK: RefCell<Option<NativeTaskOwner>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn current_native_task() -> Option<NativeTaskOwner> {
+    CURRENT_NATIVE_TASK.with_borrow(Clone::clone)
+}
+
+struct NativeTaskScope {
+    previous: Option<NativeTaskOwner>,
+    // A scope cannot move to another thread with a different TLS slot.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl NativeTaskScope {
+    fn enter(owner: NativeTaskOwner) -> Self {
+        Self {
+            previous: CURRENT_NATIVE_TASK.replace(Some(owner)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for NativeTaskScope {
+    fn drop(&mut self) {
+        CURRENT_NATIVE_TASK.set(self.previous.take());
+    }
+}
 
 /// Retain the owner's shutdown generation across asynchronous preflight. A
 /// caller must resolve its live session again after taking this token; if it
@@ -339,8 +376,16 @@ where
         settled: false,
     })));
     let worker_resources = Arc::clone(&resources);
+    let native_owner = NativeTaskOwner {
+        session: owner_session_id.to_string(),
+        job: id.clone(),
+    };
     let worker = std::thread::Builder::new().name(format!("pi-task-{id}"))
         .spawn(move || {
+            // This dedicated thread runs a current-thread runtime below.
+            // All native registrations, including later workflow waves,
+            // inherit this immutable owner without async task migration.
+            let _native_scope = NativeTaskScope::enter(native_owner);
             let Some(mut resources) = worker_resources.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).take()
             else { return; };

@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 pub mod ipc;
 mod wait;
 
-pub(crate) use wait::DependencyHold;
+pub(crate) use wait::{DependencyHold, ResultDependencies, ResultDependency};
 pub use wait::{InboxWaitResult, InboxWaitStatus, PendingReply, wait_for_replies};
 
 /// Maximum transcript bytes paged back per `transcript` call.
@@ -41,6 +41,7 @@ const MAX_QUEUE_PER_CHILD: usize = 64;
 /// Bound both a single serialized steering frame and the pending disk queue.
 const MAX_STEER_FRAME_BYTES: usize = 64 * 1024;
 const MAX_STEER_QUEUE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_NATIVE_JOB_CHILDREN: usize = 1024;
 
 /// Lifecycle states for a registered child run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +159,9 @@ pub struct AgentHubRegistry {
     /// A terminal control request can precede process reap and worktree
     /// disposition. Revival waits for the owning lease to finish both.
     active_executions: BTreeSet<String>,
+    /// Only active native execution leases retain their actual job owner.
+    /// Completed runs cannot attach a later revival to an old job wait.
+    native_jobs: BTreeMap<String, crate::jobs::NativeTaskOwner>,
     seq: u64,
     /// Per-recipient delivered/queued bus messages (in-memory view; the
     /// on-disk steer files are the cross-process channel).
@@ -336,8 +340,12 @@ impl AgentHubRegistry {
     /// revival policy: a replacement process cannot retain its conversation.
     #[cfg(any(unix, windows))]
     pub(crate) fn register_worker(&mut self, name: &str, kind: ChildKind) -> Result<ChildEntry> {
+        let job = self.native_job_admission()?;
         let entry = self.register_kind(name, "Persistent RPC worker", kind)?;
         self.active_executions.insert(entry.id.clone());
+        if let Some(job) = job {
+            self.native_jobs.insert(entry.id.clone(), job);
+        }
         Ok(entry)
     }
 
@@ -349,6 +357,7 @@ impl AgentHubRegistry {
         launch: crate::subagents::RevivalSpec,
         revived_from: Option<&str>,
     ) -> Result<ChildEntry> {
+        let job = self.native_job_admission()?;
         let lineage_root = if let Some(id) = revived_from {
             let prior = self.native_revival_source(id)?;
             if prior.entry.name != name || prior.entry.kind != kind {
@@ -375,11 +384,26 @@ impl AgentHubRegistry {
             lineage_root.unwrap_or_else(|| entry.id.clone()),
         );
         self.active_executions.insert(entry.id.clone());
+        if let Some(job) = job {
+            self.native_jobs.insert(entry.id.clone(), job);
+        }
         Ok(entry)
+    }
+
+    fn native_job_admission(&self) -> Result<Option<crate::jobs::NativeTaskOwner>> {
+        let owner = crate::jobs::current_native_task();
+        if owner.is_some() && self.native_jobs.len() >= MAX_NATIVE_JOB_CHILDREN {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_WAIT_LIMIT: too many active native job children",
+            ));
+        }
+        Ok(owner)
     }
 
     pub(crate) fn finish_native_execution(&mut self, id: &str) {
         self.active_executions.remove(id);
+        self.native_jobs.remove(id);
     }
 
     /// Snapshot only execution-owned launch metadata. This performs no

@@ -116,18 +116,33 @@ Foreground native delegations also record that the parent is waiting for each
 child's accepted result. A child that asks its synchronously waiting parent a
 question can therefore receive `peerBlocked` instead of spending its whole
 budget on an answer that cannot arrive. Explicit background delegations,
-background workflows, and `/tan` do not create this parent dependency. Persistent
-worker turns and later `hub jobs wait` calls do not yet contribute execution
-dependencies; reply waits over their authenticated hub channel still use the
-same dependency checks.
+background workflows, and `/tan` do not create this parent dependency merely by
+launching. An explicit `worker_wait` records the selected admitted turn, and
+`pool_wait` records its selected item or all pending items. A `pool_drain` can
+wake for any unacknowledged completion; an independent alternative keeps the
+wait answerable, including work admitted while the drain is already open.
+Accepted turn completion releases these dependencies before the waiting caller
+polls again, so an idle worker or its next turn does not retain an old wait.
+
+Later native `hub jobs wait` calls also record a parent dependency. Native
+registrations inherit their actual owning session and job from the dedicated
+owned-task runner, so an open wait follows later workflow waves without guessing
+from names, result text or process IDs. Shell jobs have no native child
+association. These associations are bounded to 1,024 active children and retired
+by their execution leases after cleanup. Waiting for another result from inside
+an already-background owned task does not claim that the root parent is blocked;
+internal job-to-job dependencies are not represented by this parent wait graph.
+Reply waits over authenticated child channels retain the same dependency checks.
 
 Native workers use bounded read-only probes and an authenticated wait lease on
 their existing parent channel; root callers retain a local lease. Dropping a
 wait releases its lease without acquiring the registry lock or cancelling a
 peer. A disconnected socket, expired budget, reaped waiter, or delivered reply
 cannot leave an active reply dependency behind. Foreground result dependencies
-remain until their owning execution finishes. The registry holds only weak
-references and admits at most 1,024 active dependency leases.
+remain until their owning execution finishes. Explicit result waits release on
+completion, caller cancellation, deadline or owner drop without cancelling the
+child. The registry holds only weak references and admits at most 1,024 active
+dependency leases.
 
 Ordinary lock contention retries inside the original budget. Authentication,
 revocation, broken channels and earlier transport timeouts remain errors. No

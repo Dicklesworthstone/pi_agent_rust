@@ -6,8 +6,8 @@ use super::{
     AgentCx, AgentScope, AuxiliaryPrivacySnapshot, BTreeMap, ChildRunner, ContentBlock, Deadline,
     Error, MAX_PROMPT_BYTES, MAX_SUBAGENT_DEPTH, MAX_TURNS, Mutex, OnceLock, POLL_INTERVAL,
     PendingTurn, Result, Shared, SubagentTool, TextContent, ToolOutput, Turn, Value, VecDeque,
-    WorkerState, background, check_owner, current_subagent_depth, execution, optional_integer,
-    required_text, validate_fields, workspace,
+    WorkerState, background, check_owner, current_subagent_depth, execution, hold_results,
+    optional_integer, required_text, validate_fields, workspace,
 };
 use crate::subagents::AgentDefinition;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -50,6 +50,7 @@ struct PoolState {
     failed: bool,
     workers: Vec<Shared>,
     items: Vec<Item>,
+    dependencies: Arc<crate::agent_hub::ResultDependencies>,
     // At most one snapshot per accepted batch (plus an empty initial batch).
     // A later discovery must also protect earlier summaries in final delivery.
     privacy: Vec<AuxiliaryPrivacySnapshot>,
@@ -143,6 +144,7 @@ fn worker(owner: &str, agent: &str, deadline: Deadline) -> Shared {
         owner: owner.to_string(),
         id: format!("pool-member-{}", uuid::Uuid::new_v4().simple()),
         job_id: String::new(),
+        hub_id: None,
         agent: agent.to_string(),
         deadline,
         emit_notices: false,
@@ -281,6 +283,7 @@ async fn start(
         failed: false,
         workers,
         items: Vec::new(),
+        dependencies: crate::agent_hub::ResultDependencies::new(Vec::new()),
         privacy: Vec::new(),
     }));
     register(Arc::clone(&pool))?;
@@ -548,17 +551,21 @@ async fn admit(
                 }
                 *latest = turn;
             }
+            let mut dependencies = Vec::with_capacity(batch.placements.len());
             for ((index, id), task) in batch.placements.iter().zip(assignments) {
                 // Every placement was checked above; the locked member
                 // vector is unchanged throughout the winning commit.
                 let worker = workers.get_mut(*index).ok_or_else(stopped)?;
                 worker.latest = *id;
+                let dependency = crate::agent_hub::ResultDependency::new(worker.hub_id.as_deref());
+                dependencies.push(Arc::clone(&dependency));
                 worker.turns.insert(
                     *id,
                     Turn {
                         status: "queued",
                         result: None,
                         privacy: Some(privacy.clone()),
+                        dependency,
                     },
                 );
                 worker.queue.push_back(PendingTurn {
@@ -570,6 +577,7 @@ async fn admit(
                     turn: *id,
                 });
             }
+            state.dependencies.extend(dependencies);
             state.privacy.push(privacy.clone());
             if initial {
                 for worker in &mut workers {
@@ -653,6 +661,8 @@ pub(super) async fn execute(
         close(&pool).await?;
     }
     let started = Instant::now();
+    let mut wait_admitted = false;
+    let mut _waiting = None;
     loop {
         recheck_owner(tool, &owner, &owner_id, budget).await?;
         if let Some(request) = &drain {
@@ -666,6 +676,17 @@ pub(super) async fn execute(
                 || details.get("done").and_then(Value::as_bool) == Some(true);
             if ready || expired {
                 return Ok(output);
+            }
+            // Any unacknowledged result can wake a drain; a live independent
+            // alternative must keep a peer wait answerable.
+            if !wait_admitted {
+                _waiting = hold_results(
+                    result_dependencies(&pool, None)?,
+                    request.acknowledged.clone(),
+                    false,
+                    Duration::from_millis(timeout_ms).saturating_sub(started.elapsed()),
+                )?;
+                wait_admitted = true;
             }
             owner
                 .time()
@@ -695,6 +716,18 @@ pub(super) async fn execute(
         {
             return Ok(output);
         }
+        // A selected item waits for its one turn. An entire pool waits for
+        // every pending item. Its shared set observes new admissions before
+        // their actors can start, including while this caller is asleep.
+        if !wait_admitted {
+            _waiting = hold_results(
+                result_dependencies(&pool, selected)?,
+                Vec::new(),
+                true,
+                Duration::from_millis(timeout_ms).saturating_sub(started.elapsed()),
+            )?;
+            wait_admitted = true;
+        }
         owner
             .time()
             .sleep(
@@ -703,6 +736,33 @@ pub(super) async fn execute(
             )
             .await;
     }
+}
+
+fn result_dependencies(
+    pool: &Pool,
+    selected: Option<u64>,
+) -> Result<Arc<crate::agent_hub::ResultDependencies>> {
+    let state = pool.lock().map_err(|_| stopped())?;
+    let Some(selected) = selected else {
+        return Ok(Arc::clone(&state.dependencies));
+    };
+    let mut results = Vec::new();
+    for (index, item) in state.items.iter().enumerate() {
+        if u64::try_from(index + 1).ok() != Some(selected) {
+            continue;
+        }
+        let worker = state
+            .workers
+            .get(item.worker)
+            .ok_or_else(stopped)?
+            .lock()
+            .map_err(|_| stopped())?;
+        let turn = worker.turns.get(&item.turn).ok_or_else(stopped)?;
+        if pending(turn.status) {
+            results.push(Arc::clone(&turn.dependency));
+        }
+    }
+    Ok(crate::agent_hub::ResultDependencies::new(results))
 }
 
 struct DrainRequest {

@@ -3,7 +3,8 @@
 
 use std::collections::BTreeSet;
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,66 @@ const MAX_TRACKED_PEERS: usize = 256;
 const MAX_TRACKED_PEER_BYTES: usize = 32 * 1024;
 const MAX_WAIT_HOLDS: usize = 1024;
 
+/// One admitted worker turn, independent of the retained process's lifetime.
+/// Binding precedes process launch; completion releases every observer before
+/// the actor can accept another turn, even if a waiting future is not polled.
+pub(crate) struct ResultDependency {
+    peer: OnceLock<String>,
+    pending: AtomicBool,
+}
+
+impl ResultDependency {
+    pub(crate) fn new(peer: Option<&str>) -> Arc<Self> {
+        let result = Arc::new(Self {
+            peer: OnceLock::new(),
+            pending: AtomicBool::new(true),
+        });
+        if let Some(peer) = peer {
+            result.bind(peer);
+        }
+        result
+    }
+
+    pub(crate) fn bind(&self, peer: &str) {
+        let _ = self.peer.set(peer.to_string());
+    }
+
+    pub(crate) fn complete(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+
+    fn pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+}
+
+/// Bounded by native worker/pool admission. A pool publishes each accepted
+/// batch here before unlocking admission, so a wait observes later alternatives
+/// without acquiring worker, pool or jobs locks under the hub registry lock.
+pub(crate) struct ResultDependencies(Mutex<Vec<Arc<ResultDependency>>>);
+
+impl ResultDependencies {
+    pub(crate) fn new(results: Vec<Arc<ResultDependency>>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(results)))
+    }
+
+    pub(crate) fn extend(&self, results: Vec<Arc<ResultDependency>>) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(results);
+    }
+}
+
+enum ResultWatch {
+    Turns {
+        results: Arc<ResultDependencies>,
+        acknowledged: Vec<u64>,
+        all: bool,
+    },
+    Job(crate::jobs::NativeTaskOwner),
+}
+
 struct ReplyWatch {
     cursor: u64,
     all_senders: bool,
@@ -30,6 +91,8 @@ pub struct DependencyHold {
     peers: Vec<String>,
     deadline: Instant,
     reply: Option<ReplyWatch>,
+    result: Option<ResultWatch>,
+    owner: Option<AgentCx>,
     /// A nonblocking clone observes EOF before the channel's next poll.
     /// The client socket's lifetime is the authenticated release token.
     channel: Option<TcpStream>,
@@ -37,7 +100,15 @@ pub struct DependencyHold {
 
 impl DependencyHold {
     pub(super) fn active(&self) -> bool {
-        if Instant::now() >= self.deadline {
+        if Instant::now() >= self.deadline
+            || self.owner.as_ref().is_some_and(|owner| {
+                owner.is_cancel_requested()
+                    || owner
+                        .budget()
+                        .deadline
+                        .is_some_and(|deadline| now(owner) >= deadline)
+            })
+        {
             return false;
         }
         self.channel.as_ref().is_none_or(|socket| {
@@ -47,6 +118,13 @@ impl DependencyHold {
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
             ))
         })
+    }
+
+    fn awaits_all_results(&self) -> bool {
+        matches!(
+            &self.result,
+            Some(ResultWatch::Job(_) | ResultWatch::Turns { all: true, .. })
+        )
     }
 }
 
@@ -136,7 +214,8 @@ fn expired_probe(
 
 impl AgentHubRegistry {
     /// A foreground native call awaits the child's result, including accepted
-    /// writeback. Background jobs must not install this execution dependency.
+    /// writeback. Background launch alone never installs this dependency;
+    /// an explicit later result wait owns its own bounded lease instead.
     pub(crate) fn hold_child_result(
         &mut self,
         child: &str,
@@ -161,6 +240,58 @@ impl AgentHubRegistry {
             peers: vec![child.to_string()],
             deadline,
             reply: None,
+            result: None,
+            owner: None,
+            channel: None,
+        });
+        self.wait_holds.push(Arc::downgrade(&hold));
+        Ok(hold)
+    }
+
+    pub(crate) fn hold_turn_results(
+        &mut self,
+        results: Arc<ResultDependencies>,
+        acknowledged: Vec<u64>,
+        all: bool,
+        remaining: Duration,
+    ) -> Result<Arc<DependencyHold>> {
+        self.hold_results(
+            ResultWatch::Turns {
+                results,
+                acknowledged,
+                all,
+            },
+            remaining,
+        )
+    }
+
+    pub(crate) fn hold_job_results(
+        &mut self,
+        owner: crate::jobs::NativeTaskOwner,
+        remaining: Duration,
+    ) -> Result<Arc<DependencyHold>> {
+        self.hold_results(ResultWatch::Job(owner), remaining)
+    }
+
+    fn hold_results(
+        &mut self,
+        result: ResultWatch,
+        remaining: Duration,
+    ) -> Result<Arc<DependencyHold>> {
+        self.prune_wait_holds()?;
+        let owner = AgentCx::for_current_or_request();
+        let inherited = owner.budget().deadline.map_or(Duration::MAX, |deadline| {
+            Duration::from_nanos(deadline.as_nanos().saturating_sub(now(&owner).as_nanos()))
+        });
+        let hold = Arc::new(DependencyHold {
+            waiter: "parent".to_string(),
+            peers: Vec::new(),
+            // Every native job has at most a 24-hour original budget. A
+            // caller's unbounded duration must not overflow Instant.
+            deadline: Instant::now() + remaining.min(inherited).min(Duration::from_hours(24)),
+            reply: None,
+            result: Some(result),
+            owner: Some(owner),
             channel: None,
         });
         self.wait_holds.push(Arc::downgrade(&hold));
@@ -207,6 +338,8 @@ impl AgentHubRegistry {
                 cursor,
                 all_senders: peer.is_none(),
             }),
+            result: None,
+            owner: None,
             channel,
         });
         self.wait_holds.push(Arc::downgrade(&hold));
@@ -223,6 +356,43 @@ impl AgentHubRegistry {
     /// Reply holds wake for messages, history loss or peer completion. A
     /// delivered reply must release its dependency before the wait polls again.
     fn hold_peers(&self, hold: &DependencyHold) -> Vec<String> {
+        if let Some(result) = &hold.result {
+            return match result {
+                ResultWatch::Job(owner) => self
+                    .native_jobs
+                    .iter()
+                    .filter(|(_, candidate)| *candidate == owner)
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+                ResultWatch::Turns {
+                    results,
+                    acknowledged,
+                    all,
+                } => {
+                    let results = results
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let selected = results.iter().enumerate().filter(|(index, _)| {
+                        u64::try_from(*index + 1).is_ok_and(|id| !acknowledged.contains(&id))
+                    });
+                    // A drain can wake for any completion. An already
+                    // completed or not-yet-launched alternative prevents a
+                    // claim that every possible wake depends on the caller.
+                    if !all
+                        && selected
+                            .clone()
+                            .any(|(_, result)| !result.pending() || result.peer.get().is_none())
+                    {
+                        return Vec::new();
+                    }
+                    selected
+                        .filter(|(_, result)| result.pending())
+                        .filter_map(|(_, result)| result.peer.get().cloned())
+                        .collect()
+                }
+            };
+        }
         // A lease opened after a terminal snapshot remains inert, even if a
         // concurrent send later adds a new pending recipient.
         if hold.peers.is_empty() {
@@ -281,13 +451,24 @@ impl AgentHubRegistry {
                 hold.active()
                     && (hold.waiter == "parent" || self.control_pid(&hold.waiter).is_some())
             })
-            .map(|hold| (hold.waiter.clone(), self.hold_peers(&hold)))
+            .map(|hold| {
+                (
+                    hold.waiter.clone(),
+                    self.hold_peers(&hold),
+                    hold.awaits_all_results(),
+                )
+            })
             .collect::<Vec<_>>();
         let mut blocked = BTreeSet::from([caller.to_string()]);
         loop {
             let prior = blocked.len();
-            for (waiter, peers) in &holds {
-                if !peers.is_empty() && peers.iter().all(|peer| blocked.contains(peer)) {
+            for (waiter, peers, all_results) in &holds {
+                let cannot_complete = if *all_results {
+                    peers.iter().any(|peer| blocked.contains(peer))
+                } else {
+                    !peers.is_empty() && peers.iter().all(|peer| blocked.contains(peer))
+                };
+                if cannot_complete {
                     blocked.insert(waiter.clone());
                 }
             }
@@ -719,3 +900,6 @@ pub async fn wait_for_replies(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod result_tests;

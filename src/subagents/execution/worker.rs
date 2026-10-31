@@ -203,6 +203,7 @@ impl Actor {
             .hub
             .register_worker(&self.agent.name, self.runner.hub_kind)?;
         self.lifecycle.hub_id = Some(entry.id.clone());
+        crate::subagents::worker::bind_hub(&self.state, &entry.id)?;
         self.check()?;
         let messaging = self.lifecycle.tools.iter().any(|tool| tool == "hub");
         let channel = if messaging || self.runner.cost_budget.is_some() {

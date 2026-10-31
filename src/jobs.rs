@@ -39,8 +39,8 @@ use crate::model::{Message, UserContent, UserMessage};
 
 mod host_task;
 pub(crate) use host_task::{
-    admit_owned_task, clear_owned_task_progress, publish_owned_task_progress, spawn_owned_task,
-    with_owned_task_progress,
+    NativeTaskOwner, admit_owned_task, clear_owned_task_progress, current_native_task,
+    publish_owned_task_progress, spawn_owned_task, with_owned_task_progress,
 };
 
 /// Future returned by the live session-identity resolver shared by the jobs
@@ -3273,6 +3273,7 @@ fn snapshot_now_best_effort(handle: &JobWaitHandle) -> Result<JobSnapshot> {
 }
 
 fn wait_with_handle(handle: &JobWaitHandle, timeout: Duration) -> Result<JobSnapshot> {
+    let _dependency = hold_native_job_wait(handle, timeout)?;
     let started = Instant::now();
     loop {
         if let Some(snapshot) = settled_snapshot(handle) {
@@ -3283,6 +3284,39 @@ fn wait_with_handle(handle: &JobWaitHandle, timeout: Duration) -> Result<JobSnap
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn hold_native_job_wait(
+    handle: &JobWaitHandle,
+    timeout: Duration,
+) -> Result<Option<Arc<crate::agent_hub::DependencyHold>>> {
+    if timeout.is_zero() || settled_snapshot(handle).is_some() || current_native_task().is_some() {
+        // Background work can wait internally while the parent remains free
+        // to answer. Only the foreground observer owns a parent dependency.
+        return Ok(None);
+    }
+    let native = {
+        let reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        reg.jobs.get(&handle.id).is_some_and(|job| {
+            job.owner_session_id == handle.owner_session_id && job.schema == host_task::TASK_SCHEMA
+        })
+    };
+    if !native {
+        return Ok(None);
+    }
+    crate::agent_hub::registry()
+        .lock()
+        .map_err(|_| Error::tool("hub", "PI_HUB_WAIT_REGISTRY: registry is poisoned"))?
+        .hold_job_results(
+            NativeTaskOwner {
+                session: handle.owner_session_id.clone(),
+                job: handle.id.clone(),
+            },
+            timeout,
+        )
+        .map(Some)
 }
 
 fn remaining_wait_slice(now: Instant, deadline: Option<Instant>) -> Option<Duration> {
@@ -3351,6 +3385,14 @@ async fn wait_async_with_handle(
     }
 
     let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    let dependency = hold_native_job_wait(handle, timeout)?;
+    let max_wait_slice = if dependency.is_some() {
+        // Completion notifications remain the primary wakeup. This bound
+        // also observes cancellation when the child needs the waiting parent.
+        max_wait_slice.min(Duration::from_millis(100))
+    } else {
+        max_wait_slice
+    };
     let now = cx
         .cx()
         .timer_driver()
@@ -3360,6 +3402,12 @@ async fn wait_async_with_handle(
         if let Some(snapshot) = settled_snapshot(handle) {
             return Ok(snapshot);
         }
+        cx.checkpoint().map_err(|_| {
+            Error::tool(
+                "jobs",
+                "PI_JOBS_WAIT_CANCELLED: job wait owner is cancelled",
+            )
+        })?;
         let now = cx
             .cx()
             .timer_driver()
