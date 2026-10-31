@@ -605,6 +605,45 @@ pub(super) fn save_provider_credential(
     auth.set(canonical.clone(), credential);
 }
 
+/// Recheck the source session and cancellation after the network exchange.
+/// Keep the session guard in the blocking transaction so a newer login or
+/// session replacement cannot overtake a save that has already been admitted.
+async fn persist_login_credential(
+    session: Arc<Mutex<Session>>,
+    session_id: String,
+    auth_path: PathBuf,
+    provider: String,
+    credential: crate::auth::AuthCredential,
+    control: LoginAttemptControl,
+    cx: &Cx,
+) -> crate::error::Result<bool> {
+    let signal = control.signal();
+    let session_guard = match futures::future::select(
+        Box::pin(signal.wait()),
+        Box::pin(OwnedMutexGuard::lock(session, cx)),
+    )
+    .await
+    {
+        futures::future::Either::Left(_) => return Ok(false),
+        futures::future::Either::Right((result, _)) => result?,
+    };
+    asupersync::runtime::spawn_blocking(move || {
+        if session_guard.header.id != session_id || signal.is_aborted() {
+            return Ok(false);
+        }
+        // Read the latest store here, never before awaiting the provider.
+        let mut auth = crate::auth::AuthStorage::load(auth_path)?;
+        if !control.admit_save() {
+            return Ok(false);
+        }
+        save_provider_credential(&mut auth, &provider, credential);
+        let result = auth.save().map(|()| true);
+        drop(session_guard);
+        result
+    })
+    .await
+}
+
 pub(super) fn remove_provider_credentials(
     auth: &mut crate::auth::AuthStorage,
     requested_provider: &str,
@@ -1717,12 +1756,82 @@ impl PiApp {
         Ok(())
     }
 
+    /// Retiring the UI owner cancels network work and drops the callback
+    /// server. Workers cannot prolong the listener's lifetime.
+    pub(super) fn retire_login(&mut self) -> bool {
+        let attempt = self.login_attempt.take();
+        let pending = self.pending_oauth.take();
+        let retired = attempt.is_some() || pending.is_some();
+        drop(attempt);
+        if retired {
+            self.input.reset();
+            self.input_mode = InputMode::SingleLine;
+            self.set_input_height(3);
+            self.agent_state = AgentState::Idle;
+            self.input.focus();
+        }
+        retired
+    }
+
+    pub(super) fn begin_login_attempt(&mut self, auth_path: &Path) -> Option<String> {
+        self.retire_login();
+        let session_id = match self.session.try_lock() {
+            Ok(session) => session.header.id.clone(),
+            Err(_) => {
+                self.status_message = Some("Session busy; try login again".to_string());
+                return None;
+            }
+        };
+        let attempt = LoginAttempt::new(session_id, auth_path.to_path_buf());
+        let id = attempt.id.clone();
+        self.login_attempt = Some(attempt);
+        Some(id)
+    }
+
+    pub(super) fn login_callback_poll_cmd(attempt_id: String) -> Cmd {
+        Cmd::blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Message::new(PiMsg::OAuthCallbackPoll { attempt_id })
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn submit_oauth_code(
         &mut self,
         code_input: &str,
         pending: PendingOAuth,
     ) -> Option<Cmd> {
+        let Some(attempt) = self.login_attempt.as_mut() else {
+            return None;
+        };
+        if attempt.submitting {
+            self.status_message = Some("Login is still running; Escape cancels it".to_string());
+            return None;
+        }
+        let current_session = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id == attempt.session_id);
+        match current_session {
+            Some(true) => {}
+            Some(false) => {
+                self.retire_login();
+                return None;
+            }
+            None => {
+                self.status_message = Some("Session busy; submit login again".to_string());
+                return None;
+            }
+        }
+        attempt.submitting = true;
+        // A manual code and a browser redirect must never race a second exchange.
+        attempt.callback = None;
+        let attempt_id = attempt.id.clone();
+        let session_id = attempt.session_id.clone();
+        let auth_path = attempt.auth_path.clone();
+        let control = attempt.control.clone();
+        let session = Arc::clone(&self.session);
         // Do not store OAuth codes in history or session.
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
@@ -1737,50 +1846,53 @@ impl PiApp {
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let auth_path = crate::config::Config::auth_path();
             let provider = pending.provider.clone();
-            // The exchange and the save are shared with the FTUI stack
-            // (login_flow); this stack keeps only its display and input.
-            let credential = super::login_flow::obtain_credential(&pending, &code_input)
-                .await
-                .map_err(|(_, err)| err);
+            let signal = control.signal();
+            let credential = match futures::future::select(
+                Box::pin(signal.wait()),
+                Box::pin(super::login_flow::obtain_credential(&pending, &code_input)),
+            )
+            .await
+            {
+                futures::future::Either::Left(_) => return,
+                futures::future::Either::Right((result, _)) => result,
+            };
             let credential = match credential {
                 Ok(c) => c,
-                Err(e) => {
+                Err((retry, error)) => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
                         &task_cx,
-                        PiMsg::AgentError(e.to_string()),
+                        PiMsg::LoginFinished {
+                            attempt_id,
+                            error: Some(error.to_string()),
+                            retry,
+                        },
                     )
                     .await;
                     return;
                 }
             };
 
-            if let Err(e) =
-                super::login_flow::save_credential(&auth_path, &provider, credential).await
+            let error = match persist_login_credential(
+                session, session_id, auth_path, provider, credential, control, &task_cx,
+            )
+            .await
             {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &task_cx,
-                    PiMsg::AgentError(e.to_string()),
-                )
-                .await;
-                return;
-            }
+                Ok(true) => None,
+                Ok(false) => return,
+                Err(error) => Some(error.to_string()),
+            };
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &task_cx,
-                PiMsg::CredentialUpdated {
-                    provider: provider.clone(),
+                PiMsg::LoginFinished {
+                    attempt_id,
+                    error,
+                    retry: false,
                 },
             )
             .await;
-
-            let status = super::login_flow::success_status(&provider, pending.kind);
-            let _ =
-                crate::interactive::enqueue_pi_event(&event_tx, &task_cx, PiMsg::System(status))
-                    .await;
         });
 
         None
@@ -2029,6 +2141,7 @@ impl PiApp {
     /// Handle a slash command.
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_command(&mut self, cmd: SlashCommand, args: &str) -> Option<Cmd> {
+        self.retire_login();
         // Clear input
         self.input.reset();
 
@@ -2277,7 +2390,7 @@ impl PiApp {
                     self.todo_summary = None;
                     self.pending_tool_output = None;
                     self.abort_handle = None;
-                    self.pending_oauth = None;
+                    self.retire_login();
                     self.title_cancellation = None;
                     self.title_requested = false;
                     self.role_model_overrides.clear();
@@ -2633,6 +2746,7 @@ impl PiApp {
         args: &str,
         auth_path: &std::path::Path,
     ) -> Option<Cmd> {
+        self.retire_login();
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot login while processing".to_string());
             return None;
@@ -2674,21 +2788,34 @@ impl PiApp {
 
         let requested_provider = args.split_whitespace().next().unwrap_or(args).to_string();
         let provider = normalize_auth_provider_input(&requested_provider);
+        let attempt_id = self.begin_login_attempt(auth_path)?;
+        let signal = self.login_attempt.as_ref()?.control.signal();
 
         if provider == "kimi-for-coding" {
             self.status_message = Some("Starting Kimi Code login...".to_string());
+            self.agent_state = AgentState::Processing;
             let event_tx = self.event_tx.clone();
             let provider_clone = provider;
             let runtime_handle = self.runtime_handle.clone();
             let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
 
             runtime_handle.spawn(async move {
-                match crate::auth::start_kimi_code_device_flow().await {
+                let result = match futures::future::select(
+                    Box::pin(signal.wait()),
+                    Box::pin(crate::auth::start_kimi_code_device_flow()),
+                )
+                .await
+                {
+                    futures::future::Either::Left(_) => return,
+                    futures::future::Either::Right((result, _)) => result,
+                };
+                match result {
                     Ok(device) => {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
                             PiMsg::OAuthDeviceFlowStarted {
+                                attempt_id,
                                 provider: provider_clone,
                                 device_code: device.device_code,
                                 user_code: device.user_code,
@@ -2704,7 +2831,11 @@ impl PiApp {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
-                            PiMsg::AgentError(format!("OAuth login failed: {err}")),
+                            PiMsg::LoginFinished {
+                                attempt_id,
+                                error: Some(format!("OAuth login failed: {err}")),
+                                retry: false,
+                            },
                         )
                         .await;
                     }
@@ -2717,6 +2848,7 @@ impl PiApp {
             && should_use_copilot_device_flow()
         {
             self.status_message = Some("Starting GitHub Copilot device flow login...".to_string());
+            self.agent_state = AgentState::Processing;
             let event_tx = self.event_tx.clone();
             let provider_clone = provider;
             let runtime_handle = self.runtime_handle.clone();
@@ -2728,12 +2860,22 @@ impl PiApp {
             };
 
             runtime_handle.spawn(async move {
-                match crate::auth::start_copilot_device_flow(&copilot_config).await {
+                let result = match futures::future::select(
+                    Box::pin(signal.wait()),
+                    Box::pin(crate::auth::start_copilot_device_flow(&copilot_config)),
+                )
+                .await
+                {
+                    futures::future::Either::Left(_) => return,
+                    futures::future::Either::Right((result, _)) => result,
+                };
+                match result {
                     Ok(device) => {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
                             PiMsg::OAuthDeviceFlowStarted {
+                                attempt_id,
                                 provider: provider_clone,
                                 device_code: device.device_code,
                                 user_code: device.user_code,
@@ -2749,7 +2891,11 @@ impl PiApp {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
-                            PiMsg::AgentError(format!("OAuth login failed: {err}")),
+                            PiMsg::LoginFinished {
+                                attempt_id,
+                                error: Some(format!("OAuth login failed: {err}")),
+                                retry: false,
+                            },
                         )
                         .await;
                     }
@@ -2812,6 +2958,7 @@ impl PiApp {
                 match registered_extension_provider_bindings(self.extensions.as_ref()) {
                     Ok(bindings) => bindings,
                     Err(err) => {
+                        self.retire_login();
                         self.status_message =
                             Some(format!("Unable to load extension login providers: {err}"));
                         return None;
@@ -2826,6 +2973,7 @@ impl PiApp {
                 crate::auth::start_extension_oauth(&provider, &config)
                     .map(|info| (info, Some(config)))
             } else {
+                self.retire_login();
                 self.status_message = Some(format!(
                     "Login not supported for {provider} (no built-in flow or OAuth config)"
                 ));
@@ -2874,24 +3022,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     );
                 }
 
-                // Spawn a thread to wait for the callback and inject the code
-                // via the event channel when the browser redirect arrives.
-                if let Some(server) = callback_server {
-                    let event_tx = self.event_tx.clone();
-                    std::thread::spawn(move || {
-                        // Block until the callback arrives or the sender is dropped.
-                        if let Ok(path) = server.rx.recv() {
-                            let full_url = format!("http://localhost{path}");
-                            let mut send_result =
-                                event_tx.try_send(PiMsg::OAuthCallbackReceived(full_url));
-                            while let Err(asupersync::channel::mpsc::SendError::Full(unsent)) =
-                                send_result
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                                send_result = event_tx.try_send(unsent);
-                            }
-                        }
-                    });
+                let poll = callback_server
+                    .as_ref()
+                    .map(|_| Self::login_callback_poll_cmd(attempt_id));
+                if let Some(attempt) = self.login_attempt.as_mut() {
+                    attempt.callback = callback_server;
                 }
 
                 self.messages.push(ConversationMessage {
@@ -2912,9 +3047,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.input_mode = InputMode::SingleLine;
                 self.set_input_height(3);
                 self.input.focus();
-                None
+                poll
             }
             Err(err) => {
+                self.retire_login();
                 self.status_message = Some(format!("OAuth login failed: {err}"));
                 None
             }
@@ -2922,6 +3058,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_logout(&mut self, args: &str) -> Option<Cmd> {
+        self.retire_login();
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot logout while processing".to_string());
             return None;
@@ -4824,7 +4961,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentState, PendingInput, PendingLoginKind, PiApp, SlashCommand};
+    use super::{
+        AgentState, LoginAttempt, PendingInput, PendingLoginKind, PendingOAuth, PiApp, SlashCommand,
+    };
     use super::{
         BashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
         persist_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
@@ -4833,7 +4972,7 @@ mod tests {
     use crate::auth::{AuthCredential, AuthStorage};
     use crate::config::Config;
     use crate::extensions::ExtensionManager;
-    use crate::keybindings::KeyBindings;
+    use crate::keybindings::{AppAction, KeyBindings};
     use crate::model::{Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage};
     use crate::models::{ExtensionProviderBinding, ModelEntry, ModelRole};
     use crate::package_manager::PackageManager;
@@ -4845,6 +4984,7 @@ mod tests {
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::sync::{Mutex, OwnedMutexGuard};
+    use bubbletea::{KeyMsg, KeyType};
     use futures::stream;
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
@@ -6864,6 +7004,306 @@ mod tests {
         assert!(listing.contains("Extension providers"));
         assert!(listing.contains("ext-provider"));
         assert!(listing.contains("OAuth"));
+    }
+
+    fn install_callback_login(
+        app: &mut PiApp,
+        auth_path: &Path,
+    ) -> (String, u16, crate::agent::AbortSignal) {
+        let attempt_id = app.begin_login_attempt(auth_path).expect("login attempt");
+        let (server, redirect_uri) =
+            crate::auth::start_oauth_callback_server_random_port().expect("callback listener");
+        let port = server.port;
+        let attempt = app.login_attempt.as_mut().expect("login owner");
+        let signal = attempt.control.signal();
+        attempt.callback = Some(server);
+        app.pending_oauth = Some(PendingOAuth {
+            provider: "fixture-oauth".to_string(),
+            kind: PendingLoginKind::OAuth,
+            verifier: "fixture-verifier".to_string(),
+            oauth_config: None,
+            device_code: None,
+            redirect_uri: Some(redirect_uri),
+        });
+        (attempt_id, port, signal)
+    }
+
+    #[test]
+    fn retired_browser_callback_cannot_supply_a_new_api_key_or_oauth_attempt() {
+        use std::io::{Read as _, Write as _};
+
+        for provider in ["openai", "anthropic"] {
+            let temp = TempDir::new().expect("tempdir");
+            let auth_path = temp.path().join("auth.json");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(session, temp.path());
+            let (old_id, port, old_signal) = install_callback_login(&mut app, &auth_path);
+            let mut browser = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .expect("browser connection");
+            browser
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("browser timeout");
+            browser
+                .write_all(b"GET /oauth/callback?code=old-code&state=old-state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .expect("browser redirect");
+            let mut response = String::new();
+            browser
+                .read_to_string(&mut response)
+                .expect("callback acknowledgement");
+            assert!(response.starts_with("HTTP/1.1 200"));
+
+            let _ = app.handle_slash_login_with_auth_path(provider, &auth_path);
+            let new_id = app
+                .login_attempt
+                .as_ref()
+                .expect("replacement login")
+                .id
+                .clone();
+            assert_ne!(old_id, new_id);
+            assert!(old_signal.is_aborted());
+            let pending = app.pending_oauth.clone().expect("replacement prompt");
+            let messages_before = app.messages.len();
+            for stale_event in [
+                PiMsg::OAuthCallbackPoll {
+                    attempt_id: old_id.clone(),
+                },
+                PiMsg::OAuthCallbackReceived {
+                    attempt_id: old_id.clone(),
+                    callback_url: format!(
+                        "http://localhost:{port}/oauth/callback?code=old-code&state=old-state"
+                    ),
+                },
+                PiMsg::OAuthDeviceFlowStarted {
+                    attempt_id: old_id.clone(),
+                    provider: "stale-device".to_string(),
+                    device_code: "stale-device-code".to_string(),
+                    user_code: "stale-user-code".to_string(),
+                    verification_uri: "https://example.test/device".to_string(),
+                    expires_in: 300,
+                },
+                PiMsg::LoginFinished {
+                    attempt_id: old_id,
+                    error: Some("stale exchange failure".to_string()),
+                    retry: false,
+                },
+            ] {
+                assert!(app.handle_pi_message(stale_event).is_none());
+            }
+            let retained = app.pending_oauth.as_ref().expect("new prompt retained");
+            assert_eq!(retained.provider, pending.provider);
+            assert_eq!(retained.kind, pending.kind);
+            assert_eq!(retained.verifier, pending.verifier);
+            assert_eq!(app.login_attempt.as_ref().expect("new owner").id, new_id);
+            assert_eq!(app.agent_state, AgentState::Idle);
+            assert_eq!(app.messages.len(), messages_before);
+            assert!(
+                !auth_path.exists(),
+                "an old callback must never be stored as an API key"
+            );
+        }
+    }
+
+    #[test]
+    fn login_cancel_command_quit_and_drop_release_the_callback_owner() {
+        for action in ["escape", "ctrl-c", "command", "new", "busy", "quit", "drop"] {
+            let temp = TempDir::new().expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(session, temp.path());
+            let (attempt_id, port, signal) =
+                install_callback_login(&mut app, &temp.path().join("auth.json"));
+            app.input.set_value("private credential draft");
+            match action {
+                "escape" => {
+                    let _ =
+                        app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+                }
+                "ctrl-c" => {
+                    let _ = app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                }
+                "command" => {
+                    let _ = app.submit_message("/help");
+                }
+                "new" => {
+                    let _ = app.submit_message("/new");
+                }
+                "busy" => {
+                    let session = Arc::clone(&app.session);
+                    let _guard = session.try_lock().expect("hold source session");
+                    let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
+                        event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
+                        attempts_remaining: 0,
+                    });
+                    assert_eq!(
+                        app.status_message.as_deref(),
+                        Some("Login cancelled because the session remained busy; run /login again")
+                    );
+                }
+                "quit" => {
+                    let _ = app.quit_cmd();
+                }
+                "drop" => {}
+                _ => unreachable!(),
+            }
+            if action != "drop" {
+                assert!(app.pending_oauth.is_none());
+                assert!(app.login_attempt.is_none());
+                assert!(app.input.value().is_empty());
+            }
+            drop(app);
+            assert!(signal.is_aborted(), "{action} cancels its network exchange");
+            let _rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .expect("retiring login immediately releases callback port");
+        }
+    }
+
+    #[test]
+    fn device_login_accepts_empty_enter_and_preserves_retryable_authorization() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut events) = build_bash_test_app(session, temp.path());
+        let id = app
+            .begin_login_attempt(&temp.path().join("auth.json"))
+            .expect("login owner");
+        let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            attempt_id: id.clone(),
+            provider: "fixture-device".to_string(),
+            device_code: "private-device-code".to_string(),
+            user_code: "public-user-code".to_string(),
+            verification_uri: "https://example.test/device".to_string(),
+            expires_in: 300,
+        });
+        assert!(app.input.value().is_empty());
+        let _ = app.handle_action(AppAction::Submit, &KeyMsg::from_type(KeyType::Enter));
+        assert!(app.login_attempt.as_ref().expect("login owner").submitting);
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(
+            app.pending_inputs.is_empty(),
+            "Enter must not queue an agent prompt"
+        );
+        // The fixture provider fails locally, making the exchange deterministic
+        // without contacting a real OAuth service. Exercise retry delivery with
+        // the same request id while retaining the original device code.
+        let event = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(2),
+                events.recv(&cx),
+            )
+            .await
+            .expect("exchange event before timeout")
+            .expect("exchange event")
+        });
+        assert!(matches!(event, PiMsg::LoginFinished { attempt_id, .. } if attempt_id == id));
+        app.input.set_value("private retry draft");
+        let _ = app.handle_pi_message(PiMsg::LoginFinished {
+            attempt_id: id.clone(),
+            error: Some("Authorization is still pending".to_string()),
+            retry: true,
+        });
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(
+            !app.login_attempt
+                .as_ref()
+                .expect("retained owner")
+                .submitting
+        );
+        assert_eq!(app.input.value(), "private retry draft");
+        assert_eq!(
+            app.pending_oauth
+                .as_ref()
+                .expect("retained device prompt")
+                .device_code
+                .as_deref(),
+            Some("private-device-code")
+        );
+        let _ = app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+        let _ = app.handle_pi_message(PiMsg::LoginFinished {
+            attempt_id: id,
+            error: None,
+            retry: false,
+        });
+        assert!(app.pending_oauth.is_none());
+        assert!(app.input.value().is_empty());
+        assert_eq!(app.status_message.as_deref(), Some("Login cancelled"));
+    }
+
+    #[test]
+    fn cancelled_or_replaced_login_cannot_persist_a_delayed_credential() {
+        let temp = TempDir::new().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        let mut existing = AuthStorage::empty_at(auth_path.clone());
+        existing.set(
+            "other-provider",
+            AuthCredential::ApiKey {
+                key: "keep-me".to_string(),
+            },
+        );
+        existing.save().expect("existing credential");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("hold session");
+            let session_id = guard.header.id.clone();
+            let attempt = LoginAttempt::new(session_id.clone(), auth_path.clone());
+            let mut save = Box::pin(super::persist_login_credential(
+                Arc::clone(&session),
+                session_id.clone(),
+                auth_path.clone(),
+                "openai".to_string(),
+                AuthCredential::ApiKey {
+                    key: "cancelled-key".to_string(),
+                },
+                attempt.control.clone(),
+                &cx,
+            ));
+            assert!(futures::poll!(save.as_mut()).is_pending());
+            drop(attempt);
+            assert!(!save.await.expect("cancelled save"));
+            drop(guard);
+
+            let stale = LoginAttempt::new("retired-session".to_string(), auth_path.clone());
+            assert!(
+                !super::persist_login_credential(
+                    Arc::clone(&session),
+                    stale.session_id.clone(),
+                    auth_path.clone(),
+                    "openai".to_string(),
+                    AuthCredential::ApiKey {
+                        key: "stale-session-key".to_string()
+                    },
+                    stale.control.clone(),
+                    &cx,
+                )
+                .await
+                .expect("stale save")
+            );
+            let current = LoginAttempt::new(session_id.clone(), auth_path.clone());
+            assert!(
+                super::persist_login_credential(
+                    Arc::clone(&session),
+                    session_id,
+                    auth_path.clone(),
+                    "openai".to_string(),
+                    AuthCredential::ApiKey {
+                        key: "current-key".to_string()
+                    },
+                    current.control.clone(),
+                    &cx,
+                )
+                .await
+                .expect("live save")
+            );
+        });
+        let saved = AuthStorage::load(auth_path).expect("saved credentials");
+        assert!(
+            matches!(saved.get("openai"), Some(AuthCredential::ApiKey { key }) if key == "current-key")
+        );
+        assert!(
+            matches!(saved.get("other-provider"), Some(AuthCredential::ApiKey { key }) if key == "keep-me")
+        );
     }
 
     #[test]

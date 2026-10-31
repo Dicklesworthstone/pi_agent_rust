@@ -160,9 +160,10 @@ pub use self::state::{AgentState, InputMode, PendingInput};
 pub(crate) use self::state::AutocompleteState;
 use self::state::{
     BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, ExtensionCustomOverlay,
-    HistoryList, InjectedMessageQueue, InteractiveMessageQueue, PendingLoginKind, PendingOAuth,
-    QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry, SettingsUiState,
-    TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay, ToolProgress, format_count,
+    HistoryList, InjectedMessageQueue, InteractiveMessageQueue, LoginAttempt, LoginAttemptControl,
+    PendingLoginKind, PendingOAuth, QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry,
+    SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
+    ToolProgress, format_count,
 };
 pub use self::state::{ConversationMessage, MessageRole};
 use self::text_utils::{queued_message_preview, truncate};
@@ -2185,11 +2186,18 @@ pub enum PiMsg {
     BashResult { display: String },
     /// Async OAuth device flow start
     OAuthDeviceFlowStarted {
+        attempt_id: String,
         provider: String,
         device_code: String,
         user_code: String,
         verification_uri: String,
         expires_in: u64,
+    },
+    /// Only the login that admitted this work may settle or retry it.
+    LoginFinished {
+        attempt_id: String,
+        error: Option<String>,
+        retry: bool,
     },
     /// Replace conversation state from session (compaction/fork).
     ConversationReset {
@@ -2253,9 +2261,13 @@ pub enum PiMsg {
         display: String,
         is_error: bool,
     },
-    /// OAuth callback server received the browser redirect.
-    /// The string is the full callback URL (e.g. `http://localhost:1455/auth/callback?code=abc&state=xyz`).
-    OAuthCallbackReceived(String),
+    /// Poll the callback receiver retained by one live login owner.
+    OAuthCallbackPoll { attempt_id: String },
+    /// A browser redirect can only supply the OAuth attempt that opened it.
+    OAuthCallbackReceived {
+        attempt_id: String,
+        callback_url: String,
+    },
 }
 
 /// Retry a contended session-scoped UI event with at most 80 deliberate 25 ms
@@ -3010,6 +3022,7 @@ pub struct PiApp {
 
     // Login flow state (awaiting sensitive credential input)
     pending_oauth: Option<PendingOAuth>,
+    login_attempt: Option<LoginAttempt>,
 
     // Extension system
     extensions: Option<ExtensionManager>,
@@ -3516,6 +3529,7 @@ impl PiApp {
             mcp_auth_request_id: None,
             bash_running: false,
             pending_oauth: None,
+            login_attempt: None,
             extensions,
             mcp_manager,
             keybindings,

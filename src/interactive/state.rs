@@ -39,6 +39,79 @@ pub(super) struct PendingOAuth {
     pub(super) redirect_uri: Option<String>,
 }
 
+/// The UI owns the listener and cancellation. Async workers only borrow a
+/// control handle, so abandoning a login closes its callback socket at once.
+pub(super) struct LoginAttempt {
+    pub(super) id: String,
+    pub(super) session_id: String,
+    pub(super) auth_path: PathBuf,
+    pub(super) callback: Option<crate::auth::OAuthCallbackServer>,
+    pub(super) control: LoginAttemptControl,
+    pub(super) submitting: bool,
+}
+
+impl LoginAttempt {
+    pub(super) fn new(session_id: String, auth_path: PathBuf) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            auth_path,
+            callback: None,
+            control: LoginAttemptControl::new(),
+            submitting: false,
+        }
+    }
+}
+
+impl Drop for LoginAttempt {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct LoginAttemptControl {
+    abort: crate::agent::AbortHandle,
+    save_state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl LoginAttemptControl {
+    fn new() -> Self {
+        let (abort, _) = crate::agent::AbortHandle::new();
+        Self {
+            abort,
+            save_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        }
+    }
+
+    pub(super) fn signal(&self) -> crate::agent::AbortSignal {
+        self.abort.signal()
+    }
+
+    pub(super) fn cancel(&self) {
+        let _ = self.save_state.compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        self.abort.abort();
+    }
+
+    /// Cancellation wins until the blocking save transaction is admitted.
+    /// Once admitted, durable I/O must finish even if its UI owner goes away.
+    pub(super) fn admit_save(&self) -> bool {
+        self.save_state
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 /// Tool output line count above which blocks auto-collapse.
 pub(super) const TOOL_AUTO_COLLAPSE_THRESHOLD: usize = 20;
 /// Number of preview lines to show when a tool block is collapsed.

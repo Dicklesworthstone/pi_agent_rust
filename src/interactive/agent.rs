@@ -873,6 +873,43 @@ impl PiApp {
         msg: PiMsg,
         attempts_remaining: u8,
     ) -> Option<Cmd> {
+        let login_event_id = match &msg {
+            PiMsg::OAuthDeviceFlowStarted { attempt_id, .. }
+            | PiMsg::OAuthCallbackPoll { attempt_id }
+            | PiMsg::OAuthCallbackReceived { attempt_id, .. }
+            | PiMsg::LoginFinished { attempt_id, .. } => Some(attempt_id),
+            _ => None,
+        };
+        if let Some(attempt_id) = login_event_id {
+            let Some(attempt) = self
+                .login_attempt
+                .as_ref()
+                .filter(|attempt| &attempt.id == attempt_id)
+            else {
+                return None;
+            };
+            match self.session_event_ownership(&attempt.session_id) {
+                SessionEventOwnership::Current => {}
+                SessionEventOwnership::Stale => {
+                    self.retire_login();
+                    return None;
+                }
+                SessionEventOwnership::Busy => {
+                    if attempts_remaining == 0 {
+                        // The attempt id still owns this login even though the
+                        // source session cannot be inspected. Release that
+                        // owner instead of stranding its listener or spinner.
+                        self.retire_login();
+                        self.status_message = Some(
+                            "Login cancelled because the session remained busy; run /login again"
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                    return self.retry_busy_session_event(msg, attempts_remaining);
+                }
+            }
+        }
         if let PiMsg::McpAuthFinished {
             request_id,
             message,
@@ -900,7 +937,9 @@ impl PiApp {
         match msg {
             PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return None,
             PiMsg::System(message) | PiMsg::AgentError(message)
-                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() =>
+                if self.handoff_request_id.is_some()
+                    || self.mcp_auth_request_id.is_some()
+                    || self.login_attempt.is_some() =>
             {
                 // Background notices cannot release an operator request's
                 // abort handle or admit another foreground operation.
@@ -909,6 +948,7 @@ impl PiApp {
                 self.scroll_to_bottom();
             }
             PiMsg::AgentStart => {
+                self.retire_login();
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
                 self.current_thinking.clear();
@@ -1491,12 +1531,16 @@ impl PiApp {
                 }
             }
             PiMsg::OAuthDeviceFlowStarted {
+                attempt_id: _,
                 provider,
                 device_code,
                 user_code,
                 verification_uri,
                 expires_in,
             } => {
+                if self.pending_oauth.is_some() {
+                    return None;
+                }
                 let message = format!(
                     "OAuth login: {provider}\n\n\
 Open this URL:\n{verification_uri}\n\n\
@@ -1523,6 +1567,45 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.set_input_height(3);
                 self.input.focus();
                 self.status_message = None;
+                self.agent_state = AgentState::Idle;
+            }
+            PiMsg::LoginFinished {
+                attempt_id: _,
+                error,
+                retry,
+            } => {
+                if retry
+                    && error.is_some()
+                    && self
+                        .pending_oauth
+                        .as_ref()
+                        .is_some_and(|pending| pending.kind == PendingLoginKind::DeviceFlow)
+                {
+                    if let Some(attempt) = self.login_attempt.as_mut() {
+                        attempt.submitting = false;
+                    }
+                    self.agent_state = AgentState::Idle;
+                    self.status_message = error;
+                    self.input.focus();
+                    return None;
+                }
+                let completed = self.pending_oauth.clone();
+                self.retire_login();
+                let status = match (error, completed) {
+                    (Some(error), _) => format!("Login failed: {error}"),
+                    (None, Some(pending)) => {
+                        self.sync_active_provider_credentials(&pending.provider);
+                        super::login_flow::success_status(&pending.provider, pending.kind)
+                    }
+                    (None, None) => return None,
+                };
+                self.status_message = Some(status.clone());
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, status, None));
+                self.scroll_to_bottom();
+                if !self.pending_inputs.is_empty() {
+                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
+                }
             }
             PiMsg::RetryCommitted {
                 session_id,
@@ -1643,7 +1726,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                     self.pending_inputs_paused_by_time_cap = false;
                     self.title_requested = !self.messages.is_empty();
                     self.todo_summary = None;
-                    self.pending_oauth = None;
+                    self.retire_login();
                     self.role_model_overrides.clear();
                     self.tree_ui = None;
                     self.extension_custom_active = false;
@@ -1811,9 +1894,45 @@ After approving access in the browser, press Enter in Pi to complete login."
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
-            PiMsg::OAuthCallbackReceived(callback_url) => {
-                // Auto-submit the OAuth code received from the local callback server.
-                if let Some(pending) = self.pending_oauth.take() {
+            PiMsg::OAuthCallbackPoll { attempt_id } => {
+                let Some(attempt) = self.login_attempt.as_mut() else {
+                    return None;
+                };
+                let Some(server) = attempt.callback.as_ref() else {
+                    return None;
+                };
+                match server.rx.try_recv() {
+                    Ok(path) => {
+                        let callback_url = format!("http://localhost:{}{path}", server.port);
+                        return self.handle_pi_message(PiMsg::OAuthCallbackReceived {
+                            attempt_id,
+                            callback_url,
+                        });
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return Some(Self::login_callback_poll_cmd(attempt_id));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        attempt.callback = None;
+                        self.status_message = Some(
+                            "Callback listener stopped; paste the authorization code to continue"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            PiMsg::OAuthCallbackReceived {
+                attempt_id: _,
+                callback_url,
+            } => {
+                // Browser input is never valid for an API-key or device prompt.
+                if let Some(pending) = self.pending_oauth.clone().filter(|pending| {
+                    pending.kind == PendingLoginKind::OAuth
+                        && self
+                            .login_attempt
+                            .as_ref()
+                            .is_some_and(|attempt| !attempt.submitting)
+                }) {
                     self.messages.push(ConversationMessage {
                         role: MessageRole::System,
                         content: "Authorization callback received from browser.".to_string(),
@@ -3580,6 +3699,21 @@ After approving access in the browser, press Enter in Pi to complete login."
     #[allow(clippy::too_many_lines)]
     pub(super) fn submit_message(&mut self, message: &str) -> Option<Cmd> {
         let message = message.trim();
+        if self.login_attempt.is_some() {
+            // Commands leave the sensitive prompt; they are never credentials.
+            if let Some((cmd, args)) = SlashCommand::parse(message) {
+                return self.handle_slash_command(cmd, args);
+            }
+            if let Some(pending) = self.pending_oauth.clone() {
+                if !message.is_empty() || pending.kind == PendingLoginKind::DeviceFlow {
+                    return self.submit_oauth_code(message, pending);
+                }
+            } else {
+                self.status_message =
+                    Some("Login is still starting; Escape cancels it".to_string());
+            }
+            return None;
+        }
         if message.is_empty() {
             return None;
         }
@@ -3604,10 +3738,6 @@ After approving access in the browser, press Enter in Pi to complete login."
         if self.handoff_request_id.is_some() {
             self.status_message = Some("Handoff is still running; Escape cancels it".to_string());
             return None;
-        }
-
-        if let Some(pending) = self.pending_oauth.take() {
-            return self.submit_oauth_code(message, pending);
         }
 
         if let Some((command, exclude_from_context)) = parse_bash_command(message) {
@@ -6951,7 +7081,17 @@ mod stream_delta_batcher_tests {
             crate::models::ModelRole::Smol,
             ("fixture-provider".to_string(), "fixture-model".to_string()),
         );
+        let attempt_id = app
+            .begin_login_attempt(&app.cwd.join("unused-auth.json"))
+            .expect("login attempt");
+        let login_signal = app
+            .login_attempt
+            .as_ref()
+            .expect("login owner")
+            .control
+            .signal();
         let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            attempt_id,
             provider: "fixture-provider".to_string(),
             device_code: "device-code".to_string(),
             user_code: "user-code".to_string(),
@@ -7030,6 +7170,8 @@ mod stream_delta_batcher_tests {
             app.pending_oauth.is_none(),
             "the previous session's OAuth continuation must not leak"
         );
+        assert!(app.login_attempt.is_none());
+        assert!(login_signal.is_aborted());
         assert!(
             app.role_model_overrides.is_empty(),
             "the previous session's role model overrides must not leak"
@@ -7246,7 +7388,11 @@ mod stream_delta_batcher_tests {
             crate::models::ModelRole::Smol,
             ("fixture-provider".to_string(), "fixture-model".to_string()),
         );
+        let attempt_id = app
+            .begin_login_attempt(&app.cwd.join("unused-auth.json"))
+            .expect("login attempt");
         let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            attempt_id,
             provider: "fixture-provider".to_string(),
             device_code: "device-code".to_string(),
             user_code: "user-code".to_string(),

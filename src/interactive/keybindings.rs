@@ -507,6 +507,7 @@ impl PiApp {
     }
 
     pub(super) fn quit_cmd(&mut self) -> Cmd {
+        self.retire_login();
         if let Some(handle) = self.abort_handle.take() {
             handle.abort();
         }
@@ -548,6 +549,11 @@ impl PiApp {
             // Application actions
             // =========================================================
             AppAction::Interrupt => {
+                if self.retire_login() {
+                    self.last_escape_time = None;
+                    self.status_message = Some("Login cancelled".to_string());
+                    return None;
+                }
                 // Escape generically dismisses whichever input card owns the
                 // editor (bd-1qol9): ask cards resolve as dismissed and
                 // extension prompts as cancelled, WITHOUT aborting the
@@ -586,6 +592,11 @@ impl PiApp {
                 None
             }
             AppAction::Clear | AppAction::Copy => {
+                if self.retire_login() {
+                    self.last_ctrlc_time = Some(std::time::Instant::now());
+                    self.status_message = Some("Login cancelled".to_string());
+                    return None;
+                }
                 // Ctrl+C: abort if processing, clear editor if has text, or quit on double-tap
                 // Note: Copy and Clear both bound to Ctrl+C - Copy takes precedence in lookup
                 // When selection is implemented, Copy should only trigger with active selection
@@ -628,7 +639,9 @@ impl PiApp {
             }
             AppAction::Exit => {
                 // Ctrl+D: Exit only when editor is empty (legacy behavior)
-                if self.agent_state == AgentState::Idle && self.input.value().is_empty() {
+                if (self.agent_state == AgentState::Idle || self.login_attempt.is_some())
+                    && self.input.value().is_empty()
+                {
                     return Some(self.quit_cmd());
                 }
                 // Editor has text - don't consume, let TextArea handle as delete char forward
@@ -696,6 +709,10 @@ impl PiApp {
             // Text input actions
             // =========================================================
             AppAction::Submit => {
+                if self.login_attempt.is_some() {
+                    let value = self.input.value();
+                    return self.submit_message(value.trim());
+                }
                 // A pending ask/extension card owns the input line. Cards
                 // only ever arrive mid-turn (the tool that raised them is
                 // still executing), so this must run before the busy gate
@@ -723,6 +740,10 @@ impl PiApp {
                 None
             }
             AppAction::FollowUp => {
+                if self.login_attempt.is_some() {
+                    let value = self.input.value();
+                    return self.submit_message(value.trim());
+                }
                 // Alt+Enter: queue follow-up when busy. When idle, toggles multi-line mode if the
                 // editor is empty; otherwise it submits like Enter.
                 if let Some(cmd) = self.submit_pending_card_answer() {
