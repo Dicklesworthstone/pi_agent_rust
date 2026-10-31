@@ -1764,6 +1764,8 @@ pub enum UiCommand {
     /// The user's answer to a pending `/login`: an authorization code,
     /// callback URL, API key, or (device flow) a bare confirmation.
     LoginSubmit(LoginInput),
+    /// Retire a pending login and its callback receiving endpoint.
+    CancelLogin,
     /// `/logout [provider]`: remove stored credentials (default: active
     /// provider).
     Logout { args: String },
@@ -1990,6 +1992,14 @@ struct PendingInputRestore {
     text: String,
 }
 
+/// The ordinary composer parked while login owns a separate private editor.
+/// Move the editor so its cursor, selection, and undo history survive login.
+struct LoginDraft {
+    input: TextArea,
+    history_cursor: Option<usize>,
+    history_draft: String,
+}
+
 /// Bound captures retained for one draft while slow WSL interop finishes.
 const MAX_PENDING_IMAGE_PASTES: usize = 8;
 
@@ -2036,6 +2046,8 @@ pub struct PiFtuiModel {
     /// accepts_empty_input)`. The next submitted line goes to the driver as
     /// login input and is never echoed into the transcript.
     login_pending: Option<(String, bool)>,
+    /// Ordinary input never shares storage or undo history with a credential.
+    login_draft: Option<LoginDraft>,
     /// What the powerline status line shows; sent by the driver after every
     /// command. `None` until the session exists.
     status_snapshot: Option<crate::interactive::FtuiStatusSnapshot>,
@@ -2485,6 +2497,7 @@ impl PiFtuiModel {
             todo_summary: None,
             error_banner: None,
             login_pending: None,
+            login_draft: None,
             status_snapshot: None,
             thinking: String::new(),
             spinner: SpinnerState::default(),
@@ -2552,10 +2565,7 @@ impl PiFtuiModel {
             history_draft: String::new(),
             file_ref_cwd: std::path::PathBuf::from("."),
             steer_resources: None,
-            input: TextArea::new()
-                .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
-                .with_focus(true)
-                .with_soft_wrap(true),
+            input: Self::new_input_editor(),
             autocomplete: {
                 let mut state = AutocompleteState::new(
                     std::path::PathBuf::from("."),
@@ -2568,6 +2578,80 @@ impl PiFtuiModel {
             extension_commands: Vec::new(),
             extension_command_registry: None,
             submit_tx: None,
+        }
+    }
+
+    fn new_input_editor() -> TextArea {
+        TextArea::new()
+            .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
+            .with_focus(true)
+            .with_soft_wrap(true)
+    }
+
+    /// Every Some notification starts a new driver login, even for the same
+    /// provider. Device-flow polling keeps its existing owner without one.
+    fn start_login_input(&mut self, provider: String, accepts_empty_input: bool) {
+        // Response cards cannot retain a credential in their saved draft.
+        // Settle any earlier card burst before parking the ordinary editor.
+        self.dismiss_pending_interactions();
+        self.autocomplete.close();
+        self.pending_image_pastes.clear();
+        self.input.reset_mouse_interaction();
+        let previous = std::mem::replace(&mut self.input, Self::new_input_editor());
+        if self.login_draft.is_none() {
+            self.login_draft = Some(LoginDraft {
+                input: previous,
+                history_cursor: self.history_cursor.take(),
+                history_draft: std::mem::take(&mut self.history_draft),
+            });
+        }
+        self.login_pending = Some((provider, accepts_empty_input));
+    }
+
+    fn restore_login_draft(&mut self) {
+        if self.login_pending.is_some() {
+            return;
+        }
+        if let Some(draft) = self.login_draft.take() {
+            self.input = draft.input;
+            self.input.reset_mouse_interaction();
+            self.history_cursor = draft.history_cursor;
+            self.history_draft = draft.history_draft;
+            self.autocomplete.close();
+            self.detach_edited_history();
+        }
+    }
+
+    /// Drop private text and its entire undo stack before ordinary input is
+    /// reachable. A late completion after local cancellation is harmless.
+    fn finish_login_input(&mut self, cancel_driver: bool) {
+        if self.login_pending.take().is_none() {
+            return;
+        }
+        if cancel_driver {
+            self.send_command(UiCommand::CancelLogin);
+        }
+        self.input = Self::new_input_editor();
+        self.restore_login_draft();
+    }
+
+    /// Programmatic editor APIs describe the ordinary composer, including
+    /// while a separate login editor is collecting a credential.
+    fn set_prompt_editor_text(&mut self, text: &str) {
+        if let Some(draft) = &mut self.login_draft {
+            draft.input.set_text(text);
+            if let Some(index) = draft.history_cursor {
+                let unchanged = self.input_history.get(index).is_some_and(|recalled| {
+                    let rope = draft.input.editor().rope();
+                    rope.len_bytes() == recalled.len() && rope.chars().eq(recalled.chars())
+                });
+                if !unchanged {
+                    draft.history_cursor = None;
+                    draft.history_draft.clear();
+                }
+            }
+        } else {
+            self.input.set_text(text);
         }
     }
 
@@ -3088,7 +3172,7 @@ impl PiFtuiModel {
     /// actual text: cursor movement, selection, and ineffective edits must
     /// leave untouched multiline recall traversable.
     fn detach_edited_history(&mut self) {
-        if self.active_ask.is_some() || self.active_ext.is_some() {
+        if self.active_ask.is_some() || self.active_ext.is_some() || self.login_pending.is_some() {
             // The reply editor is separate from the saved pre-card draft.
             return;
         }
@@ -3112,6 +3196,7 @@ impl PiFtuiModel {
         self.input_active()
             && self.active_ask.is_none()
             && self.active_ext.is_none()
+            && self.login_pending.is_none()
             && (self.history_cursor.is_some()
                 || self
                     .input
@@ -3380,6 +3465,7 @@ impl PiFtuiModel {
                 PiMsg::AutocompleteRefresh
                     | PiMsg::AutocompleteCatalog(_)
                     | PiMsg::ResourcesReloaded { .. }
+                    | PiMsg::LoginPending { .. }
                     | PiMsg::SystemNote(_)
                     | PiMsg::ToolStart { .. }
                     | PiMsg::ToolInvocation { .. }
@@ -3627,6 +3713,9 @@ impl PiFtuiModel {
                 status,
                 ..
             } => {
+                if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
+                    self.finish_login_input(true);
+                }
                 self.dismiss_pending_interactions();
                 if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
                     self.autocomplete.close();
@@ -3641,6 +3730,9 @@ impl PiFtuiModel {
                 text,
                 ..
             } => {
+                if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
+                    self.finish_login_input(true);
+                }
                 self.dismiss_pending_interactions();
                 if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
                     self.autocomplete.close();
@@ -3661,6 +3753,10 @@ impl PiFtuiModel {
             }
             PiMsg::AskUiRequest(request) => {
                 if !self.ask_request_is_pending(&request.id) {
+                    return Cmd::none();
+                }
+                if self.login_pending.is_some() {
+                    self.send_ask_reply(request.id, Vec::new(), true);
                     return Cmd::none();
                 }
                 if request.request.questions.is_empty() {
@@ -3703,6 +3799,12 @@ impl PiFtuiModel {
                     self.push_entry(EntryRole::System, text);
                 } else if self.answer_extension_ui_query(&request) {
                     return Cmd::none();
+                } else if self.login_pending.is_some() {
+                    self.send_ext_reply(ExtensionUiResponse {
+                        id: request.id,
+                        value: None,
+                        cancelled: true,
+                    });
                 } else if self.active_ext.is_none() && self.active_ask.is_none() {
                     self.activate_ext_request(request);
                 } else {
@@ -3743,11 +3845,11 @@ impl PiFtuiModel {
                 provider,
                 accepts_empty_input,
             } => {
-                let pending = provider.map(|provider| (provider, accepts_empty_input));
-                if self.login_pending != pending {
-                    self.input.reset_mouse_interaction();
+                if let Some(provider) = provider {
+                    self.start_login_input(provider, accepts_empty_input);
+                } else {
+                    self.finish_login_input(false);
                 }
-                self.login_pending = pending;
             }
             PiMsg::StatusSnapshot(snapshot) => {
                 self.status_snapshot = Some(snapshot);
@@ -3829,7 +3931,7 @@ impl PiFtuiModel {
                 .as_deref()
                 .is_none_or(|shown| shown == owner_session_id) =>
             {
-                self.input.set_text(&text);
+                self.set_prompt_editor_text(&text);
             }
             PiMsg::RestorePendingInput {
                 owner_session_id,
@@ -3957,6 +4059,9 @@ impl PiFtuiModel {
     /// Commands wait for the turn to end; text the lane cannot take yet (the
     /// turn is starting or ending) becomes the next prompt instead.
     fn submit_mid_turn(&mut self, follow_up: bool) {
+        if self.login_pending.is_some() {
+            return;
+        }
         if self.mcp_auth_request.is_some() {
             self.push_entry(
                 EntryRole::Error,
@@ -4280,6 +4385,24 @@ impl PiFtuiModel {
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
+        let was_login = self.login_pending.is_some();
+        self.submit_owned_input();
+        if was_login && self.login_pending.is_none() {
+            // A slash command can cancel login locally without a driver
+            // round trip. Keep any command-produced or unsent text ahead of
+            // the parked draft instead of overwriting either one.
+            let retained = self.input.text();
+            self.restore_login_draft();
+            if !retained.is_empty() {
+                let separator = if self.input.is_empty() { "" } else { "\n\n" };
+                self.input.move_to_document_start();
+                self.input.insert_text(&format!("{retained}{separator}"));
+                self.detach_edited_history();
+            }
+        }
+    }
+
+    fn submit_owned_input(&mut self) {
         if self.mcp_auth_request.is_some() {
             self.push_entry(
                 EntryRole::Error,
@@ -4303,6 +4426,7 @@ impl PiFtuiModel {
             if trimmed.starts_with('/') {
                 // A slash command abandons the login prompt and runs as usual.
                 self.login_pending = None;
+                self.send_command(UiCommand::CancelLogin);
                 self.push_entry(EntryRole::System, format!("{provider} login cancelled."));
             } else {
                 if trimmed.is_empty() && !accepts_empty_input {
@@ -5633,7 +5757,7 @@ impl PiFtuiModel {
             }
             "set_editor_text" => {
                 if let Some(text) = text_field(&["text"]) {
-                    self.input.set_text(&text);
+                    self.set_prompt_editor_text(&text);
                     self.maybe_trigger_autocomplete();
                 }
                 true
@@ -5918,7 +6042,11 @@ impl PiFtuiModel {
 
         match request.method.as_str() {
             "getEditorText" | "get_editor_text" => {
-                self.send_ext_reply(answer(serde_json::Value::String(self.input.text())));
+                let text = self
+                    .login_draft
+                    .as_ref()
+                    .map_or_else(|| self.input.text(), |draft| draft.input.text());
+                self.send_ext_reply(answer(serde_json::Value::String(text)));
                 true
             }
             "getAllThemes" | "get_all_themes" => {
@@ -6349,7 +6477,8 @@ impl PiFtuiModel {
                     Some(AppAction::ExternalEditor)
                         if self.input_active()
                             && self.active_ask.is_none()
-                            && self.active_ext.is_none() =>
+                            && self.active_ext.is_none()
+                            && self.login_pending.is_none() =>
                     {
                         // Run the editor right here, on the loop thread: as a
                         // `Cmd::task` the loop kept polling the tty, so pi and
@@ -9058,6 +9187,19 @@ fn send_login_pending(agent_tx: &Sender<PiMsg>, pending: Option<&DriverLogin>) {
     });
 }
 
+/// Any other command leaves the login interaction, including UI-local
+/// commands represented by CancelLogin. Drop the login and its receiver
+/// before the driver changes sessions or polls the callback queue again.
+fn retire_login_for_command(
+    command: &UiCommand,
+    login: &mut Option<Box<DriverLogin>>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    if !matches!(command, UiCommand::LoginSubmit(_)) && login.take().is_some() {
+        send_login_pending(agent_tx, None);
+    }
+}
+
 /// `/login [provider]` in the driver: the shared flow the classic stack
 /// runs (login_flow), with this stack's transcript as its display.
 async fn run_login_command(
@@ -9084,14 +9226,15 @@ async fn run_login_command(
             callback,
         }) => {
             let pending = Box::new((pending, callback));
-            let _ = agent_tx.send(PiMsg::System(message));
+            // Own input before showing instructions that invite a credential.
             send_login_pending(agent_tx, Some(&pending));
+            let _ = agent_tx.send(PiMsg::System(message));
             *login = Some(pending);
         }
         Err(message) => {
             *login = None;
-            let _ = agent_tx.send(PiMsg::AgentError(message));
             send_login_pending(agent_tx, None);
+            let _ = agent_tx.send(PiMsg::AgentError(message));
         }
     }
 }
@@ -9107,10 +9250,10 @@ async fn run_login_submit(
     use crate::interactive::login_flow::{LoginFailure, complete_login};
 
     let Some(pending) = login.take() else {
+        send_login_pending(agent_tx, None);
         let _ = agent_tx.send(PiMsg::AgentError(String::from(
             "No login in progress; run /login <provider>",
         )));
-        send_login_pending(agent_tx, None);
         return;
     };
     let (pending, callback) = *pending;
@@ -9118,8 +9261,8 @@ async fn run_login_submit(
     match complete_login(pending, input, &auth_path).await {
         Ok((_provider, status)) => {
             adopt_stored_credentials(handle, &auth_path);
-            let _ = agent_tx.send(PiMsg::System(status));
             send_login_pending(agent_tx, None);
+            let _ = agent_tx.send(PiMsg::System(status));
         }
         Err(LoginFailure::StillPending(pending, message)) => {
             // Device flow not approved yet: the same prompt stays armed.
@@ -9127,8 +9270,8 @@ async fn run_login_submit(
             let _ = agent_tx.send(PiMsg::System(message));
         }
         Err(LoginFailure::Failed(message)) => {
-            let _ = agent_tx.send(PiMsg::AgentError(message));
             send_login_pending(agent_tx, None);
+            let _ = agent_tx.send(PiMsg::AgentError(message));
         }
     }
 }
@@ -11374,6 +11517,9 @@ pub fn run(
                 let mut login: Option<Box<DriverLogin>> = None;
                 loop {
                     let received = submit_rx.try_recv();
+                    if let Ok(command) = &received {
+                        retire_login_for_command(command, &mut login, &agent_tx);
+                    }
                     // Every handled command may change what the status line
                     // shows (model, thinking, mode, session, usage).
                     let mut refresh_status = received.is_ok();
@@ -11886,6 +12032,9 @@ pub fn run(
                             Box::pin(run_login_submit(&mut handle, &input, &mut login, &agent_tx))
                                 .await;
                         }
+                        // Cancellation metadata must not look like the reply
+                        // to the command queued immediately behind it.
+                        Ok(UiCommand::CancelLogin) => refresh_status = false,
                         Ok(UiCommand::Logout { args }) => {
                             run_logout_command(&mut handle, &args, &agent_tx);
                         }
@@ -13057,12 +13206,15 @@ mod tests {
             }
             sim.inject_event(key(KeyCode::Char('v'), Modifiers::CTRL));
             assert!(sim.model().image_paste_task_override.is_some());
-            assert_eq!(sim.model().input.text(), "first\nsecond");
+            assert_eq!(
+                sim.model().input.text(),
+                if login { "" } else { "first\nsecond" }
+            );
             sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
             if login {
                 assert!(sim.model().image_paste_task_override.is_some());
                 assert_eq!(sim.model().next_image_paste_id, 0);
-                assert_eq!(sim.model().input.text(), "first\nsecond");
+                assert!(sim.model().input.is_empty());
                 assert!(
                     !sim.command_log()
                         .iter()
@@ -14594,18 +14746,23 @@ mod tests {
                     provider: Some(String::from("openai")),
                     accepts_empty_input: false,
                 }));
+                sim.inject_event(Event::Paste(ftui::PasteEvent::new("first\nsecond", true)));
             }
             let _ = frame_with_cursor(sim.model(), 20, 12);
             sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 9));
-            let before = sim.model().input.cursor();
             sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
                 provider,
                 accepts_empty_input: false,
             }));
+            let restored_cursor = sim.model().input.cursor();
             let _ = frame_with_cursor(sim.model(), 20, 12);
             sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 10));
-            assert_eq!(sim.model().input.cursor(), before);
+            assert_eq!(sim.model().input.cursor(), restored_cursor);
             assert!(sim.model().input.selection().is_none());
+            if sim.model().input.is_empty() {
+                sim.inject_event(Event::Paste(ftui::PasteEvent::new("first\nsecond", true)));
+                let _ = frame_with_cursor(sim.model(), 20, 12);
+            }
             sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 9));
             sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 10));
             sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 3, 10));
@@ -22359,6 +22516,539 @@ mod tests {
         }));
     }
 
+    fn login_state(provider: Option<&str>) -> PiFtuiMsg {
+        PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: provider.map(str::to_string),
+            accepts_empty_input: false,
+        })
+    }
+
+    #[test]
+    fn login_completion_discards_private_input_and_restores_native_editor_history() {
+        for failed in [false, true] {
+            let (_tx, mut model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.record_history("older prompt");
+            let mut sim = ProgramSimulator::new(
+                model.with_submit_channel(submit_tx).with_alt_screen(true),
+            );
+            sim.init();
+            for text in ["界 first\nsecond ", "tail"] {
+                sim.inject_event(Event::Paste(ftui::PasteEvent::new(text, true)));
+            }
+            sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
+            sim.inject_event(Event::Resize { width: 9, height: 12 });
+            assert!(frame_with_cursor(sim.model(), 9, 12).1.is_some());
+            let original = sim.model().input.text();
+            let cursor = sim.model().input.cursor();
+            let selection = sim.model().input.selected_text();
+            let groups = sim.model().input.undo_group_count();
+            let generation = sim.model().input.replacement_generation();
+            sim.send(login_state(Some("openai")));
+            assert!(sim.model().input.is_empty());
+            assert_eq!(sim.model().input.undo_group_count(), 0);
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new("private-code", true)));
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), "private-code");
+            sim.inject_event(Event::Resize { width: 31, height: 12 });
+            assert!(frame_with_cursor(sim.model(), 31, 12).1.is_some());
+            if failed {
+                sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(String::from("login failed"))));
+            }
+            // This is also the browser-callback path: no editor submission.
+            sim.send(login_state(None));
+            assert_eq!(sim.model().input.text(), original);
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.selected_text(), selection);
+            assert_eq!(sim.model().input.undo_group_count(), groups);
+            assert_eq!(sim.model().input.replacement_generation(), generation);
+            assert!(sim.model().login_draft.is_none());
+            for width in [31, 7, 80] {
+                sim.inject_event(Event::Resize { width, height: 12 });
+                let (rendered, displayed_cursor) = frame_with_cursor(sim.model(), width, 12);
+                let (x, y) = displayed_cursor.expect("restored composer keeps a visible cursor");
+                assert!(x < width && y < 12, "width {width}: {rendered:?}");
+                assert_eq!(sim.model().input.text(), original);
+                assert_eq!(sim.model().input.cursor(), cursor);
+                assert_eq!(sim.model().input.selected_text(), selection);
+                assert_eq!(sim.model().input.undo_group_count(), groups);
+            }
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), "界 first\nsecond ");
+            sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), original);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Prompt(original));
+            assert!(submit_rx.try_recv().is_err());
+            assert!(
+                sim.model().input_history.iter().all(|text| !text.contains("private-code"))
+            );
+            assert!(
+                sim.model().transcript.iter().all(|entry| !entry.text.contains("private-code"))
+            );
+        }
+    }
+
+    #[test]
+    fn login_completion_keeps_empty_and_returned_prompts_free_of_private_input() {
+        for ordinary in ["", " \n\t\n"] {
+            let (_tx, mut model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.displayed_session_id = Some(String::from("current"));
+            model.input.set_text(ordinary);
+            let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+            sim.init();
+            sim.send(login_state(Some("openai")));
+            type_str(&mut sim, "private-code");
+            sim.send(returned_input("current", "returned\nprompt"));
+            assert_eq!(sim.model().input.text(), "private-code");
+            sim.send(login_state(None));
+            let expected = if ordinary.is_empty() {
+                String::from("returned\nprompt")
+            } else {
+                format!("returned\nprompt\n\n{ordinary}")
+            };
+            assert_eq!(sim.model().input.text(), expected);
+            assert!(sim.model().pending_input_restores.is_empty());
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::Prompt(String::from("returned\nprompt"))
+            );
+            sim.send(login_state(Some("openai")));
+            type_str(&mut sim, "another-private-code");
+            sim.send(login_state(None));
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert!(sim.model().input.is_empty());
+            assert!(submit_rx.try_recv().is_err());
+            assert!(
+                sim.model().input_history.iter().all(|text| !text.contains("private-code"))
+            );
+        }
+    }
+
+    #[test]
+    fn restarting_login_discards_private_undo_without_replacing_the_ordinary_snapshot() {
+        for provider in ["openai", "another-provider"] {
+            let (_tx, mut model) = new_model();
+            model.input.insert_text("ordinary\ndraft");
+            let cursor = model.input.cursor();
+            let undo = model.input.undo_group_count();
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.send(login_state(Some("openai")));
+            type_str(&mut sim, "old-private-code");
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            assert!(sim.model().input.redo_group_count() > 0);
+            // Each Some is a new start; device retries emit no new Some.
+            sim.send(login_state(Some(provider)));
+            assert!(sim.model().input.is_empty());
+            assert_eq!(sim.model().input.undo_group_count(), 0);
+            assert_eq!(sim.model().input.redo_group_count(), 0);
+            sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+            assert!(sim.model().input.is_empty());
+            type_str(&mut sim, "new-private-code");
+            sim.send(login_state(None));
+            assert_eq!(sim.model().input.text(), "ordinary\ndraft");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.undo_group_count(), undo);
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            assert!(sim.model().input.is_empty());
+            sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), "ordinary\ndraft");
+        }
+    }
+
+    #[test]
+    fn login_owns_history_follow_up_and_external_editor_keys() {
+        let mut handle = dequeue_test_session();
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let (_tx, mut model) = new_model();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        model.record_history("older prompt");
+        model.input.set_text("ordinary draft");
+        let model = model
+            .with_submit_channel(submit_tx)
+            .with_turn_control(published_turn_control(control.clone()))
+            .with_suspend_task(|| PiFtuiMsg::Edited {
+                text: Ok(String::from("external editor must not open")),
+                width: 80,
+                height: 24,
+            });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(login_state(Some("openai")));
+        type_str(&mut sim, "private-code");
+        for code in [KeyCode::Up, KeyCode::Down] {
+            sim.inject_event(key(code, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "private-code");
+            assert_eq!(sim.model().history_cursor, None);
+            assert!(sim.model().history_draft.is_empty());
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "private-code");
+        assert!(sim.model().suspend_task_override.is_some());
+        assert_eq!(control.snapshot().pending_follow_up, 0);
+        assert_eq!(control.snapshot().pending_steering, 0);
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model().transcript.iter().all(|entry| !entry.text.contains("private-code"))
+        );
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(matches!(
+            submit_rx.try_recv().unwrap(),
+            UiCommand::LoginSubmit(secret) if secret.0 == "private-code"
+        ));
+        sim.send(login_state(None));
+        assert_eq!(sim.model().input.text(), "ordinary draft");
+        drop(turn);
+    }
+
+    #[test]
+    fn device_login_polling_preserves_the_parked_history_draft() {
+        let (_tx, mut model) = new_model();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        model.record_history("recalled prompt");
+        model.input.set_text("unsent ordinary draft");
+        model.history_back();
+        let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: Some(String::from("device-provider")),
+            accepts_empty_input: true,
+        }));
+        type_str(&mut sim, "private-code");
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        for _ in 0..2 {
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().unwrap(),
+                UiCommand::LoginSubmit(LoginInput(String::new()))
+            );
+            sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from("Not approved yet"))));
+            assert!(sim.model().login_pending.is_some());
+            assert!(sim.model().input.is_empty());
+        }
+        sim.send(login_state(None));
+        assert_eq!(sim.model().input.text(), "recalled prompt");
+        assert_eq!(sim.model().history_cursor, Some(0));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "unsent ordinary draft");
+        assert!(submit_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn login_declines_response_cards_without_capturing_private_text() {
+        let (_tx, mut model) = new_model();
+        let (ask_tx, ask_rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel();
+        model.input.set_text("ordinary\ndraft");
+        let mut sim = ProgramSimulator::new(
+            model
+                .with_ask_reply_channel(ask_tx)
+                .with_ext_reply_channel(ext_tx),
+        );
+        sim.init();
+        sim.send(login_state(Some("openai")));
+        type_str(&mut sim, "private-code");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "overlapping-ask",
+            vec![question("Choose?", &["yes", "no"], false)],
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "overlapping-extension",
+            "input",
+            serde_json::json!({"title": "Reply"}),
+        ))));
+        let ask = ask_rx.try_recv().expect("Ask waiter resolved");
+        assert_eq!(ask.request_id, "overlapping-ask");
+        assert!(ask.response.dismissed);
+        let ext = ext_rx.try_recv().expect("extension waiter resolved");
+        assert_eq!(ext.id, "overlapping-extension");
+        assert!(ext.cancelled);
+        assert!(sim.model().active_ask.is_none());
+        assert!(sim.model().active_ext.is_none());
+        assert!(sim.model().ext_queue.is_empty());
+        assert!(sim.model().card_draft_snapshot.is_none());
+        assert_eq!(sim.model().input.text(), "private-code");
+        sim.send(login_state(None));
+        assert_eq!(sim.model().input.text(), "ordinary\ndraft");
+        // A later ordinary card cannot resurrect the retired private editor.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ordinary-extension",
+            "input",
+            serde_json::json!({"title": "Reply"}),
+        ))));
+        type_str(&mut sim, "answer");
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "ordinary\ndraft");
+        assert!(sim.model().card_draft_snapshot.is_none());
+    }
+
+    #[test]
+    fn login_settles_existing_card_bursts_before_parking_the_ordinary_draft() {
+        for first in ["ask", "extension"] {
+            let (_tx, mut model) = new_model();
+            let (ask_tx, ask_rx) = mpsc::channel();
+            let (ext_tx, ext_rx) = mpsc::channel();
+            model.input.set_text(" \nordinary draft\n ");
+            let mut sim = ProgramSimulator::new(
+                model
+                    .with_ask_reply_channel(ask_tx)
+                    .with_ext_reply_channel(ext_tx),
+            );
+            sim.init();
+            if first == "ask" {
+                sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                    "existing-ask",
+                    vec![question("Choose?", &["yes", "no"], false)],
+                ))));
+            } else {
+                sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "existing-extension",
+                    "input",
+                    serde_json::json!({"title": "Reply"}),
+                ))));
+            }
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                "queued-extension",
+                "input",
+                serde_json::json!({"title": "Next reply"}),
+            ))));
+            type_str(&mut sim, "partial answer");
+            sim.send(login_state(Some("openai")));
+            assert!(sim.model().input.is_empty());
+            assert!(sim.model().active_ask.is_none());
+            assert!(sim.model().active_ext.is_none());
+            assert!(sim.model().ext_queue.is_empty());
+            assert!(sim.model().card_draft_snapshot.is_none());
+            if first == "ask" {
+                assert!(ask_rx.try_recv().unwrap().response.dismissed);
+            } else {
+                assert!(ext_rx.try_recv().unwrap().cancelled);
+            }
+            assert_eq!(ext_rx.try_recv().unwrap().id, "queued-extension");
+            type_str(&mut sim, "private-code");
+            sim.send(login_state(None));
+            assert_eq!(sim.model().input.text(), " \nordinary draft\n ");
+        }
+    }
+
+    #[test]
+    fn login_extension_editor_apis_only_read_and_replace_the_saved_prompt() {
+        for writer in ["agent", "extension"] {
+            let (_tx, mut model) = new_model();
+            let (ext_tx, ext_rx) = mpsc::channel();
+            model.displayed_session_id = Some(String::from("current"));
+            model.record_history("older prompt");
+            model.record_history("recalled prompt");
+            model.input.set_text("unsent ordinary draft");
+            model.history_back();
+            let mut sim = ProgramSimulator::new(model.with_ext_reply_channel(ext_tx));
+            sim.init();
+            sim.send(login_state(Some("openai")));
+            type_str(&mut sim, "private-code");
+            sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
+            let cursor = sim.model().input.cursor();
+            let selection = sim.model().input.selected_text();
+            let undo = sim.model().input.undo_group_count();
+            send_ui_effect(&mut sim, "getEditorText", serde_json::json!({}));
+            assert_eq!(
+                ext_rx.try_recv().unwrap().value,
+                Some(serde_json::json!("recalled prompt"))
+            );
+            if writer == "agent" {
+                sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+                    owner_session_id: String::from("current"),
+                    text: String::from("updated ordinary draft"),
+                }));
+            } else {
+                send_ui_effect(
+                    &mut sim,
+                    "set_editor_text",
+                    serde_json::json!({"text": "updated ordinary draft"}),
+                );
+            }
+            assert_eq!(sim.model().input.text(), "private-code");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.selected_text(), selection);
+            assert_eq!(sim.model().input.undo_group_count(), undo);
+            assert_eq!(sim.model().login_draft.as_ref().unwrap().history_cursor, None);
+            send_ui_effect(&mut sim, "get_editor_text", serde_json::json!({}));
+            assert_eq!(
+                ext_rx.try_recv().unwrap().value,
+                Some(serde_json::json!("updated ordinary draft"))
+            );
+            sim.send(login_state(None));
+            assert_eq!(sim.model().input.text(), "updated ordinary draft");
+            assert_eq!(sim.model().history_cursor, None);
+            sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "recalled prompt");
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "updated ordinary draft");
+        }
+    }
+
+    #[test]
+    fn login_slash_cancellation_preserves_drafts_and_orders_the_driver_handoff() {
+        for command in ["/help", "/model openai/next"] {
+            let (_tx, mut model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.input.insert_text("ordinary draft");
+            let cursor = model.input.cursor();
+            let undo = model.input.undo_group_count();
+            let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+            sim.init();
+            sim.send(login_state(Some("openai")));
+            type_str(&mut sim, command);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::CancelLogin);
+            if command == "/help" {
+                assert!(
+                    submit_rx.try_recv().is_err(),
+                    "local command still cancels driver login"
+                );
+            } else {
+                assert!(matches!(
+                    submit_rx.try_recv().unwrap(),
+                    UiCommand::SetModel { .. }
+                ));
+                assert!(sim.model().busy.is_some());
+            }
+            assert_eq!(sim.model().input.text(), "ordinary draft");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.undo_group_count(), undo);
+            assert!(sim.model().login_draft.is_none());
+            type_str(&mut sim, " updated");
+            let text = sim.model().input.text();
+            let groups = sim.model().input.undo_group_count();
+            sim.send(login_state(None));
+            assert_eq!(sim.model().input.text(), text);
+            assert_eq!(sim.model().input.undo_group_count(), groups);
+            if command != "/help" {
+                assert!(
+                    sim.model().busy.is_some(),
+                    "login metadata is not the model-switch result"
+                );
+                sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from("model switched"))));
+                assert!(sim.model().busy.is_none());
+            }
+        }
+
+        let (_tx, mut model) = new_model();
+        model.input.insert_text("ordinary draft");
+        model.start_login_input(String::from("openai"), false);
+        model.input.set_text("/command-that-must-wait");
+        model.state = AgentUiState::Working;
+        model.submit_input();
+        assert_eq!(model.input.text(), "/command-that-must-wait\n\nordinary draft");
+        model.input.undo();
+        assert_eq!(model.input.text(), "ordinary draft");
+    }
+
+    #[test]
+    fn login_session_switch_retires_private_input_before_returned_prompts() {
+        for retry in [false, true] {
+            let (_tx, mut model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.displayed_session_id = Some(String::from("original"));
+            model.input.set_text("ordinary draft");
+            let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+            sim.init();
+            sim.send(login_state(Some("openai")));
+            type_str(&mut sim, "private-code");
+            sim.send(returned_input("original", "old returned prompt"));
+            let reset = |session: &str| {
+                if retry {
+                    PiMsg::RetryCommitted {
+                        session_id: session.to_string(),
+                        messages: Vec::new(),
+                        usage: crate::model::Usage::default(),
+                        status: None,
+                        text: String::from("retried prompt"),
+                    }
+                } else {
+                    PiMsg::ConversationReset {
+                        session_id: session.to_string(),
+                        messages: Vec::new(),
+                        usage: crate::model::Usage::default(),
+                        status: None,
+                    }
+                }
+            };
+            sim.send(PiFtuiMsg::Agent(reset("original")));
+            assert_eq!(sim.model().input.text(), "private-code");
+            assert!(sim.model().login_pending.is_some());
+            assert!(submit_rx.try_recv().is_err());
+            sim.send(PiFtuiMsg::Agent(reset("replacement")));
+            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::CancelLogin);
+            assert_eq!(sim.model().input.text(), "ordinary draft");
+            assert!(sim.model().login_pending.is_none());
+            assert!(sim.model().login_draft.is_none());
+            assert!(sim.model().pending_input_restores.is_empty());
+            sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+                owner_session_id: String::from("replacement"),
+                text: String::from("replacement draft"),
+            }));
+            sim.send(login_state(None));
+            assert_eq!(sim.model().input.text(), "replacement draft");
+            assert!(
+                sim.model().transcript.iter().all(|entry| !entry.text.contains("private-code"))
+            );
+        }
+    }
+
+    #[test]
+    fn driver_commands_retire_login_before_the_next_owner_runs() {
+        let handle = dequeue_test_session();
+        let (tx, rx) = mpsc::channel();
+        let mut login = None;
+        // The shared API-key start path makes no request or credential write.
+        futures::executor::block_on(run_login_command(&handle, "openai", &mut login, &tx));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PiMsg::LoginPending { provider: Some(provider), .. } if provider == "openai"
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), PiMsg::System(_)));
+        let (pending, callback) = *login.take().expect("API-key flow waits for input");
+        assert!(callback.is_none());
+        for command in [
+            UiCommand::CancelLogin,
+            UiCommand::NewSession,
+            UiCommand::SessionInfo,
+            UiCommand::Login {
+                args: String::from("openai"),
+            },
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let mut login = Some(Box::new((pending.clone(), None)));
+            retire_login_for_command(
+                &UiCommand::LoginSubmit(LoginInput(String::new())),
+                &mut login,
+                &tx,
+            );
+            assert!(login.is_some(), "device polling must keep its login");
+            assert!(rx.try_recv().is_err());
+            retire_login_for_command(&command, &mut login, &tx);
+            assert!(login.is_none());
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                PiMsg::LoginPending { provider: None, .. }
+            ));
+            retire_login_for_command(&command, &mut login, &tx);
+            assert!(
+                rx.try_recv().is_err(),
+                "already retired login has no new completion"
+            );
+        }
+    }
+
     /// While a login waits for input, the next line is the secret: it goes to
     /// the driver and never into the transcript. A slash command abandons the
     /// prompt and runs normally.
@@ -22407,6 +23097,10 @@ mod tests {
         // command abandons it and routes as a command.
         type_str(&mut sim, "/session");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("login cancellation queued first"),
+            UiCommand::CancelLogin
+        );
         assert_eq!(
             submit_rx.try_recv().expect("slash command routed"),
             UiCommand::SessionInfo
