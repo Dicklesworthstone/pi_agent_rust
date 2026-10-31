@@ -3626,6 +3626,7 @@ mod tests {
         });
         config.titling = Some(crate::config::TitlingSettings {
             auto_title: Some(false),
+            ..Default::default()
         });
         let registry = role_test_registry();
         assert!(titling_model_entry(&cli, &config, &registry).is_none());

@@ -67,6 +67,39 @@ Resulting behavior:
 - `show_hardware_cursor` (bool): Show terminal hardware cursor. Default `false` unless
   `PI_HARDWARE_CURSOR=1`.
 
+### Session titles
+
+Interactive sessions can use the configured `tiny` or `smol` model role to name
+the first completed exchange. `titling.auto_title` (also `title.autoTitle`)
+defaults to `true`; setting it to `false` disables both naming and refresh.
+
+Set `title.refreshAfterPrompts` to a positive integer to reassess automatically
+generated titles as the task changes. The equivalent native spelling is
+`titling.refresh_after_prompts`. Refresh is disabled by default (`0`).
+
+```json
+{
+  "title": {
+    "autoTitle": true,
+    "refreshAfterPrompts": 3
+  }
+}
+```
+
+After that many substantive operator prompts and a successfully saved reply,
+Pi asks the auxiliary model whether the existing title still fits. It requests
+a replacement only when the title has drifted. Generated continuation messages
+and brief acknowledgments do not advance the interval. Counts follow the saved
+conversation branch, including prompts no longer in the model's compacted
+context; successful checks survive resume.
+
+Names assigned with `/name` are preserved, including when you choose the same
+text as a generated title. Older saved names without automatic-name provenance
+are also preserved. A partially loaded large session waits for its complete
+history before becoming eligible. Refresh uses bounded, privacy-screened conversation text
+and excludes reasoning, tool payloads and media. It stops when its session or
+branch changes, and only publishes a replacement after the name is saved.
+
 ### Model selection
 
 - `default_provider` (string)

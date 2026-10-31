@@ -64,11 +64,13 @@ use std::collections::{HashMap, VecDeque};
 mod console_input;
 mod info_commands;
 mod plan_commands;
+mod queued_compaction;
 pub mod session_pins;
 mod settings;
 mod textarea;
 mod workspace_commands;
 
+pub use queued_compaction::QueuedCompaction;
 pub use settings::{SettingsKey, SettingsSnapshot};
 use textarea::TextArea;
 
@@ -1709,6 +1711,8 @@ pub enum UiCommand {
     /// compaction, with any focus text as summary instructions, and replays
     /// the rewritten history into the transcript.
     Compact { instructions: Option<String> },
+    /// Compact after the owning turn yields, before later queued input.
+    QueuedCompact(QueuedCompaction),
     /// Generate and install a continuation brief without changing sessions.
     Handoff {
         focus: String,
@@ -2116,6 +2120,8 @@ pub struct PiFtuiModel {
     /// (`session_control`): Enter steers it, alt+enter queues a follow-up,
     /// Escape aborts it. Empty between turns.
     turn_control: Option<TurnControlSlot>,
+    /// One manual compaction ordered inside the active turn's input queue.
+    queued_compaction: Option<QueuedCompaction>,
     /// `/btw` availability. The driver prepares every side question against
     /// its live transcript and remembered credentials after the active turn.
     btw_client: Option<Arc<crate::btw::BtwClient>>,
@@ -2510,6 +2516,7 @@ impl PiFtuiModel {
             current_ask: None,
             turn_abort: None,
             turn_control: None,
+            queued_compaction: None,
             btw_client: None,
             term: (80, 24),
             term_size_known: false,
@@ -3306,6 +3313,13 @@ impl PiFtuiModel {
 
     #[allow(clippy::too_many_lines)]
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
+        if self
+            .queued_compaction
+            .as_ref()
+            .is_some_and(|request| !request.is_pending())
+        {
+            self.queued_compaction = None;
+        }
         if let PiMsg::McpAuthFinished {
             request_id,
             message,
@@ -3997,6 +4011,9 @@ impl PiFtuiModel {
             self.submit_mid_turn(true);
             return;
         }
+        if self.queue_compaction_command(&clean) {
+            return;
+        }
         if clean.starts_with('/') || clean.starts_with('!') {
             // The text stays in the editor for after the turn.
             self.push_entry(
@@ -4186,10 +4203,17 @@ impl PiFtuiModel {
         {
             return;
         }
-        let Some(control) = self.live_turn_control() else {
+        let pending = if let Some(pending) = self.take_queued_compaction_text() {
+            pending
+        } else if let Some(control) = self.live_turn_control() {
+            control
+                .take_pending()
+                .into_iter()
+                .map(|input| input.text)
+                .collect()
+        } else {
             return;
         };
-        let pending = control.take_pending();
         if pending.is_empty() {
             self.push_entry(
                 EntryRole::System,
@@ -4198,11 +4222,7 @@ impl PiFtuiModel {
             return;
         }
         let count = pending.len();
-        let mut text = pending
-            .into_iter()
-            .map(|input| input.text)
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let mut text = pending.join("\n\n");
         let typed = self.input.text();
         if !typed.is_empty() {
             text.push_str("\n\n");
@@ -6237,9 +6257,7 @@ impl PiFtuiModel {
                         self.abort_handoff();
                         return Cmd::none();
                     }
-                    Some(AppAction::Interrupt)
-                        if self.busy.is_some() && self.abort_driver_operation() =>
-                    {
+                    Some(AppAction::Interrupt) if self.abort_driver_operation() => {
                         return Cmd::none();
                     }
                     Some(AppAction::Interrupt) if self.state == AgentUiState::Working => {
@@ -6250,6 +6268,11 @@ impl PiFtuiModel {
                         {
                             self.push_entry(EntryRole::System, String::from("Aborting..."));
                         }
+                        self.restore_cancelled_compaction();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt) if self.queued_compaction.is_some() => {
+                        self.restore_cancelled_compaction();
                         return Cmd::none();
                     }
                     Some(AppAction::Interrupt) if self.input.is_empty() && self.busy.is_none() => {
@@ -7954,6 +7977,14 @@ impl TurnControlState {
 }
 
 fn abort_driver_work(turn_abort: Option<&TurnAbortSlot>, turn_control: Option<&TurnControlSlot>) {
+    // Seal publication first. Maintenance publishes its abort handle under
+    // this same fence, so shutdown cannot miss an operation admitted between
+    // checking the abort slot and closing the prompt lane.
+    if let Some(slot) = turn_control {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close();
+    }
     if let Some(slot) = turn_abort
         && let Some(handle) = slot
             .lock()
@@ -7961,11 +7992,6 @@ fn abort_driver_work(turn_abort: Option<&TurnAbortSlot>, turn_control: Option<&T
             .take()
     {
         handle.abort();
-    }
-    if let Some(slot) = turn_control {
-        slot.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .close();
     }
 }
 
@@ -8213,7 +8239,6 @@ async fn run_prompt_turn(
 
 /// One controlled turn; returns the text of inputs it never claimed and
 /// whether completion requires a pause before those inputs may run.
-#[allow(clippy::option_if_let_else)]
 async fn run_controlled_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
@@ -8221,8 +8246,6 @@ async fn run_controlled_turn(
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) -> (Vec<String>, bool) {
-    // ubs:ignore Sender clone per turn — the event callback must own its sender
-    let tx = agent_tx.clone();
     let content = if attachments.is_empty() {
         crate::model::UserContent::Text(prompt)
     } else {
@@ -8235,26 +8258,166 @@ async fn run_controlled_turn(
         blocks.extend(attachments);
         crate::model::UserContent::Blocks(blocks)
     };
+    run_controlled_turn_with_pending(
+        handle,
+        content,
+        None,
+        Vec::new(),
+        None,
+        agent_tx,
+        turn_control,
+    )
+    .await
+}
+
+/// Resume prepared input as one native turn. Seed its complete accepted tail
+/// before publishing control, so live input and another maintenance barrier
+/// observe the same queue. The inherited abort remains authoritative across
+/// admission and the native turn, including a delayed UI cancellation clone.
+#[allow(clippy::option_if_let_else, clippy::too_many_lines)]
+async fn run_controlled_turn_with_pending(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    content: crate::model::UserContent,
+    initial_source: Option<String>,
+    mut pending: Vec<crate::session_control::PendingInput>,
+    inherited_abort: Option<crate::agent::AbortSignal>,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) -> (Vec<String>, bool) {
+    let origin = {
+        let read = handle.with_session(|session| {
+            (
+                session.header.id.clone(),
+                session.leaf_id().map(str::to_string),
+            )
+        });
+        if let Some(abort) = &inherited_abort {
+            let cancelled = abort.wait();
+            futures::pin_mut!(read, cancelled);
+            match futures::future::select(cancelled, read).await {
+                futures::future::Either::Left(_) => {
+                    report_turn_result(Err(crate::error::Error::Aborted), agent_tx);
+                    return (
+                        initial_source
+                            .into_iter()
+                            .chain(pending.into_iter().map(|input| input.text))
+                            .collect(),
+                        true,
+                    );
+                }
+                futures::future::Either::Right((Ok(origin), _)) => Some(origin),
+                futures::future::Either::Right((Err(error), _)) => {
+                    report_turn_result(Err(error), agent_tx);
+                    return (
+                        initial_source
+                            .into_iter()
+                            .chain(pending.into_iter().map(|input| input.text))
+                            .collect(),
+                        true,
+                    );
+                }
+            }
+        } else {
+            read.await.ok()
+        }
+    };
+    if let Some(source) = &initial_source {
+        handle
+            .session_mut()
+            .agent
+            .set_magic_keyword_scan_override(Some(source.clone()));
+    }
+    // ubs:ignore Sender clone per turn — the event callback must own its sender
+    let tx = agent_tx.clone();
     let turn = handle.prompt_controlled_input(content, move |event| {
         for msg in agent_event_to_pi_msgs(&event) {
             let _ = tx.send(msg);
         }
     });
     let control = turn.control();
+    if let Err(error) = control.restore_pending(&mut pending) {
+        // Admission is all-or-nothing. The prompt has not been polled, so
+        // both it and the untouched tail are safe to return to the editor.
+        drop(turn);
+        if initial_source.is_some() {
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(None);
+        }
+        report_turn_result(Err(error), agent_tx);
+        return (
+            initial_source
+                .into_iter()
+                .chain(pending.into_iter().map(|input| input.text))
+                .collect(),
+            true,
+        );
+    }
     turn_control
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .publish(control.clone());
-    let result = turn.await;
+    let result = if let Some(abort) = &inherited_abort {
+        let cancelled = abort.wait();
+        futures::pin_mut!(turn, cancelled);
+        match futures::future::select(cancelled, turn).await {
+            futures::future::Either::Left(((), turn)) => {
+                control.abort();
+                // Cancellation must drain this same owned turn, never drop
+                // provider/tool/persistence cleanup or reset its budget.
+                turn.await
+            }
+            futures::future::Either::Right((result, _)) => result,
+        }
+    } else {
+        turn.await
+    };
     turn_control
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .current = None;
-    let leftover = control
-        .take_pending()
-        .into_iter()
-        .map(|input| input.text)
-        .collect::<Vec<_>>();
+    let mut leftover = if control.has_yield_barrier() {
+        let same_branch = handle
+            .with_session(|session| {
+                origin.as_ref().is_some_and(|(id, leaf)| {
+                    session.header.id == *id
+                        && leaf.as_deref().is_none_or(|leaf| {
+                            session
+                                .entries_for_current_path()
+                                .iter()
+                                .any(|entry| entry.base().id.as_deref() == Some(leaf))
+                        })
+                })
+            })
+            .await
+            .unwrap_or(false);
+        if !same_branch {
+            control.invalidate_yield_barrier();
+        }
+        // The queued command owns these inputs until it compacts or returns
+        // them to the editor. Starting them here would cross its barrier.
+        Vec::new()
+    } else {
+        control
+            .take_pending()
+            .into_iter()
+            .map(|input| input.text)
+            .collect()
+    };
+    // OwnedTurn guarantees this particular refusal dispatched no prompt.
+    // Other failures may have delivered the first input and must not replay it.
+    if matches!(&result, Err(crate::error::Error::Validation(message))
+        if message.starts_with("[SESSION_CONTROL_CANCELLED] turn cancelled before execution;"))
+    {
+        if let Some(source) = initial_source {
+            leftover.insert(0, source);
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(None);
+        }
+    }
     // The SDK result is the durability boundary. A successful cap must stop
     // the outer continuation loop just like an abort or terminal failure.
     let stopped = match &result {
@@ -11351,6 +11514,15 @@ pub fn run(
                             )
                             .await;
                         }
+                        Ok(UiCommand::QueuedCompact(request)) => {
+                            queued_compaction::run(
+                                &mut handle,
+                                request,
+                                &agent_tx,
+                                &driver_turn_control,
+                                &driver_turn_abort,
+                            ).await;
+                        }
                         Ok(UiCommand::Handoff { focus, request }) => {
                             run_handoff_command(&mut handle, &focus, request, &agent_tx).await;
                         }
@@ -11804,6 +11976,7 @@ pub fn run(
                     if let Some(title) = Box::pin(auto_title.tick(
                         handle.session(),
                         title_client.as_ref(),
+                        settings_controller.config().title_refresh_after_prompts(),
                         &runtime_handle,
                     ))
                     .await
@@ -23860,6 +24033,7 @@ mod tests {
     #[derive(Default)]
     struct NativePromptProbe {
         calls: Mutex<Vec<NativePromptCall>>,
+        pause_after_record: bool,
     }
 
     #[async_trait::async_trait]
@@ -23903,6 +24077,9 @@ mod tests {
                 thinking: options.thinking_level,
                 system_prompt: context.system_prompt.as_deref().map(str::to_string),
             });
+            if self.pause_after_record {
+                return futures::future::pending().await;
+            }
             Ok(Box::pin(futures::stream::iter([Ok(
                 crate::model::StreamEvent::Done {
                     reason: StopReason::Stop,
@@ -23942,6 +24119,277 @@ mod tests {
             session,
             crate::sdk::EventListeners::default(),
         )
+    }
+
+    fn detached_follow_ups(
+        inputs: &[(crate::model::UserContent, &str)],
+    ) -> Vec<crate::session_control::PendingInput> {
+        let mut handle = dequeue_test_session();
+        let turn = handle.prompt_controlled("unpolled source".into(), |_| {});
+        let control = turn.control();
+        for (content, source) in inputs {
+            control.follow_up_with_content(content, source).unwrap();
+        }
+        let pending = control.take_pending();
+        drop(turn);
+        pending
+    }
+
+    #[test]
+    fn seeded_compaction_inputs_precede_live_input_and_a_new_barrier() {
+        use crate::model::{ContentBlock, TextContent, ThinkingLevel, UserContent};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let first = UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("expanded A ultrathink")),
+                ContentBlock::Text(TextContent::new("unchanged trailing block")),
+            ]);
+            let second = UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(
+                "expanded B workflowz",
+            ))]);
+            let third = UserContent::Text("prepared C".into());
+            let pending = detached_follow_ups(&[
+                (second.clone(), "B @already-prepared.txt"),
+                (third.clone(), "ultrathink C"),
+            ]);
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let controls: TurnControlSlot = Arc::default();
+            let published = Arc::clone(&controls);
+            let observed = Arc::new(Mutex::new(None));
+            let observed_by_callback = Arc::clone(&observed);
+            handle.subscribe(move |event| {
+                if matches!(event, crate::agent::AgentEvent::AgentStart { .. }) {
+                    let control = published.lock().unwrap().current.clone().unwrap();
+                    assert_eq!(control.snapshot().pending_follow_up, 2);
+                    control.follow_up("live D").unwrap();
+                    let barrier = control.insert_yield_barrier().unwrap();
+                    control.follow_up("after second compaction E").unwrap();
+                    *observed_by_callback.lock().unwrap() = Some((control, barrier));
+                }
+            });
+            let (tx, _rx) = mpsc::channel();
+            let (_, abort) = crate::agent::AbortHandle::new();
+            let (leftover, stopped) = run_controlled_turn_with_pending(
+                &mut handle,
+                first.clone(),
+                Some("A @already-prepared.txt".into()),
+                pending,
+                Some(abort),
+                &tx,
+                &controls,
+            )
+            .await;
+            assert!(!stopped);
+            assert!(leftover.is_empty(), "the new barrier owns its held input");
+            let (control, barrier) = observed.lock().unwrap().take().unwrap();
+            assert!(control.yield_barrier_can_run(barrier));
+            let (before, after) = control.take_pending_at_barrier(barrier).unwrap();
+            assert!(before.is_empty());
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].text, "after second compaction E");
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls.len(), 4, "A, B, C, D precede the second compaction");
+            for (call, expected) in
+                calls
+                    .iter()
+                    .zip([first, second, third, UserContent::Text("live D".into())])
+            {
+                assert_eq!(
+                    serde_json::to_value(&call.content).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+            assert_eq!(calls[0].thinking, Some(ThinkingLevel::Low));
+            assert_eq!(calls[1].thinking, Some(ThinkingLevel::Low));
+            assert_eq!(calls[2].thinking, Some(ThinkingLevel::High));
+            assert_eq!(calls[3].thinking, Some(ThinkingLevel::Low));
+            assert!(
+                !calls[1]
+                    .system_prompt
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("invoked `workflowz`")
+            );
+        });
+    }
+
+    #[test]
+    fn seeded_compaction_cancellation_before_dispatch_restores_the_whole_batch() {
+        use crate::model::UserContent;
+
+        for phase in ["already_aborted", "runtime_closed", "session_admission"] {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = native_prompt_handle(Arc::clone(&provider));
+                let controls: TurnControlSlot = Arc::default();
+                let pending = detached_follow_ups(&[
+                    (UserContent::Text("prepared B".into()), "authored B"),
+                    (UserContent::Text("prepared C".into()), "authored C"),
+                ]);
+                let (abort, signal) = crate::agent::AbortHandle::new();
+                if phase == "already_aborted" {
+                    abort.abort();
+                } else if phase == "runtime_closed" {
+                    controls.lock().unwrap().close();
+                }
+                let store = handle.session_store();
+                let held = (phase == "session_admission").then(|| store.try_lock().unwrap());
+                let (tx, _rx) = mpsc::channel();
+                let mut turn = Box::pin(run_controlled_turn_with_pending(
+                    &mut handle,
+                    UserContent::Text("prepared A".into()),
+                    Some("authored A".into()),
+                    pending,
+                    Some(signal),
+                    &tx,
+                    &controls,
+                ));
+                if phase == "session_admission" {
+                    assert!(futures::poll!(turn.as_mut()).is_pending());
+                    abort.abort();
+                }
+                let (leftover, stopped) = turn.await;
+                drop(held);
+                assert!(stopped, "{phase}");
+                assert_eq!(
+                    leftover,
+                    ["authored A", "authored B", "authored C"],
+                    "{phase}"
+                );
+                assert!(provider.calls.lock().unwrap().is_empty(), "{phase}");
+                assert!(controls.lock().unwrap().current.is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn seeded_compaction_observes_a_late_abort_clone_and_drains_the_native_turn() {
+        use crate::model::{Message, UserContent};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe {
+                pause_after_record: true,
+                ..Default::default()
+            });
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let pending = detached_follow_ups(&[
+                (UserContent::Text("prepared B".into()), "authored B"),
+                (UserContent::Text("prepared C".into()), "authored C"),
+            ]);
+            let controls: TurnControlSlot = Arc::default();
+            let (abort, signal) = crate::agent::AbortHandle::new();
+            let late_clone = abort.clone();
+            let (tx, _rx) = mpsc::channel();
+            let mut turn = Box::pin(run_controlled_turn_with_pending(
+                &mut handle,
+                UserContent::Text("prepared A".into()),
+                Some("authored A".into()),
+                pending,
+                Some(signal),
+                &tx,
+                &controls,
+            ));
+            assert!(futures::poll!(turn.as_mut()).is_pending());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            let native = controls.lock().unwrap().current.clone().unwrap();
+            assert_eq!(native.snapshot().pending_follow_up, 2);
+            // The UI may have cloned the maintenance token just before the
+            // resumed native control became visible. It must still cancel it.
+            late_clone.abort();
+            let (leftover, stopped) = turn.await;
+            assert!(stopped);
+            assert_eq!(leftover, ["authored B", "authored C"]);
+            assert!(native.snapshot().finished);
+            assert!(controls.lock().unwrap().current.is_none());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            let prompts = handle
+                .with_session(|session| {
+                    session
+                        .to_messages_for_current_path()
+                        .into_iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count()
+                })
+                .await
+                .unwrap();
+            assert_eq!(prompts, 1, "delivered A is not restored or replayed");
+        });
+    }
+
+    #[test]
+    fn queued_compaction_keeps_escape_authority_while_session_admission_waits() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let owner = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+                .unwrap();
+            let turn = handle.prompt_controlled("initial completed input".into(), |_| {});
+            let control = turn.control();
+            let controls = published_turn_control(control.clone());
+            let aborts: TurnAbortSlot = Arc::default();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let (_unused, model) = new_model();
+            let mut model = model
+                .with_turn_control(Arc::clone(&controls))
+                .with_turn_abort(Arc::clone(&aborts))
+                .with_submit_channel(submit_tx);
+            model.displayed_session_id = Some(owner);
+            assert!(model.queue_compaction_command("/compact keep decisions"));
+            control.follow_up("held authored input").unwrap();
+            let UiCommand::QueuedCompact(request) = submit_rx.try_recv().unwrap() else {
+                panic!("queued compaction command");
+            };
+            assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+            controls.lock().unwrap().current = None;
+            let store = handle.session_store();
+            let held = store.try_lock().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let mut operation = Box::pin(queued_compaction::run(
+                &mut handle,
+                request,
+                &tx,
+                &controls,
+                &aborts,
+            ));
+            assert!(futures::poll!(operation.as_mut()).is_pending());
+            assert!(!control.has_yield_barrier(), "driver has claimed its input");
+            let token = aborts
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("admission abort published");
+            assert!(!token.signal().is_aborted());
+            // A delayed AgentStart must not leave Ready without cancellation.
+            model.queued_compaction = None;
+            model.state = AgentUiState::Ready;
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            assert!(token.signal().is_aborted());
+            operation.await;
+            drop(held);
+            assert!(aborts.lock().unwrap().is_none());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            assert!(rx.try_iter().any(|event| matches!(event,
+                PiMsg::RestorePendingInput { text, .. }
+                if text == "/compact keep decisions\n\nheld authored input"
+            )));
+        });
     }
 
     #[test]

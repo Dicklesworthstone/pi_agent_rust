@@ -3043,6 +3043,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// persisted session, still unnamed, exactly one user message so far, a
     /// tiny/smol-role model resolved, and titling not yet requested.
     fn maybe_request_session_title(&mut self) {
+        self.maybe_refresh_session_title();
         if self.title_requested || !self.save_enabled {
             return;
         }
@@ -3109,6 +3110,83 @@ After approving access in the browser, press Enter in Pi to complete login."
             .unwrap_or(false)
             {
                 drop(agent);
+                crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::SessionTitleSuggestion {
+                        owner_session_id,
+                        title,
+                    },
+                )
+                .await;
+            }
+        });
+    }
+
+    /// Reassess generated names after the configured number of substantive
+    /// prompts. Preparation uses the settled native session; asynchronous
+    /// results must still match its exact branch and name before saving.
+    fn maybe_refresh_session_title(&mut self) {
+        let interval = self.config.title_refresh_after_prompts();
+        if !self.save_enabled || interval == 0 {
+            return;
+        }
+        let Some(client) = self.title_client.clone() else {
+            return;
+        };
+        let prepared = {
+            let Ok(agent) = self.agent.try_lock() else {
+                return;
+            };
+            let session = agent.handle.session();
+            if session.ensure_provider_reentry_allowed().is_err() {
+                return;
+            }
+            let Ok(saved) = session.session.try_lock() else {
+                return;
+            };
+            let Ok(Some(prepared)) =
+                client.prepare_refresh_with_agent(&session.agent, &saved, interval)
+            else {
+                return;
+            };
+            let key = (saved.header.id.clone(), prepared.prompt_id().to_string());
+            if self.title_refresh_attempted.as_ref() == Some(&key) {
+                return;
+            }
+            (key, prepared)
+        };
+        let ((owner_session_id, prompt_id), prepared) = prepared;
+        self.title_refresh_attempted = Some((owner_session_id.clone(), prompt_id));
+        let (cancellation, registration) = crate::session_title::TitleCancellation::new();
+        let cancellation_check = cancellation.handle();
+        self.title_cancellation = Some(cancellation);
+        let owner = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let assess = async {
+                let outcome = client.refresh(prepared).await?;
+                let agent = OwnedMutexGuard::lock(owner, &cx).await.ok()?;
+                Some((agent, outcome))
+            };
+            let Ok(Some((agent, outcome))) =
+                futures::future::Abortable::new(assess, registration).await
+            else {
+                return;
+            };
+            if cancellation_check.is_aborted() {
+                return;
+            }
+            let saved = crate::session_title::save_refresh_if_current(
+                agent.handle.session(),
+                &outcome,
+                Some(&cancellation_check),
+            )
+            .await
+            .unwrap_or(false);
+            drop(agent);
+            if saved && let Some(title) = outcome.title {
                 crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &cx,

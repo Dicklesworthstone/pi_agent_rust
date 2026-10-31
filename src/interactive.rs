@@ -3031,6 +3031,8 @@ pub struct PiApp {
     title_requested: bool,
     /// Dropping the UI or replacing its session cancels provider work.
     title_cancellation: Option<crate::session_title::TitleCancellation>,
+    /// Do not repeat a failed optional refresh for the same saved prompt.
+    title_refresh_attempted: Option<(String, String)>,
 
     // Track last Ctrl+C time for double-tap quit detection
     last_ctrlc_time: Option<std::time::Instant>,
@@ -3521,6 +3523,7 @@ impl PiApp {
             title_client,
             title_requested,
             title_cancellation: None,
+            title_refresh_attempted: None,
             last_ctrlc_time: None,
             last_escape_time: None,
             autocomplete,

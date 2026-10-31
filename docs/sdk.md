@@ -209,6 +209,26 @@ contains secret material is refused when screening is enabled because replacing
 part of that identifier could change how the provider handles the attachment.
 Encoded payload bytes remain opaque to the text secret detector.
 
+### Manual compaction and ordered pauses
+
+`AgentSessionHandle::compact(instructions, on_event).await` and
+`shake(on_event).await` run explicitly, including when automatic compaction is
+disabled. They return `false` when there is no useful older context to compact.
+The cancellable variants are `compact_with_abort(instructions, signal, on_event)`
+and `shake_with_abort(signal, on_event)`. Pass an `AbortSignal` derived from a
+retained `AbortHandle`, then keep awaiting the operation after cancellation so
+provider cleanup and any admitted durable save can finish. Manual lifecycle
+events are paired on success, no-op, failure, and cancellation.
+
+For an in-process controlled turn, its `SessionControlHandle` can insert one
+`insert_yield_barrier()`. Input already admitted runs before the barrier; later
+input remains in the mailbox. Await the controlled turn, check
+`yield_barrier_can_run(id)`, and verify that the host still owns the same session
+and branch before running maintenance. A ready barrier alone does not establish
+successful persistence. `take_pending_at_barrier(id)` atomically claims the
+operation and returns unclaimed input before and after it; a stale claim returns
+`None`. Retain those native inputs for resumption or restoration on failure.
+
 ### In-place handoff
 
 `AgentSessionHandle::handoff(focus, &abort_signal, on_event).await` generates a
@@ -530,7 +550,7 @@ replaced generated versions remain in the audited history.
 - `SessionOptions::model_scope` accepts the ordered patterns and optional `:thinking` suffixes used by `--models`. Explicit provider/model and thinking choices take precedence; reopening retains the saved model when no explicit provider/model is supplied. With no scope override, the session uses its workspace's model scope before global enabled models.
 - `SessionOptions::max_time` sets the wall-clock run limit (`None` by default). The agent checks it at turn boundaries, allows admitted tools to finish, and saves its time-cap marker with the conversation. The default TUI forwards `--max-time` to this option.
 - `SessionOptions::out_enabled` explicitly overrides the `out.enabled` setting for interim Markdown replies. `out_default_enabled` supplies a host default only when neither the caller nor freshly loaded settings specify a value; it defaults to false. Interactive hosts set that default to true while preserving an explicit false after a workspace reload. See [interim replies](tools/interim-responses.md) for delivery and replay.
-- In-process `AgentSessionHandle` currently exposes prompt/state/model/thinking/compaction flows; queue controls like `steer`/`follow_up` are on `RpcTransportClient`.
+- In-process `AgentSessionHandle` exposes controlled prompt futures with a `SessionControlHandle` for steering, follow-up input, cancellation, and ordered yield barriers. `RpcTransportClient` exposes its own subprocess queue controls.
 - `SessionTransport::prompt` returns `SessionPromptResult`, which is `InProcess(Box<AssistantMessage>)` or `RpcEvents(Vec<Value>)` depending on backend.
 - Extension loading is opt-in via `extension_paths`, with `extension_policy`/`repair_policy` controls.
 - Extension UI/capability prompts are answered via `SessionOptions::extension_ui_handler`; without one they fail closed (deny).

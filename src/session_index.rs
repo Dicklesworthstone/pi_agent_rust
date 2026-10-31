@@ -1510,6 +1510,7 @@ mod tests {
         SessionEntry::SessionInfo(SessionInfoEntry {
             base: EntryBase::new(parent_id, id.to_string()),
             name: name.map(ToString::to_string),
+            source: None,
         })
     }
 

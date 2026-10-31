@@ -3509,6 +3509,22 @@ impl AgentSessionHandle {
         self.session.compact_now(instructions, on_event).await
     }
 
+    /// Explicitly cancellable manual compaction. The abort signal can stop
+    /// summary generation and prevents installing a cancelled or stale result.
+    /// Await completion so provider cleanup and any admitted durable save can
+    /// finish; subscribers receive the same paired manual lifecycle events.
+    pub async fn compact_with_abort(
+        &mut self,
+        instructions: Option<&str>,
+        abort: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session
+            .compact_now_with_abort(instructions, &abort, on_event)
+            .await
+    }
+
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
     /// Returns whether it changed the session. Subscribers and the callback
@@ -3519,6 +3535,17 @@ impl AgentSessionHandle {
     ) -> Result<bool> {
         let on_event = self.make_combined_callback(on_event);
         self.session.shake_now(on_event).await
+    }
+
+    /// Cancellable provider-free manual compaction. Once durable installation
+    /// begins, cancellation does not drop its reconciliation transaction.
+    pub async fn shake_with_abort(
+        &mut self,
+        abort: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session.shake_now_with_abort(&abort, on_event).await
     }
 
     /// Generate and durably install a continuation brief in this session.
@@ -7988,6 +8015,187 @@ mod tests {
                         .contains("Additional focus: keep the retry-count decision")),
                 "{sent:?}"
             );
+        });
+    }
+
+    fn cancellable_compaction_handle() -> AgentSessionHandle {
+        let mut stored = Session::in_memory();
+        for i in 0..3 {
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text(format!("question {i} ").repeat(100)),
+                timestamp: Some(i),
+            });
+            stored.append_message(crate::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(format!("answer {i}")))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            });
+        }
+        let mut agent = Agent::new(
+            Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        AgentSessionHandle::from_session_with_listeners(
+            AgentSession::new(
+                agent,
+                Arc::new(AsyncMutex::new(stored)),
+                false,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    keep_recent_tokens: 1,
+                    ..ResolvedCompactionSettings::default()
+                },
+            ),
+            EventListeners::new(),
+        )
+    }
+
+    #[test]
+    fn manual_compaction_abort_cancels_admission_and_summary_without_changing_history() {
+        for phase in ["before", "session_lock", "summary"] {
+            run_async(async {
+                let mut handle = cancellable_compaction_handle();
+                let store = handle.session_store();
+                let before = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+                let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let actions = handle.session.session_action_admission_gate();
+                handle
+                    .session
+                    .agent
+                    .set_provider(Arc::new(RewindCallbackProvider {
+                        delegate: RewindPrivacyProvider {
+                            requests: Arc::new(Mutex::new(Vec::new())),
+                        },
+                        store: Arc::clone(&store),
+                        actions,
+                        action: RewindCallbackAction::Pending,
+                        after_callback: Arc::new(Mutex::new(None)),
+                        calls: Arc::clone(&calls),
+                    }));
+                let (abort, signal) = AbortHandle::new();
+                if phase == "before" {
+                    abort.abort();
+                }
+                let held = (phase == "session_lock").then(|| store.try_lock().unwrap());
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let output = Arc::clone(&events);
+                let mut compact = Box::pin(handle.compact_with_abort(None, signal, move |event| {
+                    output
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                }));
+                if phase != "before" {
+                    assert!(futures::poll!(compact.as_mut()).is_pending(), "{phase}");
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        usize::from(phase == "summary")
+                    );
+                    abort.abort();
+                }
+                assert!(matches!(compact.await, Err(Error::Aborted)), "{phase}");
+                drop(held);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    usize::from(phase == "summary")
+                );
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before
+                );
+                assert_eq!(
+                    serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                    before_agent
+                );
+                assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+                let events = events.lock().unwrap();
+                assert_eq!(
+                    events.len(),
+                    2,
+                    "one completed manual progress pair: {phase}"
+                );
+                assert_eq!(events[0]["type"], "manual_compaction_start");
+                assert_eq!(events[1]["type"], "manual_compaction_end");
+                assert_eq!(events[1]["aborted"], true);
+                assert!(events[1]["result"].is_null());
+            });
+        }
+    }
+
+    #[test]
+    fn manual_compaction_refuses_source_changed_during_generation() {
+        for action in [RewindCallbackAction::Append, RewindCallbackAction::Header] {
+            run_async(async {
+                let mut handle = cancellable_compaction_handle();
+                let store = handle.session_store();
+                let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+                let after_callback = Arc::new(Mutex::new(None));
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let actions = handle.session.session_action_admission_gate();
+                handle
+                    .session
+                    .agent
+                    .set_provider(Arc::new(RewindCallbackProvider {
+                        delegate: RewindPrivacyProvider {
+                            requests: Arc::new(Mutex::new(Vec::new())),
+                        },
+                        store: Arc::clone(&store),
+                        actions,
+                        action,
+                        after_callback: Arc::clone(&after_callback),
+                        calls: Arc::clone(&calls),
+                    }));
+                let (_, signal) = AbortHandle::new();
+                let error = handle
+                    .compact_with_abort(None, signal, |_| {})
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("Compaction source changed"),
+                    "{error}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let live = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+                assert!(after_callback.lock().unwrap().as_ref() == Some(&live));
+                assert_eq!(
+                    serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                    before_agent
+                );
+                assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn cancellable_shake_honors_abort_and_ignores_disabled_automatic_compaction() {
+        run_async(async {
+            let mut handle = cancellable_compaction_handle();
+            let store = handle.session_store();
+            let before = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+            let (abort, signal) = AbortHandle::new();
+            abort.abort();
+            assert!(matches!(
+                handle.shake_with_abort(signal, |_| {}).await,
+                Err(Error::Aborted)
+            ));
+            assert!(SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before);
+            let (_, signal) = AbortHandle::new();
+            assert!(
+                handle
+                    .shake_with_abort(signal, |_| {})
+                    .await
+                    .expect("shake")
+            );
+            assert!(store.try_lock().unwrap().entries.iter().any(|entry| {
+                matches!(entry, crate::session::SessionEntry::Compaction(compaction)
+                    if compaction.details.as_ref().is_some_and(|details| details["mode"] == "shake"))
+            }));
         });
     }
 

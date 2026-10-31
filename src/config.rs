@@ -75,6 +75,7 @@ pub struct Config {
     #[serde(alias = "modelRoles")]
     pub model_roles: Option<ModelRoleSettings>,
     /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
+    #[serde(alias = "title")]
     pub titling: Option<TitlingSettings>,
     /// Opt in to a one-shot strong-to-small model handoff on fresh sessions.
     pub prewalk: Option<PrewalkSettings>,
@@ -509,6 +510,10 @@ pub struct TitlingSettings {
     /// Master switch for automatic session titling (default: true).
     #[serde(alias = "autoTitle", alias = "auto")]
     pub auto_title: Option<bool>,
+    /// Recheck generated titles after this many substantive user prompts.
+    /// Zero (the default) disables refresh; explicit user names are preserved.
+    #[serde(alias = "refreshAfterPrompts")]
+    pub refresh_after_prompts: Option<u32>,
 }
 
 /// Prewalk is off unless explicitly enabled. Selectors are resolved when a
@@ -1202,6 +1207,18 @@ impl Config {
             .as_ref()
             .and_then(|t| t.auto_title)
             .unwrap_or(true)
+    }
+
+    /// Optional prompt interval for checking whether a generated title drifted.
+    #[must_use]
+    pub fn title_refresh_after_prompts(&self) -> u32 {
+        if !self.auto_title_enabled() {
+            return 0;
+        }
+        self.titling
+            .as_ref()
+            .and_then(|settings| settings.refresh_after_prompts)
+            .unwrap_or(0)
     }
 
     /// Planning selector for an explicit prewalk restart.
@@ -2159,6 +2176,7 @@ fn merge_titling(
     match (base, other) {
         (Some(base), Some(other)) => Some(TitlingSettings {
             auto_title: other.auto_title.or(base.auto_title),
+            refresh_after_prompts: other.refresh_after_prompts.or(base.refresh_after_prompts),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2733,6 +2751,31 @@ mod tests {
         assert_eq!(Config::default().prewalk_from(), "@default");
         assert_eq!(Config::default().prewalk_into(), "@smol");
         Ok(())
+    }
+
+    #[test]
+    fn title_refresh_is_opt_in_and_merges_without_losing_auto_title() {
+        assert_eq!(Config::default().title_refresh_after_prompts(), 0);
+        for source in [
+            r#"{"title":{"refreshAfterPrompts":3}}"#,
+            r#"{"titling":{"refresh_after_prompts":3}}"#,
+        ] {
+            let config: Config = serde_json::from_str(source).expect("title refresh settings");
+            assert!(unrecognised_setting_keys(source).is_empty());
+            assert_eq!(config.title_refresh_after_prompts(), 3);
+            let empty = serde_json::from_str(r#"{"titling":{}}"#).expect("empty title override");
+            let merged = Config::merge(config, empty);
+            assert_eq!(merged.title_refresh_after_prompts(), 3);
+            let disabled = serde_json::from_str(r#"{"titling":{"autoTitle":false}}"#)
+                .expect("disable auto titles");
+            let disabled = Config::merge(merged, disabled);
+            assert_eq!(disabled.title_refresh_after_prompts(), 0);
+            assert_eq!(disabled.titling.unwrap().refresh_after_prompts, Some(3));
+        }
+        for invalid in ["-1", "1.5", "true", "4294967296"] {
+            let source = format!(r#"{{"title":{{"refreshAfterPrompts":{invalid}}}}}"#);
+            assert!(serde_json::from_str::<Config>(&source).is_err());
+        }
     }
 
     #[test]

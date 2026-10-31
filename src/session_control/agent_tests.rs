@@ -355,6 +355,52 @@ fn borrowed_handle_turn_steers_mid_tool_and_retires_its_control() {
 }
 
 #[test]
+fn ordered_yield_finishes_tools_and_earlier_input_before_recovering_later_input() {
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("note.txt"), "real read tool fixture").unwrap();
+    let peer = Peer::new(vec![Reply::Tool, Reply::Text, Reply::Text, Reply::Text]);
+    let mut session = peer.session(temp.path());
+    let barrier_slot = Arc::new(Mutex::new(None));
+    let barrier_writer = Arc::clone(&barrier_slot);
+    let tool_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted_tools = Arc::clone(&tool_runs);
+    runtime.block_on(async {
+        let turn = session
+            .prompt_with_control("read note.txt".to_string(), move |control, event| {
+                if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                    counted_tools.fetch_add(1, Ordering::SeqCst);
+                    control.follow_up("earlier authored follow-up").unwrap();
+                    let barrier = control.insert_yield_barrier().unwrap();
+                    control.follow_up("later authored follow-up").unwrap();
+                    *lock(&barrier_writer) = Some(barrier);
+                }
+            })
+            .unwrap();
+        let control = turn.control();
+        assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+        let barrier = lock(&barrier_slot).expect("queued barrier");
+        assert!(control.yield_barrier_can_run(barrier));
+        assert_eq!(control.snapshot().handed_to_agent, 1);
+        assert_eq!(lock(&peer.requests).len(), 3);
+        let (before, mut after) = control.take_pending_at_barrier(barrier).unwrap();
+        assert!(before.is_empty());
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "later authored follow-up");
+        let next = session.prompt(after.remove(0).text, |_| {}).unwrap();
+        assert!(after.is_empty());
+        assert_eq!(next.await.unwrap().stop_reason, StopReason::Stop);
+    });
+    let requests = lock(&peer.requests);
+    assert_eq!(requests.len(), 4);
+    assert!(!request_has(&requests[1], "earlier authored follow-up"));
+    assert!(request_has(&requests[2], "earlier authored follow-up"));
+    assert!(!request_has(&requests[2], "later authored follow-up"));
+    assert!(request_has(&requests[3], "later authored follow-up"));
+    assert_eq!(tool_runs.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn borrowed_handle_native_prompt_preserves_order_through_provider_and_session() {
     use crate::model::{ContentBlock, ImageContent, TextContent};
 

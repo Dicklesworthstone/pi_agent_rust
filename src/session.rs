@@ -5681,12 +5681,21 @@ impl Session {
     }
 
     pub fn append_session_info(&mut self, name: Option<String>) -> String {
+        let source = name.as_ref().map(|_| SessionTitleSource::User);
+        self.append_session_info_with_source(name, source)
+    }
+
+    fn append_session_info_with_source(
+        &mut self,
+        name: Option<String>,
+        source: Option<SessionTitleSource>,
+    ) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
         if name.is_some() {
             self.cached_name.clone_from(&name);
         }
-        let entry = SessionEntry::SessionInfo(SessionInfoEntry { base, name });
+        let entry = SessionEntry::SessionInfo(SessionInfoEntry { base, name, source });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
@@ -5824,6 +5833,27 @@ impl Session {
     /// Set the session name by appending a `SessionInfo` entry.
     pub fn set_name(&mut self, name: &str) -> String {
         self.append_session_info(Some(name.to_string()))
+    }
+
+    /// Record the provenance needed to refresh an automatically generated name.
+    /// Ordinary name setters always record a user name, even if its text matches.
+    pub(crate) fn set_generated_name(&mut self, name: &str) -> String {
+        self.append_session_info_with_source(Some(name.to_string()), Some(SessionTitleSource::Auto))
+    }
+
+    /// The latest naming entry owns the session name across branches. Legacy
+    /// entries without provenance are treated as user names, never guessed auto.
+    pub(crate) fn name_entry(&self) -> Option<&SessionInfoEntry> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::SessionInfo(info) if info.name.is_some() => Some(info),
+            _ => None,
+        })
+    }
+
+    #[must_use]
+    pub fn name_source(&self) -> Option<SessionTitleSource> {
+        self.name_entry()
+            .map(|info| info.source.unwrap_or(SessionTitleSource::User))
     }
 
     pub fn append_compaction(
@@ -7480,7 +7510,15 @@ pub struct LabelEntry {
     pub label: Option<String>,
 }
 
-/// Session info entry.
+/// Provenance of a persisted session name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionTitleSource {
+    Auto,
+    User,
+}
+
+/// A name and its author. Missing source in older records means user-authored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfoEntry {
@@ -7488,6 +7526,8 @@ pub struct SessionInfoEntry {
     pub base: EntryBase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SessionTitleSource>,
 }
 
 /// Custom entry.
@@ -13158,6 +13198,25 @@ mod tests {
 
         session.set_name("second");
         assert_eq!(session.get_name().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn generated_name_provenance_is_explicit_and_manual_same_text_wins() {
+        let mut session = Session::in_memory();
+        session.set_generated_name("Fix parser recovery");
+        assert_eq!(session.name_source(), Some(SessionTitleSource::Auto));
+        let recorded = serde_json::to_value(session.name_entry().unwrap()).unwrap();
+        assert_eq!(recorded["source"], "auto");
+        session.set_name("Fix parser recovery");
+        assert_eq!(session.name_source(), Some(SessionTitleSource::User));
+        let legacy: SessionInfoEntry = serde_json::from_value(serde_json::json!({
+            "id": "legacy-name", "parentId": null,
+            "timestamp": "2026-10-30T00:00:00Z", "name": "Earlier name"
+        }))
+        .expect("older name record without provenance");
+        assert_eq!(legacy.source, None);
+        session.entries.push(SessionEntry::SessionInfo(legacy));
+        assert_eq!(session.name_source(), Some(SessionTitleSource::User));
     }
 
     #[test]

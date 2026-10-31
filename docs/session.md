@@ -176,6 +176,20 @@ Creates a new session file starting from the current point (or a selected point)
 
 Manually triggers context compaction, without waiting for the automatic threshold. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
 
+In the default terminal UI, `/compact [focus]`, `/compact shake`, and `/shake`
+can also be submitted while the agent is working. Earlier queued input runs
+first; compaction waits for the active turn and its tools to finish and save.
+Later input waits behind compaction and then resumes with its prepared
+attachments and ordering intact. The command itself is never sent as a prompt.
+
+Only one compaction can be queued at a time. Before it starts, `Alt+Up` recalls
+the command together with queued text in its original order. Cancelling or
+failing the active turn returns unclaimed input to the owning session's editor
+instead of starting maintenance. Once compaction starts, the normal interrupt
+key cancels generation; an already admitted durable save finishes its
+reconciliation before control returns. A completed compaction is not replayed
+after a late cancellation.
+
 ### Session commands in print mode
 
 Explicit command-line arguments can perform session maintenance without opening
@@ -191,8 +205,8 @@ pi --session ./run.jsonl -p '/retry'
 `/compact` uses the selected session's native summarizer, privacy policy,
 extension hooks and durable compaction transaction. `/compact shake` uses the
 same transaction with local removal of bulky older tool output and no summary
-model request. Neither waits for the automatic threshold. Disabled compaction is
-an error; a session whose history all fits in `keepRecentTokens`, or that has
+model request. These explicit commands also work when automatic compaction is
+disabled. A session whose history all fits in `keepRecentTokens`, or that has
 nothing new since its last compaction, reports that no change was made. Custom
 compaction instructions are not accepted on this surface.
 

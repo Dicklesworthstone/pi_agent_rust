@@ -194,6 +194,12 @@ fn transfer(source: &mut RunData, target: &mut RunData) -> Result<Vec<Transferre
             "await or drop the source turn before transferring unclaimed input",
         ));
     }
+    if source.yield_barrier.is_some() {
+        return Err(control_error(
+            "SESSION_CONTROL_BARRIER",
+            "resolve the source turn's yield barrier before transferring its held input",
+        ));
+    }
     if !target.accepting_input || target.finished {
         return Err(control_error(
             "SESSION_CONTROL_CLOSED",
@@ -254,6 +260,35 @@ mod tests {
     use crate::session_control::tests::live;
     use crate::session_control::{InputKind, MAX_INPUT_BYTES};
     use std::sync::Barrier;
+
+    #[test]
+    fn recovery_cannot_silently_bypass_an_unresolved_yield_barrier() {
+        let (source, source_guard, _) = live();
+        let barrier = source.insert_yield_barrier().unwrap();
+        source.follow_up("after maintenance").unwrap();
+        drop(source_guard);
+        let (target, _target_guard, _) = live();
+        target.follow_up("already accepted").unwrap();
+        assert!(
+            source
+                .transfer_pending_to(&target)
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_BARRIER")
+        );
+        assert_eq!(source.snapshot().pending_follow_up, 1);
+        assert_eq!(target.snapshot().pending_follow_up, 1);
+        assert!(source.remove_yield_barrier(barrier));
+        assert_eq!(source.transfer_pending_to(&target).unwrap().len(), 1);
+        assert_eq!(
+            target
+                .take_pending()
+                .iter()
+                .map(|input| input.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["already accepted", "after maintenance"]
+        );
+    }
 
     #[test]
     fn recovery_preserves_order_lanes_payloads_and_authored_text() {

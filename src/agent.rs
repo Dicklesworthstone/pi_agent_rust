@@ -1094,6 +1094,20 @@ impl RegisteredMessageFetcher {
     }
 }
 
+/// A turn-owned host operation can request a normal yield after its earlier
+/// queued input has run. This is checked only at existing idle boundaries;
+/// it never interrupts provider streaming or a tool batch.
+struct RegisteredYieldCheck {
+    ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    lifetime: Weak<()>,
+}
+
+impl RegisteredYieldCheck {
+    fn is_live(&self) -> bool {
+        self.lifetime.strong_count() > 0
+    }
+}
+
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
 
 /// Persists completed messages mid-run, resolving to whether they reached the
@@ -1711,6 +1725,33 @@ impl Drop for ManualCompactionProgress {
     }
 }
 
+/// Cancel only admission/read waits, never an admitted persistence transaction.
+/// If completion and cancellation race, refuse the newly acquired resource
+/// before publishing it to the caller.
+async fn await_compaction_admission<T>(
+    abort: Option<&AbortSignal>,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(abort) = abort else {
+        return operation.await;
+    };
+    if abort.is_aborted() {
+        return Err(Error::Aborted);
+    }
+    let cancelled = abort.wait();
+    futures::pin_mut!(operation, cancelled);
+    match futures::future::select(cancelled, operation).await {
+        futures::future::Either::Left(_) => Err(Error::Aborted),
+        futures::future::Either::Right((result, _)) => {
+            if abort.is_aborted() {
+                Err(Error::Aborted)
+            } else {
+                result
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Agent
 // ============================================================================
@@ -2000,6 +2041,9 @@ pub struct Agent {
     /// Fetchers for queued follow-up messages (idle).
     follow_up_fetchers: Vec<RegisteredMessageFetcher>,
 
+    /// Ordered maintenance barriers installed by live SDK control lanes.
+    yield_checks: Vec<RegisteredYieldCheck>,
+
     /// Whether queue sources may be polled and dispatched automatically.
     /// Hosts can pause either lane and explicitly take already staged batches.
     automatic_steering_dispatch: bool,
@@ -2225,6 +2269,7 @@ impl Agent {
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
+            yield_checks: Vec::new(),
             automatic_steering_dispatch: true,
             automatic_follow_up_dispatch: true,
             job_session_scope,
@@ -2788,6 +2833,24 @@ impl Agent {
             self.follow_up_fetchers
                 .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
         }
+    }
+
+    pub(crate) fn register_scoped_yield_check(
+        &mut self,
+        lifetime: &Arc<()>,
+        ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        self.yield_checks.retain(RegisteredYieldCheck::is_live);
+        self.yield_checks.push(RegisteredYieldCheck {
+            ready,
+            lifetime: Arc::downgrade(lifetime),
+        });
+    }
+
+    fn ordered_yield_requested(&self) -> bool {
+        self.yield_checks
+            .iter()
+            .any(|check| check.is_live() && (check.ready)())
     }
 
     /// Register the owning surface's bounded follow-up source for a resumed
@@ -4470,6 +4533,7 @@ impl Agent {
                 // end. The nudge flows through pending_messages so it is
                 // evented and persisted like any user message.
                 if self.automatic_follow_up_dispatch
+                    && !self.ordered_yield_requested()
                     && pending_messages.is_empty()
                     && !has_more_tool_calls
                     && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
@@ -4679,7 +4743,7 @@ impl Agent {
     }
 
     async fn stage_follow_up_messages(&mut self) -> bool {
-        if !self.automatic_follow_up_dispatch {
+        if !self.automatic_follow_up_dispatch || self.ordered_yield_requested() {
             return false;
         }
         let mut owning_surface_ready = self.message_queue.follow_up_batch_len() > 0;
@@ -4702,7 +4766,9 @@ impl Agent {
             // registry. Poll them even while the owning source stays busy so a
             // continuously replenished RPC queue cannot starve the notice
             // registry until its oldest completions are evicted.
-            self.fetch_job_follow_up_messages().await;
+            if !self.ordered_yield_requested() {
+                self.fetch_job_follow_up_messages().await;
+            }
             return self.message_queue.follow_up_batch_len() > 0;
         }
 
@@ -4714,12 +4780,17 @@ impl Agent {
         self.follow_up_fetchers
             .retain(RegisteredMessageFetcher::is_live);
         for registered in &self.follow_up_fetchers {
+            if self.ordered_yield_requested() {
+                break;
+            }
             let fetched = self.fetch_messages(Some(&registered.fetcher)).await;
             for message in fetched {
                 self.message_queue.push_follow_up(message);
             }
         }
-        self.fetch_job_follow_up_messages().await;
+        if !self.ordered_yield_requested() {
+            self.fetch_job_follow_up_messages().await;
+        }
     }
 
     async fn fetch_job_follow_up_messages(&mut self) {
@@ -16424,10 +16495,6 @@ impl AgentSession {
         self
     }
 
-    pub(crate) const fn memory_enabled(&self) -> bool {
-        self.memory_settings.is_some()
-    }
-
     /// Extract and incrementally consolidate facts from the current saved branch.
     /// This uses the active provider and resolves the current session workdir.
     pub async fn sync_memory(&self) -> Result<crate::memory::MemorySyncReport> {
@@ -18656,19 +18723,21 @@ impl AgentSession {
         instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.ensure_provider_reentry_allowed()?;
-        let progress = ManualCompactionProgress::start(on_event, None);
-        let outcome = self
-            .compact_synchronous(
-                Arc::new(progress.callback()),
-                false,
-                instructions,
-                None,
-                None,
-            )
-            .await;
-        progress.finish_outcome(&outcome);
-        outcome
+        self.compact_manual(false, instructions, None, on_event)
+            .await
+    }
+
+    /// Manual compaction with explicit cancellation. Cancellation can retire
+    /// generation or refuse installation, but never drops an admitted durable
+    /// save: keep polling until its reconciliation and progress pair finish.
+    pub async fn compact_now_with_abort(
+        &mut self,
+        instructions: Option<&str>,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.compact_manual(false, instructions, Some(abort), on_event)
+            .await
     }
 
     /// OMP `/shake` (bd-cv653.3.18): compact by dropping bulky tool output
@@ -18679,10 +18748,38 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
+        self.compact_manual(true, None, None, on_event).await
+    }
+
+    /// Provider-free manual compaction with the same cancellation and durable
+    /// installation boundary as [`Self::compact_now_with_abort`].
+    pub async fn shake_now_with_abort(
+        &mut self,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.compact_manual(true, None, Some(abort), on_event).await
+    }
+
+    async fn compact_manual(
+        &mut self,
+        shake: bool,
+        instructions: Option<&str>,
+        abort: Option<&AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        let progress = ManualCompactionProgress::start(on_event, Some("shake".to_string()));
+        let progress =
+            ManualCompactionProgress::start(on_event, shake.then(|| "shake".to_string()));
         let outcome = self
-            .compact_synchronous(Arc::new(progress.callback()), true, None, None, None)
+            .compact_synchronous(
+                Arc::new(progress.callback()),
+                shake,
+                instructions,
+                None,
+                None,
+                abort,
+            )
             .await;
         progress.finish_outcome(&outcome);
         outcome
@@ -18699,7 +18796,7 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, None, Some(abort), None)
+        self.compact_synchronous(Arc::new(on_event), false, None, Some(abort), None, None)
             .await
     }
 
@@ -18727,7 +18824,14 @@ impl AgentSession {
             ));
         }
         let changed = self
-            .compact_synchronous(Arc::new(on_event), false, None, None, Some((focus, abort)))
+            .compact_synchronous(
+                Arc::new(on_event),
+                false,
+                None,
+                None,
+                Some((focus, abort)),
+                None,
+            )
             .await?;
         if !changed {
             return Err(Error::session(
@@ -18895,6 +18999,7 @@ impl AgentSession {
                         provider_admission,
                         None,
                         None,
+                        None,
                     )
                     .await?;
                     self.compaction_worker.mark_applied_success();
@@ -19020,6 +19125,7 @@ impl AgentSession {
                         true,
                         provider_admission,
                         false,
+                        None,
                         None,
                     )
                     .await;
@@ -19197,6 +19303,7 @@ impl AgentSession {
             provider_admission,
             None,
             None,
+            None,
         )
         .await
     }
@@ -19252,26 +19359,39 @@ impl AgentSession {
         provider_admission: OwnedMutexGuard<()>,
         require_reduction: bool,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
-        let session_action_permit = if handoff_source.is_some() {
-            Some(self.session_action_admission.acquire(cx.cx()).await?)
+        let source = handoff_source.or(manual_source);
+        let abort = source.map(|(_, abort)| abort);
+        let session_action_permit = if source.is_some() {
+            Some(
+                await_compaction_admission(abort, self.session_action_admission.acquire(cx.cx()))
+                    .await?,
+            )
         } else {
             None
         };
-        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
+        let mut session = await_compaction_admission(abort, async {
+            OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))
+        })
+        .await?;
         self.provider_admission.ensure_allowed()?;
-        if let Some((source, abort)) = handoff_source {
+        if let Some((source, abort)) = source {
             if abort.is_aborted() {
                 return Err(Error::Aborted);
             }
             if SessionEditSnapshot::capture(&session)? != *source {
-                return Err(Error::session(
-                    "Handoff source changed during generation; the summary was not applied",
-                ));
+                return Err(Error::session(if handoff_source.is_some() {
+                    "Handoff source changed during generation; the summary was not applied"
+                } else {
+                    "Compaction source changed during generation; the result was not applied"
+                }));
             }
+        }
+        if handoff_source.is_some() {
             if summary.trim().is_empty()
                 || !compaction::overflow_compaction_preserves_current_turn(
                     &session.entries_for_current_path(),
@@ -19401,6 +19521,7 @@ impl AgentSession {
         provider_admission: OwnedMutexGuard<()>,
         overflow_abort: Option<&AbortSignal>,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<()> {
         let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
@@ -19425,6 +19546,7 @@ impl AgentSession {
                 provider_admission,
                 overflow,
                 handoff_source,
+                manual_source,
             )
             .await
         {
@@ -19432,7 +19554,7 @@ impl AgentSession {
             Err(err) => {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
-                    aborted: false,
+                    aborted: matches!(err, Error::Aborted),
                     will_retry: false,
                     error_message: Some(err.to_string()),
                 });
@@ -19468,31 +19590,37 @@ impl AgentSession {
         instructions: Option<&str>,
         overflow_abort: Option<&AbortSignal>,
         handoff: Option<(&str, &AbortSignal)>,
+        manual_abort: Option<&AbortSignal>,
     ) -> Result<bool> {
         // `compaction.enabled` is the automatic switch, as in OMP: it stops
         // overflow recovery, not a user's `/compact`, `/shake` or handoff.
         if !self.compaction_settings.enabled && overflow_abort.is_some() {
             return Ok(false);
         }
-        let abort = handoff.map(|(_, abort)| abort).or(overflow_abort);
+        let abort = handoff
+            .map(|(_, abort)| abort)
+            .or(overflow_abort)
+            .or(manual_abort);
         if abort.is_some_and(AbortSignal::is_aborted) {
             return Err(Error::Aborted);
         }
         let overflow = overflow_abort.is_some();
 
-        let (entries, preparation, handoff_snapshot) = {
+        let (entries, preparation, source_snapshot) = {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            if handoff.is_some() {
+            let mut session = await_compaction_admission(abort, async {
+                self.session
+                    .lock(cx.cx())
+                    .await
+                    .map_err(|e| Error::session(e.to_string()))
+            })
+            .await?;
+            if handoff.is_some() || manual_abort.is_some() {
                 session.ensure_full_v2_hydration_before_save()?;
             }
             session.ensure_entry_ids();
-            let handoff_snapshot = handoff
-                .map(|_| SessionEditSnapshot::capture(&session))
+            let source_snapshot = (handoff.is_some() || manual_abort.is_some())
+                .then(|| SessionEditSnapshot::capture(&session))
                 .transpose()?;
             let entries = session
                 .entries_for_current_path()
@@ -19518,8 +19646,12 @@ impl AgentSession {
                 // `/compact` and `/shake`; automatic compaction does not run here.
                 compaction::prepare_manual_compaction(&entries, settings)
             };
-            (entries, prep, handoff_snapshot)
+            (entries, prep, source_snapshot)
         };
+
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
 
         if let Some(prep) = preparation {
             on_event(AgentEvent::AutoCompactionStart {
@@ -19569,12 +19701,17 @@ impl AgentSession {
                     return Err(error);
                 }
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
+                let provider_admission = match await_compaction_admission(
+                    abort,
+                    self.provider_admission.acquire(cx.cx()),
+                )
+                .await
+                {
                     Ok(provider_admission) => provider_admission,
                     Err(err) => {
                         on_event(AgentEvent::AutoCompactionEnd {
                             result: None,
-                            aborted: false,
+                            aborted: matches!(err, Error::Aborted),
                             will_retry: false,
                             error_message: Some(err.to_string()),
                         });
@@ -19591,6 +19728,7 @@ impl AgentSession {
                         provider_admission,
                         overflow,
                         None,
+                        source_snapshot.as_ref().zip(manual_abort),
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -19598,7 +19736,7 @@ impl AgentSession {
                     Err(err) => {
                         on_event(AgentEvent::AutoCompactionEnd {
                             result: None,
-                            aborted: false,
+                            aborted: matches!(err, Error::Aborted),
                             will_retry: false,
                             error_message: Some(err.to_string()),
                         });
@@ -19626,18 +19764,21 @@ impl AgentSession {
 
             self.invalidate_background_compaction();
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
-            let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
-                Ok(provider_admission) => provider_admission,
-                Err(err) => {
-                    on_event(AgentEvent::AutoCompactionEnd {
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: Some(err.to_string()),
-                    });
-                    return Err(err);
-                }
-            };
+            let provider_admission =
+                match await_compaction_admission(abort, self.provider_admission.acquire(cx.cx()))
+                    .await
+                {
+                    Ok(provider_admission) => provider_admission,
+                    Err(err) => {
+                        on_event(AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: matches!(err, Error::Aborted),
+                            will_retry: false,
+                            error_message: Some(err.to_string()),
+                        });
+                        return Err(err);
+                    }
+                };
             if let Err(err) = self.provider_admission.ensure_allowed() {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -19662,7 +19803,7 @@ impl AgentSession {
             } else {
                 let compact =
                     compaction::compact(prep, provider, &stream_options, instructions, &privacy);
-                if let Some(abort) = overflow_abort {
+                if let Some(abort) = abort {
                     let cancelled = abort.wait();
                     futures::pin_mut!(compact, cancelled);
                     match futures::future::select(cancelled, compact).await {
@@ -19681,7 +19822,10 @@ impl AgentSession {
                         Arc::clone(&on_event),
                         provider_admission,
                         overflow_abort,
-                        handoff_snapshot.as_ref().zip(abort),
+                        source_snapshot
+                            .as_ref()
+                            .zip(handoff.map(|(_, abort)| abort)),
+                        source_snapshot.as_ref().zip(manual_abort),
                     )
                     .await?;
                 }
@@ -21177,7 +21321,9 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             let input_id = session.append_model_message(user_message.clone());
-            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+            if self.input_source != InputSource::Extension
+                && self.agent.magic_keyword_scan_override.as_deref() != Some("")
+            {
                 crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
             }
             if self.advisor.is_some() && self.input_source != InputSource::Extension {
@@ -21280,7 +21426,9 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             let input_id = session.append_model_message(user_message.clone());
-            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+            if self.input_source != InputSource::Extension
+                && self.agent.magic_keyword_scan_override.as_deref() != Some("")
+            {
                 crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
             }
             if self.advisor.is_some() && self.input_source != InputSource::Extension {
@@ -21577,7 +21725,6 @@ impl AgentSession {
         let admission = self.provider_admission.clone();
         let cost_budget = self.agent.cost_budget().cloned();
         let reset_advisor = self.advisor.is_some();
-        let track_memory_inputs = self.memory_settings.is_some();
         let checkpoint: TurnCheckpoint = Arc::new(
             move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, bool> {
                 let session = Arc::clone(&session);
@@ -21589,8 +21736,7 @@ impl AgentSession {
                         return false;
                     };
                     for (message, authored) in messages {
-                        let memory_input =
-                            track_memory_inputs && authored && matches!(&message, Message::User(_));
+                        let authored_input = authored && matches!(&message, Message::User(_));
                         let reset =
                             reset_advisor && authored && matches!(&message, Message::User(_));
                         let entry_id = session.append_model_message(message);
@@ -21599,14 +21745,16 @@ impl AgentSession {
                         {
                             tracing::warn!(error = %err, "mid-run advisor input reset failed");
                         }
-                        if memory_input
+                        if authored_input
                             && crate::memory::extraction::record_authored_input(
                                 &mut session,
                                 &entry_id,
                             )
                             .is_err()
                         {
-                            tracing::warn!("mid-run memory input provenance could not be recorded");
+                            tracing::warn!(
+                                "mid-run authored input provenance could not be recorded"
+                            );
                         }
                     }
                     if let Some(budget) = &cost_budget
@@ -21678,14 +21826,13 @@ impl AgentSession {
                 let reset_advisor = self.advisor.is_some()
                     && self.agent.is_authored_queue_delivery(message_index)
                     && matches!(&message, Message::User(_));
-                let memory_input = self.memory_settings.is_some()
-                    && self.agent.is_authored_queue_delivery(message_index)
+                let authored_input = self.agent.is_authored_queue_delivery(message_index)
                     && matches!(&message, Message::User(_));
                 let entry_id = session.append_model_message(message);
                 if reset_advisor {
                     append_advisor_input_reset(&mut session, &entry_id)?;
                 }
-                if memory_input {
+                if authored_input {
                     crate::memory::extraction::record_authored_input(&mut session, &entry_id)?;
                 }
             }

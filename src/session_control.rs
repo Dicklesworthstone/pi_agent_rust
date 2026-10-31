@@ -49,6 +49,11 @@ pub enum InputKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputId(uuid::Uuid);
 
+/// An ordered yield point in one turn's mailbox. A stale identity cannot
+/// release a later barrier, even when the same session starts another turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YieldBarrierId(uuid::Uuid);
+
 /// An input which has not been handed to the agent and is safe to reclaim.
 /// Debug output deliberately excludes its potentially private text.
 #[derive(Clone)]
@@ -89,6 +94,17 @@ struct RunData {
     pending: VecDeque<PendingInput>,
     pending_bytes: usize,
     handed_to_agent: u64,
+    yield_barrier: Option<YieldBarrier>,
+    cancelled: bool,
+    completed_successfully: bool,
+}
+
+struct YieldBarrier {
+    id: YieldBarrierId,
+    /// Number of still-unclaimed inputs ahead of the barrier. Corrections
+    /// retain their queue position; only removal from this prefix changes it.
+    preceding_inputs: usize,
+    refused: bool,
 }
 
 struct Run {
@@ -118,6 +134,9 @@ impl Run {
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 handed_to_agent: 0,
+                yield_barrier: None,
+                cancelled: false,
+                completed_successfully: false,
             }),
             abort,
         });
@@ -129,13 +148,25 @@ impl Run {
         if !data.accepting_input {
             return Vec::new();
         }
-        let Some(index) = data.pending.iter().position(|input| input.kind == kind) else {
+        let available = data
+            .yield_barrier
+            .as_ref()
+            .map_or(data.pending.len(), |barrier| barrier.preceding_inputs);
+        let Some(index) = data
+            .pending
+            .iter()
+            .take(available)
+            .position(|input| input.kind == kind)
+        else {
             return Vec::new();
         };
         let Some(input) = data.pending.remove(index) else {
             return Vec::new();
         };
         data.pending_bytes -= input.bytes;
+        if let Some(barrier) = &mut data.yield_barrier {
+            barrier.preceding_inputs -= 1;
+        }
         data.handed_to_agent = data.handed_to_agent.saturating_add(1);
         drop(data);
         // One item per fetch avoids pre-draining a follow-up backlog into the
@@ -147,6 +178,13 @@ impl Run {
             }),
             input.text,
         )]
+    }
+
+    fn yield_ready(&self) -> bool {
+        lock(&self.data)
+            .yield_barrier
+            .as_ref()
+            .is_some_and(|barrier| barrier.preceding_inputs == 0)
     }
 }
 
@@ -186,6 +224,115 @@ impl fmt::Debug for SessionControlHandle {
 }
 
 impl SessionControlHandle {
+    /// Whether an ordered host operation still owns this turn's held input.
+    #[must_use]
+    pub fn has_yield_barrier(&self) -> bool {
+        lock(&self.run.data).yield_barrier.is_some()
+    }
+
+    /// Insert one ordered pause after input already accepted by this turn.
+    /// Existing input retains its lane and runs first; input admitted later
+    /// remains recoverable in the mailbox. The agent finishes its current
+    /// assistant/tool work and the SDK completes its normal persistence before
+    /// returning. This never aborts a tool or submits a synthetic prompt.
+    ///
+    /// The host owns the operation to run after yielding, such as manual
+    /// compaction. Await this turn and inspect its result before performing
+    /// that operation; a ready barrier alone is not a completion receipt.
+    pub fn insert_yield_barrier(&self) -> Result<YieldBarrierId> {
+        let mut data = lock(&self.run.data);
+        if !data.accepting_input || data.finished {
+            return Err(control_error(
+                "SESSION_CONTROL_CLOSED",
+                "this turn no longer accepts input",
+            ));
+        }
+        if data.yield_barrier.is_some() {
+            return Err(control_error(
+                "SESSION_CONTROL_BARRIER",
+                "this turn already has a pending yield barrier",
+            ));
+        }
+        let id = YieldBarrierId(uuid::Uuid::new_v4());
+        data.yield_barrier = Some(YieldBarrier {
+            id,
+            preceding_inputs: data.pending.len(),
+            refused: false,
+        });
+        Ok(id)
+    }
+
+    /// Whether all inputs preceding this barrier have been handed off or
+    /// reclaimed. The currently running provider/tools may still be active.
+    #[must_use]
+    pub fn yield_barrier_ready(&self, id: YieldBarrierId) -> bool {
+        lock(&self.run.data)
+            .yield_barrier
+            .as_ref()
+            .is_some_and(|barrier| barrier.id == id && barrier.preceding_inputs == 0)
+    }
+
+    /// True only after this controlled turn returned a successful, durably
+    /// completed normal stop with the barrier's preceding input drained.
+    /// Abort, failure, a run-time cap, and dropping the future never admit the
+    /// host operation. The host must still check its session/branch identity.
+    #[must_use]
+    pub fn yield_barrier_can_run(&self, id: YieldBarrierId) -> bool {
+        let data = lock(&self.run.data);
+        data.finished
+            && data.completed_successfully
+            && !data.cancelled
+            && data.yield_barrier.as_ref().is_some_and(|barrier| {
+                barrier.id == id && barrier.preceding_inputs == 0 && !barrier.refused
+            })
+    }
+
+    /// Refuse the current host operation without losing its restoration
+    /// boundary or held input. Used when the owning session/branch changed.
+    /// A later, explicitly inserted barrier starts with its own admission.
+    pub(crate) fn invalidate_yield_barrier(&self) {
+        if let Some(barrier) = &mut lock(&self.run.data).yield_barrier {
+            barrier.refused = true;
+        }
+    }
+
+    /// Cancel only this barrier, leaving every queued input in place. If the
+    /// turn is still running, its ordinary input delivery can resume.
+    pub fn remove_yield_barrier(&self, id: YieldBarrierId) -> bool {
+        let mut data = lock(&self.run.data);
+        if data
+            .yield_barrier
+            .as_ref()
+            .is_none_or(|barrier| barrier.id != id)
+        {
+            return false;
+        }
+        data.yield_barrier = None;
+        true
+    }
+
+    /// Reclaim this barrier and all unclaimed inputs atomically. The two
+    /// vectors contain input before and after the host's queued operation,
+    /// preserving admission order and exact native content within each part.
+    /// Useful both after a successful yield and for ordered editor restoration
+    /// after cancellation. A stale identity changes nothing and returns None.
+    pub fn take_pending_at_barrier(
+        &self,
+        id: YieldBarrierId,
+    ) -> Option<(Vec<PendingInput>, Vec<PendingInput>)> {
+        let mut data = lock(&self.run.data);
+        let barrier = data
+            .yield_barrier
+            .as_ref()
+            .filter(|barrier| barrier.id == id)?;
+        let preceding = barrier.preceding_inputs;
+        let before = data.pending.drain(..preceding).collect();
+        let after = data.pending.drain(..).collect();
+        data.pending_bytes = 0;
+        data.yield_barrier = None;
+        Some((before, after))
+    }
+
     /// Queue exact user-authored text for the next steering boundary.
     pub fn steer(&self, text: &str) -> Result<InputId> {
         self.enqueue(InputKind::Steering, text)
@@ -217,6 +364,7 @@ impl SessionControlHandle {
                 return false;
             }
             data.accepting_input = false;
+            data.cancelled = true;
         }
         self.run.abort.abort();
         true
@@ -226,9 +374,11 @@ impl SessionControlHandle {
     /// This is linearized against fetches: an item is either returned here OR
     /// handed to the agent, never both. It may also be used to retract input
     /// while a turn is live. Already handed-off input cannot be retracted.
+    /// Reclaiming all input also invalidates any pending yield barrier.
     pub fn take_pending(&self) -> Vec<PendingInput> {
         let mut data = lock(&self.run.data);
         data.pending_bytes = 0;
+        data.yield_barrier = None;
         data.pending.drain(..).collect()
     }
 
@@ -239,6 +389,11 @@ impl SessionControlHandle {
         let index = data.pending.iter().position(|input| input.id == id)?;
         let input = data.pending.remove(index)?;
         data.pending_bytes -= input.bytes;
+        if let Some(barrier) = &mut data.yield_barrier
+            && index < barrier.preceding_inputs
+        {
+            barrier.preceding_inputs -= 1;
+        }
         drop(data);
         Some(input)
     }
@@ -314,7 +469,15 @@ impl<F: Future<Output = Result<AssistantMessage>>> Future for ControlledTurn<F> 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.polled = true;
-        this.future.as_mut().poll(cx)
+        let result = this.future.as_mut().poll(cx);
+        if let Poll::Ready(completion) = &result {
+            let mut data = lock(&this.control.run.data);
+            data.completed_successfully = !data.cancelled
+                && matches!(completion, Ok(message)
+                    if message.stop_reason == crate::model::StopReason::Stop
+                        && crate::agent::time_cap_marker(message).is_none());
+        }
+        result
     }
 }
 
@@ -408,6 +571,11 @@ impl AgentSessionHandle {
             Some(fetcher(&active, InputKind::Steering)),
             Some(fetcher(&active, InputKind::FollowUp)),
         );
+        let yield_run = Arc::downgrade(&run);
+        self.session_mut().agent.register_scoped_yield_check(
+            &fetcher_lifetime,
+            Arc::new(move || yield_run.upgrade().is_some_and(|run| run.yield_ready())),
+        );
         let guard = TurnGuard {
             active,
             run,
@@ -460,6 +628,14 @@ impl ControllableSession {
                 &fetcher_lifetime,
                 Some(fetcher(&self.active, InputKind::Steering)),
                 Some(fetcher(&self.active, InputKind::FollowUp)),
+            );
+        let yield_run = Arc::downgrade(&run);
+        self.session
+            .session_mut()
+            .agent
+            .register_scoped_yield_check(
+                &fetcher_lifetime,
+                Arc::new(move || yield_run.upgrade().is_some_and(|run| run.yield_ready())),
             );
         Ok((
             TurnGuard {
@@ -719,6 +895,148 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].text, "second");
         assert!(control.run.fetch(InputKind::FollowUp).is_empty());
+    }
+
+    #[test]
+    fn ordered_barrier_holds_later_inputs_and_preserves_corrected_prefix() {
+        let (control, _guard, _) = live();
+        let early_follow_up = control.follow_up("before compaction").unwrap();
+        let early_steer = control.steer("earlier steering").unwrap();
+        let barrier = control.insert_yield_barrier().unwrap();
+        control.follow_up("after compaction").unwrap();
+        let late_steer = control.steer("held steering").unwrap();
+        let correction = control
+            .replace_pending(early_follow_up, "corrected before compaction")
+            .unwrap()
+            .unwrap();
+        assert_ne!(correction, early_follow_up);
+        assert!(!control.yield_barrier_ready(barrier));
+        assert_eq!(control.retract(late_steer).unwrap().text, "held steering");
+        assert!(!control.yield_barrier_ready(barrier));
+        assert_eq!(
+            control.retract(early_steer).unwrap().text,
+            "earlier steering"
+        );
+        assert!(!control.yield_barrier_ready(barrier));
+        assert_eq!(
+            control.run.fetch(InputKind::FollowUp)[0].text_for_display(),
+            Some("corrected before compaction")
+        );
+        assert!(control.yield_barrier_ready(barrier));
+        assert!(!control.yield_barrier_can_run(barrier));
+        assert!(control.run.fetch(InputKind::FollowUp).is_empty());
+        assert!(control.run.fetch(InputKind::Steering).is_empty());
+        let (before, after) = control.take_pending_at_barrier(barrier).unwrap();
+        assert!(before.is_empty());
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "after compaction");
+        assert_eq!(control.snapshot().pending_bytes, 0);
+        assert!(!control.has_yield_barrier());
+    }
+
+    #[test]
+    fn barrier_reclamation_restores_exact_order_and_native_content_after_abort() {
+        let (control, _guard, _) = live();
+        control.follow_up("  before\n ").unwrap();
+        let barrier = control.insert_yield_barrier().unwrap();
+        let content = UserContent::Blocks(vec![
+            crate::model::ContentBlock::Image(crate::model::ImageContent {
+                data: "YQ==".to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+            crate::model::ContentBlock::Text(crate::model::TextContent::new("expanded")),
+        ]);
+        control
+            .follow_up_with_content(&content, "  @image.png explain  ")
+            .unwrap();
+        assert!(control.abort());
+        let (before, after) = control.take_pending_at_barrier(barrier).unwrap();
+        assert_eq!(before[0].text, "  before\n ");
+        assert_eq!(after[0].text, "  @image.png explain  ");
+        assert_eq!(
+            serde_json::to_value(&after[0].content).unwrap(),
+            serde_json::to_value(content).unwrap()
+        );
+        assert!(!control.yield_barrier_can_run(barrier));
+        assert!(control.take_pending_at_barrier(barrier).is_none());
+    }
+
+    #[test]
+    fn stale_barriers_cannot_release_or_claim_a_newer_operation() {
+        let (control, _guard, _) = live();
+        let old = control.insert_yield_barrier().unwrap();
+        assert!(control.insert_yield_barrier().is_err());
+        control.follow_up("held").unwrap();
+        assert!(control.remove_yield_barrier(old));
+        let current = control.insert_yield_barrier().unwrap();
+        assert_ne!(old, current);
+        assert!(!control.remove_yield_barrier(old));
+        assert!(control.take_pending_at_barrier(old).is_none());
+        assert!(control.has_yield_barrier());
+        assert_eq!(control.take_pending()[0].text, "held");
+        assert!(!control.has_yield_barrier());
+        assert!(control.take_pending_at_barrier(current).is_none());
+        assert!(!control.yield_barrier_ready(current));
+    }
+
+    #[test]
+    fn barrier_admission_requires_an_observed_successful_normal_completion() {
+        use crate::model::{ContentBlock, StopReason, TextContent};
+
+        for outcome in [
+            "stop",
+            "error",
+            "aborted",
+            "length",
+            "cap",
+            "failed",
+            "cancelled",
+        ] {
+            let (control, guard, _) = live();
+            let barrier = control.insert_yield_barrier().unwrap();
+            let mut message = AssistantMessage {
+                stop_reason: match outcome {
+                    "error" => StopReason::Error,
+                    "aborted" => StopReason::Aborted,
+                    "length" => StopReason::Length,
+                    _ => StopReason::Stop,
+                },
+                ..AssistantMessage::default()
+            };
+            if outcome == "cap" {
+                message.content = vec![ContentBlock::Text(TextContent::new(
+                    "[time cap reached] time cap reached after 1s (--max-time); stopping at the turn boundary",
+                ))];
+            }
+            if outcome == "cancelled" {
+                assert!(control.abort());
+            }
+            let future = async move {
+                drop(guard);
+                if outcome == "failed" {
+                    Err(Error::session_persistence("fixture save failure"))
+                } else {
+                    Ok(message)
+                }
+            };
+            let turn = ControlledTurn {
+                future: Box::pin(future),
+                control: control.clone(),
+                polled: false,
+            };
+            assert!(!control.yield_barrier_can_run(barrier));
+            let _ = futures::executor::block_on(turn);
+            assert_eq!(control.yield_barrier_can_run(barrier), outcome == "stop");
+            control.invalidate_yield_barrier();
+            assert!(!control.yield_barrier_can_run(barrier));
+            assert!(control.take_pending_at_barrier(barrier).is_some());
+        }
+
+        let (control, guard, _) = live();
+        let barrier = control.insert_yield_barrier().unwrap();
+        drop(guard);
+        assert!(!control.yield_barrier_can_run(barrier));
+        assert!(control.insert_yield_barrier().is_err());
     }
 
     #[test]

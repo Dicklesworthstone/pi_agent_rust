@@ -911,6 +911,7 @@ mod tests {
         SessionEntry::SessionInfo(SessionInfoEntry {
             base: dummy_base(),
             name,
+            source: None,
         })
     }
 

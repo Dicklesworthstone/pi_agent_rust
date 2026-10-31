@@ -157,3 +157,10 @@ When Pi is busy generating a response or running tools, you can still type.
   editor (useful if you queued something by mistake).
 
 The queue is visible above the editor when not empty.
+
+The default UI also accepts `/compact [focus]`, `/compact shake`, and `/shake`
+while working. They wait after earlier queued messages and hold later input
+until the current work is saved and compaction finishes. `Alt+Up` recalls a
+waiting command and its queued text; interrupting active compaction cancels its
+summary request and restores unclaimed text. See [session compaction](session.md#compaction-compact)
+for cancellation and persistence behavior.

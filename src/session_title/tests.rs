@@ -699,7 +699,11 @@ async fn persist_exchange(agent_session: &mut AgentSession, messages: Vec<Messag
     let cx = crate::agent_cx::AgentCx::for_request();
     let mut session = agent_session.session.lock(cx.cx()).await.unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup requires the session lock.
     for message in &messages {
-        session.append_model_message(message.clone());
+        let id = session.append_model_message(message.clone());
+        if matches!(message, Message::User(_)) {
+            crate::memory::extraction::record_authored_input(&mut session, &id)
+                .expect("record fixture operator input"); // ubs:ignore[rust.ownership.unwrap-expect] -- Authored fixture messages need the same durable provenance as actual input.
+        }
     }
     session
         .save()
@@ -707,6 +711,389 @@ async fn persist_exchange(agent_session: &mut AgentSession, messages: Vec<Messag
         .expect("persist completed foreground exchange"); // ubs:ignore[rust.ownership.unwrap-expect] -- A setup save failure must fail the durability test.
     drop(session);
     agent_session.agent.replace_messages(messages);
+}
+
+fn prepare_refresh(
+    client: &TitleClient,
+    owner: &AgentSession,
+    interval: u32,
+) -> Option<PreparedTitleRefresh> {
+    let session = owner.session.try_lock().expect("read idle fixture session"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture preparation must not race a foreground writer.
+    client
+        .prepare_refresh_with_agent(&owner.agent, &session, interval)
+        .expect("screen refresh evidence") // ubs:ignore[rust.ownership.unwrap-expect] -- The fixture evidence is within the privacy budget.
+}
+
+#[test]
+#[allow(clippy::future_not_send)]
+fn refresh_counts_authored_durable_prompts_and_checkpoints_a_fitting_title() {
+    run_async(async {
+        let dir = tempfile::tempdir().unwrap();
+        let session = saved_session(dir.path(), "refresh-fit.jsonl").await;
+        let id = session.header.id.clone();
+        let path = session.path.clone().unwrap();
+        let provider = RecordingProvider::new(vec![Reply::Events(vec![done(r#"{"fits":0.9}"#)])]);
+        let client = client(provider.clone(), None);
+        let mut owner = agent_session(provider.clone(), session, true);
+        persist_exchange(&mut owner, exchange()).await;
+        assert!(
+            save_if_unnamed(&owner, &id, "Fix editor startup", None)
+                .await
+                .unwrap()
+        );
+
+        // Generated user-role nudges are retained in the transcript but have
+        // no authored-input marker and must not advance the refresh interval.
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = owner.session.lock(cx.cx()).await.unwrap();
+        session.append_model_message(user("Generated recovery advice with substantial text"));
+        session.append_model_message(Message::assistant(assistant("Recovery complete")));
+        session.save().await.unwrap();
+        drop(session);
+        assert!(prepare_refresh(&client, &owner, 1).is_none());
+
+        persist_exchange(
+            &mut owner,
+            vec![
+                user("Add regression coverage"),
+                Message::assistant(assistant("Tests added")),
+            ],
+        )
+        .await;
+        assert!(prepare_refresh(&client, &owner, 2).is_none());
+        persist_exchange(
+            &mut owner,
+            vec![
+                user("Verify the cold start"),
+                Message::assistant(assistant("Startup verified")),
+            ],
+        )
+        .await;
+        // The live context contains only the latest exchange. The earlier
+        // authored prompt still counts through the durable branch history.
+        let prepared = prepare_refresh(&client, &owner, 2).expect("two durable operator prompts");
+        let outcome = client
+            .refresh(prepared)
+            .await
+            .expect("valid fit assessment");
+        assert!(outcome.title.is_none());
+        assert!(
+            save_refresh_if_current(&owner, &outcome, None)
+                .await
+                .unwrap()
+        );
+        let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(reopened.get_name().as_deref(), Some("Fix editor startup"));
+        assert_eq!(reopened.name_source(), Some(SessionTitleSource::Auto));
+        owner.session = Arc::new(asupersync::sync::Mutex::new(reopened));
+        assert!(prepare_refresh(&client, &owner, 1).is_none());
+        persist_exchange(
+            &mut owner,
+            vec![
+                user("Check launch configuration"),
+                Message::assistant(assistant("Configuration checked")),
+            ],
+        )
+        .await;
+        persist_exchange(
+            &mut owner,
+            vec![
+                user("continue"),
+                Message::assistant(assistant("Already verified")),
+            ],
+        )
+        .await;
+        assert!(prepare_refresh(&client, &owner, 2).is_none());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn stale_title_refresh_screens_full_fields_before_bounding_both_model_requests() {
+    run_async(async {
+        let dir = tempfile::tempdir().unwrap();
+        let session = saved_session(dir.path(), "refresh-stale.jsonl").await;
+        let id = session.header.id.clone();
+        let provider = RecordingProvider::new(vec![
+            Reply::Events(vec![done(r#"{"fits":0.1}"#)]),
+            Reply::Events(vec![done("Repair account provisioning")]),
+        ]);
+        let settings = crate::secrets::SecretsSettings {
+            mode: Some("obfuscate".to_string()),
+            extra_patterns: Some(vec![r"^ACME-\d{6}$".to_string()]),
+        };
+        let client = client(provider.clone(), Some(&settings));
+        let mut owner = agent_session(provider.clone(), session, true);
+        persist_exchange(&mut owner, exchange()).await;
+        assert!(
+            save_if_unnamed(&owner, &id, "Fix editor startup", None)
+                .await
+                .unwrap()
+        );
+        let secret = "refreshCredentialValue123456";
+        persist_exchange(
+            &mut owner,
+            vec![
+                Message::User(UserMessage {
+                    content: UserContent::Blocks(vec![
+                        ContentBlock::Text(TextContent::new("ACME-123456")),
+                        ContentBlock::Text(TextContent::new(format!(
+                            "Repair account echo {secret}"
+                        ))),
+                        ContentBlock::Image(ImageContent {
+                            data: "PRIVATE-IMAGE".to_string(),
+                            mime_type: "image/png".to_string(),
+                        }),
+                    ]),
+                    timestamp: 0,
+                }),
+                Message::assistant(AssistantMessage {
+                    content: vec![
+                        ContentBlock::Thinking(ThinkingContent {
+                            thinking: "PRIVATE-REASONING".to_string(),
+                            thinking_signature: None,
+                        }),
+                        ContentBlock::Text(TextContent::new(format!(
+                            "{} API_KEY={secret}",
+                            "Account configuration repaired. ".repeat(100),
+                        ))),
+                    ],
+                    ..Default::default()
+                }),
+            ],
+        )
+        .await;
+        let prepared = prepare_refresh(&client, &owner, 1).expect("new operator task");
+        let outcome = client
+            .refresh(prepared)
+            .await
+            .expect("judge and replacement complete");
+        assert_eq!(
+            outcome.title.as_deref(),
+            Some("Repair account provisioning")
+        );
+        assert!(
+            save_refresh_if_current(&owner, &outcome, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            current_name(&owner).await.as_deref(),
+            Some("Repair account provisioning")
+        );
+        assert!(prepare_refresh(&client, &owner, 1).is_none());
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.prompt().contains("echo <pi-secret:redacted>"));
+            assert!(!request.prompt().contains(secret));
+            assert!(!request.prompt().contains("ACME-"));
+            assert!(!request.prompt().contains("PRIVATE-"));
+        }
+        let judgment: serde_json::Value = serde_json::from_str(requests[0].prompt()).unwrap();
+        let evidence_chars: usize = judgment["state"]["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|turn| turn["text"].as_str().unwrap().chars().count())
+            .sum();
+        assert!(evidence_chars <= REFRESH_CONTEXT_CHARS);
+    });
+}
+
+#[test]
+#[allow(clippy::future_not_send)]
+fn title_refresh_cannot_overwrite_manual_names_or_changed_branch_positions() {
+    run_async(async {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, change) in [
+            ("refresh-rename.jsonl", "rename"),
+            ("refresh-branch.jsonl", "branch"),
+            ("refresh-cancel.jsonl", "cancel"),
+        ] {
+            let session = saved_session(dir.path(), file).await;
+            let id = session.header.id.clone();
+            let provider = RecordingProvider::new(Vec::new());
+            let client = client(provider.clone(), None);
+            let mut owner = agent_session(provider.clone(), session, true);
+            persist_exchange(&mut owner, exchange()).await;
+            assert!(
+                save_if_unnamed(&owner, &id, "Original title", None)
+                    .await
+                    .unwrap()
+            );
+            persist_exchange(
+                &mut owner,
+                vec![
+                    user("Implement a different task"),
+                    Message::assistant(assistant("New task complete")),
+                ],
+            )
+            .await;
+            let prepared = prepare_refresh(&client, &owner, 1).expect("eligible generated name");
+            let outcome = TitleRefreshOutcome {
+                target: prepared.target,
+                title: Some("Late generated replacement".to_string()),
+            };
+            let (cancellation, _registration) = AbortHandle::new_pair();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut session = owner.session.lock(cx.cx()).await.unwrap();
+            match change {
+                "rename" => {
+                    session.set_name("Original title");
+                }
+                "branch" => {
+                    assert!(session.navigate_to(&outcome.target.name_entry_id));
+                }
+                _ => cancellation.abort(),
+            }
+            session.save().await.unwrap();
+            drop(session);
+            assert!(
+                !save_refresh_if_current(&owner, &outcome, Some(&cancellation))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                current_name(&owner).await.as_deref(),
+                Some("Original title")
+            );
+            if change == "rename" {
+                assert!(prepare_refresh(&client, &owner, 1).is_none());
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+#[test]
+fn title_refresh_context_keeps_the_latest_user_anchor_within_unicode_budget() {
+    let mut turns = vec![("user", "修复账户".repeat(100))];
+    turns.extend((0..12).map(|_| ("assistant", "检查完成".repeat(250))));
+    let bounded = bounded_recent_turns(turns);
+    assert_eq!(bounded.first().map(|(role, _)| *role), Some("user"));
+    assert!(
+        bounded
+            .iter()
+            .map(|(_, text)| text.chars().count())
+            .sum::<usize>()
+            <= REFRESH_CONTEXT_CHARS
+    );
+}
+
+#[test]
+fn direct_prompt_provenance_is_available_without_memory_and_excludes_generated_input() {
+    run_async(async {
+        let dir = tempfile::tempdir().unwrap();
+        let session = saved_session(dir.path(), "operator-provenance.jsonl").await;
+        let provider = RecordingProvider::new(vec![
+            Reply::Events(vec![done("First task complete")]),
+            Reply::Events(vec![done("Generated continuation complete")]),
+            Reply::Events(vec![done("Structured task complete")]),
+        ]);
+        let mut owner = agent_session(provider, session, true);
+        owner
+            .run_text_with_abort("First operator task".to_string(), None, |_| {})
+            .await
+            .unwrap();
+        owner
+            .agent
+            .set_magic_keyword_scan_override(Some(String::new()));
+        owner
+            .run_text_with_abort("Generated continuation".to_string(), None, |_| {})
+            .await
+            .unwrap();
+        owner
+            .run_with_content(
+                vec![ContentBlock::Text(TextContent::new(
+                    "Structured operator task",
+                ))],
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let session = owner.session.try_lock().unwrap();
+        let marked: Vec<_> = session
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let SessionEntry::Custom(entry) = entry else {
+                    return None;
+                };
+                if entry.custom_type != crate::memory::extraction::INPUT_ENTRY {
+                    return None;
+                }
+                let id = entry.data.as_ref()?.get("messageId")?.as_str()?;
+                let SessionEntry::Message(input) = session.get_entry(id)? else {
+                    return None;
+                };
+                let SessionMessage::User { content, .. } = &input.message else {
+                    return None;
+                };
+                Some(content)
+            })
+            .collect();
+        assert_eq!(marked.len(), 2);
+        assert!(marked.iter().all(|content| substantive_prompt(content)));
+        assert!(!marked.iter().any(|content| {
+            matches!(content, UserContent::Text(text) if text == "Generated continuation")
+        }));
+    });
+}
+
+#[test]
+#[allow(clippy::future_not_send)]
+fn pending_refresh_is_cancelled_when_the_user_keeps_the_same_name() {
+    let runtime = runtime();
+    let handle = runtime.handle();
+    runtime.block_on(Box::pin(async {
+        let dir = tempfile::tempdir().unwrap();
+        let session = saved_session(dir.path(), "refresh-pending.jsonl").await;
+        let id = session.header.id.clone();
+        let (provider, sender, state) = pending_provider();
+        let client = client(provider.clone(), None);
+        let mut owner = agent_session(provider.clone(), session, true);
+        persist_exchange(&mut owner, exchange()).await;
+        assert!(
+            save_if_unnamed(&owner, &id, "Original title", None)
+                .await
+                .unwrap()
+        );
+        persist_exchange(
+            &mut owner,
+            vec![
+                user("Work on a different task"),
+                Message::assistant(assistant("Task complete")),
+            ],
+        )
+        .await;
+        let mut controller = AutoTitleController::default();
+        assert!(
+            controller
+                .tick(&owner, Some(&client), 1, &handle)
+                .await
+                .is_none()
+        );
+        wait_until(|| state.polled.load(Ordering::SeqCst)).await;
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = owner.session.lock(cx.cx()).await.unwrap();
+        session.set_name("Original title");
+        session.save().await.unwrap();
+        drop(session);
+        assert!(
+            controller
+                .tick(&owner, Some(&client), 1, &handle)
+                .await
+                .is_none()
+        );
+        wait_until(|| state.dropped.load(Ordering::SeqCst)).await;
+        assert!(sender.send(done(r#"{"fits":0.1}"#)).is_err());
+        assert_eq!(
+            current_name(&owner).await.as_deref(),
+            Some("Original title")
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }));
 }
 
 async fn current_name(agent_session: &AgentSession) -> Option<String> {
@@ -738,7 +1125,10 @@ async fn wait_for_title(
 ) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(title) = controller.tick(agent_session, Some(client), runtime).await {
+        if let Some(title) = controller
+            .tick(agent_session, Some(client), 0, runtime)
+            .await
+        {
             return title;
         }
         assert!(
@@ -789,7 +1179,7 @@ fn controller_publishes_one_durable_title_and_never_charges_for_later_turns() {
         owner.agent.replace_messages(later);
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- Later turns must not request another title.
@@ -816,7 +1206,7 @@ fn resumed_and_ephemeral_sessions_do_not_start_automatic_title_requests() {
         owner.agent.replace_messages(exchange());
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- Resumed sessions are ineligible for automatic titling.
@@ -827,7 +1217,7 @@ fn resumed_and_ephemeral_sessions_do_not_start_automatic_title_requests() {
         owner.agent.replace_messages(exchange());
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- Ephemeral sessions are ineligible for automatic titling.
@@ -857,7 +1247,7 @@ fn failed_foreground_turn_is_not_named_and_first_success_remains_eligible() {
         .await;
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- A failed foreground turn must not be named.
@@ -896,7 +1286,7 @@ fn a_failed_title_request_is_not_retried_on_subsequent_driver_ticks() {
         persist_exchange(&mut owner, exchange()).await;
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- Starting a pending request cannot publish a title.
@@ -906,7 +1296,7 @@ fn a_failed_title_request_is_not_retried_on_subsequent_driver_ticks() {
         for _ in 0..3 {
             assert!(
                 controller
-                    .tick(&owner, Some(&client), &handle)
+                    .tick(&owner, Some(&client), 0, &handle)
                     .await
                     .is_none()
             ); // ubs:ignore[rust.panic.assert-macros] -- Driver ticks cannot retry a failed optional request.
@@ -933,7 +1323,7 @@ fn a_manual_name_wins_over_an_already_completed_background_suggestion() {
         persist_exchange(&mut owner, exchange()).await;
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
@@ -950,7 +1340,7 @@ fn a_manual_name_wins_over_an_already_completed_background_suggestion() {
         drop(session);
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- An existing manual name must win the race.
@@ -986,7 +1376,7 @@ fn replacing_the_session_retires_the_old_provider_stream_without_naming_either_s
         persist_exchange(&mut owner, exchange()).await;
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
@@ -998,7 +1388,7 @@ fn replacing_the_session_retires_the_old_provider_stream_without_naming_either_s
         owner.agent.clear_messages();
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- A replacement cannot receive the old title.
@@ -1036,7 +1426,7 @@ fn another_persistence_quarantine_discards_a_ready_title_before_publication() {
         persist_exchange(&mut owner, exchange()).await;
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- Starting the pending request cannot publish a title.
@@ -1049,7 +1439,7 @@ fn another_persistence_quarantine_discards_a_ready_title_before_publication() {
             .block("another transition has an indeterminate save".to_string());
         assert!(
             controller
-                .tick(&owner, Some(&client), &handle)
+                .tick(&owner, Some(&client), 0, &handle)
                 .await
                 .is_none()
         ); // ubs:ignore[rust.panic.assert-macros] -- A quarantine must prevent title publication.
