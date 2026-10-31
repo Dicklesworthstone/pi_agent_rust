@@ -941,6 +941,48 @@ impl TextArea {
 
     // ── Editing operations (delegated to Editor) ───────────────────
 
+    /// Replace a byte range at grapheme boundaries as one undoable edit.
+    /// Invalid ranges leave all editor state unchanged. Full-buffer draft
+    /// identity and prior undo history are retained, unlike `set_text`.
+    /// Undo uses the native selection head (the old range end) as its cursor.
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str) -> bool {
+        let rope = self.editor.rope();
+        if range.start > range.end || range.end > rope.len_bytes() {
+            return false;
+        }
+        let nav = CursorNavigator::new(rope);
+        let start = nav.from_byte_index(range.start);
+        let end = nav.from_byte_index(range.end);
+        if nav.to_byte_index(start) != range.start || nav.to_byte_index(end) != range.end {
+            return false;
+        }
+        // Match native insertion sanitization before deciding whether this
+        // is a deletion or an identical replacement.
+        let text: String = text
+            .chars()
+            .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
+            .collect();
+        if range.is_empty() && text.is_empty() {
+            return true;
+        }
+        let existing = rope.slice(rope.byte_to_char(range.start)..rope.byte_to_char(range.end));
+        let unchanged = existing.as_ref() == text.as_str();
+        self.reset_mouse_interaction();
+        if unchanged {
+            self.editor.set_cursor(end);
+        } else {
+            self.editor.set_cursor(start);
+            self.editor.extend_selection_to(end);
+            if text.is_empty() {
+                self.editor.delete_backward();
+            } else {
+                self.editor.insert_text(&text);
+            }
+        }
+        self.ensure_cursor_visible();
+        true
+    }
+
     /// Insert text at cursor.
     pub fn insert_text(&mut self, text: &str) {
         self.editor.insert_text(text);
@@ -3410,6 +3452,203 @@ mod tests {
         ta.set_text("");
         assert_ne!(ta.replacement_generation(), empty);
         assert!(ta.is_empty());
+    }
+
+    #[test]
+    fn range_replacement_preserves_prior_history_and_native_undo_cursor() {
+        let original = "prefix @ol suffix\n尾";
+        let mut ta = TextArea::new().with_text(original);
+        ta.move_to_document_end();
+        ta.insert_text("!");
+        let before = ta.text();
+        let generation = ta.replacement_generation();
+        let groups = ta.undo_group_count();
+        let range = 7..10;
+        let inside = CursorNavigator::new(ta.editor().rope()).from_byte_index(8);
+        ta.set_cursor_position(inside);
+        assert!(ta.replace_range(range.clone(), "@new-file.md"));
+        assert_eq!(ta.text(), "prefix @new-file.md suffix\n尾!");
+        assert_eq!(ta.replacement_generation(), generation);
+        assert_eq!(ta.undo_group_count(), groups + 1);
+        assert!(ta.selection().is_none());
+        assert_eq!(
+            CursorNavigator::new(ta.editor().rope()).to_byte_index(ta.cursor()),
+            range.start + "@new-file.md".len()
+        );
+
+        ta.undo();
+        assert_eq!(ta.text(), before);
+        assert_eq!(ta.undo_group_count(), groups);
+        assert_eq!(
+            CursorNavigator::new(ta.editor().rope()).to_byte_index(ta.cursor()),
+            range.end,
+            "native undo restores the constructed selection head"
+        );
+        ta.undo();
+        assert_eq!(
+            ta.text(),
+            original,
+            "typing before completion remains undoable"
+        );
+        ta.redo();
+        assert_eq!(ta.text(), before);
+        ta.redo();
+        assert_eq!(ta.text(), "prefix @new-file.md suffix\n尾!");
+        assert_eq!(ta.replacement_generation(), generation);
+    }
+
+    #[test]
+    fn range_replacement_repairs_unicode_wrapping_and_mouse_ownership() {
+        let original = "界 e\u{301}\n@old tail\nlast";
+        let mut ta = TextArea::new()
+            .with_text(original)
+            .with_soft_wrap(true)
+            .with_focus(true);
+        let generation = ta.replacement_generation();
+        let _ = viewport_snapshot(&ta, 4, 2);
+        let press = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+        ));
+        assert!(ta.handle_event_at(&press, 0));
+        assert!(ta.mouse_selecting.get());
+        let start = original.find("@old").expect("completion token");
+        assert!(ta.replace_range(start..start + 4, "@alpha\n👩\u{200d}🚀x"));
+        assert_eq!(ta.text(), "界 e\u{301}\n@alpha\n👩\u{200d}🚀x tail\nlast");
+        assert_eq!(ta.cursor(), CursorPosition::new(2, 2, 3));
+        assert_eq!(ta.replacement_generation(), generation);
+        assert!(!ta.mouse_selecting.get());
+        assert!(ta.last_click.get().is_none());
+        assert!(!ta.mouse_area_valid.get());
+        let cursor = ta.cursor();
+        let stale_drag = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Drag(MouseButton::Left),
+            3,
+            0,
+        ));
+        assert!(!ta.handle_event_at(&stale_drag, 10));
+        assert_eq!(ta.cursor(), cursor);
+        assert!(ta.selection().is_none());
+        let (_, displayed) = viewport_snapshot(&ta, 4, 2);
+        assert!(displayed.is_some_and(|(x, y)| x < 4 && y < 2));
+        assert!(ta.scroll_anchor.get() > (0, 0));
+        assert!(ta.visual_line_count(4) > 2);
+        ta.undo();
+        assert_eq!(ta.text(), original);
+        assert!(viewport_snapshot(&ta, 4, 2).1.is_some());
+        ta.redo();
+        assert_eq!(ta.cursor(), cursor);
+        assert!(viewport_snapshot(&ta, 4, 2).1.is_some());
+    }
+
+    #[test]
+    fn range_replacement_rejects_invalid_endpoints_without_mutation() {
+        let mut ta = TextArea::new()
+            .with_text("a界e\u{301}👩\u{200d}🚀z\nnext")
+            .with_focus(true);
+        ta.move_to_document_end();
+        ta.insert_text("1");
+        ta.insert_text("2");
+        ta.undo();
+        let _ = viewport_snapshot(&ta, 6, 2);
+        let press = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            1,
+            1,
+        ));
+        assert!(ta.handle_event_at(&press, 0));
+        let drag = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Drag(MouseButton::Left),
+            3,
+            1,
+        ));
+        assert!(ta.handle_event_at(&drag, 10));
+        let text = ta.text();
+        let cursor = ta.cursor();
+        let selection = ta.selection();
+        let history = (
+            ta.undo_group_count(),
+            ta.undo_op_count(),
+            ta.redo_group_count(),
+        );
+        let generation = ta.replacement_generation();
+        let viewport = (ta.scroll_anchor.get(), ta.scroll_left.get());
+        for range in [
+            Range { start: 4, end: 1 },
+            2..4, // Inside the CJK scalar.
+            4..5, // Between a base character and its combining mark.
+            7..14, // Inside the emoji ZWJ cluster.
+            0..text.len() + 1,
+            text.len() + 1..text.len() + 1,
+        ] {
+            assert!(!ta.replace_range(range, "replacement"));
+            assert_eq!(ta.text(), text);
+            assert_eq!(ta.cursor(), cursor);
+            assert_eq!(ta.selection(), selection);
+            assert_eq!(
+                (
+                    ta.undo_group_count(),
+                    ta.undo_op_count(),
+                    ta.redo_group_count(),
+                ),
+                history
+            );
+            assert_eq!(ta.replacement_generation(), generation);
+            assert_eq!((ta.scroll_anchor.get(), ta.scroll_left.get()), viewport);
+            assert!(ta.mouse_selecting.get());
+            assert!(ta.mouse_area_valid.get());
+        }
+        ta.redo();
+        assert_eq!(ta.text(), format!("{text}2"));
+    }
+
+    #[test]
+    fn range_replacement_handles_deletion_insertion_and_identical_noops() {
+        for replacement in ["", "\u{1b}\u{7}\r"] {
+            let mut ta = TextArea::new().with_text("ab界cd");
+            ta.move_to_document_end();
+            ta.insert_text("!");
+            let generation = ta.replacement_generation();
+            let groups = ta.undo_group_count();
+            assert!(ta.replace_range(2..5, replacement));
+            assert_eq!(ta.text(), "abcd!");
+            assert_eq!(ta.undo_group_count(), groups + 1);
+            assert_eq!(ta.cursor(), CursorPosition::new(0, 2, 2));
+            ta.undo();
+            assert_eq!(ta.text(), "ab界cd!");
+            let history = (ta.undo_group_count(), ta.redo_group_count());
+            ta.select_all();
+            assert!(ta.replace_range(2..5, "界\u{3}"));
+            assert_eq!(ta.text(), "ab界cd!");
+            assert_eq!(ta.cursor(), CursorPosition::new(0, 3, 4));
+            assert!(ta.selection().is_none());
+            assert_eq!((ta.undo_group_count(), ta.redo_group_count()), history);
+            ta.select_all();
+            let cursor = ta.cursor();
+            let selection = ta.selection();
+            assert!(ta.replace_range(0..0, "\u{3}"));
+            assert_eq!(ta.cursor(), cursor);
+            assert_eq!(ta.selection(), selection);
+            ta.redo();
+            assert_eq!(ta.text(), "abcd!");
+            assert_eq!(ta.replacement_generation(), generation);
+        }
+
+        let mut ta = TextArea::new().with_text("ab界cd");
+        let generation = ta.replacement_generation();
+        let insertion = "e\u{301}\n\t";
+        assert!(ta.replace_range(2..2, insertion));
+        assert_eq!(ta.text(), "abe\u{301}\n\t界cd");
+        assert_eq!(
+            CursorNavigator::new(ta.editor().rope()).to_byte_index(ta.cursor()),
+            2 + insertion.len()
+        );
+        ta.undo();
+        assert_eq!(ta.text(), "ab界cd");
+        ta.redo();
+        assert_eq!(ta.text(), "abe\u{301}\n\t界cd");
+        assert_eq!(ta.replacement_generation(), generation);
     }
 
     #[test]

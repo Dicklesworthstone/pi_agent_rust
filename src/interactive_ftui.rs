@@ -2157,6 +2157,8 @@ pub struct PiFtuiModel {
     /// state machine and the [`crate::autocomplete`] provider with the
     /// charmed stack, so both surfaces complete from the same command list.
     autocomplete: AutocompleteState,
+    /// Draft replacement generation used to compute the popup's token range.
+    autocomplete_generation: u64,
     /// Registered commands from the driver's current session. Routing must
     /// consult this catalog before built-ins, not the filtered popup items.
     extension_commands: Vec<crate::autocomplete::NamedEntry>,
@@ -2555,6 +2557,7 @@ impl PiFtuiModel {
                 state.max_visible = DEFAULT_COMPLETION_ROWS;
                 state
             },
+            autocomplete_generation: 0,
             extension_commands: Vec::new(),
             extension_command_registry: None,
             submit_tx: None,
@@ -2806,15 +2809,26 @@ impl PiFtuiModel {
     /// Whether the editor is in plain prompt-composition mode: idle agent,
     /// no card or picker owning the keys. Only then may completion open.
     fn completion_allowed(&self) -> bool {
-        self.state == AgentUiState::Ready
-            && self.active_ask.is_none()
-            && self.active_ext.is_none()
-            && self.picker.is_none()
+        self.state == AgentUiState::Ready && self.image_paste_allowed()
     }
 
     /// Whether the completion popup should capture keys and take rows.
     fn completion_visible(&self) -> bool {
-        self.autocomplete.open && !self.autocomplete.items.is_empty() && self.completion_allowed()
+        self.autocomplete.open
+            && !self.autocomplete.items.is_empty()
+            && self.autocomplete_generation == self.input.replacement_generation()
+            && self.completion_allowed()
+    }
+
+    /// A popup belongs to one ordinary draft. Close before recomputing on a
+    /// replacement: `open_with` otherwise retains a highlighted row when a
+    /// new draft happens to use the same byte range.
+    fn close_stale_autocomplete(&mut self) {
+        let generation = self.input.replacement_generation();
+        if self.autocomplete_generation != generation || !self.completion_allowed() {
+            self.autocomplete.close();
+            self.autocomplete_generation = generation;
+        }
     }
 
     /// Rows the popup reserves above the editor: one per visible suggestion
@@ -2841,8 +2855,8 @@ impl PiFtuiModel {
     /// the draft, as in OMP's editor), so ordinary prose never grows a
     /// dropdown.
     fn maybe_trigger_autocomplete(&mut self) {
+        self.close_stale_autocomplete();
         if !self.completion_allowed() {
-            self.autocomplete.close();
             return;
         }
         let text = self.input.text();
@@ -2873,26 +2887,11 @@ impl PiFtuiModel {
     /// Splice the accepted suggestion over the token it completes and park
     /// the cursor right after it (an `@file` may sit mid-draft).
     fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
-        let text = self.input.text();
-        let range = &self.autocomplete.replace_range;
-        // The range was computed against the text at trigger time; clamp to
-        // char boundaries in case the editor moved on since.
-        let mut start = range.start.min(text.len());
-        while start > 0 && !text.is_char_boundary(start) {
-            start -= 1;
-        }
-        let mut end = range.end.min(text.len()).max(start);
-        while end < text.len() && !text.is_char_boundary(end) {
-            end += 1;
-        }
-        let mut next = String::with_capacity(text.len() + item.insert.len());
-        next.push_str(&text[..start]);
-        next.push_str(&item.insert);
-        next.push_str(&text[end..]);
-        self.input.set_text(&next);
-        let after = ftui::text::CursorNavigator::new(self.input.editor().rope())
-            .from_byte_index(start + item.insert.len());
-        self.input.set_cursor_position(after);
+        // Completion edits one token in the existing draft. A full set_text
+        // discarded earlier undo steps and invalidated pending clipboard work.
+        let _ = self
+            .input
+            .replace_range(self.autocomplete.replace_range.clone(), &item.insert);
     }
 
     /// Keys the open popup owns (issue #208). Returns `true` when the key was
@@ -3615,6 +3614,9 @@ impl PiFtuiModel {
                 ..
             } => {
                 self.dismiss_pending_interactions();
+                if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
+                    self.autocomplete.close();
+                }
                 self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
             }
@@ -3626,6 +3628,9 @@ impl PiFtuiModel {
                 ..
             } => {
                 self.dismiss_pending_interactions();
+                if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
+                    self.autocomplete.close();
+                }
                 self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
                 // The driver re-sends this text next; show it as the turn's
@@ -6890,6 +6895,7 @@ impl Model for PiFtuiModel {
         // Also inspect entry: a synchronous external editor recursively
         // updates after transiently handing ownership to the terminal.
         self.discard_stale_image_pastes();
+        self.close_stale_autocomplete();
         if self.prune_expired_ask_card()
             && matches!(
                 &msg,
@@ -6900,6 +6906,7 @@ impl Model for PiFtuiModel {
             // pre-card draft or a newly promoted extension question.
             self.apply_pending_input_restores();
             self.discard_stale_image_pastes();
+            self.close_stale_autocomplete();
             self.watchdog.finish(LoopPhase::Input, probe);
             return Cmd::none();
         }
@@ -6993,6 +7000,7 @@ impl Model for PiFtuiModel {
         }
         self.apply_pending_input_restores();
         self.discard_stale_image_pastes();
+        self.close_stale_autocomplete();
         // Reset as soon as ownership changes, even if a modal opens and
         // closes without receiving a mouse event between those updates.
         if !self.editor_mouse_active() {
@@ -21877,13 +21885,13 @@ mod tests {
             let (_tx, mut model) = new_model();
             model.input.set_text(draft);
             model.maybe_trigger_autocomplete();
-            let was_open = model.completion_visible();
             model.suspending = true;
             let mut sim = ProgramSimulator::new(model);
             sim.init();
             sim.send(returned_input("current", returned));
             assert_eq!(sim.model().input.text(), draft);
-            assert_eq!(sim.model().completion_visible(), was_open);
+            assert!(!sim.model().completion_visible());
+            assert!(!sim.model().autocomplete.open);
             sim.send(PiFtuiMsg::Resumed);
             let expected = if draft.is_empty() {
                 returned.to_string()
@@ -22862,6 +22870,429 @@ mod tests {
         sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "/help");
         assert_eq!(sim.model().history_cursor, None);
+    }
+
+    #[test]
+    fn tab_completion_is_one_undo_step_and_retains_earlier_edits() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // Separate pastes provide deterministic native undo groups.
+        for text in ["/", "he"] {
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new(text, true)));
+        }
+        let groups = sim.model().input.undo_group_count();
+        let generation = sim.model().input.replacement_generation();
+        assert_eq!(groups, 2);
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/help");
+        assert_eq!(sim.model().input.undo_group_count(), groups + 1);
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "/he");
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "/");
+        sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "/he");
+        sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "/help");
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+    }
+
+    #[test]
+    fn typing_and_completion_keep_an_admitted_image_paste_in_the_same_draft() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/");
+        let request_id = sim.model_mut().begin_image_paste().expect("admitted paste");
+        let generation = sim.model().input.replacement_generation();
+        type_str(&mut sim, "he");
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/help");
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+        assert_eq!(sim.model().pending_image_pastes.len(), 1);
+
+        image_paste_result(&mut sim, request_id, Some("@shot.png"));
+        assert_eq!(sim.model().input.text(), "/help@shot.png ");
+        assert!(sim.model().pending_image_pastes.is_empty());
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "/help");
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "/he");
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+    }
+
+    #[test]
+    fn completion_inside_a_unicode_multiline_draft_preserves_suffix_and_rendered_cursor() {
+        use crate::autocomplete::AutocompleteResponse;
+        use ftui::text::CursorPosition;
+
+        let original = "界e\u{301}\nread @no tail\n終";
+        let completed = "界e\u{301}\nread @资料.md tail\n終";
+        let (_tx, mut model) = new_model();
+        model.input.set_text(original);
+        model.input.set_cursor_position(CursorPosition::new(1, 7, 7));
+        model.autocomplete_generation = model.input.replacement_generation();
+        let start = original.find("@no").expect("file reference");
+        // Supply a stable provider response without waiting for the file index.
+        model.autocomplete.open_with(AutocompleteResponse {
+            replace: start..start + "@no".len(),
+            items: vec![AutocompleteItem {
+                kind: AutocompleteItemKind::File,
+                label: String::from("@资料.md"),
+                insert: String::from("@资料.md"),
+                description: None,
+            }],
+        });
+        let generation = model.input.replacement_generation();
+        let mut sim = ProgramSimulator::new(model.with_alt_screen(true));
+        sim.init();
+        let _ = frame_with_cursor(sim.model(), 10, 12);
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), completed);
+        assert_eq!(sim.model().input.cursor(), CursorPosition::new(1, 11, 13));
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+        assert_eq!(sim.model().input.undo_group_count(), 1);
+        assert!(!sim.model().autocomplete.open);
+
+        for width in [10, 80, 8] {
+            let (rendered, cursor) = frame_with_cursor(sim.model(), width, 12);
+            let (x, y) = cursor.expect("completed draft keeps a visible cursor");
+            assert!(x < width && y < 12, "width {width}: {rendered:?}");
+            if width == 80 {
+                assert_eq!(x, 13, "unwrapped CJK cursor uses display cells");
+            }
+            assert_eq!(sim.model().input.text(), completed);
+            assert_eq!(sim.model().input.cursor(), CursorPosition::new(1, 11, 13));
+        }
+        sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), original);
+        // A native replacement restores the old selection head on undo.
+        assert_eq!(sim.model().input.cursor(), CursorPosition::new(1, 8, 8));
+        sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), completed);
+        assert_eq!(sim.model().input.cursor(), CursorPosition::new(1, 11, 13));
+    }
+
+    #[test]
+    fn identical_draft_replacements_discard_the_previous_completion_highlight() {
+        for replacement in ["agent", "extension", "editor", "history", "direct", "refresh"] {
+            let (_tx, mut model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            model.displayed_session_id = Some(String::from("current"));
+            model.record_history("/he");
+            let mut sim = ProgramSimulator::new(model.with_submit_channel(submit_tx));
+            sim.init();
+            type_str(&mut sim, "/he");
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            assert_eq!(sim.model().autocomplete.selected, Some(0));
+            let generation = sim.model().input.replacement_generation();
+            match replacement {
+                "agent" => sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+                    owner_session_id: String::from("current"),
+                    text: String::from("/he"),
+                })),
+                "extension" => send_ui_effect(
+                    &mut sim,
+                    "set_editor_text",
+                    serde_json::json!({"text": "/he"}),
+                ),
+                "editor" => sim.send(PiFtuiMsg::Edited {
+                    text: Ok(String::from("/he\n")),
+                    width: 80,
+                    height: 24,
+                }),
+                "history" => {
+                    sim.model_mut().history_back();
+                    sim.inject_event(Event::Tick);
+                }
+                _ => {
+                    sim.model_mut().input.set_text("/he");
+                    assert!(!sim.model().completion_visible());
+                    assert_eq!(sim.model().completion_rows(), 0);
+                    if replacement == "refresh" {
+                        sim.model_mut().maybe_trigger_autocomplete();
+                    } else {
+                        sim.inject_event(Event::Tick);
+                    }
+                }
+            }
+            assert_eq!(sim.model().input.text(), "/he", "{replacement}");
+            assert_ne!(sim.model().input.replacement_generation(), generation);
+            assert_eq!(sim.model().autocomplete.selected, None, "{replacement}");
+            let refreshed = matches!(replacement, "extension" | "refresh");
+            assert_eq!(sim.model().completion_visible(), refreshed, "{replacement}");
+            if !refreshed {
+                // Authoritative replacement must not steal history arrows.
+                assert!(!sim.model().autocomplete.open);
+                sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+                assert_eq!(sim.model().history_cursor, Some(0));
+                sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+                assert_eq!(sim.model().history_cursor, None);
+                assert!(!sim.model().autocomplete.open);
+                sim.inject_event(key(KeyCode::End, Modifiers::empty()));
+            }
+            assert!(sim.model().completion_visible());
+            assert_eq!(sim.model().autocomplete.selected, None);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert!(sim.model().input.is_empty());
+            assert_eq!(
+                submit_rx.try_recv().expect("raw prefix submitted"),
+                UiCommand::ExtensionCommand {
+                    name: String::from("he"),
+                    args: String::new(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn completion_owner_roundtrips_do_not_restore_a_highlight_or_capture_history_keys() {
+        for owner in [
+            "login", "ask", "extension", "queued", "picker", "custom", "settings", "suspend",
+            "working", "handoff", "mcp",
+        ] {
+            let (_tx, mut model) = new_model();
+            model.displayed_session_id = Some(String::from("current"));
+            model.record_history("older prompt");
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, "/he");
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            assert_eq!(sim.model().autocomplete.selected, Some(0));
+            match owner {
+                "login" => sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                    provider: Some(String::from("example")),
+                    accepts_empty_input: false,
+                })),
+                "ask" => sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+                    "completion-owner",
+                    vec![question("Continue?", &["yes", "no"], false)],
+                )))),
+                "extension" => sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                    "completion-owner",
+                    "input",
+                    serde_json::json!({"title": "Reply"}),
+                )))),
+                "queued" => sim.model_mut().ext_queue.push_back(ext_request(
+                    "completion-owner",
+                    "input",
+                    serde_json::json!({"title": "Reply"}),
+                )),
+                "picker" => sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+                    fork: false,
+                    messages: vec![(String::from("choice"), String::from("entry"))],
+                })),
+                "custom" => send_ui_effect(
+                    &mut sim,
+                    "setWidget",
+                    serde_json::json!({
+                        "widgetKey": EXT_CUSTOM_OVERLAY_KEY,
+                        "lines": ["custom"],
+                    }),
+                ),
+                "settings" => sim.model_mut().settings_pending = true,
+                "suspend" => sim.model_mut().suspending = true,
+                "working" => sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart)),
+                "handoff" => {
+                    sim.model_mut().begin_busy("handoff ...");
+                    sim.model_mut().busy.as_mut().expect("busy").handoff =
+                        Some(HandoffRequest::new(String::from("current")));
+                }
+                _ => {
+                    sim.model_mut().mcp_auth_request =
+                        Some(McpAuthRequest::new(String::from("current")));
+                }
+            }
+            sim.inject_event(Event::Tick);
+            assert!(!sim.model().autocomplete.open, "{owner}");
+            assert!(!sim.model().completion_visible(), "{owner}");
+            assert_eq!(sim.model().completion_rows(), 0, "{owner}");
+            sim.model_mut().maybe_trigger_autocomplete();
+            assert!(!sim.model().autocomplete.open, "{owner}");
+            match owner {
+                "login" => sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+                    provider: None,
+                    accepts_empty_input: false,
+                })),
+                "ask" | "extension" | "picker" => {
+                    sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                }
+                "queued" => sim.model_mut().ext_queue.clear(),
+                "custom" => send_ui_effect(
+                    &mut sim,
+                    "setWidget",
+                    serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "clear": true}),
+                ),
+                "settings" => sim.model_mut().settings_pending = false,
+                "suspend" => sim.send(PiFtuiMsg::Resumed),
+                "working" => sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+                    usage: None,
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                })),
+                "handoff" => sim.model_mut().busy = None,
+                _ => sim.model_mut().mcp_auth_request = None,
+            }
+            sim.inject_event(Event::Tick);
+            assert!(sim.model().completion_allowed(), "{owner}");
+            assert_eq!(sim.model().input.text(), "/he", "{owner}");
+            assert!(!sim.model().autocomplete.open, "{owner}");
+            assert_eq!(sim.model().autocomplete.selected, None, "{owner}");
+            sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "older prompt", "{owner}");
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "/he", "{owner}");
+            assert!(!sim.model().autocomplete.open, "{owner}");
+        }
+    }
+
+    #[test]
+    fn failed_external_editor_dismisses_completion_without_replacing_the_draft() {
+        let (_tx, model) = new_model();
+        let model = model.with_suspend_task(|| PiFtuiMsg::Edited {
+            text: Err(String::from("external editor failed")),
+            width: 80,
+            height: 24,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/he");
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        let generation = sim.model().input.replacement_generation();
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        assert!(!sim.model().suspending);
+        assert_eq!(sim.model().input.text(), "/he");
+        assert_eq!(sim.model().input.replacement_generation(), generation);
+        assert!(!sim.model().autocomplete.open);
+        assert_eq!(sim.model().autocomplete.selected, None);
+        assert_eq!(
+            sim.model().error_banner.as_deref(),
+            Some("external editor failed")
+        );
+    }
+
+    #[test]
+    fn completion_tracks_session_changes_without_discarding_same_session_replay() {
+        for retry in [false, true] {
+            let (_tx, mut model) = new_model();
+            model.displayed_session_id = Some(String::from("original"));
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, "/he");
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            let generation = sim.model().input.replacement_generation();
+            let reset = |session: &str| {
+                if retry {
+                    PiMsg::RetryCommitted {
+                        session_id: session.to_string(),
+                        messages: Vec::new(),
+                        usage: crate::model::Usage::default(),
+                        status: None,
+                        text: String::from("retried prompt"),
+                    }
+                } else {
+                    PiMsg::ConversationReset {
+                        session_id: session.to_string(),
+                        messages: Vec::new(),
+                        usage: crate::model::Usage::default(),
+                        status: None,
+                    }
+                }
+            };
+            sim.send(PiFtuiMsg::Agent(reset("original")));
+            assert!(sim.model().completion_visible());
+            assert_eq!(sim.model().autocomplete.selected, Some(0));
+            for session in ["replacement", "original"] {
+                sim.send(PiFtuiMsg::Agent(reset(session)));
+                assert_eq!(sim.model().input.text(), "/he");
+                assert_eq!(sim.model().input.replacement_generation(), generation);
+                assert!(!sim.model().autocomplete.open);
+                assert_eq!(sim.model().autocomplete.selected, None);
+            }
+        }
+    }
+
+    #[test]
+    fn completion_acceptance_uses_configured_submit_and_keeps_modified_enter_as_newline() {
+        for modifiers in [Modifiers::SHIFT, Modifiers::CTRL] {
+            let (_tx, model) = new_model();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let bindings = keybindings_from_json(
+                r#"{"submit": ["f6"], "newLine": ["shift+enter", "ctrl+enter"]}"#,
+            );
+            let mut sim = ProgramSimulator::new(
+                model
+                    .with_keybindings(bindings)
+                    .with_submit_channel(submit_tx),
+            );
+            sim.init();
+            type_str(&mut sim, "/he");
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            assert_eq!(sim.model().autocomplete.selected, Some(0));
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "/he", "removed submit default");
+            assert_eq!(sim.model().autocomplete.selected, Some(0));
+            sim.inject_event(key(KeyCode::Enter, modifiers));
+            assert_eq!(sim.model().input.text(), "/he\n");
+            let cursor = sim.model().input.cursor();
+            assert_eq!((cursor.line, cursor.grapheme), (1, 0));
+            assert!(submit_rx.try_recv().is_err());
+
+            sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), "/he");
+            sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+            sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
+            assert_eq!(sim.model().input.text(), "/help");
+            assert!(!sim.model().autocomplete.open);
+            assert!(submit_rx.try_recv().is_err());
+            sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
+            assert!(sim.model().input.is_empty());
+            assert!(
+                sim.model()
+                    .transcript
+                    .iter()
+                    .any(|e| e.text.contains("pi commands"))
+            );
+
+            type_str(&mut sim, "/he");
+            assert_eq!(sim.model().autocomplete.selected, None);
+            sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
+            assert_eq!(
+                submit_rx
+                    .try_recv()
+                    .expect("configured submit without a highlight"),
+                UiCommand::ExtensionCommand {
+                    name: String::from("he"),
+                    args: String::new(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn removed_enter_bindings_do_not_edit_or_accept_an_open_completion() {
+        let (_tx, model) = new_model();
+        let bindings = keybindings_from_json(r#"{"submit": ["f6"], "newLine": ["ctrl+n"]}"#);
+        let mut sim = ProgramSimulator::new(model.with_keybindings(bindings));
+        sim.init();
+        type_str(&mut sim, "/he");
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        let undo = sim.model().input.undo_op_count();
+        for modifiers in [Modifiers::empty(), Modifiers::SHIFT, Modifiers::CTRL] {
+            sim.inject_event(key(KeyCode::Enter, modifiers));
+            assert_eq!(sim.model().input.text(), "/he");
+            assert_eq!(sim.model().input.undo_op_count(), undo);
+            assert_eq!(sim.model().autocomplete.selected, Some(0));
+            assert!(sim.model().completion_visible());
+        }
+        sim.inject_event(key(KeyCode::Char('n'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "/he\n");
+        let cursor = sim.model().input.cursor();
+        assert_eq!((cursor.line, cursor.grapheme), (1, 0));
     }
 
     #[test]
