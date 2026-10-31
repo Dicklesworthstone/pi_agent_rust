@@ -61,6 +61,7 @@ use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use std::collections::{HashMap, VecDeque};
 
+mod console_input;
 mod info_commands;
 mod plan_commands;
 pub mod session_pins;
@@ -96,6 +97,9 @@ pub enum PiFtuiMsg {
         width: u16,
         height: u16,
     },
+    /// Terminal ownership could not be recovered after an editor handoff.
+    /// Exit through normal cleanup instead of polling a cooked console.
+    TerminalFailed(String),
     /// A clipboard image request finished off the loop thread (WSL). Only
     /// the still-live request may insert its result into its owning draft.
     PastedImage {
@@ -463,13 +467,26 @@ fn suspend_terminal_with(
 /// Hand the terminal back in shell-safe cooked state (suspend, external
 /// editor). Undone by [`reacquire_terminal`].
 fn release_terminal(alt_screen: bool) -> std::io::Result<()> {
-    use std::io::{Write, stdout};
+    release_terminal_with(
+        &mut std::io::stdout(),
+        alt_screen,
+        crossterm::terminal::disable_raw_mode,
+        console_input::suspend,
+    )
+}
 
+fn release_terminal_with(
+    out: &mut impl std::io::Write,
+    alt_screen: bool,
+    disable_raw: impl FnOnce() -> std::io::Result<()>,
+    suspend_input: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     // Cooked mode first: the shell (or editor) must own echo/signal handling.
-    // Raw mode is process-global termios state, safe to toggle from a task
-    // thread.
-    crossterm::terminal::disable_raw_mode()?;
-    let mut out = stdout();
+    // Always attempt native restoration too: a partial raw-mode failure must
+    // not leave the editor with the TUI's mouse/QuickEdit policy.
+    let raw = disable_raw();
+    let native = suspend_input();
+    console_input::combine_results(raw, native)?;
     out.write_all(b"\x1b[?2004l")?; // bracketed paste off
     out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
     if alt_screen {
@@ -482,22 +499,38 @@ fn release_terminal(alt_screen: bool) -> std::io::Result<()> {
 /// Take the terminal back after [`release_terminal`]; returns its size so the
 /// caller can feed a full repaint.
 fn reacquire_terminal(alt_screen: bool, mouse: bool) -> std::io::Result<(u16, u16)> {
-    use std::io::{Write, stdout};
+    reacquire_terminal_with(
+        &mut std::io::stdout(),
+        alt_screen,
+        mouse,
+        crossterm::terminal::enable_raw_mode,
+        console_input::resume,
+        crossterm::terminal::size,
+    )
+}
 
-    crossterm::terminal::enable_raw_mode()?;
-    {
-        let mut out = stdout();
-        if alt_screen {
-            out.write_all(b"\x1b[?1049h")?; // re-enter alternate screen
-        }
-        out.write_all(b"\x1b[?2004h")?; // bracketed paste on
-        if mouse {
-            out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
-        }
-        out.write_all(b"\x1b[?25l")?; // hide cursor
-        out.flush()?;
+fn reacquire_terminal_with(
+    out: &mut impl std::io::Write,
+    alt_screen: bool,
+    mouse: bool,
+    enable_raw: impl FnOnce() -> std::io::Result<()>,
+    resume_input: impl FnOnce() -> std::io::Result<()>,
+    size: impl FnOnce() -> std::io::Result<(u16, u16)>,
+) -> std::io::Result<(u16, u16)> {
+    enable_raw()?;
+    // Reapply native mouse/resize flags before any terminal write can block
+    // behind ConHost selection. ANSI reporting cannot change these flags.
+    resume_input()?;
+    if alt_screen {
+        out.write_all(b"\x1b[?1049h")?; // re-enter alternate screen
     }
-    crossterm::terminal::size()
+    out.write_all(b"\x1b[?2004h")?; // bracketed paste on
+    if mouse {
+        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+    }
+    out.write_all(b"\x1b[?25l")?; // hide cursor
+    out.flush()?;
+    size()
 }
 
 /// The editor ctrl+g opens: `$VISUAL`, else `$EDITOR`, else `vi`.
@@ -541,27 +574,75 @@ fn external_editor_task(
     mouse: bool,
 ) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
     move || {
-        // Always answer with `Edited` (errors in `text`): it is the message
-        // that clears `suspending` and repaints, whatever went wrong.
-        let text = release_terminal(alt_screen)
-            .map_err(|err| format!("external editor: {err}"))
-            .and_then(|()| {
-                run_external_editor(&external_editor_command(), &draft)
-                    .map_err(|err| format!("external editor: {err}"))
-            });
-        let (text, (width, height)) = match reacquire_terminal(alt_screen, mouse) {
-            Ok(size) => (text, size),
-            Err(err) => (
-                Err(format!("external editor: terminal not restored: {err}")),
-                crossterm::terminal::size().unwrap_or((80, 24)),
-            ),
-        };
-        PiFtuiMsg::Edited {
+        external_editor_with(
+            &draft,
+            || release_terminal(alt_screen),
+            |draft| run_external_editor(&external_editor_command(), draft),
+            || reacquire_terminal(alt_screen, mouse),
+            preserve_terminal_draft,
+        )
+    }
+}
+
+/// Keep editor errors recoverable, but stop if the terminal cannot be owned
+/// safely again. The saved editor result wins over the original draft when
+/// writing a recovery file; neither is copied into logs or error text.
+fn external_editor_with(
+    draft: &str,
+    release: impl FnOnce() -> std::io::Result<()>,
+    edit: impl FnOnce(&str) -> std::io::Result<String>,
+    reacquire: impl FnOnce() -> std::io::Result<(u16, u16)>,
+    preserve: impl FnOnce(&str) -> std::io::Result<std::path::PathBuf>,
+) -> PiFtuiMsg {
+    let text = release()
+        .and_then(|()| edit(draft))
+        .map_err(|err| format!("external editor: {err}"));
+    match reacquire() {
+        Ok((width, height)) => PiFtuiMsg::Edited {
             text,
             width,
             height,
+        },
+        Err(error) => {
+            let mut detail = format!("external editor: terminal not restored: {error}");
+            if let Err(editor_error) = &text {
+                let _ = write!(detail, "; {editor_error}");
+            }
+            let recovery = text.as_deref().unwrap_or(draft);
+            if !recovery.is_empty() {
+                match preserve(recovery) {
+                    Ok(path) => {
+                        let _ = write!(detail, "; unsent draft saved to {}", path.display());
+                    }
+                    Err(save_error) => {
+                        let _ = write!(detail, "; could not save unsent draft: {save_error}");
+                    }
+                }
+            }
+            PiFtuiMsg::TerminalFailed(detail)
         }
     }
+}
+
+/// A fatal terminal failure destroys the model on exit, so keep the draft in
+/// a securely created tempfile instead of relying on its in-memory contents.
+fn preserve_terminal_draft(draft: &str) -> std::io::Result<std::path::PathBuf> {
+    let file = tempfile::Builder::new()
+        .prefix("pi-ftui-draft-")
+        .suffix(".md")
+        .tempfile()?;
+    persist_terminal_draft(file, draft)
+}
+
+fn persist_terminal_draft(
+    mut file: tempfile::NamedTempFile,
+    draft: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    file.write_all(draft.as_bytes())?;
+    file.flush()?;
+    file.into_temp_path().keep().map_err(|error| error.error)
 }
 
 /// Build the blocking task behind [`AppAction::Suspend`]: park the terminal,
@@ -2101,6 +2182,9 @@ pub struct PiFtuiModel {
     /// input until [`PiFtuiMsg::SuspendFinished`], [`PiFtuiMsg::Resumed`], or
     /// [`PiFtuiMsg::Edited`] reports that the operation has finished.
     suspending: bool,
+    /// The app consumes the model, so terminal handoff failures need a shared
+    /// slot to survive `Cmd::quit` and reach the launcher's exit result.
+    terminal_failure: Arc<Mutex<Option<String>>>,
     /// Test seam replacing the real SIGTSTP task (which would stop or fail
     /// on a headless test host). `None` in production.
     #[cfg(test)]
@@ -2435,6 +2519,7 @@ impl PiFtuiModel {
             alt_screen: false,
             mouse: true,
             suspending: false,
+            terminal_failure: Arc::new(Mutex::new(None)),
             watchdog: LoopWatchdog::new(),
             transcript_revision: 0,
             render_cache: std::cell::RefCell::new(Vec::new()),
@@ -2568,6 +2653,7 @@ impl PiFtuiModel {
         self.turn_control.as_ref().and_then(|slot| {
             slot.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .current
                 .clone()
         })
     }
@@ -5468,6 +5554,14 @@ impl PiFtuiModel {
         }
     }
 
+    /// Stop work that the driver must finish before it can observe the app's
+    /// closed command channel. Quitting the renderer alone does not cancel a
+    /// provider stream, tool call, or independently admitted handoff.
+    fn abort_before_quit(&mut self) {
+        self.abort_handoff();
+        abort_driver_work(self.turn_abort.as_ref(), self.turn_control.as_ref());
+    }
+
     /// The active busy operation's status label, if any.
     fn busy_label(&self) -> Option<&str> {
         self.busy.as_ref().map(|op| op.label.as_str())
@@ -5957,18 +6051,7 @@ impl PiFtuiModel {
                     // Issue #205: cancel the in-flight turn before quitting;
                     // otherwise teardown blocks on the driver joining a full
                     // provider stream plus remaining tool calls.
-                    self.abort_handoff();
-                    if let Some(slot) = &self.turn_abort
-                        && let Some(handle) = slot
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                    {
-                        handle.abort();
-                    }
-                    if let Some(control) = self.live_turn_control() {
-                        control.abort();
-                    }
+                    self.abort_before_quit();
                     return Cmd::quit();
                 }
 
@@ -6790,6 +6873,15 @@ impl PiFtuiModel {
     }
 }
 
+impl Drop for PiFtuiModel {
+    fn drop(&mut self) {
+        // Startup and runtime errors can drop the app without delivering a
+        // model message. The independent handoff lane belongs to this model;
+        // close the driver control lane before its channels disappear too.
+        self.abort_before_quit();
+    }
+}
+
 impl Model for PiFtuiModel {
     type Message = PiFtuiMsg;
 
@@ -6812,9 +6904,10 @@ impl Model for PiFtuiModel {
             return Cmd::none();
         }
         let phase = match &msg {
-            PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage { .. } => {
-                LoopPhase::Input
-            }
+            PiFtuiMsg::Term(_)
+            | PiFtuiMsg::Edited { .. }
+            | PiFtuiMsg::TerminalFailed(_)
+            | PiFtuiMsg::PastedImage { .. } => LoopPhase::Input,
             PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed | PiFtuiMsg::SuspendFinished(_) => {
                 LoopPhase::AgentEvent
             }
@@ -6849,6 +6942,23 @@ impl Model for PiFtuiModel {
                     Err(err) => self.error_banner = Some(err),
                 }
                 cmd
+            }
+            PiFtuiMsg::TerminalFailed(error) => {
+                // Keep input frozen until the runtime releases the terminal.
+                // Returning to its poll loop could block forever in cooked
+                // mode. The launcher surfaces the error after cleanup.
+                self.suspending = true;
+                self.input.reset_mouse_interaction();
+                self.abort_before_quit();
+                self.error_banner = Some(sanitize(&error).into_owned());
+                let mut failure = self
+                    .terminal_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if failure.is_none() {
+                    *failure = Some(error);
+                }
+                Cmd::quit()
             }
             PiFtuiMsg::PastedImage {
                 request_id,
@@ -7807,7 +7917,49 @@ async fn run_btw_command(
 }
 
 /// The driver's running prompt turn's control lane, shared with the UI thread.
-type TurnControlSlot = Arc<Mutex<Option<crate::session_control::SessionControlHandle>>>;
+type TurnControlSlot = Arc<Mutex<TurnControlState>>;
+
+/// Published control plus a permanent shutdown fence for this FTUI runtime.
+/// Closing the app and publishing a startup turn use the same mutex: a turn
+/// admitted just after terminal startup fails must abort before its first poll.
+#[derive(Default)]
+pub struct TurnControlState {
+    current: Option<crate::session_control::SessionControlHandle>,
+    closed: bool,
+}
+
+impl TurnControlState {
+    fn publish(&mut self, control: crate::session_control::SessionControlHandle) {
+        if self.closed {
+            control.abort();
+        } else {
+            self.current = Some(control);
+        }
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        if let Some(control) = self.current.take() {
+            control.abort();
+        }
+    }
+}
+
+fn abort_driver_work(turn_abort: Option<&TurnAbortSlot>, turn_control: Option<&TurnControlSlot>) {
+    if let Some(slot) = turn_abort
+        && let Some(handle) = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    {
+        handle.abort();
+    }
+    if let Some(slot) = turn_control {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close();
+    }
+}
 
 /// Install the per-handle half of the ask bridge: a channel picker surface on
 /// the tool plus a forwarder task that turns cards into `PiMsg::AskUiRequest`.
@@ -8081,13 +8233,15 @@ async fn run_controlled_turn(
         }
     });
     let control = turn.control();
-    *turn_control
+    turn_control
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control.clone());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .publish(control.clone());
     let result = turn.await;
-    *turn_control
+    turn_control
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .current = None;
     let leftover = control
         .take_pending()
         .into_iter()
@@ -10671,6 +10825,29 @@ fn finish_ftui_run(
         .map_err(|_| std::io::Error::other("FTUI agent driver panicked during shutdown"))?
 }
 
+/// Own native console flags for the entire runtime, then surface any fatal
+/// handoff failure after FTUI and the lease have both restored the terminal.
+fn run_ftui_app<A>(
+    app: A,
+    mouse: bool,
+    terminal_failure: &Mutex<Option<String>>,
+    turn_abort: &TurnAbortSlot,
+    turn_control: &TurnControlSlot,
+    run_app: impl FnOnce(A) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let result = console_input::run(app, mouse, run_app);
+    // The app is gone on success and failure alike. An initial prompt may
+    // already be running, or publish its control concurrently with teardown.
+    // Keep this authority outside App and seal publication before joining.
+    abort_driver_work(Some(turn_abort), Some(turn_control));
+    let failure = terminal_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .map_or(Ok(()), |error| Err(std::io::Error::other(error)));
+    console_input::combine_results(failure, result)
+}
+
 fn terminal_replacement_error(
     agent_tx: &Sender<PiMsg>,
     replacement_failure: String,
@@ -10900,7 +11077,7 @@ pub fn run(
     let driver_turn_abort = Arc::clone(&turn_abort);
     // The running prompt turn's control lane: the UI thread steers, queues
     // follow-ups and aborts through it while the driver awaits the turn.
-    let turn_control: TurnControlSlot = Arc::new(Mutex::new(None));
+    let turn_control: TurnControlSlot = Arc::default();
     let driver_turn_control = Arc::clone(&turn_control);
     let command_registry: ExtensionCommandRegistry = Arc::default();
     let driver_command_registry = Arc::clone(&command_registry);
@@ -11665,8 +11842,8 @@ pub fn run(
         .with_keybindings(keybindings_result.bindings)
         .with_submit_channel(submit_tx)
         .with_extension_command_registry(command_registry)
-        .with_turn_abort(turn_abort)
-        .with_turn_control(turn_control)
+        .with_turn_abort(Arc::clone(&turn_abort))
+        .with_turn_control(Arc::clone(&turn_control))
         .with_btw_client(btw_client)
         .with_ask_reply_channel(ask_reply_tx)
         .with_current_ask(current_ask)
@@ -11692,6 +11869,7 @@ pub fn run(
     if let Some(workspace) = workspace {
         model.autocomplete.provider.set_workspace(workspace);
     }
+    let terminal_failure = Arc::clone(&model.terminal_failure);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
     // remains the default.
@@ -11707,11 +11885,24 @@ pub fn run(
     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
     // Mouse capture defaults on; when the user asked for native terminal
     // selection it must stay off, exactly as the classic frontend does.
-    let result = if disable_mouse_capture {
-        app.run()
-    } else {
-        app.with_mouse().run()
-    };
+    // Acquire before FTUI's first output write; restore before log routing,
+    // driver joining, or process restart. Acquisition failure drops the
+    // unrun app too. Retained cancellation authority stops admitted work and
+    // seals late startup turns before the driver join on every exit path.
+    let result = run_ftui_app(
+        app,
+        !disable_mouse_capture,
+        &terminal_failure,
+        &turn_abort,
+        &turn_control,
+        |app| {
+            if disable_mouse_capture {
+                app.run()
+            } else {
+                app.with_mouse().run()
+            }
+        },
+    );
     drop(log_guard);
 
     // The UI (and with it the submit sender) is gone; the driver's next poll
@@ -11893,6 +12084,14 @@ mod tests {
     fn new_model() -> (mpsc::Sender<PiMsg>, PiFtuiModel) {
         let (tx, rx) = mpsc::channel();
         (tx, PiFtuiModel::new(rx))
+    }
+
+    fn published_turn_control(
+        control: crate::session_control::SessionControlHandle,
+    ) -> TurnControlSlot {
+        let slot: TurnControlSlot = Arc::default();
+        slot.lock().unwrap().publish(control);
+        slot
     }
 
     fn keybindings_from_json(config: &str) -> KeyBindings {
@@ -13061,6 +13260,545 @@ mod tests {
                 .as_deref()
                 .is_some_and(|banner| banner.contains("exited with 1"))
         );
+        assert!(
+            !sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Quit)),
+            "an editor failure with a restored terminal stays recoverable"
+        );
+    }
+
+    #[test]
+    fn terminal_handoffs_change_native_modes_before_output() {
+        struct Output<'a>(&'a std::cell::RefCell<Vec<&'static str>>);
+        impl std::io::Write for Output<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().push("output");
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.borrow_mut().push("flush");
+                Ok(())
+            }
+        }
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        release_terminal_with(
+            &mut Output(&calls),
+            true,
+            || {
+                calls.borrow_mut().push("raw-off");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("native-off");
+                Ok(())
+            },
+        )
+        .expect("release");
+        assert_eq!(&calls.borrow()[..3], &["raw-off", "native-off", "output"]);
+        assert_eq!(calls.borrow().last(), Some(&"flush"));
+
+        calls.borrow_mut().clear();
+        let size = reacquire_terminal_with(
+            &mut Output(&calls),
+            true,
+            true,
+            || {
+                calls.borrow_mut().push("raw-on");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("native-on");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("size");
+                Ok((100, 30))
+            },
+        )
+        .expect("reacquire");
+        assert_eq!(size, (100, 30));
+        assert_eq!(&calls.borrow()[..3], &["raw-on", "native-on", "output"]);
+        let calls = calls.borrow();
+        assert_eq!(&calls[calls.len() - 2..], &["flush", "size"]);
+    }
+
+    #[test]
+    fn failed_terminal_modes_do_not_repaint_or_skip_native_release() {
+        for (raw_fails, native_fails) in [(true, false), (false, true), (true, true)] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let mut output = Vec::new();
+            let error = release_terminal_with(
+                &mut output,
+                true,
+                || {
+                    calls.borrow_mut().push("raw-off");
+                    if raw_fails {
+                        Err(std::io::Error::other("raw release failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("native-off");
+                    if native_fails {
+                        Err(std::io::Error::other("native release failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("mode release failure");
+            assert_eq!(calls.borrow().as_slice(), &["raw-off", "native-off"]);
+            assert!(output.is_empty());
+            assert_eq!(error.to_string().contains("raw release failed"), raw_fails);
+            assert_eq!(
+                error.to_string().contains("native release failed"),
+                native_fails
+            );
+        }
+
+        for raw_fails in [false, true] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let mut output = Vec::new();
+            let error = reacquire_terminal_with(
+                &mut output,
+                true,
+                true,
+                || {
+                    calls.borrow_mut().push("raw-on");
+                    if raw_fails {
+                        Err(std::io::Error::other("raw capture failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("native-on");
+                    Err(std::io::Error::other("native capture failed"))
+                },
+                || panic!("failed mode capture must not query size or resume rendering"),
+            )
+            .expect_err("mode capture failure");
+            assert!(output.is_empty());
+            assert_eq!(
+                calls.borrow().as_slice(),
+                if raw_fails {
+                    &["raw-on"][..]
+                } else {
+                    &["raw-on", "native-on"][..]
+                }
+            );
+            assert_eq!(error.to_string().contains("raw capture failed"), raw_fails);
+        }
+    }
+
+    #[test]
+    fn editor_failures_still_reacquire_before_returning_to_the_composer() {
+        for release_fails in [false, true] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let message = external_editor_with(
+                "unsent draft",
+                || {
+                    calls.borrow_mut().push("release");
+                    if release_fails {
+                        Err(std::io::Error::other("release failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    calls.borrow_mut().push("edit");
+                    Err(std::io::Error::other("editor exited with 1"))
+                },
+                || {
+                    calls.borrow_mut().push("reacquire");
+                    Ok((100, 30))
+                },
+                |_| panic!("a recovered terminal does not need a recovery file"),
+            );
+            let PiFtuiMsg::Edited {
+                text,
+                width,
+                height,
+            } = message
+            else {
+                panic!("editor failures remain recoverable after terminal reacquisition");
+            };
+            assert_eq!((width, height), (100, 30));
+            assert!(text.is_err());
+            assert_eq!(
+                calls.borrow().as_slice(),
+                if release_fails {
+                    &["release", "reacquire"][..]
+                } else {
+                    &["release", "edit", "reacquire"][..]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_editor_reacquisition_saves_the_draft_and_stops_polling() {
+        for edit_fails in [false, true] {
+            let saved = std::cell::RefCell::new(None);
+            let message = external_editor_with(
+                "private original draft",
+                || Ok(()),
+                |_| {
+                    if edit_fails {
+                        Err(std::io::Error::other("editor failed"))
+                    } else {
+                        Ok(String::from("private edited draft\n"))
+                    }
+                },
+                || Err(std::io::Error::other("native input capture failed")),
+                |draft| {
+                    *saved.borrow_mut() = Some(draft.to_string());
+                    Ok(std::path::PathBuf::from("recovered.md"))
+                },
+            );
+            assert_eq!(
+                saved.borrow().as_deref(),
+                Some(if edit_fails {
+                    "private original draft"
+                } else {
+                    "private edited draft\n"
+                })
+            );
+            let (_tx, model) = new_model();
+            let failure = Arc::clone(&model.terminal_failure);
+            let mut sim = ProgramSimulator::new(model.with_suspend_task(move || message));
+            sim.init();
+            type_str(&mut sim, "private original draft");
+            sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+            assert_eq!(sim.model().input.text(), "private original draft");
+            assert!(sim.model().suspending, "input remains frozen until exit");
+            assert!(
+                sim.command_log()
+                    .iter()
+                    .any(|record| matches!(record, CmdRecord::Quit))
+            );
+            let failure = failure.lock().unwrap();
+            let error = failure
+                .as_deref()
+                .expect("launcher receives the fatal error");
+            assert!(error.contains("native input capture failed"), "{error}");
+            assert!(error.contains("recovered.md"), "{error}");
+            assert!(!error.contains("private original"), "{error}");
+            assert!(!error.contains("private edited"), "{error}");
+        }
+    }
+
+    #[test]
+    fn failed_draft_recovery_does_not_claim_a_saved_file() {
+        let message = external_editor_with(
+            "private original draft",
+            || Err(std::io::Error::other("release failed")),
+            |_| panic!("an editor cannot start before the terminal was released"),
+            || Err(std::io::Error::other("raw capture failed")),
+            |draft| {
+                assert_eq!(draft, "private original draft");
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            },
+        );
+        let PiFtuiMsg::TerminalFailed(error) = message else {
+            panic!("terminal ownership failure must quit");
+        };
+        assert!(error.contains("release failed"), "{error}");
+        assert!(error.contains("raw capture failed"), "{error}");
+        assert!(error.contains("could not save unsent draft"), "{error}");
+        assert!(!error.contains("draft saved to"), "{error}");
+        assert!(!error.contains("private original"), "{error}");
+    }
+
+    #[test]
+    fn fatal_editor_handoff_aborts_the_live_turn_before_quitting() {
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("ftui-terminal-failure")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        );
+        // Keep the real controlled-turn authority alive without polling the
+        // provider. Dropping the app must signal it before the driver joins.
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let (abort, signal) = crate::agent::AbortHandle::new();
+        let abort_slot = Arc::new(Mutex::new(Some(abort)));
+        let (_tx, model) = new_model();
+        let model = model
+            .with_turn_control(published_turn_control(control.clone()))
+            .with_turn_abort(Arc::clone(&abort_slot))
+            .with_suspend_task(|| {
+                PiFtuiMsg::TerminalFailed(String::from("native input capture failed"))
+            });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        type_str(&mut sim, "unsent draft");
+        assert!(control.snapshot().accepting_input);
+        assert!(!signal.is_aborted());
+
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+
+        assert!(!sim.is_running());
+        assert!(signal.is_aborted(), "shared driver abort fires before quit");
+        assert!(abort_slot.lock().unwrap().is_none());
+        assert!(
+            !control.snapshot().accepting_input,
+            "the controlled turn must not outlive terminal teardown"
+        );
+        assert_eq!(sim.model().input.text(), "unsent draft");
+    }
+
+    #[test]
+    fn fatal_terminal_failure_also_aborts_an_admitted_handoff() {
+        let request = HandoffRequest::new(String::from("current-session"));
+        let signal = request.abort.signal();
+        let (_tx, mut model) = new_model();
+        model.busy = Some(BusyOp {
+            label: String::from("handoff ..."),
+            tick_pending: false,
+            handoff: Some(request),
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::TerminalFailed(String::from(
+            "terminal ownership lost",
+        )));
+        assert!(!sim.is_running());
+        assert!(signal.is_aborted(), "handoff has its own cancellation lane");
+    }
+
+    #[test]
+    fn failed_native_acquisition_aborts_the_unrun_apps_admitted_work() {
+        let mut handle = dequeue_test_session();
+        let turn = handle.prompt_controlled(String::from("initial prompt"), |_| {});
+        let control = turn.control();
+        let controls = published_turn_control(control.clone());
+        let (abort, signal) = crate::agent::AbortHandle::new();
+        let aborts = Arc::new(Mutex::new(Some(abort)));
+        let request = HandoffRequest::new(String::from("current-session"));
+        let handoff_signal = request.abort.signal();
+        let (_agent_tx, model) = new_model();
+        let mut model = model
+            .with_turn_control(Arc::clone(&controls))
+            .with_turn_abort(Arc::clone(&aborts));
+        model.busy = Some(BusyOp {
+            label: String::from("handoff ..."),
+            tick_pending: false,
+            handoff: Some(request),
+        });
+        assert!(control.snapshot().accepting_input);
+        let error = console_input::run_with_lease(
+            ftui::App::fullscreen(model),
+            || Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_app| panic!("the unowned console must never run the app"),
+            |()| panic!("failed acquisition did not create a lease"),
+        )
+        .expect_err("native acquisition must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(signal.is_aborted());
+        assert!(handoff_signal.is_aborted());
+        assert!(!control.snapshot().accepting_input);
+        assert!(controls.lock().unwrap().closed);
+        assert!(aborts.lock().unwrap().is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn runtime_exit_cancels_turns_published_before_or_after_app_teardown() {
+        for runtime_error in [false, true] {
+            for publish_late in [false, true] {
+                let mut handle = dequeue_test_session();
+                // The real control stays alive throughout the check. No
+                // provider is polled or turn dropped to manufacture closure.
+                let turn = handle.prompt_controlled(String::from("initial prompt"), |_| {});
+                let control = turn.control();
+                let controls: TurnControlSlot = Arc::default();
+                let (abort, signal) = crate::agent::AbortHandle::new();
+                let aborts = Arc::new(Mutex::new(Some(abort)));
+                if !publish_late {
+                    controls.lock().unwrap().publish(control.clone());
+                }
+                assert!(control.snapshot().accepting_input);
+                let result = run_ftui_app((), true, &Mutex::new(None), &aborts, &controls, |()| {
+                    if runtime_error {
+                        Err(std::io::Error::other("runtime startup failed"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert_eq!(result.is_err(), runtime_error);
+                assert!(signal.is_aborted());
+                assert!(aborts.lock().unwrap().is_none());
+                assert!(controls.lock().unwrap().closed);
+                if publish_late {
+                    assert!(control.snapshot().accepting_input);
+                    controls.lock().unwrap().publish(control.clone());
+                }
+                assert!(!control.snapshot().accepting_input);
+                assert!(controls.lock().unwrap().current.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn closed_runtime_rejects_a_queued_initial_prompt_before_provider_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(provider.clone());
+            let controls: TurnControlSlot = Arc::default();
+            controls.lock().unwrap().close();
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let mut initial = Some(crate::app::InitialMessage {
+                text: String::from("queued before terminal startup"),
+                attachments: Vec::new(),
+                keyword_scan_source: String::from("queued before terminal startup"),
+            });
+
+            run_initial_prompt(&mut handle, &mut initial, None, &agent_tx, &controls).await;
+
+            assert!(initial.is_none());
+            assert!(provider.calls.lock().unwrap().is_empty());
+            assert!(controls.lock().unwrap().closed);
+            assert!(controls.lock().unwrap().current.is_none());
+            assert!(
+                agent_rx
+                    .try_iter()
+                    .any(|event| matches!(event, PiMsg::UserInputSubmitted { .. })),
+                "the publication fence must work even when the earlier UI send succeeded"
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_recovery_file_survives_its_temporary_owner() {
+        let directory = tempfile::tempdir().expect("recovery directory");
+        let file = tempfile::Builder::new()
+            .prefix("pi-ftui-draft-")
+            .suffix(".md")
+            .tempfile_in(directory.path())
+            .expect("private recovery file");
+        let path =
+            persist_terminal_draft(file, "unsent\nUnicode: λ\n").expect("persist recovery draft");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read after temporary owner was dropped"),
+            "unsent\nUnicode: λ\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn runtime_wrapper_releases_the_app_and_surfaces_terminal_failures() {
+        // Native input acquisition is a no-op here; the actual launch wrapper
+        // still owns the model, drops its channels, and combines both errors.
+        let (submit_tx, submit_rx) = mpsc::channel::<()>();
+        let failure = Mutex::new(None);
+        let error = run_ftui_app(
+            submit_tx,
+            true,
+            &failure,
+            &Arc::default(),
+            &Arc::default(),
+            |app| {
+                *failure.lock().unwrap() = Some(String::from("terminal not restored"));
+                drop(app);
+                Err(std::io::Error::other("runtime cleanup failed"))
+            },
+        )
+        .expect_err("terminal failure cannot become a successful runtime exit");
+        assert!(error.to_string().contains("terminal not restored"));
+        assert!(error.to_string().contains("runtime cleanup failed"));
+        assert!(failure.lock().unwrap().is_none());
+        assert_eq!(submit_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an exclusive real Windows console, not a redirected test runner"]
+    fn runtime_wrapper_acquires_native_input_and_restores_it_on_app_failure() -> std::io::Result<()>
+    {
+        use std::fs::OpenOptions;
+        use winapi_util::{Handle, console};
+
+        struct RestoreShell {
+            input: Handle,
+            mode: u32,
+        }
+        impl Drop for RestoreShell {
+            fn drop(&mut self) {
+                let _ = console::set_mode(&self.input, self.mode | 0x0080);
+                let _ = console::set_mode(&self.input, self.mode);
+            }
+        }
+
+        let input = Handle::from_file(OpenOptions::new().read(true).write(true).open("CONIN$")?);
+        let original = console::mode(&input)?;
+        let shell = RestoreShell {
+            input,
+            mode: original,
+        };
+        let baseline = (original | 0x00c7) & !0x0018;
+        for mouse in [true, false] {
+            console::set_mode(&shell.input, baseline)?;
+            let failure = Mutex::new(None);
+            let result = run_ftui_app(
+                (),
+                mouse,
+                &failure,
+                &Arc::default(),
+                &Arc::default(),
+                |()| {
+                    // Inspect the same launch wrapper production calls, before
+                    // the app starts reading input or writing its first frame.
+                    let mode = console::mode(&shell.input)?;
+                    assert_eq!(mode & 0x0008, 0x0008, "resize events must be enabled");
+                    assert_eq!(mode & 0x0010 != 0, mouse);
+                    assert_eq!(mode & 0x0040 != 0, !mouse);
+                    assert!(console_input::enter(mouse).is_err(), "lease is owned");
+                    crossterm::terminal::enable_raw_mode()?;
+                    Err(std::io::Error::other("app failed after entering raw mode"))
+                },
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("app failed after entering raw mode")
+            );
+            assert_eq!(console::mode(&shell.input)?, baseline);
+        }
+        Ok(())
     }
 
     /// A user who bound ctrl+g to an editing action keeps it: the default
@@ -14435,7 +15173,7 @@ mod tests {
         );
         let turn = handle.prompt_controlled(String::from("start"), |_| {});
         let control = turn.control();
-        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+        let slot = published_turn_control(control.clone());
         let (_agent_tx, rx) = mpsc::channel();
         let model = PiFtuiModel::new(rx)
             .with_turn_control(slot)
@@ -14497,7 +15235,7 @@ mod tests {
         // turn is dropped, exactly as while a real turn streams.
         let turn = handle.prompt_controlled(String::from("start"), |_| {});
         let control = turn.control();
-        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+        let slot = published_turn_control(control.clone());
 
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
@@ -14613,7 +15351,7 @@ mod tests {
             control
                 .follow_up("follow\nsecond")
                 .expect("queue follow-up");
-            let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+            let slot = published_turn_control(control.clone());
             let (_tx, model) = new_model();
             let model = model
                 .with_turn_control(slot)
@@ -14671,7 +15409,7 @@ mod tests {
         control
             .follow_up("queued\nmessage")
             .expect("queue follow-up");
-        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+        let slot = published_turn_control(control.clone());
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model.with_turn_control(slot));
         sim.init();
@@ -15996,7 +16734,7 @@ mod tests {
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
         // An empty turn-control slot: the launch path always installs one,
         // and between turns (or while one starts) it holds no live lane.
-        let slot: TurnControlSlot = Arc::new(Mutex::new(None));
+        let slot: TurnControlSlot = Arc::default();
         let mut sim = ProgramSimulator::new(
             PiFtuiModel::new(rx)
                 .with_submit_channel(submit_tx)
@@ -20255,7 +20993,7 @@ mod tests {
     /// spawn an unseeded auxiliary request while the Agent is borrowed.
     #[test]
     fn slash_btw_mid_turn_waits_for_live_privacy_projection() {
-        let slot: TurnControlSlot = Arc::new(Mutex::new(None));
+        let slot: TurnControlSlot = Arc::default();
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
         let mut model = PiFtuiModel::new(rx)
@@ -22783,7 +23521,7 @@ mod tests {
                     session,
                     crate::sdk::EventListeners::default(),
                 );
-                let control: TurnControlSlot = Arc::new(Mutex::new(None));
+                let control: TurnControlSlot = Arc::default();
                 let (tx, rx) = mpsc::channel();
                 send_conversation_reset(&handle, &tx, "cap regression").await;
 
@@ -22799,6 +23537,7 @@ mod tests {
                         let current = published_control // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Fixture control must be published before AgentStart.
                             .lock()
                             .expect("control lock")
+                            .current
                             .clone()
                             .expect("active control");
                         current // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture queue admission must succeed.
@@ -22856,7 +23595,7 @@ mod tests {
                 );
                 assert!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    control.lock().expect("control lock").is_none() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
+                    control.lock().expect("control lock").current.is_none() // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- Poisoned fixture state must fail.
                 );
 
                 let events = rx.try_iter().collect::<Vec<_>>();
@@ -23131,7 +23870,7 @@ mod tests {
                 .with_session(|session| session.header.id.clone())
                 .await
                 .expect("session identity");
-            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let control: TurnControlSlot = Arc::default();
             let (agent_tx, agent_rx) = mpsc::channel();
             run_typed_prompt(
                 &mut handle,
@@ -23209,7 +23948,7 @@ mod tests {
         runtime.block_on(async {
             let provider = Arc::new(NativePromptProbe::default());
             let mut handle = native_prompt_handle(provider.clone());
-            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let control: TurnControlSlot = Arc::default();
             let (tx, rx) = mpsc::channel();
             for prompt in ["/triage @ultrathink.txt orchestrate", "ultrathink"] {
                 run_typed_prompt(
@@ -23321,13 +24060,13 @@ mod tests {
         runtime.block_on(async {
             let provider = Arc::new(NativePromptProbe::default());
             let mut handle = native_prompt_handle(provider.clone());
-            let control: TurnControlSlot = Arc::new(Mutex::new(None));
+            let control: TurnControlSlot = Arc::default();
             let (tx, rx) = mpsc::channel();
             send_conversation_reset(&handle, &tx, "startup").await;
             run_initial_prompt(&mut handle, &mut pending, Some(&resources), &tx, &control).await;
             run_initial_prompt(&mut handle, &mut pending, Some(&resources), &tx, &control).await;
             assert!(pending.is_none());
-            assert!(control.lock().unwrap().is_none());
+            assert!(control.lock().unwrap().current.is_none());
             let calls = provider.calls.lock().unwrap();
             assert_eq!(
                 calls.len(),
@@ -23422,7 +24161,7 @@ mod tests {
             ] {
                 let provider = Arc::new(NativePromptProbe::default());
                 let mut handle = native_prompt_handle(provider.clone());
-                let control: TurnControlSlot = Arc::new(Mutex::new(None));
+                let control: TurnControlSlot = Arc::default();
                 let (tx, rx) = mpsc::channel();
                 let (text, attachments) = match &content {
                     UserContent::Text(text) => (text.clone(), Vec::new()),
@@ -23436,7 +24175,7 @@ mod tests {
                 };
                 run_prompt_turn(&mut handle, text, attachments, &tx, &control).await;
                 run_retry_turn(&mut handle, &tx, &control).await;
-                assert!(control.lock().unwrap().is_none());
+                assert!(control.lock().unwrap().current.is_none());
                 let calls = provider.calls.lock().unwrap();
                 assert_eq!(calls.len(), 2, "retry must start a real second turn");
                 let expected = serde_json::to_value(&content).unwrap();

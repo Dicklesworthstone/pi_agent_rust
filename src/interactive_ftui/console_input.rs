@@ -85,7 +85,7 @@ pub fn run<A>(app: A, mouse: bool, run_app: impl FnOnce(A) -> io::Result<()>) ->
 
 /// This is also the fault-injection seam for the lifecycle regressions. The
 /// public entry point above and tests execute exactly the same ordering.
-fn run_with_lease<A, G>(
+pub(super) fn run_with_lease<A, G>(
     app: A,
     acquire: impl FnOnce() -> io::Result<G>,
     run_app: impl FnOnce(A) -> io::Result<()>,

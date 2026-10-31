@@ -2,27 +2,35 @@
 
 ## Status
 
-This is diagnostic/regression groundwork, **not a verified fix for abaynp's
-report**. `console_input.rs` is currently used by the probe and tests only;
-production integration in `src/interactive_ftui.rs` remains pending. Do not
-close #239 on the basis of this change. The authoring environment had neither
-DSR nor Rust: `dsr quality --tool pi_agent_rust` returned command-not-found
-(exit 127). No Rust, Windows, or real-ConHost test result is claimed.
+Production FTUI now acquires the native console-input lease from
+`console_input.rs`, releases it for the external editor, and restores the
+original input mode during shutdown. This closes the previously unwired
+native mouse/resize input path. It is **not a verified fix for abaynp's
+report**: do not close #239 on the basis of this change.
 
-The source reviewed was pi commit `c7a2c90887ff8ed7281a064b31ac6570128f24ff`,
-whose lockfile selects FTUI 0.7.0 and Crossterm 0.29.0.
+DSR remains unavailable in the authoring environment:
+`dsr quality --tool pi_agent_rust` returned command-not-found (exit 127).
+No compiler, test, Windows, or real-ConHost execution result is claimed.
+
+The initial investigation reviewed pi commit
+`c7a2c90887ff8ed7281a064b31ac6570128f24ff`, which used FTUI 0.7.0. The
+production integration was reviewed against `26142ee` and its locked FTUI
+0.9.0 and Crossterm 0.29.0 sources. The published FTUI crate checksums were
+verified against `Cargo.lock`; the native input-mode gap still exists there.
 
 ## Concrete gap, not yet a reproduced trigger
 
-Pi's `release_terminal`/`reacquire_terminal` change raw mode and emit ANSI mouse
-sequences. FTUI's terminal session similarly writes ANSI mouse sequences.
-Crossterm's Windows raw-mode implementation clears only line, echo and
-processed-input bits. It does not clear QuickEdit or establish native mouse
-and resize input flags. By contrast, Crossterm's native `EnableMouseCapture`
-implementation clears QuickEdit and sets mouse, window and extended flags.
+Before this integration, Pi's `release_terminal`/`reacquire_terminal` changed
+raw mode and emitted ANSI mouse sequences. FTUI's terminal session similarly
+writes ANSI mouse sequences. Crossterm's Windows raw-mode implementation clears
+only line, echo and processed-input bits. It does not clear QuickEdit or
+establish native mouse and resize input flags. By contrast, Crossterm's native
+`EnableMouseCapture` implementation clears QuickEdit and sets mouse, window
+and extended flags. Production now owns those native input flags explicitly
+through the scoped lease.
 
-This leaves a concrete ConHost selection/input-mode difference worth testing.
-It does not establish that selection caused the reported blank screen or that
+This establishes a concrete ConHost selection/input-mode difference, but it
+does not establish that selection caused the reported blank screen or that
 all ConHost stalls have the same cause. Another diagnostic discriminator is
 `ENABLE_PROCESSED_INPUT`: when it is enabled, Windows handles Ctrl+C instead of
 placing it in the input buffer. A live UI with cooked/processed input would
@@ -31,16 +39,18 @@ point toward a failed terminal reacquisition rather than a normal keybinding.
 Relevant primary sources:
 
 - [Windows SetConsoleMode](https://learn.microsoft.com/en-us/windows/console/setconsolemode)
-- [Crossterm upstream Windows terminal modes](https://github.com/crossterm-rs/crossterm/blob/master/src/terminal/sys/windows.rs)
-- [Crossterm upstream native mouse capture](https://github.com/crossterm-rs/crossterm/blob/master/src/event/sys/windows.rs)
-- [FTUI 0.7.0 terminal lifecycle](https://github.com/Dicklesworthstone/frankentui/blob/v0.7.0/crates/ftui-core/src/terminal_session.rs)
+- [Crossterm 0.29.0 Windows terminal modes](https://docs.rs/crate/crossterm/0.29.0/source/src/terminal/sys/windows.rs)
+- [Crossterm 0.29.0 native mouse capture](https://docs.rs/crate/crossterm/0.29.0/source/src/event/sys/windows.rs)
+- [FTUI 0.9.0 terminal lifecycle](https://docs.rs/crate/ftui-core/0.9.0/source/src/terminal_session.rs)
 
 The current Pi handler already filters releases, gates SIGTSTP suspension to
 Unix, and runs the external editor synchronously on the event-loop thread.
-Those facts rule out simply reapplying the duplicate-key or asynchronous-editor
-fixes as an explanation. The in-model watchdog measures completed callbacks;
-it cannot, by itself, report a callback that never returns or a runtime I/O
-operation outside a callback that stops progress.
+FTUI 0.9.0 also checks Windows input readiness immediately before reading,
+and Pi's frame budget avoids dropping every slow frame before presentation.
+These existing protections were not reapplied as an explanation for #239.
+The in-model watchdog measures completed callbacks; it cannot, by itself,
+report a callback that never returns or a runtime I/O operation outside a
+callback that stops progress.
 
 ## Probe
 
@@ -63,10 +73,11 @@ A separate observer writes and flushes JSONL every 500 ms. The model requests
 FTUI timer ticks every 250 ms. The observer never calls poll/read on terminal
 input and never writes to stdout/stderr. Records contain counters, mode bits,
 callback age and phase, not key values, typed text, prompts or credentials.
-Existing trace files are never overwritten. The native-input flag applies the
-candidate scoped mode lease in the probe only and is rejected on non-Windows
-hosts. A trace-write failure asks the model to quit on its next timer tick;
-the observer's I/O error is then returned instead of silently losing evidence.
+Existing trace files are never overwritten. The native-input flag enables
+the same scoped mode lease used by production and is rejected on non-Windows
+hosts; the baseline intentionally leaves native input modes alone. A
+trace-write failure asks the model to quit on its next timer tick; the
+observer's I/O error is then returned instead of silently losing evidence.
 
 Interpretation requires the accompanying reproduction observations:
 
@@ -84,7 +95,7 @@ Interpretation requires the accompanying reproduction observations:
 - View counts mean model rendering completed, not that terminal output was
   flushed. A stopped observer or a mode-query error is not a passing result.
 
-## Candidate lease and tests
+## Native lease and tests
 
 `src/interactive_ftui/console_input.rs` opens `CONIN$` with read/write access,
 uses the existing safe `winapi-util` dependency, preserves one original mode
@@ -99,22 +110,47 @@ mode semantics, cover all 1,024 low-bit combinations, verify preservation of
 unowned bits, and check that repeated editor mode changes do not overwrite the
 original baseline. They do not simulate a real ConHost selection stall.
 
-The native test checks actual Get/SetConsoleMode transitions and raw-mode
-handoffs, with outer cleanup even on assertion failure. It must be selected in
-a DSR Windows lane with exclusive console access, not unignored on a redirected
-or parallel test runner. Compilation, formatting, FTUI regressions and the
-native comparison are still unverified. Use DSR, not Cargo or GitHub Actions as
-an alternate quality route.
+The production module now also compiles those portable lease tests. Additional
+in-module regressions cover raw/native/output ordering, failed reacquisition,
+recovery-file persistence, fatal-error propagation, and cancellation of active
+turns and handoffs before quitting. Startup regressions also keep real controlled
+turns alive across failed lease acquisition and runtime exit, cover publication
+on either side of shutdown, and verify that a queued initial prompt cannot reach
+the provider after the runtime closes. A second explicitly ignored real-console
+test calls the production runtime wrapper, checks mouse/resize modes for both
+capture settings, and verifies restoration after an app failure.
 
-## Pending production wiring
+Native tests require a DSR Windows lane with exclusive console access; they
+must not be unignored on a redirected or parallel test runner. Compiler/test
+validation and the native comparison remain outstanding. Use DSR, not Cargo
+or GitHub Actions as an alternate quality route.
 
-Declare `mod console_input` in `interactive_ftui.rs`. Acquire its lease after
-the log redirect guard and before `App::run`; always finish it before dropping
-the log guard, joining the driver, or calling `/restart`. If acquisition fails,
-explicitly drop the unrun App before joining the driver: the model otherwise
-retains the submit sender and the driver can wait forever for disconnection.
-Call `suspend()` after disabling raw mode in `release_terminal`, and `resume()`
-after enabling raw mode but before output in `reacquire_terminal`. Keep native
-restoration errors separate from editor errors when investigating a cooked-input
-stall. Do not treat the pending wiring as evidence that the original report is
-resolved.
+## Production lifecycle
+
+`interactive_ftui.rs` declares `mod console_input`. Its runtime wrapper acquires
+the lease after the log redirect guard and before `App::run`, and finishes it
+before dropping the log guard, joining the driver, or calling `/restart`.
+Acquisition failure explicitly drops the unrun App before returning. Model
+teardown aborts its admitted handoff and driver work. The runtime also retains
+cancellation authority outside App and closes the control lane on every exit,
+including success: a mutex-protected shutdown fence aborts any initial turn
+published concurrently with teardown before that turn reaches its first poll.
+The driver's join therefore does not rely on a channel disconnect alone while
+an initial prompt is already running.
+
+`release_terminal` calls native `suspend()` after disabling raw mode, including
+when raw-mode release fails. `reacquire_terminal` calls native `resume()` after
+enabling raw mode and before output. An ordinary editor failure with a restored
+terminal stays recoverable in the composer. Failed terminal reacquisition saves
+the edited result, or the original draft when editing failed, in a securely
+created recovery file that survives temporary ownership. Errors report only
+the recovery path, and only after persistence succeeds; save failures are
+reported explicitly without exposing draft text.
+
+A fatal reacquisition failure cancels the admitted handoff, shared driver
+abort handle, and live controlled turn before requesting normal runtime quit.
+The driver can then finish cancellation and observe its closed command channel
+instead of waiting for the provider or tools to finish naturally. The terminal
+failure reaches the final exit result after cleanup, without resuming input
+polling on a potentially cooked console. These lifecycle changes are not
+evidence that the original #239 report has been reproduced or resolved.
