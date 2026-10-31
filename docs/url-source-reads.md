@@ -2,20 +2,44 @@
 
 ## Local documents and bounded output
 
-The same `read` tool also renders local `.ipynb` notebooks and PDFs. Notebook
-reads show saved cells, results, and tracebacks without starting a kernel. PDF
-extraction requires the existing `url-pdf` build feature. Local HTML continues
-to return its source so it remains suitable for code inspection and editing.
+The same `read` tool reads local `.ipynb` notebooks and PDFs. Local, SSH and
+editor-owned notebooks default to editable cell source, with markers such as
+`# %% [code] cell:0`, `# %% [markdown] cell:1`, and `# %% [raw] cell:2`.
+Notebook reads never start a kernel. PDF extraction requires the existing
+`url-pdf` build feature. Local HTML continues to return its source.
 
 ```json
 {"path":"analysis.ipynb"}
-{"path":"analysis.ipynb","offset":20,"limit":40}
+{"path":"analysis.ipynb","offset":20,"limit":40,"hashline":true}
+{"path":"analysis.ipynb","rendered":true}
 {"path":"analysis.ipynb","raw":true,"hashline":true}
 ```
 
-Rendered line numbers belong to the document view. They cannot be used as
-`hashline_edit` anchors: a converted local read with `hashline=true` returns an
-actionable error. Use `raw=true` to obtain the original notebook JSON for edits.
+The default notebook view supports ordinary `edit` replacements and
+`hashline_edit` anchors. Both tools apply the edit to that same cell view and
+serialize the result back to notebook JSON. `cell:N` references the original
+zero-based cell position; moving a marker moves that cell with its ID, metadata,
+attachments and saved results. A marker without an index, an out-of-range index,
+or a repeated index creates a fresh cell with its own ID and empty metadata.
+Omitting a cell removes it. Literal marker-shaped source lines are escaped with
+one extra `%`, including already escaped lines, so they survive round trips.
+
+Notebook-level metadata and unrelated fields are retained. Unchanged cell
+source retains its string/array representation and line endings. Changed code
+keeps saved outputs and execution counts: those results may be stale, because
+editing does not execute the notebook. Changing a code cell to Markdown or raw
+text removes its code-only outputs and execution count. Malformed JSON, cell
+source, markers, or oversized results fail before a write. The existing native
+atomic save, concurrent-change checks and undo capture operate on the original
+JSON bytes.
+
+Use `rendered=true` to see saved cells, outputs and tracebacks as a document.
+These rendered lines cannot be used as edit anchors; combining this view with
+`hashline=true` returns an actionable error. HTTP(S) notebook reads retain this
+saved-output view. Use `raw=true` to obtain the original notebook JSON; pass
+`raw=true` to `edit` or `hashline_edit` as well when editing those raw JSON lines.
+The standalone `write` tool still writes literal file content, so a complete
+notebook write must contain JSON rather than cell markers.
 `raw=true` also bypasses URL conversion and GitHub source rewriting, like the
 existing URL `:raw` suffix.
 
@@ -87,7 +111,8 @@ remain unverified. No dependencies, Actions or quality gates are changed.
 
 ## Saved notebook results
 
-Notebook reads now include saved stdout/stderr, execution counts, exception
+HTTP(S) notebook reads and local `read` calls with `rendered=true` include saved
+stdout/stderr, execution counts, exception
 names/messages/traceback frames, and one textual representation of each saved
 display or result. This is a view of existing evidence, not execution, validation
 of the original computation, or a new kernel session. It is wired into the same

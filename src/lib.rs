@@ -257,6 +257,7 @@ pub mod model_routing;
 pub mod model_selector;
 #[doc(hidden)]
 pub mod models;
+pub(crate) mod notebook;
 #[doc(hidden)]
 pub mod overlay_system;
 #[doc(hidden)]

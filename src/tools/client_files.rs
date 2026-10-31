@@ -59,13 +59,7 @@ fn bounded_text(content: String, tool: &'static str) -> Result<String> {
 }
 
 fn text_read_candidate(input: &ReadInput, path: &Path) -> bool {
-    if !input.raw
-        && (crate::document_read::recognize(&path.to_string_lossy(), "").is_some()
-            || path
-                .extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")))
-    {
+    if !input.raw && crate::document_read::recognize(&path.to_string_lossy(), "").is_some() {
         return false;
     }
     !matches!(
@@ -123,8 +117,21 @@ impl ReadTool {
         if !client.can_read() || !text_read_candidate(input, path) {
             return Ok(None);
         }
-        let content = bounded_text(client.read_text_file(path).await?, "read")?;
-        let content = normalize_to_lf(&content);
+        let source = bounded_text(client.read_text_file(path).await?, "read")?;
+        if !input.raw && crate::notebook::is_notebook_path(path) {
+            let display_path = path.to_string_lossy().into_owned();
+            let request = input.clone();
+            return asupersync::runtime::spawn_blocking(move || {
+                notebook_source_read_output(
+                    &request,
+                    source.as_bytes(),
+                    serde_json::json!({"source": "editor", "path": display_path}),
+                )
+            })
+            .await
+            .map(Some);
+        }
+        let content = normalize_to_lf(&source);
         // Ask for the complete buffer and apply the native window exactly once.
         // Never key an editor buffer's cache entry on stale disk metadata.
         let total = content.lines().count();
@@ -256,6 +263,7 @@ fn mutation_output(
     before: Option<&str>,
     requested: &str,
     written: ClientWrite,
+    notebook_edit: bool,
 ) -> ToolOutput {
     let mut details = serde_json::json!({"destination":if written.editor {"editor"} else {"disk"},
         "verified":written.verified.is_some()});
@@ -270,13 +278,37 @@ fn mutation_output(
             details["editorTransformed"] = serde_json::json!(true);
         }
         if let Some(before) = before {
-            let (diff, first) = generate_diff_string(
-                &normalize_to_lf(strip_bom(before).0),
-                &normalize_to_lf(strip_bom(actual).0),
-            );
-            details["diff"] = serde_json::json!(diff);
-            if let Some(first) = first {
-                details["firstChangedLine"] = serde_json::json!(first);
+            // A notebook diff uses the same cell-source view as read. Compare
+            // raw bytes above for editor transformations and keep persistence
+            // tied to the complete JSON, including hidden outputs/metadata.
+            let views = if notebook_edit {
+                crate::notebook::Notebook::parse(before, display_path)
+                    .and_then(|notebook| notebook.editable_text())
+                    .and_then(|before| {
+                        crate::notebook::Notebook::parse(actual, display_path)
+                            .and_then(|notebook| notebook.editable_text())
+                            .map(|after| (before, after))
+                    })
+            } else {
+                Ok((
+                    normalize_to_lf(strip_bom(before).0),
+                    normalize_to_lf(strip_bom(actual).0),
+                ))
+            };
+            match views {
+                Ok((before, after)) => {
+                    let (diff, first) = generate_diff_string(&before, &after);
+                    details["diff"] = serde_json::json!(diff);
+                    if let Some(first) = first {
+                        details["firstChangedLine"] = serde_json::json!(first);
+                    }
+                }
+                Err(_) => {
+                    // The editor already acknowledged this write. An invalid
+                    // read-back cannot turn that into a safe-to-retry failure.
+                    text.push_str(" The editor returned invalid notebook JSON; inspect it with raw=true before further edits.");
+                    details["notebookProjectionUnavailable"] = serde_json::json!(true);
+                }
             }
         }
     } else {
@@ -324,6 +356,7 @@ impl WriteTool {
             None,
             &input.content,
             written,
+            false,
         )))
     }
 }
@@ -392,13 +425,7 @@ impl EditTool {
             "edit",
         )
         .await?;
-        let outcome = apply_unique_text_replacement(
-            before.as_bytes(),
-            &input.old_text,
-            &input.new_text,
-            &input.path,
-            "edit",
-        )?;
+        let outcome = apply_file_text_replacement(before.as_bytes(), input, path)?;
         let written = persist_edit(
             client.as_ref(),
             path,
@@ -415,6 +442,7 @@ impl EditTool {
             Some(&before),
             &outcome.final_content,
             written,
+            !input.raw && crate::notebook::is_notebook_path(path),
         )))
     }
 }
@@ -438,7 +466,7 @@ impl HashlineEditTool {
             "hashline_edit",
         )
         .await?;
-        let outcome = apply_hashline_edits_to_content(&before, &input.edits, &input.path)?;
+        let outcome = apply_file_hashline_edits(&before, input, path)?;
         let written = persist_edit(
             client.as_ref(),
             path,
@@ -455,6 +483,7 @@ impl HashlineEditTool {
             Some(&before),
             &outcome.final_content,
             written,
+            !input.raw && crate::notebook::is_notebook_path(path),
         )))
     }
 }

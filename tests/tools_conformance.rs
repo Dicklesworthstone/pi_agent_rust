@@ -4349,7 +4349,7 @@ mod e2e_read {
                 &tool,
                 "read",
                 "notebook-rendered",
-                serde_json::json!({"path": "analysis.ipynb"}),
+                serde_json::json!({"path": "analysis.ipynb", "rendered": true}),
             )
             .await
             .expect("render saved notebook");
@@ -4367,7 +4367,7 @@ mod e2e_read {
                 &tool,
                 "read",
                 "notebook-hashline-refused",
-                serde_json::json!({"path": "analysis.ipynb", "hashline": true}),
+                serde_json::json!({"path": "analysis.ipynb", "rendered": true, "hashline": true}),
             )
             .await
             .expect_err("rendered lines cannot authorize source edits");
@@ -4416,7 +4416,7 @@ mod e2e_read {
                     &tool,
                     "read",
                     &format!("notebook-page-{page}"),
-                    serde_json::json!({"path": "pages.ipynb", "offset": offset, "limit": 2}),
+                    serde_json::json!({"path": "pages.ipynb", "rendered": true, "offset": offset, "limit": 2}),
                 )
                 .await
                 .unwrap();
@@ -4465,7 +4465,7 @@ mod e2e_read {
                     &tool,
                     "read",
                     code,
-                    serde_json::json!({"path": path}),
+                    serde_json::json!({"path": path, "rendered": true}),
                 )
                 .await
                 .expect_err("invalid document must not return misleading source text");
@@ -4508,7 +4508,7 @@ mod e2e_read {
                     &tool,
                     "read",
                     name,
-                    serde_json::json!({"path": name, "limit": i64::MAX}),
+                    serde_json::json!({"path": name, "rendered": true, "limit": i64::MAX}),
                 )
                 .await
                 .unwrap();
