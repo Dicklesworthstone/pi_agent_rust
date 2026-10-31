@@ -454,6 +454,13 @@ async fn replay_message(message: &Message, id: &str, out: &AcpOutput) -> History
                 }),
             )
             .await?;
+            if let Some(update) = content::interim_response_update(
+                &message.tool_name,
+                message.is_error,
+                message.details.as_ref(),
+            ) {
+                send_update(out, id, update).await?;
+            }
         }
         Message::Custom(message) if message.display => {
             // Native custom messages carry plain text, not UserContent blocks.
@@ -1276,6 +1283,116 @@ mod tests {
             for private in ["private-signature", "private-redacted-state", "not-for-display"] {
                 assert!(!serialized.contains(private));
             }
+        });
+    }
+
+    #[test]
+    fn saved_interim_replies_replay_in_order_without_reexecuting_writes() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut session = Session::create_with_dir_and_store(
+                Some(root.path().to_path_buf()),
+                SessionStoreKind::Jsonl,
+            );
+            session.header.cwd = root.path().display().to_string();
+            let progress = "## Progress\n\nFixing café 🦀 now.";
+            session.append_model_message(user("Fix the problem"));
+            session.append_model_message(
+                serde_json::from_value(json!({
+                    "role": "assistant", "api": "test", "provider": "test", "model": "test",
+                    "usage": Usage::default(), "stopReason": "toolUse", "timestamp": 1,
+                    "content": [{
+                        "type": "toolCall", "id": "reply", "name": "write",
+                        "arguments": { "path": "out://progress", "content": progress },
+                    }],
+                }))
+                .unwrap(),
+            );
+            for (id, tool, failed, details) in [
+                (
+                    "reply",
+                    "write",
+                    false,
+                    json!({
+                        "schema": "pi.interim_response.v1", "text": progress,
+                        "private": "private-reply-metadata",
+                    }),
+                ),
+                (
+                    "failed",
+                    "write",
+                    true,
+                    json!({
+                        "schema": "pi.interim_response.v1", "text": "failed-reply-must-not-display",
+                    }),
+                ),
+                (
+                    "ordinary",
+                    "read",
+                    false,
+                    json!({
+                        "schema": "pi.interim_response.v1", "text": "other-tool-must-not-display",
+                    }),
+                ),
+                (
+                    "malformed",
+                    "write",
+                    false,
+                    json!({
+                        "schema": "unknown", "text": "malformed-reply-must-not-display",
+                    }),
+                ),
+            ] {
+                session.append_model_message(Message::ToolResult(
+                    crate::model::ToolResultMessage {
+                        tool_call_id: id.into(),
+                        tool_name: tool.into(),
+                        content: vec![ContentBlock::Text(TextContent::new("Tool acknowledgment"))],
+                        details: Some(details),
+                        is_error: failed,
+                        timestamp: 2,
+                    },
+                ));
+            }
+            session.append_model_message(assistant("Finished the fix"));
+            session.save().await.unwrap();
+            let path = session.path.clone().unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let restored = Session::open(path.to_str().unwrap()).await.unwrap();
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            replay_session(&restored, &restored.header.id, &AcpOutput::new(tx))
+                .await
+                .unwrap();
+            let lines = rx.try_iter().collect::<Vec<_>>();
+            let updates = lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).unwrap()["params"]["update"].clone()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(updates.len(), 8);
+            assert_eq!(updates[0]["sessionUpdate"], "user_message_chunk");
+            assert_eq!(updates[1]["sessionUpdate"], "tool_call");
+            assert_eq!(updates[2]["toolCallId"], "reply");
+            assert_eq!(updates[2]["status"], "completed");
+            assert_eq!(updates[3]["sessionUpdate"], "agent_message_chunk");
+            assert_eq!(
+                updates[3]["content"],
+                json!({ "type": "text", "text": progress })
+            );
+            assert_eq!(updates[4]["status"], "failed");
+            assert_eq!(updates[7]["content"]["text"], "Finished the fix");
+            let serialized = lines.join("\n");
+            for hidden in [
+                "private-reply-metadata",
+                "failed-reply-must-not-display",
+                "other-tool-must-not-display",
+                "malformed-reply-must-not-display",
+            ] {
+                assert!(!serialized.contains(hidden));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
         });
     }
 

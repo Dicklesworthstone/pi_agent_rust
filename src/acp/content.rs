@@ -20,6 +20,24 @@ pub(super) fn prompt_capabilities() -> Value {
     json!({ "audio": true, "embeddedContext": true, "image": true })
 }
 
+/// Only a completed, accepted `write out://` result becomes assistant prose.
+/// Live delivery and history replay share the same bounded metadata decoder;
+/// progress updates and ordinary tool details must not publish a reply.
+pub(super) fn interim_response_update(
+    tool_name: &str,
+    is_error: bool,
+    details: Option<&Value>,
+) -> Option<Value> {
+    if tool_name != "write" || is_error {
+        return None;
+    }
+    let text = details.and_then(crate::tools::interim_response_text_from_details)?;
+    Some(json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": text },
+    }))
+}
+
 struct PromptBudget {
     remaining: usize,
     remaining_media: usize,
@@ -936,6 +954,150 @@ mod tests {
             assert!(!line.contains("not-display-content"));
         }
         assert!(rx.try_recv().is_err(), "one notification per event");
+    }
+
+    #[test]
+    fn accepted_interim_reply_is_published_once_after_completion_and_turn_continues() {
+        use crate::agent::AgentEvent;
+
+        let text = "## Progress\n\nFound the cause. Fixing café 🦀 now.";
+        let output = crate::tools::ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("Shown to the user."))],
+            details: Some(json!({
+                "schema": "pi.interim_response.v1", "text": text,
+                "private": "must-not-leak",
+            })),
+            is_error: false,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let tx = super::super::AcpOutput::new(tx);
+        let handler = super::super::build_acp_event_handler(tx, "editor-session".into());
+        handler(AgentEvent::ToolExecutionStart {
+            tool_call_id: "reply-1".into(),
+            tool_name: "write".into(),
+            args: json!({ "path": "out://progress", "content": text }),
+        });
+        handler(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "reply-1".into(),
+            tool_name: "write".into(),
+            args: json!({ "path": "out://progress", "content": text }),
+            partial_result: output.clone(),
+        });
+        handler(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "reply-1".into(),
+            tool_name: "write".into(),
+            result: output,
+            is_error: false,
+        });
+        handler(AgentEvent::ToolExecutionStart {
+            tool_call_id: "work-2".into(),
+            tool_name: "read".into(),
+            args: json!({ "path": "src/lib.rs" }),
+        });
+        let lines = rx.try_iter().collect::<Vec<_>>();
+        let updates = lines
+            .iter()
+            .map(|line| {
+                let message: Value = serde_json::from_str(line).unwrap();
+                assert_eq!(message["method"], "session/update");
+                assert_eq!(message["params"]["sessionId"], "editor-session");
+                message["params"]["update"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 5);
+        assert_eq!(updates[0]["status"], "pending");
+        assert_eq!(updates[1]["status"], "in_progress");
+        assert_eq!(updates[2]["sessionUpdate"], "tool_call_update");
+        assert_eq!(updates[2]["toolCallId"], "reply-1");
+        assert_eq!(updates[2]["status"], "completed");
+        assert_eq!(updates[3]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            updates[3]["content"],
+            json!({ "type": "text", "text": text })
+        );
+        assert_eq!(updates[4]["toolCallId"], "work-2");
+        assert_eq!(updates[4]["status"], "pending");
+        assert!(!lines.join("\n").contains("must-not-leak"));
+    }
+
+    #[test]
+    fn failed_and_malformed_interim_results_never_publish_assistant_prose() {
+        use crate::agent::AgentEvent;
+
+        let accepted = json!({ "schema": "pi.interim_response.v1", "text": "Private fixture" });
+        for (tool_name, result_error, event_error, details) in [
+            ("read", false, false, Some(accepted.clone())),
+            ("write", true, false, Some(accepted.clone())),
+            ("write", false, true, Some(accepted)),
+            ("write", false, false, None),
+            (
+                "write",
+                false,
+                false,
+                Some(json!({ "schema": "unknown", "text": "Hidden" })),
+            ),
+            (
+                "write",
+                false,
+                false,
+                Some(json!({ "schema": "pi.interim_response.v1", "text": " \n " })),
+            ),
+            (
+                "write",
+                false,
+                false,
+                Some(
+                    json!({ "schema": "pi.interim_response.v1", "text": "x".repeat(64 * 1024 + 1) }),
+                ),
+            ),
+        ] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            let tx = super::super::AcpOutput::new(tx);
+            let handler = super::super::build_acp_event_handler(tx, "editor-session".into());
+            handler(AgentEvent::ToolExecutionEnd {
+                tool_call_id: "reply".into(),
+                tool_name: tool_name.into(),
+                result: crate::tools::ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new("Tool acknowledgment"))],
+                    details,
+                    is_error: result_error,
+                },
+                is_error: event_error,
+            });
+            let lines = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1, "{tool_name}, {result_error}, {event_error}");
+            let message: Value = serde_json::from_str(&lines[0]).unwrap();
+            assert_eq!(
+                message["params"]["update"]["sessionUpdate"],
+                "tool_call_update"
+            );
+            assert_eq!(
+                message["params"]["update"]["content"][0]["content"]["text"],
+                "Tool acknowledgment"
+            );
+        }
+    }
+
+    #[test]
+    fn undeliverable_interim_reply_marks_output_failed() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let tx = super::super::AcpOutput::new(tx);
+        let handler = super::super::build_acp_event_handler(tx.clone(), "editor-session".into());
+        handler(crate::agent::AgentEvent::ToolExecutionEnd {
+            tool_call_id: "reply".into(),
+            tool_name: "write".into(),
+            result: crate::tools::ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("Shown to the user."))],
+                details: Some(json!({ "schema": "pi.interim_response.v1", "text": "Progress" })),
+                is_error: false,
+            },
+            is_error: false,
+        });
+        assert!(
+            tx.failure_reason().is_some(),
+            "lost prose must abort delivery"
+        );
+        assert_eq!(rx.try_iter().count(), 1);
     }
 
     #[test]

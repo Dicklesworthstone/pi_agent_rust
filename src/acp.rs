@@ -3184,6 +3184,19 @@ fn build_acp_event_handler(
     session_id: String,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     move |event: AgentEvent| {
+        let interim_update = match &event {
+            AgentEvent::ToolExecutionEnd {
+                tool_name,
+                result,
+                is_error,
+                ..
+            } => content::interim_response_update(
+                tool_name,
+                *is_error || result.is_error,
+                result.details.as_ref(),
+            ),
+            _ => None,
+        };
         let update = match &event {
             AgentEvent::MessageUpdate {
                 assistant_message_event,
@@ -3263,7 +3276,10 @@ fn build_acp_event_handler(
             _ => None,
         };
 
-        if let Some(update) = update {
+        // Preserve the tool's completion before publishing its accepted reply.
+        // A ToolExecutionUpdate may contain the same metadata, but cannot yet
+        // commit assistant prose or end the ongoing agent turn.
+        for update in update.into_iter().chain(interim_update) {
             let _ = out_tx.send(json_rpc_notification(
                 "session/update",
                 json!({
