@@ -4831,9 +4831,141 @@ pub struct OAuthCallbackServer {
     pub rx: std::sync::mpsc::Receiver<String>,
     /// The port the server is listening on (for logging/diagnostics).
     pub port: u16,
-    // Note: `_handle` is kept for the thread join handle, which keeps the
-    // listener thread alive until this struct is dropped.
+    io: Arc<Mutex<OAuthCallbackIo>>,
+    cancel: std::sync::mpsc::Sender<()>,
+    // The owner closes sockets and wakes the worker; Drop never joins a
+    // thread that might still be scheduled or blocked in a peer operation.
     _handle: std::thread::JoinHandle<()>,
+}
+
+struct OAuthCallbackIo {
+    listener: Option<std::net::TcpListener>,
+    shutdown: Option<std::net::TcpStream>,
+    cancelled: bool,
+}
+
+impl OAuthCallbackIo {
+    fn close(&mut self) {
+        self.listener = None;
+        if let Some(stream) = self.shutdown.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for OAuthCallbackServer {
+    fn drop(&mut self) {
+        let mut io = self
+            .io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        io.cancelled = true;
+        io.close();
+        drop(io);
+        let _ = self.cancel.send(());
+    }
+}
+
+fn oauth_callback_cancelled(io: &Mutex<OAuthCallbackIo>) -> bool {
+    io.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cancelled
+}
+
+fn deliver_oauth_callback(
+    io: &Mutex<OAuthCallbackIo>,
+    tx: &std::sync::mpsc::Sender<String>,
+    path: String,
+) -> std::result::Result<(), std::sync::mpsc::SendError<String>> {
+    let io = io.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if io.cancelled {
+        return Err(std::sync::mpsc::SendError(path));
+    }
+    tx.send(path)
+}
+
+/// Change only socket ownership; each constructor retains its existing
+/// request parsing and response-before-delivery behavior.
+fn spawn_owned_oauth_callback(
+    listener: std::net::TcpListener,
+    port: u16,
+    serve: impl FnOnce(
+        std::net::TcpStream,
+        &std::sync::mpsc::Sender<String>,
+        &Mutex<OAuthCallbackIo>,
+    ) + Send
+    + 'static,
+) -> Result<OAuthCallbackServer> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| Error::auth(format!("Failed to configure callback listener: {e}")))?;
+    let io = Arc::new(Mutex::new(OAuthCallbackIo {
+        listener: Some(listener),
+        shutdown: None,
+        cancelled: false,
+    }));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (cancel, cancelled) = std::sync::mpsc::channel();
+    let worker_io = Arc::clone(&io);
+    let handle = std::thread::spawn(move || {
+        loop {
+            let accepted = {
+                let mut io = worker_io
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if io.cancelled {
+                    break;
+                }
+                let Some(listener) = io.listener.as_ref() else {
+                    break;
+                };
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // Accepted sockets inherit nonblocking mode on some
+                        // platforms; preserve the handler's original mode.
+                        if stream.set_nonblocking(false).is_err() {
+                            break;
+                        }
+                        let Ok(shutdown) = stream.try_clone() else {
+                            break;
+                        };
+                        io.shutdown = Some(shutdown);
+                        Some(stream)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(_) => break,
+                }
+            };
+            if let Some(stream) = accepted {
+                serve(stream, &tx, &worker_io);
+                break;
+            }
+            if !matches!(
+                cancelled.recv_timeout(Duration::from_millis(25)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                break;
+            }
+        }
+        worker_io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close();
+    });
+    Ok(OAuthCallbackServer {
+        rx,
+        port,
+        io,
+        cancel,
+        _handle: handle,
+    })
 }
 
 impl std::fmt::Debug for OAuthCallbackServer {
@@ -4866,20 +4998,7 @@ pub fn start_oauth_callback_server(redirect_uri: &str) -> Result<OAuthCallbackSe
         ))
     })?;
 
-    // Set a generous timeout so the thread doesn't hang forever if the user
-    // cancels. The thread will exit when the listener is dropped or when a
-    // connection arrives.
-    listener
-        .set_nonblocking(false)
-        .map_err(|e| Error::auth(format!("Failed to configure callback listener: {e}")))?;
-
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-
-    let handle = std::thread::spawn(move || {
-        // Accept exactly one connection.
-        let Ok((mut stream, _addr)) = listener.accept() else {
-            return;
-        };
+    spawn_owned_oauth_callback(listener, port, |mut stream, tx, io| {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
         // Read the HTTP request (we only need the first line: `GET /path?query HTTP/1.1`).
@@ -4910,6 +5029,9 @@ pub fn start_oauth_callback_server(redirect_uri: &str) -> Result<OAuthCallbackSe
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
             html.len()
         );
+        if oauth_callback_cancelled(io) {
+            return;
+        }
         if let Err(e) = stream.write_all(response.as_bytes()) {
             tracing::debug!("Failed to write HTTP response: {e}");
         }
@@ -4918,17 +5040,11 @@ pub fn start_oauth_callback_server(redirect_uri: &str) -> Result<OAuthCallbackSe
         }
 
         // Deliver the callback URL to the waiting caller.
-        if tx.send(request_path).is_err() {
+        if deliver_oauth_callback(io, tx, request_path).is_err() {
             tracing::debug!(
                 "OAuth callback receiver was dropped before callback URL could be delivered"
             );
         }
-    });
-
-    Ok(OAuthCallbackServer {
-        rx,
-        port,
-        _handle: handle,
     })
 }
 
@@ -4980,16 +5096,7 @@ pub fn start_oauth_callback_server_random_port() -> Result<(OAuthCallbackServer,
 
     let redirect_uri = format!("http://localhost:{port}/callback");
 
-    listener
-        .set_nonblocking(false)
-        .map_err(|e| Error::auth(format!("Failed to configure callback listener: {e}")))?;
-
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-
-    let handle = std::thread::spawn(move || {
-        let Ok((mut stream, _addr)) = listener.accept() else {
-            return;
-        };
+    let server = spawn_owned_oauth_callback(listener, port, |mut stream, tx, io| {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
         let mut buf = [0u8; 4096];
@@ -5022,6 +5129,9 @@ pub fn start_oauth_callback_server_random_port() -> Result<(OAuthCallbackServer,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
             html.len()
         );
+        if oauth_callback_cancelled(io) {
+            return;
+        }
         if let Err(e) = stream.write_all(response.as_bytes()) {
             tracing::debug!("Failed to write HTTP response: {e}");
         }
@@ -5029,21 +5139,14 @@ pub fn start_oauth_callback_server_random_port() -> Result<(OAuthCallbackServer,
             tracing::debug!("Failed to flush HTTP response: {e}");
         }
 
-        if tx.send(request_path).is_err() {
+        if deliver_oauth_callback(io, tx, request_path).is_err() {
             tracing::debug!(
                 "OAuth callback receiver was dropped before callback URL could be delivered"
             );
         }
-    });
+    })?;
 
-    Ok((
-        OAuthCallbackServer {
-            rx,
-            port,
-            _handle: handle,
-        },
-        redirect_uri,
-    ))
+    Ok((server, redirect_uri))
 }
 
 // ── Device Flow (RFC 8628) ──────────────────────────────────────
@@ -7005,6 +7108,124 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .to_string()
+    }
+
+    fn assert_oauth_callback_worker_retired(io: &Arc<Mutex<OAuthCallbackIo>>) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(io) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            Arc::strong_count(io),
+            1,
+            "cancelled callback worker must retire"
+        );
+        let io = io.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(io.listener.is_none());
+        assert!(io.shutdown.is_none());
+    }
+
+    #[test]
+    fn oauth_callback_drop_releases_idle_fixed_and_random_ports() {
+        let (server, uri) =
+            start_oauth_callback_server_random_port().expect("random callback server");
+        let port = server.port;
+        let check_drop = |server: OAuthCallbackServer| {
+            let io = Arc::clone(&server.io);
+            drop(server);
+            // Rebinding is immediate, even if the worker has not run yet.
+            let rebound = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .expect("dropped callback listener releases its port");
+            assert_oauth_callback_worker_retired(&io);
+            drop(rebound);
+        };
+        check_drop(server);
+        for _ in 0..3 {
+            let server =
+                start_oauth_callback_server(&uri).expect("replacement fixed-port callback");
+            assert_eq!(server.port, port);
+            check_drop(server);
+        }
+    }
+
+    #[test]
+    fn oauth_callback_drop_interrupts_an_accepted_stalled_peer() {
+        let (server, _) = start_oauth_callback_server_random_port().expect("callback server");
+        let io = Arc::clone(&server.io);
+        let mut peer =
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, server.port))
+                .expect("connect callback peer");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        // Establish acceptance before cancelling, so this covers the blocking
+        // read rather than only the idle listener. Send no request bytes: the
+        // existing single-read parser intentionally remains unchanged.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if io
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "callback peer was not accepted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            server.rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let before = Instant::now();
+        drop(server);
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "Drop must not wait for the five-second read timeout"
+        );
+        let mut byte = [0_u8; 1];
+        match peer.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                ) => {}
+            result => {
+                panic!("cancelled callback must close without a success response: {result:?}")
+            }
+        }
+        assert_oauth_callback_worker_retired(&io);
+    }
+
+    #[test]
+    fn oauth_callback_delivers_after_the_existing_browser_response() {
+        let (server, _) = start_oauth_callback_server_random_port().expect("callback server");
+        let io = Arc::clone(&server.io);
+        let mut peer =
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, server.port))
+                .expect("connect callback peer");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        peer.write_all(b"GET /callback?code=example&state=test HTTP/1.1\r\n")
+            .expect("write callback request");
+        assert_eq!(
+            server
+                .rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("callback delivered"),
+            "/callback?code=example&state=test"
+        );
+        // Match CLI ownership: it drops the server immediately after receiving.
+        drop(server);
+        let mut response = String::new();
+        peer.read_to_string(&mut response).expect("browser response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Authorization successful"));
+        assert!(response.contains("You can close this browser tab and return to Pi Agent."));
+        assert_oauth_callback_worker_retired(&io);
     }
 
     // === Credential rotation wiring (bd-cv653.3.2) ===
