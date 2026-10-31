@@ -314,10 +314,11 @@ impl LspTool {
         budget.verify(&entry, &snapshot)?;
         let changed = source != updated;
         let apply = input.apply.unwrap_or(false);
+        let mut changed_paths = Vec::new();
         if apply && changed {
             let result = prepared.commit(|| budget.verify(&entry, &snapshot));
             self.invalidate_refactor(&entry);
-            result?;
+            changed_paths = result?.changed_paths(&self.cwd);
         } else if apply {
             // No-op requests neither rewrite the file nor invalidate its live
             // document; they still validate every retained preimage.
@@ -350,6 +351,7 @@ impl LspTool {
             "action":"format","file":display_path(&path,&self.cwd),"server":entry.spec_name,
             "mode":if ranged { "range" } else { "document" },
             "previewOnly":!apply,"applied":apply && changed,"changed":changed,
+            "changedPaths":changed_paths,
             "editCount":count,"returnedNull":returned_null,
             "beforeBytes":source.len(),"afterBytes":updated.len(),"formatOptions":options,
             "rollbackOnError":true,"atomic":false

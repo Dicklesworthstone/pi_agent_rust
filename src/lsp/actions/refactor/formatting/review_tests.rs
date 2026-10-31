@@ -227,6 +227,53 @@ fn approved_noops_are_consumed_without_rewriting_original_files() {
 }
 
 #[test]
+fn prewalk_uses_committed_formatter_images_instead_of_previews_or_noop_edit_counts() {
+    for setting in ["normal", "same", "empty", "null"] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some(tool) = fixture(temp.path(), "normal") else {
+            return;
+        };
+        let rt = runtime();
+        mode(temp.path(), setting);
+        let mut state = crate::prewalk::PrewalkState::new(
+            crate::prewalk::PrewalkTarget {
+                provider: "test".into(),
+                model: "implementation".into(),
+                thinking: None,
+            },
+            true,
+        );
+        let args = input();
+        let preview = rt
+            .block_on(tool.execute("prewalk-preview", args.clone(), None))
+            .unwrap();
+        assert!(!preview.is_error);
+        state.observe(tool.prewalk_evidence(&args, &preview));
+        assert!(
+            !state.ready(),
+            "a formatter preview cannot begin implementation"
+        );
+        assert_original(temp.path());
+        let args = approve(&preview.details.as_ref().unwrap()["refactorId"]);
+        let applied = rt
+            .block_on(tool.execute("prewalk-approve", args.clone(), None))
+            .unwrap();
+        assert!(!applied.is_error);
+        state.observe(tool.prewalk_evidence(&args, &applied));
+        assert_eq!(state.ready(), setting == "normal", "{setting}");
+        assert_eq!(
+            applied.details.as_ref().unwrap()["changedPaths"],
+            if setting == "normal" {
+                json!(["source.reviewfmt"])
+            } else {
+                json!([])
+            },
+        );
+        assert_eq!(count(temp.path(), "textDocument/formatting"), 1);
+    }
+}
+
+#[test]
 fn external_edits_or_removal_reject_approval_without_a_second_request() {
     for remove in [false, true] {
         let temp = tempfile::tempdir().unwrap();

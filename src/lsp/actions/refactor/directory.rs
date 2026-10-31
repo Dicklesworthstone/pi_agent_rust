@@ -402,6 +402,7 @@ impl LspTool {
         group.notify(&entries, &mut metadata);
         metadata["applied"] = json!(true);
         metadata["preview"] = json!(false);
+        metadata["changedPaths"] = json!(outcome.changed_paths(&cwd));
         metadata["importUpdates"] = json!(
             outcome
                 .files_changed

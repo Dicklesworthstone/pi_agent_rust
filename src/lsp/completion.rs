@@ -622,6 +622,7 @@ impl LspTool {
         let applied = applied?;
         let payload = json!({"action":"completion","applied":true,"label":selected.item["label"],
             "filesChanged":applied.outcome.files_changed.iter().map(|path| display_path(path, &self.cwd)).collect::<Vec<_>>(),
+            "changedPaths":applied.outcome.changed_paths(&self.cwd),
             "additionalEdits":edits.len().saturating_sub(1),"rollbackOnError":true,"commandExecuted":false});
         Ok(text_output(payload.to_string(), payload))
     }

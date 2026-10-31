@@ -1,6 +1,6 @@
 //! Explicit, snapshot-bound choices. No path or command comes from a choice.
 
-use super::{ConflictRegion, Result, Snapshot, fail};
+use super::{AppliedConflicts, ConflictRegion, Result, Snapshot, fail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -83,7 +83,9 @@ pub fn apply_conflict_choices(
     choices: &[ConflictChoice],
 ) -> Result<Vec<ConflictRegion>> {
     validate(choices)?;
-    PreparedConflicts::new(cwd, choices.to_vec())?.apply()
+    PreparedConflicts::new(cwd, choices.to_vec())?
+        .apply()
+        .map(|applied| applied.regions)
 }
 
 /// One validated inventory shared by scope checks, undo capture and staging.
@@ -141,7 +143,7 @@ impl PreparedConflicts {
             .collect()
     }
 
-    pub(crate) fn apply(self) -> Result<Vec<ConflictRegion>> {
+    pub(crate) fn apply(self) -> Result<AppliedConflicts> {
         let replacements = self
             .choices
             .iter()

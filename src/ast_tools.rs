@@ -896,7 +896,7 @@ impl AstEditTool {
             };
             let (new_content, count) = Self::compute_rewrite(lang, &original, &compiled[&lang])
                 .map_err(|message| Error::tool("ast_edit", message))?;
-            if count == 0 {
+            if count == 0 || new_content == original {
                 continue;
             }
             total_replacements += count;
@@ -1111,6 +1111,27 @@ impl AstEditTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for AstEditTool {
+    fn prewalk_evidence(
+        &self,
+        _input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        let Some(details) = output
+            .details
+            .as_ref()
+            .filter(|details| details["applied"] == true)
+        else {
+            return crate::prewalk::ToolEvidence::default();
+        };
+        crate::prewalk::ToolEvidence::paths(
+            details["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|file| file["path"].as_str()),
+        )
+    }
+
     fn name(&self) -> &str {
         "ast_edit"
     }

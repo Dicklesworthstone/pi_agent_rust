@@ -467,6 +467,11 @@ impl Transaction {
                 )
             });
         }
+        let mut changed_paths: Vec<_> = changes.iter().map(|change| change.path.clone()).collect();
+        if let Some(moving) = &self.directory {
+            changed_paths.push(moving.old.clone());
+            changed_paths.push(moving.new.clone());
+        }
         Ok(ApplyOutcome {
             files_changed: self
                 .text_paths
@@ -478,6 +483,7 @@ impl Transaction {
                 })
                 .collect(),
             file_ops_applied: self.operations,
+            changed_paths,
         })
     }
 }

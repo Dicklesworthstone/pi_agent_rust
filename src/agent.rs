@@ -2078,6 +2078,7 @@ pub struct Agent {
     /// a provider inside the tool loop or lets a tool choose the destination.
     prewalk: Option<crate::prewalk::PrewalkState>,
     prewalk_budget: Option<PrewalkRunBudget>,
+    prewalk_evidence: StdMutex<crate::prewalk::ToolEvidence>,
 
     /// Discoverable tools promoted into the live schema mid-session via
     /// `xdev promote` (bd-cv653.1.6). Interior-mutable because tool
@@ -2286,6 +2287,7 @@ impl Agent {
             stream_rule_turn: 0,
             prewalk: None,
             prewalk_budget: None,
+            prewalk_evidence: StdMutex::new(crate::prewalk::ToolEvidence::default()),
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
@@ -2403,6 +2405,7 @@ impl Agent {
         self.stream_rule_turn = 0;
         self.prewalk = None;
         self.prewalk_budget = None;
+        self.take_prewalk_evidence();
     }
 
     /// The destination armed for this live session, never restored from disk.
@@ -2412,6 +2415,7 @@ impl Agent {
     }
 
     pub(crate) fn begin_prewalk_run(&mut self) {
+        self.take_prewalk_evidence();
         // An abandoned SDK future may have yielded before it installed the
         // target. A later public prompt must not silently resume that decision.
         if self
@@ -2432,6 +2436,7 @@ impl Agent {
     }
 
     pub(crate) fn finish_prewalk_run(&mut self, interrupted: bool) {
+        self.take_prewalk_evidence();
         self.prewalk_budget = None;
         if interrupted {
             self.prewalk = None;
@@ -2453,6 +2458,37 @@ impl Agent {
     /// Explicitly cancel a pending one-shot model handoff.
     pub fn disarm_prewalk(&mut self) {
         self.prewalk = None;
+        self.take_prewalk_evidence();
+    }
+
+    fn take_prewalk_evidence(&self) -> crate::prewalk::ToolEvidence {
+        std::mem::take(
+            &mut *self
+                .prewalk_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn record_prewalk_evidence(
+        &self,
+        tool: &dyn crate::tools::Tool,
+        input: &Value,
+        output: &ToolOutput,
+    ) {
+        if self.prewalk_budget.is_none()
+            || self.prewalk.is_none()
+            || output.is_error
+            || crate::agent_cx::AgentCx::for_current_or_request()
+                .checkpoint()
+                .is_err()
+        {
+            return;
+        }
+        self.prewalk_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .merge(tool.prewalk_evidence(input, output));
     }
 
     /// The shared tool approval state (bd-cv653.3.19).
@@ -4491,10 +4527,11 @@ impl Agent {
                     budget.turn_index = turn_index;
                     budget.warned = warned_at_handoff_threshold;
                 }
+                let prewalk_evidence = self.take_prewalk_evidence();
                 let handoff = if self.prewalk_budget.is_some()
                     && let Some(prewalk) = &mut self.prewalk
                 {
-                    prewalk.observe(&tool_calls, &tool_results);
+                    prewalk.observe(prewalk_evidence);
                     !tool_results.is_empty()
                         && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
                         && prewalk.yield_at_boundary()
@@ -6057,6 +6094,9 @@ impl Agent {
         abort: Option<AbortSignal>,
         latency: SharedTurnLatencyAccumulator,
     ) -> Result<ToolExecutionOutcome> {
+        // A cancelled/abandoned batch must never donate evidence to a later
+        // request. Nested host calls contribute only while this batch runs.
+        self.take_prewalk_evidence();
         let mut results = Vec::new();
         let mut steering_messages: Option<Vec<QueuedAgentMessage>> = None;
 
@@ -6718,7 +6758,7 @@ impl Agent {
                 let mut output = inner
                     .execute_with_invocation(
                         &tool_call.id,
-                        inner_args,
+                        inner_args.clone(),
                         None,
                         crate::tools::ToolInvocationContext {
                             protect: &protect,
@@ -6728,6 +6768,7 @@ impl Agent {
                     )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
+                self.record_prewalk_evidence(inner, &inner_args, &output);
                 output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
                 Some(output)
             }
@@ -6938,6 +6979,13 @@ impl Agent {
             .await;
         match outcome {
             Ok(output) => {
+                if self
+                    .check_invocation_session(expected_session)
+                    .await
+                    .is_ok()
+                {
+                    self.record_prewalk_evidence(tool, &tool_call.arguments, &output);
+                }
                 let is_error = output.is_error;
                 (output, is_error)
             }

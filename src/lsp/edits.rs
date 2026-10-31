@@ -9,7 +9,7 @@
 //! This is bounded regular-file support, not a multi-file crash-atomic commit.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -101,6 +101,19 @@ pub struct ApplyOutcome {
     pub files_changed: Vec<PathBuf>,
     /// File operations performed, in order.
     pub file_ops_applied: Vec<String>,
+    /// Actual image/existence changes, including both ends of a directory
+    /// move. Kept separate from requested text edits and operation summaries.
+    #[serde(skip)]
+    pub(crate) changed_paths: Vec<PathBuf>,
+}
+
+impl ApplyOutcome {
+    pub(in crate::lsp) fn changed_paths(&self, cwd: &Path) -> Vec<String> {
+        self.changed_paths
+            .iter()
+            .map(|path| super::display_path(path, cwd))
+            .collect()
+    }
 }
 
 /// Apply a parsed WorkspaceEdit with staged validation and rollback.

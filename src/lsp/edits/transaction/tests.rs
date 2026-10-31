@@ -131,6 +131,25 @@ fn chained_binary_renames_use_the_staged_source() {
     assert!(!a.exists() && !b.exists());
     assert_eq!(std::fs::read(c).unwrap(), b"\xff\x00payload");
     assert_eq!(outcome.file_ops_applied.len(), 2);
+    assert_eq!(
+        outcome.changed_paths.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([a, temp.path().join("c")]),
+    );
+}
+
+#[test]
+fn mutation_receipts_exclude_text_operations_that_leave_the_same_final_image() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    std::fs::write(&path, "abc").unwrap();
+    let mut transaction = Transaction::default();
+    transaction.edit(&path, &[replace_first("a")]).unwrap();
+    let outcome = transaction.commit().unwrap();
+    assert_eq!(outcome.files_changed, vec![path]);
+    assert!(
+        outcome.changed_paths.is_empty(),
+        "requested edit paths are not mutation evidence"
+    );
 }
 
 #[test]

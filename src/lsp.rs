@@ -638,6 +638,35 @@ struct LspInput {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for LspTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        // Generic requests and server result bodies never attest local edits.
+        // These native branches build receipts only after their commit succeeds.
+        if !matches!(
+            input.get("action").and_then(serde_json::Value::as_str),
+            Some("rename" | "rename_file" | "code_actions" | "format" | "completion")
+        ) {
+            return crate::prewalk::ToolEvidence::default();
+        }
+        let Some(details) = output
+            .details
+            .as_ref()
+            .filter(|details| details["applied"] == true)
+        else {
+            return crate::prewalk::ToolEvidence::default();
+        };
+        crate::prewalk::ToolEvidence::paths(
+            details["changedPaths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str),
+        )
+    }
+
     fn name(&self) -> &str {
         "lsp"
     }

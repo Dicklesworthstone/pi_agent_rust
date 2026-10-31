@@ -108,6 +108,64 @@ fn guarded_reads_and_reverse_order_batch_splices_preserve_literal_replacement() 
 }
 
 #[test]
+fn unchanged_literal_conflict_writes_do_not_supply_prewalk_mutation_evidence() {
+    use crate::tools::Tool as _;
+    let original = format!("prefix\n{BLOCK}tail\n");
+    let dir = fixture("f.txt", &original);
+    let snapshot = Snapshot::read(dir.path()).unwrap();
+    let located = &snapshot.regions[0];
+    let unchanged = &snapshot.files[located.file].text[located.region.span.clone()];
+    let url = format!("conflict://0/{}", located.token);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let tool = crate::tools::WriteTool::new(dir.path());
+    let mut state = crate::prewalk::PrewalkState::new(
+        crate::prewalk::PrewalkTarget {
+            provider: "test".into(),
+            model: "implementation".into(),
+            thinking: None,
+        },
+        true,
+    );
+    let args = json!({"path":url,"content":unchanged});
+    let output = runtime
+        .block_on(tool.execute("unchanged", args.clone(), None))
+        .unwrap();
+    assert!(!output.is_error);
+    let details = output.details.as_ref().unwrap();
+    assert_eq!(details["paths"].as_array().unwrap().len(), 1);
+    assert_eq!(details["changedPaths"], json!([]));
+    state.observe(tool.prewalk_evidence(&args, &output));
+    assert!(!state.ready());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+        original
+    );
+
+    // An unchanged replacement preserves the guarded snapshot. Applying a
+    // genuinely different literal then provides the committed-image receipt.
+    let args = json!({"path":url,"content":"merged\n"});
+    let output = runtime
+        .block_on(tool.execute("changed", args.clone(), None))
+        .unwrap();
+    assert!(!output.is_error);
+    assert_eq!(
+        output.details.as_ref().unwrap()["changedPaths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    state.observe(tool.prewalk_evidence(&args, &output));
+    assert!(state.ready());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+        "prefix\nmerged\ntail\n"
+    );
+}
+
+#[test]
 fn one_stale_or_invalid_choice_prevents_every_replacement() {
     let text = format!("{BLOCK}gap\n{BLOCK}");
     let dir = fixture("f.txt", &text);

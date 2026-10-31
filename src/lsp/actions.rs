@@ -45,6 +45,7 @@ struct CachedAction {
 #[derive(Default)]
 struct Report {
     files: Vec<PathBuf>,
+    changed_paths: Vec<PathBuf>,
     operations: Vec<String>,
     failures: Vec<String>,
     requests: usize,
@@ -53,6 +54,11 @@ struct Report {
 
 impl Report {
     fn record(&mut self, outcome: ApplyOutcome) {
+        for path in outcome.changed_paths {
+            if !self.changed_paths.contains(&path) {
+                self.changed_paths.push(path);
+            }
+        }
         for path in outcome.files_changed {
             if !self.files.contains(&path) {
                 self.files.push(path);
@@ -855,9 +861,15 @@ impl LspTool {
             .iter()
             .map(|path| display_path(path, &self.cwd))
             .collect();
+        let changed_paths: Vec<_> = report
+            .changed_paths
+            .iter()
+            .map(|path| display_path(path, &self.cwd))
+            .collect();
         let payload = json!({
             "action":"code_actions","title":selected["title"],"applied":!failed,
             "filesChanged":files,"fileOps":report.operations,
+            "changedPaths":changed_paths,
             "executedCommand":command.as_ref().filter(|_| command_started).and_then(|params| params["command"].as_str()),
             "serverEditRequests":report.requests,"serverEditFailures":report.failures,
             "partial":partial,"rollbackIncomplete":report.rollback_incomplete,"error":failure,

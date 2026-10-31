@@ -3,11 +3,9 @@
 //! This state only requests a boundary. The SDK owns persistence, model
 //! installation and continuation; tool output can never choose a destination.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ThinkingLevel, ToolCall, ToolResultMessage};
+use crate::model::ThinkingLevel;
 
 pub const COMMAND_USAGE: &str = "Usage: /prewalk [into] | restart [from] [into] | status | off";
 
@@ -81,6 +79,66 @@ pub struct PrewalkTurn {
     pub(crate) origin: crate::extensions::SessionActionOrigin,
 }
 
+/// Native execution evidence, never deserialized from model or extension data.
+///
+/// Only opted-in host tools can construct nonempty evidence. The Agent captures
+/// it before result hooks and merges nested calls into the enclosing batch;
+/// neither a guest's return value nor a tool name grants this authority.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolEvidence {
+    todo_ready: Option<bool>,
+    project_changed: bool,
+}
+
+impl ToolEvidence {
+    pub(crate) fn todo(output: &crate::tools::ToolOutput) -> Self {
+        let todo_ready = output.details.as_ref().and_then(|details| {
+            if details.get("schema").and_then(serde_json::Value::as_str)
+                != Some(crate::todo::TODO_LIST_SCHEMA)
+            {
+                return None;
+            }
+            serde_json::from_value::<crate::todo::TodoList>(details.get("list")?.clone())
+                .ok()
+                .map(|list| !list.is_empty())
+        });
+        Self {
+            todo_ready,
+            project_changed: false,
+        }
+    }
+
+    pub(crate) fn paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            todo_ready: None,
+            project_changed: paths.into_iter().any(project_path),
+        }
+    }
+
+    pub(crate) fn text_edit(input: &serde_json::Value, output: &crate::tools::ToolOutput) -> Self {
+        // Local edit/hashline operations reject identical replacements before
+        // success. Editor-mediated writes additionally report the observed
+        // final image: an acknowledgment alone cannot prove a mutation.
+        if output
+            .details
+            .as_ref()
+            .and_then(|details| details.get("changed"))
+            .is_some_and(|changed| changed != true)
+        {
+            return Self::default();
+        }
+        Self::paths(input.get("path").and_then(serde_json::Value::as_str))
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        if other.todo_ready.is_some() {
+            self.todo_ready = other.todo_ready;
+        }
+        self.project_changed |= other.project_changed;
+    }
+}
+
 /// Pure, session-local trigger state. Never restored automatically from disk.
 #[derive(Debug, Clone)]
 pub(crate) struct PrewalkState {
@@ -113,55 +171,15 @@ impl PrewalkState {
         self.yielded
     }
 
-    /// A completed batch is the smallest handoff unit: every call already
-    /// has a result, including rejected/skipped calls. Successful todo results
-    /// carry the actual list, not a model's assertion that it wrote one.
-    pub fn observe(&mut self, calls: &[ToolCall], results: &[Arc<ToolResultMessage>]) {
-        for result in results.iter().filter(|result| !result.is_error) {
-            if result.tool_name == "todo"
-                && let Some(details) = &result.details
-                && details.get("schema").and_then(serde_json::Value::as_str)
-                    == Some(crate::todo::TODO_LIST_SCHEMA)
-                && let Some(list) = details.get("list")
-                && let Ok(list) = serde_json::from_value::<crate::todo::TodoList>(list.clone())
-            {
-                self.todo_ready = !list.is_empty();
-            }
+    /// A completed batch is the smallest handoff unit, including all native
+    /// calls made by eval or xdev. Evidence is consumed only after its outer
+    /// calls have results; a nested mutation never switches a running tool.
+    pub fn observe(&mut self, evidence: ToolEvidence) {
+        if let Some(ready) = evidence.todo_ready {
+            self.todo_ready = ready;
         }
-        if !self.todo_ready {
-            return;
-        }
-        self.ready |= calls.iter().any(|call| {
-            matches!(call.name.as_str(), "write" | "edit" | "hashline_edit")
-                && results.iter().any(|result| {
-                    result.tool_call_id == call.id
-                        && result.tool_name == call.name
-                        && !result.is_error
-                        && (call
-                            .arguments
-                            .get("path")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(project_path)
-                            || (call.name == "write" && conflict_write_changed_project(result)))
-                })
-        });
+        self.ready |= self.todo_ready && evidence.project_changed;
     }
-}
-
-fn conflict_write_changed_project(result: &ToolResultMessage) -> bool {
-    let Some(details) = &result.details else {
-        return false;
-    };
-    details.get("schema").and_then(serde_json::Value::as_str) == Some("pi.conflict.write.v1")
-        && details
-            .get("paths")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|paths| {
-                paths
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .any(project_path)
-            })
 }
 
 fn project_path(path: &str) -> bool {
@@ -233,43 +251,19 @@ mod tests {
         }
     }
 
-    fn call(path: &str) -> ToolCall {
-        ToolCall {
-            id: "edit-1".into(),
-            name: "write".into(),
-            arguments: json!({"path": path, "content": "done"}),
-            thought_signature: None,
-        }
-    }
-
-    fn result(call: &ToolCall, failed: bool) -> Arc<ToolResultMessage> {
-        Arc::new(ToolResultMessage {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            content: Vec::new(),
-            details: None,
-            is_error: failed,
-            timestamp: 0,
-        })
-    }
-
     #[test]
     fn only_a_successful_project_edit_after_todos_requests_handoff() {
-        let edit = call("src/parser.rs");
         let mut state = PrewalkState::new(target(), false);
-        state.observe(std::slice::from_ref(&edit), &[result(&edit, false)]);
+        state.observe(ToolEvidence::paths(["src/parser.rs"]));
         assert!(!state.ready());
-        let todo = Arc::new(ToolResultMessage {
-            tool_call_id: "plan-1".into(),
-            tool_name: "todo".into(),
+        let todo = crate::tools::ToolOutput {
             content: Vec::new(),
             details: Some(json!({"schema":crate::todo::TODO_LIST_SCHEMA,
                 "list":{"phases":[{"tasks":[{"content":"implement parser", "state":"in_progress"}]}]}})),
             is_error: false,
-            timestamp: 0,
-        });
-        state.observe(&[], &[todo]);
-        state.observe(std::slice::from_ref(&edit), &[result(&edit, true)]);
+        };
+        state.observe(ToolEvidence::todo(&todo));
+        state.observe(ToolEvidence::default());
         assert!(!state.ready());
         for path in [
             "plan://current",
@@ -278,40 +272,41 @@ mod tests {
             "out://",
             "OUT://progress",
         ] {
-            let preparation = call(path);
-            state.observe(
-                std::slice::from_ref(&preparation),
-                &[result(&preparation, false)],
-            );
+            state.observe(ToolEvidence::paths([path]));
             assert!(!state.ready());
         }
-        state.observe(std::slice::from_ref(&edit), &[result(&edit, false)]);
+        state.observe(ToolEvidence::paths(["src/parser.rs"]));
         assert!(state.ready());
     }
 
     #[test]
-    fn missing_todo_tool_allows_the_first_edit_and_mismatched_results_do_not() {
-        let edit = call("src/parser.rs");
+    fn missing_todo_tool_allows_the_first_native_edit() {
         let mut state = PrewalkState::new(target(), true);
-        let mut other = result(&edit, false);
-        Arc::make_mut(&mut other).tool_call_id = "different-call".into();
-        state.observe(std::slice::from_ref(&edit), &[other]);
+        state.observe(ToolEvidence::default());
         assert!(!state.ready());
-        state.observe(std::slice::from_ref(&edit), &[result(&edit, false)]);
+        state.observe(ToolEvidence::paths(["src/parser.rs"]));
         assert!(state.ready());
     }
 
     #[test]
-    fn native_conflict_resolution_uses_the_applied_files_from_its_result() {
-        let edit = call("conflict://*");
-        let mut state = PrewalkState::new(target(), true);
-        state.observe(std::slice::from_ref(&edit), &[result(&edit, false)]);
+    fn a_batch_uses_the_latest_native_todo_state_before_its_handoff() {
+        let mut state = PrewalkState::new(target(), false);
+        let mut batch = ToolEvidence::paths(["src/parser.rs"]);
+        batch.merge(ToolEvidence {
+            todo_ready: Some(true),
+            project_changed: false,
+        });
+        batch.merge(ToolEvidence {
+            todo_ready: Some(false),
+            project_changed: false,
+        });
+        state.observe(batch);
         assert!(!state.ready());
-        let mut resolved = result(&edit, false);
-        Arc::make_mut(&mut resolved).details = Some(json!({
-            "schema":"pi.conflict.write.v1", "paths":["src/parser.rs"]
-        }));
-        state.observe(std::slice::from_ref(&edit), &[resolved]);
+        batch.merge(ToolEvidence {
+            todo_ready: Some(true),
+            project_changed: false,
+        });
+        state.observe(batch);
         assert!(state.ready());
     }
 }

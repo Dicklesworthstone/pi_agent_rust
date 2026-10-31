@@ -473,6 +473,14 @@ impl crate::tools::Tool for TodoTool {
         "todo"
     }
 
+    fn prewalk_evidence(
+        &self,
+        _input: &serde_json::Value,
+        output: &crate::tools::ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::todo(output)
+    }
+
     fn label(&self) -> &str {
         "Todo"
     }

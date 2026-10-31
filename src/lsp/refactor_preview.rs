@@ -277,6 +277,7 @@ impl LspTool {
         metadata["applied"] = json!(true);
         metadata["preview"] = json!(false);
         metadata["filesChanged"] = json!(files);
+        metadata["changedPaths"] = json!(outcome.changed_paths(&self.cwd));
         metadata["confirmedAnnotations"] = json!(confirmed_annotations);
         metadata["confirmationRequired"] = json!(false);
         if input.action == "format" {

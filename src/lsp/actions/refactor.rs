@@ -407,6 +407,7 @@ impl LspTool {
             .collect();
         payload["applied"] = json!(true);
         payload["filesChanged"] = json!(files);
+        payload["changedPaths"] = json!(outcome.changed_paths(&self.cwd));
         payload["fileOps"] = json!(outcome.file_ops_applied);
         Ok(super::text_output(payload.to_string(), payload))
     }
@@ -502,6 +503,7 @@ impl LspTool {
         let payload = json!({
             "action":"rename_file","from":display_path(&old_path,&self.cwd),"to":display_path(&new_path,&self.cwd),
             "applied":true,"importUpdates":updates,"fileOps":outcome.file_ops_applied,
+            "changedPaths":outcome.changed_paths(&self.cwd),
             "willRenameFiles":will,"notificationRequested":did,"notificationWritten":did && warning.is_none(),
             "warning":warning,"atomic":false,"rollbackOnError":true
         });

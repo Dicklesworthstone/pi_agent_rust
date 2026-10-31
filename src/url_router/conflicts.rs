@@ -43,6 +43,11 @@ struct Located {
     token: String,
 }
 
+pub(crate) struct AppliedConflicts {
+    pub regions: Vec<ConflictRegion>,
+    pub changed_paths: Vec<PathBuf>,
+}
+
 struct Snapshot {
     root: PathBuf,
     files: Vec<FileImage>,
@@ -221,9 +226,10 @@ impl Snapshot {
             })
             .collect::<Result<Vec<_>>>()?;
         self.apply_replacements(&replacements)
+            .map(|applied| applied.regions)
     }
 
-    fn apply_replacements(&self, choices: &[(usize, &str)]) -> Result<Vec<ConflictRegion>> {
+    fn apply_replacements(&self, choices: &[(usize, &str)]) -> Result<AppliedConflicts> {
         self.budget.check()?;
         let mut seen = BTreeSet::new();
         let mut plan = WorkspaceEditPlan::default();
@@ -265,8 +271,11 @@ impl Snapshot {
             }
         }
         self.budget.check()?;
-        apply_workspace_edit(&plan, Some(&expected))?;
-        Ok(selected)
+        let applied = apply_workspace_edit(&plan, Some(&expected))?;
+        Ok(AppliedConflicts {
+            regions: selected,
+            changed_paths: applied.changed_paths,
+        })
     }
 }
 

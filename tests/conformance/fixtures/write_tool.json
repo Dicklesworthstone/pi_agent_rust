@@ -12,7 +12,7 @@
       },
       "expected": {
         "content_exact": "Successfully wrote 20 bytes to newfile.txt",
-        "details_none": true
+        "details_exact": {"changed": true}
       }
     },
     {
@@ -24,7 +24,7 @@
       },
       "expected": {
         "content_exact": "Successfully wrote 7 bytes to nested/dir/file.txt",
-        "details_none": true
+        "details_exact": {"changed": true}
       }
     },
     {
@@ -37,7 +37,7 @@
       },
       "expected": {
         "content_exact": "Successfully wrote 11 bytes to existing.txt",
-        "details_none": true
+        "details_exact": {"changed": true}
       }
     },
     {
@@ -49,7 +49,7 @@
       },
       "expected": {
         "content_exact": "Successfully wrote 0 bytes to empty.txt",
-        "details_none": true
+        "details_exact": {"changed": true}
       }
     },
     {
@@ -61,7 +61,7 @@
       },
       "expected": {
         "content_exact": "Successfully wrote 23 bytes to unicode.txt",
-        "details_none": true
+        "details_exact": {"changed": true}
       }
     },
     {
@@ -73,7 +73,7 @@
       },
       "expected": {
         "content_exact": "Successfully wrote 12 bytes to trailing.txt",
-        "details_none": true
+        "details_exact": {"changed": true}
       }
     },
     {
@@ -85,7 +85,17 @@
       },
       "expected": {
         "content_exact": "Successfully wrote 25 bytes to special.txt",
-        "details_none": true
+        "details_exact": {"changed": true}
+      }
+    },
+    {
+      "name": "write_identical_content",
+      "description": "An acknowledged overwrite of identical bytes is not a project mutation",
+      "setup": [{"type": "create_file", "path": "same.txt", "content": "unchanged"}],
+      "input": {"path": "same.txt", "content": "unchanged"},
+      "expected": {
+        "content_exact": "Successfully wrote 9 bytes to same.txt",
+        "details_exact": {"changed": false}
       }
     },
     {

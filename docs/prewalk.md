@@ -93,12 +93,24 @@ For example, to plan on a powerful role and implement on the usual default:
 The arguments apply to this command only. A later bare restart uses the saved
 `prewalk.from` and `prewalk.into` again.
 
-Successful `write`, `edit`, and `hashline_edit` calls trigger the handoff.
-Native `conflict://` writes also count when their result confirms applied
-project files. Failed or rejected tools, reads, discussion, and plan artifacts
-under `plan://`, `.pi/plans`, or `.omp/plans` do not trigger it. Shell commands,
-extension-specific mutation tools, and nested tool wrappers are not classified
-as prewalk edits.
+Successful native `write`, `edit`, and `hashline_edit` changes trigger the
+handoff. Applied `ast_edit` proposals, LSP refactors, formatting, selected code
+actions and completions also count, including file moves. Previewing a proposal
+or rewriting identical content does not count. Native `conflict://` writes
+count when they apply changes to project files.
+
+These same native operations count when called through `eval` or `xdev`.
+For example, an eval cell can initialize the native `todo` list and write the
+first project file; the cell and the rest of its tool batch finish before the
+handoff. The host records successful native operations before extension result
+hooks, so printed text, guest-created receipt objects and similarly named
+extension tools cannot claim that an edit happened.
+
+Failed, rejected or cancelled operations, reads, discussion, and plan artifacts
+under `plan://`, `.pi/plans`, or `.omp/plans` do not trigger the handoff. An
+editor-mediated write must have a readable preimage and a verified changed
+result; an acknowledgment with unknown contents is insufficient. Shell commands
+and extension-specific mutation tools remain unclassified.
 
 The handoff waits for every call in the current tool batch. Queued steering is
 kept, cancellation prevents another provider request, and a newer explicit

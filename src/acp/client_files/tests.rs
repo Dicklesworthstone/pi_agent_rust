@@ -504,6 +504,7 @@ fn native_edit_and_write_target_editor_and_report_formatter_readback() {
                 "write",
                 json!({"path":"new.txt", "content":"requested"}),
                 vec![
+                    ("fs/read_text_file", json!({"content":"before"})),
                     ("fs/write_text_file", json!({})),
                     ("fs/read_text_file", json!({"content":"formatted"})),
                 ],
@@ -629,10 +630,76 @@ fn write_only_acknowledgment_does_not_claim_verified_bytes() {
         let details = output.details.as_ref().unwrap();
         assert_eq!(details["destination"], "editor");
         assert_eq!(details["verified"], false);
+        assert!(details["changed"].is_null());
+        let mut prewalk = crate::prewalk::PrewalkState::new(
+            crate::prewalk::PrewalkTarget {
+                provider: "test".into(),
+                model: "implementation".into(),
+                thinking: None,
+            },
+            true,
+        );
+        prewalk.observe(
+            fixture
+                .tools
+                .get("write")
+                .unwrap()
+                .prewalk_evidence(&json!({"path":"file.txt", "content":"requested"}), &output),
+        );
+        assert!(!prewalk.ready());
         assert!(details.get("diff").is_none());
         assert!(text(&output).contains("not rolled back"));
         assert!(!fixture.abort.is_aborted());
         assert!(!fixture.root.path().join("file.txt").exists());
+    });
+}
+
+#[test]
+fn editor_write_prewalk_requires_a_verified_change_from_the_observed_preimage() {
+    asupersync::test_utils::run_test(|| async {
+        for (before, after, expected) in [
+            (json!({"content":"before"}), "changed", json!(true)),
+            // The editor may transform the requested bytes back to the original.
+            (json!({"content":"before"}), "before", json!(false)),
+            // A malformed or inaccessible preimage cannot prove a change, but
+            // it must not prevent an otherwise valid editor write.
+            (json!({"content":7}), "changed", Value::Null),
+        ] {
+            let fixture = Fixture::new(true, true);
+            let arguments = json!({"path":"file.txt", "content":"changed"});
+            let output = fixture
+                .tool(
+                    "write",
+                    arguments.clone(),
+                    vec![
+                        ("fs/read_text_file", before),
+                        ("fs/write_text_file", json!({})),
+                        ("fs/read_text_file", json!({"content":after})),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert!(!output.is_error);
+            assert_eq!(output.details.as_ref().unwrap()["changed"], expected);
+            let mut prewalk = crate::prewalk::PrewalkState::new(
+                crate::prewalk::PrewalkTarget {
+                    provider: "test".into(),
+                    model: "implementation".into(),
+                    thinking: None,
+                },
+                true,
+            );
+            prewalk.observe(
+                fixture
+                    .tools
+                    .get("write")
+                    .unwrap()
+                    .prewalk_evidence(&arguments, &output),
+            );
+            assert_eq!(prewalk.ready(), expected == true);
+            assert!(!fixture.root.path().join("file.txt").exists());
+            assert!(!fixture.abort.is_aborted());
+        }
     });
 }
 
@@ -710,6 +777,10 @@ fn cancelled_unpublished_writes_are_safe_and_published_writes_fence_the_owning_s
             json!({"path":"file.txt", "content":"new"}),
             None,
         ));
+        let preimage = fixture
+            .await_frame(pending.as_mut(), "fs/read_text_file")
+            .await;
+        fixture.reply(&preimage, json!({"content":"before"}));
         assert!(futures::poll!(pending.as_mut()).is_pending());
         let request = fixture.frame("fs/write_text_file");
         drop(pending);

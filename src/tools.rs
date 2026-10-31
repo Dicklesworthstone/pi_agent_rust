@@ -341,6 +341,18 @@ pub trait Tool: Send + Sync {
     /// Get the tool parameters as JSON Schema.
     fn parameters(&self) -> serde_json::Value;
 
+    /// Host-only planning/mutation evidence from this tool's raw successful
+    /// execution. Ordinary, extension and MCP tools cannot opt in by naming
+    /// themselves after a native tool or returning similar-looking details.
+    #[doc(hidden)]
+    fn prewalk_evidence(
+        &self,
+        _input: &serde_json::Value,
+        _output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::default()
+    }
+
     /// Execute the tool.
     ///
     /// Tools may call `on_update` to stream incremental results (e.g. while a long-running `bash`
@@ -11708,6 +11720,17 @@ fn apply_file_text_replacement(
         "edit",
     )?;
     outcome.final_content = notebook.serialize_edited(&outcome.final_content)?;
+    // Different marker spellings can refer to the same original cell. The
+    // serialized notebook, rather than its editable projection, owns mutation.
+    if outcome.final_content == source {
+        return Err(Error::tool(
+            "edit",
+            format!(
+                "No changes made to {}. The edit produced identical notebook JSON.",
+                input.path
+            ),
+        ));
+    }
     Ok(outcome)
 }
 
@@ -11723,6 +11746,15 @@ fn apply_file_hashline_edits(
     let editable = notebook.editable_text()?;
     let mut outcome = apply_hashline_edits_to_content(&editable, &input.edits, &input.path)?;
     outcome.final_content = notebook.serialize_edited(&outcome.final_content)?;
+    if outcome.final_content == source {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!(
+                "No changes made to {}. The edits produced identical notebook JSON.",
+                input.path
+            ),
+        ));
+    }
     Ok(outcome)
 }
 
@@ -12122,21 +12154,23 @@ fn apply_hashline_edits_to_content(
         }
     }
 
-    if !any_change {
-        return Err(Error::tool(
-            "hashline_edit",
-            format!(
-                "No changes made to {display_path}. All edits were no-ops (replacement identical to existing content)."
-            ),
-        ));
-    }
-
     // Reconstruct content
     let after_normalized = lines.join("\n");
     let new_content = restore_line_endings(&after_normalized, original_ending);
     let mut final_content = new_content;
     if had_bom {
         final_content = format!("\u{FEFF}{final_content}");
+    }
+
+    // Individually effective, nonoverlapping operations can cancel each other
+    // out. A successful edit must change the final image, not just a splice.
+    if !any_change || final_content == raw_content {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!(
+                "No changes made to {display_path}. The edits were no-ops or cancelled each other out, leaving identical content."
+            ),
+        ));
     }
 
     Ok(HashlineApplyOutcome {
@@ -12260,6 +12294,14 @@ impl HashlineEditTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EditTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::text_edit(input, output)
+    }
+
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
     }
@@ -12504,6 +12546,35 @@ struct WriteInput {
     content: String,
 }
 
+/// Compare the admitted preimage without allocating another file-sized buffer.
+/// An unreadable preimage is unknown, not evidence that a write changed bytes;
+/// write-only access must retain its existing successful execution behavior.
+fn write_content_changed(path: &Path, roots: &[PathBuf], content: &[u8]) -> Option<bool> {
+    let mut file = match open_regular_file_within_roots_with(path, roots, || {}) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(true),
+        Err(_) => return None,
+    };
+    if file.metadata().ok()?.len() != u64::try_from(content.len()).ok()? {
+        return Some(true);
+    }
+    let mut buffer = [0_u8; 8192];
+    let mut offset = 0;
+    while offset < content.len() {
+        let length = buffer.len().min(content.len() - offset);
+        match file.read_exact(&mut buffer[..length]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Some(true),
+            Err(_) => return None,
+        }
+        if buffer[..length] != content[offset..offset + length] {
+            return Some(true);
+        }
+        offset += length;
+    }
+    Some(file.read(&mut buffer[..1]).ok()? != 0)
+}
+
 pub struct WriteTool {
     cwd: PathBuf,
     output_enabled: bool,
@@ -12596,6 +12667,7 @@ impl WriteTool {
         }
         let resolved = resolved?;
         let regions: Vec<_> = resolved
+            .regions
             .iter()
             .map(|region| serde_json::json!({"index": region.index, "file": region.file}))
             .collect();
@@ -12609,6 +12681,7 @@ impl WriteTool {
                 "schema": "pi.conflict.write.v1",
                 "regions": regions,
                 "paths": paths,
+                "changedPaths": resolved.changed_paths,
                 "gitIndexUpdated": false
             })),
             is_error: false,
@@ -12647,6 +12720,32 @@ fn ends_with_read_truncation_notice(content: &str) -> bool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        let Some(details) = &output.details else {
+            return crate::prewalk::ToolEvidence::default();
+        };
+        if details["schema"] == "pi.conflict.write.v1" {
+            return crate::prewalk::ToolEvidence::paths(
+                details["changedPaths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            );
+        }
+        if details["changed"] == true {
+            crate::prewalk::ToolEvidence::paths(
+                input.get("path").and_then(serde_json::Value::as_str),
+            )
+        } else {
+            crate::prewalk::ToolEvidence::default()
+        }
+    }
+
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
     }
@@ -12908,18 +13007,21 @@ impl Tool for WriteTool {
             recorder.begin_file(tool_call_id, "write", &path);
         }
         let persisted = asupersync::runtime::spawn_blocking_io(move || {
-            before_persist_hook.map_or_else(
-                || atomic_replace_file(&path_clone, &cwd_clone, &content_bytes),
-                |hook| {
-                    atomic_replace_file_with(
-                        &path_clone,
-                        &cwd_clone,
-                        &content_bytes,
-                        None,
-                        move || hook(),
-                    )
-                },
-            )
+            let changed = write_content_changed(&path_clone, &cwd_clone, &content_bytes);
+            before_persist_hook
+                .map_or_else(
+                    || atomic_replace_file(&path_clone, &cwd_clone, &content_bytes),
+                    |hook| {
+                        atomic_replace_file_with(
+                            &path_clone,
+                            &cwd_clone,
+                            &content_bytes,
+                            None,
+                            move || hook(),
+                        )
+                    },
+                )
+                .map(|()| changed)
         })
         .await
         .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")));
@@ -12930,14 +13032,14 @@ impl Tool for WriteTool {
                 recorder.abort(tool_call_id);
             }
         }
-        persisted?;
+        let changed = persisted?;
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Successfully wrote {} bytes to {}",
                 bytes_written, input.path
             )))],
-            details: None,
+            details: Some(serde_json::json!({"changed":changed})),
             is_error: false,
         })
     }
@@ -18113,6 +18215,14 @@ fn op_precedence(op: &str) -> u8 {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for HashlineEditTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::text_edit(input, output)
+    }
+
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
     }
@@ -26272,6 +26382,83 @@ mod tests {
                 err_msg.contains("no-ops"),
                 "error should mention no-ops: {err_msg}"
             );
+        });
+    }
+
+    #[test]
+    fn test_hashline_edit_rejects_operations_that_cancel_each_other_out() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("test.txt");
+            let original = "a\na\n";
+            std::fs::write(&file, original).unwrap();
+            let tool = HashlineEditTool::new(dir.path());
+            let input = serde_json::json!({
+                "path": file,
+                "edits": [
+                    {"op":"replace", "pos":format_hashline_tag(0, "a"), "lines":[]},
+                    {"op":"append", "pos":format_hashline_tag(1, "a"), "lines":["a"]}
+                ]
+            });
+            let error = tool
+                .execute("net-zero-edit", input, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("leaving identical content"));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn test_notebook_marker_aliases_do_not_report_successful_native_edits() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("analysis.ipynb");
+            let source = serde_json::json!({
+                "nbformat":4, "nbformat_minor":5, "metadata":{},
+                "cells":[{
+                    "id":"code", "cell_type":"code", "metadata":{},
+                    "source":["value = 1\n"], "execution_count":null, "outputs":[]
+                }]
+            })
+            .to_string();
+            let notebook = crate::notebook::Notebook::parse(&source, "analysis.ipynb").unwrap();
+            // Start with canonical JSON so a formatting-only rewrite cannot
+            // hide that both marker spellings denote exactly the same cell.
+            let original = notebook
+                .serialize_edited(&notebook.editable_text().unwrap())
+                .unwrap();
+            std::fs::write(&file, &original).unwrap();
+            let tools = ToolRegistry::new(&["edit", "hashline_edit"], dir.path(), None);
+            for (name, input) in [
+                (
+                    "edit",
+                    serde_json::json!({
+                        "path":file, "oldText":"# %% [code] cell:0", "newText":"# %% [code] cell:00"
+                    }),
+                ),
+                (
+                    "hashline_edit",
+                    serde_json::json!({
+                        "path":file, "edits":[{
+                            "op":"replace", "pos":format_hashline_tag(0, "# %% [code] cell:0"),
+                            "lines":["# %% [code] cell:00"]
+                        }]
+                    }),
+                ),
+            ] {
+                let error = tools
+                    .get(name)
+                    .unwrap()
+                    .execute("marker-alias", input, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("identical notebook JSON"),
+                    "{name}: {error}"
+                );
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+            }
         });
     }
 

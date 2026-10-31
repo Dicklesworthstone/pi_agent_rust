@@ -862,7 +862,7 @@ mod write_tool {
 
             let text = get_text_content(&result.content);
             assert!(text.contains("Successfully wrote 20 bytes"));
-            assert!(result.details.is_none());
+            assert_eq!(result.details, Some(serde_json::json!({"changed":true})));
         });
     }
 

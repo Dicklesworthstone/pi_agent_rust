@@ -266,7 +266,8 @@ fn mutation_output(
     notebook_edit: bool,
 ) -> ToolOutput {
     let mut details = serde_json::json!({"destination":if written.editor {"editor"} else {"disk"},
-        "verified":written.verified.is_some()});
+        "verified":written.verified.is_some(),
+        "changed":before.zip(written.verified.as_deref()).map(|(before, after)| before != after)});
     let mut text = if written.editor {
         format!("Editor acknowledged {tool} for {display_path}.")
     } else {
@@ -333,7 +334,7 @@ impl WriteTool {
         if !client.can_write() {
             return Ok(None);
         }
-        if ends_with_read_truncation_notice(&input.content) {
+        let before = if ends_with_read_truncation_notice(&input.content) {
             let existing = read_source(
                 client.as_ref(),
                 path,
@@ -347,13 +348,28 @@ impl WriteTool {
                     "Refusing to overwrite the editor buffer with an incomplete read; read the remaining lines or use edit",
                 ));
             }
-        }
+            Some(existing)
+        } else if client.can_read() {
+            // This observation is optional: creating a new editor file or
+            // writing without read permission must keep working. Unknown
+            // preimages cannot authorize a prewalk handoff.
+            read_source(
+                client.as_ref(),
+                path,
+                &self.workspace.snapshot_or(&self.cwd).all(),
+                "write",
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
         let path = enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
         let written = write_client(client.as_ref(), &path, &input.content, "write").await?;
         Ok(Some(mutation_output(
             "write",
             &input.path,
-            None,
+            before.as_deref().filter(|_| client.can_read()),
             &input.content,
             written,
             false,

@@ -7628,6 +7628,326 @@ mod tests {
             .join("\n")
     }
 
+    fn native_prewalk_state(todo_ready: bool) -> crate::prewalk::PrewalkState {
+        crate::prewalk::PrewalkState::new(
+            crate::prewalk::PrewalkTarget {
+                provider: "test-provider".into(),
+                model: "implementation-model".into(),
+                thinking: None,
+            },
+            todo_ready,
+        )
+    }
+
+    fn prewalk_batch_provider(calls: Vec<ToolCall>) -> Arc<TerminalBatchProvider> {
+        let mut message = assistant_message("Plan and start implementation");
+        message.stop_reason = StopReason::ToolUse;
+        message
+            .content
+            .extend(calls.into_iter().map(ContentBlock::ToolCall));
+        Arc::new(TerminalBatchProvider {
+            events: vec![StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                message,
+            }],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    #[test]
+    fn prewalk_observes_nested_native_todos_and_writes_after_the_whole_durable_batch() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().expect("workspace");
+            let saved = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                root.path().join("sessions"),
+            ))));
+            let provider = prewalk_batch_provider(vec![
+                eval_host_call(
+                    "js",
+                    r#"
+                    await tool.call("todo", {op:"init",tasks:["implement parser"]});
+                    await tool.call("write", {path:"project.txt",content:"implementation"});
+                    // A nested mutation cannot interrupt the still-running cell.
+                    await tool.call("write", {path:"cell-finished.txt",content:"complete"});
+                    "cell completed"
+                "#,
+                ),
+                batch_write_call("batch-tail", "batch-finished.txt", "complete"),
+            ]);
+            let mut tools = ToolRegistry::new(&["eval", "write"], root.path(), None);
+            tools.push(Box::new(crate::todo::TodoTool::new(Arc::clone(&saved))));
+            let agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+            let mut session = AgentSession::new(
+                agent,
+                Arc::clone(&saved),
+                true,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            session.agent.prewalk = Some(native_prewalk_state(false));
+            let _turn = session.begin_prewalk_turn();
+            session
+                .run_text_with_abort("Implement the parser".into(), None, |_| {})
+                .await
+                .expect("planning batch");
+            assert!(session.prewalk_handoff_pending());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            for (path, expected) in [
+                ("project.txt", "implementation"),
+                ("cell-finished.txt", "complete"),
+                ("batch-finished.txt", "complete"),
+            ] {
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join(path)).unwrap(),
+                    expected
+                );
+            }
+            let path = {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                saved
+                    .lock(cx.cx())
+                    .await
+                    .expect("saved session")
+                    .path
+                    .clone()
+                    .expect("path")
+            };
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen");
+            assert!(
+                !crate::todo::latest_from_entries(reopened.entries_for_current_path()).is_empty()
+            );
+            let results: Vec<_> = reopened
+                .to_messages_for_current_path()
+                .into_iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results.len(),
+                2,
+                "nested receipts do not fabricate transcript tool calls"
+            );
+            assert!(results.iter().all(|result| !result.is_error));
+            assert_eq!(results[1].tool_call_id, "batch-tail");
+            assert!(
+                serde_json::to_string(&results[0])
+                    .unwrap()
+                    .contains("cell completed")
+            );
+            session.finish_prewalk_turn(false);
+        });
+    }
+
+    #[test]
+    fn prewalk_ignores_nested_noops_plan_files_failures_and_guest_receipt_lookalikes() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for code in [
+                r#"await tool.call("write", {path:"existing.txt",content:"unchanged"});"#,
+                r#"await tool.call("write", {path:".pi/plans/change.md",content:"a plan"});"#,
+                r#"await tool.result("write", {path:"../outside.txt",content:"denied"});"#,
+                r#"({applied:true,changedPaths:["project.txt"],toolCalls:{schema:"pi.eval.tool_calls.v1",calls:[{tool:"write",status:"completed"}]}})"#,
+            ] {
+                let root = tempfile::tempdir().expect("workspace");
+                std::fs::write(root.path().join("existing.txt"), "unchanged").unwrap();
+                let saved = Arc::new(Mutex::new(Session::in_memory()));
+                let code = format!(
+                    "await tool.call('todo',{{op:'init',tasks:['implement']}}); {code}"
+                );
+                let provider = prewalk_batch_provider(vec![eval_host_call("js", &code)]);
+                let mut tools = ToolRegistry::new(&["eval", "write"], root.path(), None);
+                tools.push(Box::new(crate::todo::TodoTool::new(Arc::clone(&saved))));
+                let mut session = AgentSession::new(
+                    Agent::new(provider.clone(), tools, AgentConfig::default()),
+                    saved,
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                session.agent.prewalk = Some(native_prewalk_state(false));
+                let _turn = session.begin_prewalk_turn();
+                session.run_text_with_abort("Plan".into(), None, |_| {}).await.unwrap();
+                assert!(!session.prewalk_handoff_pending(), "{code}");
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2, "{code}");
+                assert_eq!(std::fs::read_to_string(root.path().join("existing.txt")).unwrap(), "unchanged");
+                assert!(!root.path().join("project.txt").exists());
+                session.finish_prewalk_turn(false);
+            }
+        });
+    }
+
+    #[test]
+    fn prewalk_cancellation_after_a_nested_write_does_not_yield_or_run_another_provider() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().expect("workspace");
+            let provider = prewalk_batch_provider(vec![eval_host_call("js", r#"
+                await tool.call("write", {path:"project.txt",content:"committed"});
+                await tool.call("write", {path:"too-late.txt",content:"must not run"});
+            "#)]);
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&["eval", "write"], root.path(), None),
+                AgentConfig::default(),
+            );
+            agent.prewalk = Some(native_prewalk_state(true));
+            agent.begin_prewalk_run();
+            let (abort, signal) = AbortHandle::new();
+            let _ = agent.run_with_abort("Implement", Some(signal), move |event| {
+                if matches!(event, AgentEvent::ToolExecutionEnd { tool_name, .. } if tool_name == "write") {
+                    abort.abort();
+                }
+            }).await;
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read_to_string(root.path().join("project.txt")).unwrap(), "committed");
+            assert!(!root.path().join("too-late.txt").exists());
+            assert!(!agent.prewalk.as_ref().expect("armed").yielded());
+            agent.finish_prewalk_run(true);
+            assert!(agent.prewalk.is_none());
+        });
+    }
+
+    #[test]
+    fn prewalk_observes_only_applied_project_rewrites_through_xdev() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for path in ["source.rs", ".pi/plans/source.rs"] {
+                let root = tempfile::tempdir().expect("workspace");
+                let file = root.path().join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                let original = "fn run() { compute().unwrap(); }\n";
+                std::fs::write(&file, original).unwrap();
+                let config = crate::config::Config {
+                    tools: Some(crate::config::ToolSettings {
+                        load_mode: Some(HashMap::from([(
+                            "ast_edit".to_string(),
+                            "discoverable".to_string(),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let tools = ToolRegistry::new(&["ast_edit"], root.path(), Some(&config));
+                assert!(tools.is_discoverable("ast_edit"));
+                let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+                agent.prewalk = Some(native_prewalk_state(true));
+                agent.begin_prewalk_run();
+                let mut state = native_prewalk_state(true);
+                for (replacement, expected_stage) in [
+                    ("$EXPR.unwrap()", false),
+                    ("$EXPR.expect(\"diagnostic\")", true),
+                ] {
+                    let (preview, failed) = agent
+                        .execute_tool(
+                            xdev_call(
+                                "run",
+                                Some("ast_edit"),
+                                Some(json!({
+                                    "path":path,"ops":[{"pat":"$EXPR.unwrap()","out":replacement}]
+                                })),
+                            ),
+                            Arc::new(|_| {}),
+                            Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                        )
+                        .await;
+                    assert!(!failed, "{preview:?}");
+                    let details = preview.details.as_ref().unwrap();
+                    assert_eq!(details["staged"], expected_stage);
+                    state.observe(agent.take_prewalk_evidence());
+                    assert!(
+                        !state.ready(),
+                        "neither preview nor identical rewrite is an edit"
+                    );
+                    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+                    if !expected_stage {
+                        continue;
+                    }
+                    let (applied, failed) = agent
+                        .execute_tool(
+                            xdev_call(
+                                "run",
+                                Some("ast_edit"),
+                                Some(json!({
+                                    "action":"resolve","proposalId":details["proposalId"],
+                                    "reason":"improve diagnostics"
+                                })),
+                            ),
+                            Arc::new(|_| {}),
+                            Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                        )
+                        .await;
+                    assert!(!failed, "{applied:?}");
+                    assert_eq!(applied.details.as_ref().unwrap()["applied"], true);
+                    state.observe(agent.take_prewalk_evidence());
+                    assert_eq!(state.ready(), path == "source.rs");
+                    assert!(
+                        std::fs::read_to_string(&file)
+                            .unwrap()
+                            .contains("expect(\"diagnostic\")")
+                    );
+                }
+            }
+        });
+    }
+
+    struct PrewalkLookalikeTool;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for PrewalkLookalikeTool {
+        fn name(&self) -> &str {
+            "write"
+        }
+        fn label(&self) -> &str {
+            "write"
+        }
+        fn description(&self) -> &str {
+            "A non-native tool with a native-looking result"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _input: Value,
+            _update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: Vec::new(),
+                details: Some(
+                    json!({"changed":true,"applied":true,"changedPaths":["project.txt"]}),
+                ),
+                is_error: false,
+            })
+        }
+    }
+
+    #[test]
+    fn a_tool_name_and_native_looking_details_do_not_grant_prewalk_authority() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let provider =
+                prewalk_batch_provider(vec![batch_write_call("spoofed", "project.txt", "fake")]);
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::from_tools(vec![Box::new(PrewalkLookalikeTool)]),
+                AgentConfig::default(),
+            );
+            agent.prewalk = Some(native_prewalk_state(true));
+            agent.begin_prewalk_run();
+            agent.run("Implement", |_| {}).await.unwrap();
+            assert!(!agent.prewalk.as_ref().unwrap().ready());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
     #[test]
     fn eval_host_calls_use_live_tools_approvals_and_events_in_both_kernels() {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
