@@ -1659,12 +1659,12 @@ fn run_rpc_manual_compaction(
                 if abort_signal.is_aborted() {
                     return Err(Error::Aborted);
                 }
-                let mut guard = OwnedMutexGuard::lock(session, &owner)
+                let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &owner)
                     .await
                     .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                 let provider_admission = guard.provider_admission_gate();
                 guard.invalidate_background_compaction();
-                let _provider_call = provider_admission.acquire(&owner).await?;
+                let _compacting = guard.start_compaction_activity();
                 provider_admission.ensure_allowed()?;
                 let (mut candidate, source) = {
                     let mut inner_session =
@@ -1697,44 +1697,117 @@ fn run_rpc_manual_compaction(
                 if abort_signal.is_aborted() {
                     return Err(Error::Aborted);
                 }
-                let stream_options = guard.agent.stream_options().clone();
-                let privacy = guard.agent.compaction_privacy();
-                let compact = compact(
-                    prep,
-                    guard.agent.provider(),
-                    &stream_options,
+                let before_compact = guard.dispatch_before_compact(
+                    &prep,
+                    &path_entries,
                     custom_instructions.as_deref(),
-                    &privacy,
                 );
+                // Hooks can call the host compaction bridge or inspect/edit
+                // the session. They own no outer, store, or admission lock.
+                drop(guard);
                 let cancelled = abort_signal.wait();
-                futures::pin_mut!(compact, cancelled);
-                let result_data = match futures::future::select(cancelled, compact).await {
+                futures::pin_mut!(before_compact, cancelled);
+                let before_outcome = match futures::future::select(cancelled, before_compact).await {
                     futures::future::Either::Left(_) => return Err(Error::Aborted),
-                    futures::future::Either::Right((result, _)) => result?,
+                    futures::future::Either::Right((outcome, _)) => outcome,
                 };
                 if abort_signal.is_aborted() {
                     return Err(Error::Aborted);
                 }
-                let details_value = compaction_details_to_value(&result_data.details)?;
-                let details_value = match result_data.snap_payload.as_ref() {
-                    Some(payload) => {
-                        crate::compaction_snap::payload_to_details(Some(details_value), payload)
+                if before_outcome.cancel {
+                    // Match the SDK's hook veto: an aborted progress pair,
+                    // followed by the request's extension error response.
+                    completion.progress.finish(None, true, false, None);
+                    return Err(Error::extension("Compaction cancelled"));
+                }
+                let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                {
+                    let inner_session = OwnedMutexGuard::lock(Arc::clone(&guard.session), &owner)
+                        .await
+                        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                    if SessionEditSnapshot::capture(&inner_session)? != source {
+                        return Err(Error::session(
+                            "Manual compaction context changed during session_before_compact; retry against the current session",
+                        ));
                     }
-                    None => details_value,
-                };
-                candidate.append_compaction(
-                    result_data.summary.clone(),
-                    result_data.first_kept_entry_id.clone(),
-                    result_data.tokens_before,
-                    Some(details_value.clone()),
-                    None,
+                }
+                let provider_call = provider_admission.acquire(&owner).await?;
+                provider_admission.ensure_allowed()?;
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let (summary, first_kept_entry_id, tokens_before, details, from_extension) =
+                    if let Some(compaction) = before_outcome.compaction {
+                        (
+                            compaction.summary,
+                            compaction.first_kept_entry_id,
+                            compaction.tokens_before,
+                            compaction.details,
+                            true,
+                        )
+                    } else {
+                        let mut stream_options = guard.agent.stream_options().clone();
+                        guard.refresh_compaction_credential(&mut stream_options)?;
+                        let privacy = guard.agent.compaction_privacy();
+                        let compact = compact(
+                            prep,
+                            guard.agent.provider(),
+                            &stream_options,
+                            custom_instructions.as_deref(),
+                            &privacy,
+                        );
+                        let cancelled = abort_signal.wait();
+                        futures::pin_mut!(compact, cancelled);
+                        let result_data = match futures::future::select(cancelled, compact).await {
+                            futures::future::Either::Left(_) => return Err(Error::Aborted),
+                            futures::future::Either::Right((result, _)) => result?,
+                        };
+                        let details_value = compaction_details_to_value(&result_data.details)?;
+                        let details_value = match result_data.snap_payload.as_ref() {
+                            Some(payload) => crate::compaction_snap::payload_to_details(
+                                Some(details_value),
+                                payload,
+                            ),
+                            None => details_value,
+                        };
+                        (
+                            result_data.summary,
+                            result_data.first_kept_entry_id,
+                            result_data.tokens_before,
+                            Some(details_value),
+                            false,
+                        )
+                    };
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let entry_id = candidate.append_compaction(
+                    summary.clone(),
+                    first_kept_entry_id.clone(),
+                    tokens_before,
+                    details.clone(),
+                    from_extension.then_some(true),
                 );
+                // The provider (including an extension's host bridge) bills
+                // the live account after this candidate was cloned. Persist
+                // that account with the summary before acknowledging success.
+                if let Some(budget) = guard.agent.cost_budget() {
+                    budget.checkpoint(&mut candidate)?;
+                }
+                let installed = match candidate.get_entry(&entry_id) {
+                    Some(SessionEntry::Compaction(entry)) => {
+                        Some(guard.dispatch_compaction_installed(entry, from_extension))
+                    }
+                    _ => None,
+                };
                 let tokens_after = crate::compaction::estimate_entries_context_tokens(
                     &candidate.entries_for_current_path(),
                 );
                 let messages = candidate.to_messages_for_current_path();
                 let session_actions = guard.session_action_admission_gate();
-                let _session_action = session_actions.acquire(&owner).await?;
+                let session_action = session_actions.acquire(&owner).await?;
                 let mut inner_session = OwnedMutexGuard::lock(Arc::clone(&guard.session), &owner)
                     .await
                     .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
@@ -1769,13 +1842,23 @@ fn run_rpc_manual_compaction(
                 if save_enabled {
                     provider_admission.clear();
                 }
-                Ok(json!({
-                    "summary": result_data.summary,
-                    "firstKeptEntryId": result_data.first_kept_entry_id,
-                    "tokensBefore": result_data.tokens_before,
+                drop(inner_session);
+                drop(session_action);
+                drop(provider_call);
+                drop(guard);
+                if let Some(installed) = installed {
+                    installed.await;
+                }
+                let mut result = json!({
+                    "summary": summary,
+                    "firstKeptEntryId": first_kept_entry_id,
+                    "tokensBefore": tokens_before,
                     "tokensAfter": tokens_after,
-                    "details": details_value,
-                }))
+                });
+                if let Some(details) = details {
+                    result["details"] = details;
+                }
+                Ok(result)
             }
             .await;
             let result = match result {
@@ -17608,6 +17691,77 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BilledCompactionProvider {
+        observed_keys: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for BilledCompactionProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            self.observed_keys
+                .lock()
+                .unwrap()
+                .push(options.api_key.clone());
+            let summary = "billed manual compaction summary".to_string();
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(summary.clone()))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage {
+                    cost: crate::model::Cost {
+                        total: 0.75,
+                        ..Default::default()
+                    },
+                    ..Usage::default()
+                },
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: summary.clone(),
+                }),
+                Ok(crate::model::StreamEvent::TextEnd {
+                    content_index: 0,
+                    content: summary,
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
     struct GatedAutoCompactionProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         compaction_entered: Mutex<Option<asupersync::channel::oneshot::Sender<()>>>,
@@ -17832,6 +17986,289 @@ mod tests {
                 compactions[0].summary,
                 events[1]["result"]["summary"].as_str().unwrap()
             );
+        }));
+    }
+
+    #[test]
+    fn rpc_manual_compaction_commits_its_bill_and_refreshes_credentials_before_acknowledging() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut stored = seed_auto_compaction_session(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            )));
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            budget.checkpoint(&mut stored).unwrap();
+            stored.save().await.unwrap();
+            let path = stored.path.clone().unwrap();
+            let observed_keys = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(BilledCompactionProvider {
+                observed_keys: Arc::clone(&observed_keys),
+            });
+            let mut agent_session = handoff_agent_session(stored, true, provider);
+            agent_session.agent.set_cost_budget(Some(budget.clone()));
+            agent_session.agent.stream_options_mut().api_key = Some("expired-key".to_string());
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            options.auth.set(
+                "test-provider".to_string(),
+                AuthCredential::ApiKey {
+                    key: "current-key".to_string(),
+                },
+            );
+            let (in_tx, in_rx) = mpsc::channel(4);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        json!({"id":"billed","type":"compact","keepRecentTokens":1}).to_string(),
+                    )
+                    .await
+                    .unwrap();
+                let start = parse_response(&recv_line(&out_rx, "billed start").await.unwrap());
+                let end = parse_response(&recv_line(&out_rx, "billed end").await.unwrap());
+                let response =
+                    parse_response(&recv_line(&out_rx, "billed response").await.unwrap());
+                assert_eq!(start["type"], "manual_compaction_start");
+                assert_eq!(end["type"], "manual_compaction_end");
+                assert_eq!(end["aborted"], false);
+                assert_ok(&response, "compact");
+                assert_eq!(end["result"], response["data"]);
+                assert_eq!(
+                    *observed_keys.lock().unwrap(),
+                    vec![Some("current-key".to_string())],
+                    "manual compaction must refresh the credential at provider admission",
+                );
+                assert_eq!(budget.spent(), 1.0);
+
+                // Reopen before EOF: terminal cleanup must not repair a
+                // missing checkpoint after the compact response was sent.
+                let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+                let restored = crate::cost::resolve_budget(&reopened, None, None, Some(1.0), None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(restored.spent(), 1.0);
+                assert!(matches!(
+                    restored.admit(),
+                    Err(Error::CostCap { spent, cap }) if spent == 1.0 && cap == 1.0
+                ));
+                assert!(reopened.entries.iter().any(|entry| matches!(
+                    entry,
+                    SessionEntry::Compaction(entry)
+                        if entry.summary == "billed manual compaction summary"
+                )));
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
+            result.expect("billed manual compaction drains");
+        }));
+    }
+
+    #[test]
+    fn rpc_manual_compaction_honors_real_extension_hooks_and_install_boundaries() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for mode in ["cancel", "replace", "bridge", "mutate", "save-failure"] {
+                let temp = tempfile::tempdir().unwrap();
+                let extension_path = temp.path().join("manual-compaction.mjs");
+                std::fs::write(
+                    &extension_path,
+                    format!(
+                        "const mode = {};\n{}",
+                        serde_json::to_string(mode).unwrap(),
+                        r#"
+                        export default function init(pi) {
+                          const probe = { before: 0, after: 0 };
+                          pi.on("session_before_compact", async (event, ctx) => {
+                            probe.before += 1;
+                            probe.instructions = event.customInstructions;
+                            probe.branchEntries = event.branchEntries.length;
+                            if (mode === "cancel") return { cancel: true };
+                            if (mode === "mutate") {
+                              await pi.session("appendEntry", {
+                                customType: "hook-source-edit", data: { preserved: true }
+                              });
+                            }
+                            if (mode === "bridge") {
+                              return { compaction: await ctx.compact(event.preparation, {
+                                customInstructions: event.customInstructions
+                              }) };
+                            }
+                            return { compaction: {
+                              summary: "extension-owned summary",
+                              firstKeptEntryId: event.preparation.firstKeptEntryId,
+                              tokensBefore: event.preparation.tokensBefore,
+                              details: { fixture: mode }
+                            } };
+                          });
+                          pi.on("session_compact", async event => {
+                            probe.after += 1;
+                            probe.fromExtension = event.fromExtension;
+                            const entries = await pi.session("getEntries", {});
+                            probe.installed = entries.some(entry =>
+                              entry.type === "compaction" &&
+                              entry.id === event.compactionEntry.id &&
+                              entry.summary === event.compactionEntry.summary);
+                          });
+                          pi.on("input", () => ({
+                            action: "transform", text: JSON.stringify(probe)
+                          }));
+                        }
+                        "#,
+                    ),
+                )
+                .unwrap();
+                let mut stored = seed_auto_compaction_session(Session::create_with_dir(Some(
+                    temp.path().join("sessions"),
+                )));
+                let budget = crate::cost::CostBudget::new(None, Some(2.0), 0.0).unwrap();
+                budget.record(0.25).unwrap();
+                budget.checkpoint(&mut stored).unwrap();
+                if mode == "save-failure" {
+                    let blocked = temp.path().join("blocked.jsonl");
+                    std::fs::create_dir(&blocked).unwrap();
+                    stored.path = Some(blocked);
+                } else {
+                    stored.save().await.unwrap();
+                }
+                let path = stored.path.clone().unwrap();
+                let initial = serde_json::to_value(&stored.entries).unwrap();
+                let observed_keys = Arc::new(Mutex::new(Vec::new()));
+                let provider = Arc::new(BilledCompactionProvider {
+                    observed_keys: Arc::clone(&observed_keys),
+                });
+                let mut agent_session = handoff_agent_session(stored, true, provider);
+                agent_session.agent.set_cost_budget(Some(budget.clone()));
+                agent_session.agent.stream_options_mut().api_key = Some("hook-key".to_string());
+                agent_session.refresh_extension_completion_host_state();
+                agent_session
+                    .enable_extensions(&[], temp.path(), None, &[extension_path])
+                    .await
+                    .expect("real compaction hooks load");
+                let manager = agent_session.extensions.as_ref().unwrap().manager().clone();
+                let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+                let compacting = Arc::new(AtomicBool::new(true));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    Box::pin(run_rpc_manual_compaction(
+                        runtime_handle.clone(),
+                        AgentCx::for_testing(),
+                        Arc::clone(&session),
+                        Some(mode.to_string()),
+                        Some("keep the unresolved decision".to_string()),
+                        ResolvedCompactionSettings {
+                            keep_recent_tokens: 1,
+                            ..Default::default()
+                        },
+                        out_tx,
+                        RpcOutput::default(),
+                        Arc::clone(&compacting),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(asupersync::sync::Mutex::new(None)),
+                    )),
+                )
+                .await
+                .expect("hooks must not deadlock provider or session admission");
+                assert!(!compacting.load(Ordering::SeqCst));
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert_eq!(events.len(), 3, "one lifecycle pair and response: {mode}");
+                assert_eq!(events[0]["type"], "manual_compaction_start");
+                assert_eq!(events[1]["type"], "manual_compaction_end");
+                assert_eq!(events[2]["id"], mode);
+                let probe = manager
+                    .dispatch_event_with_response(
+                        ExtensionEventName::Input,
+                        Some(json!({"text":"inspect", "images":[]})),
+                        EXTENSION_EVENT_TIMEOUT_MS,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let probe: Value = serde_json::from_str(probe["text"].as_str().unwrap()).unwrap();
+                assert_eq!(probe["before"], 1);
+                assert_eq!(probe["instructions"], "keep the unresolved decision");
+                assert!(probe["branchEntries"].as_u64().unwrap() > 1);
+                let successful = matches!(mode, "replace" | "bridge");
+                assert_eq!(probe["after"], u64::from(successful));
+                assert_eq!(
+                    observed_keys.lock().unwrap().len(),
+                    usize::from(mode == "bridge")
+                );
+                if successful {
+                    assert_ok(&events[2], "compact");
+                    assert_eq!(events[1]["result"], events[2]["data"]);
+                    assert_eq!(probe["fromExtension"], true);
+                    assert_eq!(probe["installed"], true);
+                    let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+                    let compactions = reopened
+                        .entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            SessionEntry::Compaction(entry) => Some(entry),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(compactions.len(), 1);
+                    assert_eq!(compactions[0].from_hook, Some(true));
+                    assert_eq!(
+                        compactions[0].summary,
+                        events[2]["data"]["summary"].as_str().unwrap()
+                    );
+                    let expected_cost = if mode == "bridge" { 1.0 } else { 0.25 };
+                    assert_eq!(
+                        crate::cost::recorded_spend(&reopened).unwrap(),
+                        expected_cost
+                    );
+                    assert_eq!(budget.spent(), expected_cost);
+                } else {
+                    assert_err(&events[2], "compact");
+                    assert_eq!(events[1]["aborted"], mode == "cancel");
+                    let guard = session.try_lock().unwrap();
+                    let stored = guard.session.try_lock().unwrap();
+                    assert!(
+                        stored
+                            .entries
+                            .iter()
+                            .all(|entry| !matches!(entry, SessionEntry::Compaction(_)))
+                    );
+                    if mode == "mutate" {
+                        assert!(
+                            events[2]["error"]
+                                .as_str()
+                                .unwrap()
+                                .contains("context changed")
+                        );
+                        assert!(stored.entries.iter().any(|entry| matches!(
+                            entry,
+                            SessionEntry::Custom(entry) if entry.custom_type == "hook-source-edit"
+                        )));
+                    } else {
+                        assert_eq!(serde_json::to_value(&stored.entries).unwrap(), initial);
+                    }
+                    assert_eq!(
+                        guard.provider_admission_gate().reason().is_some(),
+                        mode == "save-failure"
+                    );
+                }
+            }
         }));
     }
 

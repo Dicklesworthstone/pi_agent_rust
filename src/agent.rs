@@ -7231,7 +7231,7 @@ impl Default for ExtensionHostConfiguration {
 
 /// RAII guard that resets an `AtomicBool` to `false` on drop, ensuring the
 /// flag is cleared even if the enclosing async task is cancelled.
-struct AtomicBoolGuard(Option<Arc<AtomicBool>>);
+pub(crate) struct AtomicBoolGuard(Option<Arc<AtomicBool>>);
 
 impl AtomicBoolGuard {
     fn activate(flag: &Arc<AtomicBool>) -> Self {
@@ -17492,7 +17492,7 @@ impl AgentSession {
             .or_else(|| normalize_api_key_opt(entry.api_key.clone())))
     }
 
-    fn refresh_compaction_credential(&self, options: &mut StreamOptions) -> Result<()> {
+    pub(crate) fn refresh_compaction_credential(&self, options: &mut StreamOptions) -> Result<()> {
         let provider = self.agent.provider();
         let entry = self.current_model_entry();
         ExtensionCompactionModelState::refresh_key_from_sources(
@@ -17627,6 +17627,10 @@ impl AgentSession {
         self.compaction_worker.invalidate_for_context_switch();
         self.extensions_is_compacting
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn start_compaction_activity(&self) -> AtomicBoolGuard {
+        AtomicBoolGuard::activate(&self.extensions_is_compacting)
     }
 
     /// Whether a background compaction task is currently pending.
@@ -19352,21 +19356,41 @@ impl AgentSession {
         // before dispatching the re-entrant post-install extension hook.
         drop(provider_admission);
 
-        if let (Some(region), Some(compaction_entry)) = (&self.extensions, compaction_entry) {
-            let payload = json!({
-                "compactionEntry": compaction_entry,
-                "fromExtension": from_extension,
-            });
-            if let Err(err) = region
-                .manager()
+        if let Some(compaction_entry) = compaction_entry {
+            self.dispatch_compaction_installed(&compaction_entry, from_extension)
+                .await;
+        }
+
+        Ok(tokens_after)
+    }
+
+    /// Notify extensions only after durable installation. The owned future
+    /// lets drivers release their outer AgentSession guard before callbacks.
+    pub(crate) fn dispatch_compaction_installed(
+        &self,
+        compaction_entry: &crate::session::CompactionEntry,
+        from_extension: bool,
+    ) -> BoxFuture<'static, ()> {
+        let Some(manager) = self
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().clone())
+        else {
+            return futures::future::ready(()).boxed();
+        };
+        let payload = json!({
+            "compactionEntry": compaction_entry,
+            "fromExtension": from_extension,
+        });
+        async move {
+            if let Err(err) = manager
                 .dispatch_event(ExtensionEventName::SessionCompact, Some(payload))
                 .await
             {
                 tracing::warn!("session_compact extension hook failed (fail-open): {err}");
             }
         }
-
-        Ok(tokens_after)
+        .boxed()
     }
 
     /// Apply a completed compaction result to the session.
@@ -20614,16 +20638,20 @@ impl AgentSession {
         }
     }
 
-    async fn dispatch_before_compact(
+    pub(crate) fn dispatch_before_compact(
         &self,
         preparation: &compaction::CompactionPreparation,
         branch_entries: &[crate::session::SessionEntry],
         custom_instructions: Option<&str>,
-    ) -> SessionBeforeCompactOutcome {
-        let Some(region) = &self.extensions else {
-            return SessionBeforeCompactOutcome::default();
+    ) -> BoxFuture<'static, SessionBeforeCompactOutcome> {
+        let Some(manager) = self
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().clone())
+        else {
+            return futures::future::ready(SessionBeforeCompactOutcome::default()).boxed();
         };
-
+        let tokens_before = preparation.tokens_before;
         let prep_value = compaction::compaction_preparation_to_value(preparation);
         let branch_entries_value =
             serde_json::to_value(branch_entries).unwrap_or(Value::Array(Vec::new()));
@@ -20637,24 +20665,28 @@ impl AgentSession {
             );
         }
 
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::SessionBeforeCompact,
-                Some(Value::Object(payload)),
-                // gh #178: a dedicated long-running budget — this hook may
-                // legitimately await the host compaction bridge.
-                ExtensionEventName::SessionBeforeCompact.default_timeout_ms(),
-            )
-            .await;
+        async move {
+            let response = manager
+                .dispatch_event_with_response(
+                    ExtensionEventName::SessionBeforeCompact,
+                    Some(Value::Object(payload)),
+                    // gh #178: a dedicated long-running budget — this hook may
+                    // legitimately await the host compaction bridge.
+                    ExtensionEventName::SessionBeforeCompact.default_timeout_ms(),
+                )
+                .await;
 
-        match response {
-            Ok(value) => apply_session_before_compact_response(value, preparation.tokens_before),
-            Err(err) => {
-                tracing::warn!("session_before_compact extension hook failed (fail-open): {err}");
-                SessionBeforeCompactOutcome::default()
+            match response {
+                Ok(value) => apply_session_before_compact_response(value, tokens_before),
+                Err(err) => {
+                    tracing::warn!(
+                        "session_before_compact extension hook failed (fail-open): {err}"
+                    );
+                    SessionBeforeCompactOutcome::default()
+                }
             }
         }
+        .boxed()
     }
 
     fn prepare_semantic_context_prompt(&self) -> Option<PreparedSemanticContextPrompt> {
