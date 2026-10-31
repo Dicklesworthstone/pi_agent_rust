@@ -32,6 +32,34 @@ This rule is guarded by `tests/traceability_staleness.rs::native_provider_module
 
 Extension-provided providers route through the extension provider bridge in `src/providers/mod.rs`; they are intentionally excluded from the native module count because they are discovered at runtime.
 
+## Gateway Reasoning Discovery
+
+`--fetch-models <provider> --refresh-models --persist-models` retains an
+OpenAI-compatible `/v1/models` row's `supported_reasoning_levels`,
+`reasoning_effort_map`, and Boolean `reasoning_required`. A non-null field
+under `metadata` takes precedence over the same top-level field. These facts
+survive the process cache and the generated catalog used on a later launch.
+
+For example, a route serving `low`, `high`, and `max` can advertise
+`{"medium":"high","xhigh":"max"}`. Selecting `medium` then uses `high`
+instead of the closest lower tier. Aliases apply only to an unserved requested
+level and a served target that is not remapped again. Malformed, oversized,
+unknown, or conflicting metadata does not invent a supported tier.
+
+`reasoning_required: true` clamps thinking off to the lowest served non-off
+tier. Explicit `false` allows thinking off without sending an effort field,
+even when the tier list contains only enabled levels. Omitting the flag keeps
+the existing ladder behavior. User `models.json` settings remain authoritative:
+`reasoning: false` disables reasoning, `supportsReasoningEffort: false` suppresses
+the transport field, and explicit `thinkingLevelMap` entries override discovery
+aliases for the named levels.
+
+This implements the gateway metadata workflow added in
+[OMP v18.14.1](https://github.com/can1357/oh-my-pi/pull/17395). Catalog parsing,
+persistence, cold loading, and request-shape regressions live in
+[`model_fetch.rs`](../src/providers/model_fetch.rs) and
+[`models.rs`](../src/models.rs).
+
 ## Tool Schema Handling
 
 Anthropic Messages requests project root `anyOf`, `oneOf`, and `allOf`

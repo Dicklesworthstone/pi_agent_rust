@@ -42,7 +42,7 @@
 //! supplying a bespoke request builder + JSON shape parser.  Keep the cache
 //! key + fallback paths unchanged; only the network call shape varies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(unix, windows))]
 use std::fs::File;
 #[cfg(any(unix, windows))]
@@ -85,7 +85,14 @@ const MODEL_CACHE_MAX_ENTRIES: usize = 16;
 const MODEL_CACHE_MAX_MODEL_ID_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ADVERTISED_REASONING_LEVELS: usize = 32;
 
-type ReasoningCatalog = HashMap<String, Vec<ThinkingLevel>>;
+type ReasoningCatalog = HashMap<String, DiscoveredReasoning>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DiscoveredReasoning {
+    levels: Vec<ThinkingLevel>,
+    effort_map: Option<BTreeMap<String, ThinkingLevel>>,
+    required: Option<bool>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoveredModels {
@@ -153,7 +160,9 @@ impl ProviderModelCatalog {
     /// advertisement leaves the model's existing capabilities unchanged.
     pub fn reasoning_levels(&self, model_id: &str) -> Option<&[ThinkingLevel]> {
         let (_, model_id) = normalized_registry_key(&self.provider, model_id);
-        self.reasoning_levels.get(&model_id).map(Vec::as_slice)
+        self.reasoning_levels
+            .get(&model_id)
+            .map(|metadata| metadata.levels.as_slice())
     }
 
     /// Whether the catalog came from a live response, its verified cache, or
@@ -377,12 +386,23 @@ fn model_id_bytes(models: &[String]) -> usize {
 fn catalog_bytes(models: &[String], reasoning_levels: &ReasoningCatalog) -> usize {
     reasoning_levels
         .iter()
-        .fold(model_id_bytes(models), |total, (id, levels)| {
-            total.saturating_add(id.len()).saturating_add(
-                levels
-                    .len()
-                    .saturating_mul(std::mem::size_of::<ThinkingLevel>()),
-            )
+        .fold(model_id_bytes(models), |total, (id, metadata)| {
+            total
+                .saturating_add(id.len())
+                .saturating_add(
+                    metadata
+                        .levels
+                        .len()
+                        .saturating_mul(std::mem::size_of::<ThinkingLevel>()),
+                )
+                .saturating_add(metadata.effort_map.as_ref().map_or(0, |aliases| {
+                    aliases.iter().fold(0usize, |bytes, (key, _)| {
+                        bytes
+                            .saturating_add(key.len())
+                            .saturating_add(std::mem::size_of::<ThinkingLevel>())
+                    })
+                }))
+                .saturating_add(std::mem::size_of::<Option<bool>>())
         })
 }
 
@@ -869,11 +889,16 @@ fn merge_provider_catalog(
             fetched_at_unix_ms,
             models: model_ids
                 .into_iter()
-                .map(|id| PersistedFetchedModel {
-                    reasoning_levels: reasoning_levels
-                        .get(&normalized_registry_key(&provider, &id).1)
-                        .cloned(),
-                    id,
+                .map(|id| {
+                    let reasoning =
+                        reasoning_levels.get(&normalized_registry_key(&provider, &id).1);
+                    PersistedFetchedModel {
+                        reasoning_levels: reasoning.map(|metadata| metadata.levels.clone()),
+                        reasoning_effort_map: reasoning
+                            .and_then(|metadata| metadata.effort_map.clone()),
+                        reasoning_required: reasoning.and_then(|metadata| metadata.required),
+                        id,
+                    }
                 })
                 .collect(),
         },
@@ -2108,11 +2133,15 @@ struct OpenAiModelRow {
     #[serde(default)]
     supported_reasoning_levels: serde_json::Value,
     #[serde(default)]
+    reasoning_effort_map: serde_json::Value,
+    #[serde(default)]
+    reasoning_required: serde_json::Value,
+    #[serde(default)]
     metadata: serde_json::Value,
 }
 
 impl OpenAiModelRow {
-    fn reasoning_levels(&self) -> Option<Vec<ThinkingLevel>> {
+    fn reasoning_levels(&self) -> Option<DiscoveredReasoning> {
         let advertised = self
             .metadata
             .get("supported_reasoning_levels")
@@ -2142,8 +2171,79 @@ impl OpenAiModelRow {
             }
         }
         levels.sort_unstable_by_key(|level| level.default_budget());
-        (!levels.is_empty()).then_some(levels)
+        if levels.is_empty() {
+            return None;
+        }
+        let raw_aliases = self
+            .metadata
+            .get("reasoning_effort_map")
+            .filter(|value| !value.is_null())
+            .unwrap_or(&self.reasoning_effort_map);
+        let effort_map = advertised_effort_map(raw_aliases, &levels);
+        let required = self
+            .metadata
+            .get("reasoning_required")
+            .filter(|value| !value.is_null())
+            .unwrap_or(&self.reasoning_required)
+            .as_bool()
+            .filter(|required| {
+                !*required || levels.iter().any(|level| *level != ThinkingLevel::Off)
+            });
+        Some(DiscoveredReasoning {
+            levels,
+            effort_map,
+            required,
+        })
     }
+}
+
+fn advertised_non_off_level(value: &str) -> Option<ThinkingLevel> {
+    if value.len() > "minimal".len() {
+        return None;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "low" => Some(ThinkingLevel::Low),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        "xhigh" => Some(ThinkingLevel::XHigh),
+        "max" => Some(ThinkingLevel::Max),
+        _ => None,
+    }
+}
+
+fn advertised_effort_map(
+    value: &serde_json::Value,
+    levels: &[ThinkingLevel],
+) -> Option<BTreeMap<String, ThinkingLevel>> {
+    let aliases = value.as_object()?;
+    if aliases.len() > MAX_ADVERTISED_REASONING_LEVELS {
+        return None;
+    }
+    let mut parsed = BTreeMap::new();
+    let mut conflicts = HashSet::new();
+    for (key, value) in aliases {
+        let Some(requested) = advertised_non_off_level(key) else {
+            continue;
+        };
+        let Some(target) = value.as_str().and_then(advertised_non_off_level) else {
+            continue;
+        };
+        if !levels.contains(&target) {
+            continue;
+        }
+        let key = requested.to_string();
+        if conflicts.contains(&key) {
+            continue;
+        }
+        if parsed.get(&key).is_some_and(|existing| *existing != target) {
+            parsed.remove(&key);
+            conflicts.insert(key);
+        } else {
+            parsed.insert(key, target);
+        }
+    }
+    (!parsed.is_empty()).then_some(parsed)
 }
 
 fn deserialize_live_model_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
@@ -2677,6 +2777,169 @@ mod tests {
         }
     }
 
+    #[test]
+    fn advertised_aliases_and_required_effort_survive_live_warm_and_cold_catalogs() {
+        let _guard = cache_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_model_cache();
+        let (base_url, server) = serve_model_catalog(
+            r#"{"data":[{
+            "id":"gateway-route", "supported_reasoning_levels":["none","low","high","max"],
+            "reasoning_effort_map":{"medium":"low"}, "reasoning_required":false,
+            "metadata":{"reasoning_effort_map":{"minimal":"high","medium":"high","xhigh":"max"},"reasoning_required":true}
+        },{
+            "id":"optional-route", "supported_reasoning_levels":["low","high"],
+            "reasoning_required":true, "metadata":{"reasoning_required":false}
+        }]}"#,
+        );
+        let route = test_catalog_route(&base_url);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let live = runtime
+            .block_on(refresh_provider_model_catalog_with_route(
+                "catalog-alias-test",
+                "",
+                route.clone(),
+            ))
+            .expect("live catalog");
+        server.join().expect("catalog server");
+        let warm = runtime
+            .block_on(fetch_provider_model_catalog_with_route(
+                "catalog-alias-test",
+                "",
+                Some(route),
+            ))
+            .expect("warm catalog without a listening server");
+        assert_eq!(warm.source(), ModelCatalogSource::Cache);
+        assert_eq!(warm.reasoning_levels, live.reasoning_levels);
+        assert_eq!(warm.reasoning_levels["gateway-route"].required, Some(true));
+        assert_eq!(
+            warm.reasoning_levels["optional-route"].required,
+            Some(false)
+        );
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let models_path = directory.path().join("models.json");
+        let manual = serde_json::json!({"providers":{"catalog-alias-test":{
+            "api":"openai-completions", "baseUrl":base_url, "authHeader":false
+        }}});
+        std::fs::write(&models_path, manual.to_string()).expect("write manual route");
+        let persisted_path =
+            persist_provider_model_catalog(&models_path, &warm).expect("persist warm metadata");
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(persisted_path).expect("read generated catalog"))
+                .expect("decode generated catalog");
+        assert_eq!(
+            persisted["providers"]["catalog-alias-test"]["models"][0]["reasoningEffortMap"],
+            serde_json::json!({"minimal":"high","medium":"high","xhigh":"max"})
+        );
+        assert_eq!(
+            persisted["providers"]["catalog-alias-test"]["models"][1]["reasoningRequired"],
+            false
+        );
+        clear_model_cache();
+        let registry =
+            ModelRegistry::load_with_credential_resolver(Some(models_path.clone()), |_| None);
+        assert!(registry.error().is_none(), "{:?}", registry.error());
+        let required = registry
+            .find("catalog-alias-test", "gateway-route")
+            .expect("required model");
+        assert_eq!(
+            required.available_thinking_levels(),
+            vec![ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+        );
+        for (requested, selected, effort) in [
+            (ThinkingLevel::Medium, ThinkingLevel::High, "high"),
+            (ThinkingLevel::Minimal, ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, ThinkingLevel::Max, "max"),
+            (ThinkingLevel::High, ThinkingLevel::High, "high"),
+            (ThinkingLevel::Off, ThinkingLevel::Low, "low"),
+        ] {
+            assert_eq!(required.clamp_thinking_level(requested), selected);
+            assert_eq!(
+                reasoning_request(&required, selected)["reasoning_effort"],
+                effort
+            );
+        }
+        let optional = registry
+            .find("catalog-alias-test", "optional-route")
+            .expect("optional model");
+        assert_eq!(
+            optional.clamp_thinking_level(ThinkingLevel::Off),
+            ThinkingLevel::Off
+        );
+        assert!(
+            reasoning_request(&optional, ThinkingLevel::Off)
+                .get("reasoning_effort")
+                .is_none()
+        );
+        assert_manual_alias_overrides(&models_path, &manual);
+    }
+
+    fn assert_manual_alias_overrides(models_path: &Path, manual_route: &serde_json::Value) {
+        for (patch, requested, selected, effort) in [
+            (
+                serde_json::json!({"thinkingLevelMap":{"medium":"max"}}),
+                ThinkingLevel::Medium,
+                ThinkingLevel::Medium,
+                Some("max"),
+            ),
+            (
+                serde_json::json!({"thinkingLevelMap":{"medium":null}}),
+                ThinkingLevel::Medium,
+                ThinkingLevel::Low,
+                Some("low"),
+            ),
+            (
+                serde_json::json!({"thinkingLevelMap":{"high":"max"}}),
+                ThinkingLevel::Medium,
+                ThinkingLevel::Low,
+                Some("low"),
+            ),
+            (
+                serde_json::json!({"reasoning":false}),
+                ThinkingLevel::Medium,
+                ThinkingLevel::Off,
+                None,
+            ),
+            (
+                serde_json::json!({"compat":{"supportsReasoningEffort":false}}),
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                None,
+            ),
+            (
+                serde_json::json!({"compat":{"reasoningRequired":false}}),
+                ThinkingLevel::Off,
+                ThinkingLevel::Off,
+                None,
+            ),
+        ] {
+            let mut manual = manual_route.clone();
+            manual["providers"]["catalog-alias-test"]["modelOverrides"] =
+                serde_json::json!({"gateway-route":patch});
+            std::fs::write(models_path, manual.to_string()).expect("write manual override");
+            let registry = ModelRegistry::load_with_credential_resolver(
+                Some(models_path.to_path_buf()),
+                |_| None,
+            );
+            assert!(registry.error().is_none(), "{:?}", registry.error());
+            let entry = registry
+                .find("catalog-alias-test", "gateway-route")
+                .expect("overridden route");
+            assert_eq!(entry.clamp_thinking_level(requested), selected, "{patch}");
+            assert_eq!(
+                reasoning_request(&entry, selected)
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+                effort,
+                "{patch}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn sap_route_preflight_requires_effective_endpoint_without_resolving_credentials() {
@@ -3087,7 +3350,10 @@ mod tests {
                     models: vec![one_mebibyte.clone()],
                     reasoning_levels: ReasoningCatalog::from([(
                         one_mebibyte.clone(),
-                        vec![ThinkingLevel::High],
+                        DiscoveredReasoning {
+                            levels: vec![ThinkingLevel::High],
+                            ..DiscoveredReasoning::default()
+                        },
                     )]),
                 },
                 4,
@@ -3411,7 +3677,7 @@ mod tests {
             {"id":"missing"}
         ]}"#).expect("parse reasoning metadata");
         assert_eq!(
-            parsed.reasoning_levels["all"],
+            parsed.reasoning_levels["all"].levels,
             vec![
                 ThinkingLevel::Off,
                 ThinkingLevel::Minimal,
@@ -3422,13 +3688,16 @@ mod tests {
                 ThinkingLevel::Max
             ]
         );
-        assert_eq!(parsed.reasoning_levels["nested"], vec![ThinkingLevel::High]);
         assert_eq!(
-            parsed.reasoning_levels["null-metadata"],
+            parsed.reasoning_levels["nested"].levels,
+            vec![ThinkingLevel::High]
+        );
+        assert_eq!(
+            parsed.reasoning_levels["null-metadata"].levels,
             vec![ThinkingLevel::Minimal]
         );
         assert_eq!(
-            parsed.reasoning_levels["off-only"],
+            parsed.reasoning_levels["off-only"].levels,
             vec![ThinkingLevel::Off]
         );
         assert!(!parsed.reasoning_levels.contains_key("missing"));
@@ -3478,9 +3747,94 @@ mod tests {
         )
         .expect("equivalent duplicates");
         assert_eq!(
-            compatible.reasoning_levels["model"],
+            compatible.reasoning_levels["model"].levels,
             vec![ThinkingLevel::Low, ThinkingLevel::High]
         );
+    }
+
+    #[test]
+    fn live_reasoning_aliases_are_canonical_bounded_and_do_not_invent_tiers() {
+        let parsed = parse_openai_model_catalog("openai", r#"{"data":[
+            {"id":"normalized","supported_reasoning_levels":["low","high","max"],"reasoning_effort_map":{
+                "MEDIUM":"HIGH","minimal":"high","xhigh":"max","off":"low","none":"high",
+                "max":"unknown","high":false,"ultra":"max","3":"low","low":" low "
+            },"reasoning_required":"true"},
+            {"id":"no-ladder","reasoning_effort_map":{"medium":"high"},"reasoning_required":true},
+            {"id":"unserved","supported_reasoning_levels":["low"],"reasoning_effort_map":{"medium":"high"}},
+            {"id":"conflict","supported_reasoning_levels":["low","high"],"reasoning_effort_map":{"MEDIUM":"high","medium":"low"}},
+            {"id":"nested-invalid","supported_reasoning_levels":["low","high"],"reasoning_effort_map":{"medium":"high"},"reasoning_required":true,
+             "metadata":{"reasoning_effort_map":false,"reasoning_required":"false"}},
+            {"id":"nested-null","supported_reasoning_levels":["low","high"],"reasoning_effort_map":{"medium":"high"},"reasoning_required":false,
+             "metadata":{"reasoning_effort_map":null,"reasoning_required":null}},
+            {"id":"off-only","supported_reasoning_levels":["none"],"reasoning_required":true}
+        ]}"#).expect("reasoning metadata");
+        assert_eq!(
+            parsed.reasoning_levels["normalized"].effort_map,
+            Some(BTreeMap::from([
+                ("medium".to_string(), ThinkingLevel::High),
+                ("minimal".to_string(), ThinkingLevel::High),
+                ("xhigh".to_string(), ThinkingLevel::Max),
+            ]))
+        );
+        assert_eq!(parsed.reasoning_levels["normalized"].required, None);
+        assert!(!parsed.reasoning_levels.contains_key("no-ladder"));
+        for id in ["unserved", "conflict", "nested-invalid"] {
+            assert_eq!(parsed.reasoning_levels[id].effort_map, None, "{id}");
+        }
+        assert_eq!(parsed.reasoning_levels["nested-invalid"].required, None);
+        assert_eq!(parsed.reasoning_levels["nested-null"].required, Some(false));
+        assert_eq!(
+            parsed.reasoning_levels["nested-null"]
+                .effort_map
+                .as_ref()
+                .and_then(|map| map.get("medium")),
+            Some(&ThinkingLevel::High)
+        );
+        assert_eq!(parsed.reasoning_levels["off-only"].required, None);
+
+        let mut aliases = serde_json::Map::new();
+        aliases.insert("medium".to_string(), serde_json::json!("high"));
+        for index in 0..MAX_ADVERTISED_REASONING_LEVELS {
+            aliases.insert(format!("extra-{index}"), serde_json::json!("high"));
+        }
+        let oversized = serde_json::json!({"data":[{"id":"model","supported_reasoning_levels":["high"],"reasoning_effort_map":aliases}]});
+        let parsed =
+            parse_openai_model_catalog("openai", &oversized.to_string()).expect("bounded aliases");
+        assert_eq!(parsed.reasoning_levels["model"].effort_map, None);
+    }
+
+    #[test]
+    fn conflicting_aliases_or_requirements_drop_duplicate_model_metadata() {
+        for (left, right) in [
+            (
+                serde_json::json!({"reasoning_effort_map":{"medium":"high"}}),
+                serde_json::json!({"reasoning_effort_map":{"medium":"low"}}),
+            ),
+            (
+                serde_json::json!({"reasoning_required":true}),
+                serde_json::json!({"reasoning_required":false}),
+            ),
+            (
+                serde_json::json!({"reasoning_required":false}),
+                serde_json::json!({}),
+            ),
+        ] {
+            let rows = [left, right].map(|fields| {
+                let mut row =
+                    serde_json::json!({"id":"model","supported_reasoning_levels":["low","high"]});
+                row.as_object_mut()
+                    .expect("row")
+                    .extend(fields.as_object().expect("fields").clone());
+                row
+            });
+            for order in [[0, 1], [1, 0]] {
+                let body = serde_json::json!({"data":order.map(|index| &rows[index])});
+                let parsed = parse_openai_model_catalog("openai", &body.to_string())
+                    .expect("duplicate membership");
+                assert_eq!(parsed.models, vec!["model"]);
+                assert!(parsed.reasoning_levels.is_empty(), "{body}");
+            }
+        }
     }
 
     #[test]

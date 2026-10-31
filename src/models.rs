@@ -328,7 +328,17 @@ impl ModelEntry {
         if self.supports_max() {
             levels.push(ThinkingLevel::Max);
         }
-        levels.retain(|level| self.thinking_level_map_supports(&level.to_string()) != Some(false));
+        levels.retain(|level| {
+            if *level == ThinkingLevel::Off
+                && let Some(required) = self
+                    .compat
+                    .as_ref()
+                    .and_then(|compat| compat.reasoning_required)
+            {
+                return !required;
+            }
+            self.thinking_level_map_supports(&level.to_string()) != Some(false)
+        });
         if levels.is_empty() {
             levels.push(ThinkingLevel::Off);
         }
@@ -340,8 +350,9 @@ impl ModelEntry {
     /// Non-reasoning models always return `Off`. Models without max support
     /// downgrade `Max` to `XHigh` (or `High` if xhigh is also unsupported);
     /// models without xhigh support downgrade `XHigh` to `High`. Explicit
-    /// null mappings remove unsupported tiers. Choose the closest supported
-    /// lower tier, or the first supported tier if none is lower.
+    /// null mappings remove unsupported tiers. An advertised alias to a stable
+    /// served tier takes precedence over the closest supported lower tier.
+    /// If neither exists, choose the first supported tier.
     pub fn clamp_thinking_level(
         &self,
         thinking: crate::model::ThinkingLevel,
@@ -352,6 +363,9 @@ impl ModelEntry {
             return crate::model::ThinkingLevel::Off;
         }
         let levels = self.available_thinking_levels();
+        if let Some(target) = self.advertised_effort_alias(thinking, &levels) {
+            return target;
+        }
         let mut lower = None;
         for candidate in [
             ThinkingLevel::Off,
@@ -372,6 +386,34 @@ impl ModelEntry {
         lower
             .or_else(|| levels.first().copied())
             .unwrap_or(ThinkingLevel::Off)
+    }
+
+    fn advertised_effort_alias(
+        &self,
+        requested: crate::model::ThinkingLevel,
+        levels: &[crate::model::ThinkingLevel],
+    ) -> Option<crate::model::ThinkingLevel> {
+        if levels.contains(&requested) {
+            return None;
+        }
+        let compat = self.compat.as_ref()?;
+        let aliases = compat.reasoning_effort_map.as_ref()?;
+        let &target = aliases.get(&requested.to_string())?;
+        let target_name = target.to_string();
+        if target == crate::model::ThinkingLevel::Off
+            || !levels.contains(&target)
+            || aliases
+                .get(&target_name)
+                .is_some_and(|next| *next != target)
+            || compat
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&target_name))
+                .is_some_and(|mapped| mapped.as_deref() != Some(target_name.as_str()))
+        {
+            return None;
+        }
+        Some(target)
     }
 }
 
@@ -625,6 +667,18 @@ pub(crate) struct PersistedFetchedModel {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) reasoning_levels: Option<Vec<crate::model::ThinkingLevel>>,
+    #[serde(
+        default,
+        rename = "reasoningEffortMap",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) reasoning_effort_map: Option<BTreeMap<String, crate::model::ThinkingLevel>>,
+    #[serde(
+        default,
+        rename = "reasoningRequired",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) reasoning_required: Option<bool>,
 }
 
 fn deserialize_fetched_providers<'de, D>(
@@ -1049,6 +1103,13 @@ pub struct CompatConfig {
     /// changes (gh #117). An explicit null disables that tier; an absent key
     /// leaves the built-in mapping intact (pi-freeflow, gh #270).
     pub thinking_level_map: Option<HashMap<String, Option<String>>>,
+    /// Advertised aliases for requested levels absent from the served ladder.
+    /// These affect capability clamping, before transport serialization. A
+    /// manual `thinkingLevelMap` remains authoritative over discovery aliases.
+    pub reasoning_effort_map: Option<BTreeMap<String, crate::model::ThinkingLevel>>,
+    /// Whether this endpoint requires a non-off reasoning tier. Explicit false
+    /// permits an off request even when the advertised ladder lists only tiers.
+    pub reasoning_required: Option<bool>,
     /// Force the modern adaptive-thinking API (`thinking: {type: "adaptive"}`
     /// plus `output_config.effort`) instead of the deprecated `budget_tokens`
     /// extended-thinking path. Authoritative over a transport's built-in
@@ -3500,6 +3561,14 @@ fn apply_fetched_models(
                 let compat = entry.compat.get_or_insert_with(CompatConfig::default);
                 compat.thinking_level_map = Some(levels.clone());
                 compat.supports_reasoning_effort = Some(true);
+                compat.reasoning_effort_map = discovered
+                    .compat
+                    .as_ref()
+                    .and_then(|metadata| metadata.reasoning_effort_map.clone());
+                compat.reasoning_required = discovered
+                    .compat
+                    .as_ref()
+                    .and_then(|metadata| metadata.reasoning_required);
             }
         }
     }
@@ -3864,9 +3933,14 @@ fn apply_model_override(
     if let Some(map) = override_cfg.thinking_level_map.clone() {
         // Per-level: each entry (`null` withdraws a level) refines the map in
         // place, a discovered ladder included, rather than replacing it.
-        entry
-            .compat
-            .get_or_insert_with(CompatConfig::default)
+        let compat = entry.compat.get_or_insert_with(CompatConfig::default);
+        if let Some(aliases) = &mut compat.reasoning_effort_map {
+            aliases.retain(|level, _| !map.contains_key(level));
+        }
+        if map.contains_key("off") {
+            compat.reasoning_required = None;
+        }
+        compat
             .thinking_level_map
             .get_or_insert_with(HashMap::new)
             .extend(map);
@@ -3942,6 +4016,20 @@ pub(crate) fn merge_compat(
                     .thinking_level_map
                     .clone()
                     .or_else(|| provider.thinking_level_map.clone()),
+                reasoning_effort_map: model.reasoning_effort_map.clone().or_else(|| {
+                    if model.thinking_level_map.is_some() {
+                        None
+                    } else {
+                        provider.reasoning_effort_map.clone()
+                    }
+                }),
+                reasoning_required: model.reasoning_required.or(
+                    if model.thinking_level_map.is_some() {
+                        None
+                    } else {
+                        provider.reasoning_required
+                    },
+                ),
                 force_adaptive_thinking: model
                     .force_adaptive_thinking
                     .or(provider.force_adaptive_thinking),
@@ -4887,7 +4975,12 @@ fn load_fetched_models_config(
                 thinking_level_map: model
                     .reasoning_levels
                     .as_deref()
-                    .map(fetched_thinking_level_map),
+                    .map(|levels| fetched_thinking_level_map(levels, model.reasoning_required)),
+                compat: Some(CompatConfig {
+                    reasoning_effort_map: model.reasoning_effort_map,
+                    reasoning_required: model.reasoning_required,
+                    ..CompatConfig::default()
+                }),
                 id: model.id,
                 ..ModelConfig::default()
             })
@@ -4906,6 +4999,7 @@ fn load_fetched_models_config(
 
 fn fetched_thinking_level_map(
     levels: &[crate::model::ThinkingLevel],
+    required: Option<bool>,
 ) -> HashMap<String, Option<String>> {
     use crate::model::ThinkingLevel;
     [
@@ -4920,7 +5014,12 @@ fn fetched_thinking_level_map(
     .into_iter()
     .map(|level| {
         let key = level.to_string();
-        let value = levels.contains(&level).then(|| {
+        // A false requirement permits Off through the capability flag, while
+        // its null wire mapping omits effort instead of sending "none" to a
+        // gateway whose ladder does not accept that value. True removes Off.
+        let supported =
+            levels.contains(&level) && !(level == ThinkingLevel::Off && required.is_some());
+        let value = supported.then(|| {
             if level == ThinkingLevel::Off {
                 "none".to_string()
             } else {
@@ -5005,6 +5104,13 @@ pub(crate) fn validate_persisted_fetched_catalog(
             )));
         }
         for model in &fetched.models {
+            if model.reasoning_levels.is_none()
+                && (model.reasoning_effort_map.is_some() || model.reasoning_required.is_some())
+            {
+                return Err(Error::config(
+                    "Generated reasoning aliases and requirement need an advertised ladder",
+                ));
+            }
             if let Some(levels) = &model.reasoning_levels {
                 if levels.is_empty() || levels.len() > 7 {
                     return Err(Error::config(
@@ -5018,6 +5124,33 @@ pub(crate) fn validate_persisted_fetched_catalog(
                 {
                     return Err(Error::config(
                         "Generated model reasoning levels contain duplicate tiers",
+                    ));
+                }
+                if model.reasoning_required == Some(true)
+                    && !levels
+                        .iter()
+                        .any(|level| *level != crate::model::ThinkingLevel::Off)
+                {
+                    return Err(Error::config(
+                        "Generated mandatory reasoning needs a non-off tier",
+                    ));
+                }
+                if let Some(aliases) = &model.reasoning_effort_map
+                    && (aliases.is_empty()
+                        || aliases.len() > 6
+                        || aliases.iter().any(|(key, target)| {
+                            let requested = key.parse::<crate::model::ThinkingLevel>();
+                            requested.is_err()
+                                || requested.is_ok_and(|level| {
+                                    level == crate::model::ThinkingLevel::Off
+                                        || level.to_string() != *key
+                                })
+                                || *target == crate::model::ThinkingLevel::Off
+                                || !levels.contains(target)
+                        }))
+                {
+                    return Err(Error::config(
+                        "Generated reasoning aliases must use canonical non-off tiers in the advertised ladder",
                     ));
                 }
             }
@@ -8044,6 +8177,23 @@ mod tests {
                 "unauthorized field: {field}"
             );
         }
+        for row in [
+            serde_json::json!({"id":"model","reasoningRequired":true}),
+            serde_json::json!({"id":"model","reasoningEffortMap":{"medium":"high"}}),
+            serde_json::json!({"id":"model","reasoningLevels":["off"],"reasoningRequired":true}),
+            serde_json::json!({"id":"model","reasoningLevels":["low"],"reasoningRequired":"true"}),
+            serde_json::json!({"id":"model","reasoningLevels":["low"],"reasoningEffortMap":{}}),
+            serde_json::json!({"id":"model","reasoningLevels":["low"],"reasoningEffortMap":{"MEDIUM":"low"}}),
+            serde_json::json!({"id":"model","reasoningLevels":["low"],"reasoningEffortMap":{"medium":"high"}}),
+            serde_json::json!({"id":"model","reasoningLevels":["off","low"],"reasoningEffortMap":{"off":"low"}}),
+            serde_json::json!({"id":"model","reasoningLevels":["off","low"],"reasoningEffortMap":{"medium":"off"}}),
+            serde_json::json!({"id":"model","reasoningLevels":["high"],"reasoningEffortMap":{"medium":"arbitrary"}}),
+        ] {
+            assert!(
+                parse_persisted_fetched_catalog(&catalog(row.clone())).is_err(),
+                "invalid reasoning metadata: {row}"
+            );
+        }
         let valid = parse_persisted_fetched_catalog(&catalog(serde_json::json!({
             "id": "new-model", "reasoningLevels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
         }))).expect("all seven canonical tiers are allowed");
@@ -9414,6 +9564,84 @@ mod tests {
         assert_eq!(
             bare.clamp_thinking_level(ThinkingLevel::XHigh),
             ThinkingLevel::High
+        );
+    }
+
+    #[test]
+    fn advertised_aliases_require_stable_served_targets_and_preserve_manual_maps() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("gateway-route", true);
+        entry.compat = Some(CompatConfig {
+            thinking_level_map: Some(fetched_thinking_level_map(
+                &[ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max],
+                Some(true),
+            )),
+            reasoning_effort_map: Some(BTreeMap::from([
+                ("medium".to_string(), ThinkingLevel::High),
+                ("xhigh".to_string(), ThinkingLevel::Max),
+            ])),
+            reasoning_required: Some(true),
+            ..CompatConfig::default()
+        });
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Medium),
+            ThinkingLevel::High
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Off),
+            ThinkingLevel::Low
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Minimal),
+            ThinkingLevel::Low
+        );
+
+        let mut chained = entry.clone();
+        chained
+            .compat
+            .as_mut()
+            .expect("compat")
+            .reasoning_effort_map
+            .as_mut()
+            .expect("aliases")
+            .insert("high".to_string(), ThinkingLevel::Max);
+        assert_eq!(
+            chained.clamp_thinking_level(ThinkingLevel::Medium),
+            ThinkingLevel::Low
+        );
+        assert_eq!(
+            chained.clamp_thinking_level(ThinkingLevel::High),
+            ThinkingLevel::High
+        );
+
+        let mut unavailable = entry.clone();
+        unavailable
+            .compat
+            .as_mut()
+            .expect("compat")
+            .reasoning_effort_map
+            .as_mut()
+            .expect("aliases")
+            .insert("medium".to_string(), ThinkingLevel::XHigh);
+        assert_eq!(
+            unavailable.clamp_thinking_level(ThinkingLevel::Medium),
+            ThinkingLevel::Low
+        );
+
+        let manual = CompatConfig {
+            thinking_level_map: Some(HashMap::from([(
+                "medium".to_string(),
+                Some("low".to_string()),
+            )])),
+            ..CompatConfig::default()
+        };
+        let merged = merge_compat(entry.compat.as_ref(), Some(&manual)).expect("merged compat");
+        assert!(merged.reasoning_effort_map.is_none());
+        assert!(merged.reasoning_required.is_none());
+        entry.compat = Some(merged);
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Medium),
+            ThinkingLevel::Medium
         );
     }
 
