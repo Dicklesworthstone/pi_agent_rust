@@ -2798,7 +2798,8 @@ impl Agent {
     /// Register async fetchers for queued steering/follow-up messages.
     ///
     /// This is additive: multiple sources (e.g. RPC, extensions) can register
-    /// fetchers, and the agent will poll all of them.
+    /// fetchers, and the agent will poll all of them. Sources own admission and
+    /// queue bounds; accepted batches are preserved in registration order.
     pub fn register_message_fetchers(
         &mut self,
         steering: Option<MessageFetcher>,
@@ -4743,10 +4744,17 @@ impl Agent {
     }
 
     async fn stage_follow_up_messages(&mut self) -> bool {
-        if !self.automatic_follow_up_dispatch || self.ordered_yield_requested() {
+        if !self.automatic_follow_up_dispatch {
             return false;
         }
         let mut owning_surface_ready = self.message_queue.follow_up_batch_len() > 0;
+        if self.ordered_yield_requested() {
+            // A source may reach its barrier while handing over the last
+            // pre-barrier input. Drain everything already accepted before
+            // yielding, including batches dispatched one message at a time.
+            // The ready barrier prevents any further source or job polling.
+            return owning_surface_ready;
+        }
         if !owning_surface_ready {
             let owning_surface = self
                 .fetch_messages(self.initial_follow_up_fetcher.as_ref())
@@ -4785,7 +4793,10 @@ impl Agent {
             }
             let fetched = self.fetch_messages(Some(&registered.fetcher)).await;
             for message in fetched {
-                self.message_queue.push_follow_up(message);
+                // Each source already owns admission and bounds. As with
+                // steering, this handoff must not evict accepted input that
+                // has already been removed from another source's queue.
+                self.message_queue.push_follow_up_lossless(message);
             }
         }
         if !self.ordered_yield_requested() {
@@ -12877,6 +12888,89 @@ mod extensions_integration_tests {
             let final_message = agent.run("write main", |_| {}).await.expect("run");
             assert_eq!(final_message.stop_reason, StopReason::Length);
             assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn admitted_follow_up_batches_preserve_both_source_orders_and_authorship() {
+        fn source(messages: Vec<QueuedAgentMessage>) -> MessageFetcher {
+            let pending = Arc::new(StdMutex::new(messages));
+            Arc::new(move || {
+                let pending = Arc::clone(&pending);
+                Box::pin(async move { std::mem::take(&mut *pending.lock().expect("source queue")) })
+            })
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            for scoped_first in [false, true] {
+                for mode in [QueueMode::All, QueueMode::OneAtATime] {
+                    let mut agent = Agent::new(
+                        Arc::new(NoopProvider),
+                        ToolRegistry::from_tools(vec![]),
+                        AgentConfig::default(),
+                    );
+                    agent.set_queue_modes(QueueMode::OneAtATime, mode);
+                    let mut expected: Vec<_> = (0..MAX_FOLLOW_UP_QUEUE_SIZE)
+                        .map(|index| (format!("extension-{index:03}"), None))
+                        .collect();
+                    let permanent = source(
+                        expected
+                            .iter()
+                            .map(|(text, _)| {
+                                QueuedAgentMessage::generated(Message::User(UserMessage {
+                                    content: UserContent::Text(text.clone()),
+                                    timestamp: 0,
+                                }))
+                            })
+                            .collect(),
+                    );
+                    let authored = (
+                        "expanded SDK follow-up".to_string(),
+                        Some("original SDK follow-up".to_string()),
+                    );
+                    let scoped = source(vec![QueuedAgentMessage::authored(
+                        Message::User(UserMessage {
+                            content: UserContent::Text(authored.0.clone()),
+                            timestamp: 0,
+                        }),
+                        authored.1.clone().unwrap(),
+                    )]);
+                    let lifetime = Arc::new(());
+                    if scoped_first {
+                        agent.register_scoped_message_fetchers(&lifetime, None, Some(scoped));
+                        agent.register_message_fetchers(None, Some(permanent));
+                        expected.insert(0, authored);
+                    } else {
+                        agent.register_message_fetchers(None, Some(permanent));
+                        agent.register_scoped_message_fetchers(&lifetime, None, Some(scoped));
+                        expected.push(authored);
+                    }
+
+                    let mut delivered = Vec::new();
+                    while agent.stage_follow_up_messages().await {
+                        let batch = agent.pop_follow_up_for_current_session().await;
+                        if mode == QueueMode::OneAtATime {
+                            assert_eq!(batch.len(), 1);
+                        }
+                        delivered.extend(batch.into_iter().map(|message| {
+                            let authored = message.keyword_scan_source().map(str::to_string);
+                            let Message::User(UserMessage {
+                                content: UserContent::Text(text),
+                                ..
+                            }) = message.into_message()
+                            else {
+                                panic!("follow-up payload changed");
+                            };
+                            (text, authored)
+                        }));
+                        assert!(delivered.len() <= expected.len(), "input was replayed");
+                    }
+                    assert_eq!(delivered, expected, "scoped_first={scoped_first}, {mode:?}");
+                }
+            }
         });
     }
 

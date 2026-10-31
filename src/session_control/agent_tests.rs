@@ -14,7 +14,7 @@ use asupersync::runtime::RuntimeBuilder;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::agent::{Agent, AgentConfig, AgentSession};
+use crate::agent::{Agent, AgentConfig, AgentSession, QueueMode};
 use crate::compaction::ResolvedCompactionSettings;
 use crate::model::StopReason;
 use crate::provider::StreamOptions;
@@ -186,6 +186,15 @@ impl Peer {
     }
 
     fn handle(&self, cwd: &std::path::Path) -> AgentSessionHandle {
+        self.handle_with_store(cwd, Session::in_memory(), false)
+    }
+
+    fn handle_with_store(
+        &self,
+        cwd: &std::path::Path,
+        store: Session,
+        save_enabled: bool,
+    ) -> AgentSessionHandle {
         let provider = Arc::new(OpenAIProvider::new("control-fixture").with_base_url(&self.url));
         let agent = Agent::new(
             provider,
@@ -203,8 +212,8 @@ impl Peer {
         );
         let session = AgentSession::new(
             agent,
-            Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
-            false,
+            Arc::new(asupersync::sync::Mutex::new(store)),
+            save_enabled,
             ResolvedCompactionSettings::default(),
         );
         AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
@@ -398,6 +407,182 @@ fn ordered_yield_finishes_tools_and_earlier_input_before_recovering_later_input(
     assert!(!request_has(&requests[2], "later authored follow-up"));
     assert!(request_has(&requests[3], "later authored follow-up"));
     assert_eq!(tool_runs.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn sdk_follow_up_and_full_extension_batch_reach_provider_and_disk_once() {
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let peer = Peer::new(vec![Reply::Text, Reply::Text]);
+    let store = Session::create_with_dir(Some(temp.path().join("sessions")));
+    let mut handle = peer.handle_with_store(temp.path(), store, true);
+    handle
+        .session_mut()
+        .set_queue_modes(QueueMode::All, QueueMode::All);
+    let extension_texts: Vec<_> = (0..100)
+        .map(|index| format!("extension follow-up {index:03}"))
+        .collect();
+    let pending = Arc::new(Mutex::new(
+        extension_texts
+            .iter()
+            .map(|text| {
+                QueuedAgentMessage::from_authored_message(Message::User(UserMessage {
+                    content: UserContent::Text(text.clone()),
+                    timestamp: 0,
+                }))
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let source = Arc::clone(&pending);
+    handle.session_mut().agent.register_message_fetchers(
+        None,
+        Some(Arc::new(move || {
+            let pending = Arc::clone(&source);
+            Box::pin(async move { std::mem::take(&mut *lock(&pending)) })
+        })),
+    );
+    let mut expected = vec!["initial prompt".to_string()];
+    expected.extend(extension_texts);
+    expected.push("SDK follow-up".to_string());
+
+    runtime.block_on(async {
+        let turn = handle.prompt_controlled("initial prompt".to_string(), |_| {});
+        let control = turn.control();
+        control.follow_up("SDK follow-up").unwrap();
+        assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+        assert_eq!(control.snapshot().handed_to_agent, 1);
+        assert!(control.snapshot().finished);
+        assert!(control.take_pending().is_empty());
+        assert!(lock(&pending).is_empty());
+
+        let store = handle.session_store();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let path = store.lock(cx.cx()).await.unwrap().path.clone().unwrap();
+        let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+        let persisted: Vec<_> = reopened
+            .to_messages_for_current_path()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text),
+                Message::User(_) => panic!("text follow-up changed representation"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(persisted, expected);
+    });
+
+    let requests = lock(&peer.requests);
+    assert_eq!(requests.len(), 2);
+    for (index, request) in requests.iter().enumerate() {
+        let users: Vec<_> = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .map(|message| message["content"].as_str().unwrap().to_string())
+            .collect();
+        let expected = if index == 0 {
+            &expected[..1]
+        } else {
+            expected.as_slice()
+        };
+        assert_eq!(users, expected);
+    }
+}
+
+#[test]
+fn ordered_yield_drains_admitted_batches_before_durable_completion() {
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let peer = Peer::new(vec![Reply::Text; 4]);
+    let store = Session::create_with_dir(Some(temp.path().join("sessions")));
+    let mut handle = peer.handle_with_store(temp.path(), store, true);
+    handle
+        .session_mut()
+        .set_queue_modes(QueueMode::OneAtATime, QueueMode::OneAtATime);
+    let pending = Arc::new(Mutex::new(VecDeque::from([
+        vec!["extension before 0", "extension before 1"],
+        vec!["unfetched extension input"],
+    ])));
+    let source = Arc::clone(&pending);
+    handle.session_mut().agent.register_message_fetchers(
+        None,
+        Some(Arc::new(move || {
+            let pending = Arc::clone(&source);
+            Box::pin(async move {
+                lock(&pending)
+                    .pop_front()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|text| {
+                        QueuedAgentMessage::from_authored_message(Message::User(UserMessage {
+                            content: UserContent::Text(text.to_string()),
+                            timestamp: 0,
+                        }))
+                    })
+                    .collect()
+            })
+        })),
+    );
+    let expected = [
+        "initial prompt",
+        "extension before 0",
+        "extension before 1",
+        "SDK before barrier",
+    ];
+    runtime.block_on(async {
+        let turn = handle.prompt_controlled("initial prompt".to_string(), |_| {});
+        let control = turn.control();
+        control.follow_up("SDK before barrier").unwrap();
+        let barrier = control.insert_yield_barrier().unwrap();
+        control.follow_up("SDK after barrier").unwrap();
+        assert_eq!(turn.await.unwrap().stop_reason, StopReason::Stop);
+        assert!(control.yield_barrier_can_run(barrier));
+        assert_eq!(control.snapshot().handed_to_agent, 1);
+        assert_eq!(handle.session().agent.queued_message_count(), 0);
+        assert_eq!(
+            lock(&pending).len(),
+            1,
+            "yield must stop further source polls"
+        );
+        let (before, after) = control.take_pending_at_barrier(barrier).unwrap();
+        assert!(before.is_empty());
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "SDK after barrier");
+
+        let store = handle.session_store();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let path = store.lock(cx.cx()).await.unwrap().path.clone().unwrap();
+        let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+        let persisted: Vec<_> = reopened
+            .to_messages_for_current_path()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text),
+                Message::User(_) => panic!("text follow-up changed representation"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(persisted, expected);
+    });
+    let requests = lock(&peer.requests);
+    assert_eq!(requests.len(), expected.len());
+    for (index, request) in requests.iter().enumerate() {
+        let users: Vec<_> = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .map(|message| message["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(users, expected[..=index]);
+    }
 }
 
 #[test]
