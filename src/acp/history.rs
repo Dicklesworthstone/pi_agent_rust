@@ -1,4 +1,5 @@
-//! ACP session recovery and transcript replay. Loading never runs an agent turn.
+//! ACP session recovery, independent forks and transcript replay.
+//! Loading or forking never runs an agent turn.
 //!
 //! Session IDs are catalog keys, not paths. Disk recovery is restricted to the
 //! explicitly configured session directory and the requested workspace. Replay
@@ -163,15 +164,15 @@ async fn open_saved_session(id: &str, cwd: &Path, root: Option<&Path>) -> Histor
         .into_iter()
         .next()
         .ok_or_else(HistoryError::missing)?;
-    let path_text = path
-        .to_str()
-        .ok_or_else(|| HistoryError::internal("Saved session path is not UTF-8"))?;
-    let session = Session::open(path_text)
+    // The catalog groups by the current attachment, while header.cwd keeps
+    // original provenance. The native resolver checks off-branch/lazy-store
+    // bindings and rejects a source changed between discovery and open.
+    let session = crate::session_workdir::open_session_for_runtime(&path, cwd)
         .await
         .map_err(|error| HistoryError::internal(format!("Cannot reopen saved session: {error}")))?;
     // Metadata can be stale. The decoded store, not its cached catalog row,
     // owns the identity and workspace that will be installed in the live map.
-    if session.header.id != id || !same_workspace(Path::new(&session.header.cwd), cwd) {
+    if session.header.id != id {
         return Err(HistoryError::invalid(
             "Saved session identity or workspace does not match the request",
         ));
@@ -274,6 +275,267 @@ pub(super) async fn load(
         // This is configuration, not replayed conversation content; resume
         // remains history-free. Servers connect only through native trust.
         send_line(out, super::mcp::commands_notification(id)).await?;
+    }
+    Ok(response)
+}
+
+/// Create a new active session without moving or shutting down the source.
+/// The dispatcher serializes management requests, and prompt reservations also
+/// protect work that has not yet taken its agent out of the source state.
+pub(super) async fn fork(
+    params: &Value,
+    options: &AcpOptions,
+    permission_client: &AcpPermissionClient,
+    sessions: &AcpSessionsMap,
+    cx: &AgentCx,
+    out: &AcpOutput,
+) -> HistoryResult<Value> {
+    let id = requested_session_id(params)?;
+    let cwd = requested_cwd(params)?;
+    match params.get("additionalDirectories") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(roots)) if roots.is_empty() => {}
+        _ => {
+            return Err(HistoryError::invalid(
+                "ACP forks support only cwd; additionalDirectories must be empty",
+            ));
+        }
+    }
+    let servers = super::mcp::parse_servers(params, &cwd, options.launch.no_mcp)
+        .map_err(HistoryError::invalid)?
+        .unwrap_or_default();
+    if out.prompt_is_active(id)
+        || out.shared.files.has_write(id)
+        || out.shared.terminals.has_unsettled(id)
+    {
+        return Err(HistoryError {
+            code: PROMPT_IN_PROGRESS,
+            message:
+                "Cannot fork while a prompt, editor file write, or terminal cleanup is in progress"
+                    .into(),
+        });
+    }
+    let live = {
+        let guard = sessions
+            .lock(cx)
+            .await
+            .map_err(|_| HistoryError::internal("Session registry is unavailable"))?;
+        guard.get(id).cloned()
+    };
+    let live = match live {
+        Some(state) => Some(
+            OwnedMutexGuard::lock(state, cx)
+                .await
+                .map_err(|_| HistoryError::internal("Session state is unavailable"))?,
+        ),
+        None => None,
+    };
+    let handle = if let Some(state) = live.as_ref() {
+        if !same_workspace(&state.cwd, &cwd) {
+            return Err(HistoryError::invalid(
+                "Session belongs to a different workspace",
+            ));
+        }
+        let handle = state
+            .agent_session
+            .as_ref()
+            .ok_or_else(HistoryError::busy)?;
+        handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| {
+                HistoryError::internal(format!("Cannot fork an unavailable session: {error}"))
+            })?;
+        Some(handle)
+    } else {
+        None
+    };
+    // Use the same action-before-store order as native session mutations.
+    // The source remains admitted after this snapshot guard is released.
+    let actions = handle.map(|handle| handle.session().session_action_admission_gate());
+    let action_permit = match actions.as_ref() {
+        Some(actions) => Some(actions.acquire(cx.cx()).await.map_err(|error| {
+            HistoryError::internal(format!("Cannot reserve source session: {error}"))
+        })?),
+        None => None,
+    };
+    let source_store = if let Some(handle) = handle {
+        handle.session_store()
+    } else {
+        Arc::new(Mutex::new(
+            open_saved_session(id, &cwd, options.session_dir.as_deref()).await?,
+        ))
+    };
+    let mut source = OwnedMutexGuard::lock(source_store, cx)
+        .await
+        .map_err(|_| HistoryError::internal("Session history is unavailable"))?;
+    let save_source = handle.is_some_and(|handle| handle.session().save_enabled());
+    let mut budget = if let Some(handle) = handle {
+        handle.session().agent.cost_budget().cloned()
+    } else {
+        crate::cost::resolve_budget(
+            &source,
+            options.config.session.as_ref(),
+            options.launch.warn_cost,
+            options.launch.max_cost,
+            None,
+        )
+        .map_err(|error| HistoryError::internal(format!("Cannot restore model spend: {error}")))?
+    };
+    if save_source {
+        if let Some(budget) = &budget {
+            budget.checkpoint(&mut source).map_err(|error| {
+                HistoryError::internal(format!("Cannot checkpoint source model spend: {error}"))
+            })?;
+        }
+        source.save().await.map_err(|error| {
+            HistoryError::internal(format!("Cannot save source session: {error}"))
+        })?;
+        if let Some(active) = &budget {
+            let prepared = active.prepare_handoff(&source).map_err(|error| {
+                HistoryError::internal(format!("Cannot prepare fork model spend: {error}"))
+            })?;
+            prepared.checkpoint(&mut source).map_err(|error| {
+                HistoryError::internal(format!("Cannot checkpoint fork ancestry: {error}"))
+            })?;
+            source.save().await.map_err(|error| {
+                HistoryError::internal(format!("Cannot save fork ancestry: {error}"))
+            })?;
+            budget = Some(prepared);
+        }
+    }
+    let model = handle
+        .map(crate::sdk::AgentSessionHandle::model)
+        .or_else(|| source.effective_model_for_current_path());
+    let thinking = handle
+        .and_then(crate::sdk::AgentSessionHandle::thinking_level)
+        .map(|level| level.to_string())
+        .or_else(|| source.effective_thinking_level_for_current_path());
+    let plan = source.plan_fork_current_context().map_err(|error| {
+        HistoryError::internal(format!("Cannot snapshot source conversation: {error}"))
+    })?;
+    let (mut candidate, save_enabled) =
+        super::new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
+    candidate.init_from_fork_plan(plan);
+    // A new session receives exactly the request's workspace authority. ACP
+    // does not currently offer additional roots, even if a terminal source did.
+    candidate.set_additional_roots(&[]);
+    // Keep original-cwd provenance consistent with copied binding records.
+    // Explicitly bind the new runtime so an off-branch source attachment
+    // cannot redirect a future CLI/SDK resume to a different directory.
+    crate::session_workdir::attach_session_workdir(&mut candidate, &cwd)
+        .map_err(|error| HistoryError::invalid(format!("Cannot bind fork workspace: {error}")))?;
+    if let Some((provider, model)) = model {
+        if candidate.effective_model_for_current_path() != Some((provider.clone(), model.clone())) {
+            candidate.append_model_change(provider.clone(), model.clone());
+        }
+        candidate.set_model_header(Some(provider), Some(model), None);
+    }
+    if let Some(thinking) = thinking {
+        if candidate
+            .effective_thinking_level_for_current_path()
+            .as_ref()
+            != Some(&thinking)
+        {
+            candidate.append_thinking_level_change(thinking.clone());
+        }
+        candidate.set_model_header(None, None, Some(thinking));
+    }
+    if let Some(budget) = &budget {
+        budget.checkpoint(&mut candidate).map_err(|error| {
+            HistoryError::internal(format!("Cannot preserve source model spend: {error}"))
+        })?;
+    }
+    let (fork_id, mut state) = super::build_acp_session_with_budget(
+        candidate,
+        save_enabled,
+        cwd.clone(),
+        options,
+        Some(permission_client),
+        budget.clone(),
+    )
+    .map_err(|error| HistoryError::internal(format!("Cannot build forked session: {error}")))?;
+    state.mcp = super::mcp::prepare(&cwd, &crate::config::Config::global_dir(), servers);
+    if let (Some(agent), Some(mcp)) = (state.agent_session.as_mut(), state.mcp.as_ref()) {
+        super::mcp::mount(agent.session_mut(), mcp);
+    }
+    super::arm_acp_prewalk(&mut state, options)
+        .await
+        .map_err(|error| HistoryError::invalid(format!("Cannot arm fork prewalk: {error}")))?;
+    let fork_handle = state
+        .agent_session
+        .as_mut()
+        .ok_or_else(HistoryError::busy)?;
+    let mut candidate = OwnedMutexGuard::lock(fork_handle.session_store(), cx)
+        .await
+        .map_err(|_| HistoryError::internal("Fork history is unavailable"))?;
+    // Capture the departing source's known writers, then bind the fork's own
+    // native journal after its first save. Reconcile again from the prepared
+    // source so a newly observed terminal bill cannot be lost during demotion.
+    if let Some(budget) = &budget {
+        let retained = budget.for_replacement(&candidate, true).map_err(|error| {
+            HistoryError::internal(format!("Cannot bind fork model spend: {error}"))
+        })?;
+        retained.checkpoint(&mut candidate).map_err(|error| {
+            HistoryError::internal(format!("Cannot checkpoint fork model spend: {error}"))
+        })?;
+    }
+    if save_enabled {
+        candidate.save().await.map_err(|error| {
+            HistoryError::internal(format!("Cannot save forked session: {error}"))
+        })?;
+    }
+    if let Some(budget) = &budget {
+        let retained = budget.for_replacement(&candidate, true).map_err(|error| {
+            HistoryError::internal(format!("Cannot retain fork model spend: {error}"))
+        })?;
+        retained.checkpoint(&mut candidate).map_err(|error| {
+            HistoryError::internal(format!("Cannot reconcile fork model spend: {error}"))
+        })?;
+        if save_enabled {
+            candidate.save().await.map_err(|error| {
+                HistoryError::internal(format!("Cannot save reconciled fork model spend: {error}"))
+            })?;
+        }
+        fork_handle
+            .session_mut()
+            .agent
+            .set_cost_budget(Some(retained));
+        fork_handle
+            .session()
+            .refresh_extension_completion_host_state();
+    }
+    drop(candidate);
+    let response = session_setup_response(&fork_id, &state).ok_or_else(HistoryError::busy)?;
+    let mcp_notification = state
+        .mcp
+        .as_ref()
+        .map(|_| super::mcp::commands_notification(&fork_id));
+    let state = Arc::new(Mutex::new(state));
+    let mut registry = sessions
+        .lock(cx)
+        .await
+        .map_err(|_| HistoryError::internal("Session registry is unavailable"))?;
+    if registry.contains_key(&fork_id) {
+        return Err(HistoryError::internal(
+            "Fork session identity already exists",
+        ));
+    }
+    if save_source && let Some(budget) = &budget {
+        // This activates a shared receipt writer only; the source agent and
+        // its work stay live. Complete every fallible preparation and await
+        // before activation, then synchronously publish the new session.
+        budget.retire_session(&source, cx.cx()).map_err(|error| {
+            HistoryError::internal(format!("Cannot activate fork model spend: {error}"))
+        })?;
+    }
+    registry.insert(fork_id, state);
+    drop(registry);
+    drop(source);
+    drop(action_permit);
+    drop(live);
+    if let Some(notification) = mcp_notification {
+        send_line(out, notification).await?;
     }
     Ok(response)
 }
@@ -791,6 +1053,309 @@ mod tests {
             session_dir: Some(root.into()),
             skills_prompt: None,
         }
+    }
+
+    fn fork_client(out: &AcpOutput, cx: &AgentCx) -> AcpPermissionClient {
+        AcpPermissionClient {
+            out_tx: out.clone(),
+            pending: Arc::clone(&out.shared.pending_permissions),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            timeout: Duration::from_secs(1),
+            cx: cx.clone(),
+        }
+    }
+
+    async fn bounded_fork<F: std::future::Future>(work: F) -> F::Output {
+        timeout(wall_now(), Duration::from_secs(30), Box::pin(work))
+            .await
+            .expect("ACP fork lifecycle watchdog expired")
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Exact quarter-dollar fixtures distinguish finalized and pending charges.
+    fn live_fork_keeps_source_active_and_recovers_late_shared_cost_after_cold_reopen() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(bounded_fork(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let attached_elsewhere = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let mut options = test_options(root.path(), runtime.handle());
+            options.launch.no_tools = true;
+            options.launch.no_context_files = true;
+            options.launch.max_cost = Some(2.0);
+            let budget = crate::cost::CostBudget::new(None, Some(2.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            let mut outstanding = budget.start_attempt().unwrap();
+            outstanding.observe(0.5).unwrap();
+            let mut source = fixture(root.path(), &cwd);
+            let leaf = source.leaf_id().unwrap().to_string();
+            crate::session_workdir::attach_session_workdir(&mut source, attached_elsewhere.path()).unwrap();
+            assert!(source.navigate_to(&leaf));
+            let original_messages = serde_json::to_value(source.to_messages_for_current_path()).unwrap();
+            let (source_id, mut source) = super::super::build_acp_session_with_budget(
+                source, true, cwd.clone(), &options, None, Some(budget.clone()),
+            ).unwrap();
+            let source_servers = super::super::mcp::parse_servers(
+                &json!({ "mcpServers": [{ "name": "source-only", "command": std::env::current_exe().unwrap() }] }),
+                &cwd, false,
+            ).unwrap().unwrap();
+            source.mcp = super::super::mcp::prepare(&cwd, root.path(), source_servers);
+            let source_mcp = source.mcp.clone().unwrap();
+            let source_store = source.agent_session.as_ref().unwrap().session_store();
+            let source = Arc::new(Mutex::new(source));
+            let sessions = Arc::new(Mutex::new(HashMap::from([(source_id.clone(), Arc::clone(&source))])));
+            let cx = AgentCx::for_testing();
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let out = AcpOutput::new(tx);
+            let client = fork_client(&out, &cx);
+            let response = fork(
+                &json!({ "sessionId": source_id, "cwd": cwd, "mcpServers": [{ "name": "fork-only", "command": std::env::current_exe().unwrap() }] }),
+                &options, &client, &sessions, &cx, &out,
+            ).await.unwrap();
+            let fork_id = response["sessionId"].as_str().unwrap();
+            assert_ne!(fork_id, source_id);
+            assert!(response.get("resumed").is_none());
+            assert_eq!(response["configOptions"][0]["currentValue"], "anthropic/claude-sonnet-4-5");
+            assert_eq!(response["configOptions"][1]["currentValue"], "off");
+            let fork_state = sessions.lock(&cx).await.unwrap().get(fork_id).unwrap().clone();
+            let (fork_path, fork_budget) = {
+                let state = fork_state.lock(&cx).await.unwrap();
+                let handle = state.agent_session.as_ref().unwrap();
+                let fork_mcp = state.mcp.as_ref().unwrap();
+                assert!(!Arc::ptr_eq(&source_mcp, fork_mcp));
+                assert_eq!(fork_mcp.manager.list()[0].name, "fork-only");
+                assert_eq!(source_mcp.manager.list()[0].name, "source-only");
+                assert!(handle.session().agent.approval_state().is_none());
+                let fork_budget = handle.session().agent.cost_budget().unwrap().clone();
+                assert!(fork_budget.same_tree(&budget));
+                assert_eq!(fork_budget.spent(), 0.25);
+                assert_eq!(fork_budget.snapshot().pending, 0.5);
+                let stored = OwnedMutexGuard::lock(handle.session_store(), &cx).await.unwrap();
+                assert_eq!(serde_json::to_value(stored.to_messages_for_current_path()).unwrap(), original_messages);
+                assert_eq!(crate::session_workdir::require_session_workdir(&stored).unwrap(), cwd);
+                let path = stored.path.clone().expect("fork saved before admission");
+                assert!(path.is_file());
+                (path, fork_budget)
+            };
+            let source_path = {
+                let stored = source_store.lock(&cx).await.unwrap();
+                assert_eq!(serde_json::to_value(stored.to_messages_for_current_path()).unwrap(), original_messages);
+                assert_eq!(crate::session_workdir::require_session_workdir(&stored).unwrap(), attached_elsewhere.path().canonicalize().unwrap());
+                stored.path.clone().unwrap()
+            };
+            {
+                let state = source.lock(&cx).await.unwrap();
+                state.agent_session.as_ref().unwrap().session().ensure_provider_reentry_allowed().unwrap();
+            }
+            // Continuing source work is charged to the fork immediately.
+            budget.record(0.5).unwrap();
+            assert_eq!(fork_budget.spent(), 0.75);
+            let source_bytes = std::fs::read(&source_path).unwrap();
+            let fork_bytes = std::fs::read(&fork_path).unwrap();
+            let updates = rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
+            assert_eq!(updates.len(), 1, "fork emits configuration, not replay or a provider turn");
+            assert_eq!(updates[0]["params"]["sessionId"], fork_id);
+            assert_eq!(updates[0]["params"]["update"]["sessionUpdate"], "available_commands_update");
+            sessions.lock(&cx).await.unwrap().clear();
+            drop(source);
+            drop(fork_state);
+            drop(source_store);
+            drop(source_mcp);
+            drop(fork_budget);
+            drop(budget);
+            // Only the actual provider attempt retains the old account now.
+            outstanding.finish(1.25).unwrap();
+            drop(outstanding);
+            assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+            assert_eq!(std::fs::read(&fork_path).unwrap(), fork_bytes);
+            let cold = Session::open(fork_path.to_str().unwrap()).await.unwrap();
+            let recovered = crate::cost::resolve_budget(&cold, None, None, Some(2.0), None).unwrap().unwrap();
+            assert_eq!(recovered.spent(), 2.0);
+            assert!(matches!(recovered.admit(), Err(crate::error::Error::CostCap { spent: 2.0, cap: 2.0 })));
+        }));
+    }
+
+    #[test]
+    fn cold_fork_preserves_selected_context_without_mutating_source_or_inheriting_extra_roots() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(bounded_fork(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let extra = tempfile::tempdir().unwrap();
+            let original_cwd = project.path().canonicalize().unwrap();
+            let cwd = extra.path().canonicalize().unwrap();
+            let mut source = fixture(root.path(), &original_cwd);
+            let selected = source.leaf_id().unwrap().to_string();
+            source.append_model_message(user("omitted sibling"));
+            assert!(source.navigate_to(&selected));
+            source.set_additional_roots(std::slice::from_ref(&original_cwd));
+            crate::session_workdir::attach_session_workdir(&mut source, &cwd).unwrap();
+            assert!(
+                source.navigate_to(&selected),
+                "attachment is outside the selected branch"
+            );
+            source.save().await.unwrap();
+            let path = source.path.clone().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let mut options = test_options(root.path(), runtime.handle());
+            options.launch.no_tools = true;
+            options.launch.no_context_files = true;
+            options.launch.provider = Some("must-not-override-saved-model".into());
+            options.launch.model = Some("not-selected".into());
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let cx = AgentCx::for_testing();
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            let out = AcpOutput::new(tx);
+            let client = fork_client(&out, &cx);
+            assert_eq!(
+                fork(
+                    &json!({ "sessionId": source.header.id, "cwd": original_cwd }),
+                    &options,
+                    &client,
+                    &sessions,
+                    &cx,
+                    &out,
+                )
+                .await
+                .unwrap_err()
+                .code,
+                SESSION_NOT_FOUND,
+                "original provenance is not the active workspace"
+            );
+            let response = fork(
+                &json!({ "sessionId": source.header.id, "cwd": cwd }),
+                &options,
+                &client,
+                &sessions,
+                &cx,
+                &out,
+            )
+            .await
+            .unwrap();
+            let id = response["sessionId"].as_str().unwrap();
+            assert_ne!(id, source.header.id);
+            assert_eq!(
+                sessions.lock(&cx).await.unwrap().len(),
+                1,
+                "cold source is not activated"
+            );
+            let restored = open_saved_session(id, &cwd, options.session_dir.as_deref())
+                .await
+                .unwrap();
+            assert_eq!(restored.header.parent_session.as_deref(), path.to_str());
+            assert_eq!(restored.header.cwd, original_cwd.to_str().unwrap());
+            assert_eq!(
+                crate::session_workdir::require_session_workdir(&restored).unwrap(),
+                cwd
+            );
+            assert!(restored.additional_roots().is_empty());
+            assert_eq!(
+                serde_json::to_value(restored.to_messages_for_current_path()).unwrap(),
+                serde_json::to_value(source.to_messages_for_current_path()).unwrap()
+            );
+            assert_eq!(
+                restored.to_messages_for_current_path().len(),
+                2,
+                "include the selected assistant leaf"
+            );
+            assert_eq!(
+                restored.effective_model_for_current_path(),
+                source.effective_model_for_current_path()
+            );
+            assert_eq!(
+                restored
+                    .effective_thinking_level_for_current_path()
+                    .as_deref(),
+                Some("off")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(rx.try_recv().is_err(), "fork does not replay old messages");
+        }));
+    }
+
+    #[test]
+    fn fork_rejects_busy_quarantined_invalid_and_unsavable_sources_before_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(bounded_fork(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let mut options = test_options(root.path(), runtime.handle());
+            options.launch.no_tools = true;
+            options.launch.no_context_files = true;
+            options.session_dir = None;
+            let (id, state) = build_acp_session(
+                fixture(root.path(), &cwd),
+                false,
+                cwd.clone(),
+                &options,
+                None,
+            )
+            .unwrap();
+            let provider_gate = state
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .session()
+                .provider_admission_gate();
+            let source_store = state.agent_session.as_ref().unwrap().session_store();
+            let sessions = Arc::new(Mutex::new(HashMap::from([(
+                id.clone(),
+                Arc::new(Mutex::new(state)),
+            )])));
+            let cx = AgentCx::for_testing();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+            let out = AcpOutput::new(tx);
+            let client = fork_client(&out, &cx);
+            let params = json!({ "sessionId": id, "cwd": cwd });
+            let (abort, _signal) = super::super::AbortHandle::new();
+            let reserved = out.begin_prompt(id.clone(), abort).unwrap();
+            assert_eq!(
+                fork(&params, &options, &client, &sessions, &cx, &out)
+                    .await
+                    .unwrap_err()
+                    .code,
+                PROMPT_IN_PROGRESS
+            );
+            drop(reserved);
+            provider_gate.block("unacknowledged source transition".into());
+            let error = fork(&params, &options, &client, &sessions, &cx, &out)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert!(error.message.contains("quarantined"));
+            provider_gate.clear();
+            for invalid in [
+                json!({ "sessionId": id, "cwd": other.path() }),
+                json!({ "sessionId": id, "cwd": cwd, "additionalDirectories": [other.path()] }),
+                json!({ "sessionId": id, "cwd": cwd, "additionalDirectories": "not-an-array" }),
+                json!({ "sessionId": id, "cwd": cwd, "mcpServers": [{ "command": "never-run" }] }),
+            ] {
+                assert_eq!(
+                    fork(&invalid, &options, &client, &sessions, &cx, &out)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    INVALID_PARAMS
+                );
+            }
+            let blocked_root = root.path().join("not-a-directory");
+            std::fs::write(&blocked_root, "occupied").unwrap();
+            options.session_dir = Some(blocked_root);
+            assert_eq!(
+                fork(&params, &options, &client, &sessions, &cx, &out)
+                    .await
+                    .unwrap_err()
+                    .code,
+                INTERNAL_ERROR
+            );
+            assert_eq!(sessions.lock(&cx).await.unwrap().len(), 1);
+            let source = source_store.lock(&cx).await.unwrap();
+            assert!(source.path.is_none());
+            assert_eq!(source.to_messages_for_current_path().len(), 2);
+        }));
     }
 
     fn catalog_fixture(count: usize) -> Vec<CatalogRow> {

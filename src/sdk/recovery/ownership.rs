@@ -43,8 +43,7 @@ impl Drop for TurnGuard {
                 state.finished = true;
                 state.session_id = None;
                 state.messages.clear();
-                state.retry = None;
-                state.fallback = None;
+                state.recovery = crate::failover::RecoveryEventLifecycle::default();
                 true
             }
         };

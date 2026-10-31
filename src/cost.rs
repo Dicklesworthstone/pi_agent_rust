@@ -923,9 +923,11 @@ impl CostBudget {
         Ok(())
     }
 
-    /// Retain only final-bill persistence for a saved source leaving the
-    /// foreground. Call after all fallible replacement preparation, immediately
-    /// before installing the replacement, or after the final shutdown save.
+    /// Retain final-bill persistence for a saved source used by a replacement
+    /// or a concurrently live fork. This registers a billing sink; it does not
+    /// cancel source work or close the shared account.
+    /// Call after all fallible candidate preparation, immediately before
+    /// installing it, or after the final shutdown save.
     /// No journal is activated by an abandoned checkpoint or an unsaved session.
     pub fn retire_session(&self, session: &Session, owner: &asupersync::Cx) -> Result<()> {
         if self.remote.is_some() || session.path.is_none() {

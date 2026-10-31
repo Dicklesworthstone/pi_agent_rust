@@ -3097,20 +3097,18 @@ impl Clone for Session {
     }
 }
 
-/// Result of planning a `/fork` operation from a specific user message.
+/// Selected conversation and workspace provenance for a new session.
 ///
-/// Mirrors legacy semantics:
-/// - The new session's leaf is the *parent* of the selected user message (or `None` if root),
-///   so the selected message can be re-submitted as a new branch without creating consecutive
-///   user messages.
-/// - The selected user message text is returned for editor pre-fill.
+/// An interactive edit-and-fork selects the parent of a user message and
+/// returns that message for editor pre-fill. A current-context fork includes
+/// the active leaf and leaves the editor text empty.
 #[derive(Debug, Clone)]
 pub struct ForkPlan {
     /// Entries to copy into the new session file (path to the fork leaf, inclusive).
     pub entries: Vec<SessionEntry>,
-    /// Leaf ID to set in the new session (parent of selected user entry).
+    /// Leaf ID to set in the new session.
     pub leaf_id: Option<String>,
-    /// Text of the selected user message (for editor pre-fill).
+    /// Text for editor pre-fill; empty for a current-context fork.
     pub selected_text: String,
     // Session-wide metadata must come from the source, independently of the
     // selected conversation ancestry or the caller's process directory.
@@ -6124,6 +6122,25 @@ impl Session {
         let selected_text = user_content_to_text(content);
         let leaf_id = message_entry.base.parent_id.clone();
 
+        self.plan_fork_at(leaf_id, selected_text)
+    }
+
+    /// Fork the complete selected conversation, including its current leaf.
+    ///
+    /// Unlike an interactive edit-and-fork, this retains the last user message
+    /// and its answer. Preparing the snapshot never navigates or rewrites the
+    /// source, and includes its latest session-wide workspace attachment even
+    /// when that metadata lives outside the selected conversation path.
+    pub fn plan_fork_current_context(&self) -> Result<ForkPlan> {
+        if self.v2_partial_hydration {
+            let mut complete = self.clone();
+            complete.ensure_full_v2_hydration_before_save()?;
+            return complete.plan_fork_current_context();
+        }
+        self.plan_fork_at(self.leaf_id.clone(), String::new())
+    }
+
+    fn plan_fork_at(&self, leaf_id: Option<String>, selected_text: String) -> Result<ForkPlan> {
         let entries = if let Some(ref leaf_id) = leaf_id {
             if self.is_linear {
                 let idx = self.entry_index.get(leaf_id).copied().ok_or_else(|| {

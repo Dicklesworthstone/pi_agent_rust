@@ -15,6 +15,7 @@
 //! - `_session/steering` — inject native input into a running turn or its
 //!   follow-up queue without starting a second prompt
 //! - `session/list`, `session/load`, `session/resume` — session management
+//! - `session/fork` — create an independent active conversation from a session
 //! - `session/set_model` — switch the live session's provider/model at runtime
 //! - `session/set_config_option` — set a runtime option (e.g. thinking/effort)
 //!
@@ -1361,7 +1362,7 @@ async fn run(
                             .map_err(|error| Error::session(error.message))?;
                     }
 
-                    "session/load" | "session/resume" => {
+                    "session/load" | "session/resume" | "session/fork" => {
                         if !initialized.load(Ordering::SeqCst) {
                             let _ = out_tx.send(json_rpc_error(
                                 id,
@@ -1386,7 +1387,7 @@ async fn run(
                             let _ = out_tx.send(json_rpc_error(
                                 id,
                                 PROMPT_IN_PROGRESS,
-                                "Cannot load or resume a session while a prompt, editor file write, or terminal cleanup is in progress",
+                                "Cannot load, resume, or fork a session while a prompt, editor file write, or terminal cleanup is in progress",
                             ));
                             continue;
                         }
@@ -1398,21 +1399,33 @@ async fn run(
                             cx: cx.clone(),
                         };
                         let replay = request.method == "session/load";
-                        let result = history::load(
-                            &request.params,
-                            &options,
-                            &permission_client,
-                            &sessions,
-                            &cx,
-                            &out_tx,
-                            replay,
-                        )
-                        .await;
+                        let result = if request.method == "session/fork" {
+                            history::fork(
+                                &request.params,
+                                &options,
+                                &permission_client,
+                                &sessions,
+                                &cx,
+                                &out_tx,
+                            )
+                            .await
+                        } else {
+                            history::load(
+                                &request.params,
+                                &options,
+                                &permission_client,
+                                &sessions,
+                                &cx,
+                                &out_tx,
+                                replay,
+                            )
+                            .await
+                        };
                         // All replay notifications precede this response. Resume is
                         // intentionally history-free for clients that kept their view.
                         let response = match result {
                             Ok(mut result) => {
-                                if !replay {
+                                if request.method == "session/resume" {
                                     result["resumed"] = json!(true);
                                 }
                                 json_rpc_ok(id, result)
@@ -1953,7 +1966,8 @@ fn handle_initialize() -> Value {
                 "sse": true,
             },
             "promptCapabilities": content::prompt_capabilities(),
-            "sessionCapabilities": { "list": {}, "resume": {} },
+            // Fork is the optional ACP v1 draft capability, not protocol v2.
+            "sessionCapabilities": { "list": {}, "resume": {}, "fork": {} },
             "_meta": {
                 "pi.dev": {
                     "toolApproval": true,
@@ -2231,11 +2245,24 @@ fn handle_session_new(
 /// auth resolution, system prompt, and persistence owner. Restore the selected
 /// branch's settings instead of another branch's header tip or startup defaults.
 fn build_acp_session(
+    session: Session,
+    save_enabled: bool,
+    cwd: PathBuf,
+    options: &AcpOptions,
+    permission_client: Option<&AcpPermissionClient>,
+) -> Result<(String, AcpSessionState)> {
+    build_acp_session_with_budget(session, save_enabled, cwd, options, permission_client, None)
+}
+
+/// Forks keep their source's live account, including pending requests, while
+/// receiving independent tools, editor permissions, terminals and MCP state.
+fn build_acp_session_with_budget(
     mut session: Session,
     save_enabled: bool,
     cwd: PathBuf,
     options: &AcpOptions,
     permission_client: Option<&AcpPermissionClient>,
+    inherited_budget: Option<crate::cost::CostBudget>,
 ) -> Result<(String, AcpSessionState)> {
     let session_id = session.header.id.clone();
     let mut auth = options.auth.clone();
@@ -2346,7 +2373,7 @@ fn build_acp_session(
             options.config.session.as_ref(),
             cli.warn_cost,
             cli.max_cost,
-            None,
+            inherited_budget,
         )?,
         turn_recovery: options.config.turn_recovery_mode(),
         approval_state: None,

@@ -218,6 +218,82 @@ fn fork_preserves_workspace_provenance_without_navigating_or_rewriting_its_sourc
 }
 
 #[test]
+fn current_context_forks_keep_the_active_leaf_and_do_not_change_the_source() {
+    for lazy in [false, true] {
+        let root = tempfile::tempdir().expect("tempdir");
+        run_async(async {
+            let mut fixture = workspace_fixture(root.path(), lazy).await;
+            for empty in [false, true] {
+                if empty {
+                    fixture.source.reset_leaf();
+                }
+                let source_view = serde_json::to_value((
+                    &fixture.source.header,
+                    &fixture.source.entries,
+                    &fixture.source.leaf_id,
+                    fixture.source.v2_partial_hydration,
+                ))
+                .expect("source snapshot");
+                let selected_leaf = fixture.source.leaf_id().map(str::to_owned);
+                let expected = serde_json::to_value(fixture.source.to_messages_for_current_path())
+                    .expect("selected context");
+                let plan = fixture
+                    .source
+                    .plan_fork_current_context()
+                    .expect("plan fork");
+                assert!(plan.selected_text.is_empty());
+                assert_eq!(plan.leaf_id, selected_leaf);
+                let mut fork = Session::create_with_dir(Some(root.path().join("forks")));
+                fork.init_from_fork_plan(plan);
+                fixture.assert_workspace(&fork);
+                assert_eq!(
+                    serde_json::to_value(fork.to_messages_for_current_path()).unwrap(),
+                    expected
+                );
+                if !empty {
+                    assert_eq!(expected.as_array().unwrap().len(), 4);
+                    let text = expected.to_string();
+                    assert!(text.contains("revise this request"));
+                    assert!(text.contains("discard this answer"));
+                    assert!(!text.contains("omitted branch question"));
+                }
+                assert_eq!(
+                    serde_json::to_value((
+                        &fixture.source.header,
+                        &fixture.source.entries,
+                        &fixture.source.leaf_id,
+                        fixture.source.v2_partial_hydration,
+                    ))
+                    .unwrap(),
+                    source_view
+                );
+
+                fork.save().await.expect("save current-context fork");
+                let mut reopened = Session::open(fork.path.as_ref().unwrap().to_str().unwrap())
+                    .await
+                    .expect("reopen current-context fork");
+                fixture.assert_workspace(&reopened);
+                assert_eq!(reopened.leaf_id(), selected_leaf.as_deref());
+                assert_eq!(
+                    serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+                    expected
+                );
+                let continuation = reopened.append_message(user("independent fork continuation"));
+                assert_eq!(
+                    reopened.get_entry(&continuation).unwrap().base().parent_id,
+                    selected_leaf
+                );
+                reopened.save().await.expect("save fork continuation");
+                assert_eq!(
+                    std::fs::read(&fixture.source_file).unwrap(),
+                    fixture.source_bytes
+                );
+            }
+        });
+    }
+}
+
+#[test]
 fn fork_from_root_keeps_empty_conversation_and_current_workspace_after_reopen() {
     let root = tempfile::tempdir().expect("tempdir");
     run_async(async {

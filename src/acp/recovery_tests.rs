@@ -557,6 +557,166 @@ fn assert_discovery_update(transcript: &[Value], id: u64, session: &str, current
     assert!(options.iter().any(|option| option["id"] == "thought_level"));
 }
 
+async fn approved_fork_prompt(
+    input: &asupersync::channel::mpsc::Sender<String>,
+    output: &std::sync::mpsc::Receiver<String>,
+    transcript: &mut Vec<Value>,
+    id: u64,
+    session: &str,
+    prompt: &str,
+) {
+    input
+        .try_send(
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                "params": { "sessionId": session, "prompt": [{ "type": "text", "text": prompt }] },
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let mut permissions = 0;
+    loop {
+        let message = match output.try_recv() {
+            Ok(line) => serde_json::from_str::<Value>(&line).unwrap(),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                sleep(wall_now(), Duration::from_millis(1)).await;
+                continue;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("ACP fork prompt disconnected")
+            }
+        };
+        transcript.push(message.clone());
+        if message["method"] == "session/request_permission" {
+            assert_eq!(
+                message["params"]["sessionId"], session,
+                "permission belongs to this conversation"
+            );
+            input.try_send(json!({
+                "jsonrpc": "2.0", "id": message["id"],
+                "result": { "outcome": { "outcome": "selected", "optionId": ACP_PERMISSION_ALLOW_ONCE } },
+            }).to_string()).unwrap();
+            permissions += 1;
+        } else if message.get("id") == Some(&json!(id)) {
+            assert_eq!(message["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            assert_eq!(
+                permissions, 1,
+                "the new session must consult its own editor permission handler"
+            );
+            return;
+        } else {
+            assert_eq!(message["method"], "session/update");
+            assert_eq!(message["params"]["sessionId"], session);
+        }
+    }
+}
+
+#[test]
+fn dispatcher_fork_saves_before_ack_and_both_sessions_continue_with_independent_permissions() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().canonicalize().unwrap();
+    let sessions_root = root.path().join("sessions");
+    let mut provider = ProviderFixture::with_replies(
+        vec![200; 5],
+        vec![
+            None,
+            Some(("current_time", json!({}))),
+            None,
+            Some(("current_time", json!({}))),
+            None,
+        ],
+    );
+    let runtime = runtime();
+    let (source_id, fork_id, source_path, fork_path) = runtime.block_on(bounded_launch_controls(async {
+        let mut options = options(root.path(), &provider.url, runtime.handle(), 0);
+        options.session_dir = Some(sessions_root.clone());
+        options.launch.tools = Some("current_time".into());
+        options.launch.no_mcp = true;
+        options.launch.no_context_files = true;
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            let initialized = discovery_request(&input, &outgoing, &mut transcript, 1, "initialize", json!({ "protocolVersion": 1 })).await;
+            assert_eq!(initialized["result"]["agentCapabilities"]["sessionCapabilities"]["fork"], json!({}));
+            let created = discovery_request(&input, &outgoing, &mut transcript, 2, "session/new", json!({ "cwd": cwd })).await;
+            let source_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+            let original = discovery_request(&input, &outgoing, &mut transcript, 3, "session/prompt", json!({
+                "sessionId": source_id, "prompt": [{ "type": "text", "text": "SOURCE-CONTEXT-ONLY" }],
+            })).await;
+            assert_eq!(original["result"]["stopReason"], ACP_STOP_REASON_END_TURN);
+            let selected = discovery_request(&input, &outgoing, &mut transcript, 4, "session/set_model", json!({
+                "sessionId": source_id, "modelId": format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}"),
+            })).await;
+            assert!(selected.get("error").is_none(), "{selected}");
+            let before_fork = transcript.len();
+            let forked = discovery_request(&input, &outgoing, &mut transcript, 5, "session/fork", json!({
+                "sessionId": source_id, "cwd": cwd,
+            })).await;
+            assert!(forked.get("error").is_none(), "{forked}");
+            assert_eq!(transcript.len(), before_fork + 1, "fork does not replay history");
+            assert_eq!(provider.requests.lock().unwrap().len(), 1, "fork does not run the provider");
+            let fork_id = forked["result"]["sessionId"].as_str().unwrap().to_string();
+            assert_ne!(fork_id, source_id);
+            assert_eq!(forked["result"]["configOptions"][0]["currentValue"], format!("{FALLBACK_PROVIDER}/{FALLBACK_MODEL}"));
+            assert_eq!(forked["result"]["configOptions"][1]["currentValue"], "off");
+            assert!(forked["result"].get("resumed").is_none());
+            let index = crate::session_index::SessionIndex::for_sessions_root(&sessions_root);
+            index.reindex_all().unwrap();
+            let rows = index.list_sessions(None).unwrap();
+            assert_eq!(rows.len(), 2);
+            let source_path = rows.iter().find(|row| row.id == source_id).unwrap().path.clone();
+            let fork_path = rows.iter().find(|row| row.id == fork_id).unwrap().path.clone();
+            let saved = Session::open(&fork_path).await.unwrap();
+            assert_eq!(saved.header.id, fork_id);
+            assert_eq!(saved.to_messages_for_current_path().len(), 2, "complete selected leaf is durable at ACK");
+            let source_before_fork_prompt = std::fs::read(&source_path).unwrap();
+            approved_fork_prompt(&input, &outgoing, &mut transcript, 6, &fork_id, "FORK-CONTINUATION-ONLY").await;
+            assert_eq!(std::fs::read(&source_path).unwrap(), source_before_fork_prompt);
+            approved_fork_prompt(&input, &outgoing, &mut transcript, 7, &source_id, "SOURCE-CONTINUATION-ONLY").await;
+            input.try_send(json!({ "jsonrpc": "2.0", "method": "exit" }).to_string()).unwrap();
+            (source_id, fork_id, source_path, fork_path)
+        };
+        let (served, result) = futures::join!(Box::pin(run(options, incoming, AcpOutput::new(output))), editor);
+        served.unwrap();
+        result
+    }));
+    let requests = provider.finish(5);
+    for index in [1, 2] {
+        let context = requests[index].1["messages"].to_string();
+        assert!(context.contains("SOURCE-CONTEXT-ONLY"));
+        assert!(context.contains("FORK-CONTINUATION-ONLY"));
+        assert!(!context.contains("SOURCE-CONTINUATION-ONLY"));
+        assert_eq!(requests[index].1["model"], FALLBACK_MODEL);
+    }
+    for index in [3, 4] {
+        let context = requests[index].1["messages"].to_string();
+        assert!(context.contains("SOURCE-CONTEXT-ONLY"));
+        assert!(context.contains("SOURCE-CONTINUATION-ONLY"));
+        assert!(!context.contains("FORK-CONTINUATION-ONLY"));
+    }
+    runtime.block_on(bounded_launch_controls(async {
+        let source = Session::open(&source_path).await.unwrap();
+        let fork = Session::open(&fork_path).await.unwrap();
+        assert_eq!(source.header.id, source_id);
+        assert_eq!(fork.header.id, fork_id);
+        assert_eq!(
+            fork.header.parent_session.as_deref(),
+            Some(source_path.as_str())
+        );
+        let source_messages = serde_json::to_value(source.to_messages_for_current_path())
+            .unwrap()
+            .to_string();
+        let fork_messages = serde_json::to_value(fork.to_messages_for_current_path())
+            .unwrap()
+            .to_string();
+        assert!(source_messages.contains("SOURCE-CONTINUATION-ONLY"));
+        assert!(!source_messages.contains("FORK-CONTINUATION-ONLY"));
+        assert!(fork_messages.contains("FORK-CONTINUATION-ONLY"));
+        assert!(!fork_messages.contains("SOURCE-CONTINUATION-ONLY"));
+    }));
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn dispatcher_discovers_selects_and_restores_provider_qualified_byo_models() {

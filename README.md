@@ -782,6 +782,30 @@ other providers still need their own credentials unless they require no key.
 If an editor shows an empty picker, compare its `session/new` response with
 `pi --list-models` using the same configuration and launch environment.
 
+**ACP session forks.** Pi advertises the optional ACP v1 draft
+`sessionCapabilities.fork` capability. A client can create an active branch
+from the source's complete selected conversation:
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"session/fork","params":{"sessionId":"SOURCE_ID","cwd":"/absolute/workspace","mcpServers":[]}}
+```
+
+The response contains a new `sessionId`, model choices, and `configOptions`.
+The last user message and assistant reply are included in the fork; the source
+keeps its conversation and remains usable. Forking does not run the model or
+replay the transcript. Use `session/load` on the returned ID when an editor
+needs the inherited history. A live source or an exact saved ID in the configured
+session directory can be forked. With `--session-dir`, the fork is saved before
+success is acknowledged, including retained model spend and pending billing
+ancestry. Live source and fork share the configured session-tree cost budget.
+
+Forks stay in the source's canonical workspace; nonempty
+`additionalDirectories` are rejected. The request supplies a fresh MCP server
+list (omission means none), and editor file requests, terminal requests, and
+permissions use the new session identity. An active source prompt, unresolved
+editor write, unsettled terminal cleanup, or failed-persistence admission fence
+blocks the fork until the source is ready.
+
 **ACP attachments.** `session/prompt` accepts ordered text, images, native
 `audio` blocks, and embedded audio/video resource blobs. Audio-only prompts
 work. Gemini-family providers receive native media; other transports show an
