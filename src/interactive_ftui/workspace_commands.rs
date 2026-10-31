@@ -4,7 +4,7 @@
 //! shared with the classic stack (`interactive::workspace_reports`); this
 //! module routes them through the driver and renders the result.
 
-mod goal_progress;
+pub(super) mod goal_progress;
 mod model_handoff;
 
 use std::path::Path;

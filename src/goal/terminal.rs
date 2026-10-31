@@ -255,6 +255,19 @@ pub async fn run_with_control(
     args: &str,
     publish_control: impl FnOnce(GoalControl) + Send,
 ) -> Result<String> {
+    run_with_control_and_pending(handle, args, publish_control, |_| {}).await
+}
+
+/// Return unclaimed native input before reading the post-run receipt. Hosts
+/// exposing live input must retain these payloads even if that final read
+/// fails; the bounded text report is not an attachment recovery mechanism.
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_control_and_pending(
+    handle: &mut AgentSessionHandle,
+    args: &str,
+    publish_control: impl FnOnce(GoalControl) + Send,
+    return_pending: impl FnOnce(Vec<crate::session_control::PendingInput>) + Send,
+) -> Result<String> {
     let command = parse(args)?;
     let owner = AgentCx::for_current_or_request();
     check_owner(&owner, false)?;
@@ -300,8 +313,9 @@ pub async fn run_with_control(
             |_control, _event| {},
         )?;
         publish_control(run.control());
-        let report = run.await;
+        let mut report = run.await;
         let mut output = execution_report(label, &report);
+        return_pending(std::mem::take(&mut report.pending));
         // A native prompt or host hook may have changed plan state. The new
         // receipt must describe the state actually shown after settlement.
         let live_plan = handle.session().agent.plan_state().mode();

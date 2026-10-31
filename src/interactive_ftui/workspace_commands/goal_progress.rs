@@ -5,7 +5,7 @@
 //! The host explicitly binds ONE GoalControl before dispatch. Observed output
 //! loss pauses that run; it never authorizes another prompt or changes tools.
 
-use std::sync::mpsc::{SendError, Sender};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::agent::AgentEvent;
@@ -25,8 +25,22 @@ struct DisplayState {
 }
 
 struct Display {
-    sender: Sender<PiMsg>,
+    sender: Output,
     state: Mutex<DisplayState>,
+}
+
+enum Output {
+    Direct(Sender<PiMsg>),
+    Goal(crate::interactive_ftui::goal_control::Invocation),
+}
+
+impl Output {
+    fn send(&self, message: PiMsg) -> Result<(), ()> {
+        match self {
+            Self::Direct(sender) => sender.send(message).map_err(|_| ()),
+            Self::Goal(invocation) => invocation.send(message),
+        }
+    }
 }
 
 impl Display {
@@ -79,11 +93,7 @@ impl Display {
         }
     }
 
-    fn forward(
-        &self,
-        state: &mut DisplayState,
-        messages: Vec<PiMsg>,
-    ) -> Result<(), Box<SendError<PiMsg>>> {
+    fn forward(&self, state: &mut DisplayState, messages: Vec<PiMsg>) -> Result<(), ()> {
         for message in messages {
             let outgoing = match message {
                 PiMsg::AgentStart => {
@@ -176,7 +186,7 @@ impl Display {
 
 /// One temporary subscription, retaining no borrow of the live SDK handle.
 /// Drop retires even an abandoned command; late cloned callbacks are inert.
-pub(super) struct Observation {
+pub(in crate::interactive_ftui) struct Observation {
     listeners: EventListeners,
     subscription: Option<SubscriptionId>,
     display: Arc<Display>,
@@ -184,8 +194,19 @@ pub(super) struct Observation {
 
 impl Observation {
     pub(super) fn attach(listeners: &EventListeners, sender: &Sender<PiMsg>) -> Self {
+        Self::with_output(listeners, Output::Direct(sender.clone()))
+    }
+
+    pub(in crate::interactive_ftui) fn attach_to_goal(
+        listeners: &EventListeners,
+        invocation: crate::interactive_ftui::goal_control::Invocation,
+    ) -> Self {
+        Self::with_output(listeners, Output::Goal(invocation))
+    }
+
+    fn with_output(listeners: &EventListeners, sender: Output) -> Self {
         let display = Arc::new(Display {
-            sender: sender.clone(),
+            sender,
             state: Mutex::new(DisplayState::default()),
         });
         let observed = Arc::clone(&display);
@@ -199,12 +220,14 @@ impl Observation {
 
     /// Used once, before the goal driver is polled. Closing this observation
     /// before publication still pauses the incoming run without dispatch.
-    pub(super) fn control_publisher(&self) -> impl FnOnce(GoalControl) + Send + 'static {
+    pub(in crate::interactive_ftui) fn control_publisher(
+        &self,
+    ) -> impl FnOnce(GoalControl) + Send + 'static {
         let display = Arc::clone(&self.display);
         move |control| display.bind_control(control)
     }
 
-    pub(super) fn finish(mut self) {
+    pub(in crate::interactive_ftui) fn finish(mut self) {
         self.retire(true);
     }
 

@@ -15,21 +15,35 @@ commands publish no execution control. A host can pause the handle before the
 first poll without dispatching a provider request or consuming a prompt intent.
 Finished/dropped handles cannot steer or stop a later invocation.
 
-The default workspace dispatcher binds the handle to its existing temporary
-progress observation. A failed progress-channel send pauses that invocation,
+The default terminal binds the handle to its shared runtime control fence and
+temporary progress observation. Escape pauses the whole invocation, including
+the gaps between prompts. Ctrl-C also pauses an active goal without clearing
+the ordinary draft; modal extension/ask/login editors keep their keyboard
+ownership. Terminal shutdown seals publication and pauses a goal even if its
+native control arrives after shutdown began. A failed progress-channel send pauses that invocation,
 sealing continuation and asking any live native turn to abort and drain.
 Abandoning the observation also requests pause. Publication after retirement
 immediately pauses the incoming control. Control calls happen after releasing
 the display mutex so a wakeup can emit events without a lock inversion.
 Normal completion only retires the observation; it does not cancel another run.
 
-This is **observed channel-loss cancellation**, not a periodic liveness probe.
-A silent provider with no event to send may not expose a disconnected UI until
-its next event or the existing deadline. This does not yet connect Escape,
-Ctrl-C, steering or follow-up entry to the terminal's `TurnControlSlot` for goal
-commands. The default terminal still needs that separate keyboard-control
-integration. The native controller and its existing SDK APIs do support pause
-and live input for hosts that explicitly retain the published handle.
+A deliberate second Ctrl-C within the normal exit window still quits while a
+paused goal drains; the first tap retains the draft and its exit timestamp.
+
+Keyboard cancellation reaches the owning `GoalControl` immediately, even when
+the provider is silent. Channel-loss cancellation still observes failed sends;
+it is not a periodic liveness probe. Progress and final reports carry both
+session and invocation identities. A late report cannot end the display of a
+new goal, another session or a later ordinary driver command.
+
+Enter steers the current native prompt. Alt+Enter and `/queue` enqueue a
+follow-up. File references are prepared once and their ordered native text,
+image and media blocks enter the same bounded mailbox as SDK input. The
+original authored text remains separate from expanded attachment contents.
+Admission in a startup/verifier gap or after pause fails visibly and keeps the
+draft; it never silently starts an ordinary prompt after the goal finishes.
+Manual `/compact` and `/shake` require pausing the goal first: their ordinary
+turn barriers cannot take ownership of a goal driver's inner prompt.
 
 ## Attachment-aware SDK goal input
 
@@ -72,10 +86,27 @@ from the retained `GoalControl`. An old ID or control cannot retract, correct
 or cancel a replacement run's input. No recovery operation automatically
 resends anything or resets the goal's prompt/token allowances.
 
-This SDK input surface is a prerequisite for terminal queue editing and native
-attachments during goals; it does not itself wire the default terminal's keys.
+The default terminal uses these same typed APIs for goal input and Alt+Up
+recall. It does not add an independent execution queue or change goal budgets.
 
 ## Explicit restoration of returned input
+
+The terminal retains the complete native payload on completion, failure and
+abandonment, including when the final goal receipt cannot be read. It restores
+the authored text only into the owning session's ordinary empty composer;
+existing drafts and login, ask, extension and picker input remain untouched.
+Alt+Up can recall unclaimed input during the same goal. Recovered attachments
+are kept as captured bytes, not reconstructed by rereading file references.
+
+Sending an unchanged recovered draft explicitly resubmits its exact native
+blocks and authored text. During its original goal it returns to that goal's
+current accepting turn; after settlement it starts one ordinary controlled
+turn, with a driver check of the originating session and branch. It never
+implicitly resumes a goal. An earlier goal's payload cannot bypass that check
+by entering a newer live goal or ordinary turn. Media-only input can be sent
+even when its authored text is empty. If a prepared draft is edited, Alt+Up
+restores the original; Ctrl-C clears it to compose a new message. This preserves
+captured attachments without guessing how edited prose maps to expanded files.
 
 Both `SessionControlHandle` and `GoalControl` provide:
 

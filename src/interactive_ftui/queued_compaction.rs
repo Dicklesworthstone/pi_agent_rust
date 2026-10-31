@@ -67,6 +67,14 @@ impl PiFtuiModel {
         } else {
             return false;
         };
+        if self.live_goal().is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                "Pause the goal with Escape before compacting; this command stays in the editor."
+                    .to_string(),
+            );
+            return true;
+        }
         if self
             .queued_compaction
             .as_ref()

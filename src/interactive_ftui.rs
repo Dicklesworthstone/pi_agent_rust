@@ -62,6 +62,7 @@ use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use std::collections::{HashMap, VecDeque};
 
 mod console_input;
+mod goal_control;
 mod info_commands;
 mod plan_commands;
 mod queued_compaction;
@@ -86,6 +87,8 @@ pub enum PiFtuiMsg {
     Term(Event),
     /// An agent/system event bridged from the async side.
     Agent(PiMsg),
+    /// Progress or unclaimed native input from one session-owned goal run.
+    Goal(goal_control::Event),
     /// The process came back from a SIGTSTP suspension: the terminal has
     /// been re-acquired and the next frame must repaint everything.
     Resumed,
@@ -1689,6 +1692,8 @@ impl Eq for McpAuthRequest {}
 pub enum UiCommand {
     /// Run an agent turn with this prompt.
     Prompt(String),
+    /// Explicitly resend recovered goal input with its captured native blocks.
+    RestoredGoalInput(goal_control::RestoredInput),
     /// Consume the driver's prepared CLI attachment message exactly once.
     InitialPrompt,
     /// Switch the session's active model (`/model provider/model`).
@@ -2112,6 +2117,9 @@ pub struct PiFtuiModel {
     /// Driver returns deferred across modal ownership, in arrival order.
     /// Replaced-session entries are discarded before any draft is changed.
     pending_input_restores: VecDeque<PendingInputRestore>,
+    pending_goal_inputs: VecDeque<goal_control::RestoredInput>,
+    goal_draft: Option<goal_control::Draft>,
+    goal_rx: Option<goal_control::EventReceiver>,
     /// Clipboard captures still owned by the ordinary composer.
     pending_image_pastes: VecDeque<PendingImagePaste>,
     /// Never reused, including after a request's owner has been invalidated.
@@ -2522,6 +2530,9 @@ impl PiFtuiModel {
             ext_queue: VecDeque::new(),
             card_draft_snapshot: None,
             pending_input_restores: VecDeque::new(),
+            pending_goal_inputs: VecDeque::new(),
+            goal_draft: None,
+            goal_rx: None,
             pending_image_pastes: VecDeque::new(),
             next_image_paste_id: 0,
             ext_reply_tx: None,
@@ -2732,6 +2743,11 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_turn_control(mut self, slot: TurnControlSlot) -> Self {
         self.turn_control = Some(slot);
+        self
+    }
+
+    fn with_goal_events(mut self, receiver: Receiver<goal_control::Event>) -> Self {
+        self.goal_rx = Some(Arc::new(Mutex::new(Some(receiver))));
         self
     }
 
@@ -3720,6 +3736,7 @@ impl PiFtuiModel {
                 if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
                     self.autocomplete.close();
                 }
+                self.park_goal_draft_for(&session_id);
                 self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
             }
@@ -3737,6 +3754,7 @@ impl PiFtuiModel {
                 if self.displayed_session_id.as_deref() != Some(session_id.as_str()) {
                     self.autocomplete.close();
                 }
+                self.park_goal_draft_for(&session_id);
                 self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
                 // The driver re-sends this text next; show it as the turn's
@@ -4076,6 +4094,9 @@ impl PiFtuiModel {
             );
             return;
         }
+        if self.submit_goal_draft() {
+            return;
+        }
         let text = self.input.text();
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -4127,16 +4148,24 @@ impl PiFtuiModel {
             );
             return;
         }
+        let goal = self.live_goal();
+        if goal.is_none() && self.goal_display_pending() {
+            self.push_entry(
+                EntryRole::Error,
+                "The goal is finishing; input stays in the editor for review.".to_string(),
+            );
+            return;
+        }
         // `@file` references are read in here, as the driver does for idle
         // prompts; they used to reach the model as literal `@path` text.
-        let steer_text = match prepare_prompt(
+        let (steer_text, attachments) = match prepare_prompt(
             &clean,
             self.steer_resources.as_ref(),
             &self.file_ref_cwd,
             None,
             true,
         ) {
-            Ok((_, images)) if !images.is_empty() => {
+            Ok((_, images)) if !images.is_empty() && goal.is_none() => {
                 // The text stays in the editor for after the turn.
                 self.push_entry(
                     EntryRole::Error,
@@ -4146,12 +4175,28 @@ impl PiFtuiModel {
                 );
                 return;
             }
-            Ok((text, _)) => text,
+            Ok(prepared) => prepared,
             Err(err) => {
                 self.push_entry(EntryRole::Error, format!("Not sent: {err}"));
                 return;
             }
         };
+        if let Some(goal) = goal {
+            let content = if attachments.is_empty() {
+                crate::model::UserContent::Text(steer_text)
+            } else {
+                let mut blocks = Vec::with_capacity(attachments.len() + 1);
+                if !steer_text.is_empty() {
+                    blocks.push(crate::model::ContentBlock::Text(
+                        crate::model::TextContent::new(steer_text),
+                    ));
+                }
+                blocks.extend(attachments);
+                crate::model::UserContent::Blocks(blocks)
+            };
+            self.submit_goal_content(&goal, content, &clean, follow_up);
+            return;
+        }
         self.record_history(&clean);
         self.input.set_text("");
         self.autocomplete.close();
@@ -4308,6 +4353,9 @@ impl PiFtuiModel {
         {
             return;
         }
+        if self.recall_goal_input() {
+            return;
+        }
         let pending = if let Some(pending) = self.take_queued_compaction_text() {
             pending
         } else if let Some(control) = self.live_turn_control() {
@@ -4353,6 +4401,7 @@ impl PiFtuiModel {
         });
         if self.pending_input_restores.is_empty()
             || !self.input_active()
+            || self.goal_draft.is_some()
             || self.active_ask.is_some()
             || self.active_ext.is_some()
             || !self.ext_queue.is_empty()
@@ -4447,6 +4496,11 @@ impl PiFtuiModel {
                 return;
             }
         }
+        // Media-only recovered input may have no authored text at all.
+        // Its typed payload still belongs to the ordinary composer.
+        if self.submit_goal_draft() {
+            return;
+        }
         if trimmed.is_empty() {
             return;
         }
@@ -4477,6 +4531,12 @@ impl PiFtuiModel {
             return;
         }
         if self.state == AgentUiState::Working {
+            self.submit_mid_turn(false);
+            return;
+        }
+        if self.live_goal().is_some() {
+            // Publication can precede the first AgentStart or span verifier
+            // gaps. Never turn refused goal input into a later ordinary turn.
             self.submit_mid_turn(false);
             return;
         }
@@ -5628,6 +5688,14 @@ impl PiFtuiModel {
 
     fn send_command(&self, command: UiCommand) {
         if let Some(tx) = &self.submit_tx {
+            if let Some(slot) = &self.turn_control {
+                let mut state = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.goal.is_none() {
+                    state.last_goal = None;
+                }
+            }
             // A dead agent loop is not a UI error; the transcript echo above
             // still shows what was typed.
             let _ = tx.send(command);
@@ -6175,6 +6243,17 @@ impl PiFtuiModel {
                 // A handoff has no driver abort lane, so without its own arm
                 // the press fell through and cleared the draft instead.
                 if ctrl_c
+                    && !double_tap
+                    && self.active_ask.is_none()
+                    && self.active_ext.is_none()
+                    && self.login_pending.is_none()
+                    && self.picker.is_none()
+                    && self.abort_goal()
+                {
+                    self.last_ctrl_c = Some(std::time::Instant::now());
+                    return Cmd::none();
+                }
+                if ctrl_c
                     && self.busy.is_some()
                     && (self.abort_handoff() || self.abort_driver_operation())
                 {
@@ -6189,6 +6268,7 @@ impl PiFtuiModel {
                         self.picker = None;
                     } else {
                         self.input.set_text("");
+                        self.goal_draft = None;
                         self.autocomplete.close();
                         self.history_cursor = None;
                         self.history_draft.clear();
@@ -6386,6 +6466,9 @@ impl PiFtuiModel {
                         return Cmd::none();
                     }
                     Some(AppAction::Interrupt) if self.abort_driver_operation() => {
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt) if self.abort_goal() => {
                         return Cmd::none();
                     }
                     Some(AppAction::Interrupt) if self.state == AgentUiState::Working => {
@@ -7067,9 +7150,10 @@ impl Model for PiFtuiModel {
             | PiFtuiMsg::Edited { .. }
             | PiFtuiMsg::TerminalFailed(_)
             | PiFtuiMsg::PastedImage { .. } => LoopPhase::Input,
-            PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed | PiFtuiMsg::SuspendFinished(_) => {
-                LoopPhase::AgentEvent
-            }
+            PiFtuiMsg::Agent(_)
+            | PiFtuiMsg::Goal(_)
+            | PiFtuiMsg::Resumed
+            | PiFtuiMsg::SuspendFinished(_) => LoopPhase::AgentEvent,
         };
         // Reconcile only events that can edit the draft. Streaming output,
         // ticks, and resize events must not repeatedly scan recalled text.
@@ -7127,6 +7211,7 @@ impl Model for PiFtuiModel {
                 Cmd::none()
             }
             PiFtuiMsg::Agent(agent) => self.handle_agent(agent),
+            PiFtuiMsg::Goal(event) => self.handle_goal_event(event),
             // Back from a SIGTSTP stop: the suspend task already re-acquired
             // raw mode / alt screen / mouse; the next frame repaints the
             // freshly-cleared alternate buffer in full.
@@ -7151,6 +7236,7 @@ impl Model for PiFtuiModel {
             self.detach_edited_history();
         }
         self.apply_pending_input_restores();
+        self.apply_goal_input_restores();
         self.discard_stale_image_pastes();
         self.close_stale_autocomplete();
         // Reset as soon as ownership changes, even if a modal opens and
@@ -7178,9 +7264,15 @@ impl Model for PiFtuiModel {
         // Re-declared every cycle under the stable AGENT_EVENTS_SUB_ID; the
         // runtime dedups by id, so exactly one instance runs and takes the
         // receiver from the shared slot.
-        vec![Box::new(AgentEventSubscription::from_shared(Arc::clone(
-            &self.agent_rx,
-        )))]
+        let mut subscriptions: Vec<Box<dyn Subscription<PiFtuiMsg>>> = vec![Box::new(
+            AgentEventSubscription::from_shared(Arc::clone(&self.agent_rx)),
+        )];
+        if let Some(receiver) = &self.goal_rx {
+            subscriptions.push(Box::new(goal_control::EventSubscription(Arc::clone(
+                receiver,
+            ))));
+        }
+        subscriptions
     }
 }
 
@@ -8085,11 +8177,16 @@ type TurnControlSlot = Arc<Mutex<TurnControlState>>;
 #[derive(Default)]
 pub struct TurnControlState {
     current: Option<crate::session_control::SessionControlHandle>,
+    goal: Option<goal_control::Invocation>,
+    last_goal: Option<uuid::Uuid>,
     closed: bool,
 }
 
 impl TurnControlState {
     fn publish(&mut self, control: crate::session_control::SessionControlHandle) {
+        // Scoped goal events may still be crossing their subscription when
+        // the next ordinary prompt starts. They no longer own this display.
+        self.last_goal = None;
         if self.closed {
             control.abort();
         } else {
@@ -8097,11 +8194,12 @@ impl TurnControlState {
         }
     }
 
-    fn close(&mut self) {
+    fn close(&mut self) -> Option<goal_control::Invocation> {
         self.closed = true;
         if let Some(control) = self.current.take() {
             control.abort();
         }
+        self.goal.take()
     }
 }
 
@@ -8110,9 +8208,13 @@ fn abort_driver_work(turn_abort: Option<&TurnAbortSlot>, turn_control: Option<&T
     // this same fence, so shutdown cannot miss an operation admitted between
     // checking the abort slot and closing the prompt lane.
     if let Some(slot) = turn_control {
-        slot.lock()
+        let goal = slot
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .close();
+        if let Some(goal) = goal {
+            goal.pause();
+        }
     }
     if let Some(slot) = turn_abort
         && let Some(handle) = slot
@@ -11419,6 +11521,7 @@ pub fn run(
         initial_messages,
     )?;
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
+    let (goal_tx, goal_rx) = std::sync::mpsc::channel::<goal_control::Event>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
     let resume_cwd = bash_cwd.clone();
@@ -11518,6 +11621,12 @@ pub fn run(
                 loop {
                     let received = submit_rx.try_recv();
                     if let Ok(command) = &received {
+                        if !matches!(command, UiCommand::Workspace {
+                            command: workspace_commands::WorkspaceCommand::Goal, ..
+                        }) {
+                            driver_turn_control.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner).last_goal = None;
+                        }
                         retire_login_for_command(command, &mut login, &agent_tx);
                     }
                     // Every handled command may change what the status line
@@ -11548,6 +11657,11 @@ pub fn run(
                                 &driver_turn_control,
                             )
                             .await;
+                        }
+                        Ok(UiCommand::RestoredGoalInput(request)) => {
+                            Box::pin(goal_control::run_restored(
+                                &mut handle, request, &agent_tx, &goal_tx, &driver_turn_control,
+                            )).await;
                         }
                         Ok(UiCommand::InitialPrompt) => {
                             run_initial_prompt(
@@ -11855,6 +11969,14 @@ pub fn run(
                                 )),
                                 Err(err) => PiMsg::AgentError(format!("fresh: {err}")),
                             });
+                        }
+                        Ok(UiCommand::Workspace {
+                            command: workspace_commands::WorkspaceCommand::Goal,
+                            args,
+                        }) => {
+                            Box::pin(goal_control::run(
+                                &mut handle, &args, &driver_turn_control, &goal_tx, &agent_tx,
+                            )).await;
                         }
                         Ok(UiCommand::Workspace { command, args }) => {
                             if command == workspace_commands::WorkspaceCommand::Review {
@@ -12217,6 +12339,7 @@ pub fn run(
         .with_extension_command_registry(command_registry)
         .with_turn_abort(Arc::clone(&turn_abort))
         .with_turn_control(Arc::clone(&turn_control))
+        .with_goal_events(goal_rx)
         .with_btw_client(btw_client)
         .with_ask_reply_channel(ask_reply_tx)
         .with_current_ask(current_ask)
@@ -14046,7 +14169,7 @@ mod tests {
             let provider = Arc::new(NativePromptProbe::default());
             let mut handle = native_prompt_handle(provider.clone());
             let controls: TurnControlSlot = Arc::default();
-            controls.lock().unwrap().close();
+            let _ = controls.lock().unwrap().close();
             let (agent_tx, agent_rx) = mpsc::channel();
             let mut initial = Some(crate::app::InitialMessage {
                 text: String::from("queued before terminal startup"),
@@ -24931,7 +25054,7 @@ mod tests {
                 if phase == "already_aborted" {
                     abort.abort();
                 } else if phase == "runtime_closed" {
-                    controls.lock().unwrap().close();
+                    let _ = controls.lock().unwrap().close();
                 }
                 let store = handle.session_store();
                 let held = (phase == "session_admission").then(|| store.try_lock().unwrap());
