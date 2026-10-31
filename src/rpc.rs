@@ -5518,15 +5518,16 @@ pub async fn run(
                                 Error::session(format!("inner session lock failed: {err}"))
                             })?;
                         if let Some(budget) = guard.agent.cost_budget() {
-                            budget.checkpoint(&mut inner_session)?;
+                            let prepared = prepare_rpc_cost_handoff(
+                                budget,
+                                &mut inner_session,
+                                guard.save_enabled(),
+                                &guard.provider_admission_gate(),
+                                AutosaveFlushTrigger::Manual,
+                            )
+                            .await?;
                             if guard.save_enabled() {
-                                crate::agent::persist_session_mutations(
-                                    &mut inner_session,
-                                    &guard.provider_admission_gate(),
-                                    crate::session::AutosaveFlushTrigger::Manual,
-                                )
-                                .await?;
-                                budget.retire_session(&inner_session, cx.cx())?;
+                                prepared.retire_session(&inner_session, cx.cx())?;
                             }
                         }
                         *inner_session = new_session;
@@ -5759,23 +5760,27 @@ pub async fn run(
                             let preserve_cost = inner_session.header.id == new_session.header.id;
                             let retiring_session =
                                 !crate::cost::same_session_target(&inner_session, &new_session);
-                            let cost_budget = guard
+                            let mut cost_budget = guard
                                 .agent
                                 .replacement_cost_budget(&new_session, preserve_cost)?;
+                            let mut retiring_budget = None;
                             if let Some(budget) = guard.agent.cost_budget() {
-                                if preserve_cost {
-                                    budget.checkpoint(&mut new_session)?;
-                                }
                                 if retiring_session {
-                                    budget.checkpoint(&mut inner_session)?;
-                                    if guard.save_enabled() {
-                                        crate::agent::persist_session_mutations(
-                                            &mut inner_session,
-                                            &guard.provider_admission_gate(),
-                                            crate::session::AutosaveFlushTrigger::Manual,
-                                        )
-                                        .await?;
+                                    let prepared = prepare_rpc_cost_handoff(
+                                        budget,
+                                        &mut inner_session,
+                                        guard.save_enabled(),
+                                        &guard.provider_admission_gate(),
+                                        AutosaveFlushTrigger::Manual,
+                                    )
+                                    .await?;
+                                    if preserve_cost {
+                                        cost_budget = Some(prepared.for_replacement(&new_session, true)?);
                                     }
+                                    retiring_budget = Some(prepared);
+                                }
+                                if preserve_cost && let Some(budget) = &cost_budget {
+                                    budget.checkpoint(&mut new_session)?;
                                 }
                             }
                             guard.invalidate_background_compaction();
@@ -5796,7 +5801,7 @@ pub async fn run(
 
                             if retiring_session
                                 && guard.save_enabled()
-                                && let Some(budget) = guard.agent.cost_budget()
+                                && let Some(budget) = &retiring_budget
                             {
                                 budget.retire_session(&inner_session, cx.cx())?;
                             }
@@ -6055,18 +6060,20 @@ pub async fn run(
                         }
                         guard.invalidate_background_compaction();
                         state.provider_admission.ensure_allowed()?;
-                        if let Some(budget) = guard.agent.cost_budget() {
-                            budget.checkpoint(&mut inner)?;
-                            if save_enabled {
-                                crate::agent::persist_session_mutations(
-                                    &mut inner,
-                                    &guard.provider_admission_gate(),
-                                    crate::session::AutosaveFlushTrigger::Manual,
-                                )
-                                .await?;
-                            }
-                            budget.checkpoint(&mut new_session)?;
-                        }
+                        let cost_budget = if let Some(budget) = guard.agent.cost_budget() {
+                            let prepared = prepare_rpc_cost_handoff(
+                                budget,
+                                &mut inner,
+                                save_enabled,
+                                &guard.provider_admission_gate(),
+                                AutosaveFlushTrigger::Manual,
+                            )
+                            .await?;
+                            prepared.checkpoint(&mut new_session)?;
+                            Some(prepared)
+                        } else {
+                            None
+                        };
                         if save_enabled
                             && let Err(first_err) = new_session.save().await
                                 && let Err(retry_err) = new_session.save().await
@@ -6075,11 +6082,29 @@ pub async fn run(
                                     "forked Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
                                 )));
                             }
+                        let cost_budget = cost_budget
+                            .map(|budget| budget.for_replacement(&new_session, true))
+                            .transpose()?;
+                        if let Some(budget) = &cost_budget {
+                            // Binding the saved target also captures the old
+                            // source's last observed writers, including one
+                            // that settled and closed during the first save.
+                            // Publish that frontier before activating retirement.
+                            budget.checkpoint(&mut new_session)?;
+                            if save_enabled
+                                && let Err(first_err) = new_session.save().await
+                                    && let Err(retry_err) = new_session.save().await
+                            {
+                                return Err(Error::session_persistence(format!(
+                                    "forked Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                                )));
+                            }
+                        }
 
                         let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
-                        if save_enabled && let Some(budget) = guard.agent.cost_budget() {
+                        if save_enabled && let Some(budget) = &cost_budget {
                             budget.retire_session(&inner, cx.cx())?;
                         }
                         state.reconstruct_failover_from_session(
@@ -6091,6 +6116,7 @@ pub async fn run(
                         session_transition_permit.commit_session_change();
                         state.output.clear_session();
                         drop(inner);
+                        guard.agent.set_cost_budget(cost_budget);
                         guard.agent.replace_messages(messages);
                         crate::app::rebind_stream_options_session(
                             guard.agent.stream_options_mut(),
@@ -6839,6 +6865,27 @@ fn find_represented_rpc_deliveries(
     Ok(represented)
 }
 
+/// Publish the source's canonical ledger reference before a replacement can
+/// escape. Preparation itself grants no write sink; only the caller's final
+/// retirement, after candidate persistence, activates late-bill settlement.
+async fn prepare_rpc_cost_handoff(
+    budget: &crate::cost::CostBudget,
+    source: &mut Session,
+    save_enabled: bool,
+    admission: &ProviderAdmissionGate,
+    trigger: AutosaveFlushTrigger,
+) -> Result<crate::cost::CostBudget> {
+    budget.checkpoint(source)?;
+    if !save_enabled {
+        return Ok(budget.clone());
+    }
+    crate::agent::persist_session_mutations(source, admission, trigger).await?;
+    let prepared = budget.prepare_handoff(source)?;
+    prepared.checkpoint(source)?;
+    crate::agent::persist_session_mutations(source, admission, trigger).await?;
+    Ok(prepared)
+}
+
 async fn flush_rpc_session_on_shutdown(
     session: &Arc<Mutex<AgentSession>>,
     cx: &AgentCx,
@@ -6854,11 +6901,15 @@ async fn flush_rpc_session_on_shutdown(
         .await
         .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
     if let Some(budget) = guard.agent.cost_budget() {
-        budget.checkpoint(&mut inner)?;
-        inner
-            .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
-            .await?;
-        budget.retire_session(&inner, cx.cx())
+        let prepared = prepare_rpc_cost_handoff(
+            budget,
+            &mut inner,
+            true,
+            &guard.provider_admission_gate(),
+            AutosaveFlushTrigger::Shutdown,
+        )
+        .await?;
+        prepared.retire_session(&inner, cx.cx())
     } else {
         inner.flush_autosave_on_shutdown().await
     }
@@ -14539,6 +14590,128 @@ mod retry_tests {
             }));
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         });
+    }
+
+    #[test]
+    fn rpc_fork_acknowledges_durable_cost_ancestry_before_observers_close() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut source = Session::create_with_dir(Some(temp.path().join("sessions")));
+            source.header.provider = Some("anthropic".to_string());
+            source.header.model_id = Some("test-model".to_string());
+            source.header.thinking_level = Some("off".to_string());
+            let entry_id = source.append_message(SessionMessage::User {
+                content: UserContent::Text(
+                    "fork while child billing remains in flight".to_string(),
+                ),
+                timestamp: Some(0),
+            });
+            let original = crate::cost::CostBudget::new(None, Some(3.0), 0.0).unwrap();
+            original.record(1.0).unwrap();
+            let mut original_attempt = original.start_attempt().unwrap();
+            original_attempt.observe(0.25).unwrap();
+            original.checkpoint(&mut source).unwrap();
+            source.save().await.unwrap();
+            let prepared = original.prepare_handoff(&source).unwrap();
+            prepared.checkpoint(&mut source).unwrap();
+            source.save().await.unwrap();
+            let owner = AgentCx::for_testing_with_io();
+            prepared.retire_session(&source, owner.cx()).unwrap();
+            drop(prepared);
+            drop(original);
+
+            // An independently resumed owner has its own outstanding child.
+            // The RPC fork must retain both that writer and its ancestor.
+            let observer = crate::cost::resolve_budget(&source, None, None, Some(3.0), None)
+                .unwrap()
+                .unwrap();
+            let mut observer_attempt = observer.start_attempt().unwrap();
+            observer_attempt.observe(0.25).unwrap();
+            let mut agent = Agent::new(
+                Arc::new(FlakyProvider::new()),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig {
+                    cost_budget: Some(observer),
+                    ..AgentConfig::default()
+                },
+            );
+            agent.replace_messages(source.to_messages_for_current_path());
+            let inner = Arc::new(asupersync::sync::Mutex::new(source));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let options = rpc_fork_test_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(4);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            let client = async {
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        json!({"id":"cold-fork","type":"fork","entryId":entry_id}).to_string(),
+                    )
+                    .await
+                    .unwrap();
+                let response =
+                    asupersync::time::timeout(wall_now(), Duration::from_secs(10), async {
+                        loop {
+                            match out_rx.try_recv() {
+                                Ok(line) => {
+                                    let value: Value = serde_json::from_str(&line).unwrap();
+                                    if value["type"] == "response" && value["id"] == "cold-fork" {
+                                        break value;
+                                    }
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    sleep(wall_now(), Duration::from_millis(5)).await;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    panic!("RPC closed before acknowledging the fork");
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    .expect("fork response");
+                assert_eq!(response["success"], true, "{response}");
+                let path = inner.try_lock().unwrap().path.clone().unwrap();
+                let acknowledged = std::fs::read(&path).unwrap();
+                drop(in_tx);
+                (path, acknowledged)
+            };
+            let (result, (fork_path, acknowledged)) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
+            result.expect("RPC fork and EOF shutdown");
+            assert_eq!(
+                std::fs::read(&fork_path).unwrap(),
+                acknowledged,
+                "EOF must not repair ancestry omitted from the acknowledged fork",
+            );
+            drop(inner);
+
+            // Only the outstanding accounting attempts remain. Neither live
+            // foreground observer can relay these final bills to the fork.
+            original_attempt.finish(1.25).unwrap();
+            drop(original_attempt);
+            observer_attempt.finish(0.75).unwrap();
+            drop(observer_attempt);
+            assert_eq!(std::fs::read(&fork_path).unwrap(), acknowledged);
+            let reopened = Session::open(fork_path.to_str().unwrap()).await.unwrap();
+            let restored = crate::cost::resolve_budget(&reopened, None, None, Some(3.0), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.spent(), 3.0);
+            assert_eq!(restored.refresh().unwrap().spent, 3.0);
+            assert!(matches!(restored.admit(), Err(Error::CostCap { .. })));
+        }));
     }
 
     #[test]

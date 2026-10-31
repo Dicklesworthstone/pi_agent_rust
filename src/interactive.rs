@@ -713,10 +713,8 @@ impl PiApp {
         let retiring_session = !crate::cost::same_session_target(&session_guard, &new_session);
         let save_enabled = agent_guard.handle.session().save_enabled();
         let preserve_cost = preserve_cost || session_guard.header.id == new_session.header.id;
-        let cost_budget = agent_guard
-            .replacement_cost_budget(&new_session, preserve_cost)
-            .map_err(|_| "Invalid model spend; session change was not applied")?;
-        if let Some(budget) = agent_guard.cost_budget() {
+        let mut retiring_budget = agent_guard.cost_budget().cloned();
+        if let Some(budget) = &retiring_budget {
             budget
                 .checkpoint(&mut session_guard)
                 .map_err(|_| "Failed to read model spend; session change was not applied")?;
@@ -725,10 +723,29 @@ impl PiApp {
                     .save()
                     .await
                     .map_err(|_| "Failed to save model spend; session change was not applied")?;
+                if retiring_session {
+                    let prepared = budget.prepare_handoff(&session_guard).map_err(
+                        |_| "Failed to prepare model cost ancestry; session change was not applied",
+                    )?;
+                    prepared.checkpoint(&mut session_guard).map_err(
+                        |_| "Failed to retain model cost ancestry; session change was not applied",
+                    )?;
+                    session_guard.save().await.map_err(
+                        |_| "Failed to save model cost ancestry; session change was not applied",
+                    )?;
+                    retiring_budget = Some(prepared);
+                }
             }
         }
-        if preserve_cost && let Some(budget) = &cost_budget {
-            budget
+        let mut cost_budget = retiring_budget
+            .as_ref()
+            .map(|budget| budget.for_replacement(&new_session, preserve_cost))
+            .transpose()
+            .map_err(|_| "Invalid model spend; session change was not applied")?;
+        if preserve_cost
+            && let (Some(candidate_budget), Some(source_budget)) = (&cost_budget, &retiring_budget)
+        {
+            candidate_budget
                 .checkpoint(&mut new_session)
                 .map_err(|_| "Failed to retain model spend; session change was not applied")?;
             if save_enabled {
@@ -736,12 +753,24 @@ impl PiApp {
                     |_| "Failed to save retained model spend; session change was not applied",
                 )?;
             }
+            let retained = source_budget.for_replacement(&new_session, true).map_err(
+                |_| "Failed to retain active model cost source; session change was not applied",
+            )?;
+            retained.checkpoint(&mut new_session).map_err(
+                |_| "Failed to reconcile retained model spend; session change was not applied",
+            )?;
+            if save_enabled {
+                new_session.save().await.map_err(
+                    |_| "Failed to save reconciled model spend; session change was not applied",
+                )?;
+            }
+            cost_budget = Some(retained);
         }
         // The source stays live if any candidate preparation fails. Once
         // retirement succeeds, install the replacement without another await.
         if save_enabled
             && retiring_session
-            && let Some(budget) = agent_guard.cost_budget()
+            && let Some(budget) = &retiring_budget
         {
             budget.retire_session(&session_guard, cx.cx()).map_err(
                 |_| "Failed to preserve background model spend; session change was not applied",

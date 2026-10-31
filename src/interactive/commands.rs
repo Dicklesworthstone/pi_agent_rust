@@ -5760,6 +5760,55 @@ mod tests {
     }
 
     #[test]
+    fn saved_fork_install_keeps_late_cost_ancestry_after_the_app_is_dropped() {
+        let temp = TempDir::new().unwrap();
+        let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+        initial.header.cwd = temp.path().display().to_string();
+        let session = Arc::new(Mutex::new(initial));
+        let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        budget.record(0.25).unwrap();
+        let mut outstanding = budget.start_attempt().unwrap();
+        outstanding.observe(0.5).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(budget.clone()));
+        let mut fork = Session::create_with_dir(Some(temp.path().join("sessions")));
+        fork.header.cwd = temp.path().display().to_string();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                fork,
+                Vec::new(),
+                None,
+                true,
+            ))
+            .unwrap();
+        let fork_path = session.try_lock().unwrap().path.clone().unwrap();
+        let bytes = std::fs::read(&fork_path).unwrap();
+        drop(app);
+        drop(session);
+        outstanding.finish(0.75).unwrap();
+        drop(outstanding);
+        drop(budget);
+        assert_eq!(std::fs::read(&fork_path).unwrap(), bytes);
+        let reopened = runtime()
+            .block_on(Session::open(fork_path.to_str().unwrap()))
+            .unwrap();
+        let restored = crate::cost::resolve_budget(&reopened, None, None, Some(1.0), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.spent(), 1.0);
+        assert!(
+            matches!(restored.admit(), Err(crate::error::Error::CostCap { spent, cap })
+            if spent == 1.0 && cap == 1.0)
+        );
+    }
+
+    #[test]
     fn new_without_extensions_saves_departing_shared_spend_before_reset() {
         let temp = TempDir::new().unwrap();
         let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));

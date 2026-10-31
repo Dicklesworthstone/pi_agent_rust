@@ -9140,7 +9140,7 @@ async fn new_session_command(
     options.model = Some(model_id.clone());
     options.session_path = None;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
-        Ok(new_handle) => {
+        Ok(mut new_handle) => {
             let prepared = match handle.preflight_replacement().await {
                 Ok(prepared) => prepared,
                 Err(shutdown) => {
@@ -9157,7 +9157,7 @@ async fn new_session_command(
             // Commit the candidate before teardown begins. Cancellation during
             // any later await can no longer leave a partially decommissioned
             // old handle installed as the current session.
-            if let Err(error) = prepared.retire_cost_for(&new_handle) {
+            if let Err(error) = prepared.retire_cost_for(&mut new_handle).await {
                 drop(prepared);
                 let _ = agent_tx.send(PiMsg::AgentError(format!(
                     "new session cancelled because background model spend could not be preserved: {error}"
@@ -10255,8 +10255,21 @@ async fn fork_session_command(
             }
         };
     let new_session_id = forked.header.id.clone();
+    // Freeze and durably identify the outgoing account before the fork's
+    // first save. Reuse this token through candidate installation instead of
+    // reentering the source store through the ordinary resume preflight.
+    let prepared = match handle.preflight_replacement().await {
+        Ok(prepared) => prepared,
+        Err(shutdown) => {
+            report_replacement_shutdown_failure(&shutdown, agent_tx);
+            return Ok(());
+        }
+    };
     let mut fork_template = template.clone();
-    fork_template.cost_budget = handle.session().agent.cost_budget().cloned();
+    fork_template.cost_budget = prepared
+        .prepared_cost_budget()
+        .cloned()
+        .or_else(|| handle.session().agent.cost_budget().cloned());
     if let Some(budget) = &fork_template.cost_budget
         && let Err(error) = budget.checkpoint(&mut forked)
     {
@@ -10275,10 +10288,12 @@ async fn fork_session_command(
         )));
         return Ok(());
     };
-    Box::pin(resume_session_command(
-        &path.to_string_lossy(),
-        &fork_template,
+    let mut options = replacement_options(&fork_template, ext_handler, runtime_handle);
+    options.session_path = Some(path);
+    Box::pin(resume_prepared_session(
+        options,
         handle,
+        prepared,
         current_ask,
         ext_handler,
         agent_tx,
@@ -10416,9 +10431,6 @@ async fn resume_session_command(
         })
         .await
         .map_err(|error| format!("resume: {error}"))?;
-    if same_file {
-        options.cost_budget = handle.session().agent.cost_budget().cloned();
-    }
     // `/reload` resumes this same file. Flush the outgoing session before
     // constructing its replacement so the new context includes pending rows.
     // No runtime resources are stopped until the candidate is installed.
@@ -10429,9 +10441,40 @@ async fn resume_session_command(
             return Ok(false);
         }
     };
+    if same_file {
+        // Preflight wrote a prospective self-reference. Carry its authority
+        // into construction so a reload can open that not-yet-retired source.
+        options.cost_budget = prepared
+            .prepared_cost_budget()
+            .cloned()
+            .or_else(|| handle.session().agent.cost_budget().cloned());
+    }
+    Box::pin(resume_prepared_session(
+        options,
+        handle,
+        prepared,
+        current_ask,
+        ext_handler,
+        agent_tx,
+        runtime_handle,
+    ))
+    .await
+}
+
+/// Finish a resume or fork without reacquiring the outgoing session store,
+/// which remains held by `prepared` until the candidate is installed.
+async fn resume_prepared_session(
+    options: crate::sdk::SessionOptions,
+    handle: &mut crate::sdk::AgentSessionHandle,
+    prepared: crate::sdk::PreparedSessionShutdown,
+    current_ask: &CurrentAsk,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> std::result::Result<bool, String> {
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
-        Ok(new_handle) => {
-            if let Err(error) = prepared.retire_cost_for(&new_handle) {
+        Ok(mut new_handle) => {
+            if let Err(error) = prepared.retire_cost_for(&mut new_handle).await {
                 drop(prepared);
                 let _ = agent_tx.send(PiMsg::AgentError(format!(
                     "resume cancelled because background model spend could not be preserved: {error}"
@@ -21899,6 +21942,169 @@ mod tests {
         assert_eq!(forked.header.model_id.as_deref(), Some("claude-test"));
         assert_eq!(forked.header.thinking_level.as_deref(), Some("high"));
         assert_eq!(forked.session_dir.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ftui_fork_recovers_late_billing_after_reload_and_all_foreground_handles_close() {
+        use crate::model::UserContent;
+        use crate::session::SessionMessage;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+        let current_ask: CurrentAsk = Arc::default();
+        let template = resume_template_from(&crate::sdk::SessionOptions {
+            provider: Some(String::from("openai")),
+            model: Some(String::from("gpt-4o")),
+            api_key: Some(String::from("ftui-fork-cost-test-key")),
+            working_directory: Some(cwd.path().to_path_buf()),
+            workspace_trusted: true,
+            session_dir: Some(sessions.path().to_path_buf()),
+            enabled_tools: Some(Vec::new()),
+            no_context_files: true,
+            max_cost: Some(2.0),
+            ..crate::sdk::SessionOptions::default()
+        });
+
+        runtime.block_on(Box::pin(async {
+            let mut handle = crate::sdk::create_agent_session_deferred_mcp(replacement_options(
+                &template,
+                &ext_handler,
+                &runtime_handle,
+            ))
+            .await
+            .expect("source session");
+            let budget = handle.session().agent.cost_budget().unwrap().clone();
+            budget.record(0.25).unwrap();
+            let mut outstanding = budget.start_attempt().unwrap();
+            outstanding.observe(0.5).unwrap();
+            let (source_id, source_path) = {
+                let store = handle.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.unwrap();
+                for text in ["keep this context", "revise this request"] {
+                    session.append_message(SessionMessage::User {
+                        content: UserContent::Text(text.to_string()),
+                        timestamp: Some(0),
+                    });
+                }
+                session.save().await.unwrap();
+                (session.header.id.clone(), session.path.clone().unwrap())
+            };
+
+            // A same-file reload must accept its prospective self-reference
+            // without retiring the account or losing the outstanding attempt.
+            reload_session_command(
+                &template,
+                &mut handle,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("reload before fork");
+            assert_eq!(
+                handle
+                    .with_session(|session| session.header.id.clone())
+                    .await
+                    .unwrap(),
+                source_id
+            );
+            assert!(
+                handle
+                    .session()
+                    .agent
+                    .cost_budget()
+                    .unwrap()
+                    .same_tree(&budget)
+            );
+            let after_reload = budget.snapshot();
+            assert!((after_reload.spent - 0.25).abs() < f64::EPSILON);
+            assert!((after_reload.pending - 0.5).abs() < f64::EPSILON);
+            assert!(agent_rx.try_iter().any(|event| matches!(event,
+                PiMsg::System(text) if text.starts_with("Reloaded"))));
+
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(30),
+                Box::pin(fork_session_command(
+                    "2",
+                    &template,
+                    &mut handle,
+                    &current_ask,
+                    &ext_handler,
+                    &agent_tx,
+                    &runtime_handle,
+                )),
+            )
+            .await
+            .expect("fork must not reacquire the prepared source store")
+            .expect("FTUI fork command");
+            let (fork_id, fork_path, messages) = handle
+                .with_session(|session| {
+                    (
+                        session.header.id.clone(),
+                        session.path.clone().unwrap(),
+                        session.to_messages_for_current_path(),
+                    )
+                })
+                .await
+                .unwrap();
+            assert_ne!(fork_id, source_id);
+            assert_ne!(fork_path, source_path);
+            assert!(
+                handle
+                    .session()
+                    .agent
+                    .cost_budget()
+                    .unwrap()
+                    .same_tree(&budget)
+            );
+            let after_fork = budget.snapshot();
+            assert!((after_fork.spent - 0.25).abs() < f64::EPSILON);
+            assert!((after_fork.pending - 0.5).abs() < f64::EPSILON);
+            assert!(
+                matches!(messages.as_slice(), [crate::model::Message::User(user)]
+                if matches!(&user.content, UserContent::Text(text) if text == "keep this context"))
+            );
+            assert!(agent_rx.try_iter().any(|event| matches!(event,
+                PiMsg::SetEditorText { owner_session_id, text }
+                    if owner_session_id == fork_id && text == "revise this request")));
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            let source_bytes = std::fs::read(&source_path).unwrap();
+            let fork_bytes = std::fs::read(&fork_path).unwrap();
+            drop(budget);
+
+            // The captured request remains after both foreground handles have
+            // closed. Its final bill must reach disk without either handle.
+            outstanding.finish(1.75).unwrap();
+            drop(outstanding);
+            assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+            assert_eq!(std::fs::read(&fork_path).unwrap(), fork_bytes);
+
+            let mut cold_options = replacement_options(&template, &ext_handler, &runtime_handle);
+            assert!(cold_options.cost_budget.is_none());
+            cold_options.session_path = Some(fork_path);
+            let cold = crate::sdk::create_agent_session_deferred_mcp(cold_options)
+                .await
+                .expect("cold resume after late billing");
+            let recovered = cold.session().agent.cost_budget().unwrap();
+            assert!((recovered.spent() - 2.0).abs() < f64::EPSILON);
+            assert!(
+                matches!(recovered.admit(), Err(crate::error::Error::CostCap { spent, cap })
+                if (spent - 2.0).abs() < f64::EPSILON && (cap - 2.0).abs() < f64::EPSILON)
+            );
+            assert!(cold.shutdown_owned_resources().await.completed_cleanly());
+        }));
     }
 
     #[test]

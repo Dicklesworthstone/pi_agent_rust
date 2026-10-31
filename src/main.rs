@@ -3634,7 +3634,12 @@ async fn run(
                     guard
                         .flush_autosave(pi::session::AutosaveFlushTrigger::Shutdown)
                         .await?;
-                    budget.retire_session(&guard, cx.cx())
+                    let prepared = budget.prepare_handoff(&guard)?;
+                    prepared.checkpoint(&mut guard)?;
+                    guard
+                        .flush_autosave(pi::session::AutosaveFlushTrigger::Shutdown)
+                        .await?;
+                    prepared.retire_session(&guard, cx.cx())
                 } else {
                     guard.flush_autosave_on_shutdown().await
                 }

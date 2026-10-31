@@ -602,11 +602,24 @@ This applies to JSONL and SQLite sessions, including the first charge arriving
 after a zero-spend checkpoint. Failed replacements and same-file reloads keep
 the foreground account live. Cost journals are not created for `--no-session`.
 
+Saved forks retain references to observed unfinished billing writers. A fork
+can recover their final charges even after every foreground handle has closed, without
+opening an ancestor's transcript or SQLite database. Repeated forks of one live
+account use the same journal. Once a writer's final closure is observed, later
+checkpoints retain its final total and remove the completed reference. Missing
+required journals or writers block further requests instead of resetting spend.
+
 Keep the adjacent `.pi-cost-*.json` files with their session files when backing
-up or moving a session directory. Failure to acknowledge a journal write blocks
-further requests on the affected account. A crash before a normal checkpoint or
-before a final charge receives its durable acknowledgement can still lose
-uncheckpointed spend; these limits do not replace the provider's billing records.
+up a session directory. Unfinished references use the original absolute journal
+location: moving or copying the directory does not redirect outstanding billing
+to the copy. Observe final closure and save a new checkpoint before expecting a
+snapshot to be independent of its original journals. Failure to acknowledge a
+journal write blocks further requests on the affected account. If an incomplete
+save leaves primary usage and journal charges with an uncertain overlap, the
+known lower bound is retained and further requests are blocked. A crash before
+a normal checkpoint or before a final charge receives its durable acknowledgement
+can still lose uncheckpointed spend; these limits do not replace the provider's
+billing records.
 
 ### Native Subagents and Orchestration
 
