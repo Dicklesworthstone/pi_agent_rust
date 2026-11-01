@@ -61,7 +61,7 @@ select your intended execution model when leaving plan mode.
 | Path | Description |
 |------|-------------|
 | `~/.pi/agent/models.json` | User-defined model overrides and custom providers |
-| `~/.pi/agent/models.fetched.json` | Generated v2 live-catalog membership and advertised reasoning tiers; managed only by `--persist-models` |
+| `~/.pi/agent/models.fetched.json` | Generated v2 live-catalog membership, reasoning tiers, and serving tiers; managed only by `--persist-models` |
 
 Do not hand-edit `models.fetched.json`. Its provider/model IDs are bound to the
 fetching endpoint and transport shape by a non-secret fingerprint and timestamp. The
@@ -98,6 +98,50 @@ and null `thinkingLevelMap` entries. A provider's `compat` merges field by field
 with the discovered settings, and each `thinkingLevelMap` entry refines the
 discovered map for its level only. Generated rows cannot supply endpoints,
 credentials, headers, or arbitrary compatibility settings.
+
+Discovery also reads `service_tiers` from model rows or their `metadata` objects
+(nested metadata takes precedence). Entries may be strings or objects with an
+`id`, such as `"ultrafast"` or `{"id":"ultrafast"}`. The recognized values are
+`auto`, `default`, `flex`, `scale`, `priority`, and `ultrafast`. Valid declarations
+survive the process cache and are saved as `serviceTiers` in generated rows.
+Unknown values, malformed or oversized advertisements, and conflicting rows for
+the same model cannot grant support. Serving tiers are independent of reasoning
+tiers: discovering either never selects one for your requests.
+
+Both terminal frontends accept `/fast ultrafast` (also `/fast ultra`), `/fast priority`, `/fast flex`,
+`/fast scale`, and `/fast default`, as well as `/fast on`, `/fast off`, and
+`/fast status`. Bare `/fast` toggles priority on or the selected tier off;
+`/fast on` preserves an already selected priority or ultrafast tier. These are
+live-session settings. Unsupported choices leave your selection unchanged.
+After a model switch, each request checks whether the selected model supports
+that tier and omits unsupported fields.
+
+Custom OpenAI Completions and Responses routes must advertise a tier before Pi
+sends it. Codex requires an advertisement for `ultrafast`; a non-empty Codex
+advertisement also controls `priority` and `scale`. Existing first-party and
+OpenRouter defaults remain available, and Anthropic priority still maps to
+`speed: "fast"` on models that support it. For a route whose catalog omits its
+capabilities, declare them explicitly in your hand-authored `models.json`:
+
+```json
+{
+  "providers": {
+    "my-relay": {
+      "api": "openai-responses",
+      "baseUrl": "https://relay.example/v1",
+      "modelOverrides": {
+        "my-model": { "serviceTiers": ["priority", "ultrafast"] }
+      }
+    }
+  }
+}
+```
+
+An exact model's `serviceTiers` overrides its `compat.serviceTiers`; either can
+override discovered capabilities. Provider-wide `compat.serviceTiers` applies to
+all its models unless overridden per model. An empty manual list withdraws
+advertised custom-route support. Catalog refresh never rewrites these manual
+declarations or the active request's selected tier.
 
 Legacy `pi.models.fetched.v1` files lack the endpoint and transport provenance
 required by v2 and are preserved rather than overwritten automatically. Move

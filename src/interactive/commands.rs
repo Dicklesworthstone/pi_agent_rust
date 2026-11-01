@@ -155,6 +155,7 @@ pub enum SlashCommand {
     Clear,
     Model,
     Thinking,
+    Fast,
     ScopedModels,
     Exit,
     History,
@@ -219,6 +220,7 @@ impl SlashCommand {
             Self::Clear => "/clear",
             Self::Model => "/model",
             Self::Thinking => "/thinking",
+            Self::Fast => "/fast",
             Self::ScopedModels => "/scoped-models",
             Self::Exit => "/exit",
             Self::History => "/history",
@@ -278,6 +280,7 @@ impl SlashCommand {
         Self::Clear,
         Self::Model,
         Self::Thinking,
+        Self::Fast,
         Self::ScopedModels,
         Self::Exit,
         Self::History,
@@ -338,6 +341,7 @@ impl SlashCommand {
             // `/models` and `/effort` are OMP's spellings.
             "/model" | "/m" | "/models" => Self::Model,
             "/thinking" | "/think" | "/t" | "/effort" => Self::Thinking,
+            "/fast" => Self::Fast,
             "/scoped-models" | "/scoped" => Self::ScopedModels,
             "/exit" | "/quit" | "/q" => Self::Exit,
             "/history" | "/hist" => Self::History,
@@ -394,6 +398,7 @@ impl SlashCommand {
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Open model selector or switch directly
   /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh/max)
+  /fast [on|off|status|default|flex|scale|priority|ultrafast] - Select a supported serving tier
   /scoped-models [patterns|clear] - Show or set scoped models for cycling
   /history, /hist    - Show input history
   /export [path]     - Export conversation to HTML
@@ -2173,6 +2178,7 @@ impl PiApp {
             }
             SlashCommand::Model => self.handle_slash_model(args),
             SlashCommand::Thinking => self.handle_slash_thinking(args),
+            SlashCommand::Fast => self.handle_slash_fast(args),
             SlashCommand::ScopedModels => self.handle_slash_scoped_models(args),
             SlashCommand::Exit => Some(self.quit_cmd()),
             SlashCommand::History => {
@@ -4258,6 +4264,28 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Advisor));
         let report = super::workspace_reports::advisor(configured, args);
         self.show_workspace_report(report);
+        None
+    }
+
+    fn handle_slash_fast(&mut self, args: &str) -> Option<Cmd> {
+        let Some(request) = crate::provider::ServiceTierCommand::parse(args) else {
+            self.status_message = Some(crate::provider::ServiceTierCommand::USAGE.to_string());
+            return None;
+        };
+        let Ok(mut agent) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let entry = agent.handle.session().current_model_entry();
+        let provider = agent.provider();
+        let result = request.apply(
+            &mut agent.stream_options_mut().service_tier,
+            provider.name(),
+            provider.api(),
+            entry.as_ref().and_then(ModelEntry::service_tiers),
+        );
+        drop(agent);
+        self.status_message = Some(result);
         None
     }
 
@@ -6514,6 +6542,72 @@ mod tests {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    #[test]
+    fn classic_fast_uses_current_catalog_and_preserves_selection_across_models() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        app.save_enabled = false;
+        let mut supported = test_model_entry("tier-relay", "supported");
+        supported.compat = Some(crate::models::CompatConfig {
+            service_tiers: Some(vec![crate::provider::ServiceTier::Ultrafast]),
+            ..crate::models::CompatConfig::default()
+        });
+        let plain = test_model_entry("tier-relay", "plain");
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                supported.clone(),
+                plain.clone(),
+            ]));
+
+        for (entry, command, status) in [
+            (&supported, "ultrafast", "service_tier=ultrafast"),
+            (&supported, "on", "service_tier=ultrafast"),
+            (&plain, "status", "omitted"),
+            (&plain, "ultrafast", "unavailable"),
+            (&supported, "status", "service_tier=ultrafast"),
+        ] {
+            let provider = crate::providers::create_provider(entry, None).expect("provider");
+            app.switch_active_model(entry, provider, entry.api_key.as_deref(), "command")
+                .expect("switch model");
+            let (parsed, args) = SlashCommand::parse(&format!("/fast {command}"))
+                .map(|(parsed, args)| (parsed, args.to_string()))
+                .expect("registered command");
+            assert_eq!(parsed, SlashCommand::Fast);
+            assert!(app.handle_slash_command(parsed, &args).is_none());
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .is_some_and(|text| text.contains(status))
+            );
+            assert_eq!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .stream_options()
+                    .service_tier
+                    .as_deref(),
+                Some("ultrafast")
+            );
+        }
+        assert!(
+            app.handle_slash_command(SlashCommand::Fast, "off")
+                .is_none()
+        );
+        assert_eq!(
+            app.agent
+                .try_lock()
+                .expect("agent")
+                .stream_options()
+                .service_tier,
+            None
+        );
     }
 
     #[test]

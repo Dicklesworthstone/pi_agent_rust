@@ -75,6 +75,7 @@ use crate::models::{
     parse_persisted_fetched_catalog, prepare_model_catalog_provider_config,
     validate_persisted_fetched_catalog,
 };
+use crate::provider::ServiceTier;
 use crate::provider_metadata::{canonical_provider_id, provider_routing_defaults};
 use crate::providers::normalize_openai_base;
 
@@ -84,8 +85,10 @@ pub const MODEL_CACHE_TTL: Duration = Duration::from_mins(5);
 const MODEL_CACHE_MAX_ENTRIES: usize = 16;
 const MODEL_CACHE_MAX_MODEL_ID_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ADVERTISED_REASONING_LEVELS: usize = 32;
+const MAX_ADVERTISED_SERVICE_TIERS: usize = 32;
 
 type ReasoningCatalog = HashMap<String, DiscoveredReasoning>;
+type ServiceTierCatalog = HashMap<String, Vec<ServiceTier>>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DiscoveredReasoning {
@@ -98,6 +101,7 @@ struct DiscoveredReasoning {
 struct DiscoveredModels {
     models: Vec<String>,
     reasoning_levels: ReasoningCatalog,
+    service_tiers: ServiceTierCatalog,
 }
 
 impl From<Vec<String>> for DiscoveredModels {
@@ -105,6 +109,7 @@ impl From<Vec<String>> for DiscoveredModels {
         Self {
             models,
             reasoning_levels: ReasoningCatalog::new(),
+            service_tiers: ServiceTierCatalog::new(),
         }
     }
 }
@@ -118,6 +123,7 @@ pub const DISABLE_CACHE_ENV: &str = "PI_DISABLE_MODEL_CACHE";
 struct CacheEntry {
     models: Vec<String>,
     reasoning_levels: ReasoningCatalog,
+    service_tiers: ServiceTierCatalog,
     fetched_at_unix_ms: u64,
     inserted: Instant,
 }
@@ -139,6 +145,7 @@ pub struct ProviderModelCatalog {
     provider: String,
     models: Vec<String>,
     reasoning_levels: ReasoningCatalog,
+    service_tiers: ServiceTierCatalog,
     source: ModelCatalogSource,
     route_fingerprint: Option<String>,
     route_persistable: bool,
@@ -163,6 +170,13 @@ impl ProviderModelCatalog {
         self.reasoning_levels
             .get(&model_id)
             .map(|metadata| metadata.levels.as_slice())
+    }
+
+    /// Recognized serving tiers explicitly advertised for this model. These
+    /// are capabilities, not a selected tier or a default request option.
+    pub fn service_tiers(&self, model_id: &str) -> Option<&[ServiceTier]> {
+        let (_, model_id) = normalized_registry_key(&self.provider, model_id);
+        self.service_tiers.get(&model_id).map(Vec::as_slice)
     }
 
     /// Whether the catalog came from a live response, its verified cache, or
@@ -371,6 +385,7 @@ fn cache_lookup(key: &str) -> Option<(DiscoveredModels, u64)> {
             DiscoveredModels {
                 models: entry.models.clone(),
                 reasoning_levels: entry.reasoning_levels.clone(),
+                service_tiers: entry.service_tiers.clone(),
             },
             entry.fetched_at_unix_ms,
         )
@@ -383,26 +398,40 @@ fn model_id_bytes(models: &[String]) -> usize {
         .fold(0usize, |total, model| total.saturating_add(model.len()))
 }
 
-fn catalog_bytes(models: &[String], reasoning_levels: &ReasoningCatalog) -> usize {
-    reasoning_levels
+fn catalog_bytes(
+    models: &[String],
+    reasoning_levels: &ReasoningCatalog,
+    service_tiers: &ServiceTierCatalog,
+) -> usize {
+    let reasoning_bytes =
+        reasoning_levels
+            .iter()
+            .fold(model_id_bytes(models), |total, (id, metadata)| {
+                total
+                    .saturating_add(id.len())
+                    .saturating_add(
+                        metadata
+                            .levels
+                            .len()
+                            .saturating_mul(std::mem::size_of::<ThinkingLevel>()),
+                    )
+                    .saturating_add(metadata.effort_map.as_ref().map_or(0, |aliases| {
+                        aliases.iter().fold(0usize, |bytes, (key, _)| {
+                            bytes
+                                .saturating_add(key.len())
+                                .saturating_add(std::mem::size_of::<ThinkingLevel>())
+                        })
+                    }))
+                    .saturating_add(std::mem::size_of::<Option<bool>>())
+            });
+    service_tiers
         .iter()
-        .fold(model_id_bytes(models), |total, (id, metadata)| {
-            total
-                .saturating_add(id.len())
-                .saturating_add(
-                    metadata
-                        .levels
-                        .len()
-                        .saturating_mul(std::mem::size_of::<ThinkingLevel>()),
-                )
-                .saturating_add(metadata.effort_map.as_ref().map_or(0, |aliases| {
-                    aliases.iter().fold(0usize, |bytes, (key, _)| {
-                        bytes
-                            .saturating_add(key.len())
-                            .saturating_add(std::mem::size_of::<ThinkingLevel>())
-                    })
-                }))
-                .saturating_add(std::mem::size_of::<Option<bool>>())
+        .fold(reasoning_bytes, |total, (id, tiers)| {
+            total.saturating_add(id.len()).saturating_add(
+                tiers
+                    .len()
+                    .saturating_mul(std::mem::size_of::<ServiceTier>()),
+            )
         })
 }
 
@@ -410,8 +439,9 @@ fn cache_store(key: String, catalog: impl Into<DiscoveredModels>, fetched_at_uni
     let DiscoveredModels {
         models,
         reasoning_levels,
+        service_tiers,
     } = catalog.into();
-    let incoming_bytes = catalog_bytes(&models, &reasoning_levels);
+    let incoming_bytes = catalog_bytes(&models, &reasoning_levels, &service_tiers);
     if incoming_bytes > MODEL_CACHE_MAX_MODEL_ID_BYTES {
         return;
     }
@@ -424,7 +454,11 @@ fn cache_store(key: String, catalog: impl Into<DiscoveredModels>, fetched_at_uni
         guard.remove(&key);
         while guard.len() >= MODEL_CACHE_MAX_ENTRIES
             || guard.values().fold(incoming_bytes, |total, entry| {
-                total.saturating_add(catalog_bytes(&entry.models, &entry.reasoning_levels))
+                total.saturating_add(catalog_bytes(
+                    &entry.models,
+                    &entry.reasoning_levels,
+                    &entry.service_tiers,
+                ))
             }) > MODEL_CACHE_MAX_MODEL_ID_BYTES
         {
             let Some(oldest_key) = guard
@@ -445,6 +479,7 @@ fn cache_store(key: String, catalog: impl Into<DiscoveredModels>, fetched_at_uni
             CacheEntry {
                 models,
                 reasoning_levels,
+                service_tiers,
                 fetched_at_unix_ms,
                 inserted: now,
             },
@@ -563,6 +598,7 @@ async fn fetch_provider_model_catalog_with_route(
             provider: canonical_provider,
             models: cached.models,
             reasoning_levels: cached.reasoning_levels,
+            service_tiers: cached.service_tiers,
             source: ModelCatalogSource::Cache,
             route_fingerprint,
             route_persistable,
@@ -625,6 +661,7 @@ async fn refresh_provider_model_catalog_with_route(
         provider: canonical_provider_key(provider),
         models: live.models,
         reasoning_levels: live.reasoning_levels,
+        service_tiers: live.service_tiers,
         source: ModelCatalogSource::Live,
         route_fingerprint: Some(route_fingerprint),
         route_persistable,
@@ -663,6 +700,7 @@ async fn fetch_and_cache(
                 provider: canonical_provider,
                 models: live.models,
                 reasoning_levels: live.reasoning_levels,
+                service_tiers: live.service_tiers,
                 source: ModelCatalogSource::Live,
                 route_fingerprint: route_fingerprint.map(ToString::to_string),
                 route_persistable: route.is_some_and(model_catalog_route_is_persistable),
@@ -678,6 +716,7 @@ async fn fetch_and_cache(
                 provider: canonical_provider,
                 models: static_registry_models(provider)?,
                 reasoning_levels: ReasoningCatalog::new(),
+                service_tiers: ServiceTierCatalog::new(),
                 source: ModelCatalogSource::StaticFallback,
                 route_fingerprint: None,
                 route_persistable: false,
@@ -694,6 +733,7 @@ async fn fetch_and_cache(
                 provider: canonical_provider,
                 models: static_registry_models(provider)?,
                 reasoning_levels: ReasoningCatalog::new(),
+                service_tiers: ServiceTierCatalog::new(),
                 source: ModelCatalogSource::StaticFallback,
                 route_fingerprint: None,
                 route_persistable: false,
@@ -853,6 +893,7 @@ where
         provider,
         model_ids,
         reasoning_levels: &catalog.reasoning_levels,
+        service_tiers: &catalog.service_tiers,
         route_fingerprint,
         fetched_at_unix_ms,
     };
@@ -866,6 +907,7 @@ struct CatalogPersistenceRequest<'a> {
     provider: &'a str,
     model_ids: Vec<String>,
     reasoning_levels: &'a ReasoningCatalog,
+    service_tiers: &'a ServiceTierCatalog,
     route_fingerprint: &'a str,
     fetched_at_unix_ms: u64,
 }
@@ -875,6 +917,7 @@ fn merge_provider_catalog(
     provider: &str,
     model_ids: Vec<String>,
     reasoning_levels: &ReasoningCatalog,
+    service_tiers: &ServiceTierCatalog,
     route_fingerprint: &str,
     fetched_at_unix_ms: u64,
 ) -> Result<PersistedFetchedCatalog> {
@@ -897,6 +940,9 @@ fn merge_provider_catalog(
                         reasoning_effort_map: reasoning
                             .and_then(|metadata| metadata.effort_map.clone()),
                         reasoning_required: reasoning.and_then(|metadata| metadata.required),
+                        service_tiers: service_tiers
+                            .get(&normalized_registry_key(&provider, &id).1)
+                            .cloned(),
                         id,
                     }
                 })
@@ -1559,6 +1605,7 @@ where
         provider,
         model_ids,
         reasoning_levels,
+        service_tiers,
         route_fingerprint,
         fetched_at_unix_ms,
     } = request;
@@ -1597,6 +1644,7 @@ where
         provider,
         model_ids,
         reasoning_levels,
+        service_tiers,
         route_fingerprint,
         fetched_at_unix_ms,
     )?;
@@ -1913,6 +1961,7 @@ where
         provider,
         model_ids,
         reasoning_levels,
+        service_tiers,
         route_fingerprint,
         fetched_at_unix_ms,
         ..
@@ -1964,6 +2013,7 @@ where
         provider,
         model_ids,
         reasoning_levels,
+        service_tiers,
         route_fingerprint,
         fetched_at_unix_ms,
     )?;
@@ -2034,6 +2084,7 @@ where
         provider,
         model_ids,
         reasoning_levels,
+        service_tiers,
         route_fingerprint,
         fetched_at_unix_ms,
     } = request;
@@ -2070,6 +2121,7 @@ where
         provider,
         model_ids,
         reasoning_levels,
+        service_tiers,
         route_fingerprint,
         fetched_at_unix_ms,
     )?;
@@ -2137,10 +2189,38 @@ struct OpenAiModelRow {
     #[serde(default)]
     reasoning_required: serde_json::Value,
     #[serde(default)]
+    service_tiers: serde_json::Value,
+    #[serde(default)]
     metadata: serde_json::Value,
 }
 
 impl OpenAiModelRow {
+    fn service_tiers(&self) -> Option<Vec<ServiceTier>> {
+        let advertised = self
+            .metadata
+            .get("service_tiers")
+            .filter(|value| !value.is_null())
+            .unwrap_or(&self.service_tiers)
+            .as_array()?;
+        if advertised.len() > MAX_ADVERTISED_SERVICE_TIERS {
+            return None;
+        }
+        let mut tiers = advertised
+            .iter()
+            .filter_map(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+                    .and_then(ServiceTier::parse)
+            })
+            .collect::<Vec<_>>();
+        tiers.sort_unstable();
+        tiers.dedup();
+        // All-unknown or malformed rows cannot grant a capability. An
+        // explicitly empty list is retained as an unreported tier catalog.
+        (!tiers.is_empty() || advertised.is_empty()).then_some(tiers)
+    }
+
     fn reasoning_levels(&self) -> Option<DiscoveredReasoning> {
         let advertised = self
             .metadata
@@ -2401,6 +2481,24 @@ fn parse_openai_model_catalog(provider: &str, body: &str) -> Result<DiscoveredMo
                 "invalid /v1/models catalog for {provider:?}: {error}"
             ))
         })?;
+    let mut tier_rows: HashMap<String, Option<Vec<ServiceTier>>> = HashMap::new();
+    let mut conflicting_tier_ids = HashSet::new();
+    for row in &parsed.data {
+        let (_, id) = normalized_registry_key(provider, &row.id);
+        let tiers = row.service_tiers();
+        if let Some(existing) = tier_rows.get(&id) {
+            if existing != &tiers {
+                conflicting_tier_ids.insert(id);
+            }
+        } else {
+            tier_rows.insert(id, tiers);
+        }
+    }
+    let service_tiers = tier_rows
+        .into_iter()
+        .filter(|(id, _)| !conflicting_tier_ids.contains(id))
+        .filter_map(|(id, tiers)| tiers.map(|tiers| (id, tiers)))
+        .collect();
     let mut reasoning_levels = ReasoningCatalog::new();
     let mut conflicting_ids = HashSet::new();
     for row in parsed.data {
@@ -2424,6 +2522,7 @@ fn parse_openai_model_catalog(provider: &str, body: &str) -> Result<DiscoveredMo
     Ok(DiscoveredModels {
         models,
         reasoning_levels,
+        service_tiers,
     })
 }
 
@@ -2579,6 +2678,7 @@ mod tests {
             models,
             reasoning_levels: ReasoningCatalog::new(),
             source: ModelCatalogSource::Live,
+            service_tiers: ServiceTierCatalog::new(),
             route_fingerprint: Some(model_catalog_route_fingerprint(provider, route)),
             route_persistable: model_catalog_route_is_persistable(route),
             fetched_at_unix_ms: Some(1_800_000_000_000),
@@ -2662,6 +2762,206 @@ mod tests {
             },
         ))
         .expect("serialize actual provider request")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep live/cache/disk/override/request stages in one fixture.
+    fn advertised_service_tiers_survive_live_cache_persistence_and_actual_requests() {
+        let _guard = cache_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_model_cache();
+        let (base_url, server) = serve_model_catalog(
+            r#"{"data":[
+                {"id":"relay-model","service_tiers":["priority"],
+                 "metadata":{"service_tiers":[{"id":"ultrafast"},"flex"]}},
+                {"id":"plain-model"}
+            ]}"#,
+        );
+        let route = test_catalog_route(&base_url);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let live = runtime
+            .block_on(refresh_provider_model_catalog_with_route(
+                "tier-relay",
+                "",
+                route.clone(),
+            ))
+            .expect("live catalog");
+        server.join().expect("catalog server");
+        assert_eq!(
+            live.service_tiers("RELAY-MODEL"),
+            Some([ServiceTier::Flex, ServiceTier::Ultrafast].as_slice())
+        );
+        assert_eq!(live.reasoning_levels("relay-model"), None);
+        let warm = runtime
+            .block_on(fetch_provider_model_catalog_with_route(
+                "tier-relay",
+                "",
+                Some(route),
+            ))
+            .expect("cache works after server has stopped");
+        assert_eq!(warm.source(), ModelCatalogSource::Cache);
+        assert_eq!(warm.service_tiers, live.service_tiers);
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("models.json");
+        let manual = serde_json::json!({"providers":{"tier-relay":{
+            "api":"openai-completions", "baseUrl":base_url, "authHeader":false,
+            "compat":{"supportsTools":true}
+        }}});
+        std::fs::write(&path, manual.to_string()).expect("write route");
+        let persisted = persist_provider_model_catalog(&path, &warm).expect("persist tiers");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(persisted).expect("read catalog"))
+                .expect("generated JSON");
+        assert_eq!(
+            saved["providers"]["tier-relay"]["models"][1]["serviceTiers"],
+            serde_json::json!(["flex", "ultrafast"])
+        );
+        clear_model_cache();
+        let load = || {
+            let registry =
+                ModelRegistry::load_with_credential_resolver(Some(path.clone()), |_| None);
+            assert!(registry.error().is_none(), "{:?}", registry.error());
+            registry
+        };
+        let registry = load();
+        let entry = registry
+            .find("tier-relay", "relay-model")
+            .expect("restored model");
+        assert!(entry.supports_service_tier(ServiceTier::Ultrafast));
+        assert!(!entry.supports_service_tier(ServiceTier::Priority));
+        assert!(
+            !registry
+                .find("tier-relay", "plain-model")
+                .expect("plain row")
+                .supports_service_tier(ServiceTier::Ultrafast)
+        );
+        assert_eq!(
+            entry
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.supports_tools),
+            Some(true)
+        );
+        for responses in [false, true] {
+            assert_eq!(
+                service_tier_request(&entry, Some("ultrafast"), responses)["service_tier"],
+                "ultrafast"
+            );
+            assert_eq!(
+                service_tier_request(&entry, Some("flex"), responses)["service_tier"],
+                "flex"
+            );
+            assert!(
+                service_tier_request(&entry, None, responses)
+                    .get("service_tier")
+                    .is_none()
+            );
+            assert!(
+                service_tier_request(&entry, Some("priority"), responses)
+                    .get("service_tier")
+                    .is_none()
+            );
+        }
+
+        // Provider compat, an exact model override, and a complete manual
+        // model row all retain authority over generated capabilities.
+        for patch in [
+            serde_json::json!({"compat":{"serviceTiers":[]}}),
+            serde_json::json!({"modelOverrides":{"relay-model":{"serviceTiers":[]}}}),
+            serde_json::json!({"modelOverrides":{"relay-model":{"compat":{"serviceTiers":[]}}}}),
+            serde_json::json!({"models":[{"id":"relay-model","serviceTiers":[],"compat":{"serviceTiers":["ultrafast"]}}]}),
+        ] {
+            let mut settings = manual.clone();
+            settings["providers"]["tier-relay"]
+                .as_object_mut()
+                .expect("route")
+                .extend(patch.as_object().expect("patch").clone());
+            std::fs::write(&path, settings.to_string()).expect("manual override");
+            let entry = load()
+                .find("tier-relay", "relay-model")
+                .expect("overridden model");
+            assert!(
+                !entry.supports_service_tier(ServiceTier::Ultrafast),
+                "{patch}"
+            );
+            for responses in [false, true] {
+                assert!(
+                    service_tier_request(&entry, Some("ultrafast"), responses)
+                        .get("service_tier")
+                        .is_none(),
+                    "{patch}"
+                );
+            }
+        }
+    }
+
+    fn service_tier_request(
+        entry: &crate::models::ModelEntry,
+        tier: Option<&str>,
+        responses: bool,
+    ) -> serde_json::Value {
+        let context = crate::provider::Context::default();
+        let options = crate::provider::StreamOptions {
+            service_tier: tier.map(str::to_string),
+            ..crate::provider::StreamOptions::default()
+        };
+        if responses {
+            let provider =
+                crate::providers::openai_responses::OpenAIResponsesProvider::new(&entry.model.id)
+                    .with_provider_name(&entry.model.provider)
+                    .with_compat(entry.compat.clone());
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("Responses request")
+        } else {
+            let provider = crate::providers::openai::OpenAIProvider::new(&entry.model.id)
+                .with_provider_name(&entry.model.provider)
+                .with_compat(entry.compat.clone());
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("Completions request")
+        }
+    }
+
+    #[test]
+    fn service_tier_metadata_is_bounded_and_conflicting_rows_cannot_grant_support() {
+        let parsed = parse_openai_model_catalog(
+            "relay",
+            r#"{"data":[
+            {"id":"valid","service_tiers":["ultrafast",{"id":"flex"},"ultrafast","unknown",42]},
+            {"id":"nested","service_tiers":["ultrafast"],"metadata":{"service_tiers":["priority"]}},
+            {"id":"null","service_tiers":["ultrafast"],"metadata":{"service_tiers":null}},
+            {"id":"invalid","service_tiers":["ultrafast"],"metadata":{"service_tiers":"ultrafast"}},
+            {"id":"unknown","service_tiers":["future",{"id":"bogus"}]},
+            {"id":"MODEL","service_tiers":["ultrafast"]},
+            {"id":"model","service_tiers":["priority"]},
+            {"id":"Model","service_tiers":["ultrafast"]},
+            {"id":"partial","service_tiers":["ultrafast"]},
+            {"id":"PARTIAL"}
+        ]}"#,
+        )
+        .expect("catalog");
+        assert_eq!(
+            parsed.service_tiers["valid"],
+            vec![ServiceTier::Flex, ServiceTier::Ultrafast]
+        );
+        assert_eq!(parsed.service_tiers["nested"], vec![ServiceTier::Priority]);
+        assert_eq!(parsed.service_tiers["null"], vec![ServiceTier::Ultrafast]);
+        for id in ["invalid", "unknown", "model", "partial"] {
+            assert!(!parsed.service_tiers.contains_key(id), "{id}");
+        }
+        let too_many = serde_json::json!({"data":[{
+            "id":"oversized", "service_tiers":vec!["ultrafast"; MAX_ADVERTISED_SERVICE_TIERS + 1]
+        }]})
+        .to_string();
+        assert!(
+            parse_openai_model_catalog("relay", &too_many)
+                .expect("model retained")
+                .service_tiers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3282,6 +3582,7 @@ mod tests {
                     CacheEntry {
                         models: vec!["stale-model".to_string()],
                         reasoning_levels: ReasoningCatalog::new(),
+                        service_tiers: ServiceTierCatalog::new(),
                         fetched_at_unix_ms: 1,
                         inserted: expired_at,
                     },
@@ -3355,6 +3656,10 @@ mod tests {
                             ..DiscoveredReasoning::default()
                         },
                     )]),
+                    service_tiers: ServiceTierCatalog::from([(
+                        one_mebibyte.clone(),
+                        vec![ServiceTier::Ultrafast],
+                    )]),
                 },
                 4,
             );
@@ -3364,13 +3669,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let retained_bytes = guard
             .values()
-            .map(|entry| catalog_bytes(&entry.models, &entry.reasoning_levels))
+            .map(|entry| {
+                catalog_bytes(&entry.models, &entry.reasoning_levels, &entry.service_tiers)
+            })
             .sum::<usize>();
         assert!(retained_bytes <= MODEL_CACHE_MAX_MODEL_ID_BYTES);
         assert_eq!(
             guard.len(),
-            3,
-            "reasoning metadata must count against the byte budget"
+            2,
+            "reasoning and service-tier metadata must count against the byte budget"
         );
         assert!(guard.contains_key("byte-budget-09"));
         drop(guard);
@@ -4052,6 +4359,7 @@ mod tests {
             provider: "openai".to_string(),
             models: vec!["fallback-model".to_string()],
             reasoning_levels: ReasoningCatalog::new(),
+            service_tiers: ServiceTierCatalog::new(),
             source: ModelCatalogSource::StaticFallback,
             route_fingerprint: None,
             route_persistable: false,

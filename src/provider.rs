@@ -758,21 +758,190 @@ pub struct StreamOptions {
     pub usage_observer: Option<UsageObserver>,
 }
 
-/// The `service_tier` value an OpenAI-shaped request to `provider` should
-/// carry, or `None` to omit the field.
-///
-/// Mirrors OMP's `shouldSendServiceTier`. OpenAI and Codex accept every tier
-/// except `auto` (their default, so sending it is pointless). OpenRouter
-/// forwards only `flex`, `scale` and `priority`. Every other OpenAI-compatible
-/// backend gets nothing, because many of them reject unknown parameters.
-pub fn openai_service_tier(provider: &str, tier: Option<&str>) -> Option<String> {
-    let tier = tier.filter(|tier| !tier.is_empty() && *tier != "auto")?;
-    let sends = match provider {
-        "openai" | "openai-codex" => true,
-        "openrouter" => matches!(tier, "flex" | "scale" | "priority"),
-        _ => false,
-    };
-    sends.then(|| tier.to_string())
+/// Recognized serving tiers. Catalog metadata describes support only; it
+/// never selects a tier or changes the operator's current request options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    Auto,
+    Default,
+    Flex,
+    Scale,
+    Priority,
+    Ultrafast,
+}
+
+impl ServiceTier {
+    pub const ALL: [Self; 6] = [
+        Self::Auto,
+        Self::Default,
+        Self::Flex,
+        Self::Scale,
+        Self::Priority,
+        Self::Ultrafast,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Flex => "flex",
+            Self::Scale => "scale",
+            Self::Priority => "priority",
+            Self::Ultrafast => "ultrafast",
+        }
+    }
+
+    /// Parse only canonical wire identifiers, never provider-supplied text.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tier| tier.as_str() == value)
+    }
+}
+
+/// Decide support from the actual transport and its model-scoped catalog.
+/// Custom OpenAI routes must explicitly advertise a tier. A matching model
+/// name alone never grants a request field to an unrelated provider.
+#[must_use]
+pub fn supports_service_tier(
+    provider: &str,
+    api: &str,
+    tier: ServiceTier,
+    advertised: Option<&[ServiceTier]>,
+) -> bool {
+    if provider == "anthropic" && api == "anthropic-messages" {
+        return tier == ServiceTier::Priority;
+    }
+    if tier == ServiceTier::Auto
+        || !matches!(
+            api,
+            "openai-completions" | "openai-responses" | "openai-codex-responses"
+        )
+        // These providers own different controls or reject service_tier.
+        || matches!(provider, "fireworks" | "github-copilot")
+    {
+        return false;
+    }
+    let reported = advertised.is_some_and(|tiers| tiers.contains(&tier));
+    if api == "openai-codex-responses" {
+        if tier == ServiceTier::Ultrafast {
+            return reported;
+        }
+        if matches!(tier, ServiceTier::Priority | ServiceTier::Scale)
+            && advertised.is_some_and(|tiers| !tiers.is_empty())
+        {
+            return reported;
+        }
+    }
+    match provider {
+        "openai" => true,
+        "openai-codex" => tier != ServiceTier::Ultrafast || reported,
+        "openrouter" => {
+            matches!(
+                tier,
+                ServiceTier::Flex | ServiceTier::Scale | ServiceTier::Priority
+            ) || (tier == ServiceTier::Ultrafast && reported)
+        }
+        _ => reported,
+    }
+}
+
+/// The `service_tier` value this OpenAI-shaped request may carry. Unknown
+/// tiers and `auto` are omitted, as are undeclared custom-route capabilities.
+/// The provider rechecks on every request, including after model switches.
+pub fn openai_service_tier(
+    provider: &str,
+    api: &str,
+    tier: Option<&str>,
+    advertised: Option<&[ServiceTier]>,
+) -> Option<String> {
+    let tier = ServiceTier::parse(tier?)?;
+    (matches!(
+        api,
+        "openai-completions" | "openai-responses" | "openai-codex-responses"
+    ) && supports_service_tier(provider, api, tier, advertised))
+    .then(|| tier.as_str().to_string())
+}
+
+/// Shared `/fast` grammar for both terminal frontends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceTierCommand {
+    Toggle,
+    On,
+    Off,
+    Status,
+    Set(ServiceTier),
+}
+
+impl ServiceTierCommand {
+    pub const USAGE: &str = "Usage: /fast [on|off|status|default|flex|scale|priority|ultrafast]";
+
+    #[must_use]
+    pub fn parse(args: &str) -> Option<Self> {
+        match args.trim().to_ascii_lowercase().as_str() {
+            "" | "toggle" => Some(Self::Toggle),
+            "on" => Some(Self::On),
+            "off" | "none" | "auto" => Some(Self::Off),
+            "status" => Some(Self::Status),
+            "ultra" => Some(Self::Set(ServiceTier::Ultrafast)),
+            value => ServiceTier::parse(value).map(Self::Set),
+        }
+    }
+
+    /// Update only the live selection. Unsupported requests leave the old
+    /// choice intact; catalog refresh and model switches never select a tier.
+    pub fn apply(
+        self,
+        selected: &mut Option<String>,
+        provider: &str,
+        api: &str,
+        advertised: Option<&[ServiceTier]>,
+    ) -> String {
+        let current = selected.as_deref().and_then(ServiceTier::parse);
+        let enabled = current.is_some_and(|tier| tier != ServiceTier::Auto);
+        let realization = |tier: ServiceTier| {
+            if provider == "anthropic" && tier == ServiceTier::Priority {
+                "speed=fast, on models that offer it".to_string()
+            } else {
+                format!("service_tier={}", tier.as_str())
+            }
+        };
+        if self == Self::Status {
+            return match current.filter(|tier| *tier != ServiceTier::Auto) {
+                Some(tier) if supports_service_tier(provider, api, tier, advertised) => {
+                    format!("Fast mode is on ({provider}: {}).", realization(tier))
+                }
+                Some(tier) => format!(
+                    "Service tier {} is selected, but unavailable for the current {provider} model; the request field is omitted.",
+                    tier.as_str()
+                ),
+                None => "Fast mode is off.".to_string(),
+            };
+        }
+        if self == Self::Off || (self == Self::Toggle && enabled) {
+            *selected = None;
+            return "Fast mode disabled.".to_string();
+        }
+        let tier = match self {
+            Self::Set(tier) => tier,
+            Self::On => current
+                .filter(|tier| matches!(tier, ServiceTier::Priority | ServiceTier::Ultrafast))
+                .unwrap_or(ServiceTier::Priority),
+            _ => ServiceTier::Priority,
+        };
+        if !supports_service_tier(provider, api, tier, advertised) {
+            return format!(
+                "Service tier {} is unavailable for the current {provider} model. Refresh its catalog or configure serviceTiers in models.json; the selection was not changed.",
+                tier.as_str()
+            );
+        }
+        *selected = Some(tier.as_str().to_string());
+        format!(
+            "Fast mode enabled ({provider}: {}). Serving tiers can have different prices.",
+            realization(tier)
+        )
+    }
 }
 
 /// Cache retention policy.
@@ -1231,6 +1400,117 @@ impl std::str::FromStr for KnownProvider {
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+
+    #[test]
+    fn service_tier_wire_policy_requires_supported_transport_and_explicit_relay_metadata() {
+        let advertised = [ServiceTier::Ultrafast, ServiceTier::Flex];
+        for api in ["openai-completions", "openai-responses"] {
+            assert_eq!(
+                openai_service_tier("relay", api, Some("ultrafast"), None),
+                None
+            );
+            assert_eq!(
+                openai_service_tier("relay", api, Some("ultrafast"), Some(&advertised)),
+                Some("ultrafast".to_string())
+            );
+            assert_eq!(
+                openai_service_tier("relay", api, Some("priority"), Some(&advertised)),
+                None
+            );
+            for unknown in ["future-tier", "ULTRAFAST", "ultrafast ", "auto"] {
+                assert_eq!(
+                    openai_service_tier("openai", api, Some(unknown), Some(&advertised)),
+                    None
+                );
+            }
+        }
+        for (provider, api) in [
+            ("relay", "anthropic-messages"),
+            ("relay", "google-generative-ai"),
+            ("github-copilot", "openai-completions"),
+            ("fireworks", "openai-completions"),
+        ] {
+            assert_eq!(
+                openai_service_tier(provider, api, Some("ultrafast"), Some(&advertised)),
+                None
+            );
+        }
+        assert_eq!(
+            openai_service_tier("openai", "openai-responses", Some("ultrafast"), None),
+            Some("ultrafast".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_advertisements_gate_ultrafast_and_reported_priority() {
+        let api = "openai-codex-responses";
+        let advertised = [ServiceTier::Ultrafast];
+        assert_eq!(
+            openai_service_tier("openai-codex", api, Some("ultrafast"), None),
+            None
+        );
+        assert_eq!(
+            openai_service_tier("openai-codex", api, Some("priority"), None),
+            Some("priority".to_string())
+        );
+        assert_eq!(
+            openai_service_tier("openai-codex", api, Some("priority"), Some(&[])),
+            Some("priority".to_string())
+        );
+        assert_eq!(
+            openai_service_tier("openai-codex", api, Some("priority"), Some(&advertised)),
+            None
+        );
+        assert_eq!(
+            openai_service_tier("openai-codex", api, Some("ultrafast"), Some(&advertised)),
+            Some("ultrafast".to_string())
+        );
+        for tier in ["default", "flex"] {
+            assert_eq!(
+                openai_service_tier("openai-codex", api, Some(tier), Some(&advertised)),
+                Some(tier.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn fast_commands_preserve_explicit_tiers_and_refuse_without_changing_selection() {
+        let advertised = [ServiceTier::Priority, ServiceTier::Ultrafast];
+        let mut selected = None;
+        ServiceTierCommand::parse("ULTRAFAST").unwrap().apply(
+            &mut selected,
+            "relay",
+            "openai-responses",
+            Some(&advertised),
+        );
+        assert_eq!(selected.as_deref(), Some("ultrafast"));
+        ServiceTierCommand::On.apply(
+            &mut selected,
+            "relay",
+            "openai-responses",
+            Some(&advertised),
+        );
+        assert_eq!(selected.as_deref(), Some("ultrafast"));
+        let refused = ServiceTierCommand::Set(ServiceTier::Flex).apply(
+            &mut selected,
+            "relay",
+            "openai-responses",
+            Some(&advertised),
+        );
+        assert!(refused.contains("unavailable"));
+        assert_eq!(selected.as_deref(), Some("ultrafast"));
+        let status =
+            ServiceTierCommand::Status.apply(&mut selected, "relay", "openai-responses", None);
+        assert!(status.contains("omitted"));
+        assert_eq!(selected.as_deref(), Some("ultrafast"));
+        ServiceTierCommand::Off.apply(&mut selected, "relay", "openai-responses", None);
+        assert_eq!(selected, None);
+        assert_eq!(
+            ServiceTierCommand::parse("ultra"),
+            Some(ServiceTierCommand::Set(ServiceTier::Ultrafast))
+        );
+        assert_eq!(ServiceTierCommand::parse("ultrafast extra"), None);
+    }
 
     struct SpendProbe {
         calls: std::sync::atomic::AtomicUsize,

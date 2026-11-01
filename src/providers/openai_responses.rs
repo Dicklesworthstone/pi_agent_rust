@@ -211,12 +211,16 @@ impl OpenAIResponsesProvider {
             reasoning,
             prompt_cache_key: options.prompt_cache_key.clone(),
             service_tier: crate::provider::openai_service_tier(
+                &self.provider,
                 if self.codex_mode {
-                    "openai-codex"
+                    "openai-codex-responses"
                 } else {
-                    &self.provider
+                    &self.api
                 },
                 options.service_tier.as_deref(),
+                self.compat
+                    .as_ref()
+                    .and_then(|compat| compat.service_tiers.as_deref()),
             ),
         }
     }
@@ -2771,7 +2775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_service_tier_for_openai_and_codex_only() {
+    fn test_build_request_service_tier_support_is_checked_before_serialization() {
         let context = Context::owned(
             None,
             vec![Message::User(crate::model::UserMessage {
@@ -2797,11 +2801,34 @@ mod tests {
                 "codex_mode={codex_mode}"
             );
         }
-        // A third-party Responses backend never sees the field.
+        // A third-party Responses backend needs an explicit advertisement.
         let provider = OpenAIResponsesProvider::new("m").with_provider_name("my-proxy");
         let value = serde_json::to_value(provider.build_request(&context, &fast))
             .expect("serialize request");
         assert!(value.get("service_tier").is_none());
+
+        let ultra = StreamOptions {
+            service_tier: Some("ultrafast".to_string()),
+            ..Default::default()
+        };
+        for name in ["openai-codex", "my-proxy"] {
+            let provider = OpenAIResponsesProvider::new("m")
+                .with_provider_name(name)
+                .with_codex_mode(true);
+            let value = serde_json::to_value(provider.build_request(&context, &ultra))
+                .expect("serialize unsupported tier");
+            assert!(value.get("service_tier").is_none());
+            let provider = provider.with_compat(Some(CompatConfig {
+                service_tiers: Some(vec![crate::provider::ServiceTier::Ultrafast]),
+                ..CompatConfig::default()
+            }));
+            let value = serde_json::to_value(provider.build_request(&context, &ultra))
+                .expect("serialize advertised tier");
+            assert_eq!(value["service_tier"], "ultrafast");
+            let value = serde_json::to_value(provider.build_request(&context, &fast))
+                .expect("serialize unadvertised priority");
+            assert!(value.get("service_tier").is_none());
+        }
     }
 
     #[test]

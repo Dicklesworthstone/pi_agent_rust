@@ -59,6 +59,7 @@ use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
 use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalog};
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
+use crate::provider::ServiceTierCommand;
 use std::collections::{HashMap, VecDeque};
 
 mod console_input;
@@ -1830,9 +1831,8 @@ pub enum UiCommand {
     /// The UI validates the level against `ThinkingLevel::from_str` before
     /// sending; invalid levels never reach the driver.
     SetThinking(Option<crate::model::ThinkingLevel>),
-    /// `/fast [on|off|status]`: toggle, set or report fast mode (the
-    /// `priority` service tier; OMP `/fast`).
-    Fast(ToggleRequest),
+    /// `/fast`: toggle, select or inspect a supported serving tier.
+    Fast(ServiceTierCommand),
     /// `/skillful [on|off|status]`: list skills in the system prompt for
     /// this session or leave them out (OMP `/skillful`).
     Skillful(ToggleRequest),
@@ -3113,8 +3113,7 @@ impl PiFtuiModel {
         let session = self.displayed_session_id.as_deref();
         let generation = self.input.replacement_generation();
         self.pending_image_pastes.retain(|pending| {
-            pending.session_id.as_deref() == session
-                && pending.replacement_generation == generation
+            pending.session_id.as_deref() == session && pending.replacement_generation == generation
         });
     }
 
@@ -4401,9 +4400,8 @@ impl PiFtuiModel {
             return;
         }
         let shown = self.displayed_session_id.as_deref();
-        self.pending_input_restores.retain(|pending| {
-            shown.is_none_or(|shown| shown == pending.owner_session_id.as_str())
-        });
+        self.pending_input_restores
+            .retain(|pending| shown.is_none_or(|shown| shown == pending.owner_session_id.as_str()));
         if self.pending_input_restores.is_empty()
             || !self.input_active()
             || self.goal_draft.is_some()
@@ -5044,7 +5042,7 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /compact [focus], /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking or /effort [level], /fast [on|off|status], /skillful [on|off|status], /branch (or Esc Esc), /theme [name], /changelog, /clear, /hotkeys, \
+                     /thinking or /effort [level], /fast [on|off|status|default|flex|scale|priority|ultrafast], /skillful [on|off|status], /branch (or Esc Esc), /theme [name], /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
@@ -5277,12 +5275,11 @@ impl PiFtuiModel {
                 return true;
             }
             "/fast" => {
-                match ToggleRequest::parse(cmd_args) {
+                match ServiceTierCommand::parse(cmd_args) {
                     Some(request) => self.send_command(UiCommand::Fast(request)),
-                    None => self.push_entry(
-                        EntryRole::Error,
-                        String::from("Usage: /fast [on|off|status]"),
-                    ),
+                    None => {
+                        self.push_entry(EntryRole::Error, String::from(ServiceTierCommand::USAGE))
+                    }
                 }
                 return true;
             }
@@ -10058,50 +10055,25 @@ fn run_skillful_command(
     ))
 }
 
-/// How the current model's provider realizes fast mode, or `None` when it
-/// has no priority tier to ask for.
-fn fast_mode_realization(provider: &str) -> Option<&'static str> {
-    match provider {
-        "openai" | "openai-codex" | "openrouter" => Some("service_tier=priority"),
-        "anthropic" => Some("speed=fast, on models that offer it"),
-        _ => None,
-    }
-}
-
 /// Apply `/fast`. The tier lives in the session's stream options, so it
-/// survives model switches and simply goes unused on providers without one.
-/// Like OMP, turning it on is refused when the current model can't use it.
-fn run_fast_command(handle: &mut crate::sdk::AgentSessionHandle, request: ToggleRequest) -> PiMsg {
-    let (provider, _) = handle.model();
-    let realization = fast_mode_realization(&provider);
-    let options = handle.session_mut().agent.stream_options_mut();
-    let enabled = options.service_tier.as_deref() == Some("priority");
-    let enable = match request {
-        ToggleRequest::Toggle => !enabled,
-        ToggleRequest::On => true,
-        ToggleRequest::Off => false,
-        ToggleRequest::Status => {
-            return PiMsg::System(match (enabled, realization) {
-                (true, Some(how)) => format!("Fast mode is on ({provider}: {how})."),
-                (true, None) => format!("Fast mode is on, but {provider} has no priority tier."),
-                (false, _) => String::from("Fast mode is off."),
-            });
-        }
-    };
-    if !enable {
-        options.service_tier = None;
-        return PiMsg::System(String::from("Fast mode disabled."));
-    }
-    let Some(how) = realization else {
-        return PiMsg::System(format!(
-            "Fast mode is unavailable for {provider}: only OpenAI, Codex, OpenRouter and \
-             Anthropic models have a priority tier."
-        ));
-    };
-    options.service_tier = Some(String::from("priority"));
-    PiMsg::System(format!(
-        "Fast mode enabled ({provider}: {how}). Priority processing costs more."
-    ))
+/// survives model switches. The shared decision checks the current route's
+/// capabilities in both the command and the provider serializer.
+fn run_fast_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    request: ServiceTierCommand,
+) -> PiMsg {
+    let entry = handle.session().current_model_entry();
+    let provider = handle.session().agent.provider();
+    PiMsg::System(
+        request.apply(
+            &mut handle.session_mut().agent.stream_options_mut().service_tier,
+            provider.name(),
+            provider.api(),
+            entry
+                .as_ref()
+                .and_then(crate::models::ModelEntry::service_tiers),
+        ),
+    )
 }
 
 async fn run_set_thinking_command(
@@ -13531,7 +13503,13 @@ mod tests {
     #[test]
     fn image_paste_full_replacements_invalidate_even_identical_drafts() {
         for replacement in [
-            "submit", "clear", "history", "agent", "extension", "editor", "restore",
+            "submit",
+            "clear",
+            "history",
+            "agent",
+            "extension",
+            "editor",
+            "restore",
         ] {
             let (_tx, mut model) = new_model();
             let (submit_tx, submit_rx) = mpsc::channel();
@@ -13593,8 +13571,16 @@ mod tests {
     fn image_paste_owner_roundtrips_never_revive_an_old_capture() {
         for draft in ["", "kept\ntext"] {
             for owner in [
-                "login", "ask", "extension", "picker", "custom", "settings", "suspend", "working",
-                "handoff", "mcp",
+                "login",
+                "ask",
+                "extension",
+                "picker",
+                "custom",
+                "settings",
+                "suspend",
+                "working",
+                "handoff",
+                "mcp",
             ] {
                 let (_tx, mut model) = new_model();
                 model.displayed_session_id = Some(String::from("current"));
@@ -13611,9 +13597,13 @@ mod tests {
                         "clipboard-owner",
                         vec![question("Continue?", &["yes", "no"], false)],
                     )))),
-                    "extension" => sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
-                        "clipboard-owner", "input", serde_json::json!({"title": "Reply"}),
-                    )))),
+                    "extension" => {
+                        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                            "clipboard-owner",
+                            "input",
+                            serde_json::json!({"title": "Reply"}),
+                        ))))
+                    }
                     "picker" => sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
                         fork: false,
                         messages: vec![(String::from("choice"), String::from("entry"))],
@@ -13634,8 +13624,10 @@ mod tests {
                         sim.model_mut().busy.as_mut().expect("busy").handoff =
                             Some(HandoffRequest::new(String::from("current")));
                     }
-                    _ => sim.model_mut().mcp_auth_request =
-                        Some(McpAuthRequest::new(String::from("current"))),
+                    _ => {
+                        sim.model_mut().mcp_auth_request =
+                            Some(McpAuthRequest::new(String::from("current")))
+                    }
                 }
                 sim.inject_event(Event::Tick);
                 assert!(sim.model().pending_image_pastes.is_empty(), "{owner}");
@@ -13646,8 +13638,9 @@ mod tests {
                         provider: None,
                         accepts_empty_input: false,
                     })),
-                    "ask" | "extension" | "picker" =>
-                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty())),
+                    "ask" | "extension" | "picker" => {
+                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()))
+                    }
                     "custom" => send_ui_effect(
                         &mut sim,
                         "setWidget",
@@ -13667,7 +13660,10 @@ mod tests {
                 assert!(sim.model().image_paste_allowed(), "{owner}");
                 assert_eq!(sim.model().input.text(), draft, "{owner}");
                 assert_stale_image_result_is_ignored(&mut sim, request_id);
-                let new_id = sim.model_mut().begin_image_paste().expect("new owner capture");
+                let new_id = sim
+                    .model_mut()
+                    .begin_image_paste()
+                    .expect("new owner capture");
                 assert_ne!(new_id, request_id);
                 image_paste_result(&mut sim, request_id, Some("@old-owner.png"));
                 assert_eq!(sim.model().pending_image_pastes.len(), 1);
@@ -13701,7 +13697,10 @@ mod tests {
             image_paste_result(&mut sim, request_id, reference);
             assert_eq!(sim.model().input.text(), "saved\ndraft");
             assert_eq!(sim.model().input.selection(), selection);
-            assert_eq!(sim.model().error_banner.as_deref(), Some("external editor failed"));
+            assert_eq!(
+                sim.model().error_banner.as_deref(),
+                Some("external editor failed")
+            );
         }
         assert!(sim.model_mut().begin_image_paste().is_some());
     }
@@ -13752,17 +13751,37 @@ mod tests {
         sim.model_mut().begin_busy("ordinary background operation");
         let mut ids = Vec::new();
         for _ in 0..MAX_PENDING_IMAGE_PASTES {
-            ids.push(sim.model_mut().begin_image_paste().expect("bounded capture"));
+            ids.push(
+                sim.model_mut()
+                    .begin_image_paste()
+                    .expect("bounded capture"),
+            );
         }
         assert!(sim.model_mut().begin_image_paste().is_none());
-        assert_eq!(sim.model().pending_image_pastes.len(), MAX_PENDING_IMAGE_PASTES);
+        assert_eq!(
+            sim.model().pending_image_pastes.len(),
+            MAX_PENDING_IMAGE_PASTES
+        );
         let completed = ids.remove(3);
         image_paste_result(&mut sim, completed, Some("@completed.png"));
-        assert_eq!(sim.model().pending_image_pastes.len(), MAX_PENDING_IMAGE_PASTES - 1);
-        ids.push(sim.model_mut().begin_image_paste().expect("capacity released"));
-        assert_eq!(sim.model().pending_image_pastes.len(), MAX_PENDING_IMAGE_PASTES);
+        assert_eq!(
+            sim.model().pending_image_pastes.len(),
+            MAX_PENDING_IMAGE_PASTES - 1
+        );
+        ids.push(
+            sim.model_mut()
+                .begin_image_paste()
+                .expect("capacity released"),
+        );
+        assert_eq!(
+            sim.model().pending_image_pastes.len(),
+            MAX_PENDING_IMAGE_PASTES
+        );
         sim.model_mut().input.set_text("new draft");
-        let next = sim.model_mut().begin_image_paste().expect("replacement capture");
+        let next = sim
+            .model_mut()
+            .begin_image_paste()
+            .expect("replacement capture");
         assert!(ids.iter().all(|old| *old < next));
         assert_eq!(sim.model().pending_image_pastes.len(), 1);
         for id in ids {
@@ -14573,7 +14592,11 @@ mod tests {
             .1
             .expect("editor cursor")
             .1;
-        sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, bottom - 1));
+        sim.inject_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            bottom - 1,
+        ));
         sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 2, bottom - 1));
         let cursor = sim.model().input.cursor();
         assert_eq!((cursor.line, cursor.grapheme), (0, 2));
@@ -14602,8 +14625,16 @@ mod tests {
             .1
             .expect("editor cursor")
             .1;
-        sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, bottom - 2));
-        sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, bottom - 1));
+        sim.inject_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            1,
+            bottom - 2,
+        ));
+        sim.inject_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            3,
+            bottom - 1,
+        ));
         sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 3, bottom - 1));
         assert_eq!(
             sim.model().input.selected_text().as_deref(),
@@ -14696,11 +14727,19 @@ mod tests {
             assert!(sim.model().input.selection().is_none());
 
             let _ = frame_with_cursor(sim.model(), width, height);
-            sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, height - 2));
+            sim.inject_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                1,
+                height - 2,
+            ));
             let before = sim.model().input.cursor();
             assert_eq!((before.line, before.grapheme), (1, 1));
             sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
-            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 4, height - 2));
+            sim.inject_event(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                4,
+                height - 2,
+            ));
             assert_eq!(sim.model().input.cursor(), before, "press outside editor");
             assert!(sim.model().input.selection().is_none());
             assert_eq!(sim.model().input.text(), "first\nsecond");
@@ -14734,7 +14773,11 @@ mod tests {
             let above = terminal_height - frame_height - 1;
             sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, above));
             let _ = frame_with_cursor(sim.model(), 20, frame_height);
-            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, second_row));
+            sim.inject_event(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                3,
+                second_row,
+            ));
             assert_eq!(sim.model().input.cursor(), before);
             assert!(sim.model().input.selection().is_none());
 
@@ -14744,7 +14787,11 @@ mod tests {
             sim.inject_event(mouse(MouseEventKind::Up(MouseButton::Left), 1, above));
             assert_eq!(sim.model().input.selected_text().as_deref(), Some("i"));
             let before = sim.model().input.cursor();
-            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, second_row));
+            sim.inject_event(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                3,
+                second_row,
+            ));
             assert_eq!(sim.model().input.cursor(), before, "release above frame");
             assert_eq!(sim.model().input.selected_text().as_deref(), Some("i"));
 
@@ -14754,7 +14801,11 @@ mod tests {
             let before = sim.model().input.cursor();
             let grown_height = frame_height + 2;
             let _ = frame_with_cursor(sim.model(), 20, grown_height);
-            sim.inject_event(mouse(MouseEventKind::Drag(MouseButton::Left), 3, second_row));
+            sim.inject_event(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                3,
+                second_row,
+            ));
             assert_eq!(sim.model().input.cursor(), before, "frame grew");
             assert!(sim.model().input.selection().is_none());
             sim.inject_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, first_row));
@@ -14881,7 +14932,9 @@ mod tests {
                 let (_tx, mut model) = new_model();
                 model.input.set_text(draft);
                 let mut sim = ProgramSimulator::new(
-                    model.with_turn_control(Arc::default()).with_alt_screen(true),
+                    model
+                        .with_turn_control(Arc::default())
+                        .with_alt_screen(true),
                 );
                 sim.init();
                 sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
@@ -16132,6 +16185,10 @@ mod tests {
             steering: crate::agent::QueueMode::OneAtATime,
             follow_up: crate::agent::QueueMode::OneAtATime,
             auto_resize_images: true,
+            enable_eval: false,
+            enable_github: false,
+            enable_security_scan: false,
+            enable_subagent: false,
             hide_thinking: false,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             double_escape: DoubleEscapeAction::Rewind,
@@ -18801,7 +18858,10 @@ mod tests {
             sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
             assert_eq!(sim.model().input.text(), "saved\nprompt");
             assert!(sim.model().custom_overlay_open());
-            sim.inject_event(Event::Paste(ftui::PasteEvent::new("back to component", true)));
+            sim.inject_event(Event::Paste(ftui::PasteEvent::new(
+                "back to component",
+                true,
+            )));
             assert_eq!(
                 sim.model()
                     .ext_custom
@@ -20360,6 +20420,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercise one session across tier and model changes.
     fn fast_command_sets_the_priority_tier_the_provider_sends() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -20385,33 +20446,88 @@ mod tests {
             };
 
             assert_eq!(
-                text(run_fast_command(&mut handle, ToggleRequest::Status)),
+                text(run_fast_command(&mut handle, ServiceTierCommand::Status)),
                 "Fast mode is off."
             );
             assert!(
-                text(run_fast_command(&mut handle, ToggleRequest::On))
+                text(run_fast_command(&mut handle, ServiceTierCommand::On))
                     .starts_with("Fast mode enabled")
             );
             assert_eq!(tier(&handle).as_deref(), Some("priority"));
             assert!(
-                text(run_fast_command(&mut handle, ToggleRequest::Status))
+                text(run_fast_command(&mut handle, ServiceTierCommand::Status))
                     .contains("service_tier=priority")
             );
             // Bare /fast toggles.
             assert_eq!(
-                text(run_fast_command(&mut handle, ToggleRequest::Toggle)),
+                text(run_fast_command(&mut handle, ServiceTierCommand::Toggle)),
                 "Fast mode disabled."
             );
             assert_eq!(tier(&handle), None);
-            run_fast_command(&mut handle, ToggleRequest::Toggle);
+            run_fast_command(&mut handle, ServiceTierCommand::Toggle);
             assert_eq!(tier(&handle).as_deref(), Some("priority"));
-            run_fast_command(&mut handle, ToggleRequest::Off);
+            run_fast_command(&mut handle, ServiceTierCommand::Off);
             assert_eq!(tier(&handle), None);
+
+            let mut entry = handle
+                .session()
+                .current_model_entry()
+                .expect("current model");
+            entry.model.provider = "tier-relay".to_string();
+            entry.compat = Some(crate::models::CompatConfig {
+                service_tiers: Some(vec![crate::provider::ServiceTier::Ultrafast]),
+                ..crate::models::CompatConfig::default()
+            });
+            let provider = crate::providers::create_provider(&entry, None).expect("relay provider");
+            handle.session_mut().agent.set_provider(provider);
+            handle.session_mut().set_model_registry(
+                crate::models::ModelRegistry::from_entries_for_tests(vec![entry.clone()]),
+            );
+            assert!(
+                text(run_fast_command(
+                    &mut handle,
+                    ServiceTierCommand::Set(crate::provider::ServiceTier::Ultrafast)
+                ))
+                .contains("service_tier=ultrafast")
+            );
+            run_fast_command(&mut handle, ServiceTierCommand::On);
+            assert_eq!(tier(&handle).as_deref(), Some("ultrafast"));
+            assert!(
+                text(run_fast_command(
+                    &mut handle,
+                    ServiceTierCommand::Set(crate::provider::ServiceTier::Priority)
+                ))
+                .contains("unavailable")
+            );
+            assert_eq!(tier(&handle).as_deref(), Some("ultrafast"));
+
+            // Replacing the model with refreshed capabilities may withdraw
+            // support, but it never changes the operator's selection.
+            entry.compat = None;
+            let provider = crate::providers::create_provider(&entry, None).expect("updated relay");
+            handle.session_mut().agent.set_provider(provider);
+            handle.session_mut().set_model_registry(
+                crate::models::ModelRegistry::from_entries_for_tests(vec![entry]),
+            );
+            assert!(
+                text(run_fast_command(&mut handle, ServiceTierCommand::Status)).contains("omitted")
+            );
+            assert_eq!(tier(&handle).as_deref(), Some("ultrafast"));
         });
 
         // Providers without a priority tier refuse `on`, as OMP does.
-        assert!(fast_mode_realization("groq").is_none());
-        assert!(fast_mode_realization("anthropic").is_some());
+        assert!(!crate::provider::supports_service_tier(
+            "groq",
+            "openai-completions",
+            crate::provider::ServiceTier::Priority,
+            None
+        ));
+        assert!(crate::provider::supports_service_tier(
+            "anthropic",
+            "anthropic-messages",
+            crate::provider::ServiceTier::Priority,
+            None
+        ));
     }
 
     #[test]
@@ -20641,10 +20757,18 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         for (typed, request) in [
-            ("/fast", ToggleRequest::Toggle),
-            ("/fast on", ToggleRequest::On),
-            ("/fast OFF", ToggleRequest::Off),
-            ("/fast status", ToggleRequest::Status),
+            ("/fast", ServiceTierCommand::Toggle),
+            ("/fast on", ServiceTierCommand::On),
+            ("/fast OFF", ServiceTierCommand::Off),
+            ("/fast status", ServiceTierCommand::Status),
+            (
+                "/fast ultrafast",
+                ServiceTierCommand::Set(crate::provider::ServiceTier::Ultrafast),
+            ),
+            (
+                "/fast flex",
+                ServiceTierCommand::Set(crate::provider::ServiceTier::Flex),
+            ),
         ] {
             type_str(&mut sim, typed);
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
@@ -22385,10 +22509,7 @@ mod tests {
             );
             sim.inject_event(event);
             assert!(sim.model().active_ask.is_none());
-            assert_eq!(
-                sim.model().input.text(),
-                "returned prompt\n\nsaved draft"
-            );
+            assert_eq!(sim.model().input.text(), "returned prompt\n\nsaved draft");
             assert!(sim.model().pending_input_restores.is_empty());
             assert!(submit_rx.try_recv().is_err());
         }
@@ -22719,15 +22840,17 @@ mod tests {
             let (_tx, mut model) = new_model();
             let (submit_tx, submit_rx) = mpsc::channel();
             model.record_history("older prompt");
-            let mut sim = ProgramSimulator::new(
-                model.with_submit_channel(submit_tx).with_alt_screen(true),
-            );
+            let mut sim =
+                ProgramSimulator::new(model.with_submit_channel(submit_tx).with_alt_screen(true));
             sim.init();
             for text in ["界 first\nsecond ", "tail"] {
                 sim.inject_event(Event::Paste(ftui::PasteEvent::new(text, true)));
             }
             sim.inject_event(key(KeyCode::Left, Modifiers::SHIFT));
-            sim.inject_event(Event::Resize { width: 9, height: 12 });
+            sim.inject_event(Event::Resize {
+                width: 9,
+                height: 12,
+            });
             assert!(frame_with_cursor(sim.model(), 9, 12).1.is_some());
             let original = sim.model().input.text();
             let cursor = sim.model().input.cursor();
@@ -22741,10 +22864,15 @@ mod tests {
             sim.inject_event(key(KeyCode::Char('-'), Modifiers::CTRL));
             sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL));
             assert_eq!(sim.model().input.text(), "private-code");
-            sim.inject_event(Event::Resize { width: 31, height: 12 });
+            sim.inject_event(Event::Resize {
+                width: 31,
+                height: 12,
+            });
             assert!(frame_with_cursor(sim.model(), 31, 12).1.is_some());
             if failed {
-                sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(String::from("login failed"))));
+                sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(String::from(
+                    "login failed",
+                ))));
             }
             // This is also the browser-callback path: no editor submission.
             sim.send(login_state(None));
@@ -22772,10 +22900,16 @@ mod tests {
             assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Prompt(original));
             assert!(submit_rx.try_recv().is_err());
             assert!(
-                sim.model().input_history.iter().all(|text| !text.contains("private-code"))
+                sim.model()
+                    .input_history
+                    .iter()
+                    .all(|text| !text.contains("private-code"))
             );
             assert!(
-                sim.model().transcript.iter().all(|entry| !entry.text.contains("private-code"))
+                sim.model()
+                    .transcript
+                    .iter()
+                    .all(|entry| !entry.text.contains("private-code"))
             );
         }
     }
@@ -22815,7 +22949,10 @@ mod tests {
             assert!(sim.model().input.is_empty());
             assert!(submit_rx.try_recv().is_err());
             assert!(
-                sim.model().input_history.iter().all(|text| !text.contains("private-code"))
+                sim.model()
+                    .input_history
+                    .iter()
+                    .all(|text| !text.contains("private-code"))
             );
         }
     }
@@ -22888,7 +23025,10 @@ mod tests {
         assert_eq!(control.snapshot().pending_steering, 0);
         assert!(submit_rx.try_recv().is_err());
         assert!(
-            sim.model().transcript.iter().all(|entry| !entry.text.contains("private-code"))
+            sim.model()
+                .transcript
+                .iter()
+                .all(|entry| !entry.text.contains("private-code"))
         );
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert!(matches!(
@@ -22921,7 +23061,9 @@ mod tests {
                 submit_rx.try_recv().unwrap(),
                 UiCommand::LoginSubmit(LoginInput(String::new()))
             );
-            sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from("Not approved yet"))));
+            sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from(
+                "Not approved yet",
+            ))));
             assert!(sim.model().login_pending.is_some());
             assert!(sim.model().input.is_empty());
         }
@@ -23069,7 +23211,10 @@ mod tests {
             assert_eq!(sim.model().input.cursor(), cursor);
             assert_eq!(sim.model().input.selected_text(), selection);
             assert_eq!(sim.model().input.undo_group_count(), undo);
-            assert_eq!(sim.model().login_draft.as_ref().unwrap().history_cursor, None);
+            assert_eq!(
+                sim.model().login_draft.as_ref().unwrap().history_cursor,
+                None
+            );
             send_ui_effect(&mut sim, "get_editor_text", serde_json::json!({}));
             assert_eq!(
                 ext_rx.try_recv().unwrap().value,
@@ -23126,7 +23271,9 @@ mod tests {
                     sim.model().busy.is_some(),
                     "login metadata is not the model-switch result"
                 );
-                sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from("model switched"))));
+                sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from(
+                    "model switched",
+                ))));
                 assert!(sim.model().busy.is_none());
             }
         }
@@ -23137,7 +23284,10 @@ mod tests {
         model.input.set_text("/command-that-must-wait");
         model.state = AgentUiState::Working;
         model.submit_input();
-        assert_eq!(model.input.text(), "/command-that-must-wait\n\nordinary draft");
+        assert_eq!(
+            model.input.text(),
+            "/command-that-must-wait\n\nordinary draft"
+        );
         model.input.undo();
         assert_eq!(model.input.text(), "ordinary draft");
     }
@@ -23189,7 +23339,10 @@ mod tests {
             sim.send(login_state(None));
             assert_eq!(sim.model().input.text(), "replacement draft");
             assert!(
-                sim.model().transcript.iter().all(|entry| !entry.text.contains("private-code"))
+                sim.model()
+                    .transcript
+                    .iter()
+                    .all(|entry| !entry.text.contains("private-code"))
             );
         }
     }
@@ -23288,7 +23441,9 @@ mod tests {
         type_str(&mut sim, "/session");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
-            submit_rx.try_recv().expect("login cancellation queued first"),
+            submit_rx
+                .try_recv()
+                .expect("login cancellation queued first"),
             UiCommand::CancelLogin
         );
         assert_eq!(
@@ -23990,7 +24145,9 @@ mod tests {
         let completed = "界e\u{301}\nread @资料.md tail\n終";
         let (_tx, mut model) = new_model();
         model.input.set_text(original);
-        model.input.set_cursor_position(CursorPosition::new(1, 7, 7));
+        model
+            .input
+            .set_cursor_position(CursorPosition::new(1, 7, 7));
         model.autocomplete_generation = model.input.replacement_generation();
         let start = original.find("@no").expect("file reference");
         // Supply a stable provider response without waiting for the file index.
@@ -24035,7 +24192,14 @@ mod tests {
 
     #[test]
     fn identical_draft_replacements_discard_the_previous_completion_highlight() {
-        for replacement in ["agent", "extension", "editor", "history", "direct", "refresh"] {
+        for replacement in [
+            "agent",
+            "extension",
+            "editor",
+            "history",
+            "direct",
+            "refresh",
+        ] {
             let (_tx, mut model) = new_model();
             let (submit_tx, submit_rx) = mpsc::channel();
             model.displayed_session_id = Some(String::from("current"));
@@ -24109,8 +24273,17 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn completion_owner_roundtrips_do_not_restore_a_highlight_or_capture_history_keys() {
         for owner in [
-            "login", "ask", "extension", "queued", "picker", "custom", "settings", "suspend",
-            "working", "handoff", "mcp",
+            "login",
+            "ask",
+            "extension",
+            "queued",
+            "picker",
+            "custom",
+            "settings",
+            "suspend",
+            "working",
+            "handoff",
+            "mcp",
         ] {
             let (_tx, mut model) = new_model();
             model.displayed_session_id = Some(String::from("current"));
@@ -27067,8 +27240,11 @@ mod tests {
         let settings_path = project_dir.join("settings.json");
         std::fs::write(&settings_path, r#"{"packages":[]}"#).expect("initial settings");
         let prompt_path = prompts.join("triage.md");
-        std::fs::write(&prompt_path, "---\ndescription: Trusted prompt\n---\nTrusted $1")
-            .expect("initial prompt");
+        std::fs::write(
+            &prompt_path,
+            "---\ndescription: Trusted prompt\n---\nTrusted $1",
+        )
+        .expect("initial prompt");
         let guard = captured_ftui_workspace_trust(cwd.path(), global.path());
         let manager = crate::package_manager::PackageManager::new(cwd.path().to_path_buf())
             .with_project_trust(true);
@@ -27135,7 +27311,12 @@ mod tests {
         );
         assert_eq!(catalog.extension_commands.len(), 1);
         assert_eq!(catalog.extension_commands[0].name, "live-command");
-        for path in ["git", "npm", "packages.lock.json", "package-trust-audit.jsonl"] {
+        for path in [
+            "git",
+            "npm",
+            "packages.lock.json",
+            "package-trust-audit.jsonl",
+        ] {
             assert!(
                 !project_dir.join(path).exists(),
                 "created package state: {path}"

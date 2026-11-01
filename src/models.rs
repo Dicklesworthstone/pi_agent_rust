@@ -2,7 +2,7 @@
 
 use crate::auth::{AuthStorage, SapResolvedCredentials, resolve_sap_credentials};
 use crate::error::Error;
-use crate::provider::{Api, InputType, Model, ModelCost};
+use crate::provider::{Api, InputType, Model, ModelCost, ServiceTier};
 use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
@@ -98,6 +98,21 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    /// Explicit model-scoped service-tier capabilities from discovery or
+    /// operator configuration. They never change the selected request tier.
+    pub fn service_tiers(&self) -> Option<&[ServiceTier]> {
+        self.compat.as_ref()?.service_tiers.as_deref()
+    }
+
+    pub fn supports_service_tier(&self, tier: ServiceTier) -> bool {
+        crate::provider::supports_service_tier(
+            &self.model.provider,
+            &self.model.api,
+            tier,
+            self.service_tiers(),
+        )
+    }
+
     /// Explicit tool-call dialect selected by the catalog. Absence is
     /// fail-closed Native behavior; model-name heuristics are informational
     /// only and never enable response repair at runtime.
@@ -679,6 +694,12 @@ pub(crate) struct PersistedFetchedModel {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) reasoning_required: Option<bool>,
+    #[serde(
+        default,
+        rename = "serviceTiers",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) service_tiers: Option<Vec<ServiceTier>>,
 }
 
 fn deserialize_fetched_providers<'de, D>(
@@ -1035,6 +1056,7 @@ pub struct ModelOverrideConfig {
     pub compat: Option<CompatConfig>,
     pub dialect: Option<crate::dialects::Dialect>,
     pub thinking_level_map: Option<HashMap<String, Option<String>>>,
+    pub service_tiers: Option<Vec<ServiceTier>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1058,6 +1080,8 @@ pub struct ModelConfig {
     /// Declaring a mapping for `xhigh`/`max` also marks the level as supported,
     /// so the registry does not clamp it away for custom models.
     pub thinking_level_map: Option<HashMap<String, Option<String>>>,
+    /// Explicit service-tier capabilities, authoritative over compat metadata.
+    pub service_tiers: Option<Vec<ServiceTier>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1071,6 +1095,10 @@ pub struct CompatConfig {
     pub supports_tools: Option<bool>,
     pub supports_streaming: Option<bool>,
     pub supports_parallel_tool_calls: Option<bool>,
+    /// Recognized serving tiers advertised by this route or declared by the
+    /// operator. Custom OpenAI transports send only explicitly supported tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tiers: Option<Vec<ServiceTier>>,
 
     /// Explicit opt-in tool-call repair dialect, folded from a model-level
     /// `dialect` declaration. Absence means Native/fail-closed.
@@ -3554,6 +3582,12 @@ fn apply_fetched_models(
             entry.clone_from(existing);
         }
         if let Some(discovered) = advertised.get(&key) {
+            if let Some(tiers) = &discovered.service_tiers {
+                entry
+                    .compat
+                    .get_or_insert_with(CompatConfig::default)
+                    .service_tiers = Some(tiers.clone());
+            }
             if let Some(reasoning) = discovered.reasoning {
                 entry.model.reasoning = reasoning;
             }
@@ -3761,6 +3795,11 @@ fn apply_custom_models_with_provider_headers(
             };
 
             let mut compat = merge_compat(provider_cfg.compat.as_ref(), model_cfg.compat.as_ref());
+            if let Some(tiers) = model_cfg.service_tiers.clone() {
+                compat
+                    .get_or_insert_with(CompatConfig::default)
+                    .service_tiers = Some(tiers);
+            }
             if let Some(map) = model_cfg.thinking_level_map.clone() {
                 // Model-level `thinkingLevelMap` is authoritative over any
                 // compat-carried map (gh #165).
@@ -3930,6 +3969,12 @@ fn apply_model_override(
     if override_cfg.compat.is_some() {
         entry.compat = merge_compat(entry.compat.as_ref(), override_cfg.compat.as_ref());
     }
+    if let Some(tiers) = override_cfg.service_tiers.clone() {
+        entry
+            .compat
+            .get_or_insert_with(CompatConfig::default)
+            .service_tiers = Some(tiers);
+    }
     if let Some(map) = override_cfg.thinking_level_map.clone() {
         // Per-level: each entry (`null` withdraws a level) refines the map in
         // place, a discovered ladder included, rather than replacing it.
@@ -3990,6 +4035,10 @@ pub(crate) fn merge_compat(
                 supports_parallel_tool_calls: model
                     .supports_parallel_tool_calls
                     .or(provider.supports_parallel_tool_calls),
+                service_tiers: model
+                    .service_tiers
+                    .clone()
+                    .or_else(|| provider.service_tiers.clone()),
                 tool_call_dialect: model.tool_call_dialect.or(provider.tool_call_dialect),
                 max_tokens_field: model
                     .max_tokens_field
@@ -4967,6 +5016,7 @@ fn load_fetched_models_config(
             .models
             .into_iter()
             .map(|model| ModelConfig {
+                service_tiers: model.service_tiers,
                 reasoning: model.reasoning_levels.as_ref().map(|levels| {
                     levels
                         .iter()
@@ -5104,6 +5154,17 @@ pub(crate) fn validate_persisted_fetched_catalog(
             )));
         }
         for model in &fetched.models {
+            if let Some(tiers) = &model.service_tiers
+                && (tiers.len() > ServiceTier::ALL.len()
+                    || tiers
+                        .iter()
+                        .enumerate()
+                        .any(|(index, tier)| tiers[..index].contains(tier)))
+            {
+                return Err(Error::config(
+                    "Generated model service tiers must contain at most six distinct recognized tiers",
+                ));
+            }
             if model.reasoning_levels.is_none()
                 && (model.reasoning_effort_map.is_some() || model.reasoning_required.is_some())
             {

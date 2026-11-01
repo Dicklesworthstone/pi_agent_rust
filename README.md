@@ -365,8 +365,18 @@ The recognized tiers are `off` (also advertised as `none`), `minimal`, `low`,
 leave existing model capabilities intact. Your configured thinking level remains
 authoritative; discovery does not select a server-advertised default effort.
 
+Model discovery also retains advertised serving tiers (`service_tiers`, including
+`metadata.service_tiers`) through the cache and saved catalog. In either terminal
+frontend, `/fast ultrafast` (also `/fast ultra`) selects an advertised ultrafast tier; `/fast priority`,
+`/fast flex`, `/fast scale`, `/fast default`, `/fast off`, and `/fast status` are
+also available. `/fast on` preserves an existing priority or ultrafast choice.
+Custom OpenAI routes require an explicit model advertisement or a manual
+`serviceTiers` declaration, and requests omit unsupported tiers after switching
+models. Discovery never changes your selected tier. See [model configuration](docs/models.md)
+for metadata precedence and provider behavior.
+
 Persistence is opt-in. The v2 `~/.pi/agent/models.fetched.json` schema stores
-provider/model IDs, optional bounded reasoning tiers, the fetch timestamp, and a non-secret SHA-256 identity
+provider/model IDs, optional bounded reasoning and serving tiers, the fetch timestamp, and a non-secret SHA-256 identity
 binding membership to the provider, API, query-free endpoint, auth-header
 mode, recognized credential-query ordered name/presence shape, and
 request-header name/presence shape that produced it. Pi never persists a static fallback, API

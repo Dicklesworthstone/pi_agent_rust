@@ -660,7 +660,11 @@ impl OpenAIProvider {
             prompt_cache_key: options.prompt_cache_key.clone(),
             service_tier: crate::provider::openai_service_tier(
                 &self.provider,
+                "openai-completions",
                 options.service_tier.as_deref(),
+                self.compat
+                    .as_ref()
+                    .and_then(|compat| compat.service_tiers.as_deref()),
             ),
         }
     }
