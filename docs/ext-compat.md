@@ -200,7 +200,14 @@ not a hard per-write disk quota.
 
 Database files and the engine's companion files are checked for symlinks,
 reparse points, and hard links, with pinned parent identities rechecked around
-operations. Guest filesystem APIs cannot create native links in a storage
+operations. This includes the migration marker, pre-migration database/WAL/SHM
+backups, their temporary files, the WAL/FEC lock, and Windows advisory locks for
+the main database, WAL, rollback journal, and WAL certificates. Native startup or
+maintenance can access these paths before guest SQL executes. They require the
+same storage grant and contribute to the aggregate database-family size limit.
+A link present before opening is rejected before the engine is entered; a
+new link discovered on an existing handle retires that handle without flushing
+retained writes. Guest filesystem APIs cannot create native links in a storage
 grant. FrankenSQLite's native VFS still opens pathnames: on Unix, this does not
 isolate the database from a separate native process with the same OS user
 identity concurrently replacing directories. Applications requiring that

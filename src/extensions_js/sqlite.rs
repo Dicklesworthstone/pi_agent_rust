@@ -68,24 +68,48 @@ const ENGINE_BOOTSTRAP_WAIT: Duration = Duration::from_millis(30_000);
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
-// The native engine has more companions than libsqlite3. Include its FEC,
-// namespace/certificate artifacts and Windows advisory locks, on every host.
+// The native engine has more companions than libsqlite3. This inventory is
+// shared by capability admission, link checks and aggregate size accounting,
+// before the first native open as well as around later operations. In
+// particular, fsqlite 0.4.10's first-open migration writes its marker and backup
+// temporaries using ordinary filesystem calls, even before guest SQL runs.
+// Keep their final and temporary paths here; checking only WAL/SHM is unsafe.
 const SIDECARS: &[&str] = &[
     "-wal",
     "-shm",
     "-journal",
     "-wal-fec",
+    "-wal-fec.lock",
     "-fsqlite-ns-gate",
     "-fsqlite-ns-use",
     "-wal-cert",
     "-wal-cert-head",
     ".fsqlite-shm",
+    ".fsqlite-migration-state",
+    ".fsqlite-migration-state.tmp",
+    ".pre-migration-bak",
+    ".pre-migration-bak.tmp",
+    ".pre-migration-bak-wal",
+    ".pre-migration-bak-wal.tmp",
+    ".pre-migration-bak-shm",
+    ".pre-migration-bak-shm.tmp",
     "-lock-shared",
     "-lock-reserved",
     "-lock-pending",
     "-wal-lock-shared",
     "-wal-lock-reserved",
     "-wal-lock-pending",
+    // Windows opens an advisory-lock triplet for every writable VFS file,
+    // including rollback journals and WAL certificates, not only main/WAL.
+    "-journal-lock-shared",
+    "-journal-lock-reserved",
+    "-journal-lock-pending",
+    "-wal-cert-lock-shared",
+    "-wal-cert-lock-reserved",
+    "-wal-cert-lock-pending",
+    "-wal-cert-head-lock-shared",
+    "-wal-cert-head-lock-reserved",
+    "-wal-cert-head-lock-pending",
 ];
 
 type Result<T> = std::result::Result<T, String>;

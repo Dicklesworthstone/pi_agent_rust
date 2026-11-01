@@ -247,6 +247,11 @@ fn sqlite_imports_initialize_a_persistent_session_database_and_reopen_it() {
         );
         drop(first);
         assert!(database.metadata().expect("real database file").len() > 0);
+        let marker = storage.join("sessions/project.db.fsqlite-migration-state");
+        let marker_before = std::fs::read(&marker).expect("native marker at database birth");
+        let marker_value: Value =
+            serde_json::from_slice(&marker_before).expect("native migration marker JSON");
+        assert!(marker_value["last_upgrade_version"].as_u64().unwrap() >= 1);
         let second = runtime(&root, "context-mode", None).await;
         second
             .add_persistent_storage_root(storage, "context-mode")
@@ -265,6 +270,11 @@ fn sqlite_imports_initialize_a_persistent_session_database_and_reopen_it() {
         assert_eq!(
             persisted,
             json!({"row": {"data": "durable; unicode λ"}, "writeDenied": true, "migration": true})
+        );
+        assert_eq!(
+            std::fs::read(marker).expect("marker after cold read-only reopen"),
+            marker_before,
+            "normal native initialization must retain the valid migration marker"
         );
     });
 }
@@ -1208,6 +1218,341 @@ fn sqlite_rejects_database_and_companion_symlinks_without_touching_targets() {
         assert_eq!(std::fs::read(outside).unwrap(), b"sentinel");
         assert!(!storage.join("sidecar.db").exists());
         assert!(!storage.join("locks.db").exists());
+    });
+}
+
+// Native first-open migration writes these even though guest SQL never names
+// them. WAL's repair worker also opens a stable lock companion. Keep the
+// regression cases explicit: an omitted native path must fail before the
+// engine creates its main file or repairs a copied database's namespace.
+const NATIVE_RECOVERY_COMPANIONS: &[&str] = &[
+    ".fsqlite-migration-state",
+    ".fsqlite-migration-state.tmp",
+    ".pre-migration-bak",
+    ".pre-migration-bak.tmp",
+    ".pre-migration-bak-wal",
+    ".pre-migration-bak-wal.tmp",
+    ".pre-migration-bak-shm",
+    ".pre-migration-bak-shm.tmp",
+    "-wal-fec.lock",
+    "-journal-lock-shared",
+    "-journal-lock-reserved",
+    "-journal-lock-pending",
+    "-wal-cert-lock-shared",
+    "-wal-cert-lock-reserved",
+    "-wal-cert-lock-pending",
+    "-wal-cert-head-lock-shared",
+    "-wal-cert-head-lock-reserved",
+    "-wal-cert-head-lock-pending",
+];
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn assert_linked_native_recovery_companions_are_rejected(
+    link: fn(&Path, &Path) -> std::io::Result<()>,
+) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = safe_canonicalize(temp.path());
+    let workspace = root.join("workspace");
+    let storage = root.join("storage");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::create_dir(&storage).expect("storage");
+    let outside = root.join("outside-grant");
+    std::fs::write(&outside, b"outside sentinel").expect("sentinel");
+    let seed = storage.join("seed.db");
+    let seed_json = serde_json::to_string(&seed).unwrap();
+    let runtime = runtime(&workspace, "owner", None).await;
+    runtime
+        .add_persistent_storage_root(storage.clone(), "owner")
+        .expect("storage grant");
+    assert_eq!(
+        evaluate(
+            &runtime,
+            &format!(
+                r#"
+        const database = new sqlite.Database({seed_json});
+        database.exec("CREATE TABLE events(data TEXT); INSERT INTO events VALUES ('durable seed')");
+        database.close();
+        globalThis.sqliteResult = true;
+    "#
+            )
+        )
+        .await,
+        json!(true)
+    );
+    let seed_bytes = std::fs::read(&seed).expect("committed native database");
+    for (index, suffix) in NATIVE_RECOVERY_COMPANIONS.iter().enumerate() {
+        for existing in [false, true] {
+            let name = format!("recovery-{index}-{existing}.db");
+            let database = storage.join(&name);
+            if existing {
+                // A normal copied main file has no native admission artifacts
+                // yet. Read-only open still needs those coordination writes.
+                std::fs::copy(&seed, &database).expect("copy native database");
+            }
+            let companion = storage.join(format!("{name}{suffix}"));
+            link(&outside, &companion).expect("linked native recovery companion");
+            let entries = || {
+                std::fs::read_dir(&storage)
+                    .expect("storage entries")
+                    .map(|entry| entry.expect("storage entry").file_name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let before = entries();
+            let filename = serde_json::to_string(&database).unwrap();
+            let rejected = evaluate(
+                &runtime,
+                &format!(
+                    r#"
+            try {{
+              const database = new sqlite.Database({filename}, {{readonly:{existing}, create:true}});
+              database.close();
+              globalThis.sqliteResult = false;
+            }} catch (error) {{
+              globalThis.sqliteResult = String(error).includes('persistent storage');
+            }}
+        "#
+                ),
+            )
+            .await;
+            assert_eq!(rejected, json!(true), "{suffix}, readonly={existing}");
+            assert_eq!(
+                entries(),
+                before,
+                "denial must precede native companion creation: {suffix}"
+            );
+            if existing {
+                assert_eq!(
+                    std::fs::read(&database).expect("copied database after denial"),
+                    seed_bytes,
+                    "read-only denial must not repair or rewrite the copied main file"
+                );
+            } else {
+                assert!(
+                    !database.exists(),
+                    "denial must precede creation of the main file: {suffix}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(&outside).expect("outside sentinel after denial"),
+                b"outside sentinel",
+                "native recovery must not follow {suffix} outside its grant"
+            );
+        }
+    }
+    assert_eq!(
+        evaluate(
+            &runtime,
+            &format!(
+                r#"
+        const database = new sqlite.Database({seed_json}, {{readonly:true}});
+        globalThis.sqliteResult = database.query('SELECT data FROM events').get();
+        database.close();
+    "#
+            )
+        )
+        .await,
+        json!({"data":"durable seed"}),
+        "failed admission must leave ordinary native SQLite usable"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_rejects_linked_migration_and_repair_companions_before_native_open() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(assert_linked_native_recovery_companions_are_rejected(
+        |from, to| std::os::unix::fs::symlink(from, to),
+    ));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn sqlite_rejects_hardlinked_migration_and_repair_companions_before_native_open() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(assert_linked_native_recovery_companions_are_rejected(
+        |from, to| std::fs::hard_link(from, to),
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_recovery_temporaries_cannot_create_files_through_dangling_links() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = safe_canonicalize(temp.path());
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage");
+        let runtime = runtime(&root, "owner", None).await;
+        runtime
+            .add_persistent_storage_root(storage.clone(), "owner")
+            .expect("grant");
+        for (index, suffix) in [".fsqlite-migration-state.tmp", "-wal-fec.lock"]
+            .iter()
+            .enumerate()
+        {
+            let name = format!("dangling-{index}.db");
+            let database = storage.join(&name);
+            let outside = root.join(format!("outside-{index}"));
+            std::os::unix::fs::symlink(&outside, storage.join(format!("{name}{suffix}")))
+                .expect("dangling native companion");
+            let filename = serde_json::to_string(&database).unwrap();
+            assert_eq!(
+                evaluate(&runtime, &format!(r#"
+                    try {{ new sqlite.Database({filename}); globalThis.sqliteResult = false; }}
+                    catch (error) {{ globalThis.sqliteResult = String(error).includes('persistent storage'); }}
+                "#)).await,
+                json!(true),
+                "{suffix}"
+            );
+            assert!(!database.exists(), "native main creation must not run");
+            assert!(
+                !outside.exists(),
+                "native open must not create an outside file"
+            );
+        }
+    });
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn sqlite_retires_handles_when_native_recovery_companions_are_replaced_by_links() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = safe_canonicalize(temp.path());
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage");
+        let outside = root.join("outside-grant");
+        std::fs::write(&outside, b"untouched outside state").expect("sentinel");
+        let runtime = runtime(&root, "owner", None).await;
+        runtime
+            .add_persistent_storage_root(storage.clone(), "owner")
+            .expect("grant");
+        for (index, suffix) in NATIVE_RECOVERY_COMPANIONS.iter().enumerate() {
+            let name = format!("live-{index}.db");
+            let database = storage.join(&name);
+            let filename = serde_json::to_string(&database).unwrap();
+            assert_eq!(
+                evaluate(&runtime, &format!(r#"
+                    globalThis.liveRecoveryDatabase = new sqlite.Database({filename});
+                    liveRecoveryDatabase.exec("CREATE TABLE events(data TEXT); INSERT INTO events VALUES ('committed')");
+                    globalThis.sqliteResult = liveRecoveryDatabase.query('SELECT data FROM events').get();
+                "#)).await,
+                json!({"data":"committed"})
+            );
+            let main_before = std::fs::read(&database).expect("committed main file");
+            let companion = storage.join(format!("{name}{suffix}"));
+            if companion.exists() {
+                // The marker is already present from the real native open.
+                // Preserve it while simulating a later namespace substitution.
+                std::fs::rename(&companion, storage.join(format!("{name}{suffix}.saved")))
+                    .expect("preserve original native companion");
+            }
+            std::fs::hard_link(&outside, &companion).expect("late linked companion");
+            let result = evaluate(
+                &runtime,
+                r#"
+                let readDenied = false;
+                let reuseDenied = false;
+                let closeDenied = false;
+                try { liveRecoveryDatabase.query('SELECT * FROM events').all(); }
+                catch (error) { readDenied = String(error).includes('persistent storage'); }
+                try { liveRecoveryDatabase.exec("INSERT INTO events VALUES ('must not commit')"); }
+                catch { reuseDenied = true; }
+                try { liveRecoveryDatabase.close(); }
+                catch { closeDenied = true; }
+                globalThis.liveRecoveryDatabase = null;
+                globalThis.sqliteResult = {readDenied, reuseDenied, closeDenied};
+            "#,
+            )
+            .await;
+            assert_eq!(
+                result,
+                json!({"readDenied":true,"reuseDenied":true,"closeDenied":true}),
+                "late replacement must retire the native handle: {suffix}"
+            );
+            assert_eq!(
+                std::fs::read(database).expect("main file after retirement"),
+                main_before,
+                "retirement must not commit further writes"
+            );
+            assert_eq!(
+                std::fs::read(&outside).expect("sentinel after retirement"),
+                b"untouched outside state"
+            );
+        }
+    });
+}
+
+#[test]
+fn sqlite_counts_native_recovery_backups_in_the_aggregate_storage_budget() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = safe_canonicalize(temp.path());
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage");
+        let runtime = runtime(&root, "owner", None).await;
+        runtime
+            .add_persistent_storage_root(storage.clone(), "owner")
+            .expect("grant");
+        let seed = storage.join("seed.db");
+        let seed_json = serde_json::to_string(&seed).unwrap();
+        evaluate(
+            &runtime,
+            &format!(
+                r#"
+            const db = new sqlite.Database({seed_json});
+            db.exec("CREATE TABLE events(data TEXT); INSERT INTO events VALUES ('durable')");
+            db.close();
+            globalThis.sqliteResult = true;
+        "#
+            ),
+        )
+        .await;
+        let database = storage.join("over-budget.db");
+        std::fs::copy(seed, &database).expect("copy existing native database");
+        let main_before = std::fs::read(&database).expect("main contents");
+        let main_bytes = database.metadata().expect("main size").len();
+        let backup = storage.join("over-budget.db.pre-migration-bak.tmp");
+        let limit = 128 * 1024 * 1024_u64;
+        let backup_bytes = limit - main_bytes + 1;
+        assert!(backup_bytes < limit, "each individual file fits the limit");
+        std::fs::File::create(&backup)
+            .expect("backup temporary")
+            .set_len(backup_bytes)
+            .expect("sparse backup exceeding aggregate family budget");
+        let filename = serde_json::to_string(&database).unwrap();
+        let result = evaluate(
+            &runtime,
+            &format!(
+                r#"
+            try {{
+              const db = new sqlite.Database({filename}, {{readonly:true, create:true}});
+              db.close();
+              globalThis.sqliteResult = false;
+            }} catch (error) {{
+              globalThis.sqliteResult = String(error).includes('exceed 128 MiB');
+            }}
+        "#
+            ),
+        )
+        .await;
+        assert_eq!(result, json!(true), "backup must count before native open");
+        assert_eq!(std::fs::read(database).unwrap(), main_before);
+        assert_eq!(backup.metadata().unwrap().len(), backup_bytes);
+        for suffix in [
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            ".fsqlite-migration-state",
+        ] {
+            assert!(
+                !storage.join(format!("over-budget.db{suffix}")).exists(),
+                "quota denial must precede native admission"
+            );
+        }
     });
 }
 
