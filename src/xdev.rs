@@ -161,6 +161,11 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "hashline_edit" => {
             "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true"
         }
+        "eval" => "Run a Python or JavaScript cell in a persistent kernel",
+        "github" => {
+            "Structured GitHub operations via the gh CLI: pr_view, issue_view, pr_diff, search (code/i…"
+        }
+        "security_scan" => "Review local source with plan/run/disposition/compare",
         "web_search" => "Search the web",
         "ast_grep" => "Structural code search using tree-sitter AST patterns (ast-grep syntax)",
         "ast_edit" => {
@@ -189,9 +194,13 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
 
 /// The system-prompt discoverable index: `(name, one-liner)` for tools that
 /// are enabled AND discoverable-tier AND known built-ins. Extension/custom
-/// tools still surface via `xdev list` at runtime.
+/// tools still surface via `xdev list` at runtime. When the dispatcher is
+/// disabled, there is no discovery route to advertise.
 #[must_use]
 pub fn prompt_index_for(enabled: &[&str], config: Option<&Config>) -> Vec<(String, String)> {
+    if tier_for("xdev", config) == LoadMode::Off {
+        return Vec::new();
+    }
     enabled
         .iter()
         .filter(|name| tier_for(name, config) == LoadMode::Discoverable)
@@ -395,6 +404,7 @@ impl Tool for XdevTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
     use std::collections::HashMap;
 
     #[test]
@@ -505,6 +515,200 @@ mod tests {
         assert!(!enabled.contains(&"subagent"));
         assert!(enabled.contains(&"read"));
         assert!(enabled.contains(&"ast_grep"));
+    }
+
+    const OPTIONAL_TOOL_SETTINGS: [(&str, &str); 4] = [
+        ("enableEval", "eval"),
+        ("enableGithub", "github"),
+        ("enableSecurityScan", "security_scan"),
+        ("enableSubagent", "subagent"),
+    ];
+
+    fn optional_tool_config(enabled: bool) -> Config {
+        serde_json::from_value(json!({
+            "tools": {
+                "enableEval": enabled,
+                "enableGithub": enabled,
+                "enableSecurityScan": enabled,
+                "enableSubagent": enabled
+            }
+        }))
+        .expect("optional tool settings")
+    }
+
+    fn selected_registry_and_prompt(
+        cli: &crate::cli::Cli,
+        config: &Config,
+        cwd: &Path,
+    ) -> (crate::tools::ToolRegistry, String) {
+        let enabled = cli.enabled_tools(config);
+        let registry = if cli.builtin_tools_disabled() {
+            crate::tools::ToolRegistry::without_builtins(Some(config))
+        } else {
+            crate::tools::ToolRegistry::new(&enabled, cwd, Some(config))
+        };
+        let prompt = crate::app::build_system_prompt(
+            cli, cwd, &enabled, None, cwd, cwd, true, false, None, config,
+        )
+        .expect("native system prompt");
+        (registry, prompt)
+    }
+
+    #[test]
+    fn settings_enabled_optional_tools_reach_the_native_prompt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            let config: Config = serde_json::from_value(json!({
+                "tools": { (setting): true }
+            }))
+            .expect("optional tool settings");
+            let (registry, prompt) = selected_registry_and_prompt(&cli, &config, temp.path());
+            let tool = registry.get(name).expect("configured optional tool");
+            let live_line = one_liner(tool.description());
+            assert_eq!(
+                builtin_one_liner(name),
+                Some(live_line.as_str()),
+                "one-liner drift for {name}"
+            );
+            assert!(
+                prompt.contains(&format!("- {name}:")),
+                "{name} is advertised"
+            );
+            if name == "subagent" {
+                assert!(!registry.is_discoverable(name));
+                assert!(
+                    !prompt_index_for(&cli.enabled_tools(&config), Some(&config))
+                        .iter()
+                        .any(|(listed, _)| listed == name)
+                );
+            } else {
+                assert!(registry.is_discoverable(name));
+                assert!(registry.get("xdev").is_some());
+                assert!(
+                    prompt.contains(&format!("- {name}: {live_line}\n")),
+                    "discovery must advertise the enabled {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_tool_discovery_respects_defaults_and_explicit_selection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let assert_absent = |cli: &crate::cli::Cli, config: &Config| {
+            let (registry, prompt) = selected_registry_and_prompt(cli, config, temp.path());
+            for (_, name) in OPTIONAL_TOOL_SETTINGS {
+                assert!(registry.get(name).is_none(), "unexpected {name}");
+                assert!(
+                    !prompt.contains(&format!("- {name}:")),
+                    "unexpected {name} advert"
+                );
+            }
+        };
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        for config in [Config::default(), optional_tool_config(false)] {
+            assert_absent(&cli, &config);
+        }
+
+        let configured = optional_tool_config(true);
+        let defaults = default_enabled_tools().join(",");
+        for tools in ["read", defaults.as_str(), "", " , , "] {
+            let cli = crate::cli::Cli::parse_from(["pi", "--tools", tools]);
+            assert_absent(&cli, &configured);
+        }
+        let cli = crate::cli::Cli::parse_from(["pi", "--no-tools"]);
+        assert_absent(&cli, &configured);
+
+        let cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--tools",
+            "eval,github,security_scan,subagent",
+        ]);
+        let (registry, prompt) =
+            selected_registry_and_prompt(&cli, &optional_tool_config(false), temp.path());
+        for (_, name) in OPTIONAL_TOOL_SETTINGS {
+            assert!(registry.get(name).is_some(), "explicit {name}");
+            assert!(
+                prompt.contains(&format!("- {name}:")),
+                "explicit {name} advert"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_tool_discovery_follows_load_mode_without_enabling_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            for mode in ["essential", "discoverable", "off"] {
+                for enabled in [false, true] {
+                    let config: Config = serde_json::from_value(json!({
+                        "tools": { (setting): enabled, "loadMode": { (name): mode } }
+                    }))
+                    .expect("optional tool load mode");
+                    let (registry, prompt) =
+                        selected_registry_and_prompt(&cli, &config, temp.path());
+                    let registered = enabled && mode != "off";
+                    let discoverable = registered && mode == "discoverable";
+                    assert_eq!(registry.get(name).is_some(), registered, "{name} {mode}");
+                    assert_eq!(registry.is_discoverable(name), discoverable, "{name} {mode}");
+                    assert_eq!(
+                        prompt_index_for(&cli.enabled_tools(&config), Some(&config))
+                            .iter()
+                            .any(|(listed, _)| listed == name),
+                        discoverable,
+                        "{name} {mode}"
+                    );
+                    if discoverable {
+                        let line = one_liner(
+                            registry.get(name).expect("discoverable tool").description(),
+                        );
+                        assert!(prompt.contains(&format!("- {name}: {line}\n")));
+                    } else if !registered {
+                        assert!(!prompt.contains(&format!("- {name}:")));
+                    }
+                }
+            }
+
+            // An explicit tool list also overrides a configured Off entry.
+            let config: Config = serde_json::from_value(json!({
+                "tools": { (setting): false, "loadMode": { (name): "off" } }
+            }))
+            .expect("explicit optional tool settings");
+            let cli = crate::cli::Cli::parse_from(["pi", "--tools", name]);
+            let (registry, _) = selected_registry_and_prompt(&cli, &config, temp.path());
+            assert!(registry.get(name).is_some(), "explicit {name}");
+            assert!(
+                !registry.is_discoverable(name),
+                "explicit off-tier {name} stays live"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_dispatcher_is_not_advertised_for_enabled_optional_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = optional_tool_config(true);
+        config.tools.as_mut().expect("tool settings").load_mode = Some(HashMap::from([(
+            "xdev".to_string(),
+            " OFF ".to_string(),
+        )]));
+        for args in [
+            vec!["pi"],
+            vec!["pi", "--tools", "eval,github,security_scan,subagent"],
+        ] {
+            let cli = crate::cli::Cli::parse_from(args);
+            let (registry, prompt) = selected_registry_and_prompt(&cli, &config, temp.path());
+            for (_, name) in OPTIONAL_TOOL_SETTINGS {
+                assert!(registry.get(name).is_some(), "{name} remains selected");
+            }
+            assert!(registry.is_discoverable("eval"));
+            assert!(registry.get("xdev").is_none());
+            assert!(prompt_index_for(&cli.enabled_tools(&config), Some(&config)).is_empty());
+            assert!(!prompt.contains("Additional tools are available via the `xdev` dispatcher"));
+            assert!(!prompt.contains("Use `xdev` with action"));
+        }
     }
 
     #[test]

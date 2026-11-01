@@ -174,6 +174,14 @@ bank still requires `memory.backend` to be `"local"` or `"cass"`. The generated
 `subagent` remains activatable with `enableSubagent: true`: its built-in
 off-by-default tier is not an explicit `loadMode.subagent: "off"` setting.
 
+Enabled `eval`, `github`, and `security_scan` use the `discoverable` tier by
+default. Pi lists their names and purposes in its default system prompt, and
+`xdev` can describe, run, or promote them. Use `loadMode.<name>: "essential"`
+to expose an enabled tool directly in the model's schema. If `xdev` is `off`,
+Pi omits the discovery instructions; use `essential` for tools that should
+remain directly available. A custom system prompt keeps its existing contract
+and does not receive Pi's automatic discovery inventory.
+
 Load modes never activate an optional tool by themselves. These activation
 flags use the existing tool registry and do not grant new approval permissions,
 extension capabilities, or child-agent tools. In particular, native children's
