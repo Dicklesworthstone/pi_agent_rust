@@ -40,6 +40,10 @@ pub enum SettingsKey {
     SteeringMode,
     FollowUpMode,
     AutoResizeImages,
+    EnableEval,
+    EnableGithub,
+    EnableSecurityScan,
+    EnableSubagent,
     HideThinking,
     MarkdownSpacing,
     DoubleEscape,
@@ -47,7 +51,7 @@ pub enum SettingsKey {
 }
 
 impl SettingsKey {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 15] = [
         Self::AutoRetry,
         Self::ModelFallback,
         Self::FallbackOn,
@@ -55,6 +59,10 @@ impl SettingsKey {
         Self::SteeringMode,
         Self::FollowUpMode,
         Self::AutoResizeImages,
+        Self::EnableEval,
+        Self::EnableGithub,
+        Self::EnableSecurityScan,
+        Self::EnableSubagent,
         Self::HideThinking,
         Self::MarkdownSpacing,
         Self::DoubleEscape,
@@ -70,6 +78,10 @@ impl SettingsKey {
             Self::SteeringMode => "steering",
             Self::FollowUpMode => "follow-up",
             Self::AutoResizeImages => "image-resize",
+            Self::EnableEval => "enable-eval",
+            Self::EnableGithub => "enable-github",
+            Self::EnableSecurityScan => "enable-security-scan",
+            Self::EnableSubagent => "enable-subagent",
             Self::HideThinking => "hide-thinking",
             Self::MarkdownSpacing => "spacing",
             Self::DoubleEscape => "double-escape",
@@ -90,6 +102,10 @@ impl SettingsKey {
             Self::SteeringMode => "Steering message delivery",
             Self::FollowUpMode => "Follow-up message delivery",
             Self::AutoResizeImages => "Resize attached images",
+            Self::EnableEval => "Enable eval tool for new sessions",
+            Self::EnableGithub => "Enable GitHub tool for new sessions",
+            Self::EnableSecurityScan => "Enable security scan tool for new sessions",
+            Self::EnableSubagent => "Enable subagent tool for new sessions",
             Self::HideThinking => "Collapse thinking blocks",
             Self::MarkdownSpacing => "Transcript spacing",
             Self::DoubleEscape => "Double Escape action",
@@ -103,6 +119,10 @@ impl SettingsKey {
             | Self::ModelFallback
             | Self::AutoCompaction
             | Self::AutoResizeImages
+            | Self::EnableEval
+            | Self::EnableGithub
+            | Self::EnableSecurityScan
+            | Self::EnableSubagent
             | Self::HideThinking => &[("on", "On"), ("off", "Off")],
             Self::FallbackOn => &[
                 ("any", "Any recoverable provider failure"),
@@ -164,6 +184,18 @@ impl SettingsKey {
             Self::AutoResizeImages => serde_json::json!({
                 "images": {"auto_resize": enabled, "autoResize": null},
             }),
+            Self::EnableEval => serde_json::json!({
+                "tools": {"enable_eval": enabled, "enableEval": null},
+            }),
+            Self::EnableGithub => serde_json::json!({
+                "tools": {"enable_github": enabled, "enableGithub": null},
+            }),
+            Self::EnableSecurityScan => serde_json::json!({
+                "tools": {"enable_security_scan": enabled, "enableSecurityScan": null},
+            }),
+            Self::EnableSubagent => serde_json::json!({
+                "tools": {"enable_subagent": enabled, "enableSubagent": null},
+            }),
             Self::HideThinking => serde_json::json!({
                 "hide_thinking_block": enabled, "hideThinkingBlock": null,
             }),
@@ -198,6 +230,18 @@ impl SettingsKey {
             Self::AutoResizeImages => {
                 config.images.get_or_insert_default().auto_resize = Some(enabled);
             }
+            Self::EnableEval => {
+                config.tools.get_or_insert_default().enable_eval = Some(enabled);
+            }
+            Self::EnableGithub => {
+                config.tools.get_or_insert_default().enable_github = Some(enabled);
+            }
+            Self::EnableSecurityScan => {
+                config.tools.get_or_insert_default().enable_security_scan = Some(enabled);
+            }
+            Self::EnableSubagent => {
+                config.tools.get_or_insert_default().enable_subagent = Some(enabled);
+            }
             Self::HideThinking => config.hide_thinking_block = Some(enabled),
             Self::MarkdownSpacing => {
                 config.markdown.get_or_insert_default().spacing = Some(if value == "compact" {
@@ -225,6 +269,10 @@ pub struct SettingsSnapshot {
     pub steering: QueueMode,
     pub follow_up: QueueMode,
     pub auto_resize_images: bool,
+    pub enable_eval: bool,
+    pub enable_github: bool,
+    pub enable_security_scan: bool,
+    pub enable_subagent: bool,
     pub hide_thinking: bool,
     pub markdown_spacing: MarkdownSpacing,
     pub double_escape: DoubleEscapeAction,
@@ -241,6 +289,10 @@ impl SettingsSnapshot {
             SettingsKey::SteeringMode => self.steering.as_str(),
             SettingsKey::FollowUpMode => self.follow_up.as_str(),
             SettingsKey::AutoResizeImages => on_off(self.auto_resize_images),
+            SettingsKey::EnableEval => on_off(self.enable_eval),
+            SettingsKey::EnableGithub => on_off(self.enable_github),
+            SettingsKey::EnableSecurityScan => on_off(self.enable_security_scan),
+            SettingsKey::EnableSubagent => on_off(self.enable_subagent),
             SettingsKey::HideThinking => on_off(self.hide_thinking),
             SettingsKey::MarkdownSpacing => match self.markdown_spacing {
                 MarkdownSpacing::Comfortable => "comfortable",
@@ -308,6 +360,30 @@ impl SettingsController {
             steering,
             follow_up,
             auto_resize_images: self.config.image_auto_resize(),
+            enable_eval: self
+                .config
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.enable_eval)
+                .unwrap_or(false),
+            enable_github: self
+                .config
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.enable_github)
+                .unwrap_or(false),
+            enable_security_scan: self
+                .config
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.enable_security_scan)
+                .unwrap_or(false),
+            enable_subagent: self
+                .config
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.enable_subagent)
+                .unwrap_or(false),
             hide_thinking: self.config.hide_thinking_block.unwrap_or(false),
             markdown_spacing: self.config.markdown_spacing(),
             double_escape: DoubleEscapeAction::from_setting(
@@ -521,6 +597,63 @@ mod tests {
         assert!(loaded.retry_enabled());
         assert!(!loaded.model_fallback_enabled());
         assert_eq!(loaded.retry_fallback_on(), FallbackOn::UsageLimit);
+    }
+
+    #[test]
+    fn optional_tool_preferences_persist_without_rebuilding_the_live_registry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tools":{"enableEval":false,"enableGithub":false,"enableSecurityScan":false,"enableSubagent":false},"pluginOptions":{"keep":true}}"#,
+        )
+        .expect("seed settings");
+        let config: Config =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read settings"))
+                .expect("seed configuration");
+        let mut handle = handle();
+        let before = handle.session().agent.shared_tools().snapshot();
+        assert!(before.get("eval").is_none());
+        assert!(before.get("github").is_none());
+        assert!(before.get("security_scan").is_none());
+        assert!(before.get("subagent").is_none());
+
+        let mut settings = SettingsController::new(config, path.clone(), &handle);
+        for key in [
+            SettingsKey::EnableEval,
+            SettingsKey::EnableGithub,
+            SettingsKey::EnableSecurityScan,
+            SettingsKey::EnableSubagent,
+        ] {
+            settings
+                .apply(&mut handle, key, "on")
+                .expect("persist optional tool preference");
+            assert_eq!(settings.snapshot(&handle).value(key), "on");
+        }
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("saved settings"))
+                .expect("JSON");
+        let loaded: Config = serde_json::from_value(raw.clone()).expect("reload settings");
+        let tools = loaded.tools.expect("tool settings");
+        assert_eq!(tools.enable_eval, Some(true));
+        assert_eq!(tools.enable_github, Some(true));
+        assert_eq!(tools.enable_security_scan, Some(true));
+        assert_eq!(tools.enable_subagent, Some(true));
+        assert!(raw["tools"].get("enableEval").is_none());
+        assert!(raw["tools"].get("enableGithub").is_none());
+        assert!(raw["tools"].get("enableSecurityScan").is_none());
+        assert!(raw["tools"].get("enableSubagent").is_none());
+        assert_eq!(raw["pluginOptions"]["keep"], true);
+
+        // Optional-tool activation is session-construction policy. Persisting
+        // a preference must not replace stateful live tool instances or erase
+        // extension/MCP overlays; the next session build consumes the setting.
+        let after = handle.session().agent.shared_tools().snapshot();
+        assert!(after.get("eval").is_none());
+        assert!(after.get("github").is_none());
+        assert!(after.get("security_scan").is_none());
+        assert!(after.get("subagent").is_none());
     }
 
     #[test]

@@ -125,14 +125,20 @@ Visualize the conversation branching structure.
 
 On the default FrankenTUI stack, `/settings` or **F2** opens an editor for
 automatic retry and provider fallback, automatic context compaction, steering
-and follow-up delivery, image resizing, thinking-block visibility, transcript
-spacing, the double-Escape action, and completion menu height. Type to filter
+and follow-up delivery, image resizing, persistent activation of the optional
+`eval`, `github`, `security_scan`, and `subagent` tools, thinking-block
+visibility, transcript spacing, the double-Escape action, and completion menu
+height. Type to filter
 the list, press Enter to choose a setting, and press Enter again to save the
 selected value. Escape returns from a value list to settings, then closes the
 editor. Your unfinished prompt stays in the editor.
 
 Changes apply to the current session and persist to the explicit
-`PI_CONFIG_PATH` file when configured. Otherwise, trusted workspaces save to
+`PI_CONFIG_PATH` file when configured. Optional-tool activation is the
+exception: those four switches persist immediately but take effect when a new
+session is constructed, such as after a restart or session replacement. This
+avoids replacing stateful tool instances and preserves an explicit `--tools`
+selection as the higher-precedence choice. Otherwise, trusted workspaces save to
 the project's `.pi/settings.json`; untrusted workspaces save to the global
 `settings.json` shown in the picker title. This follows the same configuration
 layers used when starting or reloading a session. Without an explicit override,
