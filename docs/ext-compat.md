@@ -266,6 +266,31 @@ an override hidden by environment policy or SecretBroker is never copied into
 these bindings. The metadata remains subject to environment disclosure policy
 and grants no filesystem access. Unrelated explicit bindings are preserved.
 
+For the provenance-validated `npm:context-mode` owner, the loader also prepares
+the package's supported `CONTEXT_MODE_SESSION_SUFFIX` override before its
+environment snapshot is created. It queries the real Git top-level directory
+and worktree inventory, canonicalizes the roots, and supplies the same raw
+eight-character hash that context-mode uses for a linked worktree. An empty
+value is generated only when successful queries establish the main worktree.
+The extension and its MCP child therefore use the same database filename even
+though ordinary guest synchronous process execution remains disabled. An
+explicit override, including an empty string, is preserved.
+
+This preparation requires the owner's environment, read, and exec capabilities
+to be allowed, plus normal SecretBroker disclosure of the suffix. It uses fixed
+Git queries, existing command mediation, a trusted absolute Git executable,
+and a clean noninteractive environment. The queries share a two-second budget
+bounded by the original extension-load deadline; each output stream is limited
+to 64 KiB, and native process ownership handles cancellation and cleanup.
+Returned repository paths do not become filesystem grants. Unrelated packages
+and ambiguous package owners do not trigger these queries.
+
+Unavailable Git metadata leaves the override unset rather than asserting an
+empty suffix. Automatic discovery accepts protected system Git installations;
+custom installations can supply the explicit supported suffix override. This
+is a session-start metadata snapshot, refreshed when the extension runtime is
+reloaded, and does not enable any general synchronous subprocess API.
+
 Context-mode's MCP server still needs a real Node or Bun executable on PATH.
 Its process launch and environment snapshot require the existing `exec` and
 `env` permissions; installing a package or granting storage does not enable

@@ -14616,7 +14616,35 @@ async fn build_js_runtime_shards(
     let mut application_roots_by_id = Vec::with_capacity(shard_count);
     let mut denied_application_roots = BTreeSet::new();
     for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
-        let shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
+        let mut shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
+
+        // Context-mode's supported environment override keeps its sandboxed
+        // writer and native MCP reader on the same real worktree database.
+        // Reuse the admitted package provenance; a matching display name or
+        // entry basename must not trigger host queries for an unrelated owner.
+        let owns_context_mode = application_namespaces
+            .owned
+            .iter()
+            .any(|(owner, namespaces)| {
+                owner == &extension_id
+                    && namespaces
+                        .iter()
+                        .any(|namespace| namespace == Path::new("context-mode"))
+            });
+        if owns_context_mode
+            && let Err(reason) = crate::extensions_js::prepare_context_mode_worktree_metadata(
+                &mut shard_config,
+                policy,
+                &extension_id,
+                root_deadline,
+            )
+        {
+            tracing::warn!(
+                extension_id,
+                %reason,
+                "Context-mode worktree metadata unavailable; preserving its configured fallback"
+            );
+        }
 
         let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
             crate::scheduler::WallClock,

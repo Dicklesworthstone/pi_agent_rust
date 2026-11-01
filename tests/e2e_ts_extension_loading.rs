@@ -1550,3 +1550,432 @@ export default async function (pi) {
         "{helper_url}"
     );
 }
+
+const CONTEXT_MODE_WORKTREE_EXTENSION: &str = r#"
+import { createHash } from 'node:crypto';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { Database } from 'bun:sqlite';
+
+const normalize = path => path.replace(/\\/g, '/').replace(/\/+$/, '');
+const canonical = path => {
+    let value = path;
+    try { value = realpathSync.native(path); } catch (_) {}
+    value = normalize(value);
+    return process.platform === 'win32' || process.platform === 'darwin'
+        ? value.toLowerCase() : value;
+};
+// The published 1.0.169 helper checks this supported override before Git.
+function worktreeSuffix(project) {
+    const override = process.env.CONTEXT_MODE_SESSION_SUFFIX;
+    if (override !== undefined) return override ? '__' + override : '';
+    try {
+        const git = args => execFileSync('git', ['-C', project, ...args], {
+            encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+        const current = git(['rev-parse', '--show-toplevel']);
+        const main = git(['worktree', 'list', '--porcelain']).split(/\r?\n/)
+            .find(line => line.startsWith('worktree '))?.slice(9).trim();
+        if (current && main && canonical(current) !== canonical(main)) {
+            return '__' + createHash('sha256').update(canonical(current)).digest('hex').slice(0, 8);
+        }
+    } catch (_) {}
+    return '';
+}
+export default function(pi) {
+    const project = process.env.PI_WORKSPACE_DIR || process.env.PI_PROJECT_DIR
+        || process.env.PWD || process.cwd();
+    const suffix = worktreeSuffix(project);
+    let projectKey = normalize(project);
+    if (process.platform === 'win32' || process.platform === 'darwin') projectKey = projectKey.toLowerCase();
+    const filename = createHash('sha256').update(projectKey).digest('hex').slice(0, 16) + suffix + '.db';
+    let databasePath = null, count = null;
+    if (fixture.storage) {
+        const directory = join(homedir(), '.pi', 'context-mode', 'sessions');
+        mkdirSync(directory, { recursive: true });
+        databasePath = join(directory, filename);
+        const db = new Database(databasePath);
+        db.exec('CREATE TABLE IF NOT EXISTS boots (value INTEGER NOT NULL)');
+        db.query('INSERT INTO boots (value) VALUES (?)').run(1);
+        count = db.query('SELECT COUNT(*) AS count FROM boots').get().count;
+        db.close();
+    }
+    let syncExecDenied = false;
+    try { execFileSync('git', ['--version'], { encoding: 'utf8' }); }
+    catch (error) { syncExecDenied = String(error.message).includes('disabled by default'); }
+    const readDenied = path => {
+        try { readFileSync(path, 'utf8'); return false; }
+        catch (_) { return true; }
+    };
+    const snapshot = {
+        project, filename, databasePath, count, suffix, syncExecDenied,
+        rawSuffix: process.env.CONTEXT_MODE_SESSION_SUFFIX ?? null,
+        mainReadDenied: readDenied(fixture.mainSecret),
+        peerReadDenied: readDenied(fixture.peerSecret),
+    };
+    pi.registerCommand('ctx-worktree-probe', { handler: async mode => {
+        if (mode === 'none') return { display: JSON.stringify(snapshot) };
+        const options = { timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
+        if (mode === 'explicit') options.env = { ...process.env };
+        const child = spawn(fixture.executable,
+            ['--exact', 'context_mode_worktree_environment_peer', '--nocapture', '--quiet'], options);
+        let stdout = '', stderr = '';
+        child.stdout.on('data', data => { stdout += data.toString('utf8'); });
+        child.stderr.on('data', data => { stderr += data.toString('utf8'); });
+        const code = await new Promise((resolve, reject) => {
+            child.on('error', reject);
+            child.on('close', resolve);
+        });
+        if (code !== 0) throw new Error('workspace peer failed: ' + stderr);
+        const line = stdout.split(/\r?\n/).find(line => line.startsWith('PIJS_WORKTREE_ENV '));
+        if (!line) throw new Error('workspace peer did not report its environment: ' + stdout);
+        return { display: JSON.stringify({ ...snapshot, child: JSON.parse(line.slice(18)) }) };
+    } });
+}
+"#;
+
+fn context_mode_project_hash(path: &std::path::Path) -> String {
+    use sha2::Digest as _;
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    let canonical = if cfg!(any(windows, target_os = "macos")) {
+        normalized.to_lowercase()
+    } else {
+        normalized.to_string()
+    };
+    format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()))[..16].to_string()
+}
+
+/// Selected alone by the real process bridge; no Node or npm installation is
+/// required to check that the child's snapshot selects the same on-disk DB.
+#[test]
+fn context_mode_worktree_environment_peer() {
+    if std::env::var("PIJS_WORKTREE_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let raw = std::env::var("CONTEXT_MODE_SESSION_SUFFIX").expect("forwarded worktree suffix");
+    let workspace = std::env::var("PI_WORKSPACE_DIR").expect("forwarded workspace");
+    let suffix = if raw.is_empty() {
+        String::new()
+    } else {
+        format!("__{raw}")
+    };
+    let filename = format!(
+        "{}{}.db",
+        context_mode_project_hash(std::path::Path::new(&workspace)),
+        suffix
+    );
+    let path = std::path::PathBuf::from(std::env::var("HOME").expect("fixture home"))
+        .join(".pi/context-mode/sessions")
+        .join(&filename);
+    assert!(
+        path.is_file(),
+        "child must find the extension's real database"
+    );
+    println!(
+        "PIJS_WORKTREE_ENV {}",
+        serde_json::json!({"rawSuffix": raw, "workspace": workspace, "filename": filename})
+    );
+}
+
+fn worktree_fixture_git(cwd: &std::path::Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
+    for key in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_CONFIG_COUNT",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .output()
+        .expect("real Git is required for the worktree fixture");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("UTF-8 Git fixture output")
+}
+
+fn write_worktree_probe_package(
+    base: &std::path::Path,
+    install_name: &str,
+    declared_name: &str,
+    storage: bool,
+) -> std::path::PathBuf {
+    let package = base.join("npm/node_modules").join(install_name);
+    let entry = package.join("build/adapters/pi/extension.js");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        serde_json::json!({
+            "name": declared_name, "version": "1.0.169", "type": "module",
+            "pi": {"extensions": ["./build/adapters/pi/extension.js"]},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let fixture = serde_json::json!({
+        "storage": storage,
+        "mainSecret": base.join("main/host-secret.txt"),
+        "peerSecret": base.join("peer-workspace/secret.txt"),
+        "executable": std::env::current_exe().unwrap(),
+    });
+    std::fs::write(
+        &entry,
+        format!("const fixture = {fixture};\n{CONTEXT_MODE_WORKTREE_EXTENSION}"),
+    )
+    .unwrap();
+    entry
+}
+
+fn load_worktree_probe(
+    entry: &std::path::Path,
+    workspace: &std::path::Path,
+    home: &std::path::Path,
+    explicit_suffix: Option<&str>,
+    denied_caps: &[&str],
+) -> ExtensionManager {
+    let mut env = std::collections::HashMap::<String, String>::new();
+    for name in [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            if cfg!(windows) && env.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            env.insert(name.to_string(), value);
+        }
+    }
+    env.extend([
+        ("HOME".to_string(), home.display().to_string()),
+        ("USERPROFILE".to_string(), home.display().to_string()),
+        ("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string()),
+        ("PIJS_WORKTREE_CHILD".to_string(), "1".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_GLOBAL".to_string(),
+            home.join("gitconfig").display().to_string(),
+        ),
+    ]);
+    if let Some(value) = explicit_suffix {
+        env.insert("CONTEXT_MODE_SESSION_SUFFIX".to_string(), value.to_string());
+    }
+    let config = PiJsRuntimeConfig {
+        cwd: workspace.display().to_string(),
+        env,
+        disk_cache_dir: None,
+        repair_mode: pi::extensions_js::RepairMode::Off,
+        ..Default::default()
+    };
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "env" && cap != "exec");
+    policy
+        .default_caps
+        .extend(["env".to_string(), "exec".to_string()]);
+    policy
+        .deny_caps
+        .extend(denied_caps.iter().map(|cap| (*cap).to_string()));
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], workspace, None));
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        config,
+        tools,
+        manager.clone(),
+        policy,
+    ))
+    .expect("start worktree runtime");
+    manager.set_js_runtime(runtime);
+    let spec = JsExtensionLoadSpec::from_entry_path(entry).unwrap();
+    let loading_manager = manager.clone();
+    common::run_async(async move { loading_manager.load_js_extensions(vec![spec]).await })
+        .expect("load worktree package");
+    manager
+}
+
+fn read_worktree_probe(manager: &ExtensionManager, mode: &str) -> Value {
+    let manager = manager.clone();
+    let mode = mode.to_string();
+    let response = common::run_async(async move {
+        manager
+            .execute_command("ctx-worktree-probe", &mode, 15000)
+            .await
+    })
+    .expect("run worktree probe registered after initialization");
+    serde_json::from_str(response["display"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn npm_context_mode_worktree_metadata_aligns_persistent_database_and_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let main = base.join("main");
+    let linked = base.join("linked workspace");
+    let home = base.join("home");
+    let peer = base.join("peer-workspace");
+    for path in [&main, &home, &peer] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(
+        main.join("host-secret.txt"),
+        "main workspace private content",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("peer-workspace/secret.txt"),
+        "peer private content",
+    )
+    .unwrap();
+    worktree_fixture_git(&main, &["init", "--quiet", "--initial-branch=main"]);
+    worktree_fixture_git(
+        &main,
+        &[
+            "-c",
+            "user.name=Pi Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+    );
+    worktree_fixture_git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let main_subdir = main.join("sub/project");
+    let linked_subdir = linked.join("sub/project");
+    std::fs::create_dir_all(&main_subdir).unwrap();
+    std::fs::create_dir_all(&linked_subdir).unwrap();
+    let native_root = worktree_fixture_git(&linked_subdir, &["rev-parse", "--show-toplevel"]);
+    assert_eq!(
+        pi::extensions::safe_canonicalize(std::path::Path::new(native_root.trim())),
+        linked
+    );
+    let native_list = worktree_fixture_git(&linked, &["worktree", "list", "--porcelain"]);
+    let native_main = native_list
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .unwrap();
+    assert_eq!(
+        pi::extensions::safe_canonicalize(std::path::Path::new(native_main)),
+        main
+    );
+    let raw_linked_suffix = context_mode_project_hash(&linked)[..8].to_string();
+    let entry = write_worktree_probe_package(&base, "context-mode", "context-mode", true);
+    for (workspace, explicit, raw, expected_count, check_children) in [
+        (&main, None, "", 1, true),
+        (&main_subdir, None, "", 1, false),
+        (&linked, None, raw_linked_suffix.as_str(), 1, true),
+        (&linked_subdir, None, raw_linked_suffix.as_str(), 1, false),
+        (
+            &linked,
+            Some("operator-explicit"),
+            "operator-explicit",
+            1,
+            true,
+        ),
+        (&linked, Some(""), "", 1, true),
+        (&linked, None, raw_linked_suffix.as_str(), 2, false),
+    ] {
+        let manager = load_worktree_probe(&entry, workspace, &home, explicit, &[]);
+        let suffix = if raw.is_empty() {
+            String::new()
+        } else {
+            format!("__{raw}")
+        };
+        let filename = format!("{}{suffix}.db", context_mode_project_hash(workspace));
+        let result = read_worktree_probe(&manager, "none");
+        assert_eq!(result["rawSuffix"], raw, "{result}");
+        assert_eq!(result["suffix"], suffix, "{result}");
+        assert_eq!(result["filename"], filename, "{result}");
+        assert_eq!(result["count"], expected_count, "{result}");
+        assert_eq!(
+            result["syncExecDenied"], true,
+            "ordinary sync exec must remain denied"
+        );
+        assert_eq!(
+            result["mainReadDenied"],
+            workspace != &main,
+            "metadata cannot expand workspace read scope"
+        );
+        assert_eq!(
+            result["peerReadDenied"], true,
+            "metadata cannot grant peer file access"
+        );
+        assert!(
+            home.join(".pi/context-mode/sessions")
+                .join(&filename)
+                .is_file()
+        );
+        if check_children {
+            for mode in ["explicit", "inherited"] {
+                let result = read_worktree_probe(&manager, mode);
+                assert_eq!(result["child"]["rawSuffix"], raw, "{mode}: {result}");
+                assert_eq!(
+                    result["child"]["workspace"],
+                    workspace.display().to_string()
+                );
+                assert_eq!(result["child"]["filename"], filename, "{mode}: {result}");
+            }
+        }
+        assert!(common::run_async(async move {
+            manager.shutdown(std::time::Duration::from_secs(5)).await
+        }));
+    }
+
+    let restricted = write_worktree_probe_package(&base, "context-mode", "context-mode", false);
+    for denied in ["exec", "env"] {
+        let manager = load_worktree_probe(&restricted, &linked, &home, None, &[denied]);
+        let result = read_worktree_probe(&manager, "none");
+        assert_eq!(result["rawSuffix"], Value::Null, "{denied}: {result}");
+        assert_eq!(result["syncExecDenied"], true, "{denied}: {result}");
+        assert!(common::run_async(async move {
+            manager.shutdown(std::time::Duration::from_secs(5)).await
+        }));
+    }
+    for (install, declared) in [
+        ("unrelated-state", "unrelated-state"),
+        ("name-spoof", "context-mode"),
+    ] {
+        let unrelated = write_worktree_probe_package(&base, install, declared, false);
+        let manager = load_worktree_probe(&unrelated, &linked, &home, None, &[]);
+        let result = read_worktree_probe(&manager, "none");
+        assert_eq!(result["rawSuffix"], Value::Null, "{install}: {result}");
+        assert_eq!(result["peerReadDenied"], true, "{install}: {result}");
+        assert!(common::run_async(async move {
+            manager.shutdown(std::time::Duration::from_secs(5)).await
+        }));
+    }
+}

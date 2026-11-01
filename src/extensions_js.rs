@@ -65,6 +65,7 @@ mod process_session;
 mod sqlite;
 #[path = "extensions_js_storage.rs"]
 mod storage;
+mod worktree_metadata;
 
 macro_rules! compressed_js_literal {
     ($source:expr) => {{
@@ -4642,6 +4643,41 @@ impl PiJsRuntimeConfig {
     pub(crate) fn compat_scan_mode(&self) -> bool {
         is_compat_scan_mode(&self.env)
     }
+}
+
+/// Select the same working directory used by `process.cwd()` and workspace
+/// metadata. Callers apply the immutable owner's environment admission first.
+fn effective_workspace_cwd<'a>(
+    config: &'a PiJsRuntimeConfig,
+    policy: Option<&ExtensionPolicy>,
+) -> &'a str {
+    let deterministic_cwd_allowed = !config.deny_env
+        && policy.map_or_else(
+            || is_env_var_allowed("PI_DETERMINISTIC_CWD"),
+            |policy| !policy.secret_broker.is_secret("PI_DETERMINISTIC_CWD"),
+        );
+    deterministic_cwd_allowed
+        .then(|| {
+            configured_environment_value(
+                &config.env,
+                "PI_DETERMINISTIC_CWD",
+                uses_windows_environment(&config.env),
+            )
+            .filter(|value| !value.is_empty())
+        })
+        .flatten()
+        .unwrap_or(&config.cwd)
+}
+
+/// Prepare the supported context-mode worktree override before environment
+/// snapshots freeze. The loader calls this only for its verified package owner.
+pub(crate) fn prepare_context_mode_worktree_metadata(
+    config: &mut PiJsRuntimeConfig,
+    policy: &ExtensionPolicy,
+    extension_id: &str,
+    root_deadline: std::time::Instant,
+) -> std::result::Result<(), String> {
+    worktree_metadata::prepare(config, policy, extension_id, root_deadline)
 }
 
 impl Default for PiJsRuntimeConfig {
@@ -18479,23 +18515,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         // one workspace's events in another workspace's database.
         // Match process.cwd()'s admitted deterministic override, but never
         // copy a broker-hidden value into a readable metadata binding.
-        let deterministic_cwd_allowed = !config.deny_env
-            && policy.as_ref().map_or_else(
-                || is_env_var_allowed("PI_DETERMINISTIC_CWD"),
-                |policy| !policy.secret_broker.is_secret("PI_DETERMINISTIC_CWD"),
-            );
-        let workspace_cwd = deterministic_cwd_allowed
-            .then(|| {
-                configured_environment_value(
-                    &config.env,
-                    "PI_DETERMINISTIC_CWD",
-                    windows_environment,
-                )
-                .filter(|value| !value.is_empty())
-            })
-            .flatten()
-            .unwrap_or(&config.cwd)
-            .to_string();
+        let workspace_cwd = effective_workspace_cwd(&config, policy.as_ref()).to_string();
         for key in ["PWD", "PI_WORKSPACE_DIR"] {
             if windows_environment {
                 config.env.retain(|name, _| !name.eq_ignore_ascii_case(key));
