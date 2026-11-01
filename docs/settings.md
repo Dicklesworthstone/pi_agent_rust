@@ -182,6 +182,13 @@ Pi omits the discovery instructions; use `essential` for tools that should
 remain directly available. A custom system prompt keeps its existing contract
 and does not receive Pi's automatic discovery inventory.
 
+`xdev run` checks approval and extension call hooks for both the dispatcher
+and the actual target, using the target's own name and arguments for its
+checks. A denial at either layer prevents execution. Existing policies on
+`xdev` still apply, so an interactive approval handler can ask at both layers
+when approval is required. Disabling either tool during a policy callback
+also prevents execution. Discovery does not bypass target-specific controls.
+
 Load modes never activate an optional tool by themselves. These activation
 flags use the existing tool registry and preserve existing approval and
 workspace-trust requirements.

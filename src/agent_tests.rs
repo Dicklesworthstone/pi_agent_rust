@@ -8413,6 +8413,517 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
         }
     }
 
+    type XdevPolicyExecutions = Arc<StdMutex<Vec<(String, Value)>>>;
+
+    struct XdevPolicyProbeTool {
+        name: &'static str,
+        origin: crate::tools::ToolOrigin,
+        executions: XdevPolicyExecutions,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for XdevPolicyProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn label(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Harmless xdev policy probe"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            self.origin
+        }
+
+        fn effects(&self) -> crate::tools::ToolEffects {
+            crate::tools::ToolEffects::process()
+        }
+
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            input: Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            self.executions
+                .lock()
+                .unwrap()
+                .push((tool_call_id.to_string(), input.clone()));
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("probe executed"))],
+                details: Some(json!({
+                    "tool": "probe-tool",
+                    "dispatchedVia": "probe-route",
+                    "input": input
+                })),
+                is_error: false,
+            })
+        }
+    }
+
+    fn xdev_policy_tools(
+        cwd: &Path,
+        name: &'static str,
+        origin: crate::tools::ToolOrigin,
+        executions: &XdevPolicyExecutions,
+    ) -> ToolRegistry {
+        let config: crate::config::Config = serde_json::from_value(json!({
+            "tools": {"loadMode": {(name): "discoverable"}}
+        }))
+        .unwrap();
+        let mut tools = ToolRegistry::new(&[name], cwd, Some(&config));
+        tools.push(Box::new(XdevPolicyProbeTool {
+            name,
+            origin,
+            executions: Arc::clone(executions),
+        }));
+        assert!(tools.is_discoverable(name));
+        assert!(tools.get("xdev").is_some());
+        tools
+    }
+
+    async fn execute_xdev_policy_call(agent: &Agent, call: ToolCall) -> (ToolOutput, bool) {
+        agent
+            .execute_tool(
+                call,
+                Arc::new(|_| {}),
+                Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+            )
+            .await
+    }
+
+    #[test]
+    fn xdev_optional_tools_observe_outer_and_target_approval() {
+        use clap::Parser as _;
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            for (setting, name) in [
+                ("enableEval", "eval"),
+                ("enableGithub", "github"),
+                ("enableSecurityScan", "security_scan"),
+                ("enableSubagent", "subagent"),
+            ] {
+                for deny_outer in [false, true] {
+                    let config: crate::config::Config = serde_json::from_value(json!({
+                        "tools": {(setting): true, "loadMode": {(name): "discoverable"}}
+                    }))
+                    .unwrap();
+                    let cli = crate::cli::Cli::parse_from(["pi"]);
+                    let mut tools = ToolRegistry::new(
+                        &cli.enabled_tools(&config),
+                        root.path(),
+                        Some(&config),
+                    );
+                    assert!(tools.get(name).is_some());
+                    assert!(tools.is_discoverable(name));
+                    let executions = Arc::new(StdMutex::new(Vec::new()));
+                    tools.push(Box::new(XdevPolicyProbeTool {
+                        name,
+                        origin: crate::tools::ToolOrigin::BuiltIn,
+                        executions: Arc::clone(&executions),
+                    }));
+                    let requests =
+                        Arc::new(StdMutex::new(Vec::<(String, String, Value)>::new()));
+                    let observed = Arc::clone(&requests);
+                    let agent = Agent::new(
+                        Arc::new(SilentProvider),
+                        tools,
+                        AgentConfig {
+                            tool_approval: Some(Arc::new(move |request| {
+                                let observed = Arc::clone(&observed);
+                                Box::pin(async move {
+                                    let denied_name = if deny_outer { "xdev" } else { name };
+                                    let deny = request.tool_name == denied_name;
+                                    observed.lock().unwrap().push((
+                                        request.tool_name,
+                                        request.tool_call_id,
+                                        request.arguments,
+                                    ));
+                                    if deny {
+                                        ToolApprovalDecision::deny("policy fixture veto")
+                                    } else {
+                                        ToolApprovalDecision::Allow
+                                    }
+                                })
+                            })),
+                            ..AgentConfig::default()
+                        },
+                    );
+                    let inner = json!({"marker": name, "nested": {"value": 7}});
+                    let call = xdev_call("run", Some(name), Some(inner.clone()));
+                    let (output, failed) = execute_xdev_policy_call(&agent, call.clone()).await;
+                    assert!(failed && output.is_error, "{name}: {output:?}");
+                    assert!(executions.lock().unwrap().is_empty());
+                    let requests = requests.lock().unwrap();
+                    let names = requests
+                        .iter()
+                        .map(|request| request.0.as_str())
+                        .collect::<Vec<_>>();
+                    let expected = if deny_outer {
+                        vec!["xdev"]
+                    } else {
+                        vec!["xdev", name]
+                    };
+                    assert_eq!(names, expected);
+                    assert!(requests.iter().all(|request| request.1 == call.id));
+                    assert_eq!(requests[0].2, call.arguments);
+                    if !deny_outer {
+                        assert_eq!(requests[1].2, inner);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn xdev_dangerous_command_requires_target_confirmation_even_under_yolo() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let executions = Arc::new(StdMutex::new(Vec::new()));
+            let tools = xdev_policy_tools(
+                root.path(),
+                "bash",
+                crate::tools::ToolOrigin::BuiltIn,
+                &executions,
+            );
+            let requests = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+            let observed = Arc::clone(&requests);
+            let mut agent = Agent::new(
+                Arc::new(SilentProvider),
+                tools,
+                AgentConfig {
+                    approval_state: Some(crate::approval::ApprovalState::new(
+                        crate::approval::ApprovalMode::Yolo,
+                        false,
+                        vec![crate::extensions::DangerousCommandClass::RecursiveDelete],
+                    )),
+                    tool_approval: Some(Arc::new(move |request| {
+                        let observed = Arc::clone(&observed);
+                        Box::pin(async move {
+                            observed
+                                .lock()
+                                .unwrap()
+                                .push((request.tool_name, request.arguments));
+                            ToolApprovalDecision::deny("dual-confirm fixture veto")
+                        })
+                    })),
+                    ..AgentConfig::default()
+                },
+            );
+            // Only the harmless probe sees this string; no shell is executed.
+            let command = "rm -rf /";
+            let input = json!({"command": command});
+            let call = xdev_call("run", Some("bash"), Some(input.clone()));
+            let (output, failed) = execute_xdev_policy_call(&agent, call.clone()).await;
+            assert!(failed && output.is_error, "{output:?}");
+            assert!(executions.lock().unwrap().is_empty());
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![("bash".to_string(), input.clone())]
+            );
+            agent
+                .config
+                .approval_state
+                .as_ref()
+                .unwrap()
+                .record_confirmation(&format!("bash:{command}"));
+            let (output, failed) = execute_xdev_policy_call(&agent, call).await;
+            assert!(!failed && !output.is_error, "{output:?}");
+            assert_eq!(executions.lock().unwrap().len(), 1);
+            assert_eq!(executions.lock().unwrap()[0].1, input);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "the same confirmed command needs no new approval"
+            );
+
+            let mut provider_call = xdev_call("run", Some("bash"), Some(input.clone()));
+            provider_call.id = "provider-xdev-policy-call".to_string();
+            let mut message = assistant_message("Run the admitted probe");
+            message.stop_reason = StopReason::ToolUse;
+            message.content = vec![ContentBlock::ToolCall(provider_call.clone())];
+            let provider = Arc::new(TerminalBatchProvider {
+                events: vec![StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message,
+                }],
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            agent.set_provider(provider.clone());
+            let response = agent.run("Run the admitted probe", |_| {}).await.unwrap();
+            assert_eq!(response.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let results = agent
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                results.len(),
+                1,
+                "inner policy boundaries must not create provider tool results"
+            );
+            assert_eq!(results[0].tool_call_id, provider_call.id);
+            assert_eq!(results[0].tool_name, "xdev");
+            assert!(!results[0].is_error);
+            assert_eq!(results[0].details.as_ref().unwrap()["dispatchedVia"], "xdev");
+            assert_eq!(results[0].details.as_ref().unwrap()["tool"], "bash");
+            assert_eq!(executions.lock().unwrap().len(), 2);
+            assert_eq!(executions.lock().unwrap()[1].0, provider_call.id);
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn xdev_target_and_wrapper_hooks_preserve_order_and_raw_result_details() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let extension = root.path().join("xdev-policy.mjs");
+            std::fs::write(
+                &extension,
+                r#"
+                export default function init(pi) {
+                    let trace = [];
+                    pi.on("tool_call", event => {
+                        if (event.toolName === "xdev") trace = [];
+                        trace.push("call:" + event.toolName);
+                        const mode = event.toolName === "xdev" ? event.input.args.mode : event.input.mode;
+                        if ((event.toolName === "xdev" && mode === "outer")
+                            || (event.toolName === "github" && mode === "inner")) {
+                            return {block:true,reason:event.toolName + " hook veto"};
+                        }
+                    });
+                    pi.on("tool_result", event => {
+                        trace.push("result:" + event.toolName);
+                        if (event.toolName === "github") {
+                            if (event.input.mode === "allow"
+                                && (event.details.tool !== "probe-tool"
+                                    || event.details.dispatchedVia !== "probe-route"
+                                    || event.result.details.tool !== "probe-tool")) {
+                                throw new Error("target result was wrapped before its hook");
+                            }
+                            return {
+                                content:[{type:"text",text:"target hook transformed output"}],
+                                details:{tool:"hook-owned",raw:event.details,input:event.input,id:event.toolCallId}
+                            };
+                        }
+                        if (event.toolName === "xdev") {
+                            if (event.input.args.mode !== "outer"
+                                && (event.details.dispatchedVia !== "xdev"
+                                    || event.details.tool !== "github"
+                                    || event.details.resultDetails.tool !== "hook-owned")) {
+                                throw new Error("wrapper did not see routed target-hook output");
+                            }
+                            return {details:{...event.details,trace:trace.slice(),outerId:event.toolCallId}};
+                        }
+                    });
+                }
+                "#,
+            )
+            .unwrap();
+            let executions = Arc::new(StdMutex::new(Vec::new()));
+            let tools = xdev_policy_tools(
+                root.path(),
+                "github",
+                crate::tools::ToolOrigin::BuiltIn,
+                &executions,
+            );
+            let agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            session
+                .enable_extensions(&[], root.path(), None, &[extension])
+                .await
+                .unwrap();
+            for mode in ["allow", "inner", "outer"] {
+                let before = executions.lock().unwrap().len();
+                let input = json!({"mode": mode, "marker": "exact target input"});
+                let call = xdev_call("run", Some("github"), Some(input.clone()));
+                let (output, failed) =
+                    execute_xdev_policy_call(&session.agent, call.clone()).await;
+                assert_eq!(failed, mode != "allow", "{output:?}");
+                assert_eq!(output.is_error, mode != "allow");
+                assert_eq!(
+                    executions.lock().unwrap().len(),
+                    before + usize::from(mode == "allow")
+                );
+                let details = output.details.as_ref().expect("hook details");
+                let trace = if mode == "outer" {
+                    json!(["call:xdev", "result:xdev"])
+                } else {
+                    json!(["call:xdev", "call:github", "result:github", "result:xdev"])
+                };
+                assert_eq!(details["trace"], trace);
+                assert_eq!(details["outerId"], call.id);
+                if mode == "outer" {
+                    assert!(details.get("dispatchedVia").is_none());
+                } else {
+                    assert_eq!(details["dispatchedVia"], "xdev");
+                    assert_eq!(details["tool"], "github");
+                    assert_eq!(details["resultDetails"]["tool"], "hook-owned");
+                    assert_eq!(details["resultDetails"]["input"], input);
+                    assert_eq!(details["resultDetails"]["id"], call.id);
+                }
+                if mode == "allow" {
+                    assert_eq!(
+                        details["resultDetails"]["raw"],
+                        json!({"tool": "probe-tool", "dispatchedVia": "probe-route", "input": input})
+                    );
+                    assert!(eval_host_text(&output).contains("target hook transformed output"));
+                }
+            }
+            let manager = session.extensions.as_ref().unwrap().manager();
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn xdev_rechecks_dispatcher_and_target_after_inner_approval_revokes_them() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            for revoked in ["github", "xdev"] {
+                let executions = Arc::new(StdMutex::new(Vec::new()));
+                let origin = if revoked == "github" {
+                    crate::tools::ToolOrigin::Extension
+                } else {
+                    crate::tools::ToolOrigin::BuiltIn
+                };
+                let mut tools =
+                    xdev_policy_tools(root.path(), "github", origin, &executions);
+                if revoked == "xdev" {
+                    tools.push(Box::new(XdevPolicyProbeTool {
+                        name: "xdev",
+                        origin: crate::tools::ToolOrigin::Extension,
+                        executions: Arc::clone(&executions),
+                    }));
+                }
+                let mut agent =
+                    Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+                let shared = agent.shared_tools();
+                let updates = shared.clone();
+                let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+                let observed = Arc::clone(&requests);
+                agent.set_tool_approval(Some(Arc::new(move |request| {
+                    let updates = updates.clone();
+                    let observed = Arc::clone(&observed);
+                    Box::pin(async move {
+                        observed.lock().unwrap().push(request.tool_name.clone());
+                        if request.tool_name == "github" {
+                            updates.update(|registry| registry.set_active_extension_tools(&[]));
+                        }
+                        ToolApprovalDecision::Allow
+                    })
+                })));
+                let call = xdev_call("run", Some("github"), Some(json!({"marker": "revocation"})));
+                let (output, failed) = execute_xdev_policy_call(&agent, call).await;
+                assert!(failed && output.is_error, "revoked {revoked}: {output:?}");
+                assert!(executions.lock().unwrap().is_empty());
+                assert_eq!(
+                    *requests.lock().unwrap(),
+                    vec!["xdev".to_string(), "github".to_string()]
+                );
+                assert!(shared.snapshot().get(revoked).is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn initially_unmounted_xdev_target_cannot_be_enabled_during_approval() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let executions = Arc::new(StdMutex::new(Vec::new()));
+            let mut tools = xdev_policy_tools(
+                root.path(),
+                "github",
+                crate::tools::ToolOrigin::Extension,
+                &executions,
+            );
+            tools.set_active_extension_tools(&[]);
+            assert!(tools.get("github").is_none());
+            assert!(tools.is_discoverable("github"));
+            assert!(tools.get("xdev").is_some());
+            let mut agent =
+                Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            let shared = agent.shared_tools();
+            let updates = shared.clone();
+            let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+            let observed = Arc::clone(&requests);
+            agent.set_tool_approval(Some(Arc::new(move |request| {
+                let updates = updates.clone();
+                let observed = Arc::clone(&observed);
+                Box::pin(async move {
+                    observed.lock().unwrap().push(request.tool_name);
+                    updates.update(|registry| {
+                        registry.set_active_extension_tools(&["github".to_string()]);
+                    });
+                    ToolApprovalDecision::Allow
+                })
+            })));
+            let (output, failed) = execute_xdev_policy_call(
+                &agent,
+                xdev_call("run", Some("github"), Some(json!({}))),
+            )
+            .await;
+            assert!(failed && output.is_error, "{output:?}");
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "invalid routes fail before policy awaits"
+            );
+            assert!(executions.lock().unwrap().is_empty());
+            assert!(shared.snapshot().get("github").is_none());
+        });
+    }
+
+    #[test]
+    fn invalid_xdev_target_does_not_echo_a_restored_secret() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut agent = xdev_test_agent(&["ast_grep"], root.path());
+            let secret = "rememberedCredentialValue123456";
+            remember_invocation_secret(&mut agent, secret);
+            let placeholder = agent.secrets_vault.mask(secret);
+            assert_ne!(placeholder, secret);
+            let call = xdev_call("run", Some(&placeholder), Some(json!({})));
+            assert_eq!(
+                agent
+                    .restore_secrets_inbound(call.clone())
+                    .unwrap()
+                    .arguments["name"],
+                secret,
+            );
+            let (output, failed) = execute_xdev_policy_call(&agent, call).await;
+            assert!(failed && output.is_error, "{output:?}");
+            let serialized = serde_json::to_string(&output).unwrap();
+            assert!(!serialized.contains(secret));
+            assert!(eval_host_text(&output).contains(&placeholder));
+        });
+    }
+
     #[test]
     fn configured_off_optional_tools_stay_out_of_the_provider_context() {
         use clap::Parser as _;
@@ -8476,7 +8987,11 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     Some(json!({"pattern": "$EXPR.unwrap()", "path": "."})),
                 );
                 let (output, failed) = agent
-                    .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
+                    .execute_tool(
+                        call,
+                        Arc::new(|_| {}),
+                        Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                    )
                     .await;
                 assert!(failed && output.is_error, "disabled xdev {action}");
                 assert!(
@@ -8561,7 +9076,11 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 Some(json!({"pattern": "$EXPR.unwrap()", "path": "."})),
             );
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
+                .execute_tool(
+                    call,
+                    Arc::new(|_| {}),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                )
                 .await;
             assert!(!is_error, "run must succeed: {:?}", output.content);
             let text = match &output.content[0] {
@@ -8634,7 +9153,11 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
             let call = xdev_call("run", Some("nosuch_tool"), Some(json!({})));
             let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
+                .execute_tool(
+                    call,
+                    Arc::new(|_| {}),
+                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                )
                 .await;
             assert!(is_error, "unknown discoverable tool must error");
             let text = match &output.content[0] {
@@ -8839,7 +9362,11 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     };
                     assert_eq!(agent.effects_for_call(&call), ToolEffects::read());
                     let (output, is_error) = agent
-                        .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
+                        .execute_tool(
+                            call,
+                            Arc::new(|_| {}),
+                            Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
+                        )
                         .await;
                     assert!(!is_error, "read-only recall failed: {:?}", output.content);
                     let ContentBlock::Text(text) = &output.content[0] else {

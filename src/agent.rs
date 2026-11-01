@@ -6382,6 +6382,7 @@ impl Agent {
     /// Both top-level and eval-host calls enter the same policy/hook path.
     /// Nested calls additionally pin the session across approval and hook
     /// awaits; a session-switching prompt cannot authorize the replacement.
+    #[allow(clippy::too_many_lines)]
     async fn execute_tool_in_session(
         &self,
         tool_call: ToolCall,
@@ -6405,6 +6406,21 @@ impl Agent {
             }
         };
 
+        // Resolve before any policy await: an invalid route must not acquire
+        // an unapproved target through a callback that changes the registry.
+        // The executor checks the dispatcher and target again before running.
+        let xdev_target = match Self::resolve_xdev_run(&self.tools.snapshot(), &tool_call) {
+            Ok(target) => target,
+            Err(mut output) => {
+                self.mask_secrets_in_output(&mut output);
+                return (output, true);
+            }
+        };
+        let mut policy_calls = vec![&tool_call];
+        if let Some(target) = &xdev_target {
+            policy_calls.push(target);
+        }
+
         // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
         // tool whose effects intersect the mutation/process BARRIER set before
         // soliciting approval or running extensions.
@@ -6421,38 +6437,45 @@ impl Agent {
             );
         }
 
-        let approval_denied_output = self
-            .request_tool_approval(&tool_call, Arc::clone(&on_event))
-            .await;
-        if let Err(error) = self.check_invocation_session(expected_session).await {
-            return (Self::xdev_text_output(&error.to_string(), true), true);
-        }
-
-        let (mut output, is_error) = if let Some(output) = approval_denied_output {
-            (output, true)
-        } else if let Some(extensions) = &extensions {
-            let hook_started_at = Instant::now();
-            let hook_outcome = Self::dispatch_tool_call_hook(
-                extensions,
-                &tool_call,
-                self.config.fail_closed_hooks,
-            )
-            .await;
-            record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+        // Preserve the dispatcher's own restrictions, then require the target
+        // to pass the same policy with its real name and restored arguments.
+        // An outer veto must not solicit target approval or run target hooks.
+        let mut entered_policy_calls = 0;
+        let mut blocked_output = None;
+        for (index, policy_call) in policy_calls.iter().enumerate() {
+            entered_policy_calls = index + 1;
+            let approval_denied_output = self
+                .request_tool_approval(policy_call, Arc::clone(&on_event))
+                .await;
             if let Err(error) = self.check_invocation_session(expected_session).await {
                 return (Self::xdev_text_output(&error.to_string(), true), true);
             }
-
-            if let Some(blocked_output) = hook_outcome {
-                (blocked_output, true)
-            } else {
-                let tool_started_at = Instant::now();
-                let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
-                    .await;
-                record_local_tool_latency(&latency, tool_started_at.elapsed());
-                outcome
+            if let Some(output) = approval_denied_output {
+                blocked_output = Some(output);
+                break;
             }
+
+            if let Some(extensions) = &extensions {
+                let hook_started_at = Instant::now();
+                let hook_outcome = Self::dispatch_tool_call_hook(
+                    extensions,
+                    policy_call,
+                    self.config.fail_closed_hooks,
+                )
+                .await;
+                record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+                if let Err(error) = self.check_invocation_session(expected_session).await {
+                    return (Self::xdev_text_output(&error.to_string(), true), true);
+                }
+                if let Some(output) = hook_outcome {
+                    blocked_output = Some(output);
+                    break;
+                }
+            }
+        }
+
+        let (mut output, is_error) = if let Some(output) = blocked_output {
+            (output, true)
         } else {
             let tool_started_at = Instant::now();
             let outcome = self
@@ -6465,10 +6488,28 @@ impl Agent {
         if let Err(error) = self.check_invocation_session(expected_session).await {
             return (Self::xdev_text_output(&error.to_string(), true), true);
         }
-        if let Some(extensions) = &extensions {
-            let hook_started_at = Instant::now();
-            Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
-            record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+        // Unwind only boundaries that were entered. Target hooks see the
+        // native result; dispatcher hooks see the routing envelope afterward.
+        for (index, policy_call) in policy_calls
+            .iter()
+            .take(entered_policy_calls)
+            .enumerate()
+            .rev()
+        {
+            if let Some(extensions) = &extensions {
+                let hook_started_at = Instant::now();
+                Self::apply_tool_result_hook(extensions, policy_call, &mut output, is_error).await;
+                record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+                if let Err(error) = self.check_invocation_session(expected_session).await {
+                    return (Self::xdev_text_output(&error.to_string(), true), true);
+                }
+            }
+            if index > 0 {
+                output.details = Some(Self::xdev_dispatch_details(
+                    &policy_call.name,
+                    output.details.take(),
+                ));
+            }
         }
 
         // Mask any restored real values in the result heading back to the
@@ -6745,6 +6786,59 @@ impl Agent {
         self.execute_tool(tool_call, on_event, latency).await
     }
 
+    /// Resolve only an admitted xdev execution route. The same resolver runs
+    /// before policy callbacks and against the executor's current snapshot.
+    fn resolve_xdev_run(
+        registry: &ToolRegistry,
+        tool_call: &ToolCall,
+    ) -> std::result::Result<Option<ToolCall>, ToolOutput> {
+        if tool_call.name != "xdev"
+            || tool_call
+                .arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list")
+                != "run"
+        {
+            return Ok(None);
+        }
+        if registry.get("xdev").is_none() {
+            return Err(Self::tool_not_found_output("xdev"));
+        }
+        let name = tool_call
+            .arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name.is_empty() {
+            return Err(Self::xdev_text_output("xdev run requires a `name`", true));
+        }
+        if !registry.is_discoverable(name) {
+            return Err(Self::xdev_text_output(
+                &if registry.get(name).is_some() {
+                    format!("{name:?} is already in the live schema — call it directly.")
+                } else {
+                    format!("No discoverable tool named {name:?}; use xdev list.")
+                },
+                true,
+            ));
+        }
+        if registry.get(name).is_none() {
+            return Err(Self::xdev_text_output(
+                &format!("Tool {name:?} not registered"),
+                true,
+            ));
+        }
+        let mut target = tool_call.clone();
+        target.name = name.to_string();
+        target.arguments = tool_call
+            .arguments
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        Ok(Some(target))
+    }
+
     /// xdev dispatcher interception (bd-cv653.1.6). `run` executes the inner
     /// tool through the normal `Tool::execute` contract (its own input
     /// validation produces the named errors); `promote` moves the tool into
@@ -6763,27 +6857,15 @@ impl Agent {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         match action {
             "run" => {
-                let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-                if name.is_empty() {
-                    return Some(Self::xdev_text_output("xdev run requires a `name`", true));
-                }
-                if !registry.is_discoverable(name) {
-                    return Some(Self::xdev_text_output(
-                        &if registry.get(name).is_some() {
-                            format!("{name:?} is already in the live schema — call it directly.")
-                        } else {
-                            format!("No discoverable tool named {name:?}; use xdev list.")
-                        },
-                        true,
-                    ));
-                }
-                let inner_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
-                let Some(inner) = registry.get(name) else {
-                    return Some(Self::xdev_text_output(
-                        &format!("Tool {name:?} not registered"),
-                        true,
-                    ));
+                let inner_call = match Self::resolve_xdev_run(&registry, tool_call) {
+                    Ok(Some(target)) => target,
+                    Ok(None) => return None,
+                    Err(output) => return Some(output),
                 };
+                let Some(inner) = registry.get(&inner_call.name) else {
+                    return Some(Self::tool_not_found_output(&inner_call.name));
+                };
+                let inner_args = &inner_call.arguments;
                 let protect = |parts: &[&str]| {
                     let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(
                         self.config.secrets.as_ref(),
@@ -6799,7 +6881,7 @@ impl Agent {
                         &self.secrets_vault,
                     )
                 };
-                let mut output = inner
+                let output = inner
                     .execute_with_invocation(
                         &tool_call.id,
                         inner_args.clone(),
@@ -6812,8 +6894,7 @@ impl Agent {
                     )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
-                self.record_prewalk_evidence(inner, &inner_args, &output);
-                output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
+                self.record_prewalk_evidence(inner, inner_args, &output);
                 Some(output)
             }
             "promote" => {
@@ -6940,8 +7021,8 @@ impl Agent {
         }
 
         // Load modes (bd-cv653.1.6): intercept the xdev dispatcher's
-        // run/promote actions so the inner tool executes through the normal
-        // path (effects/approval already applied to this outer call).
+        // run/promote actions. The policy pipeline has already admitted both
+        // the dispatcher and the resolved target; this lookup rechecks routing.
         if tool_call.name == "xdev"
             && let Some(output) = self.dispatch_xdev(tool_call, Arc::clone(&on_event)).await
         {

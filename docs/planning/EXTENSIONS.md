@@ -183,6 +183,28 @@ Semantics:
 - Invalid specs MUST fail fast with actionable errors.
 - Registration controls what the host advertises/dispatches for that extension.
 
+##### Native tool policy hooks and xdev routing
+
+The native agent applies the normal approval and extension-hook pipeline to
+both layers of an `xdev run` call. It checks the outer `xdev` approval and
+`tool_call` hooks first, then checks approval and `tool_call` hooks for the
+resolved target. The target event uses the target's `toolName` and exact inner
+`input`; both layers retain the provider's original `toolCallId`. A veto stops
+execution and prevents entry into any remaining inner policy layer. The
+dispatcher and target must be mounted before policy evaluation and still
+available when execution begins.
+
+`tool_result` hooks run for entered policy layers in reverse order, including
+when that layer denied the call. The target hook receives its native output
+and details first. Pi then adds the collision-safe xdev routing metadata, and
+the outer hook receives that wrapped result. The provider receives one result
+named `xdev` with the original call ID.
+
+Approval callbacks can be invoked for both names and may prompt at both
+layers when approval is required. This preserves existing dispatcher-level
+denials while enforcing target-specific policies, including dangerous-command
+confirmation against the target's actual command arguments.
+
 ##### Connector surface (hostcall-facing)
 
 At minimum:
