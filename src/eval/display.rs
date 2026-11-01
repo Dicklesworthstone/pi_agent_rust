@@ -200,6 +200,7 @@ pub(super) fn javascript_response(
     restarted: bool,
     cells_run: u64,
 ) -> Result<ToolOutput> {
+    let response_state_reset = response.state_reset;
     let response = json!({
         "ok": response.ok,
         "stdout": response.console,
@@ -207,7 +208,11 @@ pub(super) fn javascript_response(
         "error": response.error,
         "displays": response.displays,
     });
-    response_output(&response, "js", restarted, cells_run)
+    let mut output = response_output(&response, "js", restarted, cells_run)?;
+    if response_state_reset && let Some(Value::Object(details)) = output.details.as_mut() {
+        details.insert("stateReset".into(), Value::Bool(true));
+    }
+    Ok(output)
 }
 
 fn response_output(
@@ -459,6 +464,7 @@ mod javascript_tests {
             result: Some("17".into()),
             error: None,
             displays,
+            state_reset: false,
         }
     }
 

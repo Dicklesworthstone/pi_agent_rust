@@ -120,6 +120,8 @@ impl BoundedText {
 
 pub(super) struct Capture {
     kernel: &'static str,
+    kernel_spawned: bool,
+    state_lost: bool,
     stdout: BoundedText,
     stderr: BoundedText,
     sequence: u64,
@@ -141,6 +143,8 @@ impl Capture {
     pub(super) fn new(kernel: &'static str, on_update: Option<Update>) -> Self {
         Self {
             kernel,
+            kernel_spawned: false,
+            state_lost: false,
             stdout: BoundedText::new(CAPTURE_BYTES),
             stderr: BoundedText::new(CAPTURE_BYTES),
             sequence: 0,
@@ -149,6 +153,40 @@ impl Capture {
             on_update,
             archive: None,
             displays: live::LiveDisplays::default(),
+        }
+    }
+
+    pub(super) const fn kernel_started(&mut self, state_lost: bool) {
+        self.kernel_spawned = true;
+        self.state_lost = state_lost;
+        self.dirty |= state_lost;
+    }
+
+    pub(super) const fn kernel_was_spawned(&self) -> bool {
+        self.kernel_spawned
+    }
+
+    fn restart_notice(&self) -> &'static str {
+        if self.kernel == "js" {
+            "EVAL_KERNEL_RESTARTED: Kernel restarted: JavaScript state is unavailable. Re-run needed setup.\n"
+        } else {
+            "EVAL_KERNEL_RESTARTED: Kernel restarted: Python state is unavailable. Re-run needed setup.\n"
+        }
+    }
+
+    fn annotate_restart(&self, content: &mut Vec<ContentBlock>, details: &mut Value) {
+        if !self.state_lost {
+            return;
+        }
+        match content.first_mut() {
+            Some(ContentBlock::Text(text)) => text.text.insert_str(0, self.restart_notice()),
+            _ => content.insert(
+                0,
+                ContentBlock::Text(TextContent::new(self.restart_notice())),
+            ),
+        }
+        if let Some(details) = details.as_object_mut() {
+            details.insert("stateLost".into(), Value::Bool(true));
         }
     }
 
@@ -224,6 +262,7 @@ impl Capture {
             content.push(ContentBlock::Text(TextContent::new(format!("{out}{err}"))));
         }
         self.displays.append(&mut content, &mut details, false);
+        self.annotate_restart(&mut content, &mut details);
         // No native mutex or RefCell borrow is held across caller code.
         callback(ToolUpdate {
             content,
@@ -280,6 +319,10 @@ impl Capture {
     }
 
     pub(super) fn annotate(&self, output: &mut ToolOutput) {
+        if self.state_lost {
+            let details = output.details.get_or_insert_with(|| json!({}));
+            self.annotate_restart(&mut output.content, details);
+        }
         if let Some(details) = output.details.as_mut() {
             self.displays.annotate(details, true);
         }
@@ -313,6 +356,11 @@ impl Capture {
     /// Keep each language's existing Error convention while retaining a
     /// bounded tail received before timeout, cancellation, crash or bad frames.
     pub(super) fn with_error(&self, error: Error) -> Error {
+        let error = if self.state_lost {
+            Error::tool("eval", format!("{}{error}", self.restart_notice()))
+        } else {
+            error
+        };
         let error = if self.archive.is_some() {
             Error::tool(
                 "eval",
@@ -346,6 +394,10 @@ impl Capture {
     /// diagnostic first and describe the actual preview, not a larger capture
     /// which is deliberately not copied into this partial failure response.
     pub(super) fn append_partial(&self, output: &mut ToolOutput) {
+        if self.state_lost {
+            let details = output.details.get_or_insert_with(|| json!({}));
+            self.annotate_restart(&mut output.content, details);
+        }
         if !self.displays.is_empty() {
             let details = output.details.get_or_insert_with(|| json!({}));
             self.displays.append(&mut output.content, details, false);
@@ -468,6 +520,38 @@ mod tests {
             events[1].details.as_ref().unwrap()["output"]["stdoutBytes"],
             12
         );
+    }
+
+    #[test]
+    fn replacement_notice_is_native_metadata_not_captured_console_output() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let mut capture = Capture::new(
+            "python",
+            Some(Box::new(move |event| sink.lock().unwrap().push(event))),
+        );
+        capture.kernel_started(true);
+        capture.publish(true);
+        capture
+            .accept(&frame(1, 1, "stdout", "cell output"), 1)
+            .unwrap();
+        capture.publish(true);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(text(&events[0].content).contains("Python state is unavailable"));
+        assert_eq!(events[0].details.as_ref().unwrap()["stateLost"], true);
+        assert!(text(&events[1].content).starts_with("EVAL_KERNEL_RESTARTED:"));
+        assert!(text(&events[1].content).ends_with("cell output"));
+        assert_eq!(
+            events[1].details.as_ref().unwrap()["output"]["stdoutBytes"],
+            11
+        );
+        let mut response = json!({"stdout":"", "stderr":"", "outputSequence":1});
+        capture.finish_response(&mut response).unwrap();
+        assert_eq!(response["stdout"], "cell output");
+        let error = capture.with_error(Error::tool("eval", "EVAL_KERNEL_CRASH: stopped"));
+        assert!(error.to_string().contains("EVAL_KERNEL_RESTARTED:"));
+        assert!(error.to_string().contains("EVAL_KERNEL_CRASH:"));
     }
 
     #[test]

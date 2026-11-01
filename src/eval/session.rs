@@ -4,6 +4,7 @@
 //! snapshot is not a new namespace: snapshots share the same EvalTool and scope.
 //! Cache only a bounded number of idle namespaces, never arbitrary session IDs.
 
+use super::lifecycle::Kernel;
 use super::{EvalTool, PyKernel, js_kernel};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -21,12 +22,37 @@ struct StoredKernels {
     session_id: String,
     python: Option<PyKernel>,
     javascript: Option<js_kernel::JsKernel>,
+    started: StartedKernels,
+}
+
+/// Kernel absence alone cannot distinguish first use from a lost namespace.
+/// Keep this history with the bounded session cache, including after a crash
+/// or an abandoned cell has already dropped its checked-out kernel.
+#[derive(Default)]
+struct StartedKernels {
+    python: bool,
+    javascript: bool,
+}
+
+impl StartedKernels {
+    const fn any(&self) -> bool {
+        self.python || self.javascript
+    }
+
+    const fn selected(&mut self, kernel: Kernel) -> &mut bool {
+        match kernel {
+            Kernel::Python => &mut self.python,
+            Kernel::Js => &mut self.javascript,
+        }
+    }
 }
 
 #[derive(Default)]
 pub(super) struct RetainedSessions {
     active: Option<String>,
-    /// Least recently active first. Empty namespaces consume no cache entry.
+    started: StartedKernels,
+    /// Least recently active first. Failed namespaces retain their start
+    /// history within the same bound, so returning after a crash is explicit.
     dormant: VecDeque<StoredKernels>,
 }
 
@@ -139,6 +165,26 @@ impl Activation {
 }
 
 impl EvalTool {
+    /// Called only after a kernel was successfully spawned under execution
+    /// admission. Returning true means this session lost an earlier namespace.
+    pub(super) fn record_kernel_start(&self, kernel: Kernel) -> bool {
+        let mut retained = self
+            .retained_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(retained.started.selected(kernel), true)
+    }
+
+    /// An operator-requested reset has its own diagnostic; it is not an
+    /// unexpected replacement and must not report another session's history.
+    pub(super) fn clear_kernel_history(&self, kernel: Kernel) {
+        let mut retained = self
+            .retained_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *retained.started.selected(kernel) = false;
+    }
+
     /// The existing registry hook is also the live session-identity source for
     /// bash/jobs/hub. Reuse it rather than maintaining a second frontend binding.
     /// Moving a tool into another registry retires its old storage incarnation;
@@ -239,6 +285,13 @@ impl EvalTool {
                 incoming.as_mut().and_then(|entry| entry.javascript.take()),
             );
             drop(javascript);
+            let previous_started = std::mem::replace(
+                &mut retained.started,
+                incoming
+                    .as_mut()
+                    .map(|entry| std::mem::take(&mut entry.started))
+                    .unwrap_or_default(),
+            );
             let previous = retained.active.replace(session_id.to_string());
             // All production runners activate before spawning. Keep an orphan
             // pair separate so even an unowned slot is cleaned up outside locks.
@@ -246,11 +299,15 @@ impl EvalTool {
                 session_id: previous.unwrap_or_default(),
                 python: previous_python,
                 javascript: previous_javascript,
+                started: previous_started,
             };
             let evicted = if previous.session_id.is_empty() {
                 Some(previous)
             } else {
-                if previous.python.is_some() || previous.javascript.is_some() {
+                if previous.python.is_some()
+                    || previous.javascript.is_some()
+                    || previous.started.any()
+                {
                     retained.dormant.push_back(previous);
                 }
                 if retained.dormant.len() >= MAX_RETAINED_SESSIONS {

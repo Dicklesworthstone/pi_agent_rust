@@ -469,7 +469,10 @@ fn sdk_selection_survives_a_crash_without_falling_back_to_project_python() {
         assert!(error.to_string().contains("EVAL_KERNEL_CRASH"));
         let next = tool.execute("fresh", json!({"code":"import pi_runtime_fixture; ('saved' in globals(), pi_runtime_fixture.value)"}), None).await.unwrap();
         assert!(!next.is_error, "{}", text(&next));
-        assert_eq!(text(&next).trim(), "(kernel started)\n(False, 7)");
+        let rendered = text(&next);
+        assert!(rendered.starts_with("EVAL_KERNEL_RESTARTED:"), "{rendered}");
+        assert_eq!(rendered.lines().last(), Some("(False, 7)"));
+        assert_eq!(next.details.as_ref().unwrap()["stateLost"], true);
         assert_eq!(
             next.details.as_ref().unwrap()["pythonRuntime"]["executable"],
             selected.to_string_lossy().as_ref()

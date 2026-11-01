@@ -445,7 +445,10 @@ fn public_cell_deadline_owns_completion_and_retired_kernel_state() {
         assert_eq!(out.details.unwrap()["judgments"]["attempts"][0]["status"],"incomplete");
         let next = tool.execute("fresh",json!({"kernel":"js","code":"typeof beforeCompletion"}),None).await.unwrap();
         // The timeout retired the realm, so this is a new kernel's first cell.
-        assert_eq!(text(&next).trim(),"(js kernel started)\n\"undefined\"");
+        let rendered = text(&next);
+        assert!(rendered.starts_with("EVAL_KERNEL_RESTARTED:"), "{rendered}");
+        assert_eq!(rendered.lines().last(), Some("\"undefined\""));
+        assert_eq!(next.details.as_ref().unwrap()["stateLost"], true);
     });
     assert!(started.elapsed() < std::time::Duration::from_secs(15));
     assert_eq!(provider.requests.lock().unwrap().len(), 1);

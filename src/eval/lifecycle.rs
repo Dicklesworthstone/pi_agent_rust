@@ -19,7 +19,7 @@ pub(super) mod source;
 
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum Kernel {
+pub(super) enum Kernel {
     #[default]
     #[serde(alias = "py")]
     Python,
@@ -247,6 +247,7 @@ impl EvalTool {
             // Drop outside the short slot lock, before starting the next cell.
             // This uses the same process-tree/worker cleanup as session end.
             self.retire_kernel(cell.kernel, &owner);
+            self.clear_kernel_history(cell.kernel);
         }
         // Keep the existing per-language error contract: Python timeout/crash
         // is a tool Error; JS timeout is an unsuccessful ToolOutput. Capture
@@ -319,6 +320,14 @@ impl EvalTool {
                 match cell.kernel {
                     Kernel::Python => Err(Error::tool("eval", message)),
                     Kernel::Js => {
+                        // A retained worker may have died after preflight.
+                        // Use the admitted replacement's sequence, not the
+                        // stale slot's counter, if that new cell was stopped.
+                        let (js_cell, js_restarted) = if capture.kernel_was_spawned() {
+                            (1, true)
+                        } else {
+                            (js_cell, js_restarted)
+                        };
                         let mut output = ToolOutput {
                             content: vec![ContentBlock::Text(TextContent::new(message))],
                             details: Some(json!({

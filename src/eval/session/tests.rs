@@ -147,9 +147,120 @@ fn reset_and_ordinary_failure_touch_only_the_selected_session() {
             .unwrap();
         assert!(!reset.is_error);
         assert!(text(&reset).contains("undefined"));
+        assert!(!text(&reset).contains("EVAL_KERNEL_RESTARTED"));
         assert_eq!(reset.details.unwrap()["cell"], 1);
         select(&scope, "session-a");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "42");
+    });
+}
+
+#[test]
+fn idle_python_exit_reports_replacement_without_replaying_setup() {
+    if !python_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (tool, _scope) = scoped(dir.path());
+    run(async {
+        let first = cell(&tool, "python", "import os\nremembered = 42").await;
+        assert!(!text(&first).contains("EVAL_KERNEL_RESTARTED"));
+        let pid: u32 = text(&cell(&tool, "python", "os.getpid()").await)
+            .trim()
+            .parse()
+            .unwrap();
+        // Leave the dead process in its retained slot, as an external kill
+        // between cells does. The next request has not yet been delivered.
+        crate::tools::kill_process_tree(Some(pid));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tool
+                .kernel
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait_child()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "kernel did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let replaced = tool
+            .execute(
+                "replacement",
+                json!({"kernel":"python", "code":"remembered"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(replaced.is_error);
+        assert!(text(&replaced).starts_with("EVAL_KERNEL_RESTARTED:"));
+        assert!(text(&replaced).contains("Re-run needed setup"));
+        assert!(text(&replaced).contains("NameError"));
+        assert_eq!(replaced.details.as_ref().unwrap()["stateLost"], true);
+        let next = cell(&tool, "python", "'remembered' in globals()").await;
+        assert_eq!(text(&next).trim(), "False");
+        assert!(next.details.as_ref().unwrap().get("stateLost").is_none());
+    });
+}
+
+#[test]
+fn crash_history_follows_its_session_and_language() {
+    if !python_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (tool, scope) = scoped(dir.path());
+    run(async {
+        cell(&tool, "python", "remembered = 42").await;
+        let crash = tool
+            .execute(
+                "crash",
+                json!({"kernel":"python", "code":"import os\nos._exit(3)"}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(crash.to_string().contains("EVAL_KERNEL_CRASH"));
+        // This namespace has no surviving kernels. Its bounded history must
+        // still survive the switch, without being attributed to session B.
+        select(&scope, "session-b");
+        let fresh = cell(&tool, "python", "'remembered' in globals()").await;
+        assert!(!text(&fresh).contains("EVAL_KERNEL_RESTARTED"));
+        select(&scope, "session-a");
+        let fresh_js = cell(&tool, "js", "typeof remembered").await;
+        assert!(!text(&fresh_js).contains("EVAL_KERNEL_RESTARTED"));
+        let recovered = cell(&tool, "python", "'remembered' in globals()").await;
+        assert!(text(&recovered).starts_with("EVAL_KERNEL_RESTARTED:"));
+        assert!(text(&recovered).contains("False"));
+        assert_eq!(recovered.details.as_ref().unwrap()["stateLost"], true);
+        assert!(!text(&cell(&tool, "python", "42").await).contains("EVAL_KERNEL_RESTARTED"));
+    });
+}
+
+#[test]
+fn guest_exception_cannot_claim_native_javascript_state_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tool, _scope) = scoped(dir.path());
+    run(async {
+        cell(&tool, "js", "const remembered = 42").await;
+        let error = tool
+            .execute(
+                "ordinary-error",
+                json!({"kernel":"js", "code":"throw new Error('EVAL_STATE_RESET')"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(error.is_error);
+        assert!(error.details.as_ref().unwrap().get("stateReset").is_none());
+        let next = cell(&tool, "js", "remembered").await;
+        assert_eq!(text(&next).trim(), "42");
+        assert!(next.details.as_ref().unwrap().get("stateLost").is_none());
     });
 }
 
@@ -345,7 +456,9 @@ fn quiet_active_javascript_stops_without_touching_the_new_sessions_kernel() {
         assert_eq!(preserved.details.as_ref().unwrap()["restarted"], false);
         select(&scope, "session-a");
         let fresh = cell(&tool, "js", "typeof keep").await;
-        assert_eq!(text(&fresh).trim(), "(js kernel started)\n\"undefined\"");
+        assert!(text(&fresh).starts_with("EVAL_KERNEL_RESTARTED:"));
+        assert!(text(&fresh).trim().ends_with("\"undefined\""));
+        assert_eq!(fresh.details.as_ref().unwrap()["stateLost"], true);
         assert_eq!(fresh.details.unwrap()["cell"], 1);
     });
 }
@@ -430,7 +543,9 @@ fn python_callback_switch_refuses_the_next_bridge_and_preserves_other_namespaces
         select(&scope, "session-a");
         assert_eq!(text(&cell(&tool, "js", "keep").await).trim(), "43");
         let fresh = cell(&tool, "python", "'keep' in globals()").await;
-        assert_eq!(text(&fresh).trim(), "(kernel started)\nFalse");
+        assert!(text(&fresh).starts_with("EVAL_KERNEL_RESTARTED:"));
+        assert!(text(&fresh).trim().ends_with("False"));
+        assert_eq!(fresh.details.as_ref().unwrap()["stateLost"], true);
         assert_eq!(fresh.details.unwrap()["cell"], 1);
     });
 }
@@ -459,10 +574,10 @@ fn unavailable_identity_during_execution_fails_closed_and_releases_admission() {
         );
         assert!(tool.execution.try_lock().is_some());
         select(&scope, "session-a");
-        assert_eq!(
-            text(&cell(&tool, "js", "typeof keep").await).trim(),
-            "(js kernel started)\n\"undefined\""
-        );
+        let recovered = cell(&tool, "js", "typeof keep").await;
+        assert!(text(&recovered).starts_with("EVAL_KERNEL_RESTARTED:"));
+        assert!(text(&recovered).trim().ends_with("\"undefined\""));
+        assert_eq!(recovered.details.as_ref().unwrap()["stateLost"], true);
     });
 }
 
@@ -498,10 +613,10 @@ fn active_cell_deadline_includes_a_resolver_that_becomes_permanently_pending() {
         assert!(tool.execution.try_lock().is_some());
         blocked.store(false, Ordering::SeqCst);
         // The timeout retired the realm, so this is a new kernel's first cell.
-        assert_eq!(
-            text(&cell(&tool, "js", "typeof keep").await).trim(),
-            "(js kernel started)\n\"undefined\""
-        );
+        let recovered = cell(&tool, "js", "typeof keep").await;
+        assert!(text(&recovered).starts_with("EVAL_KERNEL_RESTARTED:"));
+        assert!(text(&recovered).trim().ends_with("\"undefined\""));
+        assert_eq!(recovered.details.as_ref().unwrap()["stateLost"], true);
     });
 }
 

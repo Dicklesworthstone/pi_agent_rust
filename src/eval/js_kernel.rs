@@ -50,6 +50,8 @@ pub struct JsCellResponse {
     pub error: Option<String>,
     /// Detached JSON snapshots, independently validated by the Tool host.
     pub displays: Vec<Value>,
+    /// Native lifecycle signal, never inferred from guest exception text.
+    pub state_reset: bool,
 }
 
 /// A tool re-entry request from inside a JS cell.
@@ -64,6 +66,7 @@ pub struct JsKernel {
     pub bridge: Receiver<JsBridgeRequest>,
     pub cells_run: u64,
     stopped: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
 }
 
 impl JsKernel {
@@ -80,7 +83,7 @@ impl JsKernel {
         let (bridge_tx, bridge_rx) = std::sync::mpsc::channel::<JsBridgeRequest>();
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("eval-js-kernel".into())
             .spawn(move || kernel_thread(&req_rx, &bridge_tx, &worker_stopped, &workspace))?;
         Ok(Self {
@@ -88,7 +91,12 @@ impl JsKernel {
             bridge: bridge_rx,
             cells_run: 0,
             stopped,
+            worker,
         })
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
     }
 
     /// Raw kernel tests may collect bounded console output without a host.
@@ -264,6 +272,7 @@ fn kernel_thread(
                 || cleanup_failed
                 || runtime.is_job_pending();
             if rebuild {
+                response.state_reset = true;
                 response.ok = false;
                 response.result = None;
                 let error = response.error.get_or_insert_with(|| {
@@ -413,6 +422,7 @@ fn run_cell(
                             "EVAL_TIMEOUT: promise still pending at the cell budget",
                         )),
                         displays: Vec::new(),
+                        state_reset: false,
                     };
                 }
                 match runtime.execute_pending_job() {
@@ -451,6 +461,7 @@ fn run_cell(
                 result: None,
                 error: Some(String::from("EVAL_PROTOCOL: promise restore failed")),
                 displays: Vec::new(),
+                state_reset: false,
             };
         };
         match promise.result::<rquickjs::Value<'_>>() {
@@ -469,6 +480,7 @@ fn run_cell(
                 result: None,
                 error: Some(String::from("EVAL_PROTOCOL: promise never settled")),
                 displays: Vec::new(),
+                state_reset: false,
             },
         }
     })
@@ -487,6 +499,7 @@ fn drain_jobs(
                 result: None,
                 error: Some("EVAL_TIMEOUT: microtasks exceeded the cell budget".into()),
                 displays: Vec::new(),
+                state_reset: false,
             });
         }
         match runtime.execute_pending_job() {
@@ -527,6 +540,7 @@ fn extract_result<'js>(ctx: &rquickjs::Ctx<'js>, value: &rquickjs::Value<'js>) -
         result,
         error: None,
         displays: Vec::new(),
+        state_reset: false,
     }
 }
 
@@ -552,6 +566,7 @@ fn error_response(ctx: &rquickjs::Ctx<'_>, err: &rquickjs::Error) -> JsCellRespo
         result: None,
         error: Some(detail),
         displays: Vec::new(),
+        state_reset: false,
     }
 }
 

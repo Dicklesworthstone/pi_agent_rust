@@ -357,9 +357,11 @@ fn package_install_uses_the_existing_cell_timeout_and_retires_storage() {
         "timed-out packages survived"
     );
     // The timeout retired the kernel, so this is a new kernel's first cell.
-    assert_eq!(
-        success(&tool, "'seed' in globals()").trim(),
-        "(kernel started)\nFalse"
-    );
+    let recovered = cell(&tool, "'seed' in globals()");
+    assert!(!recovered.is_error, "{}", text(&recovered));
+    let rendered = text(&recovered);
+    assert!(rendered.starts_with("EVAL_KERNEL_RESTARTED:"), "{rendered}");
+    assert_eq!(rendered.lines().last(), Some("False"));
+    assert_eq!(recovered.details.as_ref().unwrap()["stateLost"], true);
     finish(&harness);
 }

@@ -171,6 +171,8 @@ fn kernel_crash_and_bridge_denial() {
         text.contains("False"),
         "state must be lost after crash: {text}"
     );
+    assert!(text.starts_with("EVAL_KERNEL_RESTARTED:"), "{text}");
+    assert_eq!(out.details.as_ref().unwrap()["stateLost"], true);
 
     let out = block_on_local(tool.execute(
         "c4",
@@ -325,6 +327,44 @@ fn python_async_timeout_discards_state_and_restarts() {
     );
     assert!(!out.is_error, "{}", first_text(&out));
     assert!(first_text(&out).contains("(42, False)"));
+    assert!(first_text(&out).starts_with("EVAL_KERNEL_RESTARTED:"));
+    assert_eq!(out.details.as_ref().unwrap()["stateLost"], true);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn javascript_replacement_reports_lost_state_once() {
+    let case = "javascript_replacement_reports_lost_state_once";
+    let harness = TestHarness::new(case);
+    let tool = pi::eval::EvalTool::new(&harness.temp_path("."));
+    let failed = block_on_local(tool.execute(
+        "timeout",
+        json!({"language":"js", "timeout":1,
+            "code":"globalThis.remembered = 42; while (true) {}"}),
+        None,
+    ))
+    .expect("JavaScript timeout remains a tool output");
+    assert!(failed.is_error);
+    assert_eq!(failed.details.as_ref().unwrap()["stateReset"], true);
+    harness.log().info("timeout", first_text(&failed));
+    let recovered = block_on_local(tool.execute(
+        "replacement",
+        json!({"language":"js", "code":"typeof remembered"}),
+        None,
+    ))
+    .expect("replacement cell");
+    let text = first_text(&recovered);
+    harness.log().info("replacement", &text);
+    assert!(!recovered.is_error);
+    assert!(text.starts_with("EVAL_KERNEL_RESTARTED:"), "{text}");
+    assert!(text.contains("undefined"));
+    assert_eq!(recovered.details.as_ref().unwrap()["stateLost"], true);
+    assert_eq!(recovered.details.as_ref().unwrap()["cell"], 1);
+    let next =
+        block_on_local(tool.execute("ordinary", json!({"language":"js", "code":"40 + 2"}), None))
+            .expect("ordinary retained cell");
+    assert_eq!(first_text(&next).trim(), "42");
+    assert!(next.details.as_ref().unwrap().get("stateLost").is_none());
     finish_case(&harness, case);
 }
 

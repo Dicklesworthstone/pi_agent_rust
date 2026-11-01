@@ -105,6 +105,26 @@ Successful reset requests report `EVAL_STATE_RESET`, `details.reset: true`, and
 a new cell sequence starting at one. Backend errors after reset still disclose
 the state loss. Ordinary results include `details.reset: false`.
 
+### Unexpected kernel replacement
+
+When a retained Python process exits between cells, or either kernel was lost
+after a crash, cancellation, timeout or interrupted cell, the first cell on its
+replacement begins with `EVAL_KERNEL_RESTARTED: Kernel restarted: … state is
+unavailable. Re-run needed setup.` Its result and running updates carry
+`details.stateLost: true`. The notice precedes the cell's own output, including
+an exception caused by a missing variable. It does not appear on ordinary later
+cells, first use of a language, a new session, or an explicit `reset` request.
+
+Replacement history follows the same bounded session cache as the kernels and
+is separate for Python and JavaScript. A crash in one namespace does not imply
+state loss in another. JavaScript reports native realm retirement through
+`details.stateReset: true`; an exception whose text contains that code does not
+retire a healthy realm. The host replaces a worker observed dead before request
+delivery; a failed or ambiguous delivery is reported without replaying the cell.
+Setup is never rerun automatically, since an earlier cell may have had external
+effects. Retained native agent/model jobs remain managed by their existing job
+handles; kernel replacement does not resubmit them.
+
 ## Python rich displays
 
 Python's `display(value, *, mime=None)` captures an explicit output snapshot.

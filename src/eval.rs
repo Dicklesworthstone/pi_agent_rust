@@ -277,13 +277,16 @@ impl EvalTool {
             slot.take()
         };
         let mut restarted = false;
-        let mut kernel = if let Some(kernel) = kernel {
+        let mut kernel = if let Some(kernel) = kernel.filter(|kernel| !kernel.is_finished()) {
             kernel
         } else {
             restarted = true;
             js_kernel::JsKernel::spawn_in(&self.cwd)
                 .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?
         };
+        if restarted {
+            capture.kernel_started(self.record_kernel_start(lifecycle::Kernel::Js));
+        }
         let deadline = Instant::now() + timeout;
         let owner = crate::agent_cx::AgentCx::for_current_or_request();
         let (output_tx, output_rx) = std::sync::mpsc::sync_channel(JS_OUTPUT_QUEUE);
@@ -392,7 +395,7 @@ impl EvalTool {
         capture.annotate(&mut output);
         session_guard.check_tool().await?;
         capture.publish(true);
-        {
+        if !response.state_reset {
             let mut slot = self
                 .js
                 .lock()
@@ -466,6 +469,10 @@ impl EvalTool {
             kernel.kill();
             kernel = self.spawn_python(deadline, session_guard).await?;
             restarted = true;
+        }
+
+        if restarted {
+            capture.kernel_started(self.record_kernel_start(lifecycle::Kernel::Python));
         }
 
         let id = kernel.next_id;
