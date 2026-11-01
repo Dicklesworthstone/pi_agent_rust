@@ -2367,7 +2367,7 @@ async fn run(
     let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&config))
     } else {
-        ToolRegistry::with_workspace_trust(
+        ToolRegistry::with_builtin_tool_policy(
             &shared_enabled_tools,
             &cwd,
             Some(&config),
@@ -2375,6 +2375,7 @@ async fn run(
             Some(&workspace),
             workspace_trusted,
             Some(&workspace_trust_guard),
+            !cli.no_implicit_tools,
         )
     });
     let startup_cost_budget = startup_session
@@ -2795,6 +2796,9 @@ async fn run(
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
             enabled_tools: ftui_enabled_tools,
+            tool_factory: cli.no_implicit_tools.then(|| {
+                Arc::new(pi::sdk::ExplicitBuiltinTools) as Arc<dyn pi::sdk::ToolFactory>
+            }),
             out_default_enabled: true,
             thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
             include_cwd_in_prompt: !cli.hide_cwd_in_prompt,

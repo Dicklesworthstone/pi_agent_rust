@@ -651,6 +651,8 @@ pub struct AcpLaunchOptions {
     pub subagent_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
     pub tools: Option<String>,
     pub no_tools: bool,
+    /// Keep automatically configured built-ins within the explicit selection.
+    pub no_implicit_tools: bool,
     /// Host-level refusal of all client-supplied MCP servers.
     pub no_mcp: bool,
     pub system_prompt: Option<String>,
@@ -683,6 +685,7 @@ impl AcpLaunchOptions {
             subagent_fallback_policy: cli.subagent_fallback_policy.clone(),
             tools: cli.tools.clone(),
             no_tools: cli.no_tools,
+            no_implicit_tools: cli.no_implicit_tools,
             no_mcp: cli.no_mcp,
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
@@ -704,6 +707,12 @@ impl AcpLaunchOptions {
 
     fn selection_cli(&self) -> Result<crate::cli::Cli> {
         use clap::{CommandFactory as _, FromArgMatches as _};
+
+        if self.no_implicit_tools && self.tools.is_none() && !self.no_tools {
+            return Err(Error::validation(
+                "no_implicit_tools requires an explicit tools selection or no_tools",
+            ));
+        }
         // The host already parsed its flags and environment once. Construct
         // neutral defaults here: re-reading unrelated typed environment flags
         // can reject a session even when the host overrode them successfully.
@@ -722,6 +731,7 @@ impl AcpLaunchOptions {
             .clone_from(&self.subagent_fallback_policy);
         cli.tools.clone_from(&self.tools);
         cli.no_tools = self.no_tools;
+        cli.no_implicit_tools = self.no_implicit_tools;
         cli.no_mcp = self.no_mcp;
         cli.system_prompt.clone_from(&self.system_prompt);
         cli.append_system_prompt
@@ -2410,7 +2420,7 @@ fn build_acp_session_with_budget(
     let tools = if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&options.config))
     } else {
-        ToolRegistry::with_workspace_trust(
+        ToolRegistry::with_builtin_tool_policy(
             &enabled_tools,
             &cwd,
             Some(&options.config),
@@ -2421,6 +2431,7 @@ fn build_acp_session_with_budget(
                 .as_ref()
                 .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted),
             options.workspace_trust_guard.as_ref(),
+            !cli.no_implicit_tools,
         )
     };
     client_files::bind(
@@ -4666,6 +4677,100 @@ mod tests {
             if no_builtins {
                 assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn acp_builtin_ceiling_requires_explicit_selection() {
+        let mut launch = AcpLaunchOptions {
+            no_implicit_tools: true,
+            ..AcpLaunchOptions::default()
+        };
+        let error = launch
+            .selection_cli()
+            .err()
+            .expect("missing explicit selection must be rejected")
+            .to_string();
+        assert!(
+            error.contains("no_implicit_tools requires an explicit tools selection or no_tools"),
+            "{error}"
+        );
+        launch.no_tools = true;
+        let cli = launch.selection_cli().expect("explicit disable-all policy");
+        assert!(cli.no_implicit_tools);
+        assert!(cli.builtin_tools_disabled());
+    }
+
+    #[test]
+    fn acp_sessions_keep_the_native_builtin_ceiling_after_launch_projection() {
+        use clap::Parser as _;
+
+        let config: Config = serde_json::from_value(json!({
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            },
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": {
+                "enableInspectImage": true,
+                "enableReadMedia": true,
+                "enableGenerateImage": true,
+                "enableTts": true
+            }
+        }))
+        .expect("automatic tool settings");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let cases: &[&[&str]] = &[
+            &["read", "grep"],
+            &["read", "browser"],
+            &[],
+        ];
+        for &selected in cases {
+            let root = tempfile::tempdir().expect("ACP workspace");
+            let selected_arg = selected.join(",");
+            let cli = crate::cli::Cli::try_parse_from([
+                "pi",
+                "--acp",
+                "--no-implicit-tools",
+                "--tools",
+                selected_arg.as_str(),
+            ])
+            .expect("restricted ACP launch CLI");
+            let mut options = selection_options(
+                config.clone(),
+                vec![ready_selection_model("openai", "gpt-4o")],
+                runtime.handle(),
+            );
+            options.launch = AcpLaunchOptions::from_cli(&cli);
+            options.launch.provider = Some("openai".to_string());
+            options.launch.model = Some("gpt-4o".to_string());
+            options.launch.api_key = Some("acp-ceiling-fixture-key".to_string());
+            options.launch.no_context_files = true;
+            let (session, save_enabled) = new_acp_session(None, &config, root.path());
+            let (_, state) = build_acp_session(
+                session,
+                save_enabled,
+                root.path().to_path_buf(),
+                &options,
+                None,
+            )
+            .expect("build editor session");
+            let handle = state.agent_session.as_ref().expect("editor agent session");
+            let registry = handle.session().agent.shared_tools().snapshot();
+            for name in selected {
+                assert!(registry.get(name).is_some(), "explicit {name}");
+            }
+            assert!(registry.tools().iter().all(|tool| {
+                selected.contains(&tool.name()) || tool.name() == "xdev"
+            }));
+            let discoverable = registry.discoverable_index();
+            assert!(discoverable.iter().all(|(name, _)| {
+                selected.contains(&name.as_str())
+            }));
+            assert_eq!(registry.get("xdev").is_some(), !discoverable.is_empty());
         }
     }
 

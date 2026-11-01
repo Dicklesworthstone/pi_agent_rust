@@ -32,6 +32,15 @@ Its five bundled profiles use the existing native child runner:
 | `security-reviewer` | Defensive security review of trust boundaries | read, grep, find, ls |
 | `sonic` | Narrow mechanical updates or data collection | read, bash, edit, write, grep, find, ls, hashline_edit |
 
+These lists bound the native child's built-ins. Global browser, computer,
+media, and memory settings do not add tools omitted by the profile, and the
+normally automatic `manage_skill` tool is also excluded unless named.
+The same selection applies to one-shot children, corrective retries,
+background work, and persistent workers. Authored profiles can explicitly
+include additional built-ins; memory tools also require their configured
+backend. Pi adds `xdev` only as a dispatcher over the admitted discoverable
+tools. Extension and MCP loading remains governed by its separate controls.
+
 ```json
 {"agent":"scout","task":"Map the provider failover flow and identify its tests"}
 ```

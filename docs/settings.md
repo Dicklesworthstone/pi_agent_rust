@@ -183,9 +183,19 @@ remain directly available. A custom system prompt keeps its existing contract
 and does not receive Pi's automatic discovery inventory.
 
 Load modes never activate an optional tool by themselves. These activation
-flags use the existing tool registry and do not grant new approval permissions,
-extension capabilities, or child-agent tools. In particular, native children's
-explicit tool allowlists still override inherited optional-tool settings.
+flags use the existing tool registry and preserve existing approval and
+workspace-trust requirements.
+
+Native child agents keep their profile's built-in tool list across one-shot
+runs, retries, background runs, and persistent workers. Inherited settings
+cannot add optional tools or automatic browser, computer, media, memory, or
+`manage_skill` access beyond that list. A profile can name those tools
+explicitly; backend requirements still apply, including `memory.backend`
+for memory tools. The `xdev` dispatcher exposes only admitted discoverable
+targets. Extensions and MCP servers retain their separate loading and
+authorization controls; this built-in selection is not an operating-system
+sandbox. Ordinary operator launches keep their existing automatic-tool
+behavior.
 
 ### Appearance
 

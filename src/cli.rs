@@ -77,6 +77,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "acp"
         | "verbose"
         | "no-tools"
+        | "no-implicit-tools"
         | "no-mcp"
         | "no-extensions"
         | "plan-mode"
@@ -572,6 +573,10 @@ pub struct Cli {
     /// `enableSecurityScan`, `enableSubagent`).
     #[arg(long, value_name = "TOOLS")]
     pub tools: Option<String>,
+
+    /// Keep the explicit built-in tool list as the native child's ceiling.
+    #[arg(long, hide = true, requires = "tools")]
+    pub no_implicit_tools: bool,
 
     // === Extensions ===
     /// Load extension file (can use multiple times)
@@ -1841,6 +1846,61 @@ mod tests {
                     crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
                 assert!(registry.get(name).is_none(), "{name}");
             }
+        }
+    }
+
+    #[test]
+    fn native_tool_ceiling_requires_and_preserves_explicit_selection() {
+        let error = Cli::try_parse_from(["pi", "--no-implicit-tools"])
+            .expect_err("a child tool ceiling requires a selected list");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--tools"));
+        assert!(!Cli::parse_from(["pi"]).no_implicit_tools);
+
+        let config = optional_tool_config(true);
+        for tools in ["read", "eval,github", "", " , , "] {
+            let cli = Cli::parse_from(["pi", "--no-implicit-tools", "--tools", tools]);
+            assert!(cli.no_implicit_tools);
+            let ordinary = Cli::parse_from(["pi", "--tools", tools]);
+            assert_eq!(cli.enabled_tools(&config), ordinary.enabled_tools(&config));
+        }
+        let cli = Cli::parse_from([
+            "pi",
+            "--no-implicit-tools",
+            "--tools",
+            "read,eval",
+            "--no-tools",
+        ]);
+        assert!(cli.builtin_tools_disabled());
+        assert!(cli.enabled_tools(&config).is_empty());
+    }
+
+    #[test]
+    fn native_tool_ceiling_survives_extension_flag_preprocessing() {
+        for extension in [None, Some("--fixture-mode=fast")] {
+            let mut args = vec!["pi", "--tools", "read", "--no-implicit-tools"];
+            if let Some(flag) = extension {
+                args.push(flag);
+            }
+            args.push("inspect");
+            let parsed = parse_with_extension_flags(
+                args.into_iter().map(str::to_string).collect(),
+            )
+            .expect("native tool policy must survive the real parser");
+            assert!(parsed.cli.no_implicit_tools);
+            assert_eq!(parsed.cli.tools.as_deref(), Some("read"));
+            assert_eq!(parsed.cli.message_args(), ["inspect"]);
+            let expected = extension.map(|_| ExtensionCliFlag {
+                name: "fixture-mode".to_string(),
+                value: Some("fast".to_string()),
+            });
+            assert_eq!(
+                parsed.extension_flags,
+                expected.into_iter().collect::<Vec<_>>()
+            );
         }
     }
 

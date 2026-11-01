@@ -5842,7 +5842,7 @@ impl ToolRegistry {
 
     /// Every name `--tools` will honour.
     ///
-    /// The match in [`Self::with_workspace_trust`] ends in `_ => {}`, so a
+    /// The match in [`Self::with_builtin_tool_policy`] ends in `_ => {}`, so a
     /// name it does not know is dropped without a word: `pi --tools
     /// completely_made_up` starts an agent with no tools at all and says
     /// nothing, and `--tools read,bsah,edit` quietly hands the model two tools
@@ -5944,7 +5944,6 @@ impl ToolRegistry {
     /// Build tools with the host's admission for project agent definitions.
     /// A retained guard takes precedence over the boolean and is revalidated
     /// before discovery can turn a project profile into child CLI arguments.
-    #[allow(clippy::too_many_lines)]
     pub fn with_workspace_trust(
         enabled: &[&str],
         cwd: &Path,
@@ -5953,6 +5952,33 @@ impl ToolRegistry {
         workspace: Option<&WorkspaceHandle>,
         project_trusted: bool,
         workspace_trust_guard: Option<&crate::workspace_trust::WorkspaceTrustGuard>,
+    ) -> Self {
+        Self::with_builtin_tool_policy(
+            enabled,
+            cwd,
+            config,
+            mutation_recorder,
+            workspace,
+            project_trusted,
+            workspace_trust_guard,
+            true,
+        )
+    }
+
+    /// Build the selected built-ins with the host's workspace admission.
+    /// When implicit tools are disabled, configured automatic tools must also
+    /// appear in `enabled`. Their backend prerequisites still apply. The xdev
+    /// dispatcher may expose only the discoverable targets admitted here.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub fn with_builtin_tool_policy(
+        enabled: &[&str],
+        cwd: &Path,
+        config: Option<&Config>,
+        mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+        workspace: Option<&WorkspaceHandle>,
+        project_trusted: bool,
+        workspace_trust_guard: Option<&crate::workspace_trust::WorkspaceTrustGuard>,
+        allow_implicit_tools: bool,
     ) -> Self {
         let legacy_workspace = WorkspaceHandle::default();
         let workspace = workspace.unwrap_or(&legacy_workspace);
@@ -5971,6 +5997,7 @@ impl ToolRegistry {
         let block_images = config
             .and_then(|c| c.images.as_ref().and_then(|i| i.block_images))
             .unwrap_or(false);
+        let automatic_allowed = |name: &str| allow_implicit_tools || enabled.contains(&name);
 
         for name in enabled {
             match *name {
@@ -6143,36 +6170,49 @@ impl ToolRegistry {
             }
         }
 
-        // Memory bank (bd-cv653.4.1): retain/recall/reflect/memory_edit join
-        // the active set with local or cass; cass adds read-only history to
-        // recall while retaining the local bank. Off keeps these tools absent.
+        // Memory bank (bd-cv653.4.1): backend configuration supplies the bank;
+        // a child's declared tool set also limits individual memory tools.
+        // Check that admission before opening a store, which creates its dir.
         if config.is_some_and(|cfg| matches!(cfg.memory_backend(), "local" | "cass"))
+            && ["retain", "recall", "reflect", "memory_edit", "learn"]
+                .iter()
+                .any(|name| automatic_allowed(name))
             && let Ok(store) = crate::memory::MemoryStore::open(cwd)
         {
             let store = std::sync::Arc::new(
                 store.with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
             );
-            tools.push(Box::new(crate::memory::RetainTool::new(
-                std::sync::Arc::clone(&store),
-            )));
-            tools.push(Box::new(
-                crate::memory::RecallTool::new(std::sync::Arc::clone(&store))
-                    .with_cass_history(config.is_some_and(|cfg| cfg.memory_backend() == "cass")),
-            ));
-            tools.push(Box::new(
-                crate::memory::ReflectTool::new(std::sync::Arc::clone(&store))
-                    .with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
-            ));
-            tools.push(Box::new(crate::memory::MemoryEditTool::new(
-                std::sync::Arc::clone(&store),
-            )));
-            // learn captures lessons into the same bank (bd-cv653.4.2).
-            tools.push(Box::new(LearnTool::new(store)));
+            if automatic_allowed("retain") {
+                tools.push(Box::new(crate::memory::RetainTool::new(
+                    std::sync::Arc::clone(&store),
+                )));
+            }
+            if automatic_allowed("recall") {
+                tools.push(Box::new(
+                    crate::memory::RecallTool::new(std::sync::Arc::clone(&store))
+                        .with_cass_history(config.is_some_and(|cfg| cfg.memory_backend() == "cass")),
+                ));
+            }
+            if automatic_allowed("reflect") {
+                tools.push(Box::new(
+                    crate::memory::ReflectTool::new(std::sync::Arc::clone(&store))
+                        .with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
+                ));
+            }
+            if automatic_allowed("memory_edit") {
+                tools.push(Box::new(crate::memory::MemoryEditTool::new(
+                    std::sync::Arc::clone(&store),
+                )));
+            }
+            if automatic_allowed("learn") {
+                tools.push(Box::new(LearnTool::new(store)));
+            }
         }
 
         // Media tools (bd-cv653.2.7): opt-in via config.media
         if let Some(media_cfg) = config.and_then(|c| c.media.as_ref()) {
-            if media_cfg.enable_inspect_image.unwrap_or(false)
+            if automatic_allowed("inspect_image")
+                && media_cfg.enable_inspect_image.unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "inspect_image")
             {
                 tools.push(Box::new(
@@ -6183,14 +6223,16 @@ impl ToolRegistry {
                     ),
                 ));
             }
-            if media_cfg.enable_read_media.unwrap_or(false)
+            if automatic_allowed("read_media")
+                && media_cfg.enable_read_media.unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "read_media")
             {
                 tools.push(Box::new(
                     crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(media_cfg.max_bytes),
                 ));
             }
-            if media_cfg.enable_generate_image.unwrap_or(false)
+            if automatic_allowed("generate_image")
+                && media_cfg.enable_generate_image.unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "generate_image")
             {
                 tools.push(Box::new(
@@ -6201,7 +6243,10 @@ impl ToolRegistry {
                     ),
                 ));
             }
-            if media_cfg.enable_tts.unwrap_or(false) && !tools.iter().any(|t| t.name() == "tts") {
+            if automatic_allowed("tts")
+                && media_cfg.enable_tts.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "tts")
+            {
                 tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
                     cwd,
                     media_cfg.tts_provider.clone(),
@@ -6212,6 +6257,7 @@ impl ToolRegistry {
 
         // Computer tool (bd-cv653.2.5): opt-in via config.computer
         if let Some(comp_cfg) = config.and_then(|c| c.computer.as_ref())
+            && automatic_allowed("computer")
             && comp_cfg.enable_computer.unwrap_or(false)
             && !tools.iter().any(|t| t.name() == "computer")
         {
@@ -6231,6 +6277,7 @@ impl ToolRegistry {
 
         // Browser tool (bd-cv653.2.4): opt-in via config.browser
         if let Some(browser_cfg) = config.and_then(|c| c.browser.as_ref())
+            && automatic_allowed("browser")
             && browser_cfg.enable_browser.unwrap_or(false)
             && !tools.iter().any(|t| t.name() == "browser")
         {
@@ -6242,7 +6289,9 @@ impl ToolRegistry {
 
         // manage_skill (bd-cv653.4.2): CRUD over the isolated managed-skills
         // dir; available by default, subject to the load-mode filter below.
-        tools.push(Box::new(ManageSkillTool));
+        if automatic_allowed("manage_skill") {
+            tools.push(Box::new(ManageSkillTool));
+        }
 
         // The resolved selection is authoritative. Configured Off overrides
         // also exclude automatically added tools that were not selected by
@@ -6300,7 +6349,7 @@ impl ToolRegistry {
             discoverable: discoverable_names,
             mutation_recorder,
             host_ask,
-            builtins_disabled: false,
+            builtins_disabled: !allow_implicit_tools && enabled.is_empty(),
             shared: None,
         }
     }
@@ -27106,6 +27155,216 @@ mod tests {
 #[cfg(test)]
 mod known_tool_name_tests {
     use super::*;
+
+    #[test]
+    fn builtin_tool_ceiling_keeps_only_declared_tools_and_their_dispatcher() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[], &[]),
+            (
+                &["read", "grep", "find", "ls"],
+                &["read", "grep", "find", "ls"],
+            ),
+            (&["read", "hub"], &["read", "hub", "xdev"]),
+        ];
+        for &(selected, expected) in cases {
+            let registry = ToolRegistry::with_builtin_tool_policy(
+                selected,
+                dir.path(),
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+            );
+            let mut actual = registry
+                .tools()
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "selection: {selected:?}");
+            assert!(registry.get("manage_skill").is_none());
+            assert!(
+                registry
+                    .discoverable_index()
+                    .iter()
+                    .all(|(name, _)| selected.contains(&name.as_str()))
+            );
+            assert_eq!(registry.builtins_disabled(), selected.is_empty());
+            assert_eq!(
+                registry.clone_shallow().builtins_disabled(),
+                selected.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn builtin_tool_ceiling_gates_configured_extras_before_memory_open() {
+        const PROBE: &str = "PI_TEST_BUILTIN_TOOL_POLICY_ROOT";
+        let Some(root) = std::env::var_os(PROBE) else {
+            let fixture = tempfile::tempdir().expect("isolated tool policy fixture");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "tools::known_tool_name_tests::builtin_tool_ceiling_gates_configured_extras_before_memory_open",
+                "--nocapture",
+            ])
+            .env(PROBE, fixture.path())
+            .env("PI_CODING_AGENT_DIR", fixture.path().join("global"))
+            .output()
+            .expect("run isolated registry fixture");
+            assert!(
+                output.status.success(),
+                "isolated registry fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(fixture.path().join("completed").is_file());
+            return;
+        };
+        let root = PathBuf::from(root);
+        let cwd = root.join("workspace");
+        let global = root.join("global");
+        std::fs::create_dir_all(&cwd).expect("workspace directory");
+        assert_eq!(Config::global_dir(), global);
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            },
+            "memory": { "backend": "local" },
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": {
+                "enableInspectImage": true,
+                "enableReadMedia": true,
+                "enableGenerateImage": true,
+                "enableTts": true
+            }
+        }))
+        .expect("all automatic tools enabled");
+        let names = |registry: &ToolRegistry| {
+            let mut names = registry
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        for selected in [&[][..], &["read"][..]] {
+            let registry = ToolRegistry::with_builtin_tool_policy(
+                selected, &cwd, Some(&config), None, None, false, None, false,
+            );
+            assert_eq!(
+                names(&registry),
+                selected
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert!(!global.join("memory").exists());
+        }
+
+        let selected = [
+            "read",
+            "eval",
+            "github",
+            "security_scan",
+            "subagent",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let registry = ToolRegistry::with_builtin_tool_policy(
+            &selected, &cwd, Some(&config), None, None, false, None, false,
+        );
+        let mut expected = selected
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected.push("xdev".to_string());
+        expected.sort();
+        assert_eq!(names(&registry), expected);
+        assert!(
+            registry
+                .discoverable_index()
+                .iter()
+                .all(|(name, _)| selected.contains(&name.as_str()))
+        );
+        assert!(!global.join("memory").exists());
+
+        let mut backend_off = config.clone();
+        backend_off.memory = None;
+        let unavailable = ToolRegistry::with_builtin_tool_policy(
+            &["recall"],
+            &cwd,
+            Some(&backend_off),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        assert!(unavailable.tools().is_empty());
+        assert!(!global.join("memory").exists());
+        let recalled = ToolRegistry::with_builtin_tool_policy(
+            &["recall"],
+            &cwd,
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        assert_eq!(names(&recalled), ["recall", "xdev"]);
+        assert_eq!(
+            recalled
+                .discoverable_index()
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["recall"]
+        );
+        assert!(global.join("memory").is_dir());
+
+        // Ordinary operator invocations keep their established automatic tools.
+        let legacy = ToolRegistry::new(&["read"], &cwd, Some(&config));
+        for name in [
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ] {
+            assert!(legacy.get(name).is_some(), "legacy automatic tool: {name}");
+        }
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert!(legacy.get(name).is_none(), "unselected optional tool: {name}");
+        }
+        std::fs::write(root.join("completed"), "ok").expect("fixture completion marker");
+    }
 
     #[test]
     fn configured_off_excludes_automatic_tools_before_discovery() {

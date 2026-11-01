@@ -1341,6 +1341,7 @@ fn child_options(
 ) -> Vec<OsString> {
     let mut args = vec![
         "--no-session".into(),
+        "--no-implicit-tools".into(),
         "--tools".into(),
         agent
             .tools
@@ -2202,6 +2203,70 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--thinking", "low"]));
         assert_eq!(args.iter().filter(|arg| *arg == "--thinking").count(), 1);
         assert!(args.windows(2).any(|pair| pair == ["--tools", "read,grep"]));
+    }
+
+    #[test]
+    fn child_tool_ceiling_reaches_registry_for_bundled_and_default_profiles() {
+        use clap::Parser as _;
+
+        let cwd = TempDir::new().expect("workspace");
+        let config = Config::default();
+        let mut agents = bundled::definitions().into_values().collect::<Vec<_>>();
+        agents.push(tan_agent_definition());
+        let mut implicit = tan_agent_definition();
+        implicit.name = "implicit-tools-fixture".to_string();
+        implicit.tools = None;
+        agents.push(implicit);
+        let mut empty = tan_agent_definition();
+        empty.name = "empty-tools-fixture".to_string();
+        empty.tools = Some(Vec::new());
+        agents.push(empty);
+        for agent in agents {
+            for args in [
+                child_args(&agent, "inspect", None, None, None, None),
+                worker_args(&agent, None, None, None),
+            ] {
+                let cli = crate::cli::Cli::try_parse_from(
+                    std::iter::once(OsString::from("pi")).chain(args),
+                )
+                .expect("native child CLI");
+                assert!(cli.no_implicit_tools, "{} lost its tool ceiling", agent.name);
+                let selected = cli.enabled_tools(&config);
+                let registry = if cli.builtin_tools_disabled() {
+                    crate::tools::ToolRegistry::without_builtins(Some(&config))
+                } else {
+                    crate::tools::ToolRegistry::with_builtin_tool_policy(
+                        &selected,
+                        cwd.path(),
+                        Some(&config),
+                        None,
+                        None,
+                        false,
+                        None,
+                        !cli.no_implicit_tools,
+                    )
+                };
+                let mut expected = agent
+                    .tools
+                    .clone()
+                    .unwrap_or_else(|| split_csv(DEFAULT_CHILD_TOOLS));
+                expected.sort();
+                let mut actual = registry
+                    .tools()
+                    .iter()
+                    .filter(|tool| tool.name() != "xdev")
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>();
+                actual.sort();
+                assert_eq!(actual, expected, "profile: {}", agent.name);
+                assert!(
+                    registry
+                        .discoverable_index()
+                        .iter()
+                        .all(|(name, _)| expected.contains(name))
+                );
+            }
+        }
     }
 
     #[test]

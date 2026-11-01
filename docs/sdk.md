@@ -71,7 +71,7 @@ be breaking for Rust consumers.
 | `pi::sdk::{create_read_tool, create_bash_tool, create_edit_tool, create_write_tool, create_grep_tool, create_find_tool, create_ls_tool, create_hashline_edit_tool, create_all_tools}` | Stable | Default non-delegating tool constructors. |
 | `pi::sdk::{tool_to_definition, all_tool_definitions}` | Stable | Default non-delegating tool schema helpers. |
 | `pi::sdk::{SubscriptionId, EventListeners, EventSubscriber, OnStreamEvent, OnToolEnd, OnToolStart}` | Stable | Event subscription and hook types. |
-| `pi::sdk::{SessionOptions, ToolFactory, default_tool_registry}` | Stable | In-process session construction and custom tool registry extension points. |
+| `pi::sdk::{SessionOptions, ToolFactory, ToolFactoryContext, ExplicitBuiltinTools, default_tool_registry}` | Stable | In-process session construction and custom tool registry extension points. |
 | `pi::sdk::{AgentSessionHandle, AgentSessionState, create_agent_session}` | Stable | Primary in-process SDK entry point and state handle. |
 | `pi::sdk::{SessionPromptResult, SessionTransport, SessionTransportEvent, SessionTransportState}` | Stable | Unified in-process/RPC transport adapter. |
 | `pi::sdk::{RpcTransportClient, RpcTransportOptions}` | Stable | Subprocess RPC transport client. |
@@ -304,6 +304,35 @@ a tool selection, including when settings happen to disable every default
 tool. See [Optional tools](settings.md#optional-tools) for activation flags and
 load modes.
 
+To keep automatic built-ins within that resolved selection, install
+`ExplicitBuiltinTools` through the existing factory hook:
+
+```rust
+use pi::sdk::{ExplicitBuiltinTools, SessionOptions};
+use std::sync::Arc;
+
+let options = SessionOptions {
+    enabled_tools: Some(vec!["read".into(), "grep".into()]),
+    tool_factory: Some(Arc::new(ExplicitBuiltinTools)),
+    ..SessionOptions::default()
+};
+```
+
+This excludes automatic browser, computer, media, memory, and `manage_skill`
+tools unless the resolved list includes them. Backend prerequisites still
+apply. A derived `xdev` dispatcher exposes only the admitted discoverable
+tools, and an empty list retains the disabled-builtins policy. With
+`enabled_tools: None`, configured optional-tool flags still contribute to
+the resolved list. The ordinary default factory keeps its existing behavior.
+
+`ExplicitBuiltinTools` receives the current session's workspace, effective
+trust decision and guard, and undo recorder. These resources are resolved
+again for each session construction, including replacement sessions. Existing
+custom factories keep their `create_tool_registry` implementation and behavior;
+they can override `create_tool_registry_with_context` to use the same
+`ToolFactoryContext`. Extensions and MCP servers retain their separate loading
+and authorization controls.
+
 Programmatic callers keep the existing `workspace_trusted` contract when
 `workspace_trust_guard` is `None`, its default. Hosts that reuse discovered
 project extension paths or a launch package manager can capture the actual
@@ -322,8 +351,10 @@ constructors default to excluding project profiles; standalone hosts can use
 `SubagentTool::with_project_trust` for an explicit decision, or
 `with_workspace_trust_guard` to retain a checked launch admission.
 Custom `ToolFactory` implementations own their registry policy and can pass
-the host's decision through `ToolRegistry::with_workspace_trust`; merely
-receiving a `Config` does not grant project profile access.
+the admission from `ToolFactoryContext` through
+`ToolRegistry::with_workspace_trust`, or use
+`ToolRegistry::with_builtin_tool_policy` to control automatic additions too.
+Merely receiving a `Config` does not grant project profile access.
 
 The guard never replays an earlier `--trust` flag. A changed scoped project
 surface or revoked grant produces `PI_WORKSPACE_TRUST_RESTART_REQUIRED`;

@@ -511,6 +511,9 @@ pub struct SessionOptions {
     /// it to inherit the current built-in resolution rules. That baseline
     /// helper excludes project agent definitions; a factory must retain its
     /// own admission to opt into them with [`ToolRegistry::with_workspace_trust`].
+    /// [`ToolFactory::create_tool_registry_with_context`] supplies the SDK's
+    /// effective admission and session resources without capturing stale values.
+    /// Use [`ExplicitBuiltinTools`] to suppress automatic built-in additions.
     ///
     /// Wrapped in `Arc` because [`SessionOptions`] is cloned through
     /// the session-handle pipeline and the factory may need to outlive
@@ -528,7 +531,8 @@ pub struct SessionOptions {
     /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
     /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
     /// and `/fork`, passes the same recorder so `/undo` keeps working across
-    /// the rebuild, as on the classic stack. Unused with a [`Self::tool_factory`].
+    /// the rebuild, as on the classic stack. [`ExplicitBuiltinTools`] uses it;
+    /// custom factories can opt in through [`ToolFactoryContext`].
     pub mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 
     /// Session-level event listener invoked for every [`AgentEvent`].
@@ -683,6 +687,93 @@ pub trait ToolFactory: Send + Sync {
     ///   not grant workspace trust; the factory owns any explicit admission
     ///   it supplies to [`ToolRegistry::with_workspace_trust`].
     fn create_tool_registry(&self, enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry;
+
+    /// Build the registry with the SDK's resolved session admission.
+    ///
+    /// The default preserves existing factories' behavior. Override this to
+    /// share the session's workspace, undo recorder, and workspace admission
+    /// when constructing built-ins.
+    fn create_tool_registry_with_context(
+        &self,
+        enabled: &[&str],
+        cwd: &Path,
+        config: &Config,
+        _context: &ToolFactoryContext<'_>,
+    ) -> ToolRegistry {
+        self.create_tool_registry(enabled, cwd, config)
+    }
+}
+
+/// Session resources and admission resolved by the SDK before a factory runs.
+///
+/// The references describe the current session, including a resumed workspace.
+/// Receiving this context does not change an existing factory's behavior.
+#[non_exhaustive]
+pub struct ToolFactoryContext<'a> {
+    /// Caller-supplied undo recorder; built-in factories create a default when absent.
+    pub mutation_recorder: Option<&'a Arc<crate::undo::FileMutationRecorder>>,
+    /// The workspace shared by this session's tools.
+    pub workspace: Option<&'a crate::workspace::WorkspaceHandle>,
+    /// Effective admission after validating the session's workspace guard.
+    pub workspace_trusted: bool,
+    /// The guard that continues to constrain project-controlled resources.
+    pub workspace_trust_guard: Option<&'a crate::workspace_trust::WorkspaceTrustGuard>,
+}
+
+impl ToolFactoryContext<'_> {
+    fn explicit_builtin_registry(
+        &self,
+        enabled: &[&str],
+        cwd: &Path,
+        config: &Config,
+    ) -> ToolRegistry {
+        if enabled.is_empty() {
+            return ToolRegistry::without_builtins(Some(config));
+        }
+        ToolRegistry::with_builtin_tool_policy(
+            enabled,
+            cwd,
+            Some(config),
+            Some(self.mutation_recorder.cloned().unwrap_or_default()),
+            self.workspace,
+            self.workspace_trusted,
+            self.workspace_trust_guard,
+            false,
+        )
+    }
+}
+
+/// Construct only built-ins in the already resolved enabled-tool list.
+///
+/// Install this in [`SessionOptions::tool_factory`] to suppress automatic
+/// built-in additions while preserving the SDK's workspace and undo support.
+/// Configured optional-tool flags still contribute to the resolved list when
+/// [`SessionOptions::enabled_tools`] is `None`. A derived `xdev` dispatcher may
+/// expose the admitted discoverable tools. Extensions and MCP retain their
+/// separate admission paths.
+#[derive(Debug, Default)]
+pub struct ExplicitBuiltinTools;
+
+impl ToolFactory for ExplicitBuiltinTools {
+    fn create_tool_registry(&self, enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry {
+        let context = ToolFactoryContext {
+            mutation_recorder: None,
+            workspace: None,
+            workspace_trusted: false,
+            workspace_trust_guard: None,
+        };
+        self.create_tool_registry_with_context(enabled, cwd, config, &context)
+    }
+
+    fn create_tool_registry_with_context(
+        &self,
+        enabled: &[&str],
+        cwd: &Path,
+        config: &Config,
+        context: &ToolFactoryContext<'_>,
+    ) -> ToolRegistry {
+        context.explicit_builtin_registry(enabled, cwd, config)
+    }
 }
 
 /// Build the standard built-in registry without project agent definitions.
@@ -4238,6 +4329,12 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         secrets: config.secrets.clone(),
     };
 
+    let factory_context = ToolFactoryContext {
+        mutation_recorder: options.mutation_recorder.as_ref(),
+        workspace: workspace.as_ref(),
+        workspace_trusted,
+        workspace_trust_guard: options.workspace_trust_guard.as_ref(),
+    };
     let tools = options.tool_factory.as_ref().map_or_else(
         // The default registry carries an undo recorder (bd-cv653.3.13) so
         // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
@@ -4255,7 +4352,14 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 options.workspace_trust_guard.as_ref(),
             )
         },
-        |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
+        |factory| {
+            factory.create_tool_registry_with_context(
+                &enabled_tools,
+                &cwd,
+                &config,
+                &factory_context,
+            )
+        },
     );
     // Permission prompts belong to the host, not to the model-facing ask
     // capability. Every registry owns one picker even when "ask" is disabled.
@@ -7184,6 +7288,113 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_builtin_ceiling_survives_settings_driven_registry_construction() {
+        const AUTOMATIC: [&str; 7] = [
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let cases: &[(bool, Option<&[&str]>)] = &[
+            (false, Some(&["read", "grep"])),
+            (true, Some(&["read", "grep"])),
+            (
+                true,
+                Some(&[
+                    "read",
+                    "browser",
+                    "computer",
+                    "inspect_image",
+                    "read_media",
+                    "generate_image",
+                    "tts",
+                    "eval",
+                    "github",
+                    "security_scan",
+                    "subagent",
+                ]),
+            ),
+            (true, Some(&[])),
+            (true, None),
+        ];
+        for &(strict, selected) in cases {
+            let (_tmp, mut options) = guarded_optional_tool_fixture(true);
+            let global_dir = options
+                .workspace_trust_guard
+                .as_ref()
+                .expect("fixture admission")
+                .global_dir();
+            std::fs::write(
+                global_dir.join("settings.json"),
+                serde_json::json!({
+                    "browser": { "enableBrowser": true },
+                    "computer": { "enableComputer": true },
+                    "media": {
+                        "enableInspectImage": true,
+                        "enableReadMedia": true,
+                        "enableGenerateImage": true,
+                        "enableTts": true
+                    }
+                })
+                .to_string(),
+            )
+            .expect("global automatic tool settings");
+            options.tool_factory = strict.then(|| {
+                Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>
+            });
+            options.enabled_tools =
+                selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            let handle = run_async(create_agent_session(options)).expect("create SDK session");
+            if let Some(selected) = selected {
+                for name in selected {
+                    assert!(handle.has_tool(name), "explicit {name}");
+                }
+            }
+            for name in AUTOMATIC {
+                assert_eq!(
+                    handle.has_tool(name),
+                    !strict || selected.is_some_and(|names| names.contains(&name)),
+                    "{name}, strict={strict}, selected={selected:?}"
+                );
+            }
+            for name in ["eval", "github", "security_scan", "subagent"] {
+                assert_eq!(
+                    handle.has_tool(name),
+                    selected.is_none_or(|names| names.contains(&name)),
+                    "{name}"
+                );
+            }
+            if strict {
+                let registry = handle.session().agent.shared_tools().snapshot();
+                if let Some(selected) = selected {
+                    assert!(
+                        registry.tools().iter().all(|tool| {
+                            selected.contains(&tool.name()) || tool.name() == "xdev"
+                        })
+                    );
+                    assert!(
+                        registry
+                            .discoverable_index()
+                            .iter()
+                            .all(|(name, _)| selected.contains(&name.as_str()))
+                    );
+                    assert_eq!(registry.builtins_disabled(), selected.is_empty());
+                }
+                assert_eq!(
+                    handle.has_tool("xdev"),
+                    !registry.discoverable_index().is_empty()
+                );
+            }
+            let shutdown = run_async(handle.shutdown_owned_resources());
+            assert!(shutdown.completed_cleanly());
+        }
+    }
+
     fn guarded_optional_tool_fixture(trusted: bool) -> (tempfile::TempDir, SessionOptions) {
         use crate::workspace_trust::{TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish};
 
@@ -7308,6 +7519,106 @@ mod tests {
         for name in ["eval", "github", "security_scan", "subagent"] {
             assert!(!handle.has_tool(name), "captured denial must exclude {name}");
         }
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn explicit_builtin_factory_keeps_session_scope_recorder_and_admission() {
+        use crate::workspace_trust::{
+            TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish,
+        };
+
+        let (tmp, mut options) = guarded_optional_tool_fixture(true);
+        let cwd = options.working_directory.clone().expect("fixture workspace");
+        let global_dir = tmp.path().join("global");
+        let agents = cwd.join(".pi/agents");
+        std::fs::create_dir_all(&agents).expect("project agent directory");
+        let definition = "---\nname: factory-context-probe\ndescription: Discovery sentinel\ntools: read\n---\nProject instructions\n";
+        for name in ["first.md", "second.md"] {
+            std::fs::write(agents.join(name), definition).expect("duplicate project role");
+        }
+        let inputs = TrustInputs {
+            cli_trust: true,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = establish(&cwd, &global_dir.join(TRUST_STORE_FILE), &inputs, |_| {
+            panic!("noninteractive fixture must not prompt")
+        })
+        .expect("admit complete project surface");
+        options.workspace_trust_guard = Some(WorkspaceTrustGuard::from_established(
+            &cwd,
+            &state,
+            &inputs,
+            &global_dir,
+            None,
+        ));
+        assert!(!options.workspace_trusted, "the effective guard must win");
+
+        let additional = tmp.path().join("additional");
+        std::fs::create_dir(&additional).expect("additional root");
+        let path = additional.join("probe.txt");
+        std::fs::write(&path, "before").expect("original contents");
+        let mut workspace = crate::workspace::WorkspaceHandle::single(&cwd);
+        workspace.add_root(&additional);
+        let recorder = Arc::new(crate::undo::FileMutationRecorder::default());
+        options.workspace = Some(workspace.clone());
+        options.mutation_recorder = Some(Arc::clone(&recorder));
+        options.enabled_tools = Some(vec!["write".to_string(), "subagent".to_string()]);
+        options.tool_factory = Some(Arc::new(ExplicitBuiltinTools));
+
+        let handle = run_async(create_agent_session(options)).expect("strict SDK session");
+        let tools = handle.session().agent.shared_tools().snapshot();
+        assert!(Arc::ptr_eq(
+            &tools.mutation_recorder().expect("session undo recorder"),
+            &recorder,
+        ));
+        let write = tools.get("write").expect("selected write tool");
+        let written = run_async(write.execute(
+            "factory-context-write",
+            serde_json::json!({"path": path, "content": "after"}),
+            None,
+        ))
+        .expect("the factory must share the admitted additional root");
+        assert!(!written.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
+        assert_eq!(recorder.undo(1, false).applied.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        assert!(workspace.remove_root(&additional));
+        assert!(
+            run_async(write.execute(
+                "factory-context-revoked",
+                serde_json::json!({"path": path, "content": "must stay denied"}),
+                None,
+            ))
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+
+        let subagent = tools.get("subagent").expect("selected subagent tool");
+        let probe = || {
+            run_async(subagent.execute(
+                "factory-context-discovery",
+                serde_json::json!({
+                    "agent": "missing-factory-context-probe",
+                    "task": "inspect discovery only",
+                    "scope": "project"
+                }),
+                None,
+            ))
+        };
+        let error = probe().err().expect("admitted duplicate profiles are parsed");
+        assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
+        std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
+            .expect("change the admitted profile");
+        let error = probe().err().expect("project admission must be revalidated");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")
+        );
         assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
     }
 

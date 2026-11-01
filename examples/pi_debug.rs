@@ -235,7 +235,20 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         tool_approval: None,
         ..AgentConfig::default()
     };
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+    let tools = if cli.builtin_tools_disabled() {
+        ToolRegistry::without_builtins(Some(&config))
+    } else {
+        ToolRegistry::with_builtin_tool_policy(
+            &enabled_tools,
+            &cwd,
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            !cli.no_implicit_tools,
+        )
+    };
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
         enabled: config.compaction_enabled(),
