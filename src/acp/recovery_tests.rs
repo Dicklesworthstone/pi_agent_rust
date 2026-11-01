@@ -231,6 +231,7 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
     ];
     AcpOptions {
         settings_source: None,
+        workspace_trust_guard: None,
         launch: AcpLaunchOptions::default(),
         config: Config {
             default_provider: Some(PRIMARY_PROVIDER.to_string()),

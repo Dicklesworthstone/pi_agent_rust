@@ -1758,6 +1758,7 @@ pub async fn run_interactive(
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     package_manager: PackageManager,
+    workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     workspace: WorkspaceHandle,
@@ -1911,10 +1912,9 @@ pub async fn run_interactive(
         // Keep the actual AgentSession/ExtensionRegion alive until async
         // shutdown finishes, even after the terminal program drops PiApp.
         shutdown_owner = Arc::clone(&app.agent);
-        // `/reload` must reuse the exact startup trust decision. Rebuilding a
-        // default PackageManager here would silently re-enable project package
-        // resolution in an untrusted workspace.
-        app.set_reload_package_manager(package_manager);
+        // Retain the actual launch admission so `/reload` cannot resolve
+        // changed project packages under a stale trust decision.
+        app.set_reload_package_manager(package_manager, workspace_trust_guard);
         app.ask_tool = ask_tool;
         // The live multi-root handle must reach the app (bd-cv653.3.12) —
         // without it /add-dir, @-file scope, and autocomplete run on a
@@ -2973,6 +2973,8 @@ pub struct PiApp {
     /// `PiApp::new` construction starts fail-closed until its host installs an
     /// explicitly trusted manager.
     package_manager: PackageManager,
+    /// Admission for project configuration reread by the retained resolver.
+    workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     cwd: PathBuf,
     model_entry: ModelEntry,
     model_entry_shared: Arc<StdMutex<ModelEntry>>,
@@ -3128,8 +3130,16 @@ impl PiApp {
     ///
     /// Keeping this as one explicit seam prevents reload from reconstructing a
     /// resolver whose default trust differs from the decision made at startup.
-    pub(crate) fn set_reload_package_manager(&mut self, package_manager: PackageManager) {
-        self.package_manager = package_manager;
+    pub(crate) fn set_reload_package_manager(
+        &mut self,
+        package_manager: PackageManager,
+        workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
+    ) {
+        self.package_manager = match &workspace_trust_guard {
+            Some(guard) => package_manager.with_project_trust(guard.trusted()),
+            None => package_manager,
+        };
+        self.workspace_trust_guard = workspace_trust_guard;
     }
 
     /// Attach the session workspace root handle (bd-cv653.3.12). Installed
@@ -3498,6 +3508,7 @@ impl PiApp {
             resources,
             resource_cli,
             package_manager: PackageManager::new(cwd.clone()).with_project_trust(false),
+            workspace_trust_guard: None,
             cwd,
             model_entry,
             model_entry_shared: model_entry_shared.clone(),

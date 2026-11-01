@@ -1934,9 +1934,12 @@ fn ftui_tool_selection(cli: &cli::Cli, enabled_tools: &[&str]) -> Option<Vec<Str
     if cli.no_tools {
         return Some(Vec::new());
     }
-    cli.tools
-        .as_ref()
-        .map(|_| enabled_tools.iter().map(|name| (*name).to_string()).collect())
+    cli.tools.as_ref().map(|_| {
+        enabled_tools
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    })
 }
 
 #[allow(
@@ -2364,12 +2367,14 @@ async fn run(
     let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&config))
     } else {
-        ToolRegistry::with_mutation_recorder(
+        ToolRegistry::with_workspace_trust(
             &shared_enabled_tools,
             &cwd,
             Some(&config),
             Some(Arc::clone(&session_mutation_recorder)),
             Some(&workspace),
+            workspace_trusted,
+            Some(&workspace_trust_guard),
         )
     });
     let startup_cost_budget = startup_session
@@ -2549,6 +2554,7 @@ async fn run(
                 workspace_trust_env: std::env::var(pi::workspace_trust::TRUST_ENV_VAR).ok(),
                 launch_cwd: cwd.clone(),
             }),
+            workspace_trust_guard: Some(workspace_trust_guard.clone()),
             launch: pi::acp::AcpLaunchOptions::from_cli(&cli),
             available_models,
             model_registry: model_registry.clone(),
@@ -3573,6 +3579,7 @@ async fn run(
             resources,
             resource_cli,
             package_manager,
+            Some(workspace_trust_guard),
             cwd.clone(),
             runtime_handle.clone(),
             workspace.clone(),
@@ -9581,6 +9588,25 @@ fn prompt_workspace_trust(
             );
         }
     }
+    if !surface.agent_definition_entries.is_empty() {
+        eprintln!(
+            "  - project agent definitions ({}; profiles choose child tools, models, and instructions):",
+            surface.agent_definition_entries.len()
+        );
+        for entry in surface
+            .agent_definition_entries
+            .iter()
+            .take(MAX_LISTED_ENTRIES)
+        {
+            eprintln!("      {entry}");
+        }
+        if surface.agent_definition_entries.len() > MAX_LISTED_ENTRIES {
+            eprintln!(
+                "      ... and {} more",
+                surface.agent_definition_entries.len() - MAX_LISTED_ENTRIES
+            );
+        }
+    }
     if !surface.mcp_config_entries.is_empty() {
         let noun = if surface.mcp_config_entries.len() == 1 {
             "file"
@@ -11653,6 +11679,7 @@ async fn run_interactive_mode(
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     package_manager: PackageManager,
+    workspace_trust_guard: Option<pi::workspace_trust::WorkspaceTrustGuard>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     workspace: pi::workspace::WorkspaceHandle,
@@ -11694,6 +11721,7 @@ async fn run_interactive_mode(
         resources,
         resource_cli,
         package_manager,
+        workspace_trust_guard,
         cwd,
         runtime_handle,
         workspace,
@@ -11906,7 +11934,10 @@ mod tests {
         let explicit_defaults = defaults.into_iter().map(str::to_string).collect();
         for (args, expected) in [
             (vec!["pi"], None),
-            (vec!["pi", "--tools", "read"], Some(vec!["read".to_string()])),
+            (
+                vec!["pi", "--tools", "read"],
+                Some(vec!["read".to_string()]),
+            ),
             (
                 vec!["pi", "--tools", default_arg.as_str()],
                 Some(explicit_defaults),
@@ -11918,7 +11949,10 @@ mod tests {
                 Some(vec!["read".to_string(), "eval".to_string()]),
             ),
             (vec!["pi", "--no-tools"], Some(Vec::new())),
-            (vec!["pi", "--no-tools", "--tools", "eval"], Some(Vec::new())),
+            (
+                vec!["pi", "--no-tools", "--tools", "eval"],
+                Some(Vec::new()),
+            ),
         ] {
             let cli = cli::Cli::try_parse_from(args.clone()).expect("CLI selection");
             assert_eq!(
@@ -11942,7 +11976,13 @@ mod tests {
         for name in pi::xdev::default_enabled_tools() {
             load_modes.insert(name.to_string(), json!("off"));
         }
-        for name in ["eval", "github", "security_scan", "subagent", "manage_skill"] {
+        for name in [
+            "eval",
+            "github",
+            "security_scan",
+            "subagent",
+            "manage_skill",
+        ] {
             load_modes.insert(name.to_string(), json!("essential"));
         }
         let settings = |enabled| {
@@ -11978,13 +12018,15 @@ mod tests {
             model: Some("gpt-4o".to_string()),
             api_key: Some("dummy-key".to_string()),
             working_directory: Some(cwd.clone()),
-            workspace_trust_guard: Some(pi::workspace_trust::WorkspaceTrustGuard::from_established(
-                &cwd,
-                &state,
-                &inputs,
-                &global_dir,
-                None,
-            )),
+            workspace_trust_guard: Some(
+                pi::workspace_trust::WorkspaceTrustGuard::from_established(
+                    &cwd,
+                    &state,
+                    &inputs,
+                    &global_dir,
+                    None,
+                ),
+            ),
             no_session: true,
             no_context_files: true,
             enabled_tools: ftui_tool_selection(&cli, &initial_tools),

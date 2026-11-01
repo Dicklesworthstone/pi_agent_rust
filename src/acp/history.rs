@@ -1047,6 +1047,7 @@ mod tests {
         let entry = registry.find("anthropic", "claude-sonnet-4-5").unwrap();
         AcpOptions {
             settings_source: None,
+            workspace_trust_guard: None,
             launch: crate::acp::AcpLaunchOptions::default(),
             config: crate::config::Config::default(),
             available_models: vec![entry],
@@ -2216,6 +2217,7 @@ mod tests {
             let entry = registry.find("anthropic", "claude-sonnet-4-5").unwrap();
             let options = AcpOptions {
                 settings_source: None,
+                workspace_trust_guard: None,
                 launch: crate::acp::AcpLaunchOptions::default(),
                 config: crate::config::Config::default(),
                 available_models: vec![entry],

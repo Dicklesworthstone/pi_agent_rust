@@ -96,7 +96,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         for scope in [AgentScope::Both, AgentScope::User, AgentScope::Project] {
             let agents =
-                discover_agents_with_roots(temp.path(), &temp.path().join("global"), scope)
+                discover_agents_with_roots(temp.path(), &temp.path().join("global"), scope, false)
                     .expect("discover built-ins");
             assert_eq!(agents.len(), 5);
             for name in ["task", "scout", "reviewer", "security-reviewer", "sonic"] {
@@ -128,7 +128,7 @@ mod tests {
             (AgentScope::Project, "project scout"),
             (AgentScope::User, "user scout"),
         ] {
-            let agents = discover_agents_with_roots(&cwd, &global, scope).expect("discover");
+            let agents = discover_agents_with_roots(&cwd, &global, scope, true).expect("discover");
             assert_eq!(agents["scout"].description, expected);
             assert!(matches!(agents["task"].source, AgentSource::BuiltIn));
             assert_eq!(
@@ -137,7 +137,8 @@ mod tests {
             );
         }
         write_definition(&cwd.join(".pi/agents"), "reviewer", "nearest reviewer");
-        let agents = discover_agents_with_roots(&cwd, &global, AgentScope::Both).expect("nearest");
+        let agents =
+            discover_agents_with_roots(&cwd, &global, AgentScope::Both, true).expect("nearest");
         assert_eq!(agents["scout"].description, "user scout");
         assert_eq!(agents["reviewer"].description, "nearest reviewer");
     }
@@ -237,7 +238,7 @@ mod tests {
             "---\nname: scout\n---\nmissing description",
         )
         .expect("write malformed definition");
-        assert!(discover_agents_with_roots(temp.path(), &global, AgentScope::Both).is_err());
+        assert!(discover_agents_with_roots(temp.path(), &global, AgentScope::Both, false).is_err());
     }
 
     #[test]

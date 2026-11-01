@@ -314,13 +314,25 @@ precedence over the boolean. The SDK verifies the requested workspace and
 current trust before loading settings, credentials, tools, MCP, or extensions,
 using the captured configuration roots.
 
+The default registry passes that same admission to `subagent` discovery.
+Project agent definitions are excluded when workspace trust is denied, while
+bundled and global definitions remain available. A guard also revalidates
+profile contents before delegation. Direct `SubagentTool` and `ToolRegistry`
+constructors default to excluding project profiles; standalone hosts can use
+`SubagentTool::with_project_trust` for an explicit decision, or
+`with_workspace_trust_guard` to retain a checked launch admission.
+Custom `ToolFactory` implementations own their registry policy and can pass
+the host's decision through `ToolRegistry::with_workspace_trust`; merely
+receiving a `Config` does not grant project profile access.
+
 The guard never replays an earlier `--trust` flag. A changed scoped project
 surface or revoked grant produces `PI_WORKSPACE_TRUST_RESTART_REQUIRED`;
 a fresh launch must re-establish trust and resolve its resources. A previously
 denied launch cannot become trusted through a cloned options object.
 Hosts that reload resources outside SDK construction must also validate the
-guard before resolving packages or executing cached project paths. The default
-terminal UI does this before replacement side effects and resource loading.
+guard before resolving packages or executing cached project paths. Both
+terminal UIs validate before resource loading; the default UI also validates
+before session replacement side effects.
 
 ### Stream rules
 

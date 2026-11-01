@@ -759,6 +759,9 @@ pub struct AcpOptions {
     pub config: Config,
     /// None preserves a programmatic host's supplied configuration.
     pub settings_source: Option<AcpSettingsSource>,
+    /// Admission for project agent definitions discovered by native subagents.
+    /// Hosts without filesystem provenance default to excluding those profiles.
+    pub workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     pub launch: AcpLaunchOptions,
     pub available_models: Vec<ModelEntry>,
     /// Full model registry (every known/loaded model, not just the ready ones in
@@ -785,9 +788,14 @@ pub struct AcpOptions {
 
 impl AcpOptions {
     fn global_dir(&self) -> PathBuf {
-        self.settings_source
-            .as_ref()
-            .map_or_else(Config::global_dir, |source| source.global_dir.clone())
+        self.settings_source.as_ref().map_or_else(
+            || {
+                self.workspace_trust_guard
+                    .as_ref()
+                    .map_or_else(Config::global_dir, |guard| guard.global_dir().to_path_buf())
+            },
+            |source| source.global_dir.clone(),
+        )
     }
 
     /// Resolve once before constructing a new, restored, or forked session.
@@ -795,27 +803,40 @@ impl AcpOptions {
     fn for_workspace(&self, cwd: &std::path::Path) -> Result<Self> {
         let mut resolved = self.clone();
         if let Some(source) = &self.settings_source {
-            let config_override = source.config_override.as_deref().map(|path| {
-                Config::resolve_config_override_path(path, &source.launch_cwd)
-            });
+            let config_override = source
+                .config_override
+                .as_deref()
+                .map(|path| Config::resolve_config_override_path(path, &source.launch_cwd));
             let global = Config::load_with_roots_and_project_trust(
                 config_override.as_deref(),
                 &source.global_dir,
                 cwd,
                 false,
             )?;
+            let inputs = crate::workspace_trust::TrustInputs {
+                // main already recorded the launch workspace/digest only.
+                cli_trust: false,
+                trust_all_workspaces: global.trust_all_workspaces.unwrap_or(false),
+                env_override: source.workspace_trust_env.clone(),
+                interactive: false,
+            };
             let state = crate::workspace_trust::establish(
                 cwd,
-                &source.global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
-                &crate::workspace_trust::TrustInputs {
-                    // main already recorded the launch workspace/digest only.
-                    cli_trust: false,
-                    trust_all_workspaces: global.trust_all_workspaces.unwrap_or(false),
-                    env_override: source.workspace_trust_env.clone(),
-                    interactive: false,
-                },
+                &source
+                    .global_dir
+                    .join(crate::workspace_trust::TRUST_STORE_FILE),
+                &inputs,
                 |_| Ok(false),
             )?;
+            resolved.workspace_trust_guard = Some(
+                crate::workspace_trust::WorkspaceTrustGuard::from_established(
+                    cwd,
+                    &state,
+                    &inputs,
+                    &source.global_dir,
+                    config_override.as_deref(),
+                ),
+            );
             resolved.config = Config::load_with_roots_and_project_trust(
                 config_override.as_deref(),
                 &source.global_dir,
@@ -837,6 +858,8 @@ impl AcpOptions {
             {
                 resolved.skills_prompt = None;
             }
+        } else if let Some(guard) = &resolved.workspace_trust_guard {
+            guard.validate_workspace(cwd)?;
         }
         if let Some(policy) = &self.launch.subagent_fallback_policy {
             policy.apply_to_config(&mut resolved.config);
@@ -2387,7 +2410,18 @@ fn build_acp_session_with_budget(
     let tools = if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&options.config))
     } else {
-        ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config))
+        ToolRegistry::with_workspace_trust(
+            &enabled_tools,
+            &cwd,
+            Some(&options.config),
+            None,
+            None,
+            options
+                .workspace_trust_guard
+                .as_ref()
+                .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted),
+            options.workspace_trust_guard.as_ref(),
+        )
     };
     client_files::bind(
         &tools,
@@ -4204,6 +4238,7 @@ mod tests {
             let auth = AuthStorage::load(root.path().join("auth.json")).unwrap();
             let options = AcpOptions {
                 settings_source: None,
+                workspace_trust_guard: None,
                 config: Config::default(),
                 launch: AcpLaunchOptions::default(),
                 available_models: Vec::new(),
@@ -4698,6 +4733,88 @@ mod tests {
     }
 
     #[test]
+    fn acp_subagent_discovery_retains_each_workspace_admission() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let root = tempfile::tempdir().expect("tempdir");
+        let options = acp_workspace_options(root.path(), runtime.handle());
+        let source = options
+            .settings_source
+            .as_ref()
+            .expect("settings provenance");
+        write_acp_settings(
+            &source.global_dir.join("settings.json"),
+            json!({"tools": {"enableSubagent": true}}),
+        );
+        let cwd = root.path().join("target");
+        let agents = cwd.join(".pi/agents");
+        std::fs::create_dir_all(&agents).expect("project agents directory");
+        let definition = "---\nname: acp-project-probe\ndescription: Discovery sentinel\ntools: bash,eval\n---\nProject instructions\n";
+        for name in ["first.md", "second.md"] {
+            std::fs::write(agents.join(name), definition).expect("duplicate project role");
+        }
+        let params = json!({"cwd": cwd, "mcpServers": []});
+        let probe = |state: &AcpSessionState| {
+            let handle = state.agent_session.as_ref().expect("constructed agent");
+            let tools = handle.session().agent.shared_tools().snapshot();
+            runtime.block_on(
+                tools
+                    .get("subagent")
+                    .expect("global subagent opt-in")
+                    .execute(
+                        "acp-agent-trust-probe",
+                        json!({
+                            "agent": "missing-acp-trust-probe",
+                            "task": "inspect discovery only"
+                        }),
+                        None,
+                    ),
+            )
+        };
+
+        let (_, denied) = handle_session_new(&params, &options, None).expect("untrusted workspace");
+        let result = probe(&denied).expect("denied project profiles remain unparsed");
+        assert_eq!(
+            result.details.expect("unknown-agent details")["results"][0]["error"],
+            "Unknown agent: missing-acp-trust-probe"
+        );
+
+        trust_acp_settings(&cwd, &source.global_dir);
+        let (_, admitted) = handle_session_new(&params, &options, None).expect("trusted workspace");
+        let error = probe(&admitted)
+            .err()
+            .expect("trusted duplicates are parsed");
+        assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
+        std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
+            .expect("mutate admitted project role");
+        let error = probe(&admitted)
+            .err()
+            .expect("retained session must recheck its admission");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")
+        );
+        let (_, changed) =
+            handle_session_new(&params, &options, None).expect("new denied snapshot");
+        assert!(
+            probe(&changed)
+                .expect("changed project is excluded")
+                .is_error
+        );
+
+        let mut supplied = options.clone();
+        supplied.settings_source = None;
+        supplied.workspace_trust_guard = None;
+        let (_, supplied) =
+            handle_session_new(&params, &supplied, None).expect("programmatic host");
+        let result = probe(&supplied).expect("a supplied config does not grant project profiles");
+        assert_eq!(
+            result.details.expect("unknown-agent details")["results"][0]["error"],
+            "Unknown agent: missing-acp-trust-probe"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn acp_new_sessions_admit_only_the_requested_workspace_snapshot() {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
@@ -5011,6 +5128,7 @@ mod tests {
     ) -> AcpOptions {
         AcpOptions {
             settings_source: None,
+            workspace_trust_guard: None,
             config,
             launch: AcpLaunchOptions::default(),
             available_models: models.clone(),
@@ -5971,6 +6089,7 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let options = AcpOptions {
             settings_source: None,
+            workspace_trust_guard: None,
             config: Config::default(),
             launch: AcpLaunchOptions {
                 provider: Some(provider_id.clone()),

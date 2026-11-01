@@ -556,11 +556,14 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "tts" => Box::new(pi::media_tools::TtsTool::new(temp_dir.path()).with_mock(true)),
         "computer" => Box::new(pi::computer::ComputerTool::new(temp_dir.path()).with_mock(true)),
         "browser" => Box::new(pi::browser::BrowserTool::new(temp_dir.path()).with_mock(true)),
-        "subagent" => Box::new(pi::subagents::SubagentTool::with_paths(
-            temp_dir.path().to_path_buf(),
-            temp_dir.path().join("global"),
-            temp_dir.path().join("child-fixture.sh"),
-        )),
+        "subagent" => Box::new(
+            pi::subagents::SubagentTool::with_paths(
+                temp_dir.path().to_path_buf(),
+                temp_dir.path().join("global"),
+                temp_dir.path().join("child-fixture.sh"),
+            )
+            .with_project_trust(true),
+        ),
         "ask" => Box::new(pi::ask::AskTool::new(pi::ask::AskPolicy::Recommended)),
         "todo" => Box::new(pi::todo::TodoTool::new(std::sync::Arc::new(
             asupersync::sync::Mutex::new(pi::session::Session::in_memory()),

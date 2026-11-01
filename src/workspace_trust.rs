@@ -4,16 +4,17 @@
 //! A repository can select Git/npm packages via `.pi/settings.json` (whose npm
 //! lifecycle scripts run as the local user during install) and can auto-load
 //! JavaScript from `.pi/extensions/` (which may call `pi.exec` during session
-//! startup). Neither is model-generated content — it is deterministic
-//! configuration execution controlled by whoever authored the repository.
+//! startup). Project agent definitions can also select a child process's tool
+//! allowlist, skills and prompt. These are repository-authored capabilities,
+//! even when the model selects the profile by name.
 //!
 //! This module decides, before any of that resolution runs, whether the
 //! current workspace is trusted:
 //!
 //! - The decision is keyed to the canonical workspace path **and** a content
 //!   digest over the project-controlled surfaces (`.pi/settings.json`, every
-//!   file under `.pi/extensions/`, and project-local MCP configuration). Any
-//!   content change re-prompts.
+//!   file under `.pi/extensions/`, project-local MCP configuration, and the
+//!   nearest `.pi/agents/` profiles). Any content change re-prompts.
 //! - Interactive launches prompt once and persist the answer (trusted or
 //!   untrusted) in `<global_dir>/workspace-trust.json`.
 //! - Non-interactive launches (RPC, `--print`, piped stdin) fail closed:
@@ -46,6 +47,9 @@ const TRUST_STORE_VERSION: u32 = 1;
 const TRUST_SURFACE_DIGEST_DOMAIN: &[u8] = b"pi_agent_rust:workspace-trust-surface:v2";
 const MAX_TRUST_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_TRUST_EXTENSION_BYTES: usize = 16 * 1024 * 1024;
+// Match the bounded Markdown definition reader in subagents::definition.
+const MAX_TRUST_AGENT_DEFINITIONS: usize = 256;
+const MAX_TRUST_AGENT_BYTES: usize = 1024 * 1024;
 
 /// A recorded (or requested) trust decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +75,10 @@ pub struct WorkspaceTrustSurface {
     /// sorted. Explicit CLI and global MCP files are deliberate operator
     /// inputs and are not workspace trust surfaces.
     pub mcp_config_entries: Vec<String>,
+    /// Markdown profiles in the nearest `.pi/agents/` directory. Descendant
+    /// paths are relative to the workspace; inherited ancestor paths retain
+    /// their full origin. Entries are sorted and escaped for display.
+    pub agent_definition_entries: Vec<String>,
     /// Hex sha256 over the canonical surface manifest.
     pub digest: String,
 }
@@ -79,8 +87,8 @@ impl WorkspaceTrustSurface {
     /// Scan `cwd` for project-controlled executable surfaces.
     ///
     /// Returns `Ok(None)` when the workspace declares nothing to trust
-    /// (no `.pi/settings.json`, no `.pi/extensions/` entries, and no
-    /// project-local MCP configuration).
+    /// (no `.pi/settings.json`, no `.pi/extensions/` entries, no project-local
+    /// MCP configuration, and no effective project agent definitions).
     pub fn scan(cwd: &Path) -> Result<Option<Self>> {
         const PROJECT_MCP_CONFIGS: &[&str] = &[
             ".agents/mcp.json",
@@ -110,7 +118,18 @@ impl WorkspaceTrustSurface {
             }
         }
 
-        if settings_bytes.is_none() && extension_files.is_empty() && mcp_config_files.is_empty() {
+        let agent_directory = nearest_project_agents_dir(cwd);
+        let agent_files = agent_directory
+            .as_deref()
+            .map(collect_agent_definition_files)
+            .transpose()?
+            .unwrap_or_default();
+
+        if settings_bytes.is_none()
+            && extension_files.is_empty()
+            && mcp_config_files.is_empty()
+            && agent_files.is_empty()
+        {
             return Ok(None);
         }
 
@@ -155,6 +174,12 @@ impl WorkspaceTrustSurface {
             hash_surface_record(&mut surface_hasher, b"mcp", &relative, &bytes);
             mcp_config_entries.push(escaped_path(&relative));
         }
+        let agent_definition_entries = hash_agent_definitions(
+            &mut surface_hasher,
+            cwd,
+            agent_directory.as_deref(),
+            &agent_files,
+        )?;
 
         Ok(Some(Self {
             workspace_display: escaped_path(
@@ -164,9 +189,91 @@ impl WorkspaceTrustSurface {
             package_count,
             extension_entries,
             mcp_config_entries,
+            agent_definition_entries,
             digest: crate::package_manager::hex_encode(&surface_hasher.finalize()),
         }))
     }
+}
+
+/// Select the same nearest authored directory for trust admission and loading.
+/// An empty nearer directory intentionally shadows an ancestor's definitions.
+pub(crate) fn nearest_project_agents_dir(cwd: &Path) -> Option<PathBuf> {
+    let mut current = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    loop {
+        let candidate = current.join(Config::project_dir()).join("agents");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn collect_agent_definition_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(directory).map_err(|err| {
+        Error::config(format!(
+            "Failed to scan agent directory {}: {err}",
+            escaped_path(directory)
+        ))
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|err| Error::config(format!("Failed to enumerate agent definitions: {err}")))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            if paths.len() >= MAX_TRUST_AGENT_DEFINITIONS {
+                return Err(Error::config(
+                    "PI_AGENT_DEFINITION_LIMIT: too many agent definitions in one directory",
+                ));
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn hash_agent_definitions(
+    hasher: &mut Sha256,
+    cwd: &Path,
+    directory: Option<&Path>,
+    files: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut entries = Vec::with_capacity(files.len());
+    if !files.is_empty()
+        && let Some(directory) = directory
+    {
+        // Both the selected logical directory and its resolved origin matter:
+        // identical profiles at another root can select different relative skills.
+        let canonical = std::fs::canonicalize(directory).map_err(|err| {
+            Error::config(format!(
+                "Failed to resolve agent directory {}: {err}",
+                escaped_path(directory)
+            ))
+        })?;
+        hash_surface_record(
+            hasher,
+            b"agent-directory",
+            directory,
+            canonical.as_os_str().as_encoded_bytes(),
+        );
+    }
+    for path in files {
+        let bytes = read_bounded_regular_file(path, MAX_TRUST_AGENT_BYTES)?.ok_or_else(|| {
+            Error::config(format!(
+                "Agent definition disappeared while scanning {}",
+                escaped_path(path)
+            ))
+        })?;
+        hash_surface_record(hasher, b"agent-definition", path, &bytes);
+        entries.push(escaped_path(path.strip_prefix(cwd).unwrap_or(path)));
+    }
+    Ok(entries)
 }
 
 fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>> {
@@ -1118,6 +1225,185 @@ mod tests {
             vec![".codex/config.toml", ".pi/mcp.json"]
         );
         assert_ne!(changed.digest, foreign_added.digest);
+    }
+
+    #[test]
+    fn scan_tracks_agent_profile_bytes_names_and_nearest_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        let cwd = project.join("nested");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        let ancestor = project.join(".pi/agents/scout.md");
+        write(&ancestor, "read-only profile");
+        let first = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("inherited profiles are a trust surface");
+        assert!(!first.has_project_settings);
+        assert!(first.extension_entries.is_empty());
+        assert!(first.mcp_config_entries.is_empty());
+        assert_eq!(
+            first.agent_definition_entries,
+            vec![escaped_path(&ancestor)]
+        );
+
+        write(&project.join(".pi/agents/notes.txt"), "ignored");
+        write(&project.join(".pi/agents/nested/ignored.md"), "ignored");
+        assert_eq!(
+            first.digest,
+            WorkspaceTrustSurface::scan(&cwd)
+                .expect("scan")
+                .expect("surface")
+                .digest,
+            "discovery is nonrecursive and Markdown-only"
+        );
+
+        write(&ancestor, "privileged profile");
+        let changed = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("surface");
+        assert_ne!(first.digest, changed.digest);
+        let renamed = project.join(".pi/agents/reviewer.MD");
+        std::fs::rename(&ancestor, &renamed).expect("rename fixture");
+        let renamed_surface = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("case-insensitive Markdown selection");
+        assert_ne!(changed.digest, renamed_surface.digest);
+        assert_eq!(
+            renamed_surface.agent_definition_entries,
+            vec![escaped_path(&renamed)]
+        );
+
+        // The loader stops at the nearest directory, even when it is empty.
+        let nearest = cwd.join(".pi/agents");
+        std::fs::create_dir_all(&nearest).expect("empty nearest directory");
+        assert!(WorkspaceTrustSurface::scan(&cwd).expect("scan").is_none());
+        write(&nearest.join("reviewer.MD"), "privileged profile");
+        let nearest_surface = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("nearest surface");
+        assert_eq!(
+            nearest_surface.agent_definition_entries,
+            vec![".pi/agents/reviewer.MD"]
+        );
+        assert_ne!(renamed_surface.digest, nearest_surface.digest);
+        write(&renamed, "ignored ancestor mutation");
+        assert_eq!(
+            nearest_surface.digest,
+            WorkspaceTrustSurface::scan(&cwd)
+                .expect("scan")
+                .expect("surface")
+                .digest
+        );
+    }
+
+    #[test]
+    fn agent_only_workspaces_require_admission_and_late_profiles_invalidate_empty_launches() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        let initially_empty = guard_for(workspace.path(), global.path(), &inputs());
+        assert!(initially_empty.trusted());
+        write(
+            &workspace.path().join(".pi/agents/scout.md"),
+            "---\nname: scout\ndescription: project\ntools: eval,github,security_scan,subagent\n---\nproject prompt",
+        );
+        assert_restart_required(initially_empty.validate_origin());
+        let denied = establish(
+            workspace.path(),
+            &global.path().join(TRUST_STORE_FILE),
+            &inputs(),
+            no_prompt,
+        )
+        .expect("noninteractive admission");
+        assert!(!denied.trusted);
+        assert_eq!(denied.source, TrustSource::NonInteractive);
+        let admitted = guard_for(
+            workspace.path(),
+            global.path(),
+            &TrustInputs {
+                cli_trust: true,
+                ..inputs()
+            },
+        );
+        admitted.validate_origin().expect("admitted profile");
+        assert_restart_required(initially_empty.validate_origin());
+    }
+
+    #[test]
+    fn scan_enforces_agent_definition_file_and_directory_bounds() {
+        let non_regular = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(non_regular.path().join(".pi/agents/directory.md"))
+            .expect("non-regular definition");
+        let error = WorkspaceTrustSurface::scan(non_regular.path())
+            .expect_err("non-regular definitions must fail closed");
+        assert!(error.to_string().contains("not a regular file"));
+
+        let oversized = tempfile::tempdir().expect("tempdir");
+        write(
+            &oversized.path().join(".pi/agents/scout.md"),
+            &"x".repeat(MAX_TRUST_AGENT_BYTES + 1),
+        );
+        let error = WorkspaceTrustSurface::scan(oversized.path())
+            .expect_err("oversized definition must fail closed");
+        assert!(error.to_string().contains("exceeds 1048576 bytes"));
+
+        let many = tempfile::tempdir().expect("tempdir");
+        for index in 0..MAX_TRUST_AGENT_DEFINITIONS {
+            write(
+                &many.path().join(format!(".pi/agents/{index}.md")),
+                "profile",
+            );
+        }
+        let accepted = WorkspaceTrustSurface::scan(many.path())
+            .expect("bounded scan")
+            .expect("profiles");
+        assert_eq!(
+            accepted.agent_definition_entries.len(),
+            MAX_TRUST_AGENT_DEFINITIONS
+        );
+        write(&many.path().join(".pi/agents/overflow.md"), "profile");
+        let error = WorkspaceTrustSurface::scan(many.path())
+            .expect_err("definition count is bounded before file reads");
+        assert!(error.to_string().contains("PI_AGENT_DEFINITION_LIMIT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_binds_agent_directory_symlink_origin_and_escapes_profile_names() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("workspace");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("workspace");
+        let first_root = temp.path().join("profiles-first");
+        let second_root = temp.path().join("profiles-second");
+        let filename = "scout\n\u{1b}[2J.md";
+        for root in [&first_root, &second_root] {
+            write(&root.join(filename), "identical profile bytes");
+        }
+        let selected = cwd.join(".pi/agents");
+        symlink(&first_root, &selected).expect("first origin");
+        let first = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("surface");
+        let displayed = first.agent_definition_entries.join(" ");
+        assert!(!displayed.contains('\n'));
+        assert!(!displayed.contains('\u{1b}'));
+        assert!(displayed.contains("\\n"));
+        assert!(displayed.contains("\\u{1b}"));
+        std::fs::rename(&selected, cwd.join(".pi/agents.previous")).expect("retain old link");
+        symlink(&second_root, &selected).expect("second origin");
+        let second = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("surface");
+        assert_ne!(
+            first.digest, second.digest,
+            "origin changes must invalidate trust"
+        );
+
+        symlink("/dev/zero", second_root.join("device.md")).expect("non-regular target");
+        let error = WorkspaceTrustSurface::scan(&cwd)
+            .expect_err("agent device symlink must fail without reading");
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[test]

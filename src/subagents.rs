@@ -128,6 +128,10 @@ impl TanCompletion {
 pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
+    /// Explicit host admission for project-authored agent definitions.
+    project_trusted: bool,
+    /// A captured launch decision is authoritative over the standalone flag.
+    workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     /// Shared admission policy for saved sessions and task files, including live roots.
     workspace: crate::workspace::WorkspaceHandle,
     child_binary: PathBuf,
@@ -272,6 +276,8 @@ impl SubagentTool {
         Self {
             cwd: cwd.to_path_buf(),
             global_dir: Config::global_dir(),
+            project_trusted: false,
+            workspace_trust_guard: None,
             workspace: crate::workspace::WorkspaceHandle::default(),
             child_binary,
             structured_results: false,
@@ -292,6 +298,30 @@ impl SubagentTool {
     #[must_use]
     pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
         self.workspace = workspace;
+        self
+    }
+
+    /// Admit project-authored agent definitions for a standalone host. The
+    /// default is false; model-selected scope cannot grant workspace trust.
+    /// A supplied launch guard remains authoritative over this flag.
+    #[must_use]
+    pub const fn with_project_trust(mut self, trusted: bool) -> Self {
+        self.project_trusted = trusted;
+        self
+    }
+
+    /// Retain and revalidate the host's original workspace admission before
+    /// loading project profiles. User profiles use the same captured global
+    /// directory as the host, even if the process environment changes later.
+    #[must_use]
+    pub fn with_workspace_trust_guard(
+        mut self,
+        guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
+    ) -> Self {
+        if let Some(guard) = &guard {
+            self.global_dir = guard.global_dir().to_path_buf();
+        }
+        self.workspace_trust_guard = guard;
         self
     }
 
@@ -465,6 +495,8 @@ impl SubagentTool {
         Self {
             cwd,
             global_dir,
+            project_trusted: false,
+            workspace_trust_guard: None,
             workspace: crate::workspace::WorkspaceHandle::default(),
             child_binary,
             structured_results: false,
@@ -481,7 +513,17 @@ impl SubagentTool {
     }
 
     fn discover(&self, scope: AgentScope) -> Result<BTreeMap<String, AgentDefinition>> {
-        discover_agents_with_roots(&self.cwd, &self.global_dir, scope)
+        let project_trusted = if matches!(scope, AgentScope::User) {
+            // User-only delegation never consumes project profiles and stays
+            // usable when an unrelated project trust surface has changed.
+            false
+        } else if let Some(guard) = &self.workspace_trust_guard {
+            guard.validate_workspace(&self.cwd)?;
+            guard.trusted()
+        } else {
+            self.project_trusted
+        };
+        discover_agents_with_roots(&self.cwd, &self.global_dir, scope, project_trusted)
     }
 
     async fn run_request(
@@ -617,7 +659,7 @@ impl Tool for SubagentTool {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
+            "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both only when the host has admitted workspace trust. Scope never grants trust. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
             " Model selection: an optional model on one task or workflow call accepts an exact provider/model[:thinking] or unambiguous catalog ID, overriding definition/task-role/parent defaults. Every explicit selector is checked before any child or worktree is created; unknown, unavailable, disabled or unsupported destinations fail without fallback. Put model on each tasks/chain entry, not the batch. worker_start and pool_start freeze the same option for their entire lifetime; send/push cannot switch models.",
             " File instructions: ordinary single/tasks/chain requests and workflow calls accept taskFile instead of task. Supply an absolute read-admitted workspace/agent file or local:// scratch document, containing nonempty UTF-8 instructions of at most 4 MiB (workflow tasks retain their 64 KiB expanded-task limit). Every source is captured before any child starts or a background job is acknowledged; results retain taskFile and taskFileSha256 for the original bytes. Queued tasks, schema retries and revival use the captured instructions. File content never changes the selected agent, model, tools, workspace or approval policy. Seance and retained workers/pools do not accept taskFile.",
             " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
@@ -655,7 +697,7 @@ impl Tool for SubagentTool {
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
                 "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": deadline::MAX_TIMEOUT_SECS, "description": "Budget for this whole delegation request, including queueing, chained steps and corrective retries. May shorten, never extend, the host's limit."},
-                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both"}
+                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both", "description": "Select authored profile sources. Project profiles require host-established workspace trust; scope cannot grant it. Built-ins are always available. User scope never reads project profiles."}
             },
             "definitions": {
                 "task": {
@@ -1163,32 +1205,21 @@ fn discover_agents_with_roots(
     cwd: &Path,
     global_dir: &Path,
     scope: AgentScope,
+    project_trusted: bool,
 ) -> Result<BTreeMap<String, AgentDefinition>> {
     // Scope selects authored overrides; bundled definitions are always available.
     let mut agents = bundled::definitions();
     if !matches!(scope, AgentScope::Project) {
         load_agent_dir(&global_dir.join("agents"), AgentSource::User, &mut agents)?;
     }
-    if !matches!(scope, AgentScope::User)
-        && let Some(project_dir) = nearest_project_agents_dir(cwd)
+    if project_trusted
+        && !matches!(scope, AgentScope::User)
+        && let Some(project_dir) = crate::workspace_trust::nearest_project_agents_dir(cwd)
     {
         // Project definitions intentionally replace user definitions of the same name.
         load_agent_dir(&project_dir, AgentSource::Project, &mut agents)?;
     }
     Ok(agents)
-}
-
-fn nearest_project_agents_dir(cwd: &Path) -> Option<PathBuf> {
-    let mut current = cwd.to_path_buf();
-    loop {
-        let candidate = current.join(".pi").join("agents");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
 }
 
 fn load_agent_dir(
@@ -1811,6 +1842,208 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.md")), body).expect("write agent");
     }
 
+    fn project_guard(
+        cwd: &Path,
+        global_dir: &Path,
+        cli_trust: bool,
+    ) -> crate::workspace_trust::WorkspaceTrustGuard {
+        use crate::workspace_trust::{
+            TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish,
+        };
+
+        let inputs = TrustInputs {
+            cli_trust,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = establish(cwd, &global_dir.join(TRUST_STORE_FILE), &inputs, |_| {
+            panic!("noninteractive discovery must not prompt")
+        })
+        .expect("establish project trust");
+        WorkspaceTrustGuard::from_established(cwd, &state, &inputs, global_dir, None)
+    }
+
+    #[test]
+    fn untrusted_project_profiles_cannot_expand_bundled_or_user_tool_access() {
+        for with_user_profile in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let cwd = temp.path().join("workspace");
+            let global = temp.path().join("global");
+            let project_agents = cwd.join(".pi/agents");
+            write_agent(
+                &project_agents,
+                "scout",
+                "---\nname: scout\ndescription: project\ntools: eval,github,security_scan,subagent\n---\nproject prompt",
+            );
+            if with_user_profile {
+                write_agent(
+                    &global.join("agents"),
+                    "scout",
+                    "---\nname: scout\ndescription: user\ntools: read\n---\nuser prompt",
+                );
+            }
+            let tool = SubagentTool::with_paths(cwd, global, PathBuf::from("unused-child"));
+            for scope in [AgentScope::Both, AgentScope::Project, AgentScope::User] {
+                let agents = tool.discover(scope).expect("untrusted profiles skipped");
+                let scout = &agents["scout"];
+                let expected = if with_user_profile && !matches!(scope, AgentScope::Project) {
+                    assert!(matches!(scout.source, AgentSource::User));
+                    "read"
+                } else {
+                    assert!(matches!(scout.source, AgentSource::BuiltIn));
+                    "read,grep,find,ls"
+                };
+                let args = child_args(scout, "inspect", None, None, None, None);
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair[0] == "--tools" && pair[1] == expected)
+                );
+            }
+
+            let trusted = tool.with_project_trust(true);
+            let agents = trusted
+                .discover(AgentScope::Both)
+                .expect("explicit host trust");
+            assert!(matches!(agents["scout"].source, AgentSource::Project));
+            let args = child_args(&agents["scout"], "inspect", None, None, None, None);
+            assert!(args.windows(2).any(|pair| {
+                pair[0] == "--tools" && pair[1] == "eval,github,security_scan,subagent"
+            }));
+
+            write_agent(&project_agents, "scout", "malformed project definition");
+            assert!(trusted.discover(AgentScope::Both).is_err());
+            let denied = trusted.with_project_trust(false);
+            for scope in [AgentScope::Both, AgentScope::Project, AgentScope::User] {
+                denied.discover(scope).expect("denied bytes are not parsed");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_project_denial_overrides_builder_flags_and_anchors_user_profiles() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().join("workspace");
+        let global = temp.path().join("captured-global");
+        let other_global = temp.path().join("other-global");
+        write_agent(
+            &cwd.join(".pi/agents"),
+            "scout",
+            "---\nname: scout\ndescription: project\ntools: eval,github,security_scan,subagent\n---\nproject prompt",
+        );
+        for (root, description) in [(&global, "captured user"), (&other_global, "other user")] {
+            write_agent(
+                &root.join("agents"),
+                "scout",
+                &format!(
+                    "---\nname: scout\ndescription: {description}\ntools: read\n---\nuser prompt"
+                ),
+            );
+        }
+        let denied_guard = project_guard(&cwd, &global, false);
+        assert!(!denied_guard.trusted());
+        // A later process's approval cannot promote the original launch.
+        assert!(project_guard(&cwd, &global, true).trusted());
+        for guard_first in [false, true] {
+            let tool = SubagentTool::with_paths(
+                cwd.clone(),
+                other_global.clone(),
+                PathBuf::from("unused-child"),
+            );
+            let tool = if guard_first {
+                tool.with_workspace_trust_guard(Some(denied_guard.clone()))
+                    .with_project_trust(true)
+            } else {
+                tool.with_project_trust(true)
+                    .with_workspace_trust_guard(Some(denied_guard.clone()))
+            };
+            for scope in [AgentScope::Both, AgentScope::User] {
+                let agents = tool.discover(scope).expect("captured user profiles");
+                assert_eq!(agents["scout"].description, "captured user");
+            }
+            assert!(matches!(
+                tool.discover(AgentScope::Project)
+                    .expect("bundled fallback")["scout"]
+                    .source,
+                AgentSource::BuiltIn
+            ));
+        }
+    }
+
+    #[test]
+    fn project_profile_changes_require_fresh_admission_before_request_preparation() {
+        for inherited in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let project = temp.path().join("workspace");
+            let cwd = if inherited {
+                project.join("nested")
+            } else {
+                project.clone()
+            };
+            std::fs::create_dir_all(&cwd).expect("workspace");
+            let global = temp.path().join("global");
+            let profiles = project.join(".pi/agents");
+            write_agent(
+                &profiles,
+                "scout",
+                "---\nname: scout\ndescription: admitted\ntools: read\n---\noriginal prompt",
+            );
+            let guard = project_guard(&cwd, &global, true);
+            let tool = SubagentTool::with_paths(
+                cwd.clone(),
+                global.clone(),
+                PathBuf::from("unused-child"),
+            )
+            .with_model_config(Some(Config::default()))
+            .with_workspace_trust_guard(Some(guard));
+            let mut request: SubagentRequest =
+                serde_json::from_value(json!({"agent":"scout", "task":"inspect"}))
+                    .expect("request");
+            let admitted = tool
+                .prepare_request(&request)
+                .expect("freeze admitted profile");
+            assert_eq!(
+                admitted.agents["scout"].tools,
+                Some(vec!["read".to_string()])
+            );
+
+            write_agent(
+                &profiles,
+                "scout",
+                "---\nname: scout\ndescription: changed\ntools: eval,github,security_scan,subagent\n---\nchanged prompt",
+            );
+            for scope in [AgentScope::Both, AgentScope::Project] {
+                request.scope = scope;
+                let error = tool
+                    .prepare_request(&request)
+                    .err()
+                    .expect("changed profile must fail before child preparation");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")
+                );
+            }
+            assert_eq!(
+                admitted.agents["scout"].tools,
+                Some(vec!["read".to_string()])
+            );
+            request.scope = AgentScope::User;
+            let user = tool
+                .prepare_request(&request)
+                .expect("user-only remains usable");
+            assert!(matches!(user.agents["scout"].source, AgentSource::BuiltIn));
+
+            let fresh_guard = project_guard(&cwd, &global, true);
+            assert!(tool.discover(AgentScope::Both).is_err());
+            let fresh = tool.with_workspace_trust_guard(Some(fresh_guard));
+            let agents = fresh
+                .discover(AgentScope::Both)
+                .expect("new launch admission");
+            assert_eq!(agents["scout"].description, "changed");
+        }
+    }
+
     #[test]
     fn project_agents_override_user_and_parse_runtime_configuration() {
         let temp = TempDir::new().expect("tempdir");
@@ -1826,7 +2059,8 @@ mod tests {
             "scout",
             "---\nname: scout\ndescription: project\nmodel: provider/project\nthinking: high\ntools: read,find\n---\nproject prompt",
         );
-        let agents = discover_agents_with_roots(&cwd, &global, AgentScope::Both).expect("discover");
+        let agents =
+            discover_agents_with_roots(&cwd, &global, AgentScope::Both, true).expect("discover");
         let scout = agents.get("scout").expect("project scout");
         assert_eq!(scout.description, "project");
         assert_eq!(scout.model.as_deref(), Some("provider/project"));
@@ -2155,7 +2389,7 @@ mod tests {
             "typed",
             "---\nname: typed\ndescription: typed agent\noutput_schema: {\"type\": \"object\"}\n---\nbody",
         );
-        let agents = discover_agents_with_roots(temp.path(), &global, AgentScope::User)
+        let agents = discover_agents_with_roots(temp.path(), &global, AgentScope::User, false)
             .expect("discover typed agent");
         assert_eq!(
             agents.get("typed").expect("typed").output_schema,
@@ -2167,7 +2401,7 @@ mod tests {
             "broken",
             "---\nname: broken\ndescription: broken agent\noutput_schema: {not json\n---\nbody",
         );
-        let error = discover_agents_with_roots(temp.path(), &global, AgentScope::User)
+        let error = discover_agents_with_roots(temp.path(), &global, AgentScope::User, false)
             .expect_err("invalid schema must fail agent loading");
         assert!(error.to_string().contains("output_schema"), "{error}");
     }

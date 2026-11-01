@@ -366,10 +366,10 @@ fn discovery_rejects_same_directory_duplicates_but_preserves_project_override() 
     let user = global.join("agents");
     write_agent(&user, "one.md", "tools: [read]");
     write_agent(&cwd.join(".pi/agents"), "one.md", "tools: []");
-    let loaded = discover_agents_with_roots(&cwd, &global, AgentScope::Both).unwrap();
+    let loaded = discover_agents_with_roots(&cwd, &global, AgentScope::Both, true).unwrap();
     assert_eq!(loaded["analyst"].tools, Some(Vec::new()));
     write_agent(&user, "two.md", "tools: [bash]");
-    assert!(discover_agents_with_roots(&cwd, &global, AgentScope::User).is_err());
+    assert!(discover_agents_with_roots(&cwd, &global, AgentScope::User, false).is_err());
 }
 
 #[test]

@@ -148,6 +148,17 @@ session. Refusal preserves the current session and previously loaded resources.
 Global `trustAllWorkspaces` and `PI_WORKSPACE_TRUST=trusted` retain their
 documented broad scope, while current global policy and stored trust are
 checked again. A workspace launched untrusted remains excluded until restart.
+The classic terminal UI also revalidates this admission before `/reload`
+resolves packages or refreshes resources; a refusal preserves its loaded
+prompts, skills, and current session.
+
+Enabling `subagent` grants access to bundled and global agent definitions.
+Project profiles from the nearest `.pi/agents/*.md` directory require workspace
+trust independently of that activation setting. They are part of the trust
+digest even when discovered in an ancestor directory: a profile can select
+child tools and override a bundled or global agent. Untrusted project profiles
+are excluded from both `scope: "both"` and `scope: "project"`.
+`scope: "user"` remains available without reading project profiles.
 
 `tools.loadMode.<name>` (also `tools.load_mode.<name>`) configures tool exposure
 as `essential`, `discoverable`, or `off`. An explicit `off` setting excludes a

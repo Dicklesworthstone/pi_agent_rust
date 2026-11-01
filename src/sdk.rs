@@ -500,15 +500,17 @@ pub struct SessionOptions {
     /// Optional factory for the session's [`ToolRegistry`].
     ///
     /// When `None` (the default), [`create_agent_session`] builds the
-    /// built-in tool set from [`SessionOptions::enabled_tools`] exactly
-    /// as it always has — existing callers are unaffected.
+    /// built-in tool set from [`SessionOptions::enabled_tools`] and applies
+    /// the session's workspace admission to project agent definitions.
     ///
     /// Setting this lets a downstream embedder layer custom tools onto
     /// the registry: approval-gated wrappers around the built-ins, a
     /// read-only "plan mode" subset, a `Task` tool that spawns nested
     /// sandboxed sessions, etc. Implement [`ToolFactory`] on your own
     /// `Send + Sync` type and call [`default_tool_registry`] from inside
-    /// it to inherit the current built-in resolution rules.
+    /// it to inherit the current built-in resolution rules. That baseline
+    /// helper excludes project agent definitions; a factory must retain its
+    /// own admission to opt into them with [`ToolRegistry::with_workspace_trust`].
     ///
     /// Wrapped in `Arc` because [`SessionOptions`] is cloned through
     /// the session-handle pipeline and the factory may need to outlive
@@ -677,12 +679,18 @@ pub trait ToolFactory: Send + Sync {
     /// - `cwd` is the working directory the session opened in.
     /// - `config` is pi's loaded [`Config`], passed through so custom
     ///   tools can read settings such as `block_images` without
-    ///   duplicating the config-loading logic.
+    ///   duplicating the config-loading logic. Receiving configuration does
+    ///   not grant workspace trust; the factory owns any explicit admission
+    ///   it supplies to [`ToolRegistry::with_workspace_trust`].
     fn create_tool_registry(&self, enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry;
 }
 
-/// Build the same [`ToolRegistry`] [`create_agent_session`] uses by
-/// default.
+/// Build the standard built-in registry without project agent definitions.
+///
+/// This helper has no workspace admission. Global and bundled agent profiles
+/// remain available when `subagent` is selected; hosts that explicitly admit
+/// project profiles can use [`ToolRegistry::with_workspace_trust`]. The SDK's
+/// default construction passes its effective session admission to that method.
 ///
 /// Useful inside a [`ToolFactory`] impl when you want to start from
 /// the standard built-in tool set and then layer custom tools on top
@@ -4237,12 +4245,14 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             if cli.builtin_tools_disabled() {
                 return ToolRegistry::without_builtins(Some(&config));
             }
-            ToolRegistry::with_mutation_recorder(
+            ToolRegistry::with_workspace_trust(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
                 Some(options.mutation_recorder.clone().unwrap_or_default()),
                 workspace.as_ref(),
+                workspace_trusted,
+                options.workspace_trust_guard.as_ref(),
             )
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
@@ -7299,6 +7309,92 @@ mod tests {
             assert!(!handle.has_tool(name), "captured denial must exclude {name}");
         }
         assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+    }
+
+    #[test]
+    fn sdk_subagent_discovery_uses_the_session_admission_and_rechecks_project_changes() {
+        use crate::workspace_trust::{
+            TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish,
+        };
+
+        for trusted in [false, true] {
+            let (tmp, mut options) = guarded_optional_tool_fixture(trusted);
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
+            let global_dir = tmp.path().join("global");
+            std::fs::write(
+                global_dir.join("settings.json"),
+                r#"{"tools":{"enableSubagent":true}}"#,
+            )
+            .expect("persistently enable native subagents");
+            let agents = cwd.join(".pi/agents");
+            std::fs::create_dir_all(&agents).expect("project agents directory");
+            let definition = "---\nname: sdk-project-probe\ndescription: Discovery sentinel\ntools: bash,eval\n---\nProject instructions\n";
+            for name in ["first.md", "second.md"] {
+                std::fs::write(agents.join(name), definition).expect("duplicate project role");
+            }
+            let inputs = TrustInputs {
+                cli_trust: trusted,
+                trust_all_workspaces: false,
+                env_override: None,
+                interactive: false,
+            };
+            let state = establish(&cwd, &global_dir.join(TRUST_STORE_FILE), &inputs, |_| {
+                Ok(false)
+            })
+            .expect("admit complete project surface");
+            options.workspace_trust_guard = Some(WorkspaceTrustGuard::from_established(
+                &cwd,
+                &state,
+                &inputs,
+                &global_dir,
+                None,
+            ));
+            let handle = run_async(create_agent_session(options)).expect("create guarded session");
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let tool = tools.get("subagent").expect("settings-enabled subagent");
+            // An unknown name exercises discovery without ever launching a child.
+            let probe = |scope| {
+                run_async(tool.execute(
+                    "sdk-agent-trust-probe",
+                    serde_json::json!({
+                        "agent": "missing-sdk-trust-probe",
+                        "task": "inspect discovery only",
+                        "scope": scope
+                    }),
+                    None,
+                ))
+            };
+            let user_only = probe("user").expect("global and bundled discovery remains usable");
+            assert!(user_only.is_error);
+            let discovered = probe("both");
+            if trusted {
+                let error = discovered
+                    .err()
+                    .expect("trusted duplicate definitions are parsed");
+                assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
+                std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
+                    .expect("mutate admitted project profile");
+                let error = probe("both")
+                    .err()
+                    .expect("stale project admission must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")
+                );
+            } else {
+                let output = discovered.expect("denied project files must not be parsed");
+                assert!(output.is_error);
+                assert_eq!(
+                    output.details.expect("structured unknown-agent result")["results"][0]["error"],
+                    "Unknown agent: missing-sdk-trust-probe"
+                );
+            }
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
     }
 
     #[test]

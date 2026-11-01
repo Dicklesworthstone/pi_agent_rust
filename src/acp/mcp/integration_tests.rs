@@ -685,6 +685,7 @@ fn options(root: &Path, handle: asupersync::runtime::RuntimeHandle) -> AcpOption
         .unwrap();
     AcpOptions {
         settings_source: None,
+        workspace_trust_guard: None,
         launch: crate::acp::AcpLaunchOptions::default(),
         config: crate::config::Config::default(),
         available_models: vec![model],

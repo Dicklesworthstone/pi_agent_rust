@@ -668,9 +668,16 @@ for the bundled agent profiles.
 
 Agent definitions are Markdown files in `$PI_CODING_AGENT_DIR/agents/*.md`
 (normally `~/.pi/agent/agents/*.md`) or the nearest
-`.pi/agents/*.md`. Project definitions take precedence over same-named user
-definitions. The process inherits the parent's provider, router, authentication,
-and model-registry environment, including `PI_CODING_AGENT_DIR`.
+`.pi/agents/*.md`. Project definitions require workspace trust before they can
+override same-named bundled or user definitions. The trust digest includes the
+selected directory and its Markdown files, including a directory inherited
+from an ancestor workspace, because profiles choose child tools, models, and
+instructions. Enabling `subagent` does not grant that project authority.
+Untrusted workspaces retain bundled and global agents; `scope: "user"`
+excludes project profiles explicitly. A scoped grant is revalidated before
+project discovery, so changed profiles require a fresh launch and trust decision.
+The process inherits the parent's provider, router, authentication, and
+model-registry environment, including `PI_CODING_AGENT_DIR`.
 
 Children choose their model in this order: the agent definition's `model:` pin,
 the configured `task` role (or `smol` fallback), then the parent's active provider
@@ -955,7 +962,7 @@ Pi supports two extension runtime families with capability-gated host connectors
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
 - Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
 - Trust-state lifecycle and kill-switch controls with audited state transitions (`pending`/`acknowledged`/`trusted`/`killed`)
-- Workspace trust-on-first-use gate: project-local `.pi/settings.json` packages and `.pi/extensions/` require a one-time interactive approval (keyed to workspace path + content digest; `--trust`, `PI_WORKSPACE_TRUST`, or global `trustAllWorkspaces` for automation; non-interactive launches fail closed)
+- Workspace trust-on-first-use gate: project settings, extension files, MCP configuration, and discovered project agent profiles require approval keyed to workspace path and content digest. `--trust`, `PI_WORKSPACE_TRUST`, or global `trustAllWorkspaces` support automation; non-interactive launches fail closed.
 - Hostcall reactor mesh with deterministic shard routing, bounded queue backpressure, and optional NUMA-aware telemetry
 - Fresh owner-isolated realms on every reload, with versioned persistent transpile caching instead of mutable realm reuse
 

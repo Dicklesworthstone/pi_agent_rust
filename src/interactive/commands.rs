@@ -4437,6 +4437,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let config = self.config.clone();
         let cli = self.resource_cli.clone();
         let package_manager = self.package_manager.clone();
+        let workspace_trust_guard = self.workspace_trust_guard.clone();
         let cwd = self.cwd.clone();
         let event_tx = self.event_tx.clone();
         let extensions = self.extensions.clone();
@@ -4444,7 +4445,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
 
         runtime_handle.spawn(async move {
-            match ResourceLoader::load(&package_manager, &cwd, &config, &cli).await {
+            let global_dir = workspace_trust_guard
+                .as_ref()
+                .map_or_else(Config::global_dir, |guard| guard.global_dir().to_path_buf());
+            let loaded = async {
+                if let Some(guard) = &workspace_trust_guard {
+                    guard.validate_workspace(&cwd)?;
+                }
+                ResourceLoader::load(&package_manager, &cwd, &config, &cli).await
+            }
+            .await;
+            match loaded {
                 Ok(mut resources) => {
                     if let Some(manager) = extensions {
                         let discovered = manager.discover_resources(&cwd, "reload").await;
@@ -4459,15 +4470,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         }
                     }
 
-                    let auth_result = crate::auth::AuthStorage::load_async(Config::auth_path())
-                        .await
-                        .and_then(|mut auth| {
-                            auth.set_command_working_directory(&cwd)?;
-                            Ok(auth)
-                        });
+                    let auth_result =
+                        crate::auth::AuthStorage::load_async(global_dir.join("auth.json"))
+                            .await
+                            .and_then(|mut auth| {
+                                auth.set_command_working_directory(&cwd)?;
+                                Ok(auth)
+                            });
                     let models_error = match auth_result {
                         Ok(auth) => {
-                            let models_path = default_models_path(&Config::global_dir());
+                            let models_path = default_models_path(&global_dir);
                             let registry = ModelRegistry::load(&auth, Some(models_path));
                             registry.error().map(ToString::to_string)
                         }
@@ -5421,6 +5433,7 @@ mod tests {
 
         app.set_reload_package_manager(
             PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            None,
         );
         assert!(app.handle_slash_reload().is_none());
         let trusted = runtime().block_on(async {
@@ -5445,6 +5458,179 @@ mod tests {
                     .any(|skill| skill.name == expected),
                 "trusted reload should include {expected}"
             );
+        }
+    }
+
+    fn classic_reload_guard(
+        cwd: &Path,
+        global_dir: &Path,
+        trusted: bool,
+    ) -> crate::workspace_trust::WorkspaceTrustGuard {
+        let inputs = crate::workspace_trust::TrustInputs {
+            cli_trust: trusted,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = crate::workspace_trust::establish(
+            cwd,
+            &global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
+            &inputs,
+            |_| Ok(false),
+        )
+        .expect("establish launch trust");
+        assert_eq!(state.trusted, trusted);
+        crate::workspace_trust::WorkspaceTrustGuard::from_established(
+            cwd, &state, &inputs, global_dir, None,
+        )
+    }
+
+    fn receive_reload_event(event_rx: &mut asupersync::channel::mpsc::Receiver<PiMsg>) -> PiMsg {
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(30),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("reload event before timeout")
+            .expect("reload event")
+        })
+    }
+
+    #[test]
+    fn classic_reload_rejects_changed_packages_and_preserves_loaded_prompts() {
+        let workspace = TempDir::new().expect("workspace");
+        let global = TempDir::new().expect("global configuration");
+        let cwd = workspace.path();
+        let project_dir = cwd.join(".pi");
+        let prompts = project_dir.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        let settings_path = project_dir.join("settings.json");
+        std::fs::write(&settings_path, r#"{"packages":[]}"#).expect("initial settings");
+        let prompt_path = prompts.join("trust-reload-281.md");
+        std::fs::write(&prompt_path, "Trusted $1").expect("initial prompt");
+        let guard = classic_reload_guard(cwd, global.path(), true);
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli = ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![prompt_path.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        // Seed an actual loader without resolving any configured packages.
+        app.resources = runtime()
+            .block_on(ResourceLoader::load(
+                &app.package_manager,
+                cwd,
+                &app.config,
+                &app.resource_cli,
+            ))
+            .expect("initial explicit prompt");
+        app.autocomplete.provider.set_catalog(
+            crate::autocomplete::AutocompleteCatalog::from_resources(&app.resources),
+        );
+        app.resource_cli.no_prompt_templates = false;
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            Some(guard),
+        );
+        let session_id = current_session_id(&app);
+        std::fs::write(&settings_path, r#"{"packages":["git:./missing-package"]}"#)
+            .expect("changed project package");
+        std::fs::write(&prompt_path, "Changed $1").expect("changed prompt");
+
+        assert!(app.handle_slash_reload().is_none());
+        let event = receive_reload_event(&mut event_rx);
+        assert!(matches!(&event, PiMsg::AgentError(error)
+            if error.contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")));
+        let _ = app.handle_pi_message(event);
+        assert_eq!(
+            app.resources.expand_input("/trust-reload-281 #281"),
+            "Trusted #281"
+        );
+        assert_eq!(current_session_id(&app), session_id);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        for path in [
+            "git",
+            "npm",
+            "packages.lock.json",
+            "package-trust-audit.jsonl",
+        ] {
+            assert!(
+                !project_dir.join(path).exists(),
+                "created package state: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classic_reload_keeps_a_denied_launch_inert_despite_a_trusted_manager() {
+        let workspace = TempDir::new().expect("workspace");
+        let global = TempDir::new().expect("global configuration");
+        let cwd = workspace.path();
+        let project_dir = cwd.join(".pi");
+        let prompts = project_dir.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        let settings_path = project_dir.join("settings.json");
+        let package_settings = r#"{"packages":["git:./missing-package"]}"#;
+        std::fs::write(&settings_path, package_settings).expect("untrusted package");
+        std::fs::write(prompts.join("trust-reload-project-281.md"), "Project $1")
+            .expect("project prompt");
+        let explicit_prompt = cwd.join("trust-reload-explicit-281.md");
+        std::fs::write(&explicit_prompt, "Explicit $1").expect("explicit prompt");
+        let guard = classic_reload_guard(cwd, global.path(), false);
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli = ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: false,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![explicit_prompt.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            Some(guard),
+        );
+
+        for settings in [package_settings, "malformed project configuration"] {
+            std::fs::write(&settings_path, settings).expect("update untrusted settings");
+            assert!(app.handle_slash_reload().is_none());
+            let event = receive_reload_event(&mut event_rx);
+            assert!(matches!(&event, PiMsg::ResourcesReloaded { .. }));
+            let _ = app.handle_pi_message(event);
+            assert_eq!(
+                app.resources
+                    .expand_input("/trust-reload-explicit-281 #281"),
+                "Explicit #281"
+            );
+            assert!(
+                app.resources
+                    .prompts()
+                    .iter()
+                    .all(|prompt| prompt.name != "trust-reload-project-281")
+            );
+            for path in [
+                "git",
+                "npm",
+                "packages.lock.json",
+                "package-trust-audit.jsonl",
+            ] {
+                assert!(
+                    !project_dir.join(path).exists(),
+                    "created package state: {path}"
+                );
+            }
         }
     }
 

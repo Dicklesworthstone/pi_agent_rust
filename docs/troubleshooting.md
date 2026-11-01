@@ -70,18 +70,21 @@ Common fixes:
 Extension discovery is tracked under **bd-1e0** (install + resolution). If an
 extension fails to load, expect diagnostics to improve as that bead lands.
 
-**Symptom:** project-local `.pi/settings.json` packages or `.pi/extensions/`
-entries are not loading, or a "Trust this workspace?" prompt appears.
+**Symptom:** project-local packages, extensions, MCP configuration, or agent
+profiles are not loading, or a "Trust this workspace?" prompt appears.
 
 Project-local configuration can execute code (npm/git package installs run
-lifecycle scripts; project extensions run JavaScript at session startup), so
+lifecycle scripts; project extensions run JavaScript at session startup;
+agent profiles choose child tool permissions and instructions), so
 Pi gates it behind a workspace trust decision (GH #151):
 
 - On the first interactive launch in a workspace that declares such
   configuration, Pi lists what would execute and asks once. The answer is
   remembered in `~/.pi/agent/workspace-trust.json`, keyed to the workspace
   path **and** a content digest — editing `.pi/settings.json` or anything
-  under `.pi/extensions/` re-prompts.
+  under `.pi/extensions/`, project MCP configuration, or the discovered
+  `.pi/agents/*.md` profiles re-prompts. Agent discovery includes the nearest
+  ancestor directory when the current workspace has no agent directory.
 - Non-interactive launches (`--mode rpc`, `-p/--print`, piped stdin) fail
   closed: project-local configuration is skipped for that run with a warning,
   and nothing is persisted.
@@ -93,6 +96,9 @@ Pi gates it behind a workspace trust decision (GH #151):
   as user consent and are never gated.
 - To revoke trust, edit or delete the workspace's entry in
   `~/.pi/agent/workspace-trust.json`.
+- If a running session reports `PI_WORKSPACE_TRUST_RESTART_REQUIRED`, restart
+  Pi to review the changed content and resolve resources under the new grant.
+  Both terminal UIs preserve existing resources when reload is refused.
 
 ## Sessions (persistence + recovery)
 

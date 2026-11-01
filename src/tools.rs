@@ -5842,7 +5842,7 @@ impl ToolRegistry {
 
     /// Every name `--tools` will honour.
     ///
-    /// The match in [`Self::with_mutation_recorder`] ends in `_ => {}`, so a
+    /// The match in [`Self::with_workspace_trust`] ends in `_ => {}`, so a
     /// name it does not know is dropped without a word: `pi --tools
     /// completely_made_up` starts an agent with no tools at all and says
     /// nothing, and `--tools read,bsah,edit` quietly hands the model two tools
@@ -5921,13 +5921,38 @@ impl ToolRegistry {
     /// Like [`ToolRegistry::new`] but attaches a session undo recorder to the
     /// mutating file tools (bd-cv653.3.13). `workspace` installs the shared
     /// multi-root handle on every path-confining tool (bd-cv653.3.12).
-    #[allow(clippy::too_many_lines)]
+    /// Project agent definitions remain excluded without an explicit host
+    /// decision; trust-aware hosts use [`Self::with_workspace_trust`].
     pub fn with_mutation_recorder(
         enabled: &[&str],
         cwd: &Path,
         config: Option<&Config>,
         mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
         workspace: Option<&WorkspaceHandle>,
+    ) -> Self {
+        Self::with_workspace_trust(
+            enabled,
+            cwd,
+            config,
+            mutation_recorder,
+            workspace,
+            false,
+            None,
+        )
+    }
+
+    /// Build tools with the host's admission for project agent definitions.
+    /// A retained guard takes precedence over the boolean and is revalidated
+    /// before discovery can turn a project profile into child CLI arguments.
+    #[allow(clippy::too_many_lines)]
+    pub fn with_workspace_trust(
+        enabled: &[&str],
+        cwd: &Path,
+        config: Option<&Config>,
+        mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+        workspace: Option<&WorkspaceHandle>,
+        project_trusted: bool,
+        workspace_trust_guard: Option<&crate::workspace_trust::WorkspaceTrustGuard>,
     ) -> Self {
         let legacy_workspace = WorkspaceHandle::default();
         let workspace = workspace.unwrap_or(&legacy_workspace);
@@ -6097,6 +6122,8 @@ impl ToolRegistry {
                     let role_model_selection = config.and_then(crate::app::subagent_role_selection);
                     tools.push(Box::new(
                         crate::subagents::SubagentTool::new(cwd)
+                            .with_project_trust(project_trusted)
+                            .with_workspace_trust_guard(workspace_trust_guard.cloned())
                             .with_structured_results(structured_results)
                             .with_workspace(workspace.clone())
                             .with_secrets_settings(
