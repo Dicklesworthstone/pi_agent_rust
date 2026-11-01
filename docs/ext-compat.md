@@ -255,6 +255,17 @@ exposes no snapshot keys or values. Pi
 advertises its configuration directory through `PI_CONFIG_DIR` metadata while
 preserving an explicitly configured value. This lets child integrations
 identify their host without receiving read access to a parent data directory.
+
+`PWD` and `PI_WORKSPACE_DIR` are reserved workspace metadata. Both follow the
+runtime's selected working directory, replacing stale values inherited from
+the launcher. This keeps context-mode's extension and MCP child on the selected
+project database when an SDK or resumed session uses a different directory.
+Windows snapshots contain one canonical spelling of each key. An admitted
+`PI_DETERMINISTIC_CWD` override follows the existing `process.cwd()` contract;
+an override hidden by environment policy or SecretBroker is never copied into
+these bindings. The metadata remains subject to environment disclosure policy
+and grants no filesystem access. Unrelated explicit bindings are preserved.
+
 Context-mode's MCP server still needs a real Node or Bun executable on PATH.
 Its process launch and environment snapshot require the existing `exec` and
 `env` permissions; installing a package or granting storage does not enable
@@ -487,6 +498,26 @@ for an empty request. This deterministic normalization preserves explicit
 timestamps and does not repair malformed values or relax the persisted
 message schema. Context transformations affect the provider request without
 adding those injected messages to durable conversation history.
+
+### Tool-result capture and transforms
+
+`tool_result` events retain the existing flat `content`, `details`, and
+`isError` fields and also expose `result: { content, details, isError }`.
+Context-mode 1.0.169 reads this structured result to extract error text, facts,
+and MCP responses for its persistent session history and compaction snapshot.
+Without it, that adapter can record an error with empty text or miss facts in
+otherwise successful tool output.
+
+QuickJS handlers receive the accepted output from earlier handlers in the
+existing direct-handler order, followed by event-bus order, including across
+isolated realms. Each handler receives a fresh deep snapshot. Only explicitly
+returned, validated flat `content` and `details` fields change the result;
+in-place mutation, a void return, and null fields preserve prior accepted
+values. A malformed patch is rejected as a whole without undoing earlier
+transforms. The structured `result` view is rebuilt before the next handler,
+so it cannot expose output that an earlier handler has replaced. The host
+retains authority over `isError`; neither a returned error flag nor a returned
+nested `result` object changes the execution outcome or the transform contract.
 
 ### Session and State APIs
 

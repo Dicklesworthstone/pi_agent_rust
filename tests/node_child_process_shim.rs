@@ -903,9 +903,15 @@ fn persistent_stdio_peer() {
     if std::env::var("PIJS_STDIO_TEST_PEER").as_deref() != Ok("enabled") {
         return;
     }
+    let workspace = std::env::var("PI_WORKSPACE_DIR").expect("child workspace metadata");
+    assert_eq!(std::env::var("PWD").as_deref(), Ok(workspace.as_str()));
     assert_eq!(
-        std::env::var("PI_WORKSPACE_DIR").as_deref(),
-        Ok("snapshot-fixture")
+        std::fs::canonicalize(&workspace).expect("workspace path"),
+        std::env::current_dir()
+            .expect("child cwd")
+            .canonicalize()
+            .expect("canonical child cwd"),
+        "both inherited and explicitly copied environments must use the selected workspace"
     );
     for name in [
         "NODE_OPTIONS",
@@ -976,6 +982,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
     // node:path but is not an ordinary child environment binding.
     for (name, value) in [
         ("PI_WORKSPACE_DIR", "snapshot-fixture"),
+        ("PWD", "/stale/launcher/workspace"),
         ("NODE_OPTIONS", "--require=untrusted"),
         ("LD_PRELOAD", "/untrusted.so"),
         ("PYTHONPATH", "/untrusted/python"),

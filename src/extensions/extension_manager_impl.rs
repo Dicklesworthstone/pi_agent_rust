@@ -5169,8 +5169,8 @@ impl ExtensionManager {
         Ok(response)
     }
 
-    /// Dispatch a `tool_result` event to registered extensions and return the
-    /// last handler response (if any).
+    /// Dispatch a `tool_result` event and return the accepted content/details
+    /// overrides. QuickJS handlers compose explicit overrides in event order.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::significant_drop_tightening)]
     pub async fn dispatch_tool_result(
@@ -5231,7 +5231,14 @@ impl ExtensionManager {
             "input": tool_call.arguments.clone(),
             "content": output.content.clone(),
             "details": output.details.clone(),
-            "isError": is_error
+            "isError": is_error,
+            // Context-mode and other result consumers read this complete
+            // output object. The flat fields remain the transform contract.
+            "result": {
+                "content": output.content.clone(),
+                "details": output.details.clone(),
+                "isError": is_error
+            }
         });
 
         let mut response: Option<ToolResultEventResult> = None;
@@ -5259,8 +5266,19 @@ impl ExtensionManager {
         if has_hook_wasm {
             let mut wasm_payload = event_payload;
             if let Value::Object(map) = &mut wasm_payload {
+                // A later runtime must observe the accepted JS transform,
+                // including through the complete result object.
+                if let Some(previous) = &response {
+                    if let Some(content) = &previous.content {
+                        map.insert("content".into(), json!(content));
+                    }
+                    if let Some(details) = &previous.details {
+                        map.insert("details".into(), details.clone());
+                    }
+                }
                 map.insert("ctx".into(), (*ctx_payload).clone());
             }
+            refresh_tool_result_event_payload(&mut wasm_payload);
             if let Some(value) = Self::dispatch_wasm_event_value(
                 &wasm_extensions,
                 event_name,
@@ -5269,10 +5287,18 @@ impl ExtensionManager {
             )
             .await?
             {
-                response = Some(
-                    serde_json::from_value(value)
-                        .map_err(|err| Error::extension(err.to_string()))?,
-                );
+                let next: ToolResultEventResult = serde_json::from_value(value)
+                    .map_err(|err| Error::extension(err.to_string()))?;
+                if let Some(previous) = &mut response {
+                    if next.content.is_some() {
+                        previous.content = next.content;
+                    }
+                    if next.details.is_some() {
+                        previous.details = next.details;
+                    }
+                } else {
+                    response = Some(next);
+                }
             }
         }
 

@@ -15097,6 +15097,46 @@ struct JsEventPhaseEnvelope {
     value: Value,
 }
 
+/// Validate a tool-result rewrite before exposing it to another handler.
+/// Null fields have the same keep-current semantics as the host response API.
+pub(crate) fn normalize_tool_result_patch(value: Value) -> Result<serde_json::Map<String, Value>> {
+    if value.is_null() {
+        return Ok(serde_json::Map::new());
+    }
+    if !value.is_object() {
+        return Err(Error::extension(
+            "tool_result handler response must be an object or null",
+        ));
+    }
+    let response: ToolResultEventResult = serde_json::from_value(value)
+        .map_err(|err| Error::extension(format!("Invalid tool_result handler response: {err}")))?;
+    let mut patch = serde_json::Map::new();
+    if let Some(content) = response.content {
+        patch.insert("content".to_string(), serde_json::to_value(content)?);
+    }
+    if let Some(details) = response.details {
+        patch.insert("details".to_string(), details);
+    }
+    Ok(patch)
+}
+
+/// Keep the structured read view consistent with the current flat event fields.
+/// Only the host supplies `isError`; handler response patches cannot change it.
+pub(crate) fn refresh_tool_result_event_payload(payload: &mut Value) {
+    if let Some(event) = payload.as_object_mut() {
+        let content = event
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let details = event.get("details").cloned().unwrap_or(Value::Null);
+        let is_error = event.get("isError").cloned().unwrap_or(Value::Bool(false));
+        event.insert(
+            "result".to_string(),
+            json!({ "content": content, "details": details, "isError": is_error }),
+        );
+    }
+}
+
 fn remaining_js_task_timeout(deadline: Instant, operation: &str) -> Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -15461,6 +15501,58 @@ async fn dispatch_extension_event_across_shards_until(
             json!({ "messages": messages })
         } else {
             Value::Null
+        });
+    }
+
+    if event_name == "tool_result" {
+        let mut payload = event_payload.clone();
+        refresh_tool_result_event_payload(&mut payload);
+        let mut result = serde_json::Map::new();
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: payload.clone(),
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        origin,
+                        deadline,
+                    },
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let patch = match normalize_tool_result_patch(value) {
+                    Ok(patch) => patch,
+                    Err(err) => {
+                        tracing::warn!(
+                            shard_index,
+                            phase,
+                            error = %err,
+                            "Ignoring invalid tool_result rewrite; preserving prior transforms"
+                        );
+                        continue;
+                    }
+                };
+                if let Some(event) = payload.as_object_mut() {
+                    for (key, value) in patch {
+                        event.insert(key.clone(), value.clone());
+                        result.insert(key, value);
+                    }
+                    refresh_tool_result_event_payload(&mut payload);
+                }
+            }
+        }
+        return Ok(if result.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(result)
         });
     }
 

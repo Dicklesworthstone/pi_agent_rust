@@ -18472,6 +18472,37 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             }
         }
 
+        // These bindings describe this runtime's workspace, not the shell
+        // that launched Pi. SDK sessions and resumed workspaces can select a
+        // different cwd without changing the host process directory. Retaining
+        // the shell's PWD or PI_WORKSPACE_DIR would make integrations persist
+        // one workspace's events in another workspace's database.
+        // Match process.cwd()'s admitted deterministic override, but never
+        // copy a broker-hidden value into a readable metadata binding.
+        let deterministic_cwd_allowed = !config.deny_env
+            && policy.as_ref().map_or_else(
+                || is_env_var_allowed("PI_DETERMINISTIC_CWD"),
+                |policy| !policy.secret_broker.is_secret("PI_DETERMINISTIC_CWD"),
+            );
+        let workspace_cwd = deterministic_cwd_allowed
+            .then(|| {
+                configured_environment_value(
+                    &config.env,
+                    "PI_DETERMINISTIC_CWD",
+                    windows_environment,
+                )
+                .filter(|value| !value.is_empty())
+            })
+            .flatten()
+            .unwrap_or(&config.cwd)
+            .to_string();
+        for key in ["PWD", "PI_WORKSPACE_DIR"] {
+            if windows_environment {
+                config.env.retain(|name, _| !name.eq_ignore_ascii_case(key));
+            }
+            config.env.insert(key.to_string(), workspace_cwd.clone());
+        }
+
         // This is host metadata, not a filesystem grant. Child integrations
         // identify Pi from it without probing a parent of their data root.
         // Preserve explicit snapshots and avoid ambient HOME when supplied.
@@ -19989,6 +20020,38 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 global.set(
                     "__pi_host_temp_roots_json",
                     Func::from(move || extension_temp_roots_json.clone()),
+                )?;
+                global.set(
+                    "__pi_tool_result_json_native",
+                    Func::from(
+                        |input: Value<'_>, validate_patch: bool| -> rquickjs::Result<String> {
+                            // Reuse the bounded host JSON conversion for snapshots
+                            // and the host's exact response schema for rewrites.
+                            let value = js_to_json(&input)?;
+                            let value = if validate_patch {
+                                serde_json::Value::Object(
+                                    crate::extensions::normalize_tool_result_patch(value).map_err(
+                                        |err| {
+                                            rquickjs::Error::new_into_js_message(
+                                                "tool_result",
+                                                "response",
+                                                err.to_string(),
+                                            )
+                                        },
+                                    )?,
+                                )
+                            } else {
+                                value
+                            };
+                            serde_json::to_string(&value).map_err(|err| {
+                                rquickjs::Error::new_into_js_message(
+                                    "tool_result",
+                                    "json",
+                                    err.to_string(),
+                                )
+                            })
+                        },
+                    ),
                 )?;
 
                 // Install native functions that return call_ids
@@ -24048,6 +24111,11 @@ function __pi_project_model_entry(raw) {
     return out;
 }
 
+// Capture the JSON reader and native snapshotter before extension code runs.
+// The native conversion is bounded and does not invoke extension toJSON hooks.
+const __pi_tool_result_parse_json = JSON.parse;
+const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
+
 	async function __pi_dispatch_event_inner(eventName, event_payload, ctx, handlerPhase = 'all') {
 	    // gh #167: remember the host-provided system prompt (even with zero
 	    // handlers) so ctx.getSystemPrompt() works on later events too.
@@ -24182,6 +24250,50 @@ function __pi_project_model_entry(raw) {
 	        // Return the messages even for in-place/void handlers so changes
 	        // survive the realm boundary and cannot be lost to a later owner.
 	        return { messages: currentMessages };
+	    }
+
+	    if (eventName === 'tool_result') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        const current = __pi_tool_result_parse_json(__pi_tool_result_json(base, false));
+	        if (current.content === undefined) current.content = [];
+	        if (current.details === undefined) current.details = null;
+	        const isError = current.isError === undefined ? false : current.isError;
+	        const response = {};
+	        let modified = false;
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            current.result = { content: current.content, details: current.details, isError };
+	            // Handlers may inspect either shape. A fresh deep snapshot keeps
+	            // void/in-place mutations from becoming implicit returned patches.
+	            const event = __pi_tool_result_parse_json(__pi_tool_result_json(current, false));
+	            let value = undefined;
+	            try {
+	                value = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            if (value === undefined || value === null) continue;
+	            let patch;
+	            try {
+	                patch = __pi_tool_result_parse_json(__pi_tool_result_json(value, true));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Invalid tool_result handler response (ignored):', entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            if (patch.content !== undefined) {
+	                current.content = patch.content;
+	                response.content = patch.content;
+	                modified = true;
+	            }
+	            if (patch.details !== undefined) {
+	                current.details = patch.details;
+	                response.details = patch.details;
+	                modified = true;
+	            }
+	        }
+	        return modified ? response : undefined;
 	    }
 
 	    if (eventName === 'resources_discover') {
@@ -27861,11 +27973,17 @@ mod tests {
     /// and provider/model compatibility and thinking metadata are preserved.
     /// URL resolution, route ownership, and native provider regressions cover
     /// these changes; every virtual-module receipt remains unchanged.
+    ///
+    /// Re-pinned 2026-11-01 for gh #279: the tool-result transform branch
+    /// adds 2_602 bytes. Existing drift since the 237_923-byte receipt is
+    /// accounted for by d9999a5f (+363, footer/header factories), 27e9d778
+    /// (+1_177, environment/executable facade), and 70110103 (+5_689,
+    /// context transforms and timer lifecycle): 245_152 -> 247_754 bytes.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            237_923,
-            "ec8680176fdb8d45e609ee6549023d4ea21e0f37d78447f16d13a1cb1f0062f6",
+            247_754,
+            "29f10a474b23f3cda3ec56ce1f74781f2918cef375dd27ba5effa6a5b5b343ed",
         ),
         (
             "node:fs",
@@ -33785,6 +33903,178 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             let a = run_seeded_runtime_trace(0x00C0_FFEE).await;
             let b = run_seeded_runtime_trace(0x00C0_FFEE).await;
             assert_eq!(a, b);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_tool_result_handlers_chain_valid_explicit_rewrites() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    globalThis.seen = [];
+                    globalThis.done = false;
+                    globalThis.original = {
+                        type: 'tool_result', toolName: 'read', toolCallId: 'read-1',
+                        input: { path: '/workspace/file.txt' },
+                        content: [{ type: 'text', text: 'secret output' }],
+                        details: { secret: 'private detail' }, isError: true,
+                        metadata: { source: 'host' },
+                        result: { content: [{ type: 'text', text: 'stale duplicate' }] }
+                    };
+
+                    __pi_begin_extension(__pi_test_secret, 'ext.capture', { name: 'ext.capture' });
+                    pi.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        return {
+                            content: [{ type: 'text', text: '[redacted]' }],
+                            toJSON() { throw new Error('extension toJSON must not run'); }
+                        };
+                    });
+                    pi.on('tool_result', (event) => {
+                        event.content[0].text = 'implicit mutation';
+                        event.result.content[0].text = 'implicit nested mutation';
+                        event.details.secret = 'implicit detail';
+                        event.input.path = '/wrong/path';
+                        event.metadata.source = 'wrong source';
+                        event.isError = false;
+                    });
+                    pi.on('tool_result', () => ({
+                        content: [{ type: 'text', text: 123 }],
+                        details: { invalid: 'must not leak through a malformed patch' }
+                    }));
+                    pi.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        return { details: { stage: 'captured' }, isError: false };
+                    });
+                    pi.on('tool_result', () => ({ content: null, details: null }));
+                    pi.on('tool_result', () => null);
+                    pi.events.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        // This is the read shape used by unmodified context-mode.
+                        globalThis.captured = JSON.stringify(event?.result ?? event?.output);
+                        return { content: [...event.content, { type: 'text', text: 'bus rewrite' }] };
+                    });
+                    pi.events.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        return null;
+                    });
+                    __pi_end_extension(__pi_test_secret);
+
+                    (async () => {
+                        globalThis.result = await __pi_dispatch_extension_event(
+                            __pi_test_secret, 'tool_result', globalThis.original, {}
+                        );
+                        globalThis.done = true;
+                    })();
+                    "#,
+                ))
+                .await
+                .expect("eval");
+
+            assert_eq!(get_global_json(&runtime, "done").await, json!(true));
+            let seen = get_global_json(&runtime, "seen").await;
+            assert_eq!(seen.as_array().expect("handler observations").len(), 4);
+            assert_eq!(seen[0]["result"]["content"], seen[0]["content"]);
+            assert_eq!(seen[1]["content"][0]["text"], json!("[redacted]"));
+            assert_eq!(seen[1]["details"], json!({ "secret": "private detail" }));
+            for observation in seen.as_array().expect("observations") {
+                assert_eq!(observation["type"], json!("tool_result"));
+                assert_eq!(observation["toolName"], json!("read"));
+                assert_eq!(observation["toolCallId"], json!("read-1"));
+                assert_eq!(observation["input"]["path"], json!("/workspace/file.txt"));
+                assert_eq!(observation["metadata"]["source"], json!("host"));
+                assert_eq!(observation["isError"], json!(true));
+                assert_eq!(observation["result"]["isError"], json!(true));
+                assert_eq!(observation["result"]["content"], observation["content"]);
+                assert_eq!(observation["result"]["details"], observation["details"]);
+            }
+            assert_eq!(
+                seen[2]["result"],
+                json!({
+                    "content": [{ "type": "text", "text": "[redacted]" }],
+                    "details": { "stage": "captured" },
+                    "isError": true
+                })
+            );
+            let captured = get_global_json(&runtime, "captured").await;
+            let captured: serde_json::Value =
+                serde_json::from_str(captured.as_str().expect("captured output"))
+                    .expect("structured output");
+            assert_eq!(captured, seen[2]["result"]);
+            assert_eq!(
+                get_global_json(&runtime, "result").await,
+                json!({
+                    "content": [
+                        { "type": "text", "text": "[redacted]" },
+                        { "type": "text", "text": "bus rewrite" }
+                    ],
+                    "details": { "stage": "captured" }
+                })
+            );
+            let original = get_global_json(&runtime, "original").await;
+            assert_eq!(original["content"][0]["text"], json!("secret output"));
+            assert_eq!(original["details"], json!({ "secret": "private detail" }));
+            assert_eq!(original["input"]["path"], json!("/workspace/file.txt"));
+        });
+    }
+
+    #[test]
+    fn pijs_tool_result_noop_handlers_do_not_create_a_rewrite() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    globalThis.done = false;
+                    __pi_begin_extension(__pi_test_secret, 'ext.noop', { name: 'ext.noop' });
+                    pi.on('tool_result', (event) => {
+                        event.content.length = 0;
+                        event.result.details.nested.value = 'changed';
+                    });
+                    pi.on('tool_result', () => ({ content: null, details: null }));
+                    pi.on('tool_result', () => ({
+                        isError: true,
+                        result: { content: [{ type: 'text', text: 'unsupported return envelope' }] }
+                    }));
+                    pi.on('tool_result', () => 'invalid response');
+                    pi.events.on('tool_result', (event) => { globalThis.observed = event; });
+                    __pi_end_extension(__pi_test_secret);
+                    (async () => {
+                        const result = await __pi_dispatch_extension_event(
+                            __pi_test_secret, 'tool_result', {
+                                content: [{ type: 'text', text: 'original' }],
+                                details: { nested: { value: 'original' } }, isError: false
+                            }, {}
+                        );
+                        globalThis.wasUndefined = result === undefined;
+                        globalThis.done = true;
+                    })();
+                    "#,
+                ))
+                .await
+                .expect("eval");
+
+            assert_eq!(get_global_json(&runtime, "done").await, json!(true));
+            assert_eq!(get_global_json(&runtime, "wasUndefined").await, json!(true));
+            let observed = get_global_json(&runtime, "observed").await;
+            assert_eq!(observed["content"][0]["text"], json!("original"));
+            assert_eq!(observed["result"]["content"], observed["content"]);
+            assert_eq!(
+                observed["result"]["details"],
+                json!({ "nested": { "value": "original" } })
+            );
+            assert_eq!(observed["result"]["isError"], json!(false));
         });
     }
 

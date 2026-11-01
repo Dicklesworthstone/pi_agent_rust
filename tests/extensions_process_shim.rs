@@ -729,6 +729,8 @@ fn pijs_process_env_denial_applies_to_enumeration_and_config_metadata() {
             globalThis.deniedEnv = {
                 keys: Object.keys(process.env), spread: {...process.env},
                 configHidden: process.env.PI_CONFIG_DIR === undefined,
+                workspaceHidden: process.env.PI_WORKSPACE_DIR === undefined,
+                pwdHidden: process.env.PWD === undefined,
             };
         "#,
             )
@@ -738,6 +740,7 @@ fn pijs_process_env_denial_applies_to_enumeration_and_config_metadata() {
             runtime.read_global_json("deniedEnv").await.unwrap(),
             serde_json::json!({
                 "keys": [], "spread": {}, "configHidden": true,
+                "workspaceHidden": true, "pwdHidden": true,
             })
         );
     });
@@ -819,6 +822,161 @@ fn pijs_process_config_metadata_uses_the_supplied_home_without_creating_director
             !temp.path().join(".pi").exists(),
             "metadata must not create directories"
         );
+    });
+}
+
+#[test]
+fn pijs_workspace_identity_uses_the_selected_cwd_instead_of_the_launcher_environment() {
+    use sha2::Digest as _;
+
+    futures::executor::block_on(async {
+        for (platform, cwd, deterministic_cwd) in [
+            ("linux", "/workspaces/resumed", None),
+            ("win32", r"C:\Workspaces\Resumed", None),
+            ("linux", "/host/physical", Some("/deterministic/project")),
+        ] {
+            let expected = deterministic_cwd.unwrap_or(cwd);
+            let mut config = config_with_env(vec![
+                ("PI_PLATFORM", platform),
+                ("PWD", "/stale/launcher"),
+                ("PI_WORKSPACE_DIR", "/stale/previous-session"),
+                ("PI_PROJECT_DIR", "/explicit/legacy-project"),
+                ("PI_FIXTURE", "preserved"),
+            ]);
+            config.cwd = cwd.to_string();
+            config.disk_cache_dir = None;
+            if platform == "win32" {
+                config.env.extend([
+                    ("pWd".to_string(), r"D:\Stale\Launcher".to_string()),
+                    (
+                        "Pi_Workspace_Dir".to_string(),
+                        r"D:\Stale\Session".to_string(),
+                    ),
+                ]);
+            }
+            if let Some(deterministic_cwd) = deterministic_cwd {
+                config.env.insert(
+                    "PI_DETERMINISTIC_CWD".to_string(),
+                    deterministic_cwd.to_string(),
+                );
+            }
+            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+                .await
+                .expect("workspace runtime");
+            runtime
+                .eval(
+                    r#"
+                    import('node:crypto').then(({createHash}) => {
+                        // context-mode chooses these variables before cwd and
+                        // hashes the result to select its persistent database.
+                        const workspace = process.env.PI_WORKSPACE_DIR
+                            || process.env.PI_PROJECT_DIR || process.env.PWD || process.cwd();
+                        const normalized = workspace.replace(/\\/g, '/');
+                        const canonical = process.platform === 'win32'
+                            ? normalized.toLowerCase() : normalized;
+                        const copied = {...process.env};
+                        globalThis.workspaceIdentity = {
+                            cwd: process.cwd(), workspace, pwd: copied.PWD,
+                            copiedWorkspace: copied.PI_WORKSPACE_DIR,
+                            legacyProject: copied.PI_PROJECT_DIR,
+                            fixture: copied.PI_FIXTURE,
+                            workspaceKeys: Object.keys(copied).filter(key => key.toUpperCase() === 'PI_WORKSPACE_DIR'),
+                            pwdKeys: Object.keys(copied).filter(key => key.toUpperCase() === 'PWD'),
+                            databaseKey: createHash('sha256').update(canonical).digest('hex').slice(0, 16),
+                        };
+                    });
+                    "#,
+                )
+                .await
+                .expect("resolve extension project identity");
+            runtime.drain_microtasks().await.expect("load node:crypto");
+            let normalized = expected.replace('\\', "/");
+            let canonical = if platform == "win32" {
+                normalized.to_lowercase()
+            } else {
+                normalized
+            };
+            let database_key = format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()));
+            assert_eq!(
+                runtime.read_global_json("workspaceIdentity").await.unwrap(),
+                serde_json::json!({
+                    "cwd": expected, "workspace": expected, "pwd": expected,
+                    "copiedWorkspace": expected, "legacyProject": "/explicit/legacy-project",
+                    "fixture": "preserved", "workspaceKeys": ["PI_WORKSPACE_DIR"],
+                    "pwdKeys": ["PWD"], "databaseKey": &database_key[..16],
+                }),
+                "selected {platform} workspace must win over stale launcher state"
+            );
+        }
+    });
+}
+
+#[test]
+fn pijs_workspace_metadata_cannot_disclose_a_hidden_deterministic_cwd() {
+    use pi::extensions::{ExtensionPolicy, ExtensionPolicyMode};
+
+    futures::executor::block_on(async {
+        for disclosed in [false, true] {
+            let mut policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                deny_caps: Vec::new(),
+                ..ExtensionPolicy::default()
+            };
+            policy
+                .secret_broker
+                .secret_exact
+                .push("PI_DETERMINISTIC_CWD".to_string());
+            if disclosed {
+                policy
+                    .secret_broker
+                    .disclosure_allowlist
+                    .push("PI_DETERMINISTIC_CWD".to_string());
+            }
+            let mut config = config_with_env(vec![
+                ("PI_DETERMINISTIC_CWD", "/private/deterministic-workspace"),
+                ("PWD", "/stale/launcher"),
+                ("PI_WORKSPACE_DIR", "/stale/session"),
+            ]);
+            config.cwd = "/selected/workspace".to_string();
+            config.disk_cache_dir = None;
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                DeterministicClock::new(0),
+                config,
+                Some(policy),
+                "workspace-owner".to_string(),
+            )
+            .await
+            .expect("owned workspace runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.workspaceDisclosure = {
+                        cwd: process.cwd(), workspace: process.env.PI_WORKSPACE_DIR,
+                        copiedWorkspace: {...process.env}.PI_WORKSPACE_DIR,
+                        pwd: process.env.PWD,
+                        deterministic: process.env.PI_DETERMINISTIC_CWD ?? null,
+                    };
+                    "#,
+                )
+                .await
+                .expect("workspace disclosure");
+            let expected = if disclosed {
+                "/private/deterministic-workspace"
+            } else {
+                "/selected/workspace"
+            };
+            assert_eq!(
+                runtime
+                    .read_global_json("workspaceDisclosure")
+                    .await
+                    .unwrap(),
+                serde_json::json!({
+                    "cwd": expected, "workspace": expected, "copiedWorkspace": expected,
+                    "pwd": expected, "deterministic": disclosed.then_some(expected),
+                }),
+                "metadata must follow the same disclosure policy as process.cwd()"
+            );
+        }
     });
 }
 

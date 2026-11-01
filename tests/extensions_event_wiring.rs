@@ -953,6 +953,158 @@ fn dispatch_tool_result_with_hook_invoked() {
     );
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() {
+    let harness = common::TestHarness::new("tool_result_transform_chain");
+    let cwd = harness.temp_dir().to_path_buf();
+    let mut specs = Vec::new();
+    for (owner, source) in [
+        (
+            "redactor",
+            r#"
+            export default function init(pi) {
+                const seen = [];
+                const capture = (phase, event) => seen.push(JSON.parse(JSON.stringify({phase, event})));
+                pi.on('tool_result', event => {
+                    if (event.result.content[0].text !== 'private output' || !event.result.isError)
+                        throw new Error('missing authoritative input result');
+                    return { content: [{type:'text', text:'redacted output'}], details:{redacted:true}, isError:false };
+                });
+                pi.on('tool_result', event => {
+                    capture('before-void', event);
+                    event.content[0].text = 'unreturned mutation';
+                    event.result.details.redacted = false;
+                    event.input.path = 'unreturned path';
+                    event.isError = false;
+                });
+                pi.on('tool_result', event => {
+                    capture('before-invalid', event);
+                    // Reject the entire malformed patch, retaining the prior
+                    // accepted redaction and details for later consumers.
+                    return { content:42, details:{redacted:false} };
+                });
+                pi.events.on('tool_result', event => {
+                    capture('redactor-bus', event);
+                    return { details:{...event.details, bus:true} };
+                });
+                pi.registerCommand('redactor-observations', { handler:async () => seen });
+            }
+        "#,
+        ),
+        (
+            "observer",
+            r#"
+            export default function init(pi) {
+                const seen = [];
+                const capture = (phase, event) => seen.push(JSON.parse(JSON.stringify({phase, event})));
+                pi.on('tool_result', event => {
+                    capture('observer-direct', event);
+                    return { details:{...event.details, observer:true} };
+                });
+                pi.on('tool_result', () => ({content:null, details:null}));
+                pi.events.on('tool_result', event => {
+                    capture('observer-bus', event);
+                    return null;
+                });
+                pi.registerCommand('observer-observations', { handler:async () => seen });
+            }
+        "#,
+        ),
+    ] {
+        // Each index entry gets its own extension owner and QuickJS realm.
+        let entry =
+            harness.create_file(&format!("extensions/{owner}/index.mjs"), source.as_bytes());
+        specs.push(JsExtensionLoadSpec::from_entry_path(&entry).expect("load spec"));
+    }
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        disk_cache_dir: None,
+        ..Default::default()
+    };
+    common::run_async(async move {
+        let runtime = JsExtensionRuntimeHandle::start(config, tools, manager.clone())
+            .await
+            .expect("start runtime");
+        manager.set_js_runtime(runtime);
+        manager
+            .load_js_extensions(specs)
+            .await
+            .expect("load isolated extensions");
+        let call = make_tool_call("read", json!({"path":"original.txt"}));
+        let mut original = make_tool_output("private output");
+        original.details = Some(json!({"private":true}));
+        let transformed = manager
+            .dispatch_tool_result(&call, &original, true, 5_000)
+            .await
+            .expect("dispatch transformations")
+            .expect("accepted patch");
+        assert_eq!(
+            serde_json::to_value(transformed.content).unwrap(),
+            json!([
+                {"type":"text", "text":"redacted output"},
+            ])
+        );
+        assert_eq!(
+            transformed.details,
+            Some(json!({"redacted":true,"observer":true,"bus":true}))
+        );
+        assert_eq!(
+            original.details,
+            Some(json!({"private":true})),
+            "caller output stays immutable until applied"
+        );
+
+        let redactor = manager
+            .execute_command("redactor-observations", "", 5_000)
+            .await
+            .unwrap();
+        let observer = manager
+            .execute_command("observer-observations", "", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(redactor.as_array().unwrap().len(), 3);
+        assert_eq!(observer.as_array().unwrap().len(), 2);
+        for capture in redactor
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(observer.as_array().unwrap())
+        {
+            let event = &capture["event"];
+            assert_eq!(
+                event["content"],
+                json!([{"type":"text","text":"redacted output"}]),
+                "{capture}"
+            );
+            assert_eq!(event["result"]["content"], event["content"], "{capture}");
+            assert_eq!(event["result"]["details"], event["details"], "{capture}");
+            assert_eq!(event["details"]["redacted"], true, "{capture}");
+            assert_eq!(
+                event["isError"], true,
+                "the host owns the execution outcome"
+            );
+            assert_eq!(event["result"]["isError"], true);
+            assert_eq!(event["toolName"], "read");
+            assert_eq!(event["toolCallId"], "call-read");
+            assert_eq!(event["input"], json!({"path":"original.txt"}));
+        }
+        assert_eq!(redactor[2]["phase"], "redactor-bus");
+        assert_eq!(
+            redactor[2]["event"]["details"],
+            json!({"redacted":true,"observer":true})
+        );
+        assert_eq!(observer[1]["phase"], "observer-bus");
+        assert_eq!(
+            observer[1]["event"]["details"],
+            json!({"redacted":true,"observer":true,"bus":true})
+        );
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tests: Event hook filtering
 // ---------------------------------------------------------------------------

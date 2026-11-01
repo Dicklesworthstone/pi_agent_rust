@@ -947,7 +947,12 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
                     : `pi-${Date.now()}`;
                 write(sessionId, 'session_start', 'started');
             });
-            pi.on('tool_result', (event) => write(sessionId, 'tool_result', event.toolName));
+            pi.on('tool_result', (event) => {
+                // The unmodified adapter consumes result/output, including
+                // error text and facts used to build its resume snapshot.
+                const result = event.result ?? event.output;
+                write(sessionId, 'tool_result', typeof result === 'string' ? result : JSON.stringify(result));
+            });
             pi.registerCommand('ctx-storage-stats', {
                 description: 'Only registers after persistent SQLite initialization',
                 handler: async () => ({ display: JSON.stringify({
@@ -1079,16 +1084,40 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
         1,
         "unique event dedup survives a cold reload"
     );
-    dispatch(
-        &manager,
-        pi::extensions::ExtensionEventName::ToolResult,
-        Some(serde_json::json!({"toolName":"read"})),
-    );
+    let result_manager = manager.clone();
+    common::run_async(async move {
+        result_manager
+            .dispatch_tool_result(
+                &pi::model::ToolCall {
+                    id: "after-resume".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"command":"cargo test"}),
+                    thought_signature: None,
+                },
+                &pi::tools::ToolOutput {
+                    content: vec![pi::model::ContentBlock::Text(pi::model::TextContent::new(
+                        "Error: permission denied: /project/.cache",
+                    ))],
+                    details: Some(serde_json::json!({"exitCode":1})),
+                    is_error: true,
+                },
+                true,
+                5_000,
+            )
+            .await
+            .expect("capture real tool output after resume");
+    });
+    let expected_result = serde_json::json!({
+        "content":[{"type":"text","text":"Error: permission denied: /project/.cache"}],
+        "details":{"exitCode":1},
+        "isError":true,
+    })
+    .to_string();
     assert_eq!(
         stats(&manager)["rows"],
         serde_json::json!([
             {"type":"session_start","data":"started"},
-            {"type":"tool_result","data":"read"},
+            {"type":"tool_result","data":expected_result},
         ])
     );
     close(manager);
