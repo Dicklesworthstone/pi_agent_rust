@@ -133,6 +133,22 @@ cannot activate these tools or override global choices. Editing the project
 settings invalidates a stored trust decision. `PI_CONFIG_PATH` retains its
 existing explicit single-file behavior and skips the global/project merge.
 
+In the default terminal UI, omitting `--tools` keeps the selection driven by
+settings across session replacements. Global optional-tool settings are read
+again when `/new`, `/resume`, `/fork`, or `/reload` builds a session. An explicit
+CLI selection remains authoritative across those operations.
+
+A launch grant from `--trust`, a prompt, or the stored workspace decision
+applies to the admitted project configuration and executable resources.
+Changing that surface while Pi is running causes replacement and resource
+reload to report `PI_WORKSPACE_TRUST_RESTART_REQUIRED`. Restart Pi to
+re-establish trust and resolve the project resources together; approving the
+new digest in another process does not refresh cached paths in the running
+session. Refusal preserves the current session and previously loaded resources.
+Global `trustAllWorkspaces` and `PI_WORKSPACE_TRUST=trusted` retain their
+documented broad scope, while current global policy and stored trust are
+checked again. A workspace launched untrusted remains excluded until restart.
+
 `tools.loadMode.<name>` (also `tools.load_mode.<name>`) configures tool exposure
 as `essential`, `discoverable`, or `off`. An explicit `off` setting excludes a
 tool from implicit selection, including tools automatically added by browser,

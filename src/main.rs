@@ -1929,6 +1929,16 @@ async fn run_print_mcp_command(
     }
 }
 
+#[cfg(feature = "ftui")]
+fn ftui_tool_selection(cli: &cli::Cli, enabled_tools: &[&str]) -> Option<Vec<String>> {
+    if cli.no_tools {
+        return Some(Vec::new());
+    }
+    cli.tools
+        .as_ref()
+        .map(|_| enabled_tools.iter().map(|name| (*name).to_string()).collect())
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::future_not_send,
@@ -2028,7 +2038,7 @@ async fn run(
     // configuration (.pi/settings.json packages, .pi/extensions/) may load
     // and execute. Explicit CLI resource paths are user consent and stay
     // ungated.
-    let workspace_trusted = {
+    let workspace_trust_guard = {
         // Always scan the complete workspace-controlled execution surface.
         // Even when skills/extensions/themes are disabled or PI_CONFIG_PATH
         // overrides settings, project MCP discovery remains independently
@@ -2076,8 +2086,15 @@ async fn run(
                 );
             }
         }
-        state.trusted
+        pi::workspace_trust::WorkspaceTrustGuard::from_established(
+            &cwd,
+            &state,
+            &inputs,
+            &Config::global_dir(),
+            config_path.as_deref(),
+        )
     };
+    let workspace_trusted = workspace_trust_guard.trusted();
 
     let mut config = Config::load_with_roots_and_project_trust(
         config_path.as_deref(),
@@ -2737,10 +2754,7 @@ async fn run(
         // nothing holds its resources while the frontend runs. It was never
         // written.
         drop(session);
-        let ftui_enabled_tools = enabled_tools
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
+        let ftui_enabled_tools = ftui_tool_selection(&cli, &enabled_tools);
         let options = pi::sdk::SessionOptions {
             provider: cli.provider.clone(),
             model: cli.model.clone(),
@@ -2749,6 +2763,7 @@ async fn run(
             prewalk: prewalk_target.clone(),
             working_directory: Some(cwd.clone()),
             workspace_trusted,
+            workspace_trust_guard: Some(workspace_trust_guard.clone()),
             // Session persistence honors the same flags as the default
             // stack: saved by default, --no-session for ephemeral,
             // --session/--session-dir for explicit paths. The SDK path
@@ -2773,7 +2788,7 @@ async fn run(
             // behavior as the default stack.
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
-            enabled_tools: Some(ftui_enabled_tools),
+            enabled_tools: ftui_enabled_tools,
             out_default_enabled: true,
             thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
             include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
@@ -2950,6 +2965,7 @@ async fn run(
                     package_manager: package_manager.clone(),
                     config: config.clone(),
                     cli: resource_cli.clone(),
+                    workspace_trust_guard: Some(workspace_trust_guard.clone()),
                 }),
                 cwd: cwd.clone(),
                 max_visible: config
@@ -11871,6 +11887,127 @@ mod tests {
             .build()
             .expect("runtime");
         runtime.block_on(Box::pin(future))
+    }
+
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_tool_selection_preserves_explicit_cli_authority() {
+        let config: Config = serde_json::from_value(json!({
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            }
+        }))
+        .expect("optional tool settings");
+        let defaults = pi::xdev::default_enabled_tools();
+        let default_arg = defaults.join(",");
+        let explicit_defaults = defaults.into_iter().map(str::to_string).collect();
+        for (args, expected) in [
+            (vec!["pi"], None),
+            (vec!["pi", "--tools", "read"], Some(vec!["read".to_string()])),
+            (
+                vec!["pi", "--tools", default_arg.as_str()],
+                Some(explicit_defaults),
+            ),
+            (vec!["pi", "--tools", ""], Some(Vec::new())),
+            (vec!["pi", "--tools", " , "], Some(Vec::new())),
+            (
+                vec!["pi", "--tools", "read, eval,read"],
+                Some(vec!["read".to_string(), "eval".to_string()]),
+            ),
+            (vec!["pi", "--no-tools"], Some(Vec::new())),
+            (vec!["pi", "--no-tools", "--tools", "eval"], Some(Vec::new())),
+        ] {
+            let cli = cli::Cli::try_parse_from(args.clone()).expect("CLI selection");
+            assert_eq!(
+                ftui_tool_selection(&cli, &cli.enabled_tools(&config)),
+                expected,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_implicit_selection_reloads_settings_and_keeps_automatic_tools() {
+        let root = TempDir::new().expect("tempdir");
+        let cwd = root.path().join("workspace");
+        let global_dir = root.path().join("global");
+        fs::create_dir_all(cwd.join(".pi")).expect("project directory");
+        fs::create_dir_all(&global_dir).expect("global directory");
+        fs::write(cwd.join(".pi/settings.json"), "{}").expect("project surface");
+        let mut load_modes = serde_json::Map::new();
+        for name in pi::xdev::default_enabled_tools() {
+            load_modes.insert(name.to_string(), json!("off"));
+        }
+        for name in ["eval", "github", "security_scan", "subagent", "manage_skill"] {
+            load_modes.insert(name.to_string(), json!("essential"));
+        }
+        let settings = |enabled| {
+            json!({
+                "tools": {
+                    "enableEval": enabled,
+                    "enableGithub": enabled,
+                    "enableSecurityScan": enabled,
+                    "enableSubagent": enabled,
+                    "loadMode": load_modes.clone()
+                }
+            })
+        };
+        let config: Config = serde_json::from_value(settings(false)).expect("initial settings");
+        let cli = cli::Cli::try_parse_from(["pi"]).expect("implicit CLI selection");
+        let initial_tools = cli.enabled_tools(&config);
+        assert!(initial_tools.is_empty());
+        let inputs = pi::workspace_trust::TrustInputs {
+            cli_trust: true,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = pi::workspace_trust::establish(
+            &cwd,
+            &global_dir.join(pi::workspace_trust::TRUST_STORE_FILE),
+            &inputs,
+            |_| Ok(false),
+        )
+        .expect("admit unchanged project");
+        let options = pi::sdk::SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(cwd.clone()),
+            workspace_trust_guard: Some(pi::workspace_trust::WorkspaceTrustGuard::from_established(
+                &cwd,
+                &state,
+                &inputs,
+                &global_dir,
+                None,
+            )),
+            no_session: true,
+            no_context_files: true,
+            enabled_tools: ftui_tool_selection(&cli, &initial_tools),
+            ..pi::sdk::SessionOptions::default()
+        };
+        assert!(options.enabled_tools.is_none());
+        for enabled in [false, true, false] {
+            fs::write(
+                global_dir.join("settings.json"),
+                settings(enabled).to_string(),
+            )
+            .expect("update global settings");
+            let handle = run_cli_workdir_test(pi::sdk::create_agent_session(options.clone()))
+                .expect("rebuild with current global settings");
+            assert!(handle.has_tool("manage_skill"));
+            for name in pi::xdev::default_enabled_tools() {
+                assert!(!handle.has_tool(name), "configured off: {name}");
+            }
+            for name in ["eval", "github", "security_scan", "subagent"] {
+                assert_eq!(handle.has_tool(name), enabled, "{name}");
+            }
+            assert!(run_cli_workdir_test(handle.shutdown_owned_resources()).completed_cleanly());
+        }
     }
 
     async fn saved_cli_workdir_fixture(path: &Path, cwd: &Path) -> Session {

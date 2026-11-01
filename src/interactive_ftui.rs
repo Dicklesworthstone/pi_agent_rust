@@ -2345,6 +2345,8 @@ pub struct ResourceSource {
     pub package_manager: crate::package_manager::PackageManager,
     pub config: crate::config::Config,
     pub cli: crate::resources::ResourceCliOptions,
+    /// Admission for cached project paths and the launch package manager.
+    pub workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
 }
 
 /// After `/reload`: read skills and prompt templates again, then refresh the
@@ -2359,14 +2361,17 @@ async fn reload_driver_resources(
     agent_tx: &Sender<PiMsg>,
 ) {
     let mut reloaded = None;
-    match crate::resources::ResourceLoader::load(
-        &source.package_manager,
-        cwd,
-        &source.config,
-        &source.cli,
-    )
-    .await
-    {
+    let loaded = async {
+        let mut package_manager = source.package_manager.clone();
+        if let Some(guard) = &source.workspace_trust_guard {
+            guard.validate_workspace(cwd)?;
+            package_manager = package_manager.with_project_trust(guard.trusted());
+        }
+        crate::resources::ResourceLoader::load(&package_manager, cwd, &source.config, &source.cli)
+            .await
+    }
+    .await;
+    match loaded {
         Ok(loader) => {
             *catalog = AutocompleteCatalog::from_resources(&loader);
             reloaded = Some(Box::new(loader.clone()));
@@ -8749,6 +8754,21 @@ fn replacement_options(
     options
 }
 
+/// Revalidate before replacement can flush, fork, or resolve project resources.
+fn replacement_resources_are_trusted(
+    template: &crate::sdk::SessionOptions,
+    operation: &str,
+    agent_tx: &Sender<PiMsg>,
+) -> bool {
+    if let Some(guard) = &template.workspace_trust_guard
+        && let Err(error) = guard.validate_origin()
+    {
+        let _ = agent_tx.send(PiMsg::AgentError(format!("{operation}: {error}")));
+        return false;
+    }
+    true
+}
+
 /// Match the bubbletea stack's interactive extension-command budget.
 const EXT_COMMAND_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -9547,6 +9567,9 @@ async fn new_session_command(
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) -> std::result::Result<bool, String> {
+    if !replacement_resources_are_trusted(template, "new session", agent_tx) {
+        return Ok(false);
+    }
     let (provider, model_id) = handle.model();
     let mut options = replacement_options(template, ext_handler, runtime_handle);
     // `thinking` is deliberately left as the template carries it: that is the
@@ -10634,6 +10657,9 @@ async fn fork_session_command(
         let _ = agent_tx.send(PiMsg::System(text));
         return Ok(());
     }
+    if !replacement_resources_are_trusted(template, "fork", agent_tx) {
+        return Ok(());
+    }
     let selection = match crate::interactive::select_fork_candidate(&candidates, args) {
         Ok(selection) => selection,
         Err(message) => {
@@ -10831,6 +10857,9 @@ async fn resume_session_command(
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) -> std::result::Result<bool, String> {
+    if !replacement_resources_are_trusted(template, "resume", agent_tx) {
+        return Ok(false);
+    }
     let mut options = replacement_options(template, ext_handler, runtime_handle);
     options.session_path = Some(std::path::PathBuf::from(path));
     let requested_path = std::path::Path::new(path);
@@ -11438,11 +11467,33 @@ pub fn run(
         .mutation_recorder
         .get_or_insert_with(Default::default);
     let bash_cwd = driver_bash_cwd(&session_options);
+    if let Some(guard) = &session_options.workspace_trust_guard {
+        guard
+            .validate_workspace(&bash_cwd)
+            .map_err(std::io::Error::other)?;
+        session_options.workspace_trusted = guard.trusted();
+    }
     let workspace = session_options.workspace.clone();
     autocomplete.cwd.clone_from(&bash_cwd);
-    if !supplied_workspace && let Some(source) = &mut autocomplete.resource_source {
-        source.package_manager = crate::package_manager::PackageManager::new(bash_cwd.clone())
-            .with_project_trust(session_options.workspace_trusted);
+    if let Some(source) = &mut autocomplete.resource_source {
+        if !supplied_workspace {
+            source.package_manager = crate::package_manager::PackageManager::new(bash_cwd.clone())
+                .with_project_trust(session_options.workspace_trusted);
+        }
+        if source.workspace_trust_guard.is_none() {
+            source
+                .workspace_trust_guard
+                .clone_from(&session_options.workspace_trust_guard);
+        }
+        if let Some(guard) = &source.workspace_trust_guard {
+            guard
+                .validate_workspace(&bash_cwd)
+                .map_err(std::io::Error::other)?;
+            source.package_manager = source
+                .package_manager
+                .clone()
+                .with_project_trust(guard.trusted());
+        }
     }
     let FtuiSettings {
         markdown_spacing,
@@ -11504,12 +11555,21 @@ pub fn run(
         }
         .to_string(),
     );
-    let settings_path = settings::settings_destination(
-        crate::config::Config::config_path_override_from_env(&bash_cwd).as_deref(),
-        &crate::config::Config::global_dir(),
-        &bash_cwd,
-        session_options.workspace_trusted,
-    );
+    let settings_path = if let Some(guard) = &session_options.workspace_trust_guard {
+        settings::settings_destination(
+            guard.config_override(),
+            guard.global_dir(),
+            &bash_cwd,
+            guard.trusted(),
+        )
+    } else {
+        settings::settings_destination(
+            crate::config::Config::config_path_override_from_env(&bash_cwd).as_deref(),
+            &crate::config::Config::global_dir(),
+            &bash_cwd,
+            session_options.workspace_trusted,
+        )
+    };
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     // Planning precedes every startup turn. Files have already been read by
@@ -12171,6 +12231,13 @@ pub fn run(
                             .await;
                         }
                         Ok(UiCommand::Reload) => {
+                            if !replacement_resources_are_trusted(
+                                &resume_template,
+                                "reload",
+                                &agent_tx,
+                            ) {
+                                continue;
+                            }
                             auto_title.cancel_pending();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(reload_session_command(
@@ -26828,6 +26895,271 @@ mod tests {
         assert_eq!(template_prompt(None, false, "fix", ""), None);
     }
 
+    fn captured_ftui_workspace_trust(
+        cwd: &std::path::Path,
+        global_dir: &std::path::Path,
+    ) -> crate::workspace_trust::WorkspaceTrustGuard {
+        let inputs = crate::workspace_trust::TrustInputs {
+            cli_trust: true,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = crate::workspace_trust::establish(
+            cwd,
+            &global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
+            &inputs,
+            |_| Ok(false),
+        )
+        .expect("establish launch trust");
+        crate::workspace_trust::WorkspaceTrustGuard::from_established(
+            cwd, &state, &inputs, global_dir, None,
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn changed_workspace_trust_refuses_replacement_before_session_writes() {
+        use crate::model::UserContent;
+        use crate::session::SessionMessage;
+
+        let cwd = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global configuration");
+        let sessions = tempfile::tempdir().expect("sessions");
+        std::fs::create_dir_all(cwd.path().join(".pi")).expect("project directory");
+        let settings_path = cwd.path().join(".pi/settings.json");
+        std::fs::write(&settings_path, r#"{"tools":{"enableSubagent":false}}"#)
+            .expect("initial settings");
+        let guard = captured_ftui_workspace_trust(cwd.path(), global.path());
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+        let current_ask: CurrentAsk = Arc::default();
+        let template = resume_template_from(&crate::sdk::SessionOptions {
+            provider: Some(String::from("openai")),
+            model: Some(String::from("gpt-4o")),
+            api_key: Some(String::from("dummy-key")),
+            working_directory: Some(cwd.path().to_path_buf()),
+            workspace_trusted: true,
+            workspace_trust_guard: Some(guard),
+            session_dir: Some(sessions.path().to_path_buf()),
+            no_context_files: true,
+            ..crate::sdk::SessionOptions::default()
+        });
+
+        runtime.block_on(Box::pin(async {
+            let mut handle = crate::sdk::create_agent_session_deferred_mcp(replacement_options(
+                &template,
+                &ext_handler,
+                &runtime_handle,
+            ))
+            .await
+            .expect("trusted source session");
+            let (source_id, source_path) = {
+                let store = handle.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.expect("session lock");
+                for text in ["keep this context", "fork this request"] {
+                    session.append_message(SessionMessage::User {
+                        content: UserContent::Text(text.to_string()),
+                        timestamp: Some(0),
+                    });
+                }
+                session.save().await.expect("save initial conversation");
+                session.append_message(SessionMessage::User {
+                    content: UserContent::Text("pending unsaved message".to_string()),
+                    timestamp: Some(0),
+                });
+                (
+                    session.header.id.clone(),
+                    session.path.clone().expect("saved path"),
+                )
+            };
+            let original_bytes = std::fs::read(&source_path).expect("saved conversation");
+            let session_files = || {
+                let mut files = std::fs::read_dir(sessions.path())
+                    .expect("session directory")
+                    .map(|entry| entry.expect("session entry").path())
+                    .collect::<Vec<_>>();
+                files.sort();
+                files
+            };
+            let original_files = session_files();
+            std::fs::write(&settings_path, r#"{"tools":{"enableSubagent":true}}"#)
+                .expect("changed project settings");
+
+            assert!(
+                !new_session_command(
+                    &template,
+                    &mut handle,
+                    &current_ask,
+                    &ext_handler,
+                    &agent_tx,
+                    &runtime_handle,
+                )
+                .await
+                .expect("new command reports refusal")
+            );
+            assert!(
+                !resume_session_command(
+                    source_path.to_str().expect("UTF-8 session path"),
+                    &template,
+                    &mut handle,
+                    &current_ask,
+                    &ext_handler,
+                    &agent_tx,
+                    &runtime_handle,
+                )
+                .await
+                .expect("resume command reports refusal")
+            );
+            fork_session_command(
+                "2",
+                &template,
+                &mut handle,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("fork command reports refusal");
+
+            assert_eq!(std::fs::read(&source_path).unwrap(), original_bytes);
+            assert_eq!(session_files(), original_files);
+            let live = handle
+                .with_session(|session| {
+                    (
+                        session.header.id.clone(),
+                        session.path.clone(),
+                        session.to_messages_for_current_path().len(),
+                    )
+                })
+                .await
+                .expect("live source session");
+            assert_eq!(live, (source_id, Some(source_path), 3));
+            assert!(!handle.has_tool("subagent"));
+            assert_eq!(
+                agent_rx
+                    .try_iter()
+                    .filter(|message| matches!(message, PiMsg::AgentError(text)
+                        if text.contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")))
+                    .count(),
+                3
+            );
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn changed_workspace_trust_preserves_resources_without_resolving_packages() {
+        let cwd = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global configuration");
+        let project_dir = cwd.path().join(".pi");
+        let prompts = project_dir.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        let settings_path = project_dir.join("settings.json");
+        std::fs::write(&settings_path, r#"{"packages":[]}"#).expect("initial settings");
+        let prompt_path = prompts.join("triage.md");
+        std::fs::write(&prompt_path, "---\ndescription: Trusted prompt\n---\nTrusted $1")
+            .expect("initial prompt");
+        let guard = captured_ftui_workspace_trust(cwd.path(), global.path());
+        let manager = crate::package_manager::PackageManager::new(cwd.path().to_path_buf())
+            .with_project_trust(true);
+        let config = crate::config::Config::default();
+        let mut cli = crate::resources::ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![prompt_path.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let loader = runtime
+            .block_on(crate::resources::ResourceLoader::load(
+                &manager,
+                cwd.path(),
+                &config,
+                &cli,
+            ))
+            .expect("initial explicit prompt");
+        let mut catalog = AutocompleteCatalog::from_resources(&loader);
+        catalog.extension_commands = vec![crate::autocomplete::NamedEntry {
+            name: "retired-command".to_string(),
+            description: None,
+        }];
+        let mut resources = Some(loader);
+        cli.no_prompt_templates = false;
+        let source = ResourceSource {
+            package_manager: manager,
+            config,
+            cli,
+            workspace_trust_guard: Some(guard),
+        };
+        std::fs::write(&settings_path, r#"{"packages":["git:./missing-package"]}"#)
+            .expect("changed project package");
+        std::fs::write(&prompt_path, "Changed $1").expect("changed prompt");
+        let (tx, rx) = mpsc::channel();
+        runtime.block_on(reload_driver_resources(
+            &source,
+            cwd.path(),
+            vec![crate::autocomplete::NamedEntry {
+                name: "live-command".to_string(),
+                description: None,
+            }],
+            &mut resources,
+            &mut catalog,
+            &tx,
+        ));
+
+        assert_eq!(
+            template_prompt(resources.as_ref(), false, "triage", "#281").as_deref(),
+            Some("Trusted #281")
+        );
+        assert!(
+            catalog
+                .prompt_templates
+                .iter()
+                .any(|entry| entry.name == "triage")
+        );
+        assert_eq!(catalog.extension_commands.len(), 1);
+        assert_eq!(catalog.extension_commands[0].name, "live-command");
+        for path in ["git", "npm", "packages.lock.json", "package-trust-audit.jsonl"] {
+            assert!(
+                !project_dir.join(path).exists(),
+                "created package state: {path}"
+            );
+        }
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert!(messages.iter().any(|message| {
+            matches!(message, PiMsg::System(text)
+                if text.contains("were not re-read")
+                    && text.contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED"))
+        }));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, PiMsg::ResourcesReloaded { .. }))
+        );
+        assert!(messages.iter().any(|message| {
+            matches!(message, PiMsg::AutocompleteCatalog(updated)
+                if updated.extension_commands.len() == 1
+                    && updated.extension_commands[0].name == "live-command"
+                    && updated.prompt_templates.iter().any(|entry| entry.name == "triage"))
+        }));
+    }
+
     /// `/reload` re-reads prompt templates: one added after launch expands
     /// afterwards, and the completion catalog lists it next to the session's
     /// extension commands.
@@ -26847,6 +27179,7 @@ mod tests {
                 extension_paths: Vec::new(),
                 theme_paths: Vec::new(),
             },
+            workspace_trust_guard: None,
         };
         let prompts = dir.path().join(".pi").join("prompts");
         std::fs::create_dir_all(&prompts).expect("prompts dir");

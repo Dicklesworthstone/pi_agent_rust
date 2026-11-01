@@ -407,6 +407,157 @@ pub struct TrustInputs {
     pub interactive: bool,
 }
 
+/// Launch trust retained by CLI-owned sessions that reuse resolved resources.
+///
+/// A rebuilt session must not treat previously discovered project extensions
+/// as newly authorized explicit paths. Keep the original decision and surface
+/// digest, then recheck policy before any configuration or resource reload.
+/// Programmatic SDK callers can omit this guard and keep their explicit trust
+/// decision.
+#[derive(Debug, Clone)]
+pub struct WorkspaceTrustGuard {
+    origin: PathBuf,
+    origin_key: String,
+    trusted: bool,
+    source: TrustSource,
+    surface_digest: Option<String>,
+    global_dir: PathBuf,
+    config_override: Option<PathBuf>,
+    env_override: Option<String>,
+}
+
+impl WorkspaceTrustGuard {
+    /// Capture the decision that actually admitted the launch resources.
+    /// This does not scan again, grant trust, or retain `--trust` for replay.
+    #[must_use]
+    pub fn from_established(
+        cwd: &Path,
+        state: &WorkspaceTrustState,
+        inputs: &TrustInputs,
+        global_dir: &Path,
+        config_override: Option<&Path>,
+    ) -> Self {
+        let origin = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let global_dir =
+            std::path::absolute(global_dir).unwrap_or_else(|_| global_dir.to_path_buf());
+        let config_override = config_override.map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                origin.join(path)
+            }
+        });
+        Self {
+            origin_key: workspace_key(&origin),
+            origin,
+            trusted: state.trusted,
+            source: state.source,
+            surface_digest: state.surface.as_ref().map(|surface| surface.digest.clone()),
+            global_dir,
+            config_override,
+            env_override: inputs.env_override.clone(),
+        }
+    }
+
+    /// The original decision; revalidation never promotes a denied launch.
+    #[must_use]
+    pub const fn trusted(&self) -> bool {
+        self.trusted
+    }
+
+    #[must_use]
+    pub(crate) fn global_dir(&self) -> &Path {
+        &self.global_dir
+    }
+
+    #[must_use]
+    pub(crate) fn config_override(&self) -> Option<&Path> {
+        self.config_override.as_deref()
+    }
+
+    /// Verify that a replacement still uses the admitted launch workspace.
+    ///
+    /// # Errors
+    /// Returns an actionable restart error if the workspace or trust changed.
+    pub fn validate_workspace(&self, cwd: &Path) -> Result<()> {
+        if workspace_key(cwd) != self.origin_key {
+            return Err(self
+                .restart_required("the requested workspace differs from the launch workspace"));
+        }
+        self.validate_origin()
+    }
+
+    /// Revalidate the origin of cached project configuration and resources.
+    ///
+    /// # Errors
+    /// Returns an actionable restart error if the original grant is no longer
+    /// valid, its scoped surface changed, or current policy cannot be read.
+    pub fn validate_origin(&self) -> Result<()> {
+        if workspace_key(&self.origin) != self.origin_key {
+            return Err(
+                self.restart_required("the launch workspace path now resolves elsewhere"),
+            );
+        }
+        if !self.trusted {
+            return Ok(());
+        }
+
+        let global = Config::load_with_roots_and_project_trust(
+            self.config_override.as_deref(),
+            &self.global_dir,
+            &self.origin,
+            false,
+        )
+        .map_err(|error| {
+            self.restart_required(&format!("cannot reload operator settings: {error}"))
+        })?;
+        let inputs = TrustInputs {
+            cli_trust: false,
+            trust_all_workspaces: global.trust_all_workspaces.unwrap_or(false),
+            env_override: self.env_override.clone(),
+            interactive: false,
+        };
+        let current = establish(
+            &self.origin,
+            &self.global_dir.join(TRUST_STORE_FILE),
+            &inputs,
+            |_| Ok(false),
+        )
+        .map_err(|error| {
+            self.restart_required(&format!("cannot revalidate workspace trust: {error}"))
+        })?;
+        if !current.trusted {
+            return Err(self.restart_required("workspace trust is no longer granted"));
+        }
+
+        // `establish` returns NoSurface before consulting universal policy.
+        // A captured trusted environment override cannot change in this guard;
+        // global policy is read above on every validation.
+        let universal = matches!(
+            current.source,
+            TrustSource::EnvOverride | TrustSource::TrustAllConfig
+        ) || (current.source == TrustSource::NoSurface
+            && (self.source == TrustSource::EnvOverride
+                || (inputs.env_override.is_none() && inputs.trust_all_workspaces)));
+        if !universal
+            && current.surface.as_ref().map(|surface| surface.digest.as_str())
+                != self.surface_digest.as_deref()
+        {
+            return Err(self.restart_required(
+                "the project configuration or executable resources changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restart_required(&self, reason: &str) -> Error {
+        Error::config(format!(
+            "PI_WORKSPACE_TRUST_RESTART_REQUIRED: {reason} for {}; restart Pi and re-establish workspace trust before rebuilding the session or reloading resources",
+            escaped_path(&self.origin)
+        ))
+    }
+}
+
 #[cfg(unix)]
 fn encoded_workspace_key(canonical: &Path) -> String {
     // The tag is part of the persistence contract. Changing it deliberately
@@ -560,6 +711,280 @@ mod tests {
             env_override: None,
             interactive: false,
         }
+    }
+
+    fn guard_for(cwd: &Path, global_dir: &Path, trust_inputs: &TrustInputs) -> WorkspaceTrustGuard {
+        let state = establish(
+            cwd,
+            &global_dir.join(TRUST_STORE_FILE),
+            trust_inputs,
+            no_prompt,
+        )
+        .expect("establish launch trust");
+        WorkspaceTrustGuard::from_established(cwd, &state, trust_inputs, global_dir, None)
+    }
+
+    fn assert_restart_required(result: Result<()>) {
+        let error = result.expect_err("changed launch authority must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn reload_guard_keeps_the_admitted_digest_and_never_replays_cli_trust() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        let settings = workspace.path().join(".pi/settings.json");
+        write(
+            &settings,
+            r#"{"tools":{"enable_eval":false,"enable_github":false,"enable_security_scan":false,"enable_subagent":false}}"#,
+        );
+        let trust_inputs = TrustInputs {
+            cli_trust: true,
+            ..inputs()
+        };
+        let store_path = global.path().join(TRUST_STORE_FILE);
+        let admitted = establish(workspace.path(), &store_path, &trust_inputs, no_prompt)
+            .expect("admit original settings");
+        let guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &admitted,
+            &trust_inputs,
+            global.path(),
+            None,
+        );
+        assert!(guard.trusted());
+        guard
+            .validate_workspace(workspace.path())
+            .expect("unchanged workspace");
+
+        write(
+            &settings,
+            r#"{"tools":{"enable_eval":true,"enable_github":true,"enable_security_scan":true,"enable_subagent":true}}"#,
+        );
+        // Capturing after a mutation must still retain the digest from the
+        // actual admission, rather than scanning and granting the new bytes.
+        let late_guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &admitted,
+            &trust_inputs,
+            global.path(),
+            None,
+        );
+        assert_restart_required(guard.validate_origin());
+        assert_restart_required(late_guard.validate_origin());
+
+        // A separate process can approve the new surface, but this session's
+        // cached resources still require resolution in a fresh launch.
+        let readmitted = establish(workspace.path(), &store_path, &trust_inputs, no_prompt)
+            .expect("admit changed settings separately");
+        assert_restart_required(guard.validate_origin());
+        let fresh_guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &readmitted,
+            &trust_inputs,
+            global.path(),
+            None,
+        );
+        fresh_guard
+            .validate_origin()
+            .expect("freshly resolved launch");
+
+        let other = tempfile::tempdir().expect("other workspace");
+        write(&other.path().join(".pi/settings.json"), r#"{}"#);
+        assert_restart_required(fresh_guard.validate_workspace(other.path()));
+    }
+
+    #[test]
+    fn reload_guard_rejects_mutated_extensions_and_project_mcp() {
+        for (relative, before, after) in [
+            (
+                ".pi/extensions/hook.ts",
+                "export const value = 1;\n",
+                "export const value = 2;\n",
+            ),
+            (
+                ".agents/mcp.json",
+                r#"{"mcpServers":{}}"#,
+                r#"{"mcpServers":{"new":{"command":"new-server"}}}"#,
+            ),
+        ] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let global = tempfile::tempdir().expect("global");
+            let path = workspace.path().join(relative);
+            write(&path, before);
+            let guard = guard_for(
+                workspace.path(),
+                global.path(),
+                &TrustInputs {
+                    cli_trust: true,
+                    ..inputs()
+                },
+            );
+            guard.validate_origin().expect("unchanged surface");
+            write(&path, after);
+            assert_restart_required(guard.validate_origin());
+        }
+    }
+
+    #[test]
+    fn reload_guard_rejects_new_surface_after_empty_workspace_admission() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        let guard = guard_for(workspace.path(), global.path(), &inputs());
+        assert!(guard.trusted());
+        guard.validate_origin().expect("still empty");
+        write(
+            &workspace.path().join(".pi/settings.json"),
+            r#"{"tools":{"enable_eval":true,"enable_github":true,"enable_security_scan":true,"enable_subagent":true}}"#,
+        );
+        assert_restart_required(guard.validate_origin());
+    }
+
+    #[test]
+    fn reload_guard_honors_current_universal_policy_including_empty_surfaces() {
+        for via_env in [false, true] {
+            for initially_empty in [false, true] {
+                let workspace = tempfile::tempdir().expect("workspace");
+                let global = tempfile::tempdir().expect("global");
+                let settings = workspace.path().join(".pi/settings.json");
+                if !initially_empty {
+                    write(&settings, r#"{}"#);
+                }
+                let trust_inputs = if via_env {
+                    TrustInputs {
+                        env_override: Some(" TrUsTeD ".to_string()),
+                        ..inputs()
+                    }
+                } else {
+                    write(
+                        &global.path().join("settings.json"),
+                        r#"{"trustAllWorkspaces":true}"#,
+                    );
+                    TrustInputs {
+                        trust_all_workspaces: true,
+                        ..inputs()
+                    }
+                };
+                let guard = guard_for(workspace.path(), global.path(), &trust_inputs);
+                write(&settings, r#"{"tools":{"enable_subagent":true}}"#);
+                guard
+                    .validate_origin()
+                    .expect("universal policy remains active");
+                std::fs::rename(&settings, workspace.path().join("old-settings.json"))
+                    .expect("remove the last executable surface");
+                guard
+                    .validate_origin()
+                    .expect("universal policy also allows removal");
+            }
+        }
+    }
+
+    #[test]
+    fn reload_guard_observes_policy_revocation_and_malformed_operator_settings() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        let global_settings = global.path().join("settings.json");
+        write(&global_settings, r#"{"trustAllWorkspaces":true}"#);
+        let global_guard = guard_for(
+            workspace.path(),
+            global.path(),
+            &TrustInputs {
+                trust_all_workspaces: true,
+                ..inputs()
+            },
+        );
+        write(&global_settings, r#"{"trustAllWorkspaces":false}"#);
+        assert_restart_required(global_guard.validate_origin());
+
+        let trust_inputs = TrustInputs {
+            cli_trust: true,
+            ..inputs()
+        };
+        let scoped_guard = guard_for(workspace.path(), global.path(), &trust_inputs);
+        let surface = WorkspaceTrustSurface::scan(workspace.path())
+            .expect("scan")
+            .expect("surface");
+        WorkspaceTrustStore::load(&global.path().join(TRUST_STORE_FILE))
+            .record(
+                &workspace_key(workspace.path()),
+                &surface.digest,
+                TrustDecision::Untrusted,
+            )
+            .expect("revoke stored trust");
+        assert_restart_required(scoped_guard.validate_origin());
+
+        let trusted_guard = guard_for(workspace.path(), global.path(), &trust_inputs);
+        write(&global_settings, r#"{"tools":{"enable_eval":"yes"}}"#);
+        assert_restart_required(trusted_guard.validate_origin());
+    }
+
+    #[test]
+    fn reload_guard_uses_the_anchored_operator_override() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        write(
+            &global.path().join("settings.json"),
+            r#"{"trustAllWorkspaces":true}"#,
+        );
+        let operator_settings = workspace.path().join("operator.json");
+        write(&operator_settings, r#"{"trustAllWorkspaces":true}"#);
+        let trust_inputs = TrustInputs {
+            trust_all_workspaces: true,
+            ..inputs()
+        };
+        let state = establish(
+            workspace.path(),
+            &global.path().join(TRUST_STORE_FILE),
+            &trust_inputs,
+            no_prompt,
+        )
+        .expect("admit operator policy");
+        let guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &state,
+            &trust_inputs,
+            global.path(),
+            Some(Path::new("operator.json")),
+        );
+        write(
+            &workspace.path().join(".pi/settings.json"),
+            r#"{"tools":{"enable_eval":true}}"#,
+        );
+        guard
+            .validate_origin()
+            .expect("relative override resolved at origin");
+        write(&operator_settings, r#"{"trustAllWorkspaces":false}"#);
+        assert_restart_required(guard.validate_origin());
+    }
+
+    #[test]
+    fn reload_guard_never_promotes_an_originally_untrusted_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        let guard = guard_for(workspace.path(), global.path(), &inputs());
+        assert!(!guard.trusted());
+        write(
+            &workspace.path().join(".pi/settings.json"),
+            "malformed project configuration",
+        );
+        write(
+            &global.path().join("settings.json"),
+            r#"{"trustAllWorkspaces":true}"#,
+        );
+        guard
+            .validate_origin()
+            .expect("project configuration stays excluded");
+        assert!(!guard.trusted());
+        let other = tempfile::tempdir().expect("other workspace");
+        assert_restart_required(guard.validate_workspace(other.path()));
     }
 
     #[test]

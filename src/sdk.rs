@@ -398,6 +398,11 @@ pub struct SessionOptions {
     /// be loaded. Programmatic callers default to fail-closed; CLI hosts pass
     /// the decision produced by `workspace_trust::establish`.
     pub workspace_trusted: bool,
+    /// Launch admission for hosts that reuse discovered project resources.
+    /// When present, this guard revalidates before initialization and its
+    /// original decision takes precedence over `workspace_trusted`. Omit it
+    /// to retain the explicit trust contract for programmatic callers.
+    pub workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
@@ -613,6 +618,7 @@ impl Default for SessionOptions {
             out_default_enabled: false,
             working_directory: None,
             workspace_trusted: false,
+            workspace_trust_guard: None,
             package_dir: None,
             no_session: true,
             session_path: None,
@@ -3948,6 +3954,12 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     } else {
         requested_cwd
     };
+    let workspace_trusted = if let Some(guard) = &options.workspace_trust_guard {
+        guard.validate_workspace(&cwd)?;
+        guard.trusted()
+    } else {
+        options.workspace_trusted
+    };
 
     let mut cli = Cli::try_parse_from(["pi"])
         .map_err(|e| Error::validation(format!("CLI init failed: {e}")))?;
@@ -3979,13 +3991,25 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         }
     }
 
-    let global_dir = Config::global_dir();
-    let config_override = Config::config_path_override_from_env(&cwd);
+    let (global_dir, config_override) = options.workspace_trust_guard.as_ref().map_or_else(
+        || {
+            (
+                Config::global_dir(),
+                Config::config_path_override_from_env(&cwd),
+            )
+        },
+        |guard| {
+            (
+                guard.global_dir().to_path_buf(),
+                guard.config_override().map(Path::to_path_buf),
+            )
+        },
+    );
     let mut config = load_session_config(
         &cwd,
         &global_dir,
         config_override.as_deref(),
-        options.workspace_trusted,
+        workspace_trusted,
     )?;
     apply_session_out_config(&mut config, &options);
     let mut session = Session::new(&cli, &config).await?;
@@ -4032,7 +4056,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         // next save, including CLI --add-dir handed through the FTUI SDK.
         session.set_additional_roots(&workspace.additional_roots());
     }
-    let auth_path = Config::auth_path();
+    let auth_path = global_dir.join("auth.json");
     let auth_result = AuthStorage::load_async(auth_path.clone()).await;
     let mut auth = match auth_result {
         Ok(auth) => auth,
@@ -4276,7 +4300,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
                 cwd.clone(),
                 global_dir.clone(),
-                options.workspace_trusted,
+                workspace_trusted,
             ))?;
     }
     // Session-coupled todo tool joins after construction (opt-in), matching
@@ -4395,12 +4419,12 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     };
 
     let mcp_manager = if let Some(mcp) = &options.mcp {
-        let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
+        let global_dir = mcp.global_dir.clone().unwrap_or_else(|| global_dir.clone());
         let manager = Arc::new(crate::mcp::McpManager::bootstrap(
             &cwd,
             &global_dir,
             &mcp.config_paths,
-            options.workspace_trusted && config.mcp_project_config_enabled(),
+            workspace_trusted && config.mcp_project_config_enabled(),
         )?);
         if let Some(extension_manager) = agent_session
             .extensions
@@ -7148,6 +7172,133 @@ mod tests {
             let shutdown = run_async(handle.shutdown_owned_resources());
             assert!(shutdown.completed_cleanly());
         }
+    }
+
+    fn guarded_optional_tool_fixture(trusted: bool) -> (tempfile::TempDir, SessionOptions) {
+        use crate::workspace_trust::{TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish};
+
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi/extensions")).expect("project resources");
+        std::fs::create_dir_all(&global_dir).expect("global directory");
+        let settings = |enabled| {
+            serde_json::json!({
+                "tools": {
+                    "enableEval": enabled,
+                    "enableGithub": enabled,
+                    "enableSecurityScan": enabled,
+                    "enableSubagent": enabled
+                }
+            })
+            .to_string()
+        };
+        std::fs::write(global_dir.join("settings.json"), settings(false))
+            .expect("global optional tools disabled");
+        std::fs::write(cwd.join(".pi/settings.json"), settings(true))
+            .expect("project optional tools enabled");
+        std::fs::write(
+            cwd.join(".pi/extensions/trust_guard.js"),
+            "export default function init() {}\n",
+        )
+        .expect("benign project extension");
+        let inputs = TrustInputs {
+            cli_trust: trusted,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = establish(&cwd, &global_dir.join(TRUST_STORE_FILE), &inputs, |_| {
+            panic!("noninteractive fixture must not prompt")
+        })
+        .expect("establish workspace trust");
+        assert_eq!(state.trusted, trusted);
+        let options = SessionOptions {
+            workspace_trusted: !trusted,
+            workspace_trust_guard: Some(WorkspaceTrustGuard::from_established(
+                &cwd,
+                &state,
+                &inputs,
+                &global_dir,
+                None,
+            )),
+            no_context_files: true,
+            ..hermetic_session_options(&cwd)
+        };
+        (tmp, options)
+    }
+
+    #[test]
+    fn sdk_guarded_sessions_reject_changed_project_resources_before_initialization() {
+        const OPTIONAL: [&str; 4] = ["eval", "github", "security_scan", "subagent"];
+        for changed_surface in ["settings", "extension"] {
+            let (_tmp, mut options) = guarded_optional_tool_fixture(true);
+            let cwd = options.working_directory.clone().expect("fixture workspace");
+            let extension_path = cwd.join(".pi/extensions/trust_guard.js");
+            options.extension_paths = vec![extension_path.clone()];
+            assert!(!options.workspace_trusted, "the captured grant must win");
+            let probe = cwd.join("still_live.txt");
+            std::fs::write(&probe, "the admitted session is still usable").expect("write read probe");
+            let handle = run_async(create_agent_session(options.clone()))
+                .expect("construct originally admitted session");
+            assert!(handle.extension_manager().is_some());
+            for name in OPTIONAL {
+                assert!(handle.has_tool(name), "captured grant enables {name}");
+            }
+
+            if changed_surface == "settings" {
+                std::fs::write(
+                    cwd.join(".pi/settings.json"),
+                    r#"{"tools":{"enableEval":false}}"#,
+                )
+                .expect("change project settings");
+            } else {
+                std::fs::write(
+                    &extension_path,
+                    "throw new Error('STALE_TRUST_EXTENSION_EXECUTED');\n\
+                     export default function init() {}\n",
+                )
+                .expect("poison the previously discovered extension");
+            }
+            let error = run_async(create_agent_session(options))
+                .err()
+                .expect("changed project resources must require renewed trust")
+                .to_string();
+            assert!(
+                error.contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED"),
+                "{changed_surface}: {error}"
+            );
+            assert!(
+                !error.contains("STALE_TRUST_EXTENSION_EXECUTED"),
+                "the extension must not initialize before trust is checked: {error}"
+            );
+            for name in OPTIONAL {
+                assert!(handle.has_tool(name), "the original session retains {name}");
+            }
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let output = run_async(tools.get("read").expect("live read tool").execute(
+                "after-rejected-rebuild",
+                serde_json::json!({"path": probe}),
+                None,
+            ))
+            .expect("the original session can still execute tools");
+            assert!(!output.is_error);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_guarded_denial_cannot_be_overridden_by_the_legacy_trust_boolean() {
+        let (_tmp, options) = guarded_optional_tool_fixture(false);
+        assert!(
+            options.workspace_trusted,
+            "the fixture supplies conflicting trust"
+        );
+        let handle = run_async(create_agent_session(options)).expect("create denied session");
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert!(!handle.has_tool(name), "captured denial must exclude {name}");
+        }
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
     }
 
     #[test]

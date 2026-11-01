@@ -294,11 +294,40 @@ policy. A summary error or privacy refusal leaves the span intact. If an
 extension changes the session during summarization, the stale report is
 rejected without overwriting that change.
 
+### Tool selection and workspace trust
+
+`SessionOptions::enabled_tools: None` resolves the default tools and persistent
+optional-tool settings when each session is constructed. `Some(names)` is an
+explicit selection with CLI precedence; `Some(Vec::new())` disables built-in
+tools. Hosts rebuilding sessions should preserve `None` when the user omitted
+a tool selection, including when settings happen to disable every default
+tool. See [Optional tools](settings.md#optional-tools) for activation flags and
+load modes.
+
+Programmatic callers keep the existing `workspace_trusted` contract when
+`workspace_trust_guard` is `None`, its default. Hosts that reuse discovered
+project extension paths or a launch package manager can capture the actual
+`workspace_trust::establish` result with
+`WorkspaceTrustGuard::from_established` and pass that guard in
+`SessionOptions::workspace_trust_guard`. Its original trust decision takes
+precedence over the boolean. The SDK verifies the requested workspace and
+current trust before loading settings, credentials, tools, MCP, or extensions,
+using the captured configuration roots.
+
+The guard never replays an earlier `--trust` flag. A changed scoped project
+surface or revoked grant produces `PI_WORKSPACE_TRUST_RESTART_REQUIRED`;
+a fresh launch must re-establish trust and resolve its resources. A previously
+denied launch cannot become trusted through a cloned options object.
+Hosts that reload resources outside SDK construction must also validate the
+guard before resolving packages or executing cached project paths. The default
+terminal UI does this before replacement side effects and resource loading.
+
 ### Stream rules
 
 SDK sessions load global stream rules from the configured agent directory and
-project rules when `SessionOptions.workspace_trusted` is true. Ambient rules
-are omitted when context-file loading is disabled. The shared agent enforces
+project rules when the effective workspace trust decision is true (the guard's
+decision when supplied, otherwise `SessionOptions.workspace_trusted`). Ambient
+rules are omitted when context-file loading is disabled. The shared agent enforces
 the rules across provider streams, cancels a matching draft before its tools
 execute, and records a bounded corrective retry in the transcript. The newest
 active-branch correction per rule survives compaction.
