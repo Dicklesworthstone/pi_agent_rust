@@ -1048,7 +1048,10 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
     assert!(!initial["sessionId"].as_str().unwrap().starts_with("pi-"));
     common::run_async(async move {
         let cx = pi::agent_cx::AgentCx::for_request();
-        let mut session = shared.lock(cx.cx()).await.expect("session lock");
+        // Owned guard: run_async needs a Send future, and save() awaits with the lock held.
+        let mut session = asupersync::sync::OwnedMutexGuard::lock(shared, cx.cx())
+            .await
+            .expect("session lock");
         session.set_name("Durable context-mode session");
         session.save().await.expect("first native session save");
     });
