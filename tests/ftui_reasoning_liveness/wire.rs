@@ -11,13 +11,12 @@ use ftui::{
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{PiMsg, conversation_from_session};
-use pi::interactive_ftui::{PiFtuiModel, UiCommand, agent_event_to_pi_msgs};
+use pi::interactive_ftui::{PiFtuiModel, TurnControlState, UiCommand, agent_event_to_pi_msgs};
 use pi::model::{AssistantMessage, ContentBlock, Message, StopReason};
 use pi::provider::StreamOptions;
 use pi::providers::openai::OpenAIProvider;
 use pi::sdk::{AgentSessionHandle, EventListeners};
 use pi::session::Session;
-use pi::session_control::SessionControlHandle;
 use pi::tools::ToolRegistry;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -32,7 +31,7 @@ const COLS: u16 = 47;
 const ROWS: u16 = 16;
 const BATCH: usize = 64;
 const WAIT: Duration = Duration::from_secs(20);
-type ControlSlot = Arc<Mutex<Option<SessionControlHandle>>>;
+type ControlSlot = Arc<Mutex<TurnControlState>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -472,9 +471,9 @@ fn controlled_prompt(
         }
     });
     let control = turn.control();
-    *slot.lock().expect("control slot") = Some(control.clone());
+    slot.lock().expect("control slot").publish(control.clone());
     let result = runtime.block_on(turn);
-    *slot.lock().expect("control slot") = None;
+    slot.lock().expect("control slot").retire();
     assert!(
         control.snapshot().finished,
         "owner must retire before next turn"
@@ -601,7 +600,7 @@ fn drive(
 fn run_ui(mode: Mode, path: &Path, url: &str, ack: mpsc::SyncSender<usize>) {
     let (agent_tx, agent_rx) = mpsc::channel();
     let (submit_tx, submit_rx) = mpsc::channel();
-    let slot: ControlSlot = Arc::new(Mutex::new(None));
+    let slot: ControlSlot = Arc::new(Mutex::new(TurnControlState::default()));
     let screen = Arc::new(Mutex::new(Screen {
         terminal: TerminalModel::new(usize::from(COLS), usize::from(ROWS)),
         flushes: 0,
