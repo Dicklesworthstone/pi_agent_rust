@@ -2,6 +2,7 @@
 mod tests {
     use super::extensions_integration_tests::PiAiCaptureProvider;
     use super::*;
+    use crate::agent_cx::AgentCx;
     use crate::auth::AuthCredential;
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;
