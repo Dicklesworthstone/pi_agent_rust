@@ -1,0 +1,5 @@
+# clippy's large_futures lint flags futures over 16 KiB by default. For the
+# 0.9.0 release this raises the threshold to 64 KiB instead of allowing the
+# lint, so a future over 64 KiB still fails. bd-jdf1u lists the 103 futures
+# between 16 KiB and 64 KiB; lower the threshold as they are boxed or split.
+future-size-threshold = 65536

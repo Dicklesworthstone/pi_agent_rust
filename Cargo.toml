@@ -669,6 +669,81 @@ assert_is_empty = "allow"
 # the wrong trade; a sibling project on the same build fleet allows it too.
 suboptimal_flops = "allow"
 
+# Lint debt allowed for the 0.9.0 release (a release decision; see `bd-jdf1u`). Work since the
+# nightly-2026-08-31 validation run (7b6a53cc0) added clippy warnings that `-D warnings`
+# turns into errors. The kinds below are style or design lints with no correctness
+# impact, so they are allowed here, in one place, as bd-39x9z did, instead of being
+# rewritten under release pressure. Counts are from `cargo clippy --all-targets` with
+# CI's features at efdcaeaf9d; `bd-jdf1u` lists them for burn-down. Correctness-relevant
+# kinds were fixed per site, and machine-applicable ones applied, in the same release.
+# large_futures stays on: clippy.toml raises its size threshold to 64 KiB instead.
+# 55 sites. Narrowing each guard's scope reorders releases; each site needs review.
+significant_drop_tightening = "allow"
+# 31 sites. Splitting long functions is a refactor, not a lint fix.
+too_many_lines = "allow"
+# 17 sites. Changing these parameters to borrows changes signatures.
+needless_pass_by_value = "allow"
+# 1 site. Changing these parameters to shared borrows changes signatures.
+needless_pass_by_ref_mut = "allow"
+# 1 site. Passing these small Copy values by value changes signatures.
+trivially_copy_pass_by_ref = "allow"
+# 11 sites. Making a public fn const is an API commitment, decided per fn.
+missing_const_for_fn = "allow"
+# 14 sites. Making these futures Send is a design change.
+future_not_send = "allow"
+# 9 sites. Returning &'static str changes signatures.
+unnecessary_literal_bound = "allow"
+# 1 site. Unwrapping these return types changes signatures.
+unnecessary_wraps = "allow"
+# 14 sites. Rewording these doc summaries is documentation work.
+too_long_first_doc_paragraph = "allow"
+# 4 sites. Boxing a variant changes the type's layout and its constructors.
+large_enum_variant = "allow"
+# 3 sites. Replacing these bools with enums changes the type.
+struct_excessive_bools = "allow"
+# 1 site. Replacing these bool parameters changes signatures.
+fn_params_excessive_bools = "allow"
+# 1 site. Renaming these fields changes the type.
+struct_field_names = "allow"
+# 2 sites. Naming these types is a refactor, not a lint fix.
+type_complexity = "allow"
+# 2 sites. Replacing Option<Option<T>> changes the type.
+option_option = "allow"
+# 1 site. Rewriting these joins with fmt::Write is a refactor.
+format_collect = "allow"
+# 1 site. Uninhabited enums used as marker types are intended.
+empty_enums = "allow"
+# 10 sites. Rewriting these if-let/else blocks as map_or_else is a style refactor.
+option_if_let_else = "allow"
+# 9 sites. Naming the type in place of Default::default() is style only.
+default_trait_access = "allow"
+# 6 sites. Adding digit separators to these literals is style only.
+unreadable_literal = "allow"
+# 4 sites. Moving these local items above the statements is style only.
+items_after_statements = "allow"
+# 4 sites. Rewriting these early returns with `?` is a style refactor.
+question_mark = "allow"
+# 3 sites. Making these default values lazy is a per-site style change.
+or_fun_call = "allow"
+# 3 sites. Rewriting these matches as let-else is a style refactor.
+manual_let_else = "allow"
+# 3 sites. Switching these assignments to clone_from is a per-site refactor.
+assigning_clones = "allow"
+# 2 sites. Folding these let-then-if sequences is a style refactor.
+useless_let_if_seq = "allow"
+# 2 sites. Naming the variant changes how a new variant would match.
+match_wildcard_for_single_variants = "allow"
+# 1 site. Dropping the redundant #[must_use] is style only.
+double_must_use = "allow"
+# 1 site. Using From for this tuple/array conversion is style only.
+tuple_array_conversions = "allow"
+# 1 site. Rewriting format!-then-push_str with write! is a style refactor.
+format_push_string = "allow"
+# 1 site. Dropping this collect changes when the iterator runs; decided per site.
+needless_collect = "allow"
+# 1 site. Folding this field assignment into the literal is style only.
+field_reassign_with_default = "allow"
+
 [patch.crates-io]
 # rquickjs-sys 0.12.2 with one quickjs-ng fix: JS_FreeContext freed every
 # module definition while the reactions of an unsettled top-level-await
