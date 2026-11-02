@@ -1,4 +1,4 @@
-//! Real SQLite initialization through the PiJS ESM and createRequire loaders.
+//! Real SQLite initialization through the `PiJS` ESM and createRequire loaders.
 //! The fixtures exercise the API shape used by context-mode's Bun adapter,
 //! including durable session data, migrations, transactions and RETURNING.
 

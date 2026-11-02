@@ -875,7 +875,7 @@ export default function init(pi: any): void {
 
 /// Reproduces the package, storage and SQLite initialization sequence used by
 /// context-mode 1.0.169 (build/adapters/base.js, build/db-base.js and
-/// build/session/db.js). This is a real database across two cold PiJS realms;
+/// build/session/db.js). This is a real database across two cold `PiJS` realms;
 /// no hostcall interceptor or database stub participates in this test.
 #[test]
 fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {

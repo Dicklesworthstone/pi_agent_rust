@@ -6385,7 +6385,7 @@ fn print_background_args() -> Vec<&'static str> {
     ]
 }
 
-/// The real shell job cannot settle until the original AgentEnd has reached
+/// The real shell job cannot settle until the original `AgentEnd` has reached
 /// the caller. A successful third provider request therefore proves that
 /// print mode woke an idle session, not that its ordinary tool loop happened
 /// to notice a fast job before returning.

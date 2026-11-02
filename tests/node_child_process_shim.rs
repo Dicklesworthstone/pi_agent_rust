@@ -895,7 +895,7 @@ fn exec_file_accepts_callback_only() {
 }
 
 /// This test is also a portable subprocess fixture. Selecting it alone with
-/// PIJS_STDIO_TEST_PEER set produces genuine newline-delimited responses.
+/// `PIJS_STDIO_TEST_PEER` set produces genuine newline-delimited responses.
 #[test]
 fn persistent_stdio_peer() {
     use sha2::Digest as _;
