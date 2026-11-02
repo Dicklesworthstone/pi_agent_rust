@@ -14648,7 +14648,7 @@ mod retry_tests {
             );
             let options = rpc_fork_test_options(&runtime_handle, temp.path().join("auth.json"));
             let (in_tx, in_rx) = mpsc::channel(4);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
             let client = async {
                 in_tx
                     .send(
