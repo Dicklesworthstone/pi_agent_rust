@@ -6935,7 +6935,7 @@ mod tests {
                 .expect("provider admission");
 
             agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None)
+                .apply_compaction_result(result, on_event, provider_admission, None, None, None)
                 .await
                 .expect("apply compaction result");
 
@@ -7044,6 +7044,7 @@ mod tests {
                     provider_admission,
                     None,
                     None,
+                    None,
                 ),
             )
             .await
@@ -7126,7 +7127,7 @@ mod tests {
                 .expect("provider admission");
 
             let err = agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None)
+                .apply_compaction_result(result, on_event, provider_admission, None, None, None)
                 .await
                 .expect_err("blocked persistence must fail");
             assert!(
