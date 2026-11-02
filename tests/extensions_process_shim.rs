@@ -896,7 +896,8 @@ fn pijs_workspace_identity_uses_the_selected_cwd_instead_of_the_launcher_environ
             } else {
                 normalized
             };
-            let database_key = format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()));
+            let database_key =
+                pi::package_manager::hex_encode(&sha2::Sha256::digest(canonical.as_bytes()));
             assert_eq!(
                 runtime.read_global_json("workspaceIdentity").await.unwrap(),
                 serde_json::json!({
