@@ -2710,7 +2710,7 @@ mod tests {
         let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
         let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
         assert_eq!(
-            ring.current_key(start + Duration::from_secs(86_400)),
+            ring.current_key(start + Duration::from_hours(24)),
             Some("sibling")
         );
         assert!(ring.report_success("primary", start + Duration::from_secs(1)));

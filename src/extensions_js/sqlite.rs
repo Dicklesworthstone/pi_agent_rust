@@ -64,7 +64,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BUSY_TIMEOUT_MS: u64 = 30_000;
 // fsqlite 0.4.10 uses this floor for connection admission and prepare refresh,
 // independently of a connection's current PRAGMA busy_timeout setting.
-const ENGINE_BOOTSTRAP_WAIT: Duration = Duration::from_millis(30_000);
+const ENGINE_BOOTSTRAP_WAIT: Duration = Duration::from_secs(30);
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
