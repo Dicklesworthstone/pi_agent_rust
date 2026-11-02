@@ -2089,13 +2089,13 @@ impl PackageManager {
             source: "auto".to_string(),
             scope: PackageScope::User,
             origin: ResourceOrigin::TopLevel,
-            base_dir: Some(global_base_dir.to_path_buf()),
+            base_dir: Some(global_base_dir.clone()),
         };
         let project_metadata = PathMetadata {
             source: "auto".to_string(),
             scope: PackageScope::Project,
             origin: ResourceOrigin::TopLevel,
-            base_dir: Some(project_base_dir.to_path_buf()),
+            base_dir: Some(project_base_dir.clone()),
         };
 
         let user_dirs = AutoDirs::new(global_base_dir);
