@@ -354,7 +354,7 @@ fn javascript_replacement_reports_lost_state_once() {
     ))
     .expect("replacement cell");
     let text = first_text(&recovered);
-    harness.log().info("replacement", &text);
+    harness.log().info("replacement", text);
     assert!(!recovered.is_error);
     assert!(text.starts_with("EVAL_KERNEL_RESTARTED:"), "{text}");
     assert!(text.contains("undefined"));
