@@ -501,11 +501,7 @@ impl PiFtuiModel {
         }
         let request = draft.request.clone();
         let result = if let Some(goal) = self.live_goal() {
-            if goal.id != request.source_invocation {
-                Err(Error::validation(
-                    "Recovered input belongs to an earlier goal; finish or pause this goal before resubmitting it",
-                ))
-            } else {
+            if goal.id == request.source_invocation {
                 goal.accepting_control().and_then(|control| {
                     control
                         .restore_pending(
@@ -516,6 +512,10 @@ impl PiFtuiModel {
                         )
                         .map(|_| ())
                 })
+            } else {
+                Err(Error::validation(
+                    "Recovered input belongs to an earlier goal; finish or pause this goal before resubmitting it",
+                ))
             }
         } else if self.state == AgentUiState::Working {
             // Only the sequential driver can validate an older input's branch
