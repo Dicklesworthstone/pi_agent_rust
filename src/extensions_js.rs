@@ -19982,8 +19982,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let windows_environment = uses_windows_environment(&self.config.env);
         let process_platform =
             configured_environment_value(&self.config.env, "PI_PLATFORM", windows_environment)
-                .map(str::to_string)
-                .unwrap_or_else(|| std::env::consts::OS.to_string());
+                .map_or_else(|| std::env::consts::OS.to_string(), str::to_string);
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
