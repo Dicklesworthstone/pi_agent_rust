@@ -115,7 +115,7 @@ fn parse_editable(text: &str, display: &str) -> Result<Vec<EditedCell>> {
                 return Err(invalid(display, "notebook exceeds the 10000-cell limit"));
             }
             let original_index = index
-                .map(|index| index.parse::<usize>())
+                .map(str::parse::<usize>)
                 .transpose()
                 .map_err(|_| invalid(display, "cell index is too large"))?;
             cells.push(EditedCell {
