@@ -360,18 +360,17 @@ impl SqliteRuntime {
             if db.extension_id != owner {
                 return Err("SQLite database belongs to another extension".into());
             }
-            if let Some(path) = &db.path {
-                if let Err(error) =
+            if let Some(path) = &db.path
+                && let Err(error) =
                     authorize_database(path, owner.as_deref(), modules, policy, db.readonly)
-                {
-                    // Once authority or the namespace changes, do not leave
-                    // an engine handle that could later flush through it.
-                    if let Some(worker) = self.worker.as_mut() {
-                        let _ = worker.call(Command::Retire { id });
-                    }
-                    self.databases.remove(&id);
-                    return Err(error.into());
+            {
+                // Once authority or the namespace changes, do not leave
+                // an engine handle that could later flush through it.
+                if let Some(worker) = self.worker.as_mut() {
+                    let _ = worker.call(Command::Retire { id });
                 }
+                self.databases.remove(&id);
+                return Err(error.into());
             }
         }
 

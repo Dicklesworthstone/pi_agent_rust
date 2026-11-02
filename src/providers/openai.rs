@@ -516,16 +516,16 @@ impl OpenAIProvider {
                 ));
             }
         }
-        if self.audio_input {
-            if body.get("modalities").is_some_and(|modalities| {
+        if self.audio_input
+            && body.get("modalities").is_some_and(|modalities| {
                 modalities
                     .as_array()
                     .is_none_or(|values| values.len() != 1 || values[0].as_str() != Some("text"))
-            }) {
-                return Err(Error::validation(
-                    "Native OpenAI audio input requires text-only output modalities",
-                ));
-            }
+            })
+        {
+            return Err(Error::validation(
+                "Native OpenAI audio input requires text-only output modalities",
+            ));
         }
         Ok(budget.blocks > 0)
     }

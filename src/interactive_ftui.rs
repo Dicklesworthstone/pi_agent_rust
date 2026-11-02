@@ -8654,14 +8654,13 @@ async fn run_controlled_turn_with_pending(
     // Other failures may have delivered the first input and must not replay it.
     if matches!(&result, Err(crate::error::Error::Validation(message))
         if message.starts_with("[SESSION_CONTROL_CANCELLED] turn cancelled before execution;"))
+        && let Some(source) = initial_source
     {
-        if let Some(source) = initial_source {
-            leftover.insert(0, source);
-            handle
-                .session_mut()
-                .agent
-                .set_magic_keyword_scan_override(None);
-        }
+        leftover.insert(0, source);
+        handle
+            .session_mut()
+            .agent
+            .set_magic_keyword_scan_override(None);
     }
     // The SDK result is the durability boundary. A successful cap must stop
     // the outer continuation loop just like an abort or terminal failure.

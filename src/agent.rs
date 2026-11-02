@@ -4652,14 +4652,13 @@ impl Agent {
                     && pending_messages.is_empty()
                     && !has_more_tool_calls
                     && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
+                    && let Some(action) = turn_recovery.evaluate_assistant(&assistant_arc)
                 {
-                    if let Some(action) = turn_recovery.evaluate_assistant(&assistant_arc) {
-                        pending_messages =
-                            vec![QueuedAgentMessage::generated(Message::User(UserMessage {
-                                content: UserContent::Text(action.nudge_text),
-                                timestamp: Utc::now().timestamp_millis(),
-                            }))];
-                    }
+                    pending_messages =
+                        vec![QueuedAgentMessage::generated(Message::User(UserMessage {
+                            content: UserContent::Text(action.nudge_text),
+                            timestamp: Utc::now().timestamp_millis(),
+                        }))];
                 }
             }
 
@@ -20234,17 +20233,16 @@ impl AgentSession {
                 }));
             }
         }
-        if handoff_source.is_some() {
-            if summary.trim().is_empty()
+        if handoff_source.is_some()
+            && (summary.trim().is_empty()
                 || !compaction::overflow_compaction_preserves_current_turn(
                     &session.entries_for_current_path(),
                     &first_kept_entry_id,
-                )
-            {
-                return Err(Error::session(
-                    "Handoff must preserve the current authored turn and have a nonempty summary",
-                ));
-            }
+                ))
+        {
+            return Err(Error::session(
+                "Handoff must preserve the current authored turn and have a nonempty summary",
+            ));
         }
         if require_reduction
             && !compaction::overflow_compaction_preserves_current_turn(
