@@ -931,7 +931,7 @@ fn persistent_stdio_peer() {
                 .expect("large tool input");
             serde_json::json!({
                 "bytes": text.len(), "characters": text.chars().count(),
-                "sha256": format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+                "sha256": pi::package_manager::hex_encode(&sha2::Sha256::digest(text.as_bytes())),
             })
         } else {
             serde_json::json!({"method": request["method"], "text": request["params"]["text"]})
@@ -1130,7 +1130,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
             result["large"],
             serde_json::json!({
                 "bytes": large_text.len(), "characters": large_text.chars().count(),
-                "sha256": format!("{:x}", sha2::Sha256::digest(large_text.as_bytes())),
+                "sha256": pi::package_manager::hex_encode(&sha2::Sha256::digest(large_text.as_bytes())),
             }),
             "large UTF-8 frames must reach the peer without truncation or interleaving"
         );
