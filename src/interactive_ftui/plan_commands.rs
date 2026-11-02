@@ -237,7 +237,7 @@ impl PlanController {
                 } else {
                     mode_hint(mode, self.model_restore.is_some())
                 };
-                return Ok(format!("Plan mode: {}. {}\n{USAGE}", mode.as_str(), hint,));
+                return Ok(format!("Plan mode: {}. {}\n{USAGE}", mode.as_str(), hint));
             }
             PlanCommand::Review => {
                 // A failed refresh must not leave an earlier display authorizing
