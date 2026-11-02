@@ -211,7 +211,7 @@ fn native_sync_uses_live_binding_and_survives_reopen_without_rebilling() {
         bank.edit(memory.id, crate::memory::MemoryEditOp::Forget, None)
             .unwrap();
         assert!(bank.list(1).unwrap().is_empty());
-        assert!(bank.recall("bounded", 1).unwrap().is_empty());
+        assert!(bank.recall("bounded", Some(1)).unwrap().is_empty());
         bank.with_conn(|conn| {
             assert!(
                 conn.query_sync("SELECT memory_id FROM memory_generated", &[])
