@@ -199,7 +199,7 @@ pub(super) fn prepare<'a>(
         validate_fields(&serde_json::json!({"taskFile": source}))?;
         check(&owner, deadline)?;
         let bytes = source_bytes(tool, source, &owner, deadline)?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(&bytes));
         let text =
             String::from_utf8(bytes).map_err(|_| invalid("taskFile must contain valid UTF-8"))?;
         if text.trim().is_empty() || text.contains('\0') {

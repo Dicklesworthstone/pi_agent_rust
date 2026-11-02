@@ -83,7 +83,7 @@ fn file_tasks_reach_real_child_stdin_beyond_argv_limits_with_source_provenance()
     );
     assert_eq!(
         result(&output)["taskFileSha256"],
-        format!("{:x}", Sha256::digest(text.as_bytes()))
+        crate::package_manager::hex_encode(&Sha256::digest(text.as_bytes()))
     );
     assert_eq!(result(&output)["task"], source.to_string_lossy().as_ref());
     let visible = crate::agent_hub::registry()
@@ -162,7 +162,7 @@ fn queued_chain_file_snapshots_keep_original_bytes_and_render_previous_results()
         std::fs::read_to_string(root.path().join("instructions-used")).unwrap(),
         "Task: Review accepted."
     );
-    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let digest = crate::package_manager::hex_encode(&Sha256::digest(text.as_bytes()));
     assert_eq!(
         results[1].task_file_sha256.as_deref(),
         Some(digest.as_str())
@@ -205,7 +205,7 @@ fn oversized_raw_and_typed_file_chain_expansion_fails_before_that_child_launches
         assert_eq!(records[1]["taskFile"], source.to_string_lossy().as_ref());
         assert_eq!(
             records[1]["taskFileSha256"],
-            format!("{:x}", Sha256::digest(instructions.as_bytes()))
+            crate::package_manager::hex_encode(&Sha256::digest(instructions.as_bytes()))
         );
         assert_eq!(
             std::fs::read_to_string(root.path().join("launches")).expect("real launches"),
@@ -245,7 +245,7 @@ fn workflow_file_instructions_keep_typed_predecessor_data_and_source_digest() {
     );
     assert_eq!(
         output.details.as_ref().unwrap()["nodes"][1]["result"]["taskFileSha256"],
-        format!("{:x}", Sha256::digest(text.as_bytes()))
+        crate::package_manager::hex_encode(&Sha256::digest(text.as_bytes()))
     );
 }
 
@@ -301,7 +301,7 @@ fn task_file_snapshot_survives_schema_retry_and_explicit_hub_revival() {
     assert_eq!(results.len(), 1);
     assert!(!results[0].is_error, "{:?}", results[0]);
     assert_eq!(results[0].schema_retries, Some(1));
-    let digest = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let digest = crate::package_manager::hex_encode(&Sha256::digest(original.as_bytes()));
     assert_eq!(
         results[0].task_file_sha256.as_deref(),
         Some(digest.as_str())
