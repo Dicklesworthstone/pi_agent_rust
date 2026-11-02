@@ -43,7 +43,7 @@ struct Located {
     token: String,
 }
 
-pub(crate) struct AppliedConflicts {
+pub struct AppliedConflicts {
     pub regions: Vec<ConflictRegion>,
     pub changed_paths: Vec<PathBuf>,
 }

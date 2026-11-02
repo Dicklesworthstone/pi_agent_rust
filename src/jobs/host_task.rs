@@ -33,7 +33,7 @@ const TASK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Identity supplied by the owned-task runner, never by a model or a child.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct NativeTaskOwner {
+pub struct NativeTaskOwner {
     pub(crate) session: String,
     pub(crate) job: String,
 }
@@ -42,7 +42,7 @@ thread_local! {
     static CURRENT_NATIVE_TASK: RefCell<Option<NativeTaskOwner>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn current_native_task() -> Option<NativeTaskOwner> {
+pub fn current_native_task() -> Option<NativeTaskOwner> {
     CURRENT_NATIVE_TASK.with_borrow(Clone::clone)
 }
 

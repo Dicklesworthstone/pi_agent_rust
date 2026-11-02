@@ -28,7 +28,7 @@ const RELATED_TASK: &str = "io.modelcontextprotocol/related-task";
 
 /// This value must not outlive the native tool invocation. In particular,
 /// neither a transport reader nor a background job receives its host borrow.
-pub(crate) struct SamplingContext<'a> {
+pub struct SamplingContext<'a> {
     host: &'a dyn ToolInvocationHost,
     model: ToolSamplingModel,
     privacy: AuxiliaryPrivacySnapshot,

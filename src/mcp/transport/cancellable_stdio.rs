@@ -17,13 +17,13 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The parent endpoints only. The child's opposite pipe ends retain their
 /// ordinary blocking behavior. Prepare every endpoint before starting workers.
-pub(crate) struct StdioPipes {
+pub struct StdioPipes {
     pub(crate) stdin: CancellablePipe<ChildStdin>,
     pub(crate) stdout: CancellablePipe<ChildStdout>,
     pub(crate) stderr: CancellablePipe<ChildStderr>,
 }
 
-pub(crate) fn prepare(
+pub fn prepare(
     stdin: ChildStdin,
     stdout: ChildStdout,
     stderr: ChildStderr,
@@ -36,7 +36,7 @@ pub(crate) fn prepare(
     })
 }
 
-pub(crate) struct CancellablePipe<T> {
+pub struct CancellablePipe<T> {
     inner: T,
     alive: Arc<AtomicBool>,
 }

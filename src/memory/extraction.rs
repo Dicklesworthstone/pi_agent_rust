@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) const INPUT_ENTRY: &str = "pi.memory.input.v1";
+pub const INPUT_ENTRY: &str = "pi.memory.input.v1";
 const MAX_MESSAGES: usize = 48;
 const MAX_SOURCE_BYTES: usize = 96 * 1024;
 const MAX_CORPUS_BYTES: usize = 32 * 1024;
@@ -124,7 +124,7 @@ fn digest(value: &[u8]) -> String {
 /// Persist explicit input provenance independently of advisor-generated user rows.
 /// This transcript metadata also serves session titles when memory is disabled;
 /// recording it does not invoke extraction or write to the memory database.
-pub(crate) fn record_authored_input(session: &mut Session, message_id: &str) -> Result<String> {
+pub fn record_authored_input(session: &mut Session, message_id: &str) -> Result<String> {
     let timestamp = match session.get_entry(message_id) {
         Some(SessionEntry::Message(entry))
             if matches!(&entry.message, SessionMessage::User { .. }) =>
@@ -489,7 +489,7 @@ fn commit(
 
 /// Explicit sync and the opt-in native turn-end hook share the same admission,
 /// privacy, completion and transactional persistence boundary.
-pub(crate) async fn synchronize(
+pub async fn synchronize(
     session: &AgentSession,
     settings: &MemorySettings,
     automatic: bool,

@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 const SCHEMA: &str = "pi.interim_response.v1";
 const MAX_REPLY_BYTES: usize = 64 * 1024;
 
-pub(crate) fn is_interim_response_path(path: &str) -> bool {
+pub fn is_interim_response_path(path: &str) -> bool {
     path.get(..6)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("out://"))
 }
@@ -35,7 +35,7 @@ pub fn interim_response_text(output: &ToolOutput) -> Option<&str> {
 }
 
 /// History consumers additionally check the tool name and result's error flag.
-pub(crate) fn interim_response_text_from_details(details: &Value) -> Option<&str> {
+pub fn interim_response_text_from_details(details: &Value) -> Option<&str> {
     if details.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
         return None;
     }

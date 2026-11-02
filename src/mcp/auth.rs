@@ -1826,11 +1826,11 @@ async fn await_callback(
 }
 
 #[cfg(test)]
-pub(crate) mod configured_tests {
+pub mod configured_tests {
     use super::*;
 
     #[derive(Clone)]
-    pub(crate) struct CapturedRequest {
+    pub struct CapturedRequest {
         pub(crate) method: String,
         pub(crate) target: String,
         pub(crate) headers: HashMap<String, String>,
@@ -1845,7 +1845,7 @@ pub(crate) mod configured_tests {
         }
     }
 
-    pub(crate) struct OAuthFixture {
+    pub struct OAuthFixture {
         pub(crate) origin: String,
         methods: Vec<String>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
@@ -2024,7 +2024,7 @@ pub(crate) mod configured_tests {
         Err("fixture request deadline elapsed or fixture stopped".to_string())
     }
 
-    pub(crate) fn fixture_response(origin: &str, methods: &[String], request: &CapturedRequest) -> String {
+    pub fn fixture_response(origin: &str, methods: &[String], request: &CapturedRequest) -> String {
         let (status, extra, body) = match (request.method.as_str(), request.target.as_str()) {
             ("GET", "/mcp") => (
                 "401 Unauthorized",
@@ -2097,7 +2097,7 @@ pub(crate) mod configured_tests {
         http_response(status, &extra, "application/json", &body.to_string())
     }
 
-    pub(crate) fn http_response(status: &str, extra: &str, content_type: &str, body: &str) -> String {
+    pub fn http_response(status: &str, extra: &str, content_type: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
             body.len(),
@@ -2164,7 +2164,7 @@ pub(crate) mod configured_tests {
         Arc::new(|| Ok(()))
     }
 
-    pub(crate) fn browser_callback(
+    pub fn browser_callback(
         captured: Arc<Mutex<Vec<Url>>>,
         issuer: String,
     ) -> Arc<dyn Fn(&str) + Send + Sync> {

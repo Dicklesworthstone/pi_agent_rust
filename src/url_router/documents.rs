@@ -321,7 +321,7 @@ fn scratch_store() -> &'static std::sync::Mutex<std::collections::HashMap<String
 
 /// Capture a scratch document without cloning an oversized instruction body.
 /// This is the same store as ordinary local:// reads, not a filesystem URL.
-pub(crate) fn read_local_bounded(name: &str, limit: usize) -> Result<String> {
+pub fn read_local_bounded(name: &str, limit: usize) -> Result<String> {
     let store = scratch_store()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

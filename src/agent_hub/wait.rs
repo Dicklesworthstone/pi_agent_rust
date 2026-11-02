@@ -22,7 +22,7 @@ const MAX_WAIT_HOLDS: usize = 1024;
 /// One admitted worker turn, independent of the retained process's lifetime.
 /// Binding precedes process launch; completion releases every observer before
 /// the actor can accept another turn, even if a waiting future is not polled.
-pub(crate) struct ResultDependency {
+pub struct ResultDependency {
     peer: OnceLock<String>,
     pending: AtomicBool,
 }
@@ -55,7 +55,7 @@ impl ResultDependency {
 /// Bounded by native worker/pool admission. A pool publishes each accepted
 /// batch here before unlocking admission, so a wait observes later alternatives
 /// without acquiring worker, pool or jobs locks under the hub registry lock.
-pub(crate) struct ResultDependencies(Mutex<Vec<Arc<ResultDependency>>>);
+pub struct ResultDependencies(Mutex<Vec<Arc<ResultDependency>>>);
 
 impl ResultDependencies {
     pub(crate) fn new(results: Vec<Arc<ResultDependency>>) -> Arc<Self> {

@@ -4,7 +4,7 @@
 use super::*;
 use std::sync::RwLock;
 
-pub(crate) const MAX_CLIENT_TEXT_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_CLIENT_TEXT_BYTES: usize = 10 * 1024 * 1024;
 
 /// A session's editor filesystem. An error never authorizes a disk fallback.
 #[async_trait]
