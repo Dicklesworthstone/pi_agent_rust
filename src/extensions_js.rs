@@ -31295,7 +31295,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 RepairMode::Off,
                 &roots
             ),
-            Some(module.clone())
+            Some(module)
         );
         let outside_url = url::Url::from_file_path(&outside).unwrap();
         assert!(

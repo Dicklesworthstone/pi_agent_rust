@@ -501,7 +501,7 @@ fn cancelling_the_tool_owner_releases_the_exact_pending_host_picker() {
             let cancelled_id = Arc::new(Mutex::new(None));
             let cancel = async {
                 let request = receiver.recv(owner.cx()).await.unwrap();
-                *McpManager::lock(&cancelled_id) = Some(request.id.clone());
+                *McpManager::lock(&cancelled_id) = Some(request.id);
                 owner.cancel_with(
                     asupersync::types::CancelKind::User,
                     Some("cancel form owner"),

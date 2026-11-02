@@ -106,11 +106,11 @@ fn invalid_later_file_tasks_launch_no_valid_prefix_in_any_delegation_mode() {
         .unwrap();
     for input in [
         later.clone(),
-        json!({"tasks":[first.clone(), later.clone()], "concurrency":1}),
-        json!({"chain":[first.clone(), later.clone()]}),
+        json!({"tasks":[first, later], "concurrency":1}),
+        json!({"chain":[first, later]}),
         json!({"workflow":[
-            {"id":"first", "call":first.clone()},
-            {"id":"later", "needs":["first"], "call":later.clone()}
+            {"id":"first", "call":first},
+            {"id":"later", "needs":["first"], "call":later}
         ]}),
     ] {
         assert!(
@@ -394,11 +394,11 @@ fn task_role_provenance_is_carried_in_all_modes_without_model_id_inference() {
         json!({"agent":"worker", "task":"explicit work", "model":"selection-local/selection-fast"});
     for input in [
         role.clone(),
-        json!({"tasks":[role.clone(), explicit.clone()], "concurrency":1}),
-        json!({"chain":[role.clone(), explicit.clone()]}),
+        json!({"tasks":[role, explicit], "concurrency":1}),
+        json!({"chain":[role, explicit]}),
         json!({"workflow":[
-            {"id":"role", "call":role.clone()},
-            {"id":"explicit", "needs":["role"], "call":explicit.clone()}
+            {"id":"role", "call":role},
+            {"id":"explicit", "needs":["role"], "call":explicit}
         ]}),
     ] {
         let (_dir, tool) = fixture(&record_fallback_script(&emit(&[ended("complete", "stop")])));
@@ -496,11 +496,11 @@ fn explicit_models_override_definition_role_and_parent_in_every_one_shot_mode() 
     let second = json!({"agent":"worker", "task":"review {previous}", "model":"selection-local/selection-careful:high"});
     for input in [
         first.clone(),
-        json!({"tasks":[first.clone(), second.clone()], "concurrency":1}),
-        json!({"chain":[first.clone(), second.clone()]}),
+        json!({"tasks":[first, second], "concurrency":1}),
+        json!({"chain":[first, second]}),
         json!({"workflow":[
-            {"id":"inspect", "call":first.clone()},
-            {"id":"review", "needs":["inspect"], "call":second.clone()}
+            {"id":"inspect", "call":first},
+            {"id":"review", "needs":["inspect"], "call":second}
         ]}),
     ] {
         let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));

@@ -12672,7 +12672,7 @@ mod tests {
     fn reserved_path_rejects_identity_drift_without_creating_storage() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions_root = temp.path().join("sessions");
-        let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+        let mut session = Session::create_with_dir(Some(sessions_root));
         session
             .reserve_persistence_path()
             .expect("reserve filename");

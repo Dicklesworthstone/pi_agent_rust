@@ -25,8 +25,8 @@ fn task_sources_are_explicit_and_cannot_forge_snapshot_metadata() {
     let file = json!({"agent":"task", "taskFile":"local://instructions"});
     for valid in [
         file.clone(),
-        json!({"tasks":[file.clone(), {"agent":"task", "task":"inline"}]}),
-        json!({"chain":[file.clone()]}),
+        json!({"tasks":[file, {"agent":"task", "task":"inline"}]}),
+        json!({"chain":[file]}),
     ] {
         validate_request(&valid).expect("supported request");
     }

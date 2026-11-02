@@ -4945,7 +4945,7 @@ mod tests {
         let cwd = root.path().join("target");
         let params = json!({ "cwd": cwd, "mcpServers": [] });
         let audio = json!({ "type": "audio", "mimeType": "audio/wav", "data": "AQID" });
-        let steering_params = json!({ "prompt": [audio.clone()] });
+        let steering_params = json!({ "prompt": [audio] });
         for (name, setting) in [
             ("eval", "enableEval"),
             ("github", "enableGithub"),
