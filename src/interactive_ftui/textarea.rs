@@ -1901,14 +1901,12 @@ impl TextArea {
                     if displayed_row_index < visual_rows_capacity {
                         // Visible.
                         return;
-                    } else {
-                        // Not visible (below).
-                        break;
                     }
-                } else {
-                    // Cursor is before the anchor start? Handled by step 1.
-                    return;
+                    // Not visible (below).
+                    break;
                 }
+                // Cursor is before the anchor start? Handled by step 1.
+                return;
             }
 
             let rows_remaining_in_line = wrap_count.saturating_sub(current_v_start);
