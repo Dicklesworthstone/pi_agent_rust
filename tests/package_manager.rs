@@ -328,7 +328,7 @@ fn resolve_with_roots_universal_alias_ignores_root_markdown() {
 fn resolve_with_roots_discovers_universal_skill_ancestors_only_to_git_root() {
     let harness =
         TestHarness::new("resolve_with_roots_discovers_universal_skill_ancestors_only_to_git_root");
-    let repo = harness.create_dir("repo");
+    let _repo = harness.create_dir("repo");
     harness.create_dir("repo/.git");
     let cwd = harness.create_dir("repo/crates/app/src");
     let global_base_dir = harness.create_dir("agent");
