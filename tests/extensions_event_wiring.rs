@@ -1013,8 +1013,7 @@ fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() 
         ),
     ] {
         // Each index entry gets its own extension owner and QuickJS realm.
-        let entry =
-            harness.create_file(&format!("extensions/{owner}/index.mjs"), source.as_bytes());
+        let entry = harness.create_file(format!("extensions/{owner}/index.mjs"), source.as_bytes());
         specs.push(JsExtensionLoadSpec::from_entry_path(&entry).expect("load spec"));
     }
     let manager = ExtensionManager::new();

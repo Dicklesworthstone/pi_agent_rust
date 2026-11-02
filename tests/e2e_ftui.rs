@@ -234,7 +234,7 @@ fn run_ftui_multiline_terminal_scenario(
     });
     session.harness.create_file(
         "env/agent/models.json",
-        &serde_json::to_vec(&models).expect("serialize loopback model"),
+        serde_json::to_vec(&models).expect("serialize loopback model"),
     );
     if let Some(config) = keybindings {
         session

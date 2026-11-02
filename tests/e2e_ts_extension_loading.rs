@@ -1427,11 +1427,11 @@ fn context_mode_driver_selection_and_encoded_module_paths_load_without_stubs() {
     let cwd = harness.temp_dir().to_path_buf();
     let prefix = "extensions/context # % λ";
     harness.create_file(
-        &format!("{prefix}/package.json"),
+        format!("{prefix}/package.json"),
         br#"{"name":"context-mode-loader-fixture","type":"module","pi":{"extensions":["./entry.mjs"]}}"#,
     );
     harness.create_file(
-        &format!("{prefix}/driver.mjs"),
+        format!("{prefix}/driver.mjs"),
         br"
 import { createRequire } from 'node:module';
 export function openDatabase() {
@@ -1445,19 +1445,19 @@ export function openDatabase() {
 ",
     );
     let factory = harness.create_file(
-        &format!("{prefix}/factory.cjs"),
+        format!("{prefix}/factory.cjs"),
         br"
 const { basename } = require('node:path');
 module.exports = value => ({ value, filename: __filename, directory: __dirname, basename: basename(__filename) });
 ",
     );
-    harness.create_file(&format!("{prefix}/value.cjs"), b"module.exports = 41;\n");
+    harness.create_file(format!("{prefix}/value.cjs"), b"module.exports = 41;\n");
     harness.create_file(
-        &format!("{prefix}/side-effect.cjs"),
+        format!("{prefix}/side-effect.cjs"),
         b"const path = require ('node:path'); globalThis.loaderSideEffect = path.basename('/fixture/loaded');\n",
     );
     harness.create_file(
-        &format!("{prefix}/consumer.cjs"),
+        format!("{prefix}/consumer.cjs"),
         br"
 require('./side-effect.cjs');
 const createValue = require('./factory.cjs');
@@ -1465,13 +1465,13 @@ const value = require('./value.cjs');
 module.exports = createValue(value);
 ",
     );
-    harness.create_file(&format!("{prefix}/prices.json"), br#"{"price":3}"#);
+    harness.create_file(format!("{prefix}/prices.json"), br#"{"price":3}"#);
     harness.create_file(
-        &format!("{prefix}/helper #%.mjs"),
+        format!("{prefix}/helper #%.mjs"),
         b"export const count = 7;\n",
     );
     let entry = harness.create_file(
-        &format!("{prefix}/entry.mjs"),
+        format!("{prefix}/entry.mjs"),
         br"
 import { openDatabase } from './driver.mjs';
 import importedValue from './consumer.cjs';
