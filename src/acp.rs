@@ -1291,16 +1291,15 @@ async fn run(
                             continue;
                         };
 
-                        let session_config = match session_state.lock(&cx).await {
-                            Ok(state) => Arc::clone(&state.config),
-                            Err(_) => {
-                                let _ = out_tx.send(json_rpc_error(
-                                    id,
-                                    INTERNAL_ERROR,
-                                    "Session settings are unavailable",
-                                ));
-                                continue;
-                            }
+                        let session_config = if let Ok(state) = session_state.lock(&cx).await {
+                            Arc::clone(&state.config)
+                        } else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INTERNAL_ERROR,
+                                "Session settings are unavailable",
+                            ));
+                            continue;
                         };
                         let message_content = match content::extract_prompt_content(
                             prompt_blocks,
@@ -1423,18 +1422,17 @@ async fn run(
                             }
                             continue;
                         };
-                        let session_config = match session_state.lock(&cx).await {
-                            Ok(state) => Arc::clone(&state.config),
-                            Err(_) => {
-                                if request.id.is_some() {
-                                    let _ = out_tx.send(json_rpc_error(
-                                        id,
-                                        INTERNAL_ERROR,
-                                        "Session settings are unavailable",
-                                    ));
-                                }
-                                continue;
+                        let session_config = if let Ok(state) = session_state.lock(&cx).await {
+                            Arc::clone(&state.config)
+                        } else {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    "Session settings are unavailable",
+                                ));
                             }
+                            continue;
                         };
                         match steering::Input::parse(
                             &request.params,

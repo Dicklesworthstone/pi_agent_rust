@@ -296,20 +296,17 @@ fn mutation_output(
                     normalize_to_lf(strip_bom(actual).0),
                 ))
             };
-            match views {
-                Ok((before, after)) => {
-                    let (diff, first) = generate_diff_string(&before, &after);
-                    details["diff"] = serde_json::json!(diff);
-                    if let Some(first) = first {
-                        details["firstChangedLine"] = serde_json::json!(first);
-                    }
+            if let Ok((before, after)) = views {
+                let (diff, first) = generate_diff_string(&before, &after);
+                details["diff"] = serde_json::json!(diff);
+                if let Some(first) = first {
+                    details["firstChangedLine"] = serde_json::json!(first);
                 }
-                Err(_) => {
-                    // The editor already acknowledged this write. An invalid
-                    // read-back cannot turn that into a safe-to-retry failure.
-                    text.push_str(" The editor returned invalid notebook JSON; inspect it with raw=true before further edits.");
-                    details["notebookProjectionUnavailable"] = serde_json::json!(true);
-                }
+            } else {
+                // The editor already acknowledged this write. An invalid
+                // read-back cannot turn that into a safe-to-retry failure.
+                text.push_str(" The editor returned invalid notebook JSON; inspect it with raw=true before further edits.");
+                details["notebookProjectionUnavailable"] = serde_json::json!(true);
             }
         }
     } else {

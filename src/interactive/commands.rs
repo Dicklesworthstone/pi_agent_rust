@@ -1780,12 +1780,11 @@ impl PiApp {
 
     pub(super) fn begin_login_attempt(&mut self, auth_path: &Path) -> Option<String> {
         self.retire_login();
-        let session_id = match self.session.try_lock() {
-            Ok(session) => session.header.id.clone(),
-            Err(_) => {
-                self.status_message = Some("Session busy; try login again".to_string());
-                return None;
-            }
+        let session_id = if let Ok(session) = self.session.try_lock() {
+            session.header.id.clone()
+        } else {
+            self.status_message = Some("Session busy; try login again".to_string());
+            return None;
         };
         let attempt = LoginAttempt::new(session_id, auth_path.to_path_buf());
         let id = attempt.id.clone();
