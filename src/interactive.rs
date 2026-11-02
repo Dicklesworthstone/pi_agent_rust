@@ -704,10 +704,11 @@ impl PiApp {
             .acquire(cx.cx())
             .await
             .map_err(|_| "Session busy; session change was not applied")?;
-        let Ok(mut agent_guard) = agent.try_lock() else {
+        // Owned guards are Send: this future is spawned and holds both locks across the saves.
+        let Ok(mut agent_guard) = OwnedMutexGuard::try_lock(Arc::clone(agent)) else {
             return Err("Agent busy; session change was not applied");
         };
-        let Ok(mut session_guard) = session.try_lock() else {
+        let Ok(mut session_guard) = OwnedMutexGuard::try_lock(Arc::clone(session)) else {
             return Err("Session busy; session change was not applied");
         };
 
