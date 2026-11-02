@@ -7609,11 +7609,11 @@ mod tests {
                 None,
             ))
         };
-        let error = probe().err().expect("admitted duplicate profiles are parsed");
+        let error = probe().expect_err("admitted duplicate profiles are parsed");
         assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
         std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
             .expect("change the admitted profile");
-        let error = probe().err().expect("project admission must be revalidated");
+        let error = probe().expect_err("project admission must be revalidated");
         assert!(
             error
                 .to_string()
@@ -7682,15 +7682,11 @@ mod tests {
             assert!(user_only.is_error);
             let discovered = probe("both");
             if trusted {
-                let error = discovered
-                    .err()
-                    .expect("trusted duplicate definitions are parsed");
+                let error = discovered.expect_err("trusted duplicate definitions are parsed");
                 assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
                 std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
                     .expect("mutate admitted project profile");
-                let error = probe("both")
-                    .err()
-                    .expect("stale project admission must fail");
+                let error = probe("both").expect_err("stale project admission must fail");
                 assert!(
                     error
                         .to_string()

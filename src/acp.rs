@@ -4688,8 +4688,7 @@ mod tests {
         };
         let error = launch
             .selection_cli()
-            .err()
-            .expect("missing explicit selection must be rejected")
+            .expect_err("missing explicit selection must be rejected")
             .to_string();
         assert!(
             error.contains("no_implicit_tools requires an explicit tools selection or no_tools"),
@@ -4885,15 +4884,11 @@ mod tests {
 
         trust_acp_settings(&cwd, &source.global_dir);
         let (_, admitted) = handle_session_new(&params, &options, None).expect("trusted workspace");
-        let error = probe(&admitted)
-            .err()
-            .expect("trusted duplicates are parsed");
+        let error = probe(&admitted).expect_err("trusted duplicates are parsed");
         assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
         std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
             .expect("mutate admitted project role");
-        let error = probe(&admitted)
-            .err()
-            .expect("retained session must recheck its admission");
+        let error = probe(&admitted).expect_err("retained session must recheck its admission");
         assert!(
             error
                 .to_string()
