@@ -221,7 +221,7 @@ mod tests {
                     "reply-1",
                     json!({"path": "OUT://../ignored", "content": markdown}),
                     Some(Box::new(move |update| {
-                        captured.lock().unwrap().push(update)
+                        captured.lock().unwrap().push(update);
                     })),
                 )
                 .await
@@ -304,7 +304,7 @@ mod tests {
                         "reply",
                         json!({"path": "out://", "content": "Progress"}),
                         Some(Box::new(move |_| {
-                            assert_eq!(enabled, Some(true), "disabled replies cannot publish")
+                            assert_eq!(enabled, Some(true), "disabled replies cannot publish");
                         })),
                     )
                     .await;

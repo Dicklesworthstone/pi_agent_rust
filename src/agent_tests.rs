@@ -11100,11 +11100,12 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             let streaming = Arc::clone(&session.extensions_is_streaming);
             let events = Arc::new(StdMutex::new(Vec::new()));
             let captured = Arc::clone(&events);
-            let mut turn = Box::pin(
-                session.run_text("check the fixture".to_string(), move |event| {
-                    captured.lock().expect("events").push(event)
-                }),
-            );
+            let mut turn = Box::pin(session.run_text(
+                "check the fixture".to_string(),
+                move |event| {
+                    captured.lock().expect("events").push(event);
+                },
+            ));
             let reached_review = futures::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
                 if advisor.observed_durable_completion.load(Ordering::SeqCst) {

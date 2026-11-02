@@ -5278,7 +5278,7 @@ impl PiFtuiModel {
                 match ServiceTierCommand::parse(cmd_args) {
                     Some(request) => self.send_command(UiCommand::Fast(request)),
                     None => {
-                        self.push_entry(EntryRole::Error, String::from(ServiceTierCommand::USAGE))
+                        self.push_entry(EntryRole::Error, String::from(ServiceTierCommand::USAGE));
                     }
                 }
                 return true;
@@ -13614,7 +13614,7 @@ mod tests {
                             "clipboard-owner",
                             "input",
                             serde_json::json!({"title": "Reply"}),
-                        ))))
+                        ))));
                     }
                     "picker" => sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
                         fork: false,
@@ -13638,7 +13638,7 @@ mod tests {
                     }
                     _ => {
                         sim.model_mut().mcp_auth_request =
-                            Some(McpAuthRequest::new(String::from("current")))
+                            Some(McpAuthRequest::new(String::from("current")));
                     }
                 }
                 sim.inject_event(Event::Tick);
@@ -13651,7 +13651,7 @@ mod tests {
                         accepts_empty_input: false,
                     })),
                     "ask" | "extension" | "picker" => {
-                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()))
+                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
                     }
                     "custom" => send_ui_effect(
                         &mut sim,

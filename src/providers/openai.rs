@@ -3050,7 +3050,7 @@ mod tests {
             match (usage.billing(true).unwrap(), reported) {
                 (BillingUsage::Unavailable { .. }, None) => {}
                 (BillingUsage::ReportedTotal { total }, Some(expected)) => {
-                    assert_eq!(total, expected)
+                    assert_eq!(total, expected);
                 }
                 other => panic!("unexpected accounting evidence: {other:?}"),
             }
@@ -3076,12 +3076,12 @@ mod tests {
                                 "model" => body["model"] = json!("unpriced-replacement"),
                                 "format" => {
                                     body["messages"][0]["content"][0]["input_audio"]["format"] =
-                                        json!("flac")
+                                        json!("flac");
                                 }
                                 "output" => body["modalities"] = json!(["audio"]),
                                 "data" => {
                                     body["messages"][0]["content"][0]["input_audio"]["data"] =
-                                        json!("not base64!")
+                                        json!("not base64!");
                                 }
                                 "usage" => body["stream_options"]["include_usage"] = json!(false),
                                 _ => unreachable!(),

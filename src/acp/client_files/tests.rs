@@ -932,7 +932,7 @@ fn real_agent_permission_denial_publishes_no_filesystem_request() {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let observed = Arc::clone(&events);
         let mut turn = Box::pin(agent.run("Update the file", move |event| {
-            observed.lock().unwrap().push(event)
+            observed.lock().unwrap().push(event);
         }));
         let permission = fixture
             .await_frame(turn.as_mut(), "session/request_permission")

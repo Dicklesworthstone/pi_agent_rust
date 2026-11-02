@@ -6970,10 +6970,10 @@ mod tests {
                         for _ in 0..8 {
                             match output.next().await.expect("expected exactly one error") {
                                 Ok(StreamEvent::TextDelta { delta, .. }) => {
-                                    saw_partial |= delta == "partial"
+                                    saw_partial |= delta == "partial";
                                 }
                                 Ok(StreamEvent::Start { partial }) => {
-                                    mode.assert_identity(&partial)
+                                    mode.assert_identity(&partial);
                                 }
                                 Ok(StreamEvent::TextStart { .. }) => {}
                                 Ok(event) => {
