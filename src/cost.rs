@@ -27,7 +27,7 @@ static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_attempt_id() -> Result<u64> {
     NEXT_ATTEMPT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| Error::session("model cost attempt identities exhausted"))
 }
 

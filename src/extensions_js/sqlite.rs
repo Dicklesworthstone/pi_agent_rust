@@ -1157,7 +1157,7 @@ struct Worker {
 impl Worker {
     fn start() -> Result<Self> {
         ACTIVE_WORKERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_WORKERS).then_some(active + 1)
             })
             .map_err(|_| "SQLite process worker limit reached")?;
