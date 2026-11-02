@@ -215,6 +215,7 @@ mod tests {
                     total: self.provider_reported_total.unwrap_or(0.0),
                     ..crate::model::Cost::default()
                 },
+                billing: None,
             };
             Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
                 reason: StopReason::Stop,

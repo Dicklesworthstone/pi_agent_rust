@@ -633,6 +633,7 @@ mod tests {
                         total: 0.5,
                         ..Default::default()
                     },
+                    billing: None,
                 },
                 stop_reason: crate::model::StopReason::Stop,
                 stop_details: None,
