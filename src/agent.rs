@@ -10623,7 +10623,7 @@ mod extensions_integration_tests {
                     "refresh must preserve the explicit active-tool allowlist"
                 );
 
-                let (reason, content) = if index % 2 == 0 {
+                let (reason, content) = if index.is_multiple_of(2) {
                     (
                         StopReason::ToolUse,
                         vec![ContentBlock::ToolCall(ToolCall {
