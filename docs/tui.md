@@ -149,7 +149,10 @@ disabling compaction invalidates any pending background summary. Settings open
 when the agent is idle. Custom `openSettings` keybindings are supported.
 
 Use `/thinking` to change reasoning level and `/theme` to select a theme. The
-classic stack retains its own settings selector.
+classic stack retains its own settings selector and exposes the same four
+persistent optional-tool switches. Classic toggles also persist immediately and
+apply when a new session is constructed; they do not hot-swap the running tool
+registry.
 
 ## Message Queue
 

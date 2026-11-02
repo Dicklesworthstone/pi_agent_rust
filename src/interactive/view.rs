@@ -1560,6 +1560,46 @@ impl PiApp {
                         "followUpMode: {}",
                         self.config.follow_up_queue_mode().as_str()
                     ),
+                    SettingsUiEntry::EnableEval => format!(
+                        "tools.enableEval: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_eval)
+                                .unwrap_or(false)
+                        )
+                    ),
+                    SettingsUiEntry::EnableGithub => format!(
+                        "tools.enableGithub: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_github)
+                                .unwrap_or(false)
+                        )
+                    ),
+                    SettingsUiEntry::EnableSecurityScan => format!(
+                        "tools.enableSecurityScan: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_security_scan)
+                                .unwrap_or(false)
+                        )
+                    ),
+                    SettingsUiEntry::EnableSubagent => format!(
+                        "tools.enableSubagent: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_subagent)
+                                .unwrap_or(false)
+                        )
+                    ),
                     SettingsUiEntry::DefaultPermissive => format!(
                         "extensionPolicy.defaultPermissive: {}{}",
                         bool_label(self.effective_default_permissive()),

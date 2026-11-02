@@ -3421,14 +3421,11 @@ fn tui_state_slash_settings_quiet_startup_persists_and_overrides_global() {
     assert_after_contains(&harness, &step, "Settings");
     assert_after_contains(&harness, &step, "quietStartup:");
 
-    // Navigate to quietStartup entry:
-    // Summary(0), Theme(1), SteeringMode(2), FollowUpMode(3),
-    // DefaultPermissive(4), QuietStartup(5)
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
+    // Navigate to quietStartup entry. The four optional-tool toggles sit
+    // between FollowUpMode and DefaultPermissive.
+    for _ in 0..9 {
+        press_down(&harness, &mut app);
+    }
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Updated quietStartup: on");
 
@@ -3446,6 +3443,41 @@ fn tui_state_slash_settings_quiet_startup_persists_and_overrides_global() {
     .expect("write global settings");
     let loaded = Config::load_with_roots(None, &global_dir, harness.temp_dir()).expect("load");
     assert_eq!(loaded.quiet_startup, Some(true));
+}
+
+#[test]
+fn tui_state_slash_settings_optional_tools_persist_for_new_sessions() {
+    let harness = TestHarness::new("tui_state_slash_settings_optional_tools_persist_for_new_sessions");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/settings");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "tools.enableEval: off (new session)");
+    assert_after_contains(&harness, &step, "tools.enableGithub: off (new session)");
+    assert_after_contains(&harness, &step, "tools.enableSecurityScan: off (new session)");
+    assert_after_contains(&harness, &step, "tools.enableSubagent: off (new session)");
+
+    // Summary(0), Theme(1), Steering(2), FollowUp(3), EnableEval(4).
+    for _ in 0..4 {
+        press_down(&harness, &mut app);
+    }
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(
+        &harness,
+        &step,
+        "Updated tools.enableEval: on (new session)",
+    );
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(settings["tools"]["enable_eval"], json!(true));
+    assert!(settings["tools"].get("enableEval").is_none());
+
+    // The running registry is deliberately unchanged; the next session
+    // construction consumes the persisted activation setting.
+    type_text(&harness, &mut app, "/settings");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "tools.enableEval: on (new session)");
 }
 
 #[test]
@@ -7045,15 +7077,10 @@ fn tui_state_collapse_changelog_settings_toggle_persists() {
     assert_after_contains(&harness, &step, "Settings");
     assert_after_contains(&harness, &step, "collapseChangelog:");
 
-    // Navigate to CollapseChangelog entry:
-    // Summary(0), Theme(1), SteeringMode(2), FollowUpMode(3), DefaultPermissive(4),
-    // QuietStartup(5), CollapseChangelog(6)
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
-    press_down(&harness, &mut app);
+    // Navigate to CollapseChangelog entry after the four optional-tool toggles.
+    for _ in 0..10 {
+        press_down(&harness, &mut app);
+    }
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Updated collapseChangelog: on");
 
@@ -7072,10 +7099,8 @@ fn tui_state_hide_thinking_block_settings_toggle_persists() {
     assert_after_contains(&harness, &step, "Settings");
     assert_after_contains(&harness, &step, "hideThinkingBlock:");
 
-    // Navigate to HideThinkingBlock entry:
-    // Summary(0), Theme(1), SteeringMode(2), FollowUpMode(3), DefaultPermissive(4),
-    // QuietStartup(5), CollapseChangelog(6), HideThinkingBlock(7)
-    for _ in 0..7 {
+    // Navigate to HideThinkingBlock entry after the four optional-tool toggles.
+    for _ in 0..11 {
         press_down(&harness, &mut app);
     }
     let step = press_enter(&harness, &mut app);

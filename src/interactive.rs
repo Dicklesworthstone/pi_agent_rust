@@ -891,6 +891,81 @@ impl PiApp {
             SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
                 self.toggle_queue_mode_setting(entry);
             }
+            SettingsUiEntry::EnableEval => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_eval)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableEval",
+                    json!({ "tools": { "enable_eval": next, "enableEval": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_eval = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableEval: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableGithub => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_github)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableGithub",
+                    json!({ "tools": { "enable_github": next, "enableGithub": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_github = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableGithub: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableSecurityScan => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_security_scan)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableSecurityScan",
+                    json!({ "tools": { "enable_security_scan": next, "enableSecurityScan": null } }),
+                ) {
+                    self.config
+                        .tools
+                        .get_or_insert_default()
+                        .enable_security_scan = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableSecurityScan: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableSubagent => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_subagent)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableSubagent",
+                    json!({ "tools": { "enable_subagent": next, "enableSubagent": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_subagent = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableSubagent: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
             SettingsUiEntry::DefaultPermissive => {
                 let next = !self.effective_default_permissive();
                 if self.persist_project_settings_patch(
@@ -1107,6 +1182,19 @@ impl PiApp {
         let keep_recent = self.config.compaction_keep_recent_tokens();
         let steering = self.config.steering_queue_mode();
         let follow_up = self.config.follow_up_queue_mode();
+        let tool_settings = self.config.tools.as_ref();
+        let enable_eval = tool_settings
+            .and_then(|tools| tools.enable_eval)
+            .unwrap_or(false);
+        let enable_github = tool_settings
+            .and_then(|tools| tools.enable_github)
+            .unwrap_or(false);
+        let enable_security_scan = tool_settings
+            .and_then(|tools| tools.enable_security_scan)
+            .unwrap_or(false);
+        let enable_subagent = tool_settings
+            .and_then(|tools| tools.enable_subagent)
+            .unwrap_or(false);
         let default_permissive = self.effective_default_permissive();
         let quiet_startup = self.config.quiet_startup.unwrap_or(false);
         let collapse_changelog = self.config.collapse_changelog.unwrap_or(false);
@@ -1132,6 +1220,26 @@ impl PiApp {
         );
         let _ = writeln!(output, "  steeringMode: {}", steering.as_str());
         let _ = writeln!(output, "  followUpMode: {}", follow_up.as_str());
+        let _ = writeln!(
+            output,
+            "  tools.enableEval: {} (new session)",
+            bool_label(enable_eval)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableGithub: {} (new session)",
+            bool_label(enable_github)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableSecurityScan: {} (new session)",
+            bool_label(enable_security_scan)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableSubagent: {} (new session)",
+            bool_label(enable_subagent)
+        );
         let _ = writeln!(
             output,
             "  extensionPolicy.defaultPermissive: {}{}",

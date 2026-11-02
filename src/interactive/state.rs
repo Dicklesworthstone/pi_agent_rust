@@ -475,6 +475,10 @@ pub(super) enum SettingsUiEntry {
     Theme,
     SteeringMode,
     FollowUpMode,
+    EnableEval,
+    EnableGithub,
+    EnableSecurityScan,
+    EnableSubagent,
     DefaultPermissive,
     QuietStartup,
     CollapseChangelog,
@@ -579,6 +583,10 @@ impl SettingsUiState {
                 SettingsUiEntry::Theme,
                 SettingsUiEntry::SteeringMode,
                 SettingsUiEntry::FollowUpMode,
+                SettingsUiEntry::EnableEval,
+                SettingsUiEntry::EnableGithub,
+                SettingsUiEntry::EnableSecurityScan,
+                SettingsUiEntry::EnableSubagent,
                 SettingsUiEntry::DefaultPermissive,
                 SettingsUiEntry::QuietStartup,
                 SettingsUiEntry::CollapseChangelog,
@@ -1360,5 +1368,18 @@ mod tests {
     fn settings_ui_includes_default_permissive_toggle() {
         let state = SettingsUiState::new();
         assert!(state.entries.contains(&SettingsUiEntry::DefaultPermissive));
+    }
+
+    #[test]
+    fn settings_ui_includes_all_persistent_optional_tool_toggles() {
+        let state = SettingsUiState::new();
+        for entry in [
+            SettingsUiEntry::EnableEval,
+            SettingsUiEntry::EnableGithub,
+            SettingsUiEntry::EnableSecurityScan,
+            SettingsUiEntry::EnableSubagent,
+        ] {
+            assert!(state.entries.contains(&entry), "{entry:?}");
+        }
     }
 }
