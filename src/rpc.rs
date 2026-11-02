@@ -7481,9 +7481,9 @@ async fn run_prompt_with_retry_owned(
                 }
             };
             let provider = guard.agent.provider().name().to_string();
-            if !guard
+            if guard
                 .recovery_api_key_override(&provider, options.cli_api_key.as_deref())
-                .is_some_and(|key| !key.trim().is_empty())
+                .is_none_or(|key| key.trim().is_empty())
                 && let Some(key) = guard.agent.stream_options().api_key.clone()
             {
                 quota_credential = Some((provider, key));

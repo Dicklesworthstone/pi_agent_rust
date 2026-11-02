@@ -41,10 +41,10 @@ pub(super) fn anthropic_tool_schema(schema: &Value) -> Cow<'_, Value> {
     let mut required = string_entries(wire.get("required"));
     let mut closed = false;
     for key in COMBINATORS {
-        if !wire
+        if wire
             .get(key)
             .and_then(Value::as_array)
-            .is_some_and(|variants| !variants.is_empty())
+            .is_none_or(|variants| variants.is_empty())
         {
             continue;
         }
