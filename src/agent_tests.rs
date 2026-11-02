@@ -13,6 +13,19 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc as StdArc, Mutex as StdTestMutex};
 
+    fn assistant_text_content(content: &[ContentBlock]) -> String {
+        let mut text = String::new();
+        for block in content {
+            if let ContentBlock::Text(part) = block {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&part.text);
+            }
+        }
+        text
+    }
+
     fn user_message(text: &str) -> Message {
         Message::User(UserMessage {
             content: UserContent::Text(text.to_string()),
