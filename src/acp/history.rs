@@ -2053,7 +2053,7 @@ mod tests {
                     }),
                 ),
             ] {
-                session.append_model_message(Message::ToolResult(
+                session.append_model_message(Message::ToolResult(Arc::new(
                     crate::model::ToolResultMessage {
                         tool_call_id: id.into(),
                         tool_name: tool.into(),
@@ -2062,7 +2062,7 @@ mod tests {
                         is_error: failed,
                         timestamp: 2,
                     },
-                ));
+                )));
             }
             session.append_model_message(assistant("Finished the fix"));
             session.save().await.unwrap();
