@@ -23996,7 +23996,7 @@ mod tests {
                 for name in ["secret", "secret/hidden.rs", "secret/.gitignore"] {
                     let unreadable = temp.path().join(name);
                     let original = std::fs::metadata(&unreadable).unwrap().permissions();
-                    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0))
+                    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o0))
                         .unwrap();
                     let excluded = tool
                         .execute(

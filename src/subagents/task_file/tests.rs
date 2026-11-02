@@ -155,7 +155,7 @@ fn symlink_escapes_unreadable_files_and_fifos_are_rejected() {
 
     let unreadable = root.path().join("unreadable.md");
     std::fs::write(&unreadable, "private").expect("unreadable source");
-    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0)).expect("mode");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o0)).expect("mode");
     let mut denied = task(unreadable.to_str().expect("path"));
     assert!(prepare(&tool, std::iter::once(&mut denied), deadline()).is_err());
     std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).expect("mode");
