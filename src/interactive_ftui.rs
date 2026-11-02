@@ -8185,7 +8185,11 @@ pub struct TurnControlState {
 }
 
 impl TurnControlState {
-    fn publish(&mut self, control: crate::session_control::SessionControlHandle) {
+    /// Publishes a prompt turn's control, as the live UI's driver does at the start of each turn.
+    ///
+    /// Public only so integration tests can drive the live-UI path; not public API.
+    #[doc(hidden)]
+    pub fn publish(&mut self, control: crate::session_control::SessionControlHandle) {
         // Scoped goal events may still be crossing their subscription when
         // the next ordinary prompt starts. They no longer own this display.
         self.last_goal = None;
@@ -8194,6 +8198,14 @@ impl TurnControlState {
         } else {
             self.current = Some(control);
         }
+    }
+
+    /// Clears the published control when its turn ends, as the live UI's driver does.
+    ///
+    /// Public only so integration tests can drive the live-UI path; not public API.
+    #[doc(hidden)]
+    pub fn retire(&mut self) {
+        self.current = None;
     }
 
     fn close(&mut self) -> Option<goal_control::Invocation> {
