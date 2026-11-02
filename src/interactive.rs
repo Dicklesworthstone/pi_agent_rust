@@ -2191,7 +2191,7 @@ pub enum PiMsg {
     AutocompleteCatalog(crate::autocomplete::AutocompleteCatalog),
     /// Atomically replace reloaded prompt/skill bodies and their completion
     /// catalog. Side-command routing must use the same loader as the driver.
-    ResourcesReloaded {
+    ResourcesReloadedWithCatalog {
         resources: Box<crate::resources::ResourceLoader>,
         catalog: crate::autocomplete::AutocompleteCatalog,
     },

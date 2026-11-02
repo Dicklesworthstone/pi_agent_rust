@@ -2388,7 +2388,7 @@ async fn reload_driver_resources(
     catalog.extension_commands = extension_commands;
     let update = reloaded.map_or_else(
         || PiMsg::AutocompleteCatalog(catalog.clone()),
-        |resources| PiMsg::ResourcesReloaded {
+        |resources| PiMsg::ResourcesReloadedWithCatalog {
             resources,
             catalog: catalog.clone(),
         },
@@ -3484,7 +3484,7 @@ impl PiFtuiModel {
                 msg,
                 PiMsg::AutocompleteRefresh
                     | PiMsg::AutocompleteCatalog(_)
-                    | PiMsg::ResourcesReloaded { .. }
+                    | PiMsg::ResourcesReloadedWithCatalog { .. }
                     | PiMsg::LoginPending { .. }
                     | PiMsg::SystemNote(_)
                     | PiMsg::ToolStart { .. }
@@ -3844,7 +3844,7 @@ impl PiFtuiModel {
                 self.autocomplete.provider.set_catalog(catalog);
                 self.autocomplete.close();
             }
-            PiMsg::ResourcesReloaded { resources, catalog } => {
+            PiMsg::ResourcesReloadedWithCatalog { resources, catalog } => {
                 self.steer_resources = Some(*resources);
                 self.extension_commands
                     .clone_from(&catalog.extension_commands);
@@ -27331,7 +27331,7 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|message| matches!(message, PiMsg::ResourcesReloaded { .. }))
+                .any(|message| matches!(message, PiMsg::ResourcesReloadedWithCatalog { .. }))
         );
         assert!(messages.iter().any(|message| {
             matches!(message, PiMsg::AutocompleteCatalog(updated)
@@ -27394,7 +27394,7 @@ mod tests {
             Some("Triage issue #12")
         );
         assert!(catalog.prompt_templates.iter().any(|t| t.name == "triage"));
-        let Ok(update @ PiMsg::ResourcesReloaded { .. }) = rx.try_recv() else {
+        let Ok(update @ PiMsg::ResourcesReloadedWithCatalog { .. }) = rx.try_recv() else {
             panic!("the refreshed bodies and catalog go to the UI together");
         };
         let (_agent_tx, ui_rx) = mpsc::channel();
