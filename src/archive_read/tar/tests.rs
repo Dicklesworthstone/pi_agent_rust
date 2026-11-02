@@ -118,7 +118,7 @@ fn late_bad_headers_duplicates_and_conflicts_invalidate_an_early_match() {
 
 #[test]
 fn rejects_links_devices_sparse_and_unsafe_names_even_when_unselected() {
-    for kind in [b'1', b'2', b'3', b'4', b'6', b'S', b'7', b'K'] {
+    for kind in *b"12346S7K" {
         let bytes = archive(&[("found", b"ok", b'0'), ("other", b"", kind)]);
         assert!(error(&bytes, "found").contains("Unsupported TAR member type"));
     }
@@ -324,7 +324,7 @@ fn malformed_duplicate_or_unsupported_pax_records_are_not_ignored() {
 
 #[test]
 fn orphan_ambiguous_and_oversized_extensions_fail_before_publication() {
-    for kind in [b'x', b'L'] {
+    for kind in *b"xL" {
         let data = if kind == b'x' { pax_record("path", b"file") } else { b"file\0".to_vec() };
         let mut bytes = Vec::new();
         append(&mut bytes, &header("metadata", data.len() as u64, kind), &data);
