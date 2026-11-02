@@ -62,6 +62,16 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> St
     )
 }
 
+fn read_dir_sorted_paths(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    paths
+}
+
 fn read_dir_sorted_paths_bounded(dir: &Path, remaining: usize) -> Option<Vec<PathBuf>> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Some(Vec::new());
