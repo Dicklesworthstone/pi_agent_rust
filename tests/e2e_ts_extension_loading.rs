@@ -1648,7 +1648,7 @@ fn context_mode_project_hash(path: &std::path::Path) -> String {
     } else {
         normalized.to_string()
     };
-    format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()))[..16].to_string()
+    pi::package_manager::hex_encode(&sha2::Sha256::digest(canonical.as_bytes()))[..16].to_string()
 }
 
 /// Selected alone by the real process bridge; no Node or npm installation is
