@@ -896,7 +896,7 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
     }"#,
     )
     .unwrap();
-    std::fs::write(package.join("build/db.js"), r#"
+    std::fs::write(package.join("build/db.js"), r"
         import { createRequire } from 'node:module';
         import { Database as ESMDatabase } from 'bun:sqlite';
         const require = createRequire(import.meta.url);
@@ -925,8 +925,8 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
             });
             return { db, write };
         }
-    "#).unwrap();
-    std::fs::write(&entry, r#"
+    ").unwrap();
+    std::fs::write(&entry, r"
         import { mkdirSync } from 'node:fs';
         import { createHash } from 'node:crypto';
         import { homedir } from 'node:os';
@@ -964,7 +964,7 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
             });
             pi.registerCommand('ctx-storage-close', { handler: async () => { db.close(); return { display: 'closed' }; } });
         }
-    "#).unwrap();
+    ").unwrap();
 
     let load = |session: Arc<asupersync::sync::Mutex<Session>>| {
         let manager = ExtensionManager::new();
@@ -1147,7 +1147,7 @@ fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
         (
             "broken-state",
             "broken.js",
-            r#"
+            r"
             import { readFileSync } from 'node:fs';
             import { homedir } from 'node:os';
             import { join } from 'node:path';
@@ -1157,12 +1157,12 @@ fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
                 catch (_) { denied = true; }
                 pi.registerCommand('broken-state-check', { handler: async () => ({ display: denied ? 'denied' : 'escaped' }) });
             }
-        "#,
+        ",
         ),
         (
             "healthy-state",
             "healthy.js",
-            r#"
+            r"
             import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
             import { homedir } from 'node:os';
             import { join } from 'node:path';
@@ -1175,7 +1175,7 @@ fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
                 catch (_) { peerDenied = true; }
                 pi.registerCommand('healthy-state-check', { handler: async () => ({ display: peerDenied ? readFileSync(join(root, 'state.txt'), 'utf8') : 'escaped' }) });
             }
-        "#,
+        ",
         ),
     ] {
         let package = base.join("npm/node_modules").join(package_name);
@@ -1270,7 +1270,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
     let owner_entry = owner_package.join("owner.js");
     std::fs::write(
         &owner_entry,
-        r#"
+        r"
         import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
         import { homedir } from 'node:os';
         import { join } from 'node:path';
@@ -1284,7 +1284,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
                 handler: async () => ({ display: readFileSync(path, 'utf8') }),
             });
         }
-        "#,
+        ",
     )
     .unwrap();
     let state_json = serde_json::to_string(&state_path).unwrap();
@@ -1293,7 +1293,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
     std::fs::write(
         &peer_entry,
         format!(
-            r#"
+            r"
         import {{ readFileSync, writeFileSync }} from 'node:fs';
         export default function(pi) {{
             const state = {state_json};
@@ -1324,7 +1324,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
                 homeHidden: process.env.HOME === undefined && pi.env.get('HOME') === undefined,
             }}) }}) }});
         }}
-        "#
+        "
         ),
     )
     .unwrap();
@@ -1554,7 +1554,7 @@ export default async function (pi) {
     );
 }
 
-const CONTEXT_MODE_WORKTREE_EXTENSION: &str = r#"
+const CONTEXT_MODE_WORKTREE_EXTENSION: &str = r"
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
@@ -1637,7 +1637,7 @@ export default function(pi) {
         return { display: JSON.stringify({ ...snapshot, child: JSON.parse(line.slice(18)) }) };
     } });
 }
-"#;
+";
 
 fn context_mode_project_hash(path: &std::path::Path) -> String {
     use sha2::Digest as _;

@@ -32,7 +32,7 @@ async fn discovery_runtime(
 async fn evaluate(runtime: &PiJsRuntime<DeterministicClock>, body: &str) -> Value {
     runtime
         .eval(&format!(
-            r#"
+            r"
             globalThis.discoveryResult = null;
             globalThis.discoveryError = null;
             import('node:child_process').then(({{ execSync }}) => {{
@@ -40,7 +40,7 @@ async fn evaluate(runtime: &PiJsRuntime<DeterministicClock>, body: &str) -> Valu
                     ? 'where discovery-fixture' : 'command -v discovery-fixture';
                 {body}
             }}).catch(error => {{ globalThis.discoveryError = String(error); }});
-            "#
+            "
         ))
         .await
         .expect("evaluate");
@@ -97,7 +97,7 @@ fn conventional_probes_and_bun_which_resolve_configured_paths_without_execution(
             ("PATHEXT".to_string(), ".EXE".to_string()),
         ]);
         let runtime = discovery_runtime(temp.path(), env, None).await;
-        let result = evaluate(&runtime, r#"
+        let result = evaluate(&runtime, r"
             const paths = execSync(command, {encoding: 'utf8', stdio: 'pipe'}).trim().split(/\r?\n/);
             const blocked = [];
             for (const unsafe of [command + '; echo injected', command + ' && echo injected', 'echo blocked']) {
@@ -111,7 +111,7 @@ fn conventional_probes_and_bun_which_resolve_configured_paths_without_execution(
                 paths, which: Bun.which('discovery-fixture'), blocked, missingStatus,
                 badName: Bun.which('../discovery-fixture'),
             };
-        "#).await;
+        ").await;
         let paths = if cfg!(windows) {
             vec![first_file.clone(), second_file]
         } else {
@@ -140,12 +140,12 @@ fn discovery_requires_exec_capability_and_never_uses_an_ambient_path() {
         let denied = discovery_runtime(temp.path(), env, Some(ExtensionPolicy::default())).await;
         let result = evaluate(
             &denied,
-            r#"
+            r"
             let denied = false;
             try { execSync(command); }
             catch (error) { denied = String(error).includes('exec capability'); }
             globalThis.discoveryResult = {denied, which: Bun.which('discovery-fixture')};
-        "#,
+        ",
         )
         .await;
         assert_eq!(result, json!({"denied": true, "which": null}));
@@ -153,12 +153,12 @@ fn discovery_requires_exec_capability_and_never_uses_an_ambient_path() {
         let empty = discovery_runtime(temp.path(), HashMap::new(), None).await;
         let result = evaluate(
             &empty,
-            r#"
+            r"
             globalThis.discoveryResult = {
                 fixture: Bun.which('discovery-fixture'), shell: Bun.which('sh'),
                 command: Bun.which('cmd.exe'),
             };
-        "#,
+        ",
         )
         .await;
         assert_eq!(
@@ -207,11 +207,11 @@ fn discovery_uses_the_canonical_exec_policy_precedence() {
                 },
             );
             let runtime = discovery_runtime(temp.path(), env.clone(), Some(policy)).await;
-            let result = evaluate(&runtime, r#"
+            let result = evaluate(&runtime, r"
                 let resolved = false;
                 try { resolved = execSync(command).includes('discovery-fixture'); } catch (_) {}
                 globalThis.discoveryResult = {resolved, which: Bun.which('discovery-fixture') !== null};
-            "#).await;
+            ").await;
             assert_eq!(
                 result,
                 json!({"resolved": visible, "which": visible}),

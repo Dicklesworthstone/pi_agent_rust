@@ -807,7 +807,7 @@ fn context_messages_compose_across_realms_and_event_phases() {
     .expect("start context runtime");
     manager.set_js_runtime(runtime);
     let entries = [
-        ("extensions/context_first.mjs", r#"
+        ("extensions/context_first.mjs", r"
             export default function(pi) {
                 pi.on('context', event => ({ messages: [
                     ...event.messages, { role: 'user', content: 'first', timestamp: 1 },
@@ -820,8 +820,8 @@ fn context_messages_compose_across_realms_and_event_phases() {
                     ...event.messages, { role: 'user', content: 'event bus', timestamp: 3 },
                 ] });
             }
-        "#.to_string()),
-        ("extensions/context_mode.mjs", r#"
+        ".to_string()),
+        ("extensions/context_mode.mjs", r"
             export default function(pi) {
                 let pendingContext = 'context-mode active.\n<resume>Resume the task</resume>';
                 pi.on('context', event => {
@@ -832,8 +832,8 @@ fn context_messages_compose_across_realms_and_event_phases() {
                     return { messages: event.messages };
                 });
             }
-        "#.to_string()),
-        ("extensions/context_observer.mjs", r#"
+        ".to_string()),
+        ("extensions/context_observer.mjs", r"
             export default function(pi) {
                 let direct = [], bus = [];
                 pi.on('context', event => {
@@ -848,7 +848,7 @@ fn context_messages_compose_across_realms_and_event_phases() {
                     handler: async () => ({ display: JSON.stringify({ direct, bus }) }),
                 });
             }
-        "#.to_string()),
+        ".to_string()),
     ];
     assert!(load_inline_extensions(&harness, &manager, entries));
     let (first, observations, second, cleared, stopped) = common::run_async(async move {
@@ -1035,7 +1035,7 @@ fn idle_tool_registration_publishes_routes_and_rejects_cross_realm_collisions() 
         &[
             (
                 "catalog-idle",
-                r#"
+                r"
             import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
             import { dirname, join } from 'node:path';
             import { fileURLToPath } from 'node:url';
@@ -1060,11 +1060,11 @@ fn idle_tool_registration_publishes_routes_and_rejects_cross_realm_collisions() 
                     if (phase === 2) clearInterval(timer);
                 }, 5);
             }
-        "#,
+        ",
             ),
             (
                 "catalog-original",
-                r#"
+                r"
             export default function(pi) {
                 pi.registerTool({
                     name: 'reserved_peer_tool', description: 'Original peer',
@@ -1074,7 +1074,7 @@ fn idle_tool_registration_publishes_routes_and_rejects_cross_realm_collisions() 
                     }
                 });
             }
-        "#,
+        ",
             ),
         ],
     );
@@ -1166,7 +1166,7 @@ fn quarantined_owner_preserves_name_reservations_without_blocking_healthy_tools(
         &[
             (
                 "catalog-timeout",
-                r#"
+                r"
             export default function(pi) {
                 pi.registerTool({ name: 'reserved_tool', description: 'Timed-out owner',
                     parameters: { type: 'object', properties: {} },
@@ -1174,11 +1174,11 @@ fn quarantined_owner_preserves_name_reservations_without_blocking_healthy_tools(
                 pi.registerCommand('quarantine-owner', { handler: async () => new Promise(() => {}) });
                 pi.on('before_agent_start', () => { throw new Error('quarantined hook ran'); });
             }
-        "#,
+        ",
             ),
             (
                 "catalog-healthy",
-                r#"
+                r"
             export default function(pi) {
                 pi.registerTool({ name: 'healthy_tool', description: 'Healthy peer',
                     parameters: { type: 'object', properties: {} },
@@ -1190,11 +1190,11 @@ fn quarantined_owner_preserves_name_reservations_without_blocking_healthy_tools(
                     return { systemPrompt: 'healthy hook completed' };
                 });
             }
-        "#,
+        ",
             ),
             (
                 "catalog-contender",
-                r#"
+                r"
             export default function(pi) {
                 pi.registerTool({ name: 'contender_tool', description: 'Initial contender',
                     parameters: { type: 'object', properties: {} },
@@ -1205,7 +1205,7 @@ fn quarantined_owner_preserves_name_reservations_without_blocking_healthy_tools(
                         async execute() { return { content: [{ type: 'text', text: 'stolen' }], details: {} }; } });
                 } });
             }
-        "#,
+        ",
             ),
         ],
     );
@@ -1301,7 +1301,7 @@ fn quarantined_provider_cleanup_cannot_publish_new_tool_reservations() {
         &[
             (
                 "catalog-cleanup",
-                r#"
+                r"
             import { mkdirSync, writeFileSync } from 'node:fs';
             import { join } from 'node:path';
             import { homedir } from 'node:os';
@@ -1326,11 +1326,11 @@ fn quarantined_provider_cleanup_cannot_publish_new_tool_reservations() {
                     }
                 });
             }
-        "#,
+        ",
             ),
             (
                 "catalog-cleanup-peer",
-                r#"
+                r"
             export default function(pi) {
                 pi.registerCommand('claim-cleanup-name', { handler() {
                     pi.registerTool({ name: 'cleanup_name', description: 'Healthy registration',
@@ -1338,7 +1338,7 @@ fn quarantined_provider_cleanup_cannot_publish_new_tool_reservations() {
                         async execute() { return { content: [{ type: 'text', text: 'healthy owner' }], details: {} }; } });
                 } });
             }
-        "#,
+        ",
             ),
         ],
     );
@@ -1403,11 +1403,11 @@ fn unrelated_same_id_packages_and_cross_package_coentries_fail_before_factories(
         &harness,
         &[(
             "surviving-package",
-            r#"
+            r"
             export default function(pi) {
                 pi.registerCommand('surviving-command', { handler: () => 'still alive' });
             }
-        "#,
+        ",
         )],
     );
     let source = "export default function() { throw new Error('unrelated factory executed'); }";
@@ -1595,14 +1595,14 @@ fn declared_same_package_entries_preserve_order_assets_and_legacy_policy_denials
     harness.create_file("bundle/asset.txt", b"package asset");
     let first = harness.create_file(
         "bundle/a/extension.mjs",
-        br#"
+        br"
         export default function(pi) {
             globalThis.provenanceOrder = ['first'];
             pi.registerCommand('bundle-order', { handler: () => globalThis.provenanceOrder });
         }
-    "#,
+    ",
     );
-    let second = harness.create_file("bundle/build/extension.mjs", br#"
+    let second = harness.create_file("bundle/build/extension.mjs", br"
         import { readFileSync } from 'node:fs';
         import { dirname, join } from 'node:path';
         import { fileURLToPath } from 'node:url';
@@ -1616,7 +1616,7 @@ fn declared_same_package_entries_preserve_order_assets_and_legacy_policy_denials
                 return { asset, env: process.env.PROVENANCE_TEST_VALUE ?? null, execError };
             }});
         }
-    "#);
+    ");
     let specs = vec![
         JsExtensionLoadSpec::from_entry_path(first).expect("first spec"),
         JsExtensionLoadSpec::from_entry_path(second).expect("second spec"),
@@ -1683,7 +1683,7 @@ fn distinct_owners_in_one_declared_package_keep_private_leaf_boundaries() {
         "bundle/right/helper.mjs",
         b"export default 'right private module';",
     );
-    let left = harness.create_file("bundle/left/left.mjs", br#"
+    let left = harness.create_file("bundle/left/left.mjs", br"
         import { readFileSync, writeFileSync } from 'node:fs';
         import { dirname, join } from 'node:path';
         import { fileURLToPath } from 'node:url';
@@ -1697,8 +1697,8 @@ fn distinct_owners_in_one_declared_package_keep_private_leaf_boundaries() {
                 return { own: readFileSync(join(root, 'private.txt'), 'utf8'), read, write, imported };
             }});
         }
-    "#);
-    let right = harness.create_file("bundle/right/right.mjs", br#"
+    ");
+    let right = harness.create_file("bundle/right/right.mjs", br"
         import { readFileSync } from 'node:fs';
         import { dirname, join } from 'node:path';
         import { fileURLToPath } from 'node:url';
@@ -1706,7 +1706,7 @@ fn distinct_owners_in_one_declared_package_keep_private_leaf_boundaries() {
             pi.registerCommand('right-private', { handler: () =>
                 readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'private.txt'), 'utf8') });
         }
-    "#);
+    ");
     let specs = vec![
         JsExtensionLoadSpec::from_entry_path(left).unwrap(),
         JsExtensionLoadSpec::from_entry_path(right).unwrap(),

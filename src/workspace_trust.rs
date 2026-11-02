@@ -902,7 +902,7 @@ mod tests {
             .expect("freshly resolved launch");
 
         let other = tempfile::tempdir().expect("other workspace");
-        write(&other.path().join(".pi/settings.json"), r#"{}"#);
+        write(&other.path().join(".pi/settings.json"), r"{}");
         assert_restart_required(fresh_guard.validate_workspace(other.path()));
     }
 
@@ -960,7 +960,7 @@ mod tests {
                 let global = tempfile::tempdir().expect("global");
                 let settings = workspace.path().join(".pi/settings.json");
                 if !initially_empty {
-                    write(&settings, r#"{}"#);
+                    write(&settings, r"{}");
                 }
                 let trust_inputs = if via_env {
                     TrustInputs {
@@ -995,7 +995,7 @@ mod tests {
     fn reload_guard_observes_policy_revocation_and_malformed_operator_settings() {
         let workspace = tempfile::tempdir().expect("workspace");
         let global = tempfile::tempdir().expect("global");
-        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        write(&workspace.path().join(".pi/settings.json"), r"{}");
         let global_settings = global.path().join("settings.json");
         write(&global_settings, r#"{"trustAllWorkspaces":true}"#);
         let global_guard = guard_for(
@@ -1035,7 +1035,7 @@ mod tests {
     fn reload_guard_uses_the_anchored_operator_override() {
         let workspace = tempfile::tempdir().expect("workspace");
         let global = tempfile::tempdir().expect("global");
-        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        write(&workspace.path().join(".pi/settings.json"), r"{}");
         write(
             &global.path().join("settings.json"),
             r#"{"trustAllWorkspaces":true}"#,
@@ -1075,7 +1075,7 @@ mod tests {
     fn reload_guard_never_promotes_an_originally_untrusted_workspace() {
         let workspace = tempfile::tempdir().expect("workspace");
         let global = tempfile::tempdir().expect("global");
-        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        write(&workspace.path().join(".pi/settings.json"), r"{}");
         let guard = guard_for(workspace.path(), global.path(), &inputs());
         assert!(!guard.trusted());
         write(

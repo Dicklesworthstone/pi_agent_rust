@@ -10130,7 +10130,7 @@ mod extensions_integration_tests {
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
             let entry = temp.path().join("context-mode.mjs");
-            std::fs::write(&entry, r#"
+            std::fs::write(&entry, r"
                 export default function(pi) {
                     let pendingContext = '';
                     pi.on('before_agent_start', () => {
@@ -10145,7 +10145,7 @@ mod extensions_integration_tests {
                         return { messages: event.messages };
                     });
                 }
-            "#).expect("extension fixture");
+            ").expect("extension fixture");
             let manager = ExtensionManager::new();
             let js = JsExtensionRuntimeHandle::start(
                 PiJsRuntimeConfig {
@@ -10511,7 +10511,7 @@ mod extensions_integration_tests {
                 let transcripts = base.join("transcripts");
                 std::fs::create_dir_all(&cwd).expect("workspace");
                 let entry = base.join("session_identity.mjs");
-                std::fs::write(&entry, r#"
+                std::fs::write(&entry, r"
                     export default async function init(pi) {
                         const observed = { factory: (await pi.session('getState', {})).sessionFile };
                         pi.on('startup', (event, ctx) => {
@@ -10527,7 +10527,7 @@ mod extensions_integration_tests {
                             }),
                         });
                     }
-                "#).expect("extension");
+                ").expect("extension");
                 let mut storage = if save_enabled {
                     Session::create_with_dir(Some(transcripts.clone()))
                 } else {
@@ -10676,7 +10676,7 @@ mod extensions_integration_tests {
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
             let entry = temp.path().join("context-mode-lazy-tools.mjs");
-            std::fs::write(&entry, r#"
+            std::fs::write(&entry, r"
                 export default function(pi) {
                     let generation = 0;
                     pi.on('before_agent_start', async () => {
@@ -10711,7 +10711,7 @@ mod extensions_integration_tests {
                         pi.setActiveTools(['ctx_search']);
                     });
                 }
-            "#).expect("extension fixture");
+            ").expect("extension fixture");
             let provider = Arc::new(DeferredToolProvider { calls: AtomicUsize::new(0) });
             let agent = Agent::new(
                 provider.clone(),
@@ -10803,7 +10803,7 @@ mod extensions_integration_tests {
             let entry = temp.path().join("catalog-owner.mjs");
             std::fs::write(
                 &entry,
-                r#"
+                r"
                 export default function(pi) {
                     pi.registerTool({
                         name: 'ctx_search',
@@ -10819,7 +10819,7 @@ mod extensions_integration_tests {
                         }
                     });
                 }
-            "#,
+            ",
             )
             .expect("extension fixture");
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();

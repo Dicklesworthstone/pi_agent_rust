@@ -16859,11 +16859,11 @@ mod idle_runtime_tests {
             .expect("fixture runtime");
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.completed = [];
                     pi.tool('first', {}).then(() => completed.push('first'));
                     pi.tool('second', {}).then(() => completed.push('second'));
-                    "#,
+                    ",
                 )
                 .await
                 .expect("queue FIFO hostcalls");

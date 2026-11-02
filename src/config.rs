@@ -3243,7 +3243,7 @@ mod tests {
             Config::load_with_roots(None, &global_dir, &cwd).expect("missing settings");
         assert_optional_tool_selection(&missing, &[]);
         for content in [
-            r#"{}"#,
+            r"{}",
             r#"{"tools":{}}"#,
             r#"{"tools":{"loadMode":{"eval":"essential","github":"essential","security_scan":"essential","subagent":"essential"}}}"#,
         ] {
@@ -4209,7 +4209,7 @@ mod tests {
     #[test]
     fn interim_response_settings_preserve_unset_and_explicit_overrides() {
         let base: Config = serde_json::from_str(r#"{"out":{"enabled":true}}"#).unwrap();
-        for overlay in [r#"{}"#, r#"{"out":{}}"#, r#"{"out":{"enabled":null}}"#] {
+        for overlay in [r"{}", r#"{"out":{}}"#, r#"{"out":{"enabled":null}}"#] {
             let merged = Config::merge(base.clone(), serde_json::from_str(overlay).unwrap());
             assert_eq!(merged.out.unwrap().enabled, Some(true), "{overlay}");
         }

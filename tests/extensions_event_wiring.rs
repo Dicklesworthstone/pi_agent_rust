@@ -962,7 +962,7 @@ fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() 
     for (owner, source) in [
         (
             "redactor",
-            r#"
+            r"
             export default function init(pi) {
                 const seen = [];
                 const capture = (phase, event) => seen.push(JSON.parse(JSON.stringify({phase, event})));
@@ -990,11 +990,11 @@ fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() 
                 });
                 pi.registerCommand('redactor-observations', { handler:async () => seen });
             }
-        "#,
+        ",
         ),
         (
             "observer",
-            r#"
+            r"
             export default function init(pi) {
                 const seen = [];
                 const capture = (phase, event) => seen.push(JSON.parse(JSON.stringify({phase, event})));
@@ -1009,7 +1009,7 @@ fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() 
                 });
                 pi.registerCommand('observer-observations', { handler:async () => seen });
             }
-        "#,
+        ",
         ),
     ] {
         // Each index entry gets its own extension owner and QuickJS realm.

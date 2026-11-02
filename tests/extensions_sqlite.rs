@@ -26,7 +26,7 @@ struct StockSqlitePeer {
 impl StockSqlitePeer {
     fn start(path: &Path) -> Option<Self> {
         let executable = std::env::var_os("PI_TEST_NODE").unwrap_or_else(|| "node".into());
-        let script = r#"
+        let script = r"
             let DatabaseSync;
             try { ({ DatabaseSync } = await import('node:sqlite')); }
             catch (error) {
@@ -57,7 +57,7 @@ impl StockSqlitePeer {
             }
             // stdin EOF is also a normal close path for this trusted fixture.
             try { database.close(); } catch {}
-        "#;
+        ";
         let mut child = match std::process::Command::new(executable)
             .args(["--no-warnings", "--input-type=module", "--eval", script])
             .arg(path)
@@ -161,13 +161,13 @@ async fn runtime(
 async fn evaluate(runtime: &PiJsRuntime<DeterministicClock>, source: &str) -> Value {
     runtime
         .eval(&format!(
-            r#"
+            r"
         globalThis.sqliteResult = null;
         globalThis.sqliteError = null;
         Promise.all([import('bun:sqlite'), import('node:module'), import('node:fs')])
           .then(([sqlite, module, fs]) => {{ {source} }})
           .catch(error => {{ globalThis.sqliteError = String(error.stack || error); }});
-    "#
+    "
         ))
         .await
         .expect("evaluate");
@@ -201,7 +201,7 @@ fn sqlite_imports_initialize_a_persistent_session_database_and_reopen_it() {
         first
             .add_persistent_storage_root(storage.clone(), "context-mode")
             .expect("storage grant");
-        let result = evaluate(&first, &format!(r#"
+        let result = evaluate(&first, &format!(r"
             const {{ Database }} = module.createRequire('file:///extension/index.mjs')('bun:sqlite');
             if (Database !== sqlite.Database) throw new Error('ESM and require must share the constructor');
             fs.mkdirSync({dir}, {{ recursive: true }});
@@ -236,7 +236,7 @@ fn sqlite_imports_initialize_a_persistent_session_database_and_reopen_it() {
               inTransaction: db.inTransaction,
             }};
             db.close();
-        "#)).await;
+        ")).await;
         assert_eq!(
             result,
             json!({
@@ -292,7 +292,7 @@ fn sqlite_busy_error_reaches_context_mode_retry_and_preserves_persistent_state()
         runtime
             .add_persistent_storage_root(storage, "retry")
             .expect("storage grant");
-        let result = evaluate(&runtime, &format!(r#"
+        let result = evaluate(&runtime, &format!(r"
             const locker = new sqlite.Database({path});
             locker.exec('PRAGMA journal_mode = WAL');
             locker.exec('CREATE TABLE events (id INTEGER PRIMARY KEY, data TEXT)');
@@ -326,7 +326,7 @@ fn sqlite_busy_error_reaches_context_mode_retry_and_preserves_persistent_state()
             globalThis.sqliteResult = {{ attempts, failures, inTransaction, configuredWait,
               rows: reopened.query('SELECT id, data FROM events ORDER BY id').values() }};
             reopened.close();
-        "#)).await;
+        ")).await;
         assert_eq!(result["attempts"], 2, "{result}");
         assert_eq!(
             result["configuredWait"], 150,
@@ -360,7 +360,7 @@ fn sqlite_default_transactions_serialize_writers_and_publish_autocommit_results(
         runtime
             .add_persistent_storage_root(storage, "single-writer")
             .expect("storage grant");
-        let result = evaluate(&runtime, &format!(r#"
+        let result = evaluate(&runtime, &format!(r"
             const writer = new sqlite.Database({path});
             writer.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 0');
             writer.exec('CREATE TABLE first_writer(id INTEGER PRIMARY KEY, data TEXT); CREATE TABLE second_writer(id INTEGER PRIMARY KEY, data TEXT)');
@@ -388,7 +388,7 @@ fn sqlite_default_transactions_serialize_writers_and_publish_autocommit_results(
               rolledBack: writer.query('SELECT COUNT(*) AS n FROM first_writer').get().n,
             }};
             peer.close(); writer.close();
-        "#)).await;
+        ")).await;
         assert_eq!(
             result,
             json!({
@@ -414,7 +414,7 @@ fn sqlite_guest_sql_cannot_restore_engine_specific_concurrent_transactions() {
         let runtime = runtime(temp.path(), "concurrency-admission", None).await;
         let result = evaluate(
             &runtime,
-            r#"
+            r"
             const db = new sqlite.Database();
             db.exec('CREATE TABLE evidence(value)');
             const denied = [];
@@ -436,7 +436,7 @@ fn sqlite_guest_sql_cannot_restore_engine_specific_concurrent_transactions() {
               changes:db.query('SELECT COUNT(*) AS n FROM evidence').get().n,
             };
             db.close();
-        "#,
+        ",
         )
         .await;
         assert_eq!(
@@ -506,10 +506,10 @@ fn sqlite_native_wal_interoperates_with_a_live_stock_node_connection() {
         );
 
         stock.execute("BEGIN IMMEDIATE; UPDATE session_resume SET snapshot='uncommitted stock value' WHERE session_id='session-1'");
-        let blocked = evaluate(&runtime, r#"
+        let blocked = evaluate(&runtime, r"
             try { saveSnapshot.run('blocked', 'must not commit', 0); }
             catch (error) { globalThis.sqliteResult = {code:error.code, primaryCode:error.primaryCode}; }
-        "#).await;
+        ").await;
         assert_eq!(blocked, json!({"code":"SQLITE_BUSY", "primaryCode":5}));
         stock.execute("ROLLBACK");
         evaluate(
@@ -573,11 +573,11 @@ fn sqlite_native_wal_interoperates_with_a_live_stock_node_connection() {
         );
         assert_eq!(stock.request("", "close", json!([])), json!({"ok":null}));
 
-        let reopened = evaluate(&runtime, &format!(r#"
+        let reopened = evaluate(&runtime, &format!(r"
             const db = new sqlite.Database({path}, {{readonly:true, create:false}});
             globalThis.sqliteResult = db.prepare('SELECT session_id, snapshot, consumed FROM session_resume ORDER BY id').all();
             db.close();
-        "#)).await;
+        ")).await;
         assert_eq!(
             reopened,
             json!([
@@ -738,7 +738,7 @@ fn sqlite_dml_row_methods_execute_returning_and_commit_once() {
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime = runtime(temp.path(), "returning", None).await;
-        let result = evaluate(&runtime, r#"
+        let result = evaluate(&runtime, r"
             const db = new sqlite.Database(':memory:');
             db.prepare('CREATE TABLE claims(id INTEGER PRIMARY KEY, consumed INTEGER DEFAULT 0)').run();
             const inserted = db.prepare('INSERT INTO claims(id) VALUES (1), (2), (3) RETURNING id, consumed').all();
@@ -755,7 +755,7 @@ fn sqlite_dml_row_methods_execute_returning_and_commit_once() {
               rows: db.query('SELECT id, consumed FROM claims ORDER BY id').all(), inTransaction: db.inTransaction,
             };
             db.close();
-        "#).await;
+        ").await;
         assert_eq!(
             result,
             json!({
@@ -775,7 +775,7 @@ fn sqlite_returning_encoding_failure_rolls_back_only_its_own_statement() {
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime = runtime(temp.path(), "returning-limit", None).await;
-        let result = evaluate(&runtime, r#"
+        let result = evaluate(&runtime, r"
             const db = new sqlite.Database(':memory:');
             db.exec('CREATE TABLE state(value INTEGER, payload TEXT); CREATE TABLE audit(value TEXT)');
             db.prepare('INSERT INTO state VALUES(0, ?)').run('x'.repeat(600 * 1024));
@@ -798,7 +798,7 @@ fn sqlite_returning_encoding_failure_rolls_back_only_its_own_statement() {
               audit: db.query('SELECT value FROM audit ORDER BY rowid').values(),
             };
             db.close();
-        "#).await;
+        ").await;
         assert_eq!(
             result,
             json!({
@@ -818,7 +818,7 @@ fn sqlite_returning_row_limit_rolls_back_and_select_get_stops_after_one_row() {
         let runtime = runtime(temp.path(), "returning-rows", None).await;
         let result = evaluate(
             &runtime,
-            r#"
+            r"
             const db = new sqlite.Database(':memory:');
             db.exec('CREATE TABLE many_rows(value INTEGER)');
             // Each seed batch remains below the SQL token limit. Two copies
@@ -835,7 +835,7 @@ fn sqlite_returning_row_limit_rolls_back_and_select_get_stops_after_one_row() {
               state: db.query('SELECT count(*) AS count, sum(value) AS sum FROM many_rows').get(),
             };
             db.close();
-        "#,
+        ",
         )
         .await;
         assert_eq!(
@@ -983,14 +983,14 @@ fn sqlite_file_open_requires_its_own_storage_grant_and_write_capability() {
         runtime
             .add_persistent_storage_root(storage.clone(), "owner")
             .expect("owner grant");
-        let result = evaluate(&runtime, &format!(r#"
+        let result = evaluate(&runtime, &format!(r"
             const paths = [{outside}, {traversal}, 'file:{own}'];
             const denied = paths.map(path => {{ try {{ new sqlite.Database(path); return false; }} catch {{ return true; }} }});
             const db = new sqlite.Database({own});
             db.exec('CREATE TABLE data(value TEXT)');
             db.close();
             globalThis.sqliteResult = denied;
-        "#)).await;
+        ")).await;
         assert_eq!(result, json!([true, true, true]));
         assert!(!root.join("outside.db").exists());
         assert!(!root.join("escape.db").exists());
@@ -1001,10 +1001,10 @@ fn sqlite_file_open_requires_its_own_storage_grant_and_write_capability() {
             evaluate(
                 &peer,
                 &format!(
-                    r#"
+                    r"
             try {{ new sqlite.Database({own}); globalThis.sqliteResult = false; }}
             catch {{ globalThis.sqliteResult = true; }}
-        "#
+        "
                 )
             )
             .await,
@@ -1023,10 +1023,10 @@ fn sqlite_file_open_requires_its_own_storage_grant_and_write_capability() {
             evaluate(
                 &restricted,
                 &format!(
-                    r#"
+                    r"
             try {{ new sqlite.Database({own}); globalThis.sqliteResult = false; }}
             catch {{ globalThis.sqliteResult = true; }}
-        "#
+        "
                 )
             )
             .await,
@@ -1109,7 +1109,7 @@ fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair(
         let rejected = evaluate(
             &restricted,
             &format!(
-                r#"
+                r"
             const results = [];
             for (const path of [{copied_json}, {main_only_json}]) {{
               for (const readonly of [true, false]) {{
@@ -1125,7 +1125,7 @@ fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair(
               }}
             }}
             globalThis.sqliteResult = results;
-        "#
+        "
             ),
         )
         .await;
@@ -1205,11 +1205,11 @@ fn sqlite_rejects_database_and_companion_symlinks_without_touching_targets() {
             evaluate(
                 &runtime,
                 &format!(
-                    r#"
+                    r"
             globalThis.sqliteResult = {paths}.map(path => {{
               try {{ new sqlite.Database(path); return false; }} catch {{ return true; }}
             }});
-        "#
+        "
                 )
             )
             .await,
@@ -1302,7 +1302,7 @@ async fn assert_linked_native_recovery_companions_are_rejected(
             let rejected = evaluate(
                 &runtime,
                 &format!(
-                    r#"
+                    r"
             try {{
               const database = new sqlite.Database({filename}, {{readonly:{existing}, create:true}});
               database.close();
@@ -1310,7 +1310,7 @@ async fn assert_linked_native_recovery_companions_are_rejected(
             }} catch (error) {{
               globalThis.sqliteResult = String(error).includes('persistent storage');
             }}
-        "#
+        "
                 ),
             )
             .await;
@@ -1343,11 +1343,11 @@ async fn assert_linked_native_recovery_companions_are_rejected(
         evaluate(
             &runtime,
             &format!(
-                r#"
+                r"
         const database = new sqlite.Database({seed_json}, {{readonly:true}});
         globalThis.sqliteResult = database.query('SELECT data FROM events').get();
         database.close();
-    "#
+    "
             )
         )
         .await,
@@ -1398,10 +1398,10 @@ fn sqlite_recovery_temporaries_cannot_create_files_through_dangling_links() {
                 .expect("dangling native companion");
             let filename = serde_json::to_string(&database).unwrap();
             assert_eq!(
-                evaluate(&runtime, &format!(r#"
+                evaluate(&runtime, &format!(r"
                     try {{ new sqlite.Database({filename}); globalThis.sqliteResult = false; }}
                     catch (error) {{ globalThis.sqliteResult = String(error).includes('persistent storage'); }}
-                "#)).await,
+                ")).await,
                 json!(true),
                 "{suffix}"
             );
@@ -1528,7 +1528,7 @@ fn sqlite_counts_native_recovery_backups_in_the_aggregate_storage_budget() {
         let result = evaluate(
             &runtime,
             &format!(
-                r#"
+                r"
             try {{
               const db = new sqlite.Database({filename}, {{readonly:true, create:true}});
               db.close();
@@ -1536,7 +1536,7 @@ fn sqlite_counts_native_recovery_backups_in_the_aggregate_storage_budget() {
             }} catch (error) {{
               globalThis.sqliteResult = String(error).includes('exceed 128 MiB');
             }}
-        "#
+        "
             ),
         )
         .await;
@@ -1588,7 +1588,7 @@ fn sqlite_memory_obeys_sql_readonly_without_filesystem_capabilities() {
         let runtime = runtime(temp.path(), "readonly", Some(policy)).await;
         let result = evaluate(
             &runtime,
-            r#"
+            r"
             const db = new sqlite.Database(':memory:', {readonly: true, create: true});
             let writeDenied = false;
             try { db.prepare('CREATE TABLE forbidden(value TEXT)').run(); }
@@ -1601,7 +1601,7 @@ fn sqlite_memory_obeys_sql_readonly_without_filesystem_capabilities() {
               writeDenied, row, writable:memory.query('SELECT value FROM data').get(),
             };
             memory.close();
-        "#,
+        ",
         )
         .await;
         assert_eq!(
@@ -1643,10 +1643,10 @@ fn sqlite_rejects_preexisting_schema_triggers() {
         let error = evaluate(
             &runtime,
             &format!(
-                r#"
+                r"
             try {{ new sqlite.Database({path}); globalThis.sqliteResult = 'unexpected success'; }}
             catch (error) {{ globalThis.sqliteResult = error.message; }}
-        "#
+        "
             ),
         )
         .await;
@@ -1673,12 +1673,12 @@ fn sqlite_retires_a_handle_if_a_companion_becomes_a_symlink() {
         evaluate(
             &runtime,
             &format!(
-                r#"
+                r"
             globalThis.liveDatabase = new sqlite.Database({filename});
             liveDatabase.exec('CREATE TABLE data(value TEXT)');
             liveDatabase.prepare('INSERT INTO data VALUES (?)').run('durable before link');
             globalThis.sqliteResult = true;
-        "#
+        "
             ),
         )
         .await;
