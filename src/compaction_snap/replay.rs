@@ -6,8 +6,8 @@
 //! neither a forged header nor compressed input controls an output allocation.
 
 use super::{
-    FRAME_WIDTH, MAX_FRAME_HEIGHT, PNG_SIGNATURE, SNAPCOMPACT_DETAILS_SCHEMA, SnapFrame,
-    SnapLimits, SnapPayload, crc32,
+    FRAME_WIDTH, MAX_FRAME_HEIGHT, MAX_SOURCE_TEXT_BYTES, PNG_SIGNATURE,
+    SNAPCOMPACT_DETAILS_SCHEMA, SnapFrame, SnapLimits, SnapPayload, crc32,
 };
 use base64::Engine as _;
 use serde_json::Value;
@@ -18,6 +18,7 @@ pub(super) enum ReplayError {
     Schema,
     FrameLimit,
     ByteLimit,
+    SourceLimit,
     Geometry,
     Encoding,
     Png,
@@ -30,6 +31,7 @@ impl ReplayError {
             Self::Schema => "snapcompact_unknown_schema",
             Self::FrameLimit => "snapcompact_frame_limit",
             Self::ByteLimit => "snapcompact_byte_limit",
+            Self::SourceLimit => "snapcompact_source_text_limit",
             Self::Geometry => "snapcompact_invalid_geometry",
             Self::Encoding => "snapcompact_invalid_base64",
             Self::Png => "snapcompact_invalid_png",
@@ -79,6 +81,7 @@ pub(super) fn parse_payload(value: &Value, limits: SnapLimits) -> Result<SnapPay
     if value.get("schema").and_then(Value::as_str) != Some(SNAPCOMPACT_DETAILS_SCHEMA) {
         return Err(ReplayError::Schema);
     }
+    let source_text = source_text(value)?;
     let raw = value
         .get("frames")
         .and_then(Value::as_array)
@@ -91,8 +94,9 @@ pub(super) fn parse_payload(value: &Value, limits: SnapLimits) -> Result<SnapPay
         .map(FrameView::from_value)
         .collect::<Result<Vec<_>, _>>()?;
     validate_views(&views, limits)?;
-    Ok(SnapPayload::new(
-        views
+    Ok(SnapPayload {
+        schema: SNAPCOMPACT_DETAILS_SCHEMA.to_string(),
+        frames: views
             .into_iter()
             .map(|frame| SnapFrame {
                 png: frame.png.to_owned(),
@@ -100,7 +104,26 @@ pub(super) fn parse_payload(value: &Value, limits: SnapLimits) -> Result<SnapPay
                 height: frame.height,
             })
             .collect(),
-    ))
+        source_text: source_text.map(str::to_owned),
+    })
+}
+
+/// Borrow and admit retained text before cloning any archive data. Null is
+/// not a valid source string; an absent field identifies a frame-only archive.
+pub(super) fn source_text(value: &Value) -> Result<Option<&str>, ReplayError> {
+    let Some(value) = value.get("sourceText") else {
+        return Ok(None);
+    };
+    let source = value.as_str().ok_or(ReplayError::Shape)?;
+    validate_source_text(Some(source))?;
+    Ok(Some(source))
+}
+
+fn validate_source_text(source: Option<&str>) -> Result<(), ReplayError> {
+    if source.is_some_and(|text| text.len() > MAX_SOURCE_TEXT_BYTES) {
+        return Err(ReplayError::SourceLimit);
+    }
+    Ok(())
 }
 
 /// Public payload fields also permit direct SDK construction, so attachment
@@ -112,6 +135,7 @@ pub(super) fn validate_payload(
     if payload.schema != SNAPCOMPACT_DETAILS_SCHEMA {
         return Err(ReplayError::Schema);
     }
+    validate_source_text(payload.source_text.as_deref())?;
     if payload.frames.len() > limits.max_frames {
         return Err(ReplayError::FrameLimit);
     }
@@ -304,6 +328,49 @@ mod tests {
         let details = payload_to_details(Some(json!({"readFiles":["src/lib.rs"]})), &payload);
         assert_eq!(frames_from_details(Some(&details)), Some(payload));
         assert_eq!(details["readFiles"], json!(["src/lib.rs"]));
+    }
+
+    #[test]
+    fn retained_source_roundtrips_without_normalizing_unicode_or_line_endings() {
+        let payload = SnapPayload::new(vec![frame(1, 1)])
+            .with_source_text("[User]: caf\u{e9}\r\n\t\u{65e5}\u{672c}\n".to_string());
+        let details = payload_to_details(None, &payload);
+        let encoded = serde_json::to_string(&details).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(frames_from_details(Some(&decoded)), Some(payload));
+    }
+
+    #[test]
+    fn retained_source_is_bounded_before_any_frame_is_decoded() {
+        let mut value = json!({
+            "schema": SNAPCOMPACT_DETAILS_SCHEMA,
+            "frames": [{"png":"invalid", "width":1, "height":1}],
+            "sourceText": "x".repeat(MAX_SOURCE_TEXT_BYTES + 1),
+        });
+        assert_eq!(
+            parse_payload(&value, SnapLimits::default()),
+            Err(ReplayError::SourceLimit)
+        );
+        for invalid in [Value::Null, json!(false), json!([]), json!({})] {
+            value["sourceText"] = invalid;
+            assert_eq!(
+                parse_payload(&value, SnapLimits::default()),
+                Err(ReplayError::Shape)
+            );
+        }
+        let payload =
+            SnapPayload::new(vec![frame(1, 1)]).with_source_text("x".repeat(MAX_SOURCE_TEXT_BYTES));
+        assert!(validate_payload(&payload, SnapLimits::default()).is_ok());
+        let oversized = payload.with_source_text("x".repeat(MAX_SOURCE_TEXT_BYTES + 1));
+        assert_eq!(
+            validate_payload(&oversized, SnapLimits::default()),
+            Err(ReplayError::SourceLimit)
+        );
+        assert!(
+            payload_to_details(None, &oversized)
+                .get(SNAPCOMPACT_DETAILS_KEY)
+                .is_none()
+        );
     }
 
     #[test]

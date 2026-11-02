@@ -1802,10 +1802,8 @@ fn run_rpc_manual_compaction(
                     }
                     _ => None,
                 };
-                let tokens_after = crate::compaction::estimate_entries_context_tokens(
-                    &candidate.entries_for_current_path(),
-                );
                 let messages = candidate.to_messages_for_current_path();
+                let tokens_after = guard.agent.estimate_message_context_tokens(&messages);
                 let session_actions = guard.session_action_admission_gate();
                 let session_action = session_actions.acquire(&owner).await?;
                 let mut inner_session = OwnedMutexGuard::lock(Arc::clone(&guard.session), &owner)
@@ -4027,6 +4025,7 @@ pub async fn run(
                             crate::models::ModelRegistry::models,
                         ),
                         &snapshot,
+                        &options.config,
                         is_streaming.load(Ordering::SeqCst),
                         is_compacting.load(Ordering::SeqCst),
                     )
@@ -15969,11 +15968,9 @@ async fn maybe_auto_compact(
                     Some(details_value.clone()),
                     None,
                 );
-                // Post-compaction context estimate (heuristic, ignores usage).
-                let tokens_after = crate::compaction::estimate_entries_context_tokens(
-                    &candidate.entries_for_current_path(),
-                );
                 let messages = candidate.to_messages_for_current_path();
+                // Count the selected model's reading, not hidden archive data.
+                let tokens_after = guard.agent.estimate_message_context_tokens(&messages);
                 if save_enabled {
                     provider_admission.block(
                         "RPC auto-compaction persistence was interrupted before live installation completed"
@@ -16068,6 +16065,7 @@ fn session_state(
     session: &crate::session::Session,
     models: &[ModelEntry],
     snapshot: &RpcStateSnapshot,
+    config: &Config,
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
@@ -16080,8 +16078,28 @@ fn session_state(
             model_entry_for_provider_and_id(provider, model_id, models)
         });
     let model = model_entry.map(rpc_model_from_entry);
-    let context_tokens =
-        crate::compaction::estimate_model_context_tokens(&session.to_messages_for_current_path());
+    let accepts_images = !config.image_block_images()
+        && model_entry.is_some_and(|entry| {
+            entry
+                .model
+                .input
+                .iter()
+                .any(|input| input.as_str() == "image")
+        });
+    let text_budget = model_entry.map_or(
+        crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS,
+        |entry| {
+            context_window_tokens_for_entry(entry)
+                .saturating_sub(config.compaction_reserve_tokens())
+                / 2
+        },
+    );
+    let context_tokens = crate::compaction::estimate_model_context_tokens_for_model(
+        &session.to_messages_for_current_path(),
+        accepts_images,
+        Some(text_budget),
+        session.header.provider.as_deref().unwrap_or_default(),
+    );
 
     let message_count = session
         .entries_for_current_path()
@@ -18121,8 +18139,7 @@ mod tests {
             in_tx
                 .send(
                     &asupersync::Cx::for_testing(),
-                    json!({"id":"compact-1","type":"compact","keepRecentTokens":1})
-                        .to_string(),
+                    json!({"id":"compact-1","type":"compact","keepRecentTokens":1}).to_string(),
                 )
                 .await
                 .unwrap();
@@ -18614,7 +18631,8 @@ mod tests {
                 let ended = parse_response(&recv_line(&out_rx, "manual end").await.unwrap());
                 assert_eq!(ended["type"], "manual_compaction_end");
                 assert_eq!(ended["aborted"], true);
-                let response = parse_response(&recv_line(&out_rx, "manual response").await.unwrap());
+                let response =
+                    parse_response(&recv_line(&out_rx, "manual response").await.unwrap());
                 assert_err(&response, "compact");
                 assert_eq!(response["id"], "c");
                 drop(in_tx);
@@ -28962,7 +28980,14 @@ export default function init(pi) {
             auto_retry_enabled: false,
         };
 
-        let state = session_state(&session, &options.available_models, &snapshot, false, false);
+        let state = session_state(
+            &session,
+            &options.available_models,
+            &snapshot,
+            &options.config,
+            false,
+            false,
+        );
         assert_eq!(state["model"]["provider"], "openrouter");
         assert_eq!(state["model"]["id"], "gpt-4o-mini");
         assert_eq!(state["contextTokens"], 0);
@@ -29023,19 +29048,70 @@ export default function init(pi) {
             &session.to_messages_for_current_path(),
         );
         assert!(expected < before);
-        let state = session_state(&session, &[model.clone()], &snapshot, false, false);
+        let config = Config::default();
+        let state = session_state(&session, &[model.clone()], &snapshot, &config, false, false);
         assert_eq!(state["contextTokens"], expected);
         assert!(state["contextTokens"].as_u64().unwrap() < 1000);
         assert_eq!(state["contextWindow"], 200_000);
         assert_eq!(
-            session_state(&session, &[], &snapshot, false, false)["contextWindow"],
+            session_state(&session, &[], &snapshot, &config, false, false)["contextWindow"],
             Value::Null,
         );
         model.model.context_window = 0;
         assert_eq!(
-            session_state(&session, &[model], &snapshot, false, false)["contextWindow"],
+            session_state(&session, &[model], &snapshot, &config, false, false)["contextWindow"],
             Value::Null,
         );
+    }
+
+    #[test]
+    fn session_state_counts_selected_archive_reading_and_image_blocking() {
+        let mut model = dummy_entry("archive-model", false);
+        model.model.context_window = 1_024;
+        model.model.input.push(InputType::Image);
+        let mut session = Session::in_memory();
+        session.header.provider = Some(model.model.provider.clone());
+        session.header.model_id = Some(model.model.id.clone());
+        let kept = session.append_message(SessionMessage::User {
+            content: UserContent::Text("recent request".to_string()),
+            timestamp: Some(1),
+        });
+        let source = "ARCHIVED-FACT old context ".repeat(500);
+        let payload = crate::compaction_snap::SnapPayload::new(Vec::new()).with_source_text(source);
+        session.append_compaction(
+            "short summary".to_string(),
+            kept,
+            30_000,
+            Some(crate::compaction_snap::payload_to_details(None, &payload)),
+            None,
+        );
+        let snapshot = RpcStateSnapshot {
+            steering_count: 0,
+            follow_up_count: 0,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+        };
+        let mut config = Config::default();
+        let models = [model];
+        let vision = session_state(&session, &models, &snapshot, &config, false, false);
+        config.images = Some(crate::config::ImageSettings {
+            block_images: Some(true),
+            ..crate::config::ImageSettings::default()
+        });
+        let text = session_state(&session, &models, &snapshot, &config, false, false);
+        let vision_tokens = vision["contextTokens"].as_u64().unwrap();
+        let text_tokens = text["contextTokens"].as_u64().unwrap();
+        assert!(
+            vision_tokens >= 1_000,
+            "the visual reading counts image tokens"
+        );
+        assert!(
+            text_tokens > 0 && text_tokens < 200,
+            "the tiny window keeps only the summary"
+        );
+        assert!(vision_tokens > text_tokens);
     }
 
     // -----------------------------------------------------------------------

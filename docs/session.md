@@ -190,6 +190,39 @@ key cancels generation; an already admitted durable save finishes its
 reconciliation before control returns. A completed compaction is not replayed
 after a late cancellation.
 
+#### Snapcompact archives and model switching
+
+Set `compaction.mode` to `"snapcompact"` to retain the compacted conversation
+as a privacy-screened text archive alongside its summary and rendered PNGs.
+New archives preserve the exact screened text, including Unicode and split-turn
+prefixes, across saves, resume, and later compactions. Source retention is
+bounded at 3 MiB per archive; larger sources fall back to the summary with a
+logged reason. The image allowance is separate: a source that fits its own
+limit remains available even when its PNG reading exceeds the visual budget.
+
+Each request selects a reading for its current model. Vision models receive
+the summary and images derived from the screened source. Text-only models,
+or sessions with image inputs blocked, receive the summary and retained text.
+Switching back to a vision model restores its image reading without rewriting
+the saved archive. Older frame-only archives retain their summary as the
+text-only fallback because their original source was not saved.
+
+The text reading receives half the model window remaining after the compaction
+reserve. If needed, Pi keeps the beginning and end and labels the omitted
+middle; enlarging the model window makes more of the stored source available
+again. A bare SDK `Agent` without session window metadata uses an 8,192-token
+source allowance. These are source allowances; the summary, framing, recent
+messages, tools, and system prompt also occupy context. RPC context estimates
+count the selected reading. `/btw` includes archived text within its existing
+side-question input and output limits and reports omitted content.
+
+Privacy screening reads the complete retained source before request clipping.
+Vision images are derived from that screened source, so changed privacy rules
+or mismatched persisted image bytes cannot reveal an older unscreened reading.
+Subsequent compaction carries the complete admitted source into the next archive
+while its summarizer reads the previous summary and new history. The full old
+archive therefore does not inflate a smaller model's summary request.
+
 ### Session commands in print mode
 
 Explicit command-line arguments can perform session maintenance without opening

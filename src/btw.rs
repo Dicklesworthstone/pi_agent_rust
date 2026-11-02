@@ -286,7 +286,12 @@ struct ContextPiece {
     prefix: &'static str,
     tool_name: Option<String>,
     text: String,
-    limit: usize,
+    limit: ContextLimit,
+}
+
+enum ContextLimit {
+    Chars(usize),
+    Remaining,
 }
 
 impl ContextPiece {
@@ -304,7 +309,7 @@ fn push_context_piece(
     prefix: &'static str,
     tool_name: Option<&str>,
     text: &str,
-    limit: usize,
+    limit: ContextLimit,
 ) -> bool {
     if pieces.len() >= MAX_CONTEXT_PIECES {
         return false;
@@ -321,7 +326,7 @@ fn push_context_piece(
                 prefix: "",
                 tool_name: None,
                 text: OMITTED_INPUT.to_string(),
-                limit: OMITTED_INPUT.len(),
+                limit: ContextLimit::Chars(OMITTED_INPUT.len()),
             });
         }
         return false;
@@ -359,7 +364,14 @@ fn collect_context_pieces(messages: &[Message], reserved_bytes: usize) -> Vec<Co
         match message {
             Message::User(user) => match &user.content {
                 UserContent::Text(text) => {
-                    if !push_context_piece(&mut pieces, &mut raw_bytes, "user: ", None, text, 400) {
+                    if !push_context_piece(
+                        &mut pieces,
+                        &mut raw_bytes,
+                        "user: ",
+                        None,
+                        text,
+                        ContextLimit::Chars(400),
+                    ) {
                         break;
                     }
                 }
@@ -372,7 +384,7 @@ fn collect_context_pieces(messages: &[Message], reserved_bytes: usize) -> Vec<Co
                                 "user: ",
                                 None,
                                 &text.text,
-                                400,
+                                ContextLimit::Chars(400),
                             )
                         {
                             break 'messages;
@@ -389,7 +401,7 @@ fn collect_context_pieces(messages: &[Message], reserved_bytes: usize) -> Vec<Co
                             "assistant: ",
                             None,
                             &text.text,
-                            400,
+                            ContextLimit::Chars(400),
                         ),
                         crate::model::ContentBlock::ToolCall(call) => push_context_piece(
                             &mut pieces,
@@ -397,7 +409,7 @@ fn collect_context_pieces(messages: &[Message], reserved_bytes: usize) -> Vec<Co
                             "assistant ran tool ",
                             None,
                             &call.name,
-                            400,
+                            ContextLimit::Chars(400),
                         ),
                         _ => true,
                     };
@@ -417,7 +429,23 @@ fn collect_context_pieces(messages: &[Message], reserved_bytes: usize) -> Vec<Co
                     "tool ",
                     Some(&result.tool_name),
                     first.unwrap_or(""),
-                    160,
+                    ContextLimit::Chars(160),
+                ) {
+                    break;
+                }
+            }
+            Message::Custom(custom) if crate::compaction_snap::is_archive_message(message) => {
+                // Side requests are text-only regardless of the main model.
+                // Screen the complete retained source before this client's
+                // normal context clipping; never copy image bytes to it.
+                let text = crate::compaction_snap::text_for_custom(custom);
+                if !push_context_piece(
+                    &mut pieces,
+                    &mut raw_bytes,
+                    "compacted history: ",
+                    None,
+                    &text,
+                    ContextLimit::Remaining,
                 ) {
                     break;
                 }
@@ -449,12 +477,32 @@ fn render_context_summary(
             return OMITTED_INPUT.to_string();
         };
         text.push_str(&content);
-        let piece = truncate(&text, piece.limit.saturating_add(prefix_chars));
+        let piece = match piece.limit {
+            ContextLimit::Chars(limit) => {
+                truncate(&text, limit.saturating_add(prefix_chars)).to_string()
+            }
+            ContextLimit::Remaining => {
+                let available = CONTEXT_BUDGET_CHARS.saturating_sub(used + 1);
+                if text.len() <= available {
+                    text
+                } else {
+                    const OMITTED: &str = " [Remaining archived text omitted.]";
+                    if available <= prefix_chars + OMITTED.len() {
+                        break;
+                    }
+                    let mut end = available.saturating_sub(OMITTED.len());
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}{OMITTED}", &text[..end])
+                }
+            }
+        };
         if used + piece.len() + 1 > CONTEXT_BUDGET_CHARS {
             break;
         }
         used += piece.len() + 1;
-        rendered.push(piece.to_string());
+        rendered.push(piece);
     }
     rendered.reverse();
     rendered.join("\n")
@@ -823,6 +871,33 @@ mod tests {
             "raw key prefix must not survive clipping"
         );
         assert!(clipped.len() <= CONTEXT_BUDGET_CHARS);
+    }
+
+    #[test]
+    fn side_context_reads_archives_within_remaining_budget_after_full_source_screening() {
+        let secret = "r4nd0mCredentialValue123456";
+        let source = format!(
+            "ARCHIVED-DECISION echo {secret}\n{}\nAPI_KEY={secret}",
+            "caf\u{e9} \u{65e5}\u{672c}\n".repeat(600),
+        );
+        let archive = crate::compaction_snap::attach_frames(
+            user("short checkpoint"),
+            Some(
+                &crate::compaction_snap::SnapPayload::new(crate::compaction_snap::render_frames(
+                    &source,
+                ))
+                .with_source_text(source),
+            ),
+        );
+        let canonical = serde_json::to_value(&archive).unwrap();
+        let summary = build_context_summary(&[archive.clone(), user("newest context")]);
+        assert!(summary.contains("ARCHIVED-DECISION echo <pi-secret:redacted>"));
+        assert!(!summary.contains(secret));
+        assert!(summary.contains("Remaining archived text omitted"));
+        assert!(summary.ends_with("user: newest context"));
+        assert!(summary.len() <= CONTEXT_BUDGET_CHARS);
+        assert!(!summary.contains("sourceText") && !summary.contains("image/png"));
+        assert_eq!(serde_json::to_value(&archive).unwrap(), canonical);
     }
 
     #[test]

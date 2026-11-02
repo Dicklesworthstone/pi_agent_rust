@@ -2043,6 +2043,10 @@ pub struct Agent {
     /// Agent configuration.
     config: AgentConfig,
 
+    /// Reader-specific allowance for retained snapcompact source. A bare
+    /// provider swap resets this until the owning session installs its window.
+    snapcompact_text_tokens: u32,
+
     /// Optional extension manager for tool/event hooks.
     extensions: Option<ExtensionManager>,
 
@@ -2294,6 +2298,7 @@ impl Agent {
             provider,
             tools,
             config,
+            snapcompact_text_tokens: crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS,
             extensions: None,
             extension_tool_catalog: ExtensionToolCatalog::new(json!({})),
             messages: Vec::new(),
@@ -2785,6 +2790,7 @@ impl Agent {
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
         self.tool_call_dialect = crate::dialects::Dialect::Native;
         self.config.model_accepts_images = false;
+        self.snapcompact_text_tokens = crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS;
     }
 
     #[must_use]
@@ -3071,11 +3077,31 @@ impl Agent {
         self.config.system_prompt = system_prompt;
     }
 
+    /// Estimate a session candidate using the same archive reading and budget
+    /// as this agent's next request, without changing its durable messages.
+    pub(crate) fn estimate_message_context_tokens(&self, messages: &[Message]) -> u64 {
+        compaction::estimate_model_context_tokens_for_model(
+            messages,
+            self.config.model_accepts_images && !self.config.block_images,
+            Some(self.snapcompact_text_tokens),
+            self.provider.name(),
+        )
+    }
+
     /// What the next completion request would carry: the system prompt,
     /// tool definitions and messages after the same filtering a real request
     /// applies. OMP `/dump` writes this beside the transcript.
     pub fn request_context_json(&mut self) -> serde_json::Value {
-        let context = self.build_context();
+        let accepts_images = self.config.model_accepts_images && !self.config.block_images;
+        let text_budget = self.snapcompact_text_tokens;
+        let provider = self.provider.name().to_string();
+        let mut context = self.build_context();
+        crate::compaction_snap::project_for_model(
+            context.messages.to_mut(),
+            accepts_images,
+            Some(text_budget),
+            &provider,
+        );
         let tools: Vec<serde_json::Value> = context
             .tools
             .iter()
@@ -3447,7 +3473,21 @@ impl Agent {
                         &mut total,
                         &mut labels,
                     )?;
-                    if let Some(details) = custom.details.as_mut() {
+                    if custom.custom_type == crate::compaction_snap::SNAPCOMPACT_MESSAGE_TYPE {
+                        if let Some(source) = crate::compaction_snap::source_for_custom(custom) {
+                            let screened = Self::secrets_transform_text(
+                                source,
+                                &mut staged_vault,
+                                mode,
+                                &extra,
+                                &mut total,
+                                &mut labels,
+                            )?;
+                            if screened != source {
+                                crate::compaction_snap::replace_source_text(custom, screened);
+                            }
+                        }
+                    } else if let Some(details) = custom.details.as_mut() {
                         *details = Self::secrets_transform_json(
                             details,
                             &mut staged_vault,
@@ -3545,7 +3585,11 @@ impl Agent {
                 }
                 Message::Custom(custom) => {
                     fields.push(Value::String(custom.content.clone()));
-                    if let Some(details) = &custom.details {
+                    if custom.custom_type == crate::compaction_snap::SNAPCOMPACT_MESSAGE_TYPE {
+                        if let Some(source) = crate::compaction_snap::source_for_custom(custom) {
+                            fields.push(Value::String(source.to_string()));
+                        }
+                    } else if let Some(details) = &custom.details {
                         fields.push(details.clone());
                     }
                 }
@@ -5180,7 +5224,16 @@ impl Agent {
         // context become stable placeholders (obfuscate) or a named refusal
         // (block) before any provider sees them. The vault is in-memory and
         // dies with the session.
-        let context = self.apply_secrets_outbound(context)?;
+        let mut context = self.apply_secrets_outbound(context)?;
+        // The entire retained source is screened before budget clipping, so
+        // assignments in an omitted middle still protect bare echoes in the
+        // kept ends. Providers never receive the native archive envelope.
+        crate::compaction_snap::project_for_model(
+            context.messages.to_mut(),
+            self.config.model_accepts_images && !self.config.block_images,
+            Some(self.snapcompact_text_tokens),
+            self.provider.name(),
+        );
 
         if checkpoint_cx.checkpoint().is_err()
             || abort.as_ref().is_some_and(AbortSignal::is_aborted)
@@ -17210,11 +17263,15 @@ impl AgentSession {
     }
 
     pub fn new(
-        agent: Agent,
+        mut agent: Agent,
         session: Arc<Mutex<Session>>,
         save_enabled: bool,
         compaction_settings: ResolvedCompactionSettings,
     ) -> Self {
+        agent.snapcompact_text_tokens = compaction_settings
+            .context_window_tokens
+            .saturating_sub(compaction_settings.reserve_tokens)
+            / 2;
         // The job scope is shared by every snapshot of the registry, so
         // binding through the current one binds the live registry.
         agent
@@ -17686,6 +17743,8 @@ impl AgentSession {
 
     pub const fn set_compaction_context_window(&mut self, context_window_tokens: u32) {
         self.compaction_settings.context_window_tokens = context_window_tokens;
+        self.agent.snapcompact_text_tokens =
+            context_window_tokens.saturating_sub(self.compaction_settings.reserve_tokens) / 2;
     }
 
     /// The resolved compaction settings this session was constructed with.
@@ -20211,13 +20270,14 @@ impl AgentSession {
         // Count the context actually sent next, not the archived tree entries
         // or pre-compaction usage. Refuse a no-progress overflow recovery
         // before writing or installing its candidate.
-        let tokens_after =
-            compaction::estimate_model_context_tokens(&candidate.to_messages_for_current_path());
+        let tokens_after = self
+            .agent
+            .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
         if require_reduction
             && tokens_after
-                >= compaction::estimate_model_context_tokens(
-                    &session.to_messages_for_current_path(),
-                )
+                >= self
+                    .agent
+                    .estimate_message_context_tokens(&session.to_messages_for_current_path())
         {
             return Err(Error::api(
                 "Context overflow recovery made no progress; compaction did not reduce the active context",
@@ -20419,9 +20479,9 @@ impl AgentSession {
                 // keep-recent budget. Aim to retain at most half the observed
                 // input while preserving the complete current authored turn,
                 // without inventing a different model capacity.
-                let tokens = compaction::estimate_model_context_tokens(
-                    &session.to_messages_for_current_path(),
-                );
+                let tokens = self
+                    .agent
+                    .estimate_message_context_tokens(&session.to_messages_for_current_path());
                 settings.keep_recent_tokens = settings
                     .keep_recent_tokens
                     .min(u32::try_from(tokens / 2).unwrap_or(u32::MAX));
@@ -23081,6 +23141,18 @@ fn apply_image_input_policy(
     block_images: bool,
     model_accepts_images: bool,
 ) {
+    // Source-bearing archives remain typed until full-source privacy screening
+    // completes. Frame-only archives have no extra source to screen.
+    if block_images || !model_accepts_images {
+        for message in messages.iter_mut() {
+            if !crate::compaction_snap::is_archive_message(message) {
+                crate::compaction_snap::strip_snapcompact_images(
+                    std::slice::from_mut(message),
+                    false,
+                );
+            }
+        }
+    }
     let placeholder = if block_images {
         BLOCK_IMAGES_PLACEHOLDER
     } else if !model_accepts_images {
@@ -23089,11 +23161,6 @@ fn apply_image_input_policy(
         return;
     };
 
-    if !model_accepts_images {
-        // Preserve snapcompact's named degradation and its text-only summary
-        // shape before replacing ordinary images with omission explanations.
-        crate::compaction_snap::strip_snapcompact_images(messages, false);
-    }
     let stats = filter_images_for_provider(messages, placeholder);
     if stats.removed_images > 0 {
         tracing::debug!(

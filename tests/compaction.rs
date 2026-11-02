@@ -1339,11 +1339,15 @@ fn local_and_shake_compaction_keep_screened_snapshots_and_omit_blocked_pixels() 
             if mode == "block" {
                 assert!(result.snap_payload.is_none());
             } else {
+                let retained = "[User]: <pi-secret:redacted>\n\n[User]: ongoing turn";
                 assert_eq!(
                     result.snap_payload,
-                    Some(pi::compaction_snap::SnapPayload::new(
-                        pi::compaction_snap::render_frames("[User]: <pi-secret:redacted>")
-                    ))
+                    Some(
+                        pi::compaction_snap::SnapPayload::new(pi::compaction_snap::render_frames(
+                            retained
+                        ))
+                        .with_source_text(retained.to_string())
+                    )
                 );
             }
 

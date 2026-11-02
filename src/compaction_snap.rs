@@ -4,8 +4,8 @@
 //! compacted conversation span is rasterized into deterministic PNG frames
 //! ("terminal-style" bitmap rendering) and attached to the compaction
 //! summary message as image blocks. Vision-capable models can then consume
-//! the rasterized history; text-only models never see the frames (they are
-//! stripped at context-build time with a logged reason).
+//! the rasterized history; text-only models receive the retained source text
+//! instead. The stored archive is independent of the selected model.
 //!
 //! Design invariants:
 //! - Determinism: identical transcript bytes produce identical PNG bytes.
@@ -23,7 +23,9 @@
 //! - Archive construction is streaming and bounded. If the complete visual
 //!   history exceeds its budget, the ordinary text summary remains authoritative.
 
-use crate::model::{ContentBlock, ImageContent, Message, TextContent, UserContent};
+use crate::model::{
+    ContentBlock, CustomMessage, ImageContent, Message, TextContent, UserContent, UserMessage,
+};
 use serde::{Deserialize, Serialize};
 
 mod archive;
@@ -35,6 +37,21 @@ pub const SNAPCOMPACT_DETAILS_SCHEMA: &str = "pi.compaction.snapcompact.v1";
 
 /// Key under `CompactionEntry.details` holding the snapcompact payload.
 pub const SNAPCOMPACT_DETAILS_KEY: &str = "snapcompact";
+
+/// Native, model-independent carrier used only while rebuilding context.
+/// It is projected to an ordinary user message before a provider request.
+pub(crate) const SNAPCOMPACT_MESSAGE_TYPE: &str = "pi.snapcompact";
+
+/// A complete source archive is retained or rejected; it is never silently
+/// clipped while being saved. This allowance is separate from encoded images.
+pub const MAX_SOURCE_TEXT_BYTES: usize = 3 * 1024 * 1024;
+
+/// Bare SDK agents have no model window metadata. Session-owned agents replace
+/// this conservative allowance with half their available compaction window.
+pub(crate) const DEFAULT_SOURCE_TEXT_TOKENS: u32 = 8_192;
+
+const SOURCE_TEXT_PREFIX: &str = "\n\n<compacted_history>\n";
+const SOURCE_TEXT_SUFFIX: &str = "\n</compacted_history>";
 
 /// Prefix used on compaction summary messages (mirrors `session.rs`).
 ///
@@ -144,6 +161,11 @@ pub struct SnapFrame {
 pub struct SnapPayload {
     pub schema: String,
     pub frames: Vec<SnapFrame>,
+    /// The privacy-screened transcript used to render these frames. Archives
+    /// written before source retention have no recoverable text beyond their
+    /// separately stored summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text: Option<String>,
 }
 
 impl SnapPayload {
@@ -152,7 +174,16 @@ impl SnapPayload {
         Self {
             schema: SNAPCOMPACT_DETAILS_SCHEMA.to_string(),
             frames,
+            source_text: None,
         }
+    }
+
+    /// Retain the same already-screened source that was rasterized. Persistence
+    /// and attachment validate the source budget before accepting the archive.
+    #[must_use]
+    pub fn with_source_text(mut self, source_text: String) -> Self {
+        self.source_text = Some(source_text);
+        self
     }
 }
 
@@ -312,9 +343,10 @@ pub fn payload_to_details(
     Value::Object(details)
 }
 
-/// Extract validated snapcompact frames from compaction entry details.
+/// Extract an admitted archive from compaction entry details.
 ///
-/// Returns `None` when absent, invalid, or over the local archive budget.
+/// Invalid frames may still retain a valid bounded source-only reading.
+/// Returns `None` when neither reading is admissible.
 /// Known fields are borrowed until the complete archive passes count, byte,
 /// geometry and native PNG integrity checks; unknown JSON fields are not cloned.
 #[must_use]
@@ -323,19 +355,22 @@ pub fn frames_from_details(details: Option<&serde_json::Value>) -> Option<SnapPa
     match replay::parse_payload(value, SnapLimits::default()) {
         Ok(payload) => Some(payload),
         Err(error) => {
+            let source = source_from_details(details);
             tracing::warn!(
                 target: "snapcompact",
                 reason_code = error.reason_code(),
-                "Stored visual archive was rejected; retaining the text-only compaction summary"
+                retained_source = source.is_some(),
+                "Stored visual archive was rejected; retaining available text"
             );
-            None
+            source.map(|source| SnapPayload::new(Vec::new()).with_source_text(source.to_string()))
         }
     }
 }
 
-/// Attach snapcompact frames to a freshly converted compaction-summary
-/// message: content becomes `[Text(summary), Image(frame0), …]`. A message
-/// without available frames is returned unchanged.
+/// Attach an archive to a freshly converted compaction-summary message.
+/// Source-bearing archives use a native custom-message envelope until the
+/// request chooses text or images. Frame-only archives retain the ordinary
+/// `[Text(summary), Image(frame0), …]` form. No provider receives the envelope.
 ///
 /// Timestamps are preserved from the incoming message so context rebuilds
 /// stay deterministic relative to the source entry. Direct SDK payloads are
@@ -347,7 +382,9 @@ pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Mes
     let Some(payload) = payload else {
         return message;
     };
-    if payload.frames.is_empty() || !matches!(&message, Message::User(_)) {
+    if (payload.frames.is_empty() && payload.source_text.is_none())
+        || !matches!(&message, Message::User(_))
+    {
         return message;
     }
     if let Err(error) = replay::validate_payload(payload, SnapLimits::default()) {
@@ -359,6 +396,28 @@ pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Mes
         return message;
     }
     if let Message::User(user) = &mut message {
+        if payload.source_text.is_some() {
+            let summary = match &user.content {
+                UserContent::Text(text) => Some(text.as_str()),
+                UserContent::Blocks(blocks) => match blocks.as_slice() {
+                    [ContentBlock::Text(text)] => Some(text.text.as_str()),
+                    _ => None,
+                },
+            };
+            if let Some(summary) = summary {
+                return Message::Custom(CustomMessage {
+                    content: summary.to_string(),
+                    custom_type: SNAPCOMPACT_MESSAGE_TYPE.to_string(),
+                    display: true,
+                    details: Some(payload_to_details(None, payload)),
+                    timestamp: user.timestamp,
+                });
+            }
+            // Source-bearing archives must keep their typed carrier. Never
+            // drop the source and append independent unscreened image bytes
+            // when an SDK caller supplies an unsupported content shape.
+            return message;
+        }
         if let UserContent::Blocks(existing) = &user.content
             && has_archive_suffix(existing, &payload.frames)
         {
@@ -381,6 +440,158 @@ pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Mes
     message
 }
 
+/// Whether this message needs native archive projection, including on vision
+/// models. Recognition does not authorize unvalidated archive data.
+#[must_use]
+pub(crate) fn is_archive_message(message: &Message) -> bool {
+    matches!(message, Message::Custom(custom) if custom.custom_type == SNAPCOMPACT_MESSAGE_TYPE)
+}
+
+/// Retained source for a text-only consumer. The source has its own bounded
+/// shape check; a reader that sends no images need not decompress any PNG.
+/// The caller must apply its usual outbound privacy and text-budget policy.
+#[must_use]
+pub(crate) fn source_for_custom(custom: &CustomMessage) -> Option<&str> {
+    if custom.custom_type != SNAPCOMPACT_MESSAGE_TYPE {
+        return None;
+    }
+    source_from_details(custom.details.as_ref())
+}
+
+#[must_use]
+pub(crate) fn source_from_details(details: Option<&serde_json::Value>) -> Option<&str> {
+    let payload = details?.get(SNAPCOMPACT_DETAILS_KEY)?;
+    if payload.get("schema").and_then(serde_json::Value::as_str) != Some(SNAPCOMPACT_DETAILS_SCHEMA)
+    {
+        return None;
+    }
+    replay::source_text(payload).ok().flatten()
+}
+
+/// Build a text-only reading without losing information that was kept only in
+/// images. The summary remains first; the archive is labeled as past history.
+#[must_use]
+pub(crate) fn text_for_custom(custom: &CustomMessage) -> String {
+    let mut text = custom.content.clone();
+    if let Some(source) = source_for_custom(custom) {
+        text.push_str(SOURCE_TEXT_PREFIX);
+        text.push_str(source);
+        text.push_str(SOURCE_TEXT_SUFFIX);
+    }
+    text
+}
+
+/// Update only the outbound copy after privacy screening. Vision projection
+/// derives its raster from this admitted source, so stale persisted image bytes
+/// cannot bypass the current privacy policy.
+pub(crate) fn replace_source_text(custom: &mut CustomMessage, source: String) {
+    if let Some(value) = custom
+        .details
+        .as_mut()
+        .and_then(|details| details.get_mut(SNAPCOMPACT_DETAILS_KEY))
+        .and_then(|payload| payload.get_mut("sourceText"))
+    {
+        *value = serde_json::Value::String(source);
+    }
+}
+
+fn budgeted_source(source: &str, budget: Option<u32>, provider: &str) -> String {
+    let Some(budget) = budget else {
+        return source.to_string();
+    };
+    let budget = u64::from(budget);
+    let source_tokens = crate::token_count::count_tokens(source, provider);
+    if source_tokens <= budget {
+        return source.to_string();
+    }
+    const OMITTED: &str =
+        "\n[Middle of compacted history omitted to fit this model's text budget.]\n";
+    // Recount the actual retained ends because their token density can differ
+    // from the middle. At most 22 halvings for the bounded 3-MiB source.
+    let mut kept = usize::try_from(
+        u64::try_from(source.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(budget)
+            / source_tokens,
+    )
+    .unwrap_or(source.len())
+    .min(source.len().saturating_sub(1));
+    while kept > 0 {
+        let mut head = kept.div_ceil(2);
+        while !source.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = source.len().saturating_sub(kept / 2);
+        while !source.is_char_boundary(tail) {
+            tail += 1;
+        }
+        let candidate = format!("{}{OMITTED}{}", &source[..head], &source[tail..]);
+        if crate::token_count::count_tokens(&candidate, provider) <= budget {
+            return candidate;
+        }
+        kept /= 2;
+    }
+    for notice in [
+        "[Compacted history omitted: this model has no room for its text reading.]",
+        "[Compacted history omitted.]",
+        "[omitted]",
+    ] {
+        if crate::token_count::count_tokens(notice, provider) <= budget {
+            return notice.to_string();
+        }
+    }
+    String::new()
+}
+
+fn project_archive(
+    custom: &CustomMessage,
+    accepts_images: bool,
+    text_budget: Option<u32>,
+    provider: &str,
+) -> Message {
+    let source = source_for_custom(custom);
+    let base = Message::User(UserMessage {
+        content: UserContent::Text(if accepts_images {
+            custom.content.clone()
+        } else {
+            source.map_or_else(
+                || custom.content.clone(),
+                |source| {
+                    let reading = budgeted_source(source, text_budget, provider);
+                    if reading.is_empty() {
+                        return custom.content.clone();
+                    }
+                    format!(
+                        "{}{SOURCE_TEXT_PREFIX}{reading}{SOURCE_TEXT_SUFFIX}",
+                        custom.content
+                    )
+                },
+            )
+        }),
+        timestamp: custom.timestamp,
+    });
+    if !accepts_images {
+        return base;
+    }
+    if let Some(source) = source {
+        // Source is the privacy authority. Integrity-valid stored PNGs could
+        // still depict unrelated unscreened text after an SDK edit or session
+        // corruption; derive the reading from exactly the admitted source.
+        let frames = render_frames(source);
+        if frames.is_empty() {
+            return project_archive(custom, false, text_budget, provider);
+        }
+        return attach_frames(base, Some(&SnapPayload::new(frames)));
+    }
+    let Some(mut payload) = frames_from_details(custom.details.as_ref()) else {
+        return base;
+    };
+    // The provider gets one reading, never the metadata or a second copy of
+    // the transcript. The canonical envelope still owns both representations.
+    payload.source_text = None;
+    attach_frames(base, Some(&payload))
+}
+
 fn has_archive_suffix(blocks: &[ContentBlock], frames: &[SnapFrame]) -> bool {
     let Some(start) = blocks.len().checked_sub(frames.len()) else {
         return false;
@@ -400,20 +611,47 @@ pub struct StripStats {
     pub affected_messages: usize,
 }
 
-/// Strip snapcompact frames from compaction summary messages.
+/// Project native archives for this request and strip legacy frames when the
+/// target cannot read images. Call on an outbound copy, not durable history.
 ///
 /// Strips when the active model cannot accept image inputs (bd-cv653.7.6 AC 4).
-/// Only messages whose first block carries [`COMPACTION_SUMMARY_PREFIX`] are
-/// touched — user-pasted images are never removed here.
+/// Only native archive envelopes and legacy messages whose first block carries
+/// [`COMPACTION_SUMMARY_PREFIX`] are touched. User-pasted images are preserved.
 ///
 /// Returns stats; logs one structured line per affected span with a stable
 /// reason code so degradation is diagnosable from logs alone.
 pub fn strip_snapcompact_images(messages: &mut [Message], accepts_images: bool) -> StripStats {
+    project_for_model(messages, accepts_images, None, "")
+}
+
+/// Select one archive reading after full-source privacy screening. A source
+/// budget clips only the outbound copy and labels any omitted middle.
+pub(crate) fn project_for_model(
+    messages: &mut [Message],
+    accepts_images: bool,
+    text_budget: Option<u32>,
+    provider: &str,
+) -> StripStats {
     let mut stats = StripStats::default();
-    if accepts_images {
-        return stats;
-    }
     for message in messages.iter_mut() {
+        if let Message::Custom(custom) = message
+            && custom.custom_type == SNAPCOMPACT_MESSAGE_TYPE
+        {
+            if !accepts_images {
+                stats.affected_messages += 1;
+                stats.removed_frames += custom
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get(SNAPCOMPACT_DETAILS_KEY))
+                    .and_then(|payload| payload.get("frames"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+            }
+            *message = project_archive(custom, accepts_images, text_budget, provider);
+        }
+        if accepts_images {
+            continue;
+        }
         let Message::User(user) = message else {
             continue;
         };
@@ -441,7 +679,7 @@ pub fn strip_snapcompact_images(messages: &mut [Message], accepts_images: bool) 
             reason_code = "snapcompact_degraded_non_vision",
             removed_frames = stats.removed_frames,
             affected_messages = stats.affected_messages,
-            "Active model lacks image input support; snapcompact frames stripped from outbound context"
+            "Snapcompact uses retained text for this request; frame-only archives retain their summary"
         );
     }
     stats
@@ -457,6 +695,25 @@ mod tests {
         assert!(CHARS_PER_LINE >= 40, "usable terminal width");
         assert!(LINES_PER_FRAME >= 10, "usable frame height");
         assert!(PAD * 2 < FRAME_WIDTH);
+    }
+
+    #[test]
+    fn text_budget_preserves_unicode_ends_and_respects_even_tiny_allowances() {
+        let source = format!(
+            "HEAD-FACT {}MIDDLE-FACT {}TAIL-FACT",
+            "caf\u{e9} \u{65e5}\u{672c} ".repeat(500),
+            "caf\u{e9} \u{65e5}\u{672c} ".repeat(500),
+        );
+        for budget in [0, 1, 4, 64, 128] {
+            let reading = budgeted_source(&source, Some(budget), "openai");
+            assert!(crate::token_count::count_tokens(&reading, "openai") <= u64::from(budget));
+            if budget >= 64 {
+                assert!(reading.contains("HEAD-FACT") && reading.contains("TAIL-FACT"));
+                assert!(!reading.contains("MIDDLE-FACT"));
+                assert!(reading.contains("omitted"));
+            }
+        }
+        assert_eq!(budgeted_source(&source, None, "openai"), source);
     }
 
     #[test]

@@ -6,7 +6,10 @@
 
 #![allow(clippy::similar_names)]
 
-use pi::compaction::CompactionRenderMode;
+use pi::compaction::{
+    CompactionPreparation, CompactionPrivacy, CompactionRenderMode, FileOperations,
+    ResolvedCompactionSettings, compact_local,
+};
 use pi::compaction_snap::{
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SnapFrame, SnapPayload, attach_frames,
     frames_from_details, png_encode, render_frames, strip_snapcompact_images,
@@ -37,6 +40,127 @@ fn sample_transcript() -> String {
 
 fn summary_body_text() -> String {
     format!("{COMPACTION_SUMMARY_PREFIX}body{COMPACTION_SUMMARY_SUFFIX}")
+}
+
+fn preparation(source: &str) -> CompactionPreparation {
+    CompactionPreparation {
+        first_kept_entry_id: "recent-turn".to_string(),
+        messages_to_summarize: vec![pi::session::SessionMessage::User {
+            content: UserContent::Text(source.to_string()),
+            timestamp: Some(1),
+        }],
+        turn_prefix_messages: Vec::new(),
+        is_split_turn: false,
+        tokens_before: 12_000,
+        previous_summary: None,
+        file_ops: FileOperations::default(),
+        settings: ResolvedCompactionSettings {
+            render_mode: CompactionRenderMode::SnapCompact,
+            ..ResolvedCompactionSettings::default()
+        },
+    }
+}
+
+#[test]
+fn native_compaction_persists_the_complete_screened_source_used_for_images() {
+    let secret = "CUSTOM-ARCHIVE-SECRET-8432";
+    let source = format!("retain caf\u{e9}\r\n\t\u{65e5}\u{672c}, never disclose {secret}");
+    let privacy = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
+        mode: Some("obfuscate".to_string()),
+        extra_patterns: Some(vec![secret.to_string()]),
+    }));
+    let mut prep = preparation(&source);
+    prep.is_split_turn = true;
+    prep.turn_prefix_messages = vec![pi::session::SessionMessage::User {
+        content: UserContent::Text("SPLIT-TURN-FACT".to_string()),
+        timestamp: Some(2),
+    }];
+    let result = compact_local(prep, &privacy);
+    let payload = result.snap_payload.expect("screened archive retained");
+    let kept = payload.source_text.as_deref().expect("source retained");
+    assert!(kept.contains("caf\u{e9}\r\n\t\u{65e5}\u{672c}"));
+    assert!(!kept.contains(secret));
+    assert!(kept.contains("<pi-secret:"));
+    assert!(kept.contains("SPLIT-TURN-FACT"));
+    assert_eq!(payload.frames, render_frames(kept));
+    let details = pi::compaction_snap::payload_to_details(None, &payload);
+    assert_eq!(frames_from_details(Some(&details)), Some(payload));
+
+    let blocked = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
+        mode: Some("block".to_string()),
+        extra_patterns: Some(vec![secret.to_string()]),
+    }));
+    let refused = compact_local(preparation(&source), &blocked);
+    assert!(refused.snap_payload.is_none());
+    assert!(!refused.summary.contains(secret));
+}
+
+#[test]
+fn source_only_archives_remain_readable_on_both_model_types() {
+    let source = "[User]: retained source survives visual-budget refusal caf\u{e9}.";
+    let payload = SnapPayload::new(Vec::new()).with_source_text(source.to_string());
+    let canonical = attach_frames(base_summary_message(), Some(&payload));
+    assert!(matches!(canonical, Message::Custom(_)));
+    for vision in [false, true] {
+        let mut messages = vec![canonical.clone()];
+        strip_snapcompact_images(&mut messages, vision);
+        let wire = serde_json::to_string(&messages).unwrap();
+        // A source-only session can reconstruct a vision reading on replay;
+        // the source itself remains exact for the non-vision request.
+        assert_eq!(wire.contains(source), !vision);
+        assert_eq!(wire.contains("image/png"), vision);
+    }
+}
+
+#[test]
+fn source_reading_survives_corrupt_frames_but_never_invalid_source_metadata() {
+    let source = "[User]: durable ARCHIVED-FACT";
+    let mut details = serde_json::json!({
+        "snapcompact": {
+            "schema": pi::compaction_snap::SNAPCOMPACT_DETAILS_SCHEMA,
+            "sourceText": source,
+            "frames": [{"png":"corrupt", "width":960, "height":64}],
+        }
+    });
+    let payload = frames_from_details(Some(&details)).expect("valid source survives");
+    assert!(payload.frames.is_empty());
+    assert_eq!(payload.source_text.as_deref(), Some(source));
+    let canonical = attach_frames(base_summary_message(), Some(&payload));
+    let mut messages = vec![canonical];
+    strip_snapcompact_images(&mut messages, false);
+    assert!(
+        serde_json::to_string(&messages)
+            .unwrap()
+            .contains("ARCHIVED-FACT")
+    );
+
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(false),
+        serde_json::json!("x".repeat(pi::compaction_snap::MAX_SOURCE_TEXT_BYTES + 1)),
+    ] {
+        details["snapcompact"]["sourceText"] = invalid;
+        assert!(frames_from_details(Some(&details)).is_none());
+    }
+    details["snapcompact"]["sourceText"] = serde_json::json!(source);
+    details["snapcompact"]["schema"] = serde_json::json!("unknown.v2");
+    assert!(frames_from_details(Some(&details)).is_none());
+}
+
+#[test]
+fn unsupported_source_attachment_shape_cannot_drop_source_and_append_untrusted_frames() {
+    let message = Message::User(UserMessage {
+        content: UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new(summary_body_text())),
+            ContentBlock::Text(TextContent::new("second text block")),
+        ]),
+        timestamp: 7,
+    });
+    let original = serde_json::to_value(&message).unwrap();
+    let payload = SnapPayload::new(render_frames("unrelated image text"))
+        .with_source_text("screened source".to_string());
+    let attached = attach_frames(message, Some(&payload));
+    assert_eq!(serde_json::to_value(attached).unwrap(), original);
 }
 
 #[test]

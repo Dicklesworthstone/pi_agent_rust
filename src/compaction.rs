@@ -592,10 +592,23 @@ impl<'a> SummaryFields<'a> {
                 SessionMessage::Custom {
                     custom_type,
                     content,
+                    details,
                     ..
                 } => {
+                    let is_archive =
+                        custom_type == crate::compaction_snap::SNAPCOMPACT_MESSAGE_TYPE;
                     self.text(custom_type)?;
                     self.text(content)?;
+                    if is_archive
+                        && let Some(Value::String(source)) = details
+                            .as_mut()
+                            .and_then(|details| {
+                                details.get_mut(crate::compaction_snap::SNAPCOMPACT_DETAILS_KEY)
+                            })
+                            .and_then(|payload| payload.get_mut("sourceText"))
+                    {
+                        self.text(source)?;
+                    }
                 }
                 SessionMessage::BashExecution {
                     command,
@@ -1747,6 +1760,33 @@ pub fn estimate_model_context_tokens(messages: &[Message]) -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
+/// Count the same archive reading the selected provider will receive. Without
+/// this projection, a model switch could report image-size savings while the
+/// next request carries the much larger retained transcript.
+#[must_use]
+pub fn estimate_model_context_tokens_for_model(
+    messages: &[Message],
+    accepts_images: bool,
+    source_budget: Option<u32>,
+    provider: &str,
+) -> u64 {
+    if accepts_images
+        && !messages
+            .iter()
+            .any(crate::compaction_snap::is_archive_message)
+    {
+        return estimate_model_context_tokens(messages);
+    }
+    let mut projected = messages.to_vec();
+    crate::compaction_snap::project_for_model(
+        &mut projected,
+        accepts_images,
+        source_budget,
+        provider,
+    );
+    estimate_model_context_tokens(&projected)
+}
+
 fn should_compact(
     context_tokens: u64,
     context_window: u32,
@@ -1823,7 +1863,19 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
                 accumulate_block_estimate(block, &mut text, &mut flat_tokens);
             }
         }
-        SessionMessage::Custom { content, .. } => text.push_str(content),
+        SessionMessage::Custom {
+            custom_type,
+            content,
+            details,
+            ..
+        } => {
+            text.push_str(content);
+            if custom_type == crate::compaction_snap::SNAPCOMPACT_MESSAGE_TYPE
+                && let Some(source) = crate::compaction_snap::source_from_details(details.as_ref())
+            {
+                text.push_str(source);
+            }
+        }
         SessionMessage::BashExecution {
             command, output, ..
         } => {
@@ -2204,13 +2256,22 @@ fn collect_text_blocks(blocks: &[ContentBlock]) -> String {
 }
 
 fn serialize_conversation(messages: &[Message]) -> String {
+    serialize_conversation_reading(messages, true)
+}
+
+fn serialize_conversation_reading(messages: &[Message], include_archive_source: bool) -> String {
     let mut out = String::new();
 
     for msg in messages {
         match msg {
             Message::User(user) => append_user_message(&mut out, user),
             Message::Custom(custom) => {
-                append_custom_message(&mut out, &custom.custom_type, &custom.content);
+                let text = if include_archive_source {
+                    crate::compaction_snap::text_for_custom(custom)
+                } else {
+                    custom.content.clone()
+                };
+                append_custom_message(&mut out, &custom.custom_type, &text);
             }
             Message::Assistant(assistant) => append_assistant_message(&mut out, assistant),
             Message::ToolResult(tool) => append_tool_result_message(&mut out, &tool.content),
@@ -2304,7 +2365,10 @@ fn summary_prompt_text(
         .iter()
         .filter_map(session_message_to_model)
         .collect::<Vec<_>>();
-    let conversation_text = serialize_conversation(&llm_messages);
+    // Prior source remains durable in the next archive; the summarizer reads
+    // its existing summary plus new history, without expanding an old archive
+    // beyond the current model's window after a model switch.
+    let conversation_text = serialize_conversation_reading(&llm_messages, false);
 
     let mut prompt_text = format!("<conversation>\n{conversation_text}\n</conversation>\n\n");
     if let Some(previous) = previous_summary {
@@ -2323,7 +2387,7 @@ fn turn_prefix_prompt_text(messages: &[SessionMessage], prompts: &SummaryPrompts
         .iter()
         .filter_map(session_message_to_model)
         .collect::<Vec<_>>();
-    let conversation_text = serialize_conversation(&llm_messages);
+    let conversation_text = serialize_conversation_reading(&llm_messages, false);
     format!(
         "<conversation>\n{conversation_text}\n</conversation>\n\n{}",
         prompts.turn_prefix,
@@ -2715,6 +2779,30 @@ fn prepare_compaction_impl(
         return None;
     }
 
+    // Carry the last archive's source into the next archive. The summarizer
+    // reads `previous_summary`, so this durable source does not inflate its
+    // prompt when the user switches to a smaller model. Insert only after the
+    // no-op check so an archive alone never causes repeated compaction.
+    if let Some(index) = prev_compaction_index
+        && let SessionEntry::Compaction(entry) = &path_entries[index]
+        && let Some(source) = crate::compaction_snap::source_from_details(entry.details.as_ref())
+    {
+        messages_to_summarize.insert(
+            0,
+            SessionMessage::Custom {
+                custom_type: crate::compaction_snap::SNAPCOMPACT_MESSAGE_TYPE.to_string(),
+                content: String::new(),
+                display: false,
+                details: Some(crate::compaction_snap::payload_to_details(
+                    None,
+                    &crate::compaction_snap::SnapPayload::new(Vec::new())
+                        .with_source_text(source.to_string()),
+                )),
+                timestamp: None,
+            },
+        );
+    }
+
     let previous_summary = prev_compaction_index.and_then(|idx| match &path_entries[idx] {
         SessionEntry::Compaction(entry) => Some(entry.summary.clone()),
         _ => None,
@@ -2854,6 +2942,7 @@ fn prepare_summary_requests(
             let messages = preparation
                 .messages_to_summarize
                 .iter()
+                .chain(&preparation.turn_prefix_messages)
                 .filter_map(session_message_to_model)
                 .collect::<Vec<_>>();
             serialize_conversation(&messages)
@@ -2937,17 +3026,23 @@ fn finish_compaction(
         CompactionRenderMode::SnapCompact
     ) {
         screened_snap_transcript.and_then(|transcript| {
-            let frames = crate::compaction_snap::render_frames(&transcript);
-            (!frames.is_empty()).then(|| {
-                tracing::info!(
+            if transcript.len() > crate::compaction_snap::MAX_SOURCE_TEXT_BYTES {
+                tracing::warn!(
                     target: "snapcompact",
-                    frame_count = frames.len(),
-                    source_chars = transcript.chars().count(),
-                    reason_code = "snapcompact_frames_generated",
-                    "Rasterized compacted span into deterministic PNG frames"
+                    reason_code = "snapcompact_source_text_limit",
+                    "Archive source exceeds its retention budget; retaining the compaction summary"
                 );
-                crate::compaction_snap::SnapPayload::new(frames)
-            })
+                return None;
+            }
+            let frames = crate::compaction_snap::render_frames(&transcript);
+            tracing::info!(
+                target: "snapcompact",
+                frame_count = frames.len(),
+                source_chars = transcript.chars().count(),
+                reason_code = "snapcompact_archive_generated",
+                "Retained compacted source with its available visual reading"
+            );
+            Some(crate::compaction_snap::SnapPayload::new(frames).with_source_text(transcript))
         })
     } else {
         None
@@ -3130,6 +3225,7 @@ fn finish_local_compaction(
             let messages = preparation
                 .messages_to_summarize
                 .iter()
+                .chain(&preparation.turn_prefix_messages)
                 .filter_map(session_message_to_model)
                 .collect::<Vec<_>>();
             let mut transcript = serialize_conversation(&messages);
@@ -5901,6 +5997,51 @@ mod tests {
         assert!(prep.is_some());
         let p = prep.unwrap();
         assert_eq!(p.previous_summary.as_deref(), Some("previous summary"));
+    }
+
+    #[test]
+    fn repeat_compaction_keeps_source_without_expanding_the_summary_request() {
+        let source = format!("ARCHIVED-FACT {}", "older detail ".repeat(2_000));
+        let mut previous = compact_entry("3", "previous summary", 30_000);
+        let SessionEntry::Compaction(entry) = &mut previous else {
+            unreachable!();
+        };
+        entry.details = Some(crate::compaction_snap::payload_to_details(
+            None,
+            &crate::compaction_snap::SnapPayload::new(Vec::new()).with_source_text(source.clone()),
+        ));
+        let entries = vec![
+            user_entry("1", "old request"),
+            assistant_entry("2", "old response", 100, 50),
+            previous,
+            user_entry("4", &format!("NEW-FACT {}", "new detail ".repeat(500))),
+            assistant_entry("5", "new response", 8_000, 1_000),
+            user_entry("6", "recent"),
+        ];
+        let mut preparation = prepare_compaction(
+            &entries,
+            ResolvedCompactionSettings {
+                context_window_tokens: 2_048,
+                reserve_tokens: 256,
+                keep_recent_tokens: 1,
+                render_mode: CompactionRenderMode::SnapCompact,
+                ..ResolvedCompactionSettings::default()
+            },
+        )
+        .expect("new history can be compacted");
+        preparation.is_split_turn = true;
+        preparation.turn_prefix_messages = vec![make_user_text("SPLIT-TURN-FACT")];
+        let mut privacy = CompactionPrivacy::default();
+        let prompts = privacy.screen(&mut preparation, &mut None).unwrap();
+        let requests =
+            prepare_summary_requests(&preparation, None, &prompts, &mut privacy).unwrap();
+        let history = requests.history.expect("summary request");
+        assert!(history.contains("previous summary") && history.contains("NEW-FACT"));
+        assert!(!history.contains("ARCHIVED-FACT") && !history.contains("SPLIT-TURN-FACT"));
+        assert!(requests.turn_prefix.unwrap().contains("SPLIT-TURN-FACT"));
+        let retained = requests.snap_transcript.expect("next archive");
+        assert!(retained.contains(&source));
+        assert!(retained.contains("NEW-FACT") && retained.contains("SPLIT-TURN-FACT"));
     }
 
     #[test]
