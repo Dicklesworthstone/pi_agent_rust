@@ -497,8 +497,7 @@ pub async fn synchronize(
     remaining: Option<Duration>,
 ) -> Result<MemorySyncReport> {
     let child = std::env::var("PI_SUBAGENT_DEPTH")
-        .ok()
-        .is_some_and(|value| value.parse::<u32>().map_or(true, |depth| depth > 0));
+        .is_ok_and(|value| value.parse::<u32>().map_or(true, |depth| depth > 0));
     if !settings.enabled() || !session.save_enabled() || child {
         return if automatic {
             Ok(MemorySyncReport::skipped("ineligible"))
