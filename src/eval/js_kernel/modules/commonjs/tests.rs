@@ -78,6 +78,8 @@ fn linking_a_missing_named_export_does_not_run_commonjs_body() {
 fn cached_requires_check_the_current_cell_owner_without_discarding_exports() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("main.cjs"), "module.exports = () => require('./value.cjs');").unwrap();
+    // A JavaScript object literal in a fixture, not a format string.
+    #[allow(clippy::literal_string_with_formatting_args)]
     std::fs::write(root.path().join("value.cjs"), "module.exports = {answer:42};").unwrap();
     let kernel = JsKernel::spawn_in(root.path()).unwrap();
     succeeds(&kernel, "globalThis.get = (await import('./main.cjs')).default; globalThis.first = get()");
