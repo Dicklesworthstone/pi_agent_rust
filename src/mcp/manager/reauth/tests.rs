@@ -424,7 +424,10 @@ fn source_repair_preserves_authored_values_across_native_editor_and_codex_format
         let repair = SourceRepair::prepare(&selected.config, &manager.inner.cwd).expect("source repair");
         let rendered = std::str::from_utf8(&repair.rendered).expect("rendered source");
         assert!(!has_authorization(&repair.repaired));
-        if relative.ends_with(".toml") {
+        if std::path::Path::new(relative)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
             let value: toml::Value = toml::from_str(rendered).expect("repaired TOML");
             assert_eq!(value["model"].as_str(), Some("preserved"));
             let server = &value["mcp_servers"]["remote"];
