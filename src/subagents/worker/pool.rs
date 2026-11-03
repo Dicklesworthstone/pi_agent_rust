@@ -662,6 +662,8 @@ pub(super) async fn execute(
     }
     let started = Instant::now();
     let mut wait_admitted = false;
+    // RAII: holds the DependencyHold for the wait; it is never read.
+    #[allow(clippy::collection_is_never_read)]
     let mut _waiting = None;
     loop {
         recheck_owner(tool, &owner, &owner_id, budget).await?;
