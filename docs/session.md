@@ -216,6 +216,21 @@ messages, tools, and system prompt also occupy context. RPC context estimates
 count the selected reading. `/btw` includes archived text within its existing
 side-question input and output limits and reports omitted content.
 
+Context recovery, RPC estimates, and archive text clipping use the selected
+reader's token table for the entire conversation, including text originally
+written by another model. GPT-3.5 and GPT-4/Turbo use Cl100k; GPT-4o and newer
+GPT families use O200k. Claude-family models retain Pi's Cl100k approximation,
+including gateway and Bedrock IDs. Unknown model families use O200k unless
+the provider already declares the Anthropic approximation. These estimates
+are not exact provider billing counts.
+
+Automatic compaction reuses measured usage only while the latest usable
+checkpoint belongs to the active provider and model. After a switch, it
+recounts the text and retained-tail budget for the destination; an old
+model's usage cannot trigger compaction or conceal a newly oversized input.
+Once the new model returns usable usage, that measurement takes precedence
+again. The saved conversation and historical usage records stay intact.
+
 Privacy screening reads the complete retained source before request clipping.
 Vision images are derived from that screened source, so changed privacy rules
 or mismatched persisted image bytes cannot reveal an older unscreened reading.

@@ -495,12 +495,12 @@ pub(crate) fn replace_source_text(custom: &mut CustomMessage, source: String) {
     }
 }
 
-fn budgeted_source(source: &str, budget: Option<u32>, provider: &str) -> String {
+fn budgeted_source(source: &str, budget: Option<u32>, provider: &str, model_id: &str) -> String {
     let Some(budget) = budget else {
         return source.to_string();
     };
     let budget = u64::from(budget);
-    let source_tokens = crate::token_count::count_tokens(source, provider);
+    let source_tokens = crate::token_count::count_tokens_for_model(source, provider, model_id);
     if source_tokens <= budget {
         return source.to_string();
     }
@@ -526,7 +526,7 @@ fn budgeted_source(source: &str, budget: Option<u32>, provider: &str) -> String 
             tail += 1;
         }
         let candidate = format!("{}{OMITTED}{}", &source[..head], &source[tail..]);
-        if crate::token_count::count_tokens(&candidate, provider) <= budget {
+        if crate::token_count::count_tokens_for_model(&candidate, provider, model_id) <= budget {
             return candidate;
         }
         kept /= 2;
@@ -536,7 +536,7 @@ fn budgeted_source(source: &str, budget: Option<u32>, provider: &str) -> String 
         "[Compacted history omitted.]",
         "[omitted]",
     ] {
-        if crate::token_count::count_tokens(notice, provider) <= budget {
+        if crate::token_count::count_tokens_for_model(notice, provider, model_id) <= budget {
             return notice.to_string();
         }
     }
@@ -548,6 +548,7 @@ fn project_archive(
     accepts_images: bool,
     text_budget: Option<u32>,
     provider: &str,
+    model_id: &str,
 ) -> Message {
     let source = source_for_custom(custom);
     let base = Message::User(UserMessage {
@@ -557,7 +558,7 @@ fn project_archive(
             source.map_or_else(
                 || custom.content.clone(),
                 |source| {
-                    let reading = budgeted_source(source, text_budget, provider);
+                    let reading = budgeted_source(source, text_budget, provider, model_id);
                     if reading.is_empty() {
                         return custom.content.clone();
                     }
@@ -579,7 +580,7 @@ fn project_archive(
         // corruption; derive the reading from exactly the admitted source.
         let frames = render_frames(source);
         if frames.is_empty() {
-            return project_archive(custom, false, text_budget, provider);
+            return project_archive(custom, false, text_budget, provider, model_id);
         }
         return attach_frames(base, Some(&SnapPayload::new(frames)));
     }
@@ -621,7 +622,7 @@ pub struct StripStats {
 /// Returns stats; logs one structured line per affected span with a stable
 /// reason code so degradation is diagnosable from logs alone.
 pub fn strip_snapcompact_images(messages: &mut [Message], accepts_images: bool) -> StripStats {
-    project_for_model(messages, accepts_images, None, "")
+    project_for_model(messages, accepts_images, None, "", "")
 }
 
 /// Select one archive reading after full-source privacy screening. A source
@@ -631,6 +632,7 @@ pub(crate) fn project_for_model(
     accepts_images: bool,
     text_budget: Option<u32>,
     provider: &str,
+    model_id: &str,
 ) -> StripStats {
     let mut stats = StripStats::default();
     for message in messages.iter_mut() {
@@ -647,7 +649,7 @@ pub(crate) fn project_for_model(
                     .and_then(serde_json::Value::as_array)
                     .map_or(0, Vec::len);
             }
-            *message = project_archive(custom, accepts_images, text_budget, provider);
+            *message = project_archive(custom, accepts_images, text_budget, provider, model_id);
         }
         if accepts_images {
             continue;
@@ -705,7 +707,7 @@ mod tests {
             "caf\u{e9} \u{65e5}\u{672c} ".repeat(500),
         );
         for budget in [0, 1, 4, 64, 128] {
-            let reading = budgeted_source(&source, Some(budget), "openai");
+            let reading = budgeted_source(&source, Some(budget), "openai", "gpt-4o");
             assert!(crate::token_count::count_tokens(&reading, "openai") <= u64::from(budget));
             if budget >= 64 {
                 assert!(reading.contains("HEAD-FACT") && reading.contains("TAIL-FACT"));
@@ -713,7 +715,22 @@ mod tests {
                 assert!(reading.contains("omitted"));
             }
         }
-        assert_eq!(budgeted_source(&source, None, "openai"), source);
+        assert_eq!(budgeted_source(&source, None, "openai", "gpt-4o"), source);
+    }
+
+    #[test]
+    fn archive_text_budget_uses_the_destination_model_family() {
+        let source = "お誕生日おめでとう source/path.rs <|endoftext|>\n".repeat(500);
+        for model in ["gpt-4-turbo", "gpt-4o", "vendor/gpt-3.5-turbo"] {
+            for budget in [0, 1, 64, 256] {
+                let reading = budgeted_source(&source, Some(budget), "gateway", model);
+                assert!(
+                    crate::token_count::count_tokens_for_model(&reading, "gateway", model)
+                        <= u64::from(budget),
+                    "{model} must use one table for clipping and recounting",
+                );
+            }
+        }
     }
 
     #[test]

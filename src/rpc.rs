@@ -18,9 +18,10 @@ use crate::agent::{
 };
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
+#[cfg(test)]
+use crate::compaction::prepare_compaction;
 use crate::compaction::{
     ResolvedCompactionSettings, compact, compact_auto, compaction_details_to_value,
-    prepare_compaction,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -15820,7 +15821,7 @@ async fn maybe_auto_compact(
         return;
     }
     drop(state);
-    let (origin_session_id, path_entries, context_window, reserve_tokens, settings) = {
+    let (origin_session_id, path_entries, context_window, reserve_tokens, settings, reader) = {
         let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
             return;
         };
@@ -15875,10 +15876,16 @@ async fn maybe_auto_compact(
             context_window,
             reserve_tokens,
             settings,
+            guard.agent.provider(),
         )
     };
 
-    let Some(prep) = prepare_compaction(&path_entries, settings) else {
+    let Some(prep) = crate::compaction::prepare_compaction_for_model(
+        &path_entries,
+        settings,
+        reader.name(),
+        reader.model_id(),
+    ) else {
         return;
     };
     if !should_auto_compact(prep.tokens_before, context_window, reserve_tokens) {
@@ -16099,6 +16106,7 @@ fn session_state(
         accepts_images,
         Some(text_budget),
         session.header.provider.as_deref().unwrap_or_default(),
+        session.header.model_id.as_deref().unwrap_or_default(),
     );
 
     let message_count = session
@@ -29064,6 +29072,50 @@ export default function init(pi) {
             session_state(&session, &[model], &snapshot, &config, false, false)["contextWindow"],
             Value::Null,
         );
+    }
+
+    #[test]
+    fn session_state_context_budget_follows_model_switches_within_one_provider() {
+        let text = "お誕生日おめでとう source/path.rs <|endoftext|>";
+        let mut session = Session::in_memory();
+        session.header.provider = Some("openai".into());
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text(text.into()),
+            timestamp: Some(1),
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                provider: "anthropic".into(),
+                model: "claude-old".into(),
+                usage: Usage {
+                    total_tokens: 900_000,
+                    ..Usage::default()
+                },
+                ..AssistantMessage::default()
+            },
+        });
+        let snapshot = RpcStateSnapshot {
+            steering_count: 0,
+            follow_up_count: 0,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+        };
+        let config = Config::default();
+        for (id, table) in [
+            ("gpt-4-turbo", crate::token_count::TokenTable::Cl100k),
+            ("gpt-4o", crate::token_count::TokenTable::O200k),
+        ] {
+            let mut model = dummy_entry(id, true);
+            model.model.provider = "openai".into();
+            session.header.model_id = Some(id.into());
+            let expected = crate::token_count::active_counter().count(text, table)
+                + crate::token_count::active_counter().count(&format!("{text}\n"), table);
+            let state = session_state(&session, &[model], &snapshot, &config, false, false);
+            assert_eq!(state["contextTokens"], expected, "reader {id}");
+        }
     }
 
     #[test]

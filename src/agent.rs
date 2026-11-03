@@ -3085,6 +3085,7 @@ impl Agent {
             self.config.model_accepts_images && !self.config.block_images,
             Some(self.snapcompact_text_tokens),
             self.provider.name(),
+            self.provider.model_id(),
         )
     }
 
@@ -3095,12 +3096,14 @@ impl Agent {
         let accepts_images = self.config.model_accepts_images && !self.config.block_images;
         let text_budget = self.snapcompact_text_tokens;
         let provider = self.provider.name().to_string();
+        let model_id = self.provider.model_id().to_string();
         let mut context = self.build_context();
         crate::compaction_snap::project_for_model(
             context.messages.to_mut(),
             accepts_images,
             Some(text_budget),
             &provider,
+            &model_id,
         );
         let tools: Vec<serde_json::Value> = context
             .tools
@@ -5232,6 +5235,7 @@ impl Agent {
             self.config.model_accepts_images && !self.config.block_images,
             Some(self.snapcompact_text_tokens),
             self.provider.name(),
+            self.provider.model_id(),
         );
 
         if checkpoint_cx.checkpoint().is_err()
@@ -19882,7 +19886,12 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let prep = compaction::prepare_compaction_for_model(
+                &entries,
+                self.compaction_settings.clone(),
+                &origin_provider_id,
+                &origin_model_id,
+            );
             let origin = CompactionOrigin {
                 session_id: session.header.id.clone(),
                 provider_id: origin_provider_id,
@@ -20105,7 +20114,13 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            let provider = self.agent.provider();
+            compaction::prepare_compaction_for_model(
+                &entries,
+                self.compaction_settings.clone(),
+                provider.name(),
+                provider.model_id(),
+            )
         };
 
         let Some(prep) = preparation else {

@@ -1653,11 +1653,36 @@ struct ContextUsageEstimate {
     last_usage_index: Option<usize>,
 }
 
+#[cfg(test)]
 fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate {
+    estimate_context_tokens_for_model(messages, None)
+}
+
+fn estimate_context_tokens_for_model(
+    messages: &[SessionMessage],
+    model: Option<(&str, &str)>,
+) -> ContextUsageEstimate {
+    let table =
+        model.map(|(provider, model_id)| crate::token_count::table_for_model(provider, model_id));
+    let estimate = |message: &SessionMessage| {
+        table.map_or_else(
+            || estimate_tokens(message),
+            |table| estimate_tokens_with_table(message, table),
+        )
+    };
     let mut last_usage: Option<(&Usage, usize)> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {
         if let Some(usage) = get_assistant_usage(msg) {
-            last_usage = Some((usage, idx));
+            // Usage describes the request made to its original model. After a
+            // switch it cannot anchor the new reader's context, even when both
+            // models belong to the same provider. Do not search past a foreign
+            // turn for an older, superficially matching usage checkpoint.
+            if model.is_none_or(|(provider, model_id)| {
+                matches!(msg, SessionMessage::Assistant { message }
+                    if message.provider == provider && message.model == model_id)
+            }) {
+                last_usage = Some((usage, idx));
+            }
             break;
         }
     }
@@ -1665,7 +1690,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
     let Some((usage, usage_index)) = last_usage else {
         let total = messages
             .iter()
-            .map(estimate_tokens)
+            .map(estimate)
             .fold(0u64, u64::saturating_add);
         return ContextUsageEstimate {
             tokens: total,
@@ -1679,7 +1704,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
     if usage_tokens == 0 {
         let total = messages
             .iter()
-            .map(estimate_tokens)
+            .map(estimate)
             .fold(0u64, u64::saturating_add);
         return ContextUsageEstimate {
             tokens: total,
@@ -1689,7 +1714,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
 
     let trailing_tokens = messages[usage_index + 1..]
         .iter()
-        .map(estimate_tokens)
+        .map(estimate)
         .fold(0u64, u64::saturating_add);
 
     // Calibration (bd-cv653.7.1): when measured usage exists, estimate the
@@ -1697,7 +1722,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
     // quality harness can observe token_estimate_delta over time.
     let estimated_total = messages
         .iter()
-        .map(estimate_tokens)
+        .map(estimate)
         .fold(0u64, u64::saturating_add);
     let measured_total = usage_tokens.saturating_add(trailing_tokens);
     if estimated_total > 0 && measured_total > 0 {
@@ -1725,7 +1750,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
 /// session entries, using the same char-based estimator (`estimate_tokens`) as
 /// the rest of the compaction module.
 ///
-/// Unlike [`estimate_context_tokens`], this deliberately ignores any retained
+/// Unlike the usage-based estimate, this deliberately ignores any retained
 /// assistant `usage` metrics: those belong to the *pre-compaction* provider
 /// request and would massively inflate an estimate of the context the *next*
 /// request will see. Callers use this to compute the `tokensAfter` field of
@@ -1769,13 +1794,23 @@ pub fn estimate_model_context_tokens_for_model(
     accepts_images: bool,
     source_budget: Option<u32>,
     provider: &str,
+    model_id: &str,
 ) -> u64 {
+    let table = crate::token_count::table_for_model(provider, model_id);
+    let estimate = |messages: &[Message]| {
+        messages
+            .iter()
+            .cloned()
+            .map(SessionMessage::from)
+            .map(|message| estimate_tokens_with_table(&message, table))
+            .fold(0u64, u64::saturating_add)
+    };
     if accepts_images
         && !messages
             .iter()
             .any(crate::compaction_snap::is_archive_message)
     {
-        return estimate_model_context_tokens(messages);
+        return estimate(messages);
     }
     let mut projected = messages.to_vec();
     crate::compaction_snap::project_for_model(
@@ -1783,8 +1818,9 @@ pub fn estimate_model_context_tokens_for_model(
         accepts_images,
         source_budget,
         provider,
+        model_id,
     );
-    estimate_model_context_tokens(&projected)
+    estimate(&projected)
 }
 
 fn should_compact(
@@ -1834,6 +1870,19 @@ fn accumulate_block_estimate(block: &ContentBlock, text: &mut String, flat_token
 }
 
 fn estimate_tokens(message: &SessionMessage) -> u64 {
+    let table = match message {
+        SessionMessage::Assistant { message } => {
+            crate::token_count::table_for_model(&message.provider, &message.model)
+        }
+        _ => crate::token_count::TokenTable::O200k,
+    };
+    estimate_tokens_with_table(message, table)
+}
+
+fn estimate_tokens_with_table(
+    message: &SessionMessage,
+    table: crate::token_count::TokenTable,
+) -> u64 {
     // BPE counting (bd-cv653.7.1): accumulate the countable text and count
     // it with the active counter (real O200k/Cl100k-class tables when the
     // `bpe-tokens` feature is on; chars/4 when off). Measured API usage
@@ -1841,7 +1890,6 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
     // keep their flat estimate.
     let mut text = String::new();
     let mut flat_tokens: u64 = 0;
-    let mut assistant_provider: Option<&str> = None;
 
     match message {
         SessionMessage::User { content, .. } => match content {
@@ -1853,7 +1901,6 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
             }
         },
         SessionMessage::Assistant { message } => {
-            assistant_provider = Some(message.provider.as_str());
             for block in &message.content {
                 accumulate_block_estimate(block, &mut text, &mut flat_tokens);
             }
@@ -1887,10 +1934,6 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
         | SessionMessage::CompactionSummary { summary, .. } => text.push_str(summary),
     }
 
-    let table = assistant_provider.map_or(
-        crate::token_count::TokenTable::O200k,
-        crate::token_count::table_for_provider,
-    );
     flat_tokens.saturating_add(crate::token_count::active_counter().count(&text, table))
 }
 
@@ -1986,6 +2029,7 @@ fn find_cut_point(
     start_index: usize,
     end_index: usize,
     keep_recent_tokens: u32,
+    table: Option<crate::token_count::TokenTable>,
 ) -> CutPointResult {
     let cut_points = find_valid_cut_points(entries, start_index, end_index);
     if cut_points.is_empty() {
@@ -2007,7 +2051,10 @@ fn find_cut_point(
             continue;
         }
         if let Some(msg) = message_from_entry(entry) {
-            accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg));
+            accumulated_tokens = accumulated_tokens.saturating_add(table.map_or_else(
+                || estimate_tokens(&msg),
+                |table| estimate_tokens_with_table(&msg, table),
+            ));
         } else {
             continue;
         }
@@ -2553,7 +2600,25 @@ pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
-    prepare_compaction_impl(path_entries, settings, false, false)
+    prepare_compaction_impl(path_entries, settings, false, false, None)
+}
+
+/// Prepare automatic compaction for the active reader. Historical usage is
+/// reusable only while it belongs to that exact provider/model; otherwise all
+/// text and the retained tail are estimated with the destination model's table.
+pub fn prepare_compaction_for_model(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+    provider: &str,
+    model_id: &str,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_impl(
+        path_entries,
+        settings,
+        false,
+        false,
+        Some((provider, model_id)),
+    )
 }
 
 /// Provider overflow is stronger evidence than the local threshold estimate.
@@ -2565,7 +2630,7 @@ pub(crate) fn prepare_overflow_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
-    prepare_compaction_impl(path_entries, settings, true, false)
+    prepare_compaction_impl(path_entries, settings, true, false, None)
 }
 
 /// Manual `/compact` and `/shake` ignore the automatic threshold and the
@@ -2578,7 +2643,7 @@ pub(crate) fn prepare_manual_compaction(
     mut settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
     settings.enabled = true;
-    prepare_compaction_impl(path_entries, settings, true, false)
+    prepare_compaction_impl(path_entries, settings, true, false, None)
 }
 
 /// Manual handoff ignores the automatic threshold and enabled flag, but keeps
@@ -2592,7 +2657,7 @@ pub(crate) fn prepare_handoff_compaction(
     settings.enabled = true;
     settings.mode = AutoCompactionMode::Summary;
     settings.render_mode = CompactionRenderMode::Text;
-    prepare_compaction_impl(path_entries, settings, true, true)
+    prepare_compaction_impl(path_entries, settings, true, true, None)
 }
 
 fn overflow_compaction_user_index<E: Borrow<SessionEntry>>(path_entries: &[E]) -> Option<usize> {
@@ -2650,6 +2715,7 @@ fn prepare_compaction_impl(
     settings: ResolvedCompactionSettings,
     force: bool,
     preserve_complete_turn: bool,
+    model: Option<(&str, &str)>,
 ) -> Option<CompactionPreparation> {
     let settings = settings.with_mode_applied();
     if path_entries.is_empty() {
@@ -2699,7 +2765,7 @@ fn prepare_compaction_impl(
     // If the segment includes a previous compaction summary, this counts the *summary* tokens,
     // not the original uncompressed history tokens. This effectively tracks the "compressed size"
     // of the history prior to the new cut point.
-    let tokens_before = estimate_context_tokens(&usage_messages).tokens;
+    let tokens_before = estimate_context_tokens_for_model(&usage_messages, model).tokens;
 
     if !force && !should_compact(tokens_before, settings.context_window_tokens, &settings) {
         return None;
@@ -2710,6 +2776,7 @@ fn prepare_compaction_impl(
         boundary_start,
         boundary_end,
         settings.keep_recent_tokens,
+        model.map(|(provider, model_id)| crate::token_count::table_for_model(provider, model_id)),
     );
     if force {
         // An overflowing current tool result may exceed keep_recent_tokens by
@@ -4379,6 +4446,115 @@ mod tests {
         assert!(estimate.last_usage_index.is_none());
     }
 
+    #[test]
+    fn destination_estimate_does_not_depend_on_historical_model_identity() {
+        let text = "お誕生日おめでとう source/path.rs <|endoftext|>";
+        let mut assistant = make_assistant_text(text, 900_000, 100_000);
+        let messages = vec![
+            make_user_text(text),
+            assistant.clone(),
+            make_tool_result(text),
+        ];
+        for (provider, model_id) in [("openai", "gpt-4o"), ("gateway", "openai/gpt-4-turbo")] {
+            let table = crate::token_count::table_for_model(provider, model_id);
+            let expected = crate::token_count::active_counter().count(text, table)
+                + 2 * crate::token_count::active_counter().count(&format!("{text}\n"), table);
+            let model_messages = messages
+                .iter()
+                .filter_map(session_message_to_model)
+                .collect::<Vec<_>>();
+            // Exercise both the no-archive fast path and the outbound projection
+            // path; neither may select tables from historical assistant turns.
+            for accepts_images in [true, false] {
+                assert_eq!(
+                    estimate_model_context_tokens_for_model(
+                        &model_messages,
+                        accepts_images,
+                        None,
+                        provider,
+                        model_id,
+                    ),
+                    expected,
+                );
+            }
+            if let SessionMessage::Assistant { message } = &mut assistant {
+                message.provider = "unrelated".into();
+                message.model = "claude-historical".into();
+            }
+            let renamed = vec![
+                session_message_to_model(&messages[0]).expect("user message"),
+                session_message_to_model(&assistant).expect("assistant message"),
+                session_message_to_model(&messages[2]).expect("tool result"),
+            ];
+            assert_eq!(
+                estimate_model_context_tokens_for_model(&renamed, true, None, provider, model_id),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn active_model_usage_is_authoritative_but_switching_discards_the_checkpoint() {
+        let mut assistant = make_assistant_text("old answer", 80_000, 2_000);
+        if let SessionMessage::Assistant { message } = &mut assistant {
+            message.provider = "openai".into();
+            message.model = "gpt-4o".into();
+        }
+        let messages = vec![
+            make_user_text("old question"),
+            assistant,
+            make_user_text("next"),
+        ];
+        let same = estimate_context_tokens_for_model(&messages, Some(("openai", "gpt-4o")));
+        assert_eq!(
+            same.tokens,
+            82_000 + crate::token_count::count_tokens_for_model("next", "openai", "gpt-4o")
+        );
+        assert_eq!(same.last_usage_index, Some(1));
+
+        for reader in [
+            ("openai", "gpt-4-turbo"),
+            ("anthropic", "claude-sonnet-4-6"),
+        ] {
+            let switched = estimate_context_tokens_for_model(&messages, Some(reader));
+            assert!(
+                switched.tokens < 100,
+                "stale usage must not follow a model switch"
+            );
+            assert_eq!(switched.last_usage_index, None);
+        }
+        let mut foreign = make_assistant_text("foreign answer", 120_000, 2_000);
+        if let SessionMessage::Assistant { message } = &mut foreign {
+            message.provider = "anthropic".into();
+            message.model = "claude-sonnet-4-6".into();
+        }
+        let mut returned = messages;
+        returned.push(foreign);
+        let estimate = estimate_context_tokens_for_model(&returned, Some(("openai", "gpt-4o")));
+        assert!(estimate.tokens < 100);
+        assert_eq!(
+            estimate.last_usage_index, None,
+            "do not revive an older matching checkpoint"
+        );
+    }
+
+    #[test]
+    fn automatic_compaction_rechecks_the_threshold_after_a_model_switch() {
+        let entries = vec![
+            user_entry("u1", "old question"),
+            assistant_entry("a1", "answer", 900_000, 100_000),
+            user_entry("u2", "new question"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            context_window_tokens: 128_000,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        assert!(prepare_compaction(&entries, settings.clone()).is_some());
+        assert!(prepare_compaction_for_model(&entries, settings, "openai", "gpt-4o").is_none());
+    }
+
     // ── estimate_entries_context_tokens (tokensAfter heuristic) ──────
 
     #[test]
@@ -5538,7 +5714,7 @@ mod tests {
             keep_recent_tokens: 1,
             ..Default::default()
         };
-        let ordinary_cut = find_cut_point(&entries, 0, entries.len(), 1);
+        let ordinary_cut = find_cut_point(&entries, 0, entries.len(), 1, None);
         assert!(ordinary_cut.first_kept_entry_index > 2);
         let prepared = prepare_overflow_compaction(&entries, settings.clone()).unwrap();
         assert_eq!(prepared.first_kept_entry_id, "current-user");
@@ -5615,7 +5791,7 @@ mod tests {
             .map(|message| estimate_tokens(&message))
             .sum();
         let keep_recent_tokens = u32::try_from(latest_turn_tokens + 1).unwrap();
-        let ordinary_cut = find_cut_point(&entries, 0, entries.len(), keep_recent_tokens);
+        let ordinary_cut = find_cut_point(&entries, 0, entries.len(), keep_recent_tokens, None);
         assert_eq!(ordinary_cut.first_kept_entry_index, 3);
         assert_eq!(ordinary_cut.turn_start_index, Some(2));
         assert!(ordinary_cut.is_split_turn);

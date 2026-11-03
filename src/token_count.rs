@@ -38,6 +38,36 @@ pub const fn table_for_provider(provider: &str) -> TokenTable {
     }
 }
 
+/// Pick a table for the model that will read the complete request, including
+/// messages originally produced by other providers. Gateway-qualified IDs
+/// retain their model family; unknown deployments use the provider's existing
+/// approximation. These tables estimate text, not provider framing or images.
+#[must_use]
+pub fn table_for_model(provider: &str, model_id: &str) -> TokenTable {
+    let model = model_id.rsplit('/').next().unwrap_or(model_id);
+    let model = model.to_ascii_lowercase();
+    if model == "gpt-4"
+        || model.starts_with("gpt-4-")
+        || model == "gpt-3.5-turbo"
+        || model.starts_with("gpt-3.5-turbo-")
+        || model == "gpt-35-turbo"
+        || model.starts_with("gpt-35-turbo-")
+        || model.starts_with("claude-")
+        || model.starts_with("anthropic.claude-")
+        || model.contains(".anthropic.claude-")
+    {
+        TokenTable::Cl100k
+    } else {
+        table_for_provider(provider)
+    }
+}
+
+/// Count text using the destination model's tokenizer approximation.
+#[must_use]
+pub fn count_tokens_for_model(text: &str, provider: &str, model_id: &str) -> u64 {
+    active_counter().count(text, table_for_model(provider, model_id))
+}
+
 /// Counting surface (tests inject a deterministic stub).
 pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str, table: TokenTable) -> u64;
@@ -109,6 +139,65 @@ pub fn count_all_tables(text: &str) -> Vec<(TokenTable, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_table_distinguishes_legacy_gpt_from_modern_and_gateway_models() {
+        for model in [
+            "gpt-4",
+            "gpt-4-0613",
+            "gpt-4-32k",
+            "gpt-4-turbo-2024-04-09",
+            "gpt-3.5-turbo",
+            "gpt-35-turbo-0125",
+            "openai/gpt-4-turbo",
+            "gateway/openai/GPT-3.5-TURBO",
+            "anthropic/claude-sonnet-4-6",
+            "anthropic.claude-sonnet-4-6-v1:0",
+            "us.anthropic.claude-sonnet-4-6-v1:0",
+        ] {
+            assert_eq!(
+                table_for_model("gateway", model),
+                TokenTable::Cl100k,
+                "{model}"
+            );
+        }
+        for model in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4.5-preview",
+            "gpt-5",
+            "openai/gpt-4o-2024-08-06",
+            "gemini-3-flash",
+            "grok-4",
+            "unknown-deployment",
+            "",
+        ] {
+            assert_eq!(
+                table_for_model("gateway", model),
+                TokenTable::O200k,
+                "{model}"
+            );
+        }
+        assert_eq!(
+            table_for_model("anthropic", "private-deployment"),
+            TokenTable::Cl100k
+        );
+    }
+
+    #[test]
+    fn model_counting_uses_the_selected_table_for_plain_text() {
+        let text = "お誕生日おめでとう <|endoftext|> source/path.rs";
+        for (model, table) in [
+            ("gpt-4-turbo", TokenTable::Cl100k),
+            ("gpt-4o", TokenTable::O200k),
+        ] {
+            assert_eq!(
+                count_tokens_for_model(text, "openai", model),
+                active_counter().count(text, table),
+            );
+        }
+    }
 
     #[test]
     fn table_selection() {
